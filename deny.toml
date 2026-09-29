@@ -1,0 +1,41 @@
+# cargo-deny: every dependency must be permissively licensed and unflagged.
+# Run locally with `cargo deny check all`; CI runs the same command.
+# Allow-list verified against the real Cargo.lock (cargo-deny 0.20):
+# `check all` passes with no unmatched-allowance warnings, so the list is
+# tight. `BUSL-1.1` is our own crate license (repo LICENSE + workspace);
+# `Zlib` covers zlib-rs (pure-Rust zlib behind twilight-gateway's `zlib`
+# compression feature). If S2 switches compression to `zstd`, revisit this list.
+# `CDLA-Permissive-2.0` covers webpki-roots (Mozilla root data bundled for
+# sqlx's `tls-rustls-ring-webpki` feature, enabled under CI's --all-features):
+# a permissive data license, fine for a server-side bot.
+[graph]
+targets = [{ triple = "x86_64-unknown-linux-gnu" }]
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "ISC",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+  "BUSL-1.1",
+  "Zlib",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
