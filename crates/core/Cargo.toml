@@ -11,6 +11,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+unicode-normalization = { workspace = true }
 
 # Database access lives behind the `db` feature so unit tests for pure
 # domain logic never need a Postgres driver or a live database.
