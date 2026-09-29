@@ -738,6 +738,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2161,6 +2162,7 @@ dependencies = [
  "axum",
  "rustls",
  "serde_json",
+ "sqlx",
  "tokio",
  "tower",
  "tower-http",
@@ -2176,6 +2178,16 @@ dependencies = [
 name = "two-bot-core"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64",
+ "bytes",
+ "flate2",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "serde",
  "serde_json",
  "sqlx",

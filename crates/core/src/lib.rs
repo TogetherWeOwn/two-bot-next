@@ -5,6 +5,7 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod backup;
 pub mod commands;
 pub mod config;
 pub mod events;

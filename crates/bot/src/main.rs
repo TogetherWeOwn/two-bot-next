@@ -5,6 +5,7 @@
 //! `/readyz` reports `gateway: down` (HTTP 503) — the Container boots healthy
 //! on staging config either way.
 
+mod backup_cli;
 mod gateway;
 mod server;
 
@@ -27,6 +28,20 @@ async fn main() {
     // rot behind an HTTP-client upgrade.
     if std::env::args().any(|arg| arg == "--healthcheck") {
         std::process::exit(healthcheck().await);
+    }
+
+    // Operator CLI (TOG-9881): backup/restore + sealed guild-config snapshot.
+    // No subcommand falls through to the gateway path below. sqlx is linked
+    // (core `db` feature) so these paths can open Postgres directly.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if !cli_args.is_empty() && cli_args[0] != "--help" && cli_args[0] != "-h" {
+        let code = backup_cli::dispatch(&cli_args).await;
+        // 100 = not a backup subcommand: fall through to serve.
+        if code != 100 {
+            std::process::exit(code);
+        }
+    } else if !cli_args.is_empty() {
+        print_backup_help_and_exit().await;
     }
 
     tracing_subscriber::fmt()
@@ -66,6 +81,12 @@ async fn main() {
         tracing::error!(error = %err, "http server failed");
         std::process::exit(1);
     }
+}
+
+/// `--help` covers both the gateway server and the backup CLI.
+async fn print_backup_help_and_exit() -> ! {
+    let code = backup_cli::dispatch(&["--help".to_owned()]).await;
+    std::process::exit(code);
 }
 
 /// Probe /health over plain HTTP using only tokio (no client dependency).
