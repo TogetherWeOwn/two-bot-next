@@ -1,0 +1,97 @@
+name: PR lint
+
+# Org convention for every change that lands on main (TogetherWeOwn GitHub standard):
+#   * PR title = Conventional Commits header: `type(scope): summary`, <= 100 chars, no trailing period.
+#     Types: feat fix perf refactor test docs build ci chore revert style security.
+#     Put the card ID in the body (`Refs: TOG-1234`), not in the title.
+#   * PR body explains what changed, why, and how it was tested.
+#   * Repos are squash-merge only and the squash commit title is the PR title, so the history on
+#     main is one conventional commit per PR. The push job below flags any commit that bypasses it
+#     (for example a merge call that passes its own commit_title).
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-lint-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  REQUIRE_CARD_REF: "true"
+
+jobs:
+  pr-lint:
+    name: pr-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check title, body and commits
+        env:
+          EVENT: ${{ github.event_name }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          COMMITS: ${{ toJSON(github.event.commits) }}
+        shell: python3 {0}
+        run: |
+          import json, os, re, sys
+
+          TYPES = "feat|fix|perf|refactor|test|docs|build|ci|chore|revert|style|security"
+          HEADER = re.compile(rf"^({TYPES})(\([A-Za-z0-9._/,-]+\))?!?: \S.*$")
+          HELP = ("Expected a Conventional Commits header, e.g. 'fix(auth): refuse expired sudo "
+                  "sessions' or 'feat(events): shareable event page'. Allowed types: "
+                  + TYPES.replace("|", ", ") + ". Put the card ID in the body as 'Refs: TOG-1234'.")
+
+          def header_errors(text):
+              errs = []
+              if not HEADER.match(text):
+                  errs.append("not a Conventional Commits header")
+              if len(text) > 100:
+                  errs.append(f"{len(text)} chars (max 100)")
+              if text.rstrip().endswith("."):
+                  errs.append("ends with a period")
+              return errs
+
+          failed = False
+          if os.environ["EVENT"] == "pull_request":
+              title = os.environ.get("TITLE", "").strip()
+              body = os.environ.get("BODY", "") or ""
+              author = os.environ.get("AUTHOR", "")
+              if author.endswith("[bot]") and author.startswith(("dependabot", "renovate")):
+                  if header_errors(title):
+                      print(f"::warning::{author} title '{title}' is not conventional; set "
+                            "commit-message.prefix (e.g. chore(deps)) in the bot config.")
+                  sys.exit(0)
+              errs = header_errors(title)
+              if errs:
+                  failed = True
+                  print(f"::error title=PR title::'{title}': {'; '.join(errs)}. {HELP}")
+              text = re.sub(r"<!--.*?-->", "", body, flags=re.S)
+              if len(re.sub(r"\s", "", text)) < 40:
+                  failed = True
+                  print("::error title=PR body::The description is empty. Say what changed, why, "
+                        "and how it was tested (see the PR template).")
+              if not re.search(r"\bTOG-\d+\b", body):
+                  level = "error" if os.environ["REQUIRE_CARD_REF"] == "true" else "warning"
+                  failed = failed or level == "error"
+                  print(f"::{level} title=Card reference::Add 'Refs: TOG-1234' to the PR body.")
+          else:
+              for c in json.loads(os.environ.get("COMMITS") or "[]") or []:
+                  subject = (c.get("message") or "").splitlines()[0] if c.get("message") else ""
+                  if subject.startswith(("Merge ", "Revert \"")):
+                      continue
+                  errs = header_errors(subject)
+                  if errs:
+                      failed = True
+                      print(f"::error title=Commit on main::{c.get('id','')[:10]} '{subject}': "
+                            f"{'; '.join(errs)}. Merge PRs with squash and the PR title as the "
+                            "commit title.")
+          if failed:
+              sys.exit(1)
+          print("PR conventions OK")
