@@ -26,6 +26,12 @@ type = "durable-object"
 storage = "sqlite"
 
 [vars]
+# B3 (TOG-9696): go.two.gg redirect source. Hyperdrive binding
+# `REDIRECT_DB` lands with S1; until then REDIRECT_MAPPINGS_JSON carries a
+# snapshot of the invite_campaigns rows (same shape, see redirect-store.ts).
+# REDIRECT_FALLBACK_CODE is the invite code for `/` and DB outages.
+REDIRECT_FALLBACK_CODE = ""
+REDIRECT_MAPPINGS_JSON = "[]"
 # Container HTTP port (must match the Rust LISTEN_ADDR port).
 BOT_PORT = "8080"
 # Keepalive tick: the DO schedule() below re-arms itself this often; each
