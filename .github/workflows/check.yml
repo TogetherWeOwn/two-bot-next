@@ -52,3 +52,29 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --locked
+
+      # `check all` reads Cargo.lock by default (no --locked flag exists).
+      # deny.toml's allow-list is verified tight: no unmatched allowances.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check all
+
+  worker:
+    name: worker typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: wrangler
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: wrangler/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
