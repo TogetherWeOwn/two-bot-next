@@ -59,7 +59,9 @@ pub struct CommandOption {
 }
 
 impl CommandOption {
-    fn new(name: &str, description: &str, kind: CommandOptionType) -> Self {
+    /// New optional option; chain [`CommandOption::required`] etc. as needed.
+    /// `pub` so later S4 feature slices build definitions on this module.
+    pub fn new(name: &str, description: &str, kind: CommandOptionType) -> Self {
         Self {
             name: name.to_owned(),
             description: description.to_owned(),
@@ -139,7 +141,10 @@ pub struct CommandDefinition {
 }
 
 impl CommandDefinition {
-    fn new(name: &str, description: &str) -> Self {
+    /// New guild-only definition with no options or permission gate; chain
+    /// [`CommandDefinition::permissions`] / [`CommandDefinition::options`].
+    /// `pub` so later S4 feature slices build definitions on this module.
+    pub fn new(name: &str, description: &str) -> Self {
         Self {
             name: name.to_owned(),
             description: description.to_owned(),

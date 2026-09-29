@@ -40,7 +40,13 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           environment: staging
-      - name: Gate on /readyz
+      # S1 contract (TOG-9907): /health must be 200 — that proves the
+      # Container/DO bindings are wired (HTTP 1101 meant env.TWO_BOT was
+      # undefined). /readyz is truthfully 503 while the gateway supervisor is
+      # parked: S2 (TOG-9807) connects the shard, S3 (TOG-9808) wires the
+      # pipeline, so only S2/S3 may turn this gate's 503 into a 200.
+      # Never fake readyz success to pass CI.
+      - name: Gate on /health + truthful /readyz
         env:
           STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
         run: |
@@ -50,17 +56,30 @@ jobs:
             echo "ask the operator to add it (see docs/staging-soak.md), then re-run."
             exit 1
           }
-          # IDENTIFY + cold start can take a minute; poll up to ~5 minutes.
+          # Container cold start can take a minute; poll /health up to ~5 min.
           for i in $(seq 1 30); do
-            code=$(curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_URL/readyz" || true)
+            code=$(curl -s -o /tmp/health.json -w '%{http_code}' "$STAGING_URL/health" || true)
             if [ "$code" = "200" ]; then
-              echo "readyz 200 after ~$((i * 10))s"
-              cat /tmp/readyz.json
-              exit 0
+              echo "health 200 after ~$((i * 10))s"
+              cat /tmp/health.json
+              break
             fi
-            echo "attempt $i: /readyz -> $code; waiting 10s"
+            echo "attempt $i: /health -> $code; waiting 10s"
+            if [ "$i" = "30" ]; then
+              echo "health never returned 200 (bindings still broken?)"
+              cat /tmp/health.json || true
+              exit 1
+            fi
             sleep 10
           done
-          echo "readyz never returned 200"
+          # /readyz must answer with a component breakdown: 200 once S2/S3
+          # meet contract, 503 while the shard is parked. Anything else
+          # (500/1101/...) means the deploy is still broken.
+          code=$(curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_URL/readyz" || true)
+          echo "readyz -> $code"
           cat /tmp/readyz.json || true
-          exit 1
+          case "$code" in
+            200) echo "gateway ready" ;;
+            503) echo "gateway parked (S2/S3 pending); deploy is healthy" ;;
+            *) echo "unexpected readyz status $code"; exit 1 ;;
+          esac

@@ -79,3 +79,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # TOG-9907: named envs do not inherit bindings; fail if any [env.*]
+      # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
+      - name: check env bindings are explicit
+        run: python3 scripts/check-env-bindings.py wrangler.toml
