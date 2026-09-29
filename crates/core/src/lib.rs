@@ -8,10 +8,15 @@
 pub mod commands;
 pub mod config;
 pub mod events;
+pub mod feature_commands;
 pub mod health;
 pub mod leveling;
 
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
 pub use events::{CoreEvent, VoiceSessionDelta};
+pub use feature_commands::{
+    announcement_commands, automation_commands, feature_commands, scorecard_attendance_command,
+    FeatureGates, GateError,
+};
 pub use health::{ComponentStatus, HealthReport};
