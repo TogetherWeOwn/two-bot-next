@@ -1,0 +1,15 @@
+[package]
+name = "two-bot-discord"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+two-bot-core = { path = "../core" }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+twilight-cache-inmemory = { workspace = true }
+twilight-gateway = { workspace = true }
+twilight-model = { workspace = true }

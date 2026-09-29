@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/discord", "crates/bot"]
+default-members = ["crates/core", "crates/discord", "crates/bot"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.94"
+license = "BUSL-1.1"
+
+# Pinned versions for the dependency tree (see Cargo.lock). Kept in one place
+# so S3+ slices bump consistently. sqlx 0.9 sets the MSRV floor (>= 1.94).
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+    "tracing",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls-ring-webpki",
+    "migrate",
+    "json",
+    "time",
+] }
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-http = { version = "0.7", default-features = false, features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+twilight-cache-inmemory = { version = "0.17", default-features = false }
+twilight-gateway = { version = "0.17", default-features = false, features = [
+    "rustls-platform-verifier",
+    "zlib",
+] }
+twilight-http = { version = "0.17", default-features = false, features = [
+    "rustls-platform-verifier",
+] }
+twilight-model = "0.17"
+
+[profile.release]
+# lite Container headroom (256 MiB): favour size over last-percent speed.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
