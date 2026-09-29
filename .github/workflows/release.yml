@@ -1,0 +1,73 @@
+name: release
+
+# release-please (TOG-9865, TOG-10035): CHANGELOG.md + SemVer tags + GitHub
+# Releases from Conventional Commits on main. Single `.` rust package
+# (release-please-config.json + .release-please-manifest.json): the workspace
+# root carries the one `[package]` version release-please bumps, tagged as
+# flat `vX.Y.Z`. The four member crates are internal (never published, only
+# the container image ships): their manifests keep literal `0.1.0` versions
+# with explicit intra-workspace version reqs, which path resolution keeps
+# satisfied as the root advances — only the root version moves per release.
+# Stay 0.x until production cutover; 1.0.0 = cutover.
+#
+# Required-checks fix: PRs opened with GITHUB_TOKEN trigger no workflows, so
+# the required `check` / `worker check` / `gitleaks` / `pr-lint` would never
+# run on the release PR and it could never merge. The dispatch job below calls
+# `gh workflow run` (workflow_dispatch IS allowed from GITHUB_TOKEN) for
+# check / secret-scan on the release branch, plus the pr-lint dispatch path
+# that validates the open PR via the API. The check runs land on the PR head
+# SHA, which is what required checks match on. No App key or PAT in Actions
+# secrets.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      prs_created: ${{ steps.release.outputs.prs_created }}
+      pr: ${{ steps.release.outputs.pr }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  dispatch-checks:
+    name: dispatch-checks
+    needs: release-please
+    if: needs.release-please.outputs.prs_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job: gh needs the repo named explicitly.
+          GH_REPO: ${{ github.repository }}
+          PR_JSON: ${{ needs.release-please.outputs.pr }}
+        run: |
+          set -euo pipefail
+          read -r PR_NUMBER HEAD_BRANCH < <(python3 -c "
+          import json, os
+          pr = json.loads(os.environ['PR_JSON'])
+          print(pr['number'], pr['headBranchName'])
+          ")
+          echo "Release PR #$PR_NUMBER on branch $HEAD_BRANCH; dispatching required checks."
+          gh workflow run check.yml --ref "$HEAD_BRANCH"
+          gh workflow run secret-scan.yml --ref "$HEAD_BRANCH"
+          gh workflow run pr-lint.yml --ref "$HEAD_BRANCH" -f pr_number="$PR_NUMBER"

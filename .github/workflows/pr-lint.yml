@@ -14,12 +14,25 @@ on:
     types: [opened, edited, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # Dispatched by the release workflow (TOG-10035) on release-please branches:
+  # PRs opened with GITHUB_TOKEN trigger no workflows, so the required
+  # `pr-lint` check would never run on the release PR without this path.
+  # The release workflow passes the release PR number; this job fetches the
+  # title/body via the API (needs pull-requests: read) and validates them with
+  # the same inline script as the pull_request path.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Release PR number to validate"
+        required: true
+        type: string
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
-  group: pr-lint-${{ github.event.pull_request.number || github.sha }}
+  group: pr-lint-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
   cancel-in-progress: true
 
 env:
@@ -31,12 +44,50 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Resolve PR title/body
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Passed via env (not inlined into the script) so titles/bodies
+          # containing quotes can't break shell parsing.
+          EVENT_TITLE: ${{ github.event.pull_request.title }}
+          EVENT_BODY: ${{ github.event.pull_request.body }}
+          EVENT_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Validating release PR #$PR_NUMBER via the API."
+            TITLE=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title --jq .title)
+            BODY=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+            AUTHOR=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json author --jq .author.login)
+            # workflow_dispatch runs land on the dispatch ref (the release
+            # branch head = the PR head), which is what required checks match
+            # on, so validate as a PR event.
+            EVENT=pull_request
+          else
+            TITLE="$EVENT_TITLE"
+            BODY="$EVENT_BODY"
+            AUTHOR="$EVENT_AUTHOR"
+            EVENT='${{ github.event_name }}'
+          fi
+          {
+            echo "title<<PR_EOF"
+            echo "$TITLE"
+            echo "PR_EOF"
+            echo "body<<PR_EOF"
+            echo "$BODY"
+            echo "PR_EOF"
+            echo "author=$AUTHOR"
+            echo "event=$EVENT"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Check title, body and commits
         env:
-          EVENT: ${{ github.event_name }}
-          TITLE: ${{ github.event.pull_request.title }}
-          BODY: ${{ github.event.pull_request.body }}
-          AUTHOR: ${{ github.event.pull_request.user.login }}
+          EVENT: ${{ steps.pr.outputs.event }}
+          TITLE: ${{ steps.pr.outputs.title }}
+          BODY: ${{ steps.pr.outputs.body }}
+          AUTHOR: ${{ steps.pr.outputs.author }}
           COMMITS: ${{ toJSON(github.event.commits) }}
         shell: python3 {0}
         run: |
