@@ -1,0 +1,24 @@
+[package]
+name = "two-bot-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Database access lives behind the `db` feature so unit tests for pure
+# domain logic never need a Postgres driver or a live database.
+sqlx = { workspace = true, optional = true }
+
+[features]
+default = []
+db = ["dep:sqlx"]
+
+[dev-dependencies]
+tokio = { workspace = true }

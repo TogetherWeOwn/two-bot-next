@@ -4,9 +4,11 @@ The Together We Own Discord bot (Owen), rewritten in Rust to run in a single alw
 Cloudflare Container. It replaces [two-bot](https://github.com/TogetherWeOwn/two-bot)
 (TypeScript/discord.js), which is now in maintenance mode: fixes only, no new features.
 
-Status: framework selection. The Rust Discord library (for example twilight or
-serenity/poise) is being chosen on its own research card before any code lands. The
-decision record goes in `docs/adr/0001-discord-framework.md`.
+Status: scaffold (S1). Twilight is the chosen Discord framework — see
+`docs/adr/0001-discord-framework.md`. The workspace (`crates/core`,
+`crates/discord`, `crates/bot`), CI `check` job, `Dockerfile` and the
+`wrangler/` Container + Worker/DO wrapper are in place; the gateway
+supervisor connects in S3.
 
 Targets: `lite` Container instance (under 256 MiB RSS), one gateway session, shared
 Postgres with two-web-next. Migration plan: TOG-9671.

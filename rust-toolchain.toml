@@ -1,0 +1,6 @@
+# Pinned toolchain: stable >= 1.94 (sqlx 0.9 MSRV floor, ADR 0001).
+# rustup and CI both honour this file; the Dockerfile defaults to the same.
+[toolchain]
+channel = "1.94"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

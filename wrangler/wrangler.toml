@@ -1,0 +1,34 @@
+# two-bot-next deploy skeleton (S1): one always-on Container behind a
+# Worker + Durable Object wrapper (ADR 0001: `lite` target, DO-alarm keepalive).
+#
+# Secrets (DISCORD_TOKEN, DATABASE_URL) are set as Worker secrets and passed
+# into the container as env vars — never baked into the image:
+#   wrangler secret put DISCORD_TOKEN
+#   wrangler secret put DATABASE_URL
+
+name = "two-bot-next"
+main = "src/index.ts"
+compatibility_date = "2026-09-29"
+
+[[containers]]
+class_name = "TwoBotContainer"
+image = "../Dockerfile"
+# ADR 0001: target `lite`; escalate to `basic` only if measured RSS > ~200 MiB.
+instance_type = "lite"
+max_instances = 1
+
+[[durable_objects.bindings]]
+name = "TWO_BOT"
+class_name = "TwoBotContainer"
+
+[exports.TwoBotContainer]
+type = "durable-object"
+storage = "sqlite"
+
+[vars]
+# Container HTTP port (must match the Rust LISTEN_ADDR port).
+BOT_PORT = "8080"
+# Keepalive tick: the DO schedule() below re-arms itself this often; each
+# tick renews the activity timeout so the gateway WebSocket (outbound-only,
+# invisible to Container idle billing) never lets the instance sleep.
+KEEPALIVE_SECONDS = "60"
