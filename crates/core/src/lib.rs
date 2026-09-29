@@ -11,6 +11,7 @@ pub mod events;
 pub mod feature_commands;
 pub mod health;
 pub mod leveling;
+pub mod moderation;
 
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
@@ -20,3 +21,9 @@ pub use feature_commands::{
     FeatureGates, GateError,
 };
 pub use health::{ComponentStatus, HealthReport};
+pub use moderation::{
+    assert_moderation_allowed, moderation_commands, moderation_target_protection,
+    require_moderation_reason, ModerationAction, ModerationActor, ModerationGateError,
+    ModerationGates, ModerationPolicy, ModerationRequest, ModerationTarget, PolicyError,
+    ReasonError, TargetProtection,
+};
