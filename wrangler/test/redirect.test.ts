@@ -1,0 +1,379 @@
+/**
+ * B3 redirect-mapping table test (TOG-9696 acceptance).
+ *
+ * Pins the legacy resolution contract from two-bot's test/unit.redirect.test.ts
+ * (TOG-116) against the Worker port (`src/redirect.ts`): every mapping in the
+ * fixture table must resolve to a byte-identical 302 target, with identical
+ * status codes, headers, click records, and privacy behavior. The fixture rows
+ * mirror the `invite_campaigns` row shape (migration 0006 — including the
+ * hand-edited bad-code row the legacy suite inserts directly); the live table
+ * is verified separately on the staging host before DNS (card acceptance).
+ *
+ * Runs under plain node:test via Node's type stripping — no extra deps:
+ *   node --test test/redirect.test.ts
+ * (from wrangler/; Node >= 22.6).
+ */
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+import {
+  TokenBuckets,
+  clickIdempotencyKey,
+  handleRedirect,
+  inviteUrl,
+  isValidInviteCode,
+  isValidSlug,
+  type Campaign,
+  type RedirectClick,
+  type RedirectDeps,
+} from "../src/redirect.ts";
+
+const GUILD = "111222333444555666";
+const CODE = "aB3xY9";
+const FALLBACK = "fallbackCode";
+
+/**
+ * Mapping snapshot: same rows the legacy suite works with — two campaigns
+ * sharing one code (per-place breakdown still separates them), a retired row
+ * (still redirects), and a hand-edited invalid code (500, never in Location).
+ */
+const MAPPINGS: Campaign[] = [
+  { slug: "reddit", inviteCode: CODE, label: "r/MMORPG sidebar", disabledAt: null },
+  { slug: "twitch", inviteCode: CODE, label: "Twitch panel", disabledAt: null },
+  { slug: "retired", inviteCode: CODE, label: "old post", disabledAt: "2026-08-01T00:00:00.000Z" },
+  { slug: "badcode", inviteCode: "has space", label: "hand-edited", disabledAt: null },
+];
+
+interface Harness {
+  deps: RedirectDeps;
+  clicks: RedirectClick[];
+  errors: string[];
+  call: (method: string, path: string, caller?: string) => Promise<{
+    status: number;
+    headers: Record<string, string>;
+    body: string;
+    click?: RedirectClick;
+  }>;
+}
+
+function harness(opts: {
+  outage?: boolean;
+  recorderThrows?: boolean;
+  fallback?: string | null;
+  bucket?: { capacity: number; refillPerSecond: number };
+  now?: () => number;
+} = {}): Harness {
+  const clicks: RedirectClick[] = [];
+  const errors: string[] = [];
+  const buckets = new TokenBuckets(
+    opts.bucket ?? { capacity: 60, refillPerSecond: 1 },
+    opts.now ?? Date.now,
+  );
+  let token = 0;
+  const deps: RedirectDeps = {
+    guildId: GUILD,
+    fallbackInviteCode: opts.fallback === undefined ? FALLBACK : opts.fallback,
+    lookup: async (slug) => {
+      if (opts.outage) throw new Error("simulated outage");
+      return MAPPINGS.find((c) => c.slug === slug) ?? null;
+    },
+    recordClick: async (click) => {
+      if (opts.recorderThrows) throw new Error("simulated store outage");
+      clicks.push(click);
+    },
+    onError: (msg, detail) => errors.push(`${msg} ${JSON.stringify(detail)}`),
+    now: () => new Date("2026-09-03T12:00:00.000Z").getTime(),
+    uuid: () => `token-${++token}`,
+    isThrottled: (key) => !buckets.take(key).allowed,
+  };
+  return {
+    deps,
+    clicks,
+    errors,
+    call: async (method, path, caller = "caller-1") => {
+      const res = await handleRedirect(method, path, caller, deps);
+      // Mirror the Worker entry: record after the 302, swallow failures.
+      if (res.click) {
+        await deps
+          .recordClick(res.click)
+          .catch((err: unknown) =>
+            errors.push(`invite_click_record_failed ${String(err)}`),
+          );
+      }
+      return res;
+    },
+  };
+}
+
+describe("mapping table: every row resolves byte-identically", () => {
+  test("tracked link 302s to the invite and records one click", async () => {
+    const h = harness();
+    const res = await h.call("GET", "/reddit");
+    assert.equal(res.status, 302);
+    assert.equal(res.headers["location"], `https://discord.gg/${CODE}`);
+    assert.equal(h.clicks.length, 1);
+    assert.equal(h.clicks[0]?.source, `invite:${CODE}`);
+    assert.equal(h.clicks[0]?.campaign, "reddit");
+    assert.equal(h.clicks[0]?.guildId, GUILD);
+  });
+
+  test("302 is uncacheable with no referrer; a second click still counts", async () => {
+    const h = harness();
+    const res = await h.call("GET", "/reddit");
+    assert.equal(res.status, 302);
+    assert.match(res.headers["cache-control"] ?? "", /no-store/);
+    assert.equal(res.headers["referrer-policy"], "no-referrer");
+    await h.call("GET", "/reddit");
+    assert.equal(h.clicks.length, 2);
+  });
+
+  test("two campaigns on one code are told apart by campaign", async () => {
+    const h = harness();
+    await h.call("GET", "/reddit");
+    await h.call("GET", "/twitch");
+    assert.equal(h.clicks.length, 2);
+    assert.deepEqual(
+      h.clicks.map((c) => c.campaign).sort(),
+      ["reddit", "twitch"],
+    );
+    assert.ok(h.clicks.every((c) => c.source === `invite:${CODE}`));
+  });
+
+  test("retired campaign still redirects, because the post cannot be edited", async () => {
+    const h = harness();
+    const res = await h.call("GET", "/retired");
+    assert.equal(res.status, 302);
+    assert.equal(h.clicks.length, 1);
+  });
+
+  test("same-millisecond clicks get distinct idempotency keys", () => {
+    const base: RedirectClick = {
+      guildId: GUILD,
+      code: CODE,
+      campaign: "reddit",
+      occurredAt: "2026-09-03T12:00:00.000Z",
+      dedupeToken: "",
+      source: `invite:${CODE}`,
+    };
+    assert.equal(
+      clickIdempotencyKey(base),
+      clickIdempotencyKey({ ...base }),
+    );
+    assert.notEqual(
+      clickIdempotencyKey({ ...base, dedupeToken: "a" }),
+      clickIdempotencyKey({ ...base, dedupeToken: "b" }),
+    );
+    assert.match(
+      clickIdempotencyKey({ ...base, dedupeToken: "one" }),
+      new RegExp(`^${GUILD}:anon:invite_click:2026-09-03T12:00:00\\.000Z:one$`),
+    );
+  });
+
+  test("slug lookup is case-insensitive and tolerates a trailing slash", async () => {
+    const h = harness();
+    assert.equal((await h.call("GET", "/Reddit")).status, 302);
+    assert.equal((await h.call("GET", "/reddit/")).status, 302);
+    assert.equal(h.clicks.length, 2);
+  });
+
+  test("encoded known slug still resolves only to the fixed invite host", async () => {
+    const h = harness();
+    const res = await h.call("GET", "/%72eddit"); // %72 == 'r'
+    assert.equal(res.status, 302);
+    assert.equal(res.headers["location"], `https://discord.gg/${CODE}`);
+    assert.equal(h.clicks.length, 1);
+  });
+
+  test("query string is dropped, never recorded", async () => {
+    const h = harness();
+    const res = await h.call("GET", "/reddit?fbclid=abc123&utm_source=x");
+    assert.equal(res.status, 302);
+    assert.equal(h.clicks.length, 1);
+    assert.ok(!JSON.stringify(h.clicks[0]).includes("fbclid"));
+  });
+});
+
+describe("privacy: nothing about the visitor survives", () => {
+  test("click carries campaign + timestamps only; error paths leak nothing", async () => {
+    const h = harness();
+    await h.call("GET", "/reddit");
+    const blob = JSON.stringify(h.clicks[0]);
+    for (const leak of ["Mozilla", "secret", "203.0.113.44"]) {
+      assert.ok(!blob.includes(leak));
+    }
+    // Error paths log slug only — caller key never reaches onError/record.
+    const h2 = harness({ outage: true, fallback: null });
+    await h2.call("GET", "/reddit");
+    assert.ok(h2.errors.join(" ").includes("invite_redirect_lookup_failed"));
+    for (const leak of ["127.0.0.1", "caller-1"]) {
+      assert.ok(!h2.errors.join(" ").includes(leak));
+    }
+  });
+});
+
+describe("outages and misconfiguration degrade, never strand a member", () => {
+  test("failed click write still redirects and records nothing", async () => {
+    const h = harness({ recorderThrows: true });
+    const res = await h.call("GET", "/reddit");
+    assert.equal(res.status, 302);
+    assert.equal(h.clicks.length, 0);
+  });
+
+  test("lookup outage redirects to fallback and records nothing", async () => {
+    const h = harness({ outage: true });
+    const res = await h.call("GET", "/reddit");
+    assert.equal(res.status, 302);
+    assert.equal(res.headers["location"], "https://discord.gg/fallbackCode");
+    assert.equal(h.clicks.length, 0);
+  });
+
+  test("lookup outage with no fallback is a 503 that records nothing", async () => {
+    const h = harness({ outage: true, fallback: null });
+    const res = await h.call("GET", "/reddit");
+    assert.equal(res.status, 503);
+    assert.equal(res.headers["retry-after"], "30");
+    assert.equal(h.clicks.length, 0);
+  });
+
+  test("misconfigured campaign code is a 500 that records nothing", async () => {
+    const h = harness();
+    const res = await h.call("GET", "/badcode");
+    assert.equal(res.status, 500);
+    assert.equal(h.clicks.length, 0);
+  });
+});
+
+describe("things that are not people", () => {
+  test("HEAD redirects but does not count", async () => {
+    const h = harness();
+    const res = await h.call("HEAD", "/reddit");
+    assert.equal(res.status, 302);
+    assert.equal(h.clicks.length, 0);
+  });
+
+  test("favicon and robots.txt are 404s with no lookup side effects", async () => {
+    const h = harness();
+    assert.equal((await h.call("GET", "/favicon.ico")).status, 404);
+    assert.equal((await h.call("GET", "/robots.txt")).status, 404);
+    assert.equal(h.clicks.length, 0);
+  });
+
+  test("healthz is a plain 200 and not a click", async () => {
+    const h = harness();
+    assert.equal((await h.call("GET", "/healthz")).status, 200);
+    assert.equal(h.clicks.length, 0);
+  });
+
+  test("non-GET method is refused", async () => {
+    const h = harness();
+    const res = await h.call("POST", "/reddit");
+    assert.equal(res.status, 405);
+    assert.equal(res.headers["allow"], "GET, HEAD");
+    assert.equal(h.clicks.length, 0);
+  });
+});
+
+describe("abuse and malformed input fail closed", () => {
+  test("one caller's burst throttles at 429 before the store, then refills", async () => {
+    let now = 1_000_000;
+    const h = harness({
+      bucket: { capacity: 5, refillPerSecond: 1 },
+      now: () => now,
+    });
+    const statuses: number[] = [];
+    for (let i = 0; i < 8; i++) {
+      statuses.push((await h.call("GET", "/reddit")).status);
+    }
+    assert.deepEqual(statuses, [302, 302, 302, 302, 302, 429, 429, 429]);
+    const throttled = await h.call("GET", "/no-such-campaign");
+    assert.equal(throttled.status, 429);
+    assert.equal(throttled.headers["retry-after"], "1");
+    assert.equal(h.clicks.length, 5);
+    now += 61_000;
+    assert.equal((await h.call("GET", "/reddit")).status, 302);
+    assert.equal(h.clicks.length, 6);
+  });
+
+  test("unknown slug is a 404 with no redirect target", async () => {
+    const h = harness();
+    const res = await h.call("GET", "/never-created");
+    assert.equal(res.status, 404);
+    assert.equal(res.headers["location"], undefined);
+    assert.equal(h.clicks.length, 0);
+  });
+
+  test("bare domain redirects to fallback without counting", async () => {
+    const h = harness();
+    const res = await h.call("GET", "/");
+    assert.equal(res.status, 302);
+    assert.equal(
+      res.headers["location"],
+      "https://discord.gg/fallbackCode",
+    );
+    assert.equal(h.clicks.length, 0);
+  });
+
+  test("malformed percent-escape and traversal are 404s", async () => {
+    const h = harness();
+    assert.equal((await h.call("GET", "/%E0%A4%A")).status, 404);
+    const traversal = await h.call("GET", "/../../etc/passwd");
+    assert.ok(traversal.status === 404 || traversal.status === 400);
+    assert.equal(h.clicks.length, 0);
+  });
+
+  test("malicious variants are 404s with no redirect target (TOG-7196 set)", async () => {
+    const h = harness();
+    const malicious = [
+      "//evil.example",
+      "///evil.example",
+      "/%2fevil.example",
+      "/%2Fevil.example",
+      "/%252fevil.example",
+      "/javascript:alert(1)",
+      "/JaVaScRiPt:alert(1)",
+      "/https://evil.example",
+      "/http://evil.example/reddit",
+      "/reddit%2f..",
+      "/reddit%00",
+      "/reddit%0d%0aLocation:https://evil.example",
+      "/.evil.example",
+      "/-evil",
+      "/a",
+    ];
+    for (const path of malicious) {
+      const res = await h.call("GET", path);
+      assert.equal(res.status, 404, `${path} must 404, got ${res.status}`);
+      assert.equal(
+        res.headers["location"],
+        undefined,
+        `${path} must not redirect`,
+      );
+    }
+    assert.equal(h.clicks.length, 0);
+  });
+});
+
+describe("validators agree with the shapes we accept", () => {
+  test("slugs and codes", () => {
+    for (const good of ["reddit", "r-mmorpg", "twitch-panel-2", "ab"]) {
+      assert.ok(isValidSlug(good), good);
+    }
+    for (const bad of [
+      "a",
+      "UPPER",
+      "has space",
+      "-lead",
+      "trail-",
+      "a".repeat(41),
+      "",
+    ]) {
+      assert.ok(!isValidSlug(bad), bad);
+    }
+    for (const good of ["aB3xY9", "two-gaming"]) {
+      assert.ok(isValidInviteCode(good), good);
+    }
+    for (const bad of ["has space", "a/b", "", "x".repeat(65)]) {
+      assert.ok(!isValidInviteCode(bad), bad);
+    }
+    assert.equal(inviteUrl(CODE), `https://discord.gg/${CODE}`);
+  });
+});
