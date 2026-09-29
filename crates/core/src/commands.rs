@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn definitions_serialize_to_discord_wire_shape() {
-        let json = serde_json::to_value(&core_commands()).expect("serializes");
+        let json = serde_json::to_value(core_commands()).expect("serializes");
         assert_eq!(json[0]["name"], "rank");
         assert_eq!(json[0]["options"][0]["type"], 6);
         assert_eq!(json[0]["dm_permission"], false);
