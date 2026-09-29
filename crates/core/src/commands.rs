@@ -87,6 +87,14 @@ impl CommandOption {
         self
     }
 
+    /// Lower bound only (legacy `duration_seconds` sets a minimum with no
+    /// maximum); chain after [`CommandOption::new`].
+    #[must_use]
+    pub fn min_value(mut self, min: i64) -> Self {
+        self.min_value = Some(min);
+        self
+    }
+
     #[must_use]
     pub fn max_length(mut self, max: u32) -> Self {
         self.max_length = Some(max);

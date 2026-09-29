@@ -27,9 +27,10 @@
 //! `TWO_FEED_POLL_SECONDS`). The registry caller decides which slices to
 //! merge based on these flags.
 //!
-//! Deliberately out of scope: moderation #3–#11 (LAST slice, highest
-//! regression risk), `/voice` subcommands (needs an option-subcommand model —
-//! slice 3), `/rota-acknowledge` #13 (dropped with the rota stack).
+//! Deliberately out of scope: moderation #3–#11 (slice 3 of TOG-9809, LAST),
+//! `/voice` subcommands (temp-voice runtime never shipped on legacy `main` —
+//! only the S6 staging shape-check ports it, matrix §9 drop 6),
+//! `/rota-acknowledge` #13 (dropped with the rota stack).
 
 use std::collections::HashMap;
 
