@@ -10,6 +10,10 @@ name = "two-bot-next"
 main = "src/index.ts"
 compatibility_date = "2026-09-29"
 
+# Default-environment bindings. Named environments do NOT inherit these —
+# every [env.*] below repeats the full Container/DO wiring explicitly.
+# Verified against wrangler 4.143.1 (`deploy --dry-run --env <name>` warns on
+# any omission); enforced in CI by scripts/check-env-bindings.py.
 [[containers]]
 class_name = "TwoBotContainer"
 image = "../Dockerfile"
@@ -39,15 +43,61 @@ BOT_PORT = "8080"
 # invisible to Container idle billing) never lets the instance sleep.
 KEEPALIVE_SECONDS = "60"
 
-# Environments inherit the top-level Container project (same image, binding,
-# DO class). Staging deploys automatically via deploy-staging.yml; production
-# deploys are manual and owned by B4 (TOG-9699) — no workflow targets it.
+# Named environments repeat the full Container/DO/vars wiring: Wrangler
+# bindings are non-inheritable, so an [env.*] with only `vars` deploys a
+# Worker whose env.TWO_BOT is undefined (staging HTTP 1101, TOG-9907).
+# Staging deploys automatically via deploy-staging.yml; production deploys are
+# manual and owned by B4 (TOG-9699) — no workflow targets it.
 # Secrets per environment (never here):
 #   wrangler secret put --env staging DISCORD_TOKEN      # staging bot token
 #   wrangler secret put --env staging GUILD_ID           # TWO Staging guild
 #   wrangler secret put --env production DISCORD_TOKEN   # B4 only
+[[env.staging.containers]]
+class_name = "TwoBotContainer"
+image = "../Dockerfile"
+# ADR 0001: target `lite`; escalate to `basic` only if measured RSS > ~200 MiB.
+instance_type = "lite"
+max_instances = 1
+
+[[env.staging.durable_objects.bindings]]
+name = "TWO_BOT"
+class_name = "TwoBotContainer"
+
+[env.staging.exports.TwoBotContainer]
+type = "durable-object"
+storage = "sqlite"
+
 [env.staging.vars]
+# B3 (TOG-9696) redirect snapshot: same empty placeholder as top level until
+# S1 lands the shared DB (vars are not inherited, so this must be repeated).
+REDIRECT_FALLBACK_CODE = ""
+REDIRECT_MAPPINGS_JSON = "[]"
+# Container HTTP port (must match the Rust LISTEN_ADDR port).
+BOT_PORT = "8080"
+# Keepalive tick: renews the activity timeout so the gateway WebSocket
+# (outbound-only, invisible to Container idle billing) never sleeps.
+KEEPALIVE_SECONDS = "60"
 TWO_GUILD_NAME = "TWO Staging"
 
+[[env.production.containers]]
+class_name = "TwoBotContainer"
+image = "../Dockerfile"
+# ADR 0001: target `lite`; escalate to `basic` only if measured RSS > ~200 MiB.
+instance_type = "lite"
+max_instances = 1
+
+[[env.production.durable_objects.bindings]]
+name = "TWO_BOT"
+class_name = "TwoBotContainer"
+
+[env.production.exports.TwoBotContainer]
+type = "durable-object"
+storage = "sqlite"
+
 [env.production.vars]
+# B3 (TOG-9696) redirect snapshot placeholder (see staging block above).
+REDIRECT_FALLBACK_CODE = ""
+REDIRECT_MAPPINGS_JSON = "[]"
+BOT_PORT = "8080"
+KEEPALIVE_SECONDS = "60"
 TWO_GUILD_NAME = "TogetherWeOwn"
