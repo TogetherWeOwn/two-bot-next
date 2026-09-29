@@ -1,0 +1,48 @@
+{
+  "_comment": "Synthetic Discord roles snapshot for TOG-3481, same field shape as audit/raw/roles.json. The bot's own role sits at position 50, which is the single fact that makes 'Staff' at position 80 ungrantable and 'Level 5' at 10 grantable. Every id is in the 90000000000000 reserved block Discord never allocates. Role 900000000000000099, referenced by the export, is deliberately absent. Paired with test/fixtures/mee6-export-role-rewards.json.",
+  "roles": [
+    {
+      "id": "900000000000000000",
+      "name": "@everyone",
+      "position": 0,
+      "managed": false
+    },
+    {
+      "id": "900000000000000010",
+      "name": "Owen QA Test",
+      "position": 50,
+      "managed": true,
+      "tags": { "bot_id": "900000000000000001" }
+    },
+    {
+      "id": "900000000000000020",
+      "name": "Level 5",
+      "position": 10,
+      "managed": false
+    },
+    {
+      "id": "900000000000000024",
+      "name": "Level 5 Alt",
+      "position": 12,
+      "managed": false
+    },
+    {
+      "id": "900000000000000021",
+      "name": "Level Ten",
+      "position": 20,
+      "managed": false
+    },
+    {
+      "id": "900000000000000022",
+      "name": "Server Booster",
+      "position": 30,
+      "managed": true
+    },
+    {
+      "id": "900000000000000023",
+      "name": "Staff",
+      "position": 80,
+      "managed": false
+    }
+  ]
+}

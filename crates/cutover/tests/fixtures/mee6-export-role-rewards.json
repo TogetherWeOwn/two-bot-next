@@ -1,0 +1,42 @@
+{
+  "_comment": "Synthetic MEE6 export for TOG-3481. Every id is in the 90000000000000 reserved block that Discord never allocates, so nothing here is a real guild, member or role. The role_rewards list deliberately exercises every outcome in src/leveling/rewardImport.ts: two that map, and one of each skip reason. Paired with test/fixtures/mee6-guild-roles.json. If you change either file, update the other and the expected counts in test/unit.levelrewardimport.test.ts in the same commit.",
+  "guild": {
+    "id": "900000000000000000",
+    "name": "Synthetic MEE6 Source"
+  },
+  "players": [
+    { "id": "900000000000000030", "username": "fixture-one", "xp": 1000 },
+    { "id": "900000000000000031", "username": "fixture-two", "xp": 2500 },
+    { "id": "900000000000000032", "username": "fixture-three", "xp": 90 }
+  ],
+  "role_rewards": [
+    {
+      "rank": 5,
+      "role": { "id": "900000000000000020", "name": "Level 5" }
+    },
+    {
+      "rank": 10,
+      "role": { "id": "900000000000000021", "name": "Level 10" }
+    },
+    {
+      "rank": 15,
+      "role": { "id": "900000000000000099", "name": "Level 15" }
+    },
+    {
+      "rank": 20,
+      "role": { "id": "900000000000000022", "name": "Server Booster" }
+    },
+    {
+      "rank": 25,
+      "role": { "id": "900000000000000023", "name": "Staff" }
+    },
+    {
+      "rank": 30,
+      "role": { "id": "900000000000000020", "name": "Level 5" }
+    },
+    {
+      "rank": 5,
+      "role": { "id": "900000000000000024", "name": "Level 5 Alt" }
+    }
+  ]
+}
