@@ -61,7 +61,7 @@ jobs:
           command: check all
 
   worker:
-    name: worker typecheck
+    name: worker check
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -78,3 +78,4 @@ jobs:
           cache-dependency-path: wrangler/package-lock.json
       - run: npm ci
       - run: npm run typecheck
+      - run: npm test

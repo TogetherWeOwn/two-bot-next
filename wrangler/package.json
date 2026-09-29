@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "node --test test/redirect.test.ts",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev"
   },
