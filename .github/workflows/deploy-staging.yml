@@ -1,0 +1,66 @@
+name: deploy-staging
+
+# Deploys the Worker + Container to the staging environment on every push to
+# main, then gates on /readyz: the container must report the gateway ready
+# against the staging guild. Prod deploys are manual (B4 owns the cutover).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: wrangler deploy + readyz gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: wrangler
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: wrangler/package-lock.json
+      - run: npm ci
+      - name: Deploy to staging
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
+        with:
+          workingDirectory: wrangler
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          environment: staging
+      - name: Gate on /readyz
+        env:
+          STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$STAGING_URL" || {
+            echo "STAGING_WORKER_URL repo variable is not set;"
+            echo "ask the operator to add it (see docs/staging-soak.md), then re-run."
+            exit 1
+          }
+          # IDENTIFY + cold start can take a minute; poll up to ~5 minutes.
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_URL/readyz" || true)
+            if [ "$code" = "200" ]; then
+              echo "readyz 200 after ~$((i * 10))s"
+              cat /tmp/readyz.json
+              exit 0
+            fi
+            echo "attempt $i: /readyz -> $code; waiting 10s"
+            sleep 10
+          done
+          echo "readyz never returned 200"
+          cat /tmp/readyz.json || true
+          exit 1
