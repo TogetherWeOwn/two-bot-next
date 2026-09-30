@@ -6,6 +6,8 @@
 //! or by future transports. Slices S3+ build on these seams.
 
 pub mod audit;
+#[cfg(feature = "db")]
+pub mod audit_store;
 pub mod automod;
 pub mod channel_moderation;
 #[cfg(feature = "db")]

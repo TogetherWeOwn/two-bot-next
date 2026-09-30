@@ -1,6 +1,7 @@
 # Operational audit core
 
-This is the framework-free part of TOG-9810, not a deployed audit sink.
+This is the framework-free core and durable storage part of
+[TOG-9810](/TOG/issues/TOG-9810), not a deployed audit sink.
 
 ## Implemented
 
@@ -8,6 +9,10 @@ This is the framework-free part of TOG-9810, not a deployed audit sink.
   identity markers, audit/voice/moderation channel fallback, guild fence,
   mirror-source feedback-loop suppression, deterministic delivery nonce, and
   the legacy kill-switch decision/transition model.
+- `two_bot_core::audit_store` (optional `db`): durable idempotent event/pending
+  rows, opaque owner/generation claims, accepted-ID evidence, crash-safe
+  reconciliation/quarantine, and persistent halt. See the minimal downstream
+  protocol and migration allocation in [audit-store.md](audit-store.md).
 - `two_bot_core::classify`: member role/nickname-change metadata, voice
   join/leave/move boundaries, raw message edit/delete dispatches, and fourteen
   Discord audit-log action classifications. Voice classification does not
@@ -68,15 +73,19 @@ must return before delivery if recording fails.
 
 TOG-9810 is not complete until the following have been implemented and tested:
 
-1. Postgres audit rows and idempotent insertion, durable pending delivery,
-   lease/claim ownership, acknowledgement recovery and quarantine.
-2. Mock-Discord mirror adapter with guild/privacy/permission gates,
+1. Mock-Discord mirror adapter with guild/privacy/permission gates,
    `allowed_mentions: { parse: [] }`, deterministic enforced nonce, history
    reconciliation and no blind resend after an ambiguous accepted post.
-3. Persistent delivery kill switch checked per row and immediately before
-   each send, with held claims safely released.
-4. Gateway classification and successful-moderation recording wired into the
+2. Wire the persistent delivery halt into the service, check it per row and
+   immediately before each send, and safely release held claims. Store checks
+   at claim/preparation are implemented, not a runtime pre-POST check.
+3. Gateway classification and successful-moderation recording wired into the
    runtime; readyz/retry lifecycle exercised in a container.
+
+Storage acceptance is implemented in [TOG-10344](/TOG/issues/TOG-10344):
+unit decisions and 12 isolated Postgres tests cover replay, concurrent workers,
+fenced writes, restart, ambiguity/quarantine, halt, fresh embedded migrations
+and populated legacy upgrade. This does not claim the service/runtime is complete.
 
 Database tests may use only agent-testdb or CI Postgres service containers;
 Discord tests use doubles, never the production guild or token. No database or
