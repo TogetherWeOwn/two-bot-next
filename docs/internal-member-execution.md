@@ -13,8 +13,10 @@ website join-journey verbs over the shared single-attempt REST transport.
 - `GuildAddMemberRequest` holds only the validated user ID. The OAuth token is a
   separate borrowed function argument. Twilight builds the PUT body; no builder,
   body, provider response, or transport error is formatted into a log or error.
-- 201 returns `added`; 204 and other legacy-success statuses return
-  `already_member`. Role results are `assigned` and `already_held`.
+- Only 2xx responses succeed. 201 returns `added`; other 2xx statuses return
+  `already_member`. Role results are `assigned` and `already_held`. Redirects
+  are never followed or accepted as success; OAuth/bot credentials are never
+  forwarded to a `Location` target.
 - `MemberOutcome::success_body` preserves legacy JSON insertion order:
   `ok`, `result: { outcome }`, `request_id`.
 - Member addition has the legacy 1500 ms timeout; each role exchange has 2000 ms.
@@ -49,10 +51,16 @@ and audit subjects contain only validated IDs.
 Definitive Discord refusals terminalize as `discord_rejected`. Replay preserves
 the code, HTTP status, and retryability but uses a generic rejection message;
 provider/status-detail text is not in the store. The website branches on codes,
-not English messages.
+not English messages. Reconciliation may also record `Malformed` (400),
+`ActionNotAllowed` (403), or `NoEffect` (502). Replay maps the first two to their
+same-named legacy codes. `NoEffect` uses legacy `discord_unavailable`/502
+(retryable), with safe log reason `no_effect`, because the legacy envelope has
+no `no_effect` code. The recorded intent remains terminal: repeating the same
+key returns the cached failure without REST, even when its wire code is
+retryable. Only invalid response records report `store_unavailable`.
 
-Timeouts, transport failures, 429/5xx, and unreadable policy reads conservatively
-retain an unknown fence. A repeated key returns `in_progress` without sending
+Timeouts, transport failures, 429/5xx, redirects, and unreadable policy reads
+conservatively retain an unknown fence. A repeated key returns `in_progress` without sending
 again. This follows the existing store's no-automatic-reclaim contract; it is
 not a retry queue. The receiver/reconciliation owner must resolve unknown
 outcomes before another execution is authorized. A non-durable caller can

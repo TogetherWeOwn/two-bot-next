@@ -63,14 +63,32 @@ fn replay(action: &str, response: TerminalResponse) -> Result<MemberExecution, A
             ("guild.add_member", 0) => MemberOutcome::AlreadyMember,
             _ => return Err(storage_error(InternalStoreError::Unavailable)),
         },
-        TerminalResponse::Failure(TerminalFailure::DiscordRejected) => {
-            // The store intentionally contains no provider messages. The wire
-            // code/status/retryability survives; detail is not replayed.
-            return Err(ActionError::new(
-                ErrorCode::DiscordRejected,
-                "Discord refused the request",
-                "discord_rejected",
-            ));
+        TerminalResponse::Failure(failure) => {
+            // Exhaustive mapping: reconciliation can record any terminal failure.
+            // Provider detail is not stored; NoEffect uses the legacy 502 code.
+            let (code, message, reason) = match failure {
+                TerminalFailure::Malformed => (
+                    ErrorCode::Malformed,
+                    "The recorded request was malformed",
+                    "malformed",
+                ),
+                TerminalFailure::ActionNotAllowed => (
+                    ErrorCode::ActionNotAllowed,
+                    "The recorded action was not allowed",
+                    "action_not_allowed",
+                ),
+                TerminalFailure::DiscordRejected => (
+                    ErrorCode::DiscordRejected,
+                    "Discord refused the request",
+                    "discord_rejected",
+                ),
+                TerminalFailure::NoEffect => (
+                    ErrorCode::DiscordUnavailable,
+                    "The recorded attempt had no effect",
+                    "no_effect",
+                ),
+            };
+            return Err(ActionError::new(code, message, reason));
         }
         _ => return Err(storage_error(InternalStoreError::Unavailable)),
     };

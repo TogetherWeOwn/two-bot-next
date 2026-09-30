@@ -141,6 +141,52 @@ async fn refusals_match_legacy_codes_and_ignore_provider_body() {
 }
 
 #[tokio::test]
+async fn redirects_refuse_both_mutations_without_forwarding_credentials() {
+    let target = MockRest::start(vec![], ScriptedResponse::status(201)).await;
+    for status in [301, 302, 303, 307, 308] {
+        let mut redirect = ScriptedResponse::json(status, json!({"message": TOKEN}));
+        redirect.headers.push(("location".into(), target.origin()));
+        for role_action in [false, true] {
+            let mut script = if role_action {
+                policy_script(2, false)
+            } else {
+                vec![]
+            };
+            script.push(redirect.clone());
+            let mock = MockRest::start(script, ScriptedResponse::status(201)).await;
+            let exec = executor(&mock);
+            let error = if role_action {
+                let body = role_body();
+                let keys = keys();
+                exec.assign_internal_role(
+                    GUILD,
+                    BOT,
+                    &RoleAssignRequest::validate(&body, &keys).unwrap(),
+                )
+                .await
+                .unwrap_err()
+            } else {
+                let body = add_body();
+                exec.add_internal_member(
+                    GUILD,
+                    &GuildAddMemberRequest::validate(&body).unwrap(),
+                    TOKEN,
+                )
+                .await
+                .unwrap_err()
+            };
+            assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+            assert_eq!(error.log_reason, "discord_unexpected_status");
+            assert!(!format!("{error:?}").contains(TOKEN));
+            assert_eq!(mock.requests().len(), if role_action { 4 } else { 1 });
+            assert!(target.requests().is_empty());
+            mock.shutdown().await;
+        }
+    }
+    target.shutdown().await;
+}
+
+#[tokio::test]
 async fn rate_limit_returns_header_retry_delay_without_hidden_retry() {
     let mock = MockRest::start(
         vec![
@@ -339,6 +385,13 @@ async fn oauth_token_never_appears_in_captured_tracing_even_on_timeout_and_error
         ScriptedResponse::status(204),
         ScriptedResponse::json(403, json!({"message": TOKEN})),
         ScriptedResponse::json(404, json!({"message": TOKEN})),
+        ScriptedResponse {
+            headers: vec![(
+                "location".into(),
+                format!("https://fixture.invalid/{TOKEN}"),
+            )],
+            ..ScriptedResponse::json(307, json!({"message": TOKEN}))
+        },
         ScriptedResponse::rate_limited(0.1, "1"),
         ScriptedResponse::json(201, json!({"token":TOKEN}))
             .delayed(std::time::Duration::from_millis(1600)),

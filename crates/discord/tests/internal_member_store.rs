@@ -9,7 +9,9 @@ use common::{MockRest, ScriptedResponse};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::collections::HashMap;
-use two_bot_core::internal_action_store::InternalActionStore;
+use two_bot_core::internal_action_store::{
+    InternalActionStore, ReconciliationEvidence, RequestIdentity, TerminalFailure, TerminalResponse,
+};
 use two_bot_core::internal_actions::ErrorCode;
 use two_bot_discord::executor::member::{store::MemberActionConfig, MemberOutcome};
 use two_bot_discord::ActionExecutor;
@@ -187,6 +189,168 @@ async fn replay_returns_recorded_member_outcome_without_another_rest_call() {
     let persisted: Vec<String> = sqlx::query_scalar("SELECT row_to_json(i)::text FROM internal_idempotency i UNION ALL SELECT row_to_json(a)::text FROM internal_action_log a").fetch_all(&db.pool).await.unwrap();
     assert_eq!(persisted.len(), 12); // four intents, two audit rows each
     assert!(persisted.iter().all(|row| !row.contains(TOKEN)));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
+async fn reconciled_terminal_failures_replay_without_another_rest_call() {
+    let db = TestDb::new().await;
+    let store = InternalActionStore::new(db.pool.clone());
+    let keys = HashMap::from([("member".into(), ROLE.into())]);
+    let config = config(&keys);
+    for action in ["guild.add_member", "role.assign"] {
+        let payload = if action == "guild.add_member" {
+            json!({"action":action,"discord_id":USER,"access_token":TOKEN})
+        } else {
+            json!({"action":action,"discord_id":USER,"role_key":"member"})
+        }
+        .to_string();
+        for (failure, code, retryable, reason) in [
+            (
+                TerminalFailure::Malformed,
+                ErrorCode::Malformed,
+                false,
+                "malformed",
+            ),
+            (
+                TerminalFailure::ActionNotAllowed,
+                ErrorCode::ActionNotAllowed,
+                false,
+                "action_not_allowed",
+            ),
+            (
+                TerminalFailure::DiscordRejected,
+                ErrorCode::DiscordRejected,
+                false,
+                "discord_rejected",
+            ),
+            (
+                TerminalFailure::NoEffect,
+                ErrorCode::DiscordUnavailable,
+                true,
+                "no_effect",
+            ),
+        ] {
+            let response = TerminalResponse::Failure(failure);
+            let key = format!("{action}-{}", response.code());
+            let mock = MockRest::start(vec![], ScriptedResponse::status(503)).await;
+            let exec = executor(&mock);
+            assert_eq!(
+                exec.execute_stored_member(&store, "website", &key, payload.as_bytes(), &config)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::DiscordUnavailable
+            );
+            let count = mock.requests().len();
+            assert!(count > 0);
+            let identity =
+                RequestIdentity::new("website", &key, action, payload.as_bytes()).unwrap();
+            store
+                .reconcile(&identity, &response, ReconciliationEvidence::ProvenNotSent)
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let error = executor(&mock)
+                    .execute_stored_member(&store, "website", &key, payload.as_bytes(), &config)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, code);
+                assert_eq!(error.status(), response.status());
+                assert_eq!(error.code.retryable(), retryable);
+                assert_eq!(error.log_reason, reason);
+                assert_eq!(error.retry_after_secs, None);
+                assert!(!format!("{error:?}").contains(TOKEN));
+                assert_eq!(mock.requests().len(), count);
+            }
+            mock.shutdown().await;
+        }
+    }
+    let completed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM internal_idempotency WHERE state = 'completed'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(completed, 8);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
+async fn redirects_never_persist_success_or_forward_credentials() {
+    let db = TestDb::new().await;
+    let store = InternalActionStore::new(db.pool.clone());
+    let keys = HashMap::from([("member".into(), ROLE.into())]);
+    let config = config(&keys);
+    let target = MockRest::start(vec![], ScriptedResponse::status(201)).await;
+    for action in ["guild.add_member", "role.assign"] {
+        let payload = if action == "guild.add_member" {
+            json!({"action":action,"discord_id":USER,"access_token":TOKEN})
+        } else {
+            json!({"action":action,"discord_id":USER,"role_key":"member"})
+        }
+        .to_string();
+        for status in [301, 302, 307, 308] {
+            let mut script = if action == "role.assign" {
+                vec![
+                    ScriptedResponse::json(200, json!({"roles":[]})),
+                    ScriptedResponse::json(200, json!({"roles":[BOT_ROLE]})),
+                    ScriptedResponse::json(
+                        200,
+                        json!([
+                            {"id":GUILD,"position":0,"managed":false},
+                            {"id":ROLE,"position":1,"managed":false},
+                            {"id":BOT_ROLE,"position":10,"managed":true}
+                        ]),
+                    ),
+                ]
+            } else {
+                vec![]
+            };
+            let mut redirect = ScriptedResponse::status(status);
+            redirect.headers.push(("location".into(), target.origin()));
+            script.push(redirect);
+            let mock = MockRest::start(script, ScriptedResponse::status(201)).await;
+            let key = format!("{action}-redirect-{status}");
+            let error = executor(&mock)
+                .execute_stored_member(&store, "website", &key, payload.as_bytes(), &config)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+            assert_eq!(error.log_reason, "discord_unexpected_status");
+            assert_eq!(
+                executor(&mock)
+                    .execute_stored_member(&store, "website", &key, payload.as_bytes(), &config)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InProgress
+            );
+            assert_eq!(
+                mock.requests().len(),
+                if action == "role.assign" { 4 } else { 1 }
+            );
+            assert!(target.requests().is_empty());
+            mock.shutdown().await;
+        }
+    }
+    let states: Vec<(String, Option<String>, Option<i32>)> =
+        sqlx::query_as("SELECT state, response_code, http_status FROM internal_idempotency")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(states.len(), 8);
+    assert!(states
+        .iter()
+        .all(|(state, code, status)| state == "unknown" && code.is_none() && status.is_none()));
+    let terminal_audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM internal_action_log WHERE phase = 'terminal'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(terminal_audits, 0);
+    target.shutdown().await;
     db.cleanup().await;
 }
 

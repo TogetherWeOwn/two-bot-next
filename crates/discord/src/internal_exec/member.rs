@@ -47,8 +47,17 @@ impl MemberOutcome {
 /// retry parser. Only safe status/header scalars reach the public error.
 pub fn member_status_error(response: &RawResponse) -> Option<ActionError> {
     let status = response.status;
-    if status < 400 {
+    if (200..300).contains(&status) {
         return None;
+    }
+    // Raw Hyper never follows redirects. Do not persist an unfollowed exchange
+    // as success or forward credentials to the Location target.
+    if status < 400 {
+        return Some(ActionError::new(
+            ErrorCode::DiscordUnavailable,
+            format!("Discord returned unexpected status {status}"),
+            "discord_unexpected_status",
+        ));
     }
     if status == 429 {
         let retry = response
