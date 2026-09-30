@@ -41,8 +41,8 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 /// How often the version poll runs (legacy `pollSeconds ?? 15`, TOG-3093
-/// ADR §2.1). A poll is one cheap `max(version)` + `count(*)` query; NOTIFY
-/// would need a dedicated connection out of a pool sized at 5 on purpose.
+/// ADR §2.1). The poll reads a transactional revision and row count; sequence
+/// maxima cannot detect writes that commit out of allocation order.
 pub const POLL_SECONDS: u64 = 15;
 
 /// Prefix test, kept alongside the exact-name table (legacy
@@ -332,6 +332,14 @@ pub struct SettingRow {
     pub version: i64,
 }
 
+/// Rows and commit-safe revision from the same database snapshot. The revision
+/// is not `max(row.version)`: sequence allocation order is not commit order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsSnapshot {
+    pub revision: i64,
+    pub rows: Vec<SettingRow>,
+}
+
 /// In-memory cache over `guild_settings`, refreshed by the version poll
 /// (legacy `SettingsStore` minus the database: reads are synchronous and never
 /// touch the DB because the callers are gateway handlers on a hot path;
@@ -339,43 +347,34 @@ pub struct SettingRow {
 #[derive(Debug, Clone, Default)]
 pub struct SettingsCache {
     entries: HashMap<(String, String), Value>,
-    /// Highest `version` the cache has seen. `0` means "nothing loaded yet".
-    version: i64,
-    /// Rows the cache was built from. Half of the change detector, not a
-    /// statistic: `max(version)` alone cannot see a delete, because the
-    /// version lived in the deleted row — unless the deleted row held the
-    /// maximum, removing it leaves the maximum exactly where it was.
+    revision: i64,
     row_count: usize,
 }
 
 impl SettingsCache {
-    /// Fill (or refill) the cache from freshly loaded rows. Call once before
+    /// Fill (or refill) the cache from a consistent snapshot. Call once before
     /// reading, and again on every poll that moved.
     #[must_use]
-    pub fn load(rows: &[SettingRow]) -> Self {
+    pub fn load(snapshot: &SettingsSnapshot) -> Self {
         let mut cache = Self::default();
-        cache.rebuild(rows);
+        cache.rebuild(snapshot);
         cache
     }
 
-    fn rebuild(&mut self, rows: &[SettingRow]) {
-        let mut entries = HashMap::with_capacity(rows.len());
-        let mut max = 0i64;
-        for row in rows {
-            entries.insert((row.guild_id.clone(), row.key.clone()), row.value.clone());
-            if row.version > max {
-                max = row.version;
-            }
-        }
-        self.entries = entries;
-        self.version = max;
-        self.row_count = rows.len();
+    fn rebuild(&mut self, snapshot: &SettingsSnapshot) {
+        self.entries = snapshot
+            .rows
+            .iter()
+            .map(|row| ((row.guild_id.clone(), row.key.clone()), row.value.clone()))
+            .collect();
+        self.revision = snapshot.revision;
+        self.row_count = snapshot.rows.len();
     }
 
-    /// Highest version seen (`0` before the first load).
+    /// Transactional revision of the snapshot (`0` before the first load).
     #[must_use]
-    pub fn version(&self) -> i64 {
-        self.version
+    pub fn revision(&self) -> i64 {
+        self.revision
     }
 
     /// Rows the cache was built from.
@@ -393,6 +392,9 @@ impl SettingsCache {
     /// The stored JSON value, or `None` when the key falls through to env.
     #[must_use]
     pub fn get(&self, guild_id: &str, key: &str) -> Option<&Value> {
+        if !is_storable_key(key) {
+            return None;
+        }
         self.entries.get(&(guild_id.to_owned(), key.to_owned()))
     }
 
@@ -418,21 +420,21 @@ impl SettingsCache {
         out
     }
 
-    /// One cheap comparison, evaluated from the poll's `max(version)` and
-    /// `count(*)`: a refetch is needed when either moved. `!=` rather than `>`
-    /// so a restored backup with a lower sequence reloads too.
+    /// Refetch when the transactional revision or row count moves. `!=` rather
+    /// than `>` also reloads a restored backup with a lower revision.
     #[must_use]
-    pub fn needs_refresh(&self, latest_version: i64, latest_count: i64) -> bool {
-        latest_version != self.version || latest_count != self.row_count as i64
+    pub fn needs_refresh(&self, latest_revision: i64, latest_count: i64) -> bool {
+        latest_revision != self.revision || latest_count != self.row_count as i64
     }
 
-    /// Rebuild the cache from freshly loaded rows and report what moved,
+    /// Rebuild the cache from a consistent snapshot and report what moved,
     /// partitioned by class: hot changes apply live, cold changes are stored
     /// but need a restart, env-only/unknown rows are ignored with a log line
     /// (legacy `refreshIfChanged` + the `HOT_WIRED_FIELDS` change log).
-    pub fn refresh(&mut self, rows: &[SettingRow]) -> RefreshReport {
-        let from_version = self.version;
+    pub fn refresh(&mut self, snapshot: &SettingsSnapshot) -> RefreshReport {
+        let from_revision = self.revision;
         let from_rows = self.row_count;
+        let rows = &snapshot.rows;
 
         // `new` borrows `rows`; deletions read `self.entries` directly, so no
         // intermediate borrowed-key map is needed.
@@ -442,9 +444,9 @@ impl SettingsCache {
         }
 
         let mut report = RefreshReport {
-            from_version,
+            from_revision,
             from_rows,
-            to_version: 0,
+            to_revision: snapshot.revision,
             to_rows: rows.len(),
             changed: false,
             hot: Vec::new(),
@@ -465,9 +467,8 @@ impl SettingsCache {
             }
         }
 
-        self.rebuild(rows);
-        report.to_version = self.version;
-        report.changed = self.version != from_version || self.row_count != from_rows;
+        self.rebuild(snapshot);
+        report.changed = self.revision != from_revision || self.row_count != from_rows;
         report
     }
 }
@@ -506,8 +507,8 @@ pub struct IgnoredChange {
 /// (legacy `settings_reloaded` + `setting_changed` lines).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshReport {
-    pub from_version: i64,
-    pub to_version: i64,
+    pub from_revision: i64,
+    pub to_revision: i64,
     pub from_rows: usize,
     pub to_rows: usize,
     /// The poll moved (version or row count changed).
@@ -853,13 +854,17 @@ mod tests {
         }
     }
 
+    fn snapshot(revision: i64, rows: Vec<SettingRow>) -> SettingsSnapshot {
+        SettingsSnapshot { revision, rows }
+    }
+
     #[test]
     fn hot_change_is_visible_within_one_poll() {
-        let mut cache = SettingsCache::load(&[]);
+        let mut cache = SettingsCache::default();
         assert!(!cache.needs_refresh(0, 0));
-        let rows = vec![row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(3), 1)];
+        let loaded = snapshot(1, vec![row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(3), 1)]);
         assert!(cache.needs_refresh(1, 1));
-        let report = cache.refresh(&rows);
+        let report = cache.refresh(&loaded);
         assert!(report.changed);
         assert_eq!(cache.get("g1", "TWO_RAID_JOIN_THRESHOLD"), Some(&json!(3)));
         assert_eq!(report.hot.len(), 1);
@@ -870,37 +875,69 @@ mod tests {
     }
 
     #[test]
-    fn delete_is_visible_even_when_it_is_not_the_newest_row() {
-        // The staging-found hole (TOG-3100): the deleted row carries its
-        // version away, so max(version) alone never moves when a newer row
-        // survives. The row count is what catches it.
-        let rows = vec![
-            row("g1", "TWO_ONBOARDING_DRY_RUN", json!(true), 1),
-            row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(9), 2),
-        ];
-        let mut cache = SettingsCache::load(&rows);
-        let version_before = cache.version();
-        let remaining = vec![row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(9), 2)];
-        assert!(
-            cache.needs_refresh(version_before, 1),
-            "count moved while max(version) stayed put"
+    fn revision_detects_changes_with_unchanged_row_maximum_and_count() {
+        let mut cache = SettingsCache::load(&snapshot(
+            1,
+            vec![
+                row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(1), 1),
+                row("g1", "TWO_RAID_WINDOW_SECONDS", json!(9), 4),
+            ],
+        ));
+        // Sequence value 2 commits after 4. The transactional revision moves
+        // even though max(row.version) and count remain (4, 2).
+        let loaded = snapshot(
+            2,
+            vec![
+                row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(2), 2),
+                row("g1", "TWO_RAID_WINDOW_SECONDS", json!(9), 4),
+            ],
         );
-        let report = cache.refresh(&remaining);
+        assert!(cache.needs_refresh(2, 2));
+        let report = cache.refresh(&loaded);
         assert!(report.changed);
-        assert_eq!(cache.version(), version_before);
+        assert_eq!((report.from_revision, report.to_revision), (1, 2));
+        assert_eq!(cache.get("g1", "TWO_RAID_JOIN_THRESHOLD"), Some(&json!(2)));
+        assert!(!cache.needs_refresh(2, 2));
+        assert!(cache.needs_refresh(0, 2), "restored revisions reload too");
+    }
+
+    #[test]
+    fn delete_and_reinsert_are_visible_even_with_unchanged_count() {
+        let mut cache = SettingsCache::load(&snapshot(
+            1,
+            vec![
+                row("g1", "TWO_ONBOARDING_DRY_RUN", json!(true), 1),
+                row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(9), 4),
+            ],
+        ));
+        let loaded = snapshot(
+            3,
+            vec![
+                row("g1", "TWO_AUTOMOD_REPEAT_COUNT", json!(2), 2),
+                row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(9), 4),
+            ],
+        );
+        assert!(cache.needs_refresh(3, 2));
+        let report = cache.refresh(&loaded);
+        assert!(report.changed);
+        assert_eq!(cache.revision(), 3);
         assert_eq!(cache.get("g1", "TWO_ONBOARDING_DRY_RUN"), None);
+        assert_eq!(cache.get("g1", "TWO_AUTOMOD_REPEAT_COUNT"), Some(&json!(2)));
         assert_eq!(cache.get("g1", "TWO_RAID_JOIN_THRESHOLD"), Some(&json!(9)));
     }
 
     #[test]
     fn cold_and_env_only_rows_are_partitioned_with_log_data() {
-        let mut cache = SettingsCache::load(&[]);
-        let rows = vec![
-            row("g1", "TWO_FEED_POLL_SECONDS", json!(600), 1),
-            row("g1", "TWO_MODERATION", json!("1"), 2),
-            row("g1", "TWO_TOTALLY_MADE_UP", json!("1"), 3),
-        ];
-        let report = cache.refresh(&rows);
+        let mut cache = SettingsCache::default();
+        let loaded = snapshot(
+            1,
+            vec![
+                row("g1", "TWO_FEED_POLL_SECONDS", json!(600), 1),
+                row("g1", "TWO_MODERATION", json!("1"), 2),
+                row("g1", "TWO_TOTALLY_MADE_UP", json!("1"), 3),
+            ],
+        );
+        let report = cache.refresh(&loaded);
         assert!(report.changed);
         assert!(report.hot.is_empty());
         assert_eq!(report.cold.len(), 1);
@@ -914,22 +951,43 @@ mod tests {
         assert!(reasons.contains(&("TWO_MODERATION", IgnoreReason::EnvOnly)));
         assert!(reasons.contains(&("TWO_TOTALLY_MADE_UP", IgnoreReason::Unknown)));
         // Cold keys stay in the snapshot (restart applies them); env-only and
-        // unknown keys never do.
-        let snapshot = cache.env_snapshot(Some("g1"));
+        // unknown keys never do, through either read API.
+        assert_eq!(cache.get("g1", "TWO_FEED_POLL_SECONDS"), Some(&json!(600)));
+        assert_eq!(cache.get("g1", "TWO_MODERATION"), None);
+        assert_eq!(cache.get("g1", "TWO_TOTALLY_MADE_UP"), None);
+        let rendered = cache.env_snapshot(Some("g1"));
         assert_eq!(
-            snapshot.get("TWO_FEED_POLL_SECONDS").map(String::as_str),
+            rendered.get("TWO_FEED_POLL_SECONDS").map(String::as_str),
             Some("600")
         );
-        assert!(!snapshot.contains_key("TWO_MODERATION"));
-        assert!(!snapshot.contains_key("TWO_TOTALLY_MADE_UP"));
+        assert!(!rendered.contains_key("TWO_MODERATION"));
+        assert!(!rendered.contains_key("TWO_TOTALLY_MADE_UP"));
+    }
+
+    #[test]
+    fn initial_load_getter_refuses_every_env_only_and_unknown_key() {
+        let mut rows: Vec<_> = EXPECTED_ENV_ONLY
+            .iter()
+            .map(|key| row("g1", key, json!("fixture"), 1))
+            .collect();
+        rows.push(row("g1", "TWO_INTERNAL_FUTURE_GATE", json!("fixture"), 1));
+        rows.push(row("g1", "TWO_UNKNOWN", json!("fixture"), 1));
+        let cache = SettingsCache::load(&snapshot(1, rows.clone()));
+        for row in rows {
+            assert_eq!(cache.get("g1", &row.key), None, "{}", row.key);
+        }
+        assert!(cache.env_snapshot(Some("g1")).is_empty());
     }
 
     #[test]
     fn snapshots_are_per_guild() {
-        let cache = SettingsCache::load(&[
-            row("g1", "TWO_ONBOARDING_DRY_RUN", json!(true), 1),
-            row("g2", "TWO_ONBOARDING_DRY_RUN", json!(false), 2),
-        ]);
+        let cache = SettingsCache::load(&snapshot(
+            2,
+            vec![
+                row("g1", "TWO_ONBOARDING_DRY_RUN", json!(true), 1),
+                row("g2", "TWO_ONBOARDING_DRY_RUN", json!(false), 2),
+            ],
+        ));
         assert_eq!(
             cache
                 .env_snapshot(Some("g1"))

@@ -8,7 +8,7 @@
 //! database. This module is the thin sqlx seam: run the queries, hand rows to
 //! the core cache, execute validated writes transactionally.
 //!
-//! Poll loop (legacy `src/index.ts`): `SELECT max(version)` + `count(*)` every
+//! Poll loop: read the transactional revision + `count(*)` every
 //! [`two_bot_core::settings::POLL_SECONDS`]; on move, refetch the whole small
 //! table and let [`two_bot_core::settings::SettingsCache`] partition the change
 //! into hot (apply live, one `setting_changed` log line each), cold (stored,
@@ -17,8 +17,8 @@
 
 use sqlx::{Pool, Postgres};
 use two_bot_core::settings::{
-    validate_write, IgnoreReason, KeyChange, RefreshReport, SettingRow, ValidatedWrite,
-    WriteAction, WriteRefusal,
+    validate_write, IgnoreReason, KeyChange, RefreshReport, SettingRow, SettingsSnapshot,
+    ValidatedWrite, WriteAction, WriteRefusal,
 };
 
 /// Live poll view over the settings tables.
@@ -34,31 +34,48 @@ impl<'a> SettingsStore<'a> {
         Self { pool }
     }
 
-    /// Load every row the cache needs: guild, key, value, version.
-    pub async fn load_rows(&self) -> Result<Vec<SettingRow>, sqlx::Error> {
+    /// Load rows and their revision from one MVCC snapshot. Using separate
+    /// read-committed queries could label old rows with a newer revision and
+    /// suppress the next refresh.
+    pub async fn load_snapshot(&self) -> Result<SettingsSnapshot, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let revision = sqlx::query_scalar(
+            "SELECT revision FROM guild_settings_revision WHERE singleton = TRUE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         let rows: Vec<(String, String, serde_json::Value, i64)> =
             sqlx::query_as("SELECT guild_id, key, value, version FROM guild_settings")
-                .fetch_all(self.pool)
+                .fetch_all(&mut *tx)
                 .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(guild_id, key, value, version)| SettingRow {
-                guild_id,
-                key,
-                value,
-                version,
-            })
-            .collect())
+        tx.commit().await?;
+        Ok(SettingsSnapshot {
+            revision,
+            rows: rows
+                .into_iter()
+                .map(|(guild_id, key, value, version)| SettingRow {
+                    guild_id,
+                    key,
+                    value,
+                    version,
+                })
+                .collect(),
+        })
     }
 
-    /// The cheap poll: `max(version)` and `count(*)` in one query.
-    /// `COALESCE` so an empty table reports `(0, 0)` rather than NULL.
+    /// The cheap poll: commit-safe revision and row count in one snapshot.
+    /// The revision also sees deletes, rollbacks do not advance it, and a
+    /// late commit with a lower row version cannot hide behind a sequence max.
     pub async fn poll_marks(&self) -> Result<(i64, i64), sqlx::Error> {
-        let row: (Option<i64>, i64) =
-            sqlx::query_as("SELECT max(version), count(*) FROM guild_settings")
-                .fetch_one(self.pool)
-                .await?;
-        Ok((row.0.unwrap_or(0), row.1))
+        sqlx::query_as(
+            "SELECT revision, (SELECT count(*) FROM guild_settings)
+             FROM guild_settings_revision WHERE singleton = TRUE",
+        )
+        .fetch_one(self.pool)
+        .await
     }
 
     /// Write one setting and its audit row in one transaction, bumping the
@@ -68,9 +85,9 @@ impl<'a> SettingsStore<'a> {
     /// Validation runs first, before any SQL: a refusal writes no row and no
     /// audit row. `None` value deletes the row, handing the key back to the
     /// environment — the documented undo path, audited like any other change.
-    /// No `nextval` on delete: the allocated number would be discarded with
-    /// the row, so nothing observable would move; delete visibility comes from
-    /// the poll's row count.
+    /// The revision-row lock precedes the old-value read, including for absent
+    /// keys. The schema takes the same lock before every settings statement,
+    /// so audit transitions and poll revisions follow commit order.
     ///
     /// Returns the validated write so the caller can log it by class (cold
     /// writes need a restart before consumers pick them up).
@@ -83,6 +100,11 @@ impl<'a> SettingsStore<'a> {
     ) -> Result<ValidatedWrite, SettingsWriteError> {
         let validated = validate_write(guild_id, key, value, actor)?;
         let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "SELECT revision FROM guild_settings_revision WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
 
         let previous: Option<(serde_json::Value,)> =
             sqlx::query_as("SELECT value FROM guild_settings WHERE guild_id = $1 AND key = $2")
@@ -155,8 +177,8 @@ pub enum SettingsWriteError {
 /// ignored env-only/unknown DB row.
 pub fn log_refresh_report(report: &RefreshReport) {
     tracing::info!(
-        from_version = report.from_version,
-        to_version = report.to_version,
+        from_revision = report.from_revision,
+        to_revision = report.to_revision,
         from_rows = report.from_rows,
         to_rows = report.to_rows,
         "settings_reloaded"

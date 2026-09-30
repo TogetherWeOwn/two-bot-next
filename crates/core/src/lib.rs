@@ -53,8 +53,8 @@ pub use moderation::{
 pub use settings::{
     assert_storable_key, classify_key, is_declared_env_only, is_env_only_key, is_storable_key,
     to_env_string, validate_write, EnvOnlyKeyError, IgnoreReason, IgnoredChange, KeyChange,
-    RefreshReport, SettingClass, SettingRow, SettingsCache, ValidatedWrite, WriteAction,
-    WriteRefusal, ENV_ONLY_KEY_PREFIXES, HOT_WIRED, POLL_SECONDS, SETTING_CLASSES,
+    RefreshReport, SettingClass, SettingRow, SettingsCache, SettingsSnapshot, ValidatedWrite,
+    WriteAction, WriteRefusal, ENV_ONLY_KEY_PREFIXES, HOT_WIRED, POLL_SECONDS, SETTING_CLASSES,
 };
 pub use voice::{
     average_known_voice_duration, count_unknown_starts_per_window, find_blind_windows,

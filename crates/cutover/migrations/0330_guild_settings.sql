@@ -17,12 +17,12 @@
 -- so the day this ships nothing changes and the undo path is "stop writing
 -- rows". Keyed per guild from day one.
 --
--- The version sequence is monotonic and global, not per row: the bot polls
--- `max(version)` + `count(*)` every 15 s (`two_bot_core::settings::POLL_SECONDS`)
--- and refetches the small table when either moves. The count is load-bearing,
--- not a statistic: a delete carries its row's version away with it, so with a
--- surviving newer row `max(version)` never moves and the count is the only
--- thing that sees the delete (found on staging, TOG-3100).
+-- Row versions retain the legacy sequence, but sequence allocation order is
+-- not commit order. The poll reads a transactional singleton revision instead:
+-- every settings statement takes that row lock before changing any setting,
+-- advances the revision, and holds the lock until commit. Deletes advance it
+-- too, even if another insert leaves the count unchanged between 15 s polls.
+-- The store takes the same lock before reading the old value for its audit.
 
 -- Block 0330–0339 is reserved for this card so parallel S6 slices never
 -- collide; this is the only migration the slice needs.
@@ -48,8 +48,32 @@ CREATE TABLE IF NOT EXISTS guild_settings (
   CONSTRAINT guild_settings_no_internal_keys CHECK (key NOT LIKE 'TWO\_INTERNAL\_%')
 );
 
--- The poll reads max(version); the refetch reads the whole small table.
 CREATE INDEX IF NOT EXISTS idx_guild_settings_version ON guild_settings (version);
+
+CREATE TABLE IF NOT EXISTS guild_settings_revision (
+  singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton = TRUE),
+  revision  BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO guild_settings_revision (singleton, revision) VALUES (TRUE, 0)
+  ON CONFLICT (singleton) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION guild_settings_advance_revision() RETURNS TRIGGER AS $$
+BEGIN
+  UPDATE guild_settings_revision SET revision = revision + 1 WHERE singleton = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'guild_settings revision row is missing';
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- BEFORE STATEMENT locks the revision before any settings row locks, including
+-- direct SQL and inserts into absent keys. ON CONFLICT can advance it twice;
+-- only change detection matters, not the number of allocated revisions.
+DROP TRIGGER IF EXISTS trg_guild_settings_revision ON guild_settings;
+CREATE TRIGGER trg_guild_settings_revision
+  BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON guild_settings
+  FOR EACH STATEMENT EXECUTE FUNCTION guild_settings_advance_revision();
 
 -- Append-only. Who changed the bot's behaviour, when, and what it was before
 -- is the record that matters after an incident, so it is not the writer's
@@ -72,9 +96,8 @@ CREATE TABLE IF NOT EXISTS guild_settings_audit (
 CREATE INDEX IF NOT EXISTS idx_guild_settings_audit_key
   ON guild_settings_audit (guild_id, key, at DESC);
 
--- "Append-only" as something the database enforces rather than something the
--- writer remembers. TRUNCATE does not fire row triggers, so test fixtures can
--- still reset cleanly; a stray UPDATE or DELETE does not.
+-- Enforce append-only for every destructive statement, including TRUNCATE.
+-- Tests reset their own disposable schemas, never runtime audit tables.
 CREATE OR REPLACE FUNCTION guild_settings_audit_append_only() RETURNS TRIGGER AS $$
 BEGIN
   RAISE EXCEPTION 'guild_settings_audit is append-only (attempted %)', TG_OP;
@@ -83,8 +106,8 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_guild_settings_audit_append_only ON guild_settings_audit;
 CREATE TRIGGER trg_guild_settings_audit_append_only
-  BEFORE UPDATE OR DELETE ON guild_settings_audit
-  FOR EACH ROW EXECUTE FUNCTION guild_settings_audit_append_only();
+  BEFORE UPDATE OR DELETE OR TRUNCATE ON guild_settings_audit
+  FOR EACH STATEMENT EXECUTE FUNCTION guild_settings_audit_append_only();
 
 -- TOG-3183: the prefix is narrower than the set of keys that gate capability.
 -- The application refuses all of these in two_bot_core::settings; these
