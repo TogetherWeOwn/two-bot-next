@@ -178,9 +178,9 @@ pub async fn dispatch(args: &[String]) -> i32 {
 /// Live opt-in is separate from boot opt-in and checked before DB or REST I/O.
 pub async fn publish_on_boot(token: &str, guild: u64) -> Result<(), String> {
     let vars: HashMap<String, String> = std::env::vars().collect();
-    if !vars
+    if vars
         .get("TWO_COMMANDS_PUBLISH_ON_BOOT")
-        .is_some_and(|v| v == "1")
+        .is_none_or(|v| v != "1")
     {
         return Ok(());
     }
