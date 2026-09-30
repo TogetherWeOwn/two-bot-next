@@ -891,6 +891,65 @@ impl ActionExecutor {
         Ok(None)
     }
 
+    /// Raw channel document for the audit-mirror preflight
+    /// (`GET /channels/{c}`, single paced read). Unlike
+    /// [`Self::get_everyone_overwrite`] this keeps the whole document: the
+    /// `AuditMirror` adapter owns guild/privacy field policy, so a body that
+    /// is not a JSON object refuses (`Rejected` — provably no mutation).
+    pub async fn fetch_channel_document(
+        &self,
+        channel_id: &str,
+    ) -> Result<serde_json::Value, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let req = Self::request_of(self.inner.factory.channel(channel))?;
+        self.pace(false).await;
+        let res = self.call_once_raw(req, &[200]).await?;
+        let doc: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
+            DiscordError::Rejected(format!("unreadable channel {channel_id}: body is not JSON"))
+        })?;
+        if !doc.is_object() {
+            return Err(DiscordError::Rejected(format!(
+                "unreadable channel {channel_id}: body is not a JSON object"
+            )));
+        }
+        Ok(doc)
+    }
+
+    /// One newest-first history page for the audit-mirror dedup/reconcile
+    /// scan (`GET /channels/{c}/messages`, legacy `findMirror` reads).
+    /// `before` is the previous page's floor id; `limit` clamps into
+    /// Discord's 1..=100 range. The body must be a JSON array; per-element
+    /// field policy belongs to the `AuditMirror` adapter (a malformed row is
+    /// skipped there, not fatal here).
+    pub async fn fetch_channel_messages(
+        &self,
+        channel_id: &str,
+        before: Option<&str>,
+        limit: u8,
+    ) -> Result<Vec<serde_json::Value>, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let before: Option<Id<MessageMarker>> =
+            before.map(snowflake::<MessageMarker>).transpose()?;
+        let limit = u16::from(limit.clamp(1, 100));
+        let req = match before {
+            Some(cursor) => Self::request_of(
+                self.inner
+                    .factory
+                    .channel_messages(channel)
+                    .before(cursor)
+                    .limit(limit),
+            )?,
+            None => Self::request_of(self.inner.factory.channel_messages(channel).limit(limit))?,
+        };
+        self.pace(false).await;
+        let res = self.call_once_raw(req, &[200]).await?;
+        serde_json::from_slice(&res.body).map_err(|_| {
+            DiscordError::Rejected(format!(
+                "unreadable channel {channel_id} history: body is not a JSON array"
+            ))
+        })
+    }
+
     /// `PUT /channels/{c}/permissions/{g}` with decimal-string masks
     /// (legacy `putEveryoneOverwrite`, 200/204).
     pub async fn put_everyone_overwrite(
