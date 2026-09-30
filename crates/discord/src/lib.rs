@@ -6,6 +6,8 @@
 //! without a gateway connection.
 
 pub mod adapter;
+pub mod audit_mirror;
+pub mod channel_access;
 pub mod executor;
 pub mod intents;
 pub mod interactions;

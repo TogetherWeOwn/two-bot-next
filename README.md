@@ -32,6 +32,13 @@ Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/bui
 not a new `target/` in each worktree. The runbook includes offline cache tests,
 fail-closed retention auditing, `/home` available-byte alarms and the Operator rollout.
 
+## Operations
+
+- [Production cutover and rollback](docs/cutover.md): B4 preconditions, freeze/drain,
+  data and command-registry checks, 48-hour watch and preservation of Next-window
+  writes on rollback. Planned tools are explicitly marked; this is not cutover approval.
+- [Staging soak](docs/staging-soak.md) and [gateway recovery](docs/gateway-recovery.md).
+
 ## License
 
 Business Source License 1.1, converting to MIT three years after each release. See [LICENSE](LICENSE).
