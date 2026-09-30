@@ -1,0 +1,21 @@
+{
+  "description": "Public, synthetic interoperability vectors from legacy node:crypto. Never deploy these test keys or register them as caller credentials.",
+  "vectors": [
+    {
+      "body": "{\"action\":\"role.assign\",\"discord_id\":\"123456789012345678\",\"role_key\":\"member\"}",
+      "body_hash": "0d467b6aead193be79e9af85b251752c07d91e9ca2aaff0ea9b447375b1c4c66",
+      "signature": "sha256=63286b0771e9601ad29fa5ab36ddac5bb7d06f03369254c9ebc9867f36dfeee4",
+      "secret": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": "1720000000",
+      "nonce": "0123456789abcdef0123456789abcdef"
+    },
+    {
+      "body": "{\"action\":\"settings.get\",\"key\":\"TWO_RAID_JOIN_THRESHOLD\"}",
+      "body_hash": "cccc068066dd4ce177c75140dc2098ae1b3d2abdf8b4ff6d4304a1dc70963784",
+      "signature": "sha256=041d450e1dfa097f25c8d6ad019c32d6140fa48e8287b3f9d61b5750973cad2c",
+      "secret": "second-secret-bbbbbbbbbbbbbbbbbb",
+      "timestamp": "1720000060",
+      "nonce": "abcdef0123456789abcdef0123456789"
+    }
+  ]
+}
