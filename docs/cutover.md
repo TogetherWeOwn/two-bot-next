@@ -34,8 +34,8 @@ Create a B4 evidence manifest before scheduling:
 |---|---|
 | Targets | Legacy Coolify UUID, Container/Worker environment and internal URLs, Discord application/guild IDs; verify current inventory, do not reuse historical IDs blindly |
 | Releases | Legacy image digest + commit, Next digest + reviewed head + merged commit, Worker version/config, required checks |
-| Data | Current canonical database, every writer (bot, web, queues, cron), table/key ownership, migration versions, snapshot IDs/hashes, restore receipt |
-| Registry | Global/guild command-definition snapshots; separate guild permission snapshots (application defaults and per-command overrides); old→new command-ID map and restore/read-back receipts |
+| Data | Current canonical database, every writer (bot, web, queues, cron), table/key ownership, migration versions, snapshot IDs/hashes, generated-key allocator/high-water receipts, restore receipt |
+| Registry | Global/guild command-definition and separate guild permission snapshots at pre-swap and rollback freeze; defaults/inheritance, approved watch edits, old/current/restored ID maps, reconciled target and read-back receipts |
 | Ownership fence | Reviewed Worker/DO maintenance mechanism and version, singleton identity, persisted fence receipt, scheduled/startup-path rehearsal and explicit release owner |
 | Secret bindings | Existing Discord token binding, database binding, internal-action signing binding and intended consumers; never values |
 | Gates | Parity report, soak sign-off, W16 all-warm rollback drill, region/access sign-off, moderator sign-off |
@@ -81,6 +81,10 @@ Create a B4 evidence manifest before scheduling:
   the bot token is insufficient for that write. Missing access/mapping is NO-GO,
   not permission to obtain/substitute another credential. Full replacement
   deletes omitted slash/user/message commands; no unrelated command is dropped.
+  Rehearse rollback reconciliation of watch-window registry/permission changes,
+  including a revoked role allow, changed inherited defaults and command
+  additions/deletions/renames. Restoring the frozen baseline must not undo those
+  changes or broaden current access; unsupported drift keeps commands frozen.
 - [ ] A durable journal/watermark covers every affected table, deletes and
   side-effect ledger, or a tested shared-DB compatibility path preserves them.
   **No complete rollback data path = NO-GO**, even if gateway health is green.
@@ -321,29 +325,57 @@ per-command read-back. Retain role/user/channel IDs, types and allow/deny values
 including `guild_id` (`@everyone`) and `guild_id - 1` (All Channels), plus whether
 a command is synced to defaults or has explicit overrides. Capture definitions
 and permissions as one frozen registry baseline; reconcile any concurrent admin
-change before proceeding.
+change before proceeding. Database journals do **not** capture registry or
+permission edits made directly in Discord.
 
 Recovery order through the authorized permission executor:
 
-1. Restore command definitions first; retain each API response's **actual** IDs.
-   Map old→new IDs by application, scope, guild (where applicable), command type
-   and name using the approved snapshot/rename mapping. Do not assume recreated
-   commands reuse old IDs or match only by name. Unmapped/ambiguous IDs are NO-GO.
-2. Reapply each explicit override set to the mapped command's per-command PUT
-   route with `{"permissions": [{"id": "<resource-id>", "type": 1,
-   "permission": false}]}` (illustrative shape only). PUT replaces that command's
-   overrides; use the complete saved array, not a partial patch. Do not convert
-   inherited defaults into explicit per-command overrides. The batch
-   `PUT .../commands/permissions` endpoint is **disabled** and is not a fallback.
-3. Verify application-level defaults and synced/unsynced behavior separately.
-   The docs describe application-ID objects on GET but do not establish an
-   application-ID PUT shortcut here. B4 must provide a separately authorized,
-   rehearsed preservation/restoration path for those defaults; do not invent a
-   command ID or endpoint. An unresolved default mismatch blocks reopening.
-4. Read back guild-wide and mapped per-command permissions and compare all
-   resource/type/allow tuples, default inheritance and command definitions to
-   the approved baseline. Record mapping and zero unexplained mismatches before
-   either cutover GO or reopening legacy commands.
+1. **Before any definition PUT**, freeze all registry/permission writers,
+   including administrator edits and automatic command sync. At rollback freeze,
+   capture final live definitions in every global/guild scope and separate guild
+   permission objects, application defaults and synced/unsynced state. Preserve
+   this restricted snapshot even for commands about to be renamed/deleted. If
+   writers cannot be fenced or the capture is inconsistent, keep commands frozen
+   and do not overwrite the registry.
+2. Approve a **reconciled target**, not an automatic reset to `T_f`. For initial
+   cutover this is the reviewed Next registry with preserved access controls;
+   for rollback compare the pre-swap baseline, post-swap receipts, final live
+   snapshot and approved watch edits. Map old/current command identities to the
+   legacy-compatible target by application, scope, guild (where applicable),
+   type and approved name/rename lineage. Preserve legitimate additions,
+   deletions and renames; an unsupported definition or ambiguous map is NO-GO,
+   not permission to discard it or recreate a deliberately deleted command.
+   Carry current restrictions and revocations into defaults and explicit
+   overrides. Removing an allow entry is a revocation too: do not reintroduce it
+   from the baseline. Compare effective access, including definition defaults,
+   role/user/channel precedence and inheritance; a naive union of permission
+   arrays is not reconciliation. Do not silently broaden current access. Any
+   unexplained drift needs a named moderator/data-lead disposition; unresolved
+   compatibility/access changes keep commands frozen and go to the Director of
+   Engineering. Retain the approved target and mappings before mutation.
+3. Apply reconciled command definitions first; retain each API response's
+   **actual** IDs and complete old/current/restored ID maps. Do not assume
+   recreated commands reuse old IDs or match only by name. Unmapped/ambiguous
+   IDs are NO-GO. Reapply each reconciled explicit override set to the mapped
+   command's per-command PUT route with `{"permissions": [{"id": "<resource-id>",
+   "type": 1, "permission": false}]}` (illustrative shape only). PUT replaces
+   that command's overrides; use the complete approved reconciled array, not a
+   partial patch or stale saved array. Do not convert inherited defaults into
+   explicit per-command overrides. The batch `PUT .../commands/permissions`
+   endpoint is **disabled** and is not a fallback.
+4. Verify application-level defaults and synced/unsynced behavior separately
+   against the reconciled target. The docs describe application-ID objects on
+   GET but do not establish an application-ID PUT shortcut here. B4 must provide
+   a separately authorized, rehearsed preservation/restoration path for those
+   defaults; do not invent a command ID or endpoint. An unresolved default
+   mismatch blocks reopening.
+5. Read back guild-wide and mapped per-command permissions and compare all
+   resource/type/allow tuples, default inheritance, effective access and command
+   definitions to the **approved reconciled target**, not merely the frozen
+   pre-cutover baseline. Record mappings and zero unexplained mismatches before
+   either cutover GO or reopening legacy commands. Keep registry/permission
+   writers fenced through read-back; any concurrent change requires recapture
+   and reconciliation before reopening.
 
 Permission **writes require an existing authorized OAuth2 Bearer token** with
 `applications.commands.permissions.update`, not the bot token used for command
@@ -385,21 +417,43 @@ checksums, snowflake/primary-key preservation, timestamps/time zones, JSON
 settings, row constraints, tombstones/deletions, and pending/completed ledger
 states. Aggregate counts alone are insufficient. Check pending unban deadlines,
 schedule next-run times, audit/replay IDs, web read views and internal-action
-idempotency. Destination verification has zero unexplained mismatches. Do not
-start either gateway while these are unresolved. Record the baseline watermark
-from which all subsequent Next/web writes will be reconciled.
+idempotency. Destination verification has zero unexplained mismatches.
+
+**Generated-key allocation is a separate pre-boot gate.** Explicit imported IDs
+can leave a BIGSERIAL/identity sequence behind even when row checks pass. The
+reviewed migration must inventory and reconcile **every imported generated-key
+table's allocator**, including sequence/identity state and any application
+allocator. Preserve imported and pre-existing destination IDs, allocated/reserved
+high-water marks (including deleted IDs), and sequence `is_called`, increment
+and bounds semantics; never rewind an allocator to the imported rows alone.
+Record a per-table receipt proving the next allocation cannot collide or reuse
+reserved IDs before releasing any gateway/web/job writer. Rehearse real default-ID
+inserts/allocations on disposable fixtures, including nonempty destinations and
+empty/deleted-high-water cases. Production verification/correction stays inside
+the authorized migration procedure: no agent-run live test inserts, generic
+`setval` recipe or allowlisted dump restore as a substitute. Missing coverage or
+receipt is **NO-GO**. The same allocator gate applies to a rollback recovery target.
+
+Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L13)
+is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L98)
+that handle only idempotency-key conflicts, not primary-key collisions. The
+[limited restore's events sequence adjustment](../crates/core/src/backup/dump.rs#L371)
+illustrates the hazard; it does not prove the planned copier covers every table.
+
+Do not start either gateway while verification is unresolved. Record the baseline
+watermark from which all subsequent Next/web writes will be reconciled.
 
 ## Registry swap, first boot and go/no-go
 
 1. Confirm legacy is stopped, data verification is signed, producers stay
    frozen, and command restore artifacts are available to the executor.
 2. Review `commands diff` against the **live snapshot**, including localization,
-   options, default permissions, contexts and every scope. Apply only the
-   reviewed full desired registry through the authorized command executor.
-   Verify the returned definitions and execute the separate guild permissions
-   mapping/restore/read-back procedure above, including defaults and overrides
-   on global commands. Record the receipts; do not use an ordinary bot start as
-   an undocumented sync step.
+   options, default permissions, contexts and every scope. Follow the separate
+   guild permissions recovery procedure **from its pre-PUT capture/reconciliation
+   step**, including defaults and overrides on global commands. Apply only the
+   reviewed reconciled registry through the authorized executor, map returned
+   IDs and verify definitions/permissions/effective access. Record the receipts;
+   do not use an ordinary bot start as an undocumented sync step.
 3. Bind the existing application token and approved DB/signing secrets to
    Next through the secret service. Stage configuration while the gateway is
    stopped. First boot is a fresh IDENTIFY with **RESUME disabled**; never
@@ -449,6 +503,7 @@ Report only findings; keep raw healthy polls in bounded restricted evidence.
 | Data and web | Write/replay/claim conflicts, DB errors/pool pressure, internal-action contract failures, view drift and journal lag |
 | Resources | RSS/placement versus B1 baseline, CPU/restart trend and storage/backup health; metrics are supplementary to event coverage |
 | Rollback watermark | Durable captures cover every acknowledged write/effect; a gap immediately freezes new writes and fails GO |
+| Registry / permissions | Record authorized administrator/tool edits and detect unexplained drift, including removed allows and changed defaults; preserve read snapshots for rollback reconciliation, not a baseline-only reset |
 
 Use existing logs/receipts until metrics instrumentation is merged and wired;
 do not assume `/metrics` or a feature counter exists. At +48 h record a
@@ -475,9 +530,14 @@ reconcile recoverable events; do not claim IDENTIFY will replay them.
    then use control-plane/log receipts to verify terminal state and no reconnect
    beyond the rehearsed keepalive horizon. An unfenced `/health` or `/readyz`
    request can restart Next and is not a stopped-state probe. Record `T_r` and
-   final durable watermarks; preserve a restricted snapshot of Next data. Keep
-   the fence active throughout legacy ownership. If fence verification or DB
-   capture fails, keep maintenance closed; do not start legacy in uncertainty.
+   final durable watermarks; preserve a restricted snapshot of Next data. Also
+   fence registry/permission writers (including Discord administrator edits) and
+   capture final live command definitions, guild permissions and defaults/
+   inheritance **before any registry restoration**, as required above. Keep
+   those writers fenced through reconciliation/read-back; DB snapshots cannot
+   replace this external-state capture. Keep the Worker/DO fence active
+   throughout legacy ownership. If fencing or either capture fails, keep
+   maintenance closed; do not start legacy in uncertainty.
 2. Reconcile **every write since baseline**, including config updates and
    deletes, XP/levels, onboarding state, tickets/transcripts, schedules/feeds,
    moderation actions/unbans, voice ownership, audit and internal-action/web
@@ -500,12 +560,17 @@ reconcile recoverable events; do not claim IDENTIFY will replay them.
    messages, sanctions, role changes, unbans or web callbacks. Reconcile uncertain
    effects explicitly with moderators. Release/transfer leases only after old
    owners are fenced; drain overdue unbans once in the restored single consumer.
-4. Restore complete legacy command definitions in each affected global/guild
-   scope from the reviewed payload. Then run the **separate guild permissions
-   recovery** above: map old IDs to restored IDs, restore per-command overrides
-   via the authorized Bearer executor, verify application defaults/inheritance
-   and read back every affected guild. Definition PUT alone is insufficient.
-   Keep commands frozen on missing authority or any unexplained mismatch.
+4. Reconcile the frozen final live registry/permission snapshot and approved
+   watch-window edits with the pre-swap/post-swap receipts **before definition
+   PUT**, following the separate guild permissions recovery procedure above.
+   Apply the approved legacy-compatible **reconciled target**, preserving current
+   restrictions/revocations and legitimate additions/deletions/renames, not a
+   stale baseline reset. Complete old/current/restored ID maps, apply reconciled
+   overrides via the authorized Bearer executor, verify defaults/inheritance and
+   effective access, and read back every affected guild against that target.
+   Definition PUT alone is insufficient. Unsupported drift, missing authority
+   or any unexplained mismatch keeps commands frozen with a named disposition;
+   never reinstate a role allow revoked during the watch to make old counts match.
    Global propagation/read-repair may leave stale clients temporarily, whereas
    guild commands update immediately. Report that gap, not a second gateway.
 5. Restore pinned legacy image/config and the **reconciled** database binding.
