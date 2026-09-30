@@ -17,12 +17,14 @@ use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, ShardId};
+use two_bot::voice_rooms::{build_production_runtime, VoiceEventSink};
 use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{
     boot_action, dispatch_action, invalidates_session, BootAction, DispatchAction, GatewaySession,
 };
 use two_bot_core::{ComponentStatus, Config, FunnelEvent};
 use two_bot_cutover::gateway_session::GatewaySessionStore;
+use two_bot_cutover::{connect, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
     gateway_intents, needs_message_content, NoClassification, NoInvites, Pipeline,
 };
@@ -167,15 +169,27 @@ async fn checkpoint_io<T>(
 ///
 /// `sticky` is the S4 sticky runtime (TOG-10309): `dispatch` spawns detached
 /// work so this loop never awaits a REST call or store write — twilight only
-/// drives heartbeats while the shard is polled.
+/// drives heartbeats while the shard is polled. `voice` is the V1 voice sink
+/// (TOG-10093): `handle` feeds actor inboxes (never blocking) against the
+/// post-update cache; `None` unless `TWO_VOICE=1` with token + database
+/// configured (see [`build_voice_runtime`]).
 pub async fn run_shard(
     mut shard: Shard,
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
     sticky: Option<Arc<crate::sticky_runtime::StickyRuntime>>,
+    voice: Option<Arc<dyn VoiceEventSink>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store, sticky.as_ref()).await;
+    let result = run_loop(
+        &mut shard,
+        &pipeline,
+        &state,
+        &store,
+        sticky.as_ref(),
+        voice.as_ref(),
+    )
+    .await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -186,6 +200,7 @@ async fn run_loop(
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
     sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
+    voice: Option<&Arc<dyn VoiceEventSink>>,
 ) -> Result<(), sqlx::Error> {
     let mut observer = crate::gateway_metrics::Observer::default();
     let mut deadline = CHECKPOINT_IO_MAX;
@@ -203,11 +218,6 @@ async fn run_loop(
                 *state.write().await = GatewayState::Armed;
                 warn!("gateway reconnect failed; Twilight will retry");
                 continue;
-            }
-            Err(_) => {
-                return Err(sqlx::Error::InvalidArgument(
-                    "gateway receive failed; checkpoint unchanged".into(),
-                ))
             }
         };
         observer.observe(&message, shard);
@@ -304,6 +314,12 @@ async fn run_loop(
             if let Some(runtime) = sticky {
                 runtime.dispatch(&event);
             }
+            // Voice sink after the cache update: snapshots are complete,
+            // handling never blocks (actor inbox), failures stay in the
+            // worker — never here.
+            if let Some(sink) = voice {
+                sink.handle(&event, pipeline.cache());
+            }
         }
         checkpoint_io(
             state,
@@ -378,6 +394,53 @@ pub fn build_pipeline(milestones: Vec<FunnelEvent>) -> GatewayPipeline {
         NoInvites,
         NoClassification,
     )
+}
+
+/// Build the V1 voice sink, or `None` when voice stays off.
+///
+/// Voice needs all three: the `TWO_VOICE=1` gate, a Discord token
+/// (single-attempt REST), and a Postgres URL (sqlx store + migrations).
+/// Anything missing — or any construction failure — degrades to voice-off
+/// with a warn; the gateway and /readyz keep working. Secrets never appear
+/// in the logs.
+pub async fn build_voice_runtime(
+    config: &Config,
+    voice_enabled: bool,
+) -> Option<Arc<dyn VoiceEventSink>> {
+    if !voice_enabled {
+        return None;
+    }
+    let token = match config.discord_token.clone().filter(|t| !t.is_empty()) {
+        Some(token) => token,
+        None => {
+            warn!("TWO_VOICE=1 but no discord token; voice rooms disabled");
+            return None;
+        }
+    };
+    let database_url = match config.database_url.clone().filter(|u| !u.is_empty()) {
+        Some(url) => url,
+        None => {
+            warn!("TWO_VOICE=1 but no database URL; voice rooms disabled");
+            return None;
+        }
+    };
+    let db = match connect(&database_url, DB_POOL_MAX_DEFAULT, false).await {
+        Ok(db) => db,
+        Err(err) => {
+            warn!(error = %err, "voice database unavailable; voice rooms disabled");
+            return None;
+        }
+    };
+    match build_production_runtime(&token, db.pool().clone()) {
+        Ok(runtime) => {
+            info!("voice rooms enabled; gateway sink attached");
+            Some(Arc::new(runtime))
+        }
+        Err(err) => {
+            warn!(error = %err, "voice HTTP setup failed; voice rooms disabled");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -468,5 +531,39 @@ mod tests {
         ensure_crypto_provider();
         let shard = build_shard("token".to_owned(), Intents::empty(), None, None);
         assert_eq!(session_snapshot(&shard), None);
+    }
+
+    fn voice_config(token: Option<&str>, database_url: Option<&str>) -> Config {
+        Config {
+            discord_token: token.map(str::to_owned),
+            database_url: database_url.map(str::to_owned),
+            listen_addr: "0.0.0.0:8080".to_owned(),
+            guild_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_off_without_gate() {
+        let config = voice_config(Some("token"), Some("postgres://localhost/unused"));
+        assert!(build_voice_runtime(&config, false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_off_without_token() {
+        let config = voice_config(None, Some("postgres://localhost/unused"));
+        assert!(build_voice_runtime(&config, true).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_off_without_database() {
+        let config = voice_config(Some("token"), None);
+        assert!(build_voice_runtime(&config, true).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_off_on_bad_database_url() {
+        // Fails at URL validation: no socket is ever opened.
+        let config = voice_config(Some("token"), Some("not-a-database-url"));
+        assert!(build_voice_runtime(&config, true).await.is_none());
     }
 }

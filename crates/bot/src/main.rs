@@ -24,10 +24,11 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tracing::info;
-use two_bot_core::{ComponentStatus, Config};
+use two_bot_core::{ComponentStatus, Config, VoiceGates};
 
 use gateway::{
-    build_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard, GatewayState,
+    build_pipeline, build_shard, build_voice_runtime, ensure_crypto_provider, intents_from_env,
+    run_shard, GatewayState,
 };
 use server::serve;
 
@@ -100,11 +101,17 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // V1 voice rooms: per-guild lifecycle actors fed by the gateway sink.
+    // Inert unless TWO_VOICE=1 with token + database present; any failure
+    // degrades to voice-off with a warn, never a boot failure.
+    let voice = build_voice_runtime(&config, VoiceGates::from_env().enabled).await;
+
     let gateway_task = match gateway_prerequisites(&config) {
         Ok((token, url, guild_id)) => {
             let token = token.to_owned();
             let url = url.to_owned();
             let state = Arc::clone(&state);
+            let voice = voice.clone();
             Some(tokio::spawn(async move {
                 let result: Result<(), sqlx::Error> = async {
                     // Runtime is DML-only; the operator migrates before startup.
@@ -137,7 +144,7 @@ async fn main() {
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store, sticky).await
+                    run_shard(shard, pipeline, Arc::clone(&state), store, sticky, voice).await
                 }
                 .await;
                 if result.is_err() {
