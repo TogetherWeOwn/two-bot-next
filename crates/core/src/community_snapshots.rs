@@ -175,14 +175,10 @@ pub fn window_bounds(start: &str, end: &str) -> Option<(String, String)> {
     Some((fmt(from_day), fmt(to_day)))
 }
 
-/// Millis-truncated ISO-8601 UTC timestamp (`2026-09-06T17:30:00.000Z`, the
-/// shape legacy `new Date().toISOString()` writes into every TEXT column).
-/// Re-exported from [`crate::funnel`]: the S3 slice landed the identical
-/// helper first, so this module reuses it instead of owning a duplicate.
-pub use crate::funnel::now_iso;
-
 /// One roster entry the snapshot reads (legacy `RawMember` subset: id, bot
-/// flag, role snowflakes).
+/// flag, role snowflakes). Observed-at timestamps use [`crate::now_iso`]
+/// (from [`crate::funnel`]: the S3 slice landed the identical helper first,
+// same contract shape, std-only — so this module reuses it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterMember {
     pub user_id: String,
@@ -703,7 +699,8 @@ mod tests {
 
     #[test]
     fn now_iso_has_contract_shape() {
-        let now = now_iso();
+        // `crate::now_iso` (funnel's) is the tick clock; spot-check the shape.
+        let now = crate::funnel::now_iso();
         assert!(now.ends_with('Z'), "{now}");
         assert_eq!(now.len(), "2026-09-06T17:30:00.000Z".len(), "{now}");
         assert!(now.contains('T'), "{now}");

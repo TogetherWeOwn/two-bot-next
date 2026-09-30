@@ -24,7 +24,7 @@ pub mod website_store;
 
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use community_snapshots::{
-    build_community_snapshot, build_counter_reading, match_rank_roles, now_iso, window_bounds,
+    build_community_snapshot, build_counter_reading, match_rank_roles, window_bounds,
     CommunitySnapshot, CounterReading, CounterSkip, JobGate, JobGuard, MemberRank, RaidAnomaly,
     RaidWindow, RankKey, RankRole, RankRow, RankSkip, RosterMember, LIVE_COUNTER_INTERVAL_MS,
     RAID_ANOMALIES, RANK_SNAPSHOT_INTERVAL_MS,
