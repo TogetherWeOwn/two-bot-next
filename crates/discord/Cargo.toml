@@ -1,6 +1,6 @@
 [package]
 name = "two-bot-discord"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.
 [dependencies]
-two-bot-core = { version = "0.1.0", path = "../core" }
+two-bot-core = { version = "0.2.0", path = "../core" }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
