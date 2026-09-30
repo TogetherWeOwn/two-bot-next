@@ -78,8 +78,14 @@ fixtures do not contact a database; full Docker builds remain a deployment gate.
 ## Retry-safe PR reconciliation
 
 `scripts/release-pr-state.cjs` selects only an open, same-repository, main-base
-root release PR labeled `autorelease: pending`. A compare API merge-base check
-proves whether that branch already includes the main snapshot. If so, the
+root release PR labeled `autorelease: pending` on the native component head
+(`release-please--branches--main--components--two-bot-next`, derived from the
+root package name). A compare API merge-base check proves whether that branch
+already includes the main snapshot; reuse is additionally bound to the
+generation snapshot (the first parent of the newest `chore(main): release X`
+commit, which is how native parents its force-replaced branch commit), because
+an "Update branch" merge keeps ancestry while leaving the generated metadata
+stale. If both hold, the
 pinned action's [`skip-github-pull-request` input](https://github.com/googleapis/release-please-action/blob/45996ed1f6d02564a971a2fa1b5860e934307cf7/action.yml)
 skips only PR regeneration, avoiding body-comparison resets of migrated notes.
 Release publication stays enabled. A new main snapshot enables native PR
@@ -93,12 +99,21 @@ push followed by a failed PATCH therefore repairs only the body on retry.
 Unchanged reconciliation makes no commit, push or body-PATCH calls. Checks may
 be dispatched again on an explicit rerun; they still target the existing head.
 
+Oversized release notes overflow natively: the visible PR body becomes a
+single-line link while the full notes live in `release-notes.md` on the
+derived `<head>--release-notes` branch. The workflow reconciles that stored
+file (never PATCHing the native-owned link) only when the visible body parses
+as the exact native overflow link; a dangling link fails closed before any
+push or dispatch, and a stale notes branch alongside a normal body is ignored.
+
 `python3 scripts/test-release-retry.py` runs the workflow's actual reconciliation
 shell and state CLI using complete disposable local Git repositories and a
 fail-closed GitHub mock. It covers native-output-free recovery, failures before
 PATCH, failed push, failed PATCH after push, one-sided migration, unchanged-main
-no-op, new-main regeneration and foreign-head rejection. It never uses a token,
-contacts GitHub or accesses a database, and runs in Worker CI.
+no-op, new-main regeneration, Update-branch stale regeneration, overflow
+stored-notes reconciliation (including failed notes-restore and dangling-link
+fail-closed), stale-notes-branch ignore and foreign-head rejection. It never
+uses a token, contacts GitHub or accesses a database, and runs in Worker CI.
 
 ## Required-check dispatch
 

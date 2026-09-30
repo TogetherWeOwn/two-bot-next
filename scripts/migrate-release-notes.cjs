@@ -4,6 +4,53 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const releaseHeading = /^##? \[?v?\d+\.\d+\.\d+.*$/gm;
 
+// Native 17.6.0 stores oversized full release notes in `release-notes.md` on
+// a derived notes branch and replaces the visible PR body with a single-line
+// link: `release-please--branches--main--components--two-bot-next--release-notes`
+// (see native FilePullRequestOverflowHandler.handleOverflow, which returns
+// `${OVERFLOW_MESSAGE} ${url}`, and OVERFLOW_MESSAGE_REGEX which matches that
+// one line). Reconciliation must resolve the stored notes through that
+// representation instead of asserting on the visible link body; otherwise
+// every overflow run fails before check dispatch. parseOverflowLink returns
+// the {url, branchName} for a native overflow link body, or null for any
+// other body. resolveNotesBody(visibleBody, fetchNotesFile) returns the full
+// stored notes text for a native overflow link (fetchNotesFile receives the
+// notes branch name and returns the file text), or the visible body unchanged.
+// Both retain the native URL-branch parsing contract and required metadata:
+// only the exact native overflow sentence, a single-line release-notes.md
+// blob URL whose branch is this release's notes branch, and a nonempty
+// fetched body pass. Anything else fails closed or passes through untouched.
+const NATIVE_NOTES_BRANCH = 'release-please--branches--main--components--two-bot-next--release-notes';
+const NATIVE_NOTES_FILE = 'release-notes.md';
+const NATIVE_OVERFLOW_SENTENCE = 'This release is too large to preview in the pull request body. View the full release notes here:';
+
+function parseOverflowLink(visibleBody) {
+  const normalized = visibleBody.trim().replace(/\r\n/g, '\n');
+  const prefix = `${NATIVE_OVERFLOW_SENTENCE} `;
+  if (!normalized.startsWith(prefix)) return null;
+  const url = normalized.slice(prefix.length).trim();
+  if (url.length === 0 || /\s/.test(url)) return null;
+  let branchName = null;
+  try {
+    const pathname = new URL(url).pathname;
+    const match = pathname.match(new RegExp(`/blob/(?<branchName>.+)/${NATIVE_NOTES_FILE}$`));
+    branchName = match?.groups?.branchName ?? null;
+  } catch {
+    branchName = null;
+  }
+  if (!branchName) return null;
+  return {url, branchName};
+}
+
+function resolveNotesBody(visibleBody, fetchNotesFile) {
+  const link = parseOverflowLink(visibleBody);
+  if (!link) return visibleBody;
+  assert.equal(link.branchName, NATIVE_NOTES_BRANCH, 'Unexpected release-notes branch in overflow PR body');
+  const stored = fetchNotesFile(link.branchName);
+  assert(typeof stored === 'string' && stored.length > 0, 'Missing stored release notes');
+  return stored;
+}
+
 // Reconcile both sides independently: a retry may find the changelog pushed but
 // the PR-body PATCH unfinished, or a migrated body with the old changelog.
 function migrateReleaseNotes(changelog, body) {
@@ -59,14 +106,26 @@ function migrateReleaseNotes(changelog, body) {
   };
 }
 
-module.exports = {migrateReleaseNotes};
+module.exports = {migrateReleaseNotes, parseOverflowLink, resolveNotesBody, NATIVE_NOTES_BRANCH, NATIVE_NOTES_FILE, NATIVE_OVERFLOW_SENTENCE};
 
 if (require.main === module) {
-  const [changelogPath, bodyPath] = process.argv.slice(2);
-  assert(changelogPath && bodyPath, 'Usage: migrate-release-notes.cjs CHANGELOG.md pr-body.md');
+  const [changelogPath, bodyPath, notesPath] = process.argv.slice(2);
+  assert(changelogPath && bodyPath, 'Usage: migrate-release-notes.cjs CHANGELOG.md pr-body.md [release-notes.md]');
   const changelog = fs.readFileSync(changelogPath, 'utf8');
-  const body = fs.readFileSync(bodyPath, 'utf8');
+  const visibleBody = fs.readFileSync(bodyPath, 'utf8');
+  // Preserve the native overflow contract: stored notes are the source of
+  // truth, so a migrated overflow reconciles the notes file, never the link.
+  // A stale notes branch alongside a normal body is left alone entirely.
+  const link = parseOverflowLink(visibleBody);
+  if (link && !notesPath) assert.fail('Overflow PR body without stored release notes file');
+  const body = link
+    ? resolveNotesBody(visibleBody, () => fs.readFileSync(notesPath, 'utf8'))
+    : visibleBody;
   const migrated = migrateReleaseNotes(changelog, body);
   if (migrated.changelog !== changelog) fs.writeFileSync(changelogPath, migrated.changelog);
-  if (migrated.body !== body) fs.writeFileSync(bodyPath, migrated.body);
+  if (link) {
+    if (migrated.body !== body) fs.writeFileSync(notesPath, migrated.body);
+  } else if (migrated.body !== visibleBody) {
+    fs.writeFileSync(bodyPath, migrated.body);
+  }
 }

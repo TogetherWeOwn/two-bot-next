@@ -31,7 +31,7 @@ BODY = "## Summary\n\nRelease the workspace with synchronized versions.\nPR_EOF\
 PR = {
     "title": TITLE, "body": BODY, "author": {"login": "github-actions[bot]"},
     "state": "OPEN", "baseRefName": "main", "headRefOid": "a" * 40,
-    "headRefName": "release-please--branches--main",
+    "headRefName": "release-please--branches--main--components--two-bot-next",
     "headRepository": {"name": "two-bot-next"},
     "headRepositoryOwner": {"login": "TogetherWeOwn"},
 }

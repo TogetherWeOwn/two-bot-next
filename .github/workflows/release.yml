@@ -64,12 +64,29 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ fromJSON(steps.select.outputs.pr).number }}
+          HEAD_BRANCH: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
         run: |
           set -euo pipefail
           BODY_FILE="$RUNNER_TEMP/release-pr-body.md"
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          NOTES_BRANCH="$HEAD_BRANCH--release-notes"
           gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq .body > "$BODY_FILE"
           cp "$BODY_FILE" "$BODY_FILE.before"
-          node scripts/migrate-release-notes.cjs CHANGELOG.md "$BODY_FILE"
+          # Native overflow stores oversized full notes in release-notes.md on
+          # a derived notes branch (`$HEAD_BRANCH--release-notes`) and leaves
+          # only a single-line link in the visible PR body (see native
+          # FilePullRequestOverflowHandler). Reconcile the stored notes (the
+          # Release-notes source of truth) only when the visible body IS that
+          # link: a stale notes branch alongside a normal body is left alone,
+          # and a dangling link fails closed here before any push or dispatch.
+          NOTES_ARG=()
+          if node -e "process.exit(require('./scripts/migrate-release-notes.cjs').parseOverflowLink(require('node:fs').readFileSync(process.argv[1], 'utf8')) ? 0 : 1)" "$BODY_FILE"; then
+            gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" --jq .content > "$NOTES_FILE.b64"
+            python3 -c 'import base64, pathlib, sys; pathlib.Path(sys.argv[2]).write_bytes(base64.b64decode(pathlib.Path(sys.argv[1]).read_text()))' "$NOTES_FILE.b64" "$NOTES_FILE"
+            cp "$NOTES_FILE" "$NOTES_FILE.before"
+            NOTES_ARG=("$NOTES_FILE")
+          fi
+          node scripts/migrate-release-notes.cjs CHANGELOG.md "$BODY_FILE" "${NOTES_ARG[@]}"
           if ! git diff --quiet -- CHANGELOG.md; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -79,7 +96,17 @@ jobs:
           fi
           # Body reconciliation is independent of the file diff: a retry after
           # a successful push but failed PATCH must still repair Release notes.
-          if ! cmp -s "$BODY_FILE.before" "$BODY_FILE"; then
+          if [ "${#NOTES_ARG[@]}" -gt 0 ]; then
+            # Overflow: restore the native stored-body representation through
+            # its own branch so the link keeps resolving; the PR body link is
+            # native-owned and never PATCHed.
+            if ! cmp -s "$NOTES_FILE.before" "$NOTES_FILE"; then
+              python3 -c 'import base64, json, pathlib, sys; print(json.dumps({"message": "chore(release): preserve bootstrap release notes", "content": base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode()}))' "$NOTES_FILE" > "$NOTES_FILE.json"
+              NOTES_SHA=$(gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" --jq .sha)
+              python3 -c 'import json, pathlib, sys; payload = json.loads(pathlib.Path(sys.argv[1]).read_text()); payload["sha"] = sys.argv[2]; pathlib.Path(sys.argv[1]).write_text(json.dumps(payload))' "$NOTES_FILE.json" "$NOTES_SHA"
+              gh api --method PUT "repos/$GH_REPO/contents/release-notes.md" --input "$NOTES_FILE.json" -f branch="$NOTES_BRANCH" --silent
+            fi
+          elif ! cmp -s "$BODY_FILE.before" "$BODY_FILE"; then
             python3 -c 'import json, pathlib, sys; print(json.dumps({"body": pathlib.Path(sys.argv[1]).read_text()}))' "$BODY_FILE" > "$BODY_FILE.json"
             gh api --method PATCH "repos/$GH_REPO/pulls/$PR_NUMBER" --input "$BODY_FILE.json" --silent
           fi

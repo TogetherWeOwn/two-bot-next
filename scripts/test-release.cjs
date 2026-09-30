@@ -10,7 +10,12 @@ const {Version} = require(path.join(library, 'build/src/version'));
 const {parseConventionalCommits} = require(path.join(library, 'build/src/commit'));
 const {DefaultVersioningStrategy} = require(path.join(library, 'build/src/versioning-strategies/default'));
 const {parseCargoManifest, parseCargoLockfile} = require(path.join(library, 'build/src/updaters/rust/common'));
-const {migrateReleaseNotes} = require('./migrate-release-notes.cjs');
+const {FilePullRequestOverflowHandler} = require(path.join(library, 'build/src/util/pull-request-overflow-handler'));
+const {migrateReleaseNotes, parseOverflowLink, resolveNotesBody, NATIVE_NOTES_BRANCH, NATIVE_OVERFLOW_SENTENCE} = require('./migrate-release-notes.cjs');
+const {findNewestNativeCommit, findGenerationSnapshot, NATIVE_RELEASE_COMMIT_PATTERN} = require('./release-pr-state.cjs');
+// Native 17.6.0 derives the component from the root package name; the live
+// library assertions below fail loudly if either constant drifts.
+const EXPECTED_HEAD = 'release-please--branches--main--components--two-bot-next';
 const root = path.resolve(__dirname, '..');
 const read = file => fs.readFileSync(path.join(root, file), 'utf8');
 const config = JSON.parse(read('release-please-config.json'));
@@ -102,6 +107,8 @@ async function simulate(snapshot, {message, file, tagged, bootstrap}) {
   const prs = await manifest.buildPullRequests();
   assert.equal(prs.length, 1);
   const pr = prs[0];
+  assert.equal(pr.headRefName, EXPECTED_HEAD, 'Native head drift: selection constant must match the live library');
+  assert.match(pr.title.toString(), NATIVE_RELEASE_COMMIT_PATTERN, 'Native title drift: snapshot tracking depends on this shape');
   for (const update of pr.updates) {
     if (content[update.path] === undefined && !update.createIfMissing) continue;
     content[update.path] = update.updater.updateContent(content[update.path] || '', logger);
@@ -177,7 +184,99 @@ assert.equal(nextChangelog.split('- historical repair').length - 1, 1);
 assert(!nextBody.includes('- historical repair'), 'Later release must not repeat bootstrap notes');
 console.log('PASS 5 bootstrap migration guards: layout, history, section, ambiguous body, subsequent release');
 
+// Overflow link parsing retains the exact native single-line contract.
+const overflowUrl = `https://github.com/fixture/two-bot-next/blob/${NATIVE_NOTES_BRANCH}/release-notes.md`;
+const overflowBody = `${NATIVE_OVERFLOW_SENTENCE} ${overflowUrl}`;
+assert.deepEqual(parseOverflowLink(overflowBody), {url: overflowUrl, branchName: NATIVE_NOTES_BRANCH});
+assert.equal(parseOverflowLink(':robot: release\n---\n\n## 0.2.0\n\n---\nRefs: TOG-9865\n'), null);
+assert.equal(parseOverflowLink('unrelated body'), null);
+assert.equal(parseOverflowLink(`${overflowBody}\ntrailing line`), null, 'Multiline bodies are never overflow links');
+assert.equal(parseOverflowLink(`prefix ${overflowBody}`), null, 'Only the exact native sentence parses');
+assert.throws(() => resolveNotesBody(overflowBody.replace(NATIVE_NOTES_BRANCH, 'other--release-notes'), () => 'stored'), /Unexpected release-notes branch/);
+assert.throws(() => resolveNotesBody(overflowBody, () => ''), /Missing stored release notes/);
+assert.equal(resolveNotesBody('plain body', () => { throw new Error('must not fetch for normal bodies'); }), 'plain body');
+console.log('PASS 8 overflow link guards: exact sentence, single line, branch match, fail-closed fetch');
+
+// Generation-snapshot tracking binds reuse to the snapshot that produced the
+// metadata, not mere ancestry (Update-branch merges keep ancestry while stale).
+const shaA = 'a'.repeat(40);
+const shaB = 'b'.repeat(40);
+const shaC = 'c'.repeat(40);
+const shaM = 'd'.repeat(40);
+const staleCommits = [
+  {sha: shaA, message: 'chore(main): release 0.1.1'},
+  {sha: shaB, message: 'chore(release): preserve bootstrap release notes'},
+  {sha: shaC, message: 'Merge branch \'main\' of fixture into release branch'},
+];
+assert.equal(findNewestNativeCommit(staleCommits), shaA);
+assert.equal(findGenerationSnapshot(staleCommits, new Map([[shaA, shaM]])), shaM);
+assert.equal(findGenerationSnapshot([{sha: shaB, message: 'chore: something else'}], new Map()), null, 'No native commit fails toward regeneration');
+assert.throws(() => findGenerationSnapshot([{sha: shaA, message: 'chore(main): release 0.1.1'}], new Map()), /Missing parent evidence/);
+console.log('PASS 4 generation-snapshot guards: newest native commit, first-parent snapshot, fail toward regeneration');
+
+async function overflowLifecycle() {
+  // The reviewer's 490-commit / 88k-char native overflow, end to end through
+  // our code path: stored full notes resolve, migrate, and stay idempotent.
+  const snapshot = {...bootstrapSnapshot};
+  const content = {...snapshot};
+  const pad = i => `feat: scoped release item ${String(i).padStart(3, '0')} ${'x'.repeat(60)}`;
+  const github = {
+    repository: {owner: 'fixture', repo: 'two-bot-next'},
+    async getFileJson(file) { return JSON.parse(content[file]); },
+    async getFileContentsOnBranch(file) {
+      return {content: Buffer.from(content[file]).toString('base64'), parsedContent: content[file], sha: 'fixture-content'};
+    },
+    async findFilesByGlobAndRef(glob) {
+      if (glob === 'crates/*/Cargo.toml') return members.map(member => `${member}/Cargo.toml`);
+      return [glob];
+    },
+    async *releaseIterator() {},
+    async *tagIterator() {},
+    async *mergeCommitIterator() {
+      for (let i = 0; i < 490; i++) yield {sha: i.toString(16).padStart(40, '0'), message: pad(i), files: ['crates/core/src/lib.rs']};
+    },
+    async *pullRequestIterator() {},
+  };
+  const manifest = await Manifest.fromManifest(github, 'main', undefined, undefined, {logger});
+  const pr = (await manifest.buildPullRequests())[0];
+  assert.equal(pr.headRefName, EXPECTED_HEAD);
+  for (const update of pr.updates) {
+    if (content[update.path] === undefined && !update.createIfMissing) continue;
+    content[update.path] = update.updater.updateContent(content[update.path] || '', logger);
+  }
+  const fullBody = pr.body.toString();
+  assert(fullBody.length > 65536, 'Fixture must actually overflow the native body limit');
+  let stored = null;
+  let storedBranch = null;
+  const client = {
+    repository: {defaultBranch: 'main'},
+    async createFileOnNewBranch(file, contents, branchName) {
+      stored = contents;
+      storedBranch = branchName;
+      return `https://github.com/fixture/two-bot-next/blob/${branchName}/${file}`;
+    },
+  };
+  const handler = new FilePullRequestOverflowHandler(client, logger);
+  const visible = await handler.handleOverflow(pr);
+  assert(!visible.includes('\n'), 'Native overflow body is a single-line link');
+  assert.equal(storedBranch, NATIVE_NOTES_BRANCH, 'Notes-branch constant must match the native derived branch');
+  assert.equal(storedBranch, `${pr.headRefName}--release-notes`);
+  const resolved = resolveNotesBody(visible, () => stored);
+  assert.equal(resolved, fullBody, 'Stored notes must equal the full native body');
+  const migrated = migrateReleaseNotes(content['CHANGELOG.md'], resolved);
+  assert.notEqual(migrated.changelog, content['CHANGELOG.md'], 'Overflow changelog must be migrated');
+  assert.notEqual(migrated.body, resolved, 'Overflow stored notes must be migrated');
+  assert.deepEqual(migrateReleaseNotes(migrated.changelog, migrated.body), migrated, 'Overflow migration must be idempotent');
+  for (const note of originalNotes) {
+    assert.equal(migrated.changelog.split(note).length - 1, 1, 'Overflow changelog must preserve each RSVP note once');
+    assert.equal(migrated.body.split(note).length - 1, 1, 'Overflow stored notes must preserve each RSVP note once');
+  }
+  assert(migrated.body.includes('Refs: TOG-9865'));
+  console.log(`PASS overflow lifecycle: 490 commits, ${fullBody.length}-char native body, stored-notes migration idempotent`);
+}
+
 (async () => {
+  await overflowLifecycle();
   const scopes = ['src/lib.rs', ...members.map(member => `${member}/src/${member === 'crates/bot' ? 'main' : 'lib'}.rs`), 'wrangler/src/index.ts'];
   const cases = [
     ...scopes.map(file => ({message: 'feat: scoped feature', file})),
@@ -199,5 +298,5 @@ console.log('PASS 5 bootstrap migration guards: layout, history, section, ambigu
   }
   assert.equal(bootstrapCount, 18, 'Retain all existing bootstrap lifecycle cases');
   assert.equal(postReleaseCount, 18, 'Exercise the actual next native release for every generated snapshot');
-  console.log(`PASS ${bootstrapCount} bootstrap + ${postReleaseCount} generated post-release native lifecycles; 5 migration guards`);
+  console.log(`PASS ${bootstrapCount} bootstrap + ${postReleaseCount} generated post-release native lifecycles; 5 migration guards; 8 overflow guards; 4 snapshot guards; 1 overflow lifecycle`);
 })().catch(error => { console.error(error.stack); process.exitCode = 1; });
