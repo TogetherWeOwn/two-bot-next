@@ -105,7 +105,7 @@ jobs:
         run: cargo test --workspace --doc --features two-bot-core/db --locked
 
       - name: audit database regressions (CI service only)
-        run: cargo test -p two-bot-core --features db --test audit_store --locked -- --ignored
+        run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --locked -- --ignored
 
       - name: LFG store regressions (CI service container only)
         run: >-

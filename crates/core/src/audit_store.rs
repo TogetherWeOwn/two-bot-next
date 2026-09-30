@@ -351,6 +351,42 @@ impl AuditStore {
         })
     }
 
+    /// Final authorization after transport pacing. Renew only the still-live
+    /// prepared sender, without counting another attempt. The shared halt lock
+    /// prevents a toggle while waiting for/evaluating the owner row fence.
+    pub async fn check_prepared_send(
+        &self,
+        claim: &AuditClaim,
+    ) -> Result<PrepareSend, AuditStoreError> {
+        if claim.intent() != DeliveryIntent::Send {
+            return Ok(PrepareSend::LostClaim);
+        }
+        let mut tx = self.pool.begin().await?;
+        lock_halt(&mut tx, false).await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let halted: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM audit_kill_switch WHERE id = 1)")
+                .fetch_one(&mut *tx)
+                .await?;
+        if halted {
+            tx.commit().await?;
+            return Ok(PrepareSend::Halted);
+        }
+        let updated = sqlx::query(
+            "UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() + interval '5 minutes'
+             WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
+               AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
+               AND delivery_search_before IS NOT NULL AND mirror_message_id IS NULL",
+        ).bind(&claim.row.event.entry_id).bind(&claim.token).bind(claim.generation)
+            .execute(&mut *tx).await?.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(if updated {
+            PrepareSend::Prepared
+        } else {
+            PrepareSend::LostClaim
+        })
+    }
+
     /// Record the ID returned by Discord, or verified through marker recovery,
     /// separately from completion. First evidence wins; conflicting/repeated
     /// acknowledgements cannot replace it. Halt does not discard acceptance.
