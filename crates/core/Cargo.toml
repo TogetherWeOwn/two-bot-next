@@ -27,6 +27,9 @@ tracing = { workspace = true }
 unicode-normalization = { workspace = true }
 regex = { workspace = true }
 url = { workspace = true }
+# Row-by-row dump streaming only (TryStreamExt::try_next); same locked
+# version the bot and discord crates already use.
+futures-util = { workspace = true }
 
 # Database access lives behind the `db` feature so unit tests for pure
 # domain logic never need a Postgres driver or a live database.
