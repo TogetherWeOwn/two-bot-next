@@ -267,6 +267,120 @@ impl ChannelModerationStore {
         Ok(ChannelClaim::InFlight)
     }
 
+    /// Take the channel lane only while this request still owns its claim.
+    /// The lane is durable and has no timeout: a lost process or ambiguous
+    /// Discord result cannot let another key race an unfinished restoration.
+    pub async fn claim_channel(
+        &self,
+        ticket: &ChannelClaimTicket,
+        channel_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO moderation_channel_execution
+               (guild_id, channel_id, idempotency_key, claim_token)
+             SELECT guild_id, $1, idempotency_key, claim_token
+               FROM moderation_idempotency
+              WHERE guild_id = $2 AND idempotency_key = $3
+                AND claim_token = $4 AND state = 'in_flight'
+             ON CONFLICT (guild_id, channel_id) DO NOTHING",
+        )
+        .bind(channel_id)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(&ticket.claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Finish without a gap between completion, audit, recovery cleanup and
+    /// releasing the channel lane. On DB failure the claim/lane stay in flight;
+    /// the caller may retry this write with the same ticket, never Discord.
+    /// `restored` is supplied only after confirmed exact unlock restoration.
+    pub async fn finish(
+        &self,
+        ticket: &ChannelClaimTicket,
+        row: &ChannelAuditRow,
+        result_json: &str,
+        restored: Option<&LockdownRecord>,
+    ) -> Result<bool, sqlx::Error> {
+        if row.guild_id != ticket.guild_id || row.idempotency_key != ticket.idempotency_key {
+            return Err(sqlx::Error::InvalidArgument(
+                "audit does not match claim".to_owned(),
+            ));
+        }
+        if restored.is_some_and(|rec| {
+            rec.guild_id != ticket.guild_id || row.channel_id.as_deref() != Some(&rec.channel_id)
+        }) {
+            return Err(sqlx::Error::InvalidArgument(
+                "recovery does not match claim".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE moderation_idempotency
+                SET state = 'done', outcome = $1, result_json = $2, completed_at = $3
+              WHERE guild_id = $4 AND idempotency_key = $5
+                AND claim_token = $6 AND state = 'in_flight' AND action = $7",
+        )
+        .bind(&row.outcome)
+        .bind(result_json)
+        .bind(&row.created_at)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(&ticket.claim_token)
+        .bind(&row.action)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO moderation_audit
+               (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
+                outcome, idempotency_key, metadata_json, created_at)
+             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (request_id) DO NOTHING",
+        )
+        .bind(&row.request_id)
+        .bind(&row.guild_id)
+        .bind(&row.actor_id)
+        .bind(&row.action)
+        .bind(&row.channel_id)
+        .bind(&row.reason)
+        .bind(&row.outcome)
+        .bind(&row.idempotency_key)
+        .bind(&row.metadata_json)
+        .bind(&row.created_at)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(rec) = restored {
+            let cleared = sqlx::query(
+                "DELETE FROM moderation_lockdowns
+                  WHERE channel_id = $1 AND guild_id = $2 AND recovery_generation = $3",
+            )
+            .bind(&rec.channel_id)
+            .bind(&rec.guild_id)
+            .bind(&rec.recovery_generation)
+            .execute(&mut *tx)
+            .await?;
+            if cleared.rows_affected() != 1 {
+                return Ok(false);
+            }
+        }
+        sqlx::query(
+            "DELETE FROM moderation_channel_execution
+              WHERE guild_id = $1 AND idempotency_key = $2 AND claim_token = $3",
+        )
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(&ticket.claim_token)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Record the result so a retry replays it instead of acting again.
     /// Returns false if the ticket is stale or already completed; never
     /// overwrites a newer generation or an immutable completed result.
@@ -456,6 +570,180 @@ mod tests {
         ] {
             assert!(!test_database_url_allowed(url, false));
         }
+    }
+
+    async fn ticket(store: &ChannelModerationStore, key: &str) -> ChannelClaimTicket {
+        ticket_for_action(store, key, "moderation.lockdown").await
+    }
+
+    async fn ticket_for_action(
+        store: &ChannelModerationStore,
+        key: &str,
+        action: &str,
+    ) -> ChannelClaimTicket {
+        match store.claim("g1", key, action, "hash", "now").await.unwrap() {
+            ChannelClaim::Claimed { ticket } => ticket,
+            other => panic!("expected winning claim, got {other:?}"),
+        }
+    }
+
+    fn finish_row(key: &str, outcome: &str) -> ChannelAuditRow {
+        let mut row = audit_row(key, "moderation.lockdown", outcome);
+        row.guild_id = "g1".to_owned();
+        row.idempotency_key = key.to_owned();
+        row.channel_id = Some("c1".to_owned());
+        row
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn channel_lane_blocks_distinct_keys_until_safe_release_or_finish() {
+        let store = test_store().await;
+        let first = ticket(&store, "first").await;
+        let second = ticket(&store, "second").await;
+        assert!(store.claim_channel(&first, "c1").await.unwrap());
+        assert!(!store.claim_channel(&second, "c1").await.unwrap());
+        assert!(store.claim_channel(&second, "c2").await.unwrap());
+        // Ambiguity simply retains first's claim/lane: a new key cannot act.
+        assert!(!store.claim_channel(&second, "c1").await.unwrap());
+        assert!(store.release(&first).await.unwrap());
+        assert!(!store.claim_channel(&first, "c1").await.unwrap());
+        assert!(store.claim_channel(&second, "c1").await.unwrap());
+        let row = finish_row("second", "locked_down");
+        assert!(store
+            .finish(&second, &row, "{\"text\":\"done\"}", None)
+            .await
+            .unwrap());
+        assert!(!store
+            .finish(&second, &row, "overwrite", None)
+            .await
+            .unwrap());
+        assert!(!store.release(&second).await.unwrap());
+        assert!(!store.claim_channel(&second, "c1").await.unwrap());
+        let third = ticket(&store, "third").await;
+        assert!(store.claim_channel(&third, "c1").await.unwrap());
+        let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(audits, 1);
+        assert_eq!(
+            store
+                .claim("g1", "second", "moderation.lockdown", "hash", "now")
+                .await
+                .unwrap(),
+            ChannelClaim::Replayed {
+                outcome: "locked_down".to_owned(),
+                result_json: "{\"text\":\"done\"}".to_owned()
+            }
+        );
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn finish_rolls_back_completion_and_lane_release_when_audit_fails() {
+        let store = test_store().await;
+        let winner = ticket(&store, "finish").await;
+        assert!(store.claim_channel(&winner, "c1").await.unwrap());
+        sqlx::query("ALTER TABLE moderation_audit ADD CONSTRAINT fail_audit CHECK (outcome <> 'locked_down')")
+            .execute(store.pool()).await.unwrap();
+        let row = finish_row("finish", "locked_down");
+        assert!(store.finish(&winner, &row, "saved", None).await.is_err());
+        assert_eq!(
+            store
+                .claim("g1", "finish", "moderation.lockdown", "hash", "now")
+                .await
+                .unwrap(),
+            ChannelClaim::InFlight
+        );
+        let rival = ticket(&store, "rival").await;
+        assert!(!store.claim_channel(&rival, "c1").await.unwrap());
+        sqlx::query("ALTER TABLE moderation_audit DROP CONSTRAINT fail_audit")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        // Retry only finalization with the original ticket, not the effect.
+        assert!(store.finish(&winner, &row, "saved", None).await.unwrap());
+        assert!(store.claim_channel(&rival, "c1").await.unwrap());
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn finish_restoration_cleanup_is_atomic_and_generation_fenced() {
+        let store = test_store().await;
+        let winner = ticket_for_action(&store, "unlock", "moderation.unlock").await;
+        assert!(store.claim_channel(&winner, "c1").await.unwrap());
+        let rec = store
+            .record_lockdown(
+                "c1",
+                "g1",
+                &crate::LockdownSeed {
+                    prior_allow: "1024".to_owned(),
+                    prior_deny: "8192".to_owned(),
+                    prior_exists: true,
+                },
+                "raid",
+                "now",
+            )
+            .await
+            .unwrap();
+        let mut stale = rec.clone();
+        stale.recovery_generation = "stale".to_owned();
+        let mut row = finish_row("unlock", "unlocked");
+        row.action = "moderation.unlock".to_owned();
+        assert!(!store
+            .finish(&winner, &row, "saved", Some(&stale))
+            .await
+            .unwrap());
+        assert_eq!(store.get_lockdown("c1").await.unwrap(), Some(rec.clone()));
+        assert_eq!(
+            store
+                .claim("g1", "unlock", "moderation.unlock", "hash", "now")
+                .await
+                .unwrap(),
+            ChannelClaim::InFlight
+        );
+        let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(audits, 0);
+        assert!(store
+            .finish(&winner, &row, "saved", Some(&rec))
+            .await
+            .unwrap());
+        assert_eq!(store.get_lockdown("c1").await.unwrap(), None);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn stale_finish_cannot_audit_or_release_a_new_claim_generation() {
+        let store = test_store().await;
+        let old = ticket(&store, "renewed").await;
+        assert!(store.claim_channel(&old, "c1").await.unwrap());
+        assert!(store.release(&old).await.unwrap());
+        let new = ticket(&store, "renewed").await;
+        assert!(store.claim_channel(&new, "c1").await.unwrap());
+        let row = finish_row("renewed", "locked_down");
+        let mut wrong_action = row.clone();
+        wrong_action.action = "moderation.unlock".to_owned();
+        assert!(!store
+            .finish(&new, &wrong_action, "wrong", None)
+            .await
+            .unwrap());
+        assert!(!store.finish(&old, &row, "old", None).await.unwrap());
+        let rival = ticket(&store, "rival").await;
+        assert!(!store.claim_channel(&rival, "c1").await.unwrap());
+        let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(audits, 0);
+        assert!(store.finish(&new, &row, "new", None).await.unwrap());
+        store.cleanup().await;
     }
 
     fn audit_row(tag: &str, action: &str, outcome: &str) -> ChannelAuditRow {

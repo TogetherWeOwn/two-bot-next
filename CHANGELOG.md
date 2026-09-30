@@ -27,6 +27,10 @@
   unlock (or a retried cleanup whose earlier result was lost) reports stale instead of
   deleting a later lockdown cycle's seed. Repeated lockdowns preserve the original
   generation alongside the original seed (migration 0122).
+- Add a durable channel-mutation lane that blocks different request keys after
+  ambiguous outcomes, plus atomic claim completion, audit insertion and confirmed
+  unlock recovery cleanup (migration 0123). Runtime router/executor wiring remains
+  in progress.
 
 ### Fixed
 
