@@ -181,30 +181,50 @@ impl BufferedPacket {
 }
 
 const MAX_PENDING_PACKETS: usize = 64;
+const FEATURE_IO_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl BufferedPacket {
+    fn is_boundary(&self) -> bool {
+        match &self.message {
+            Ok(Message::Text(text)) => serde_json::from_str::<Header>(text)
+                .map_or(true, |header| matches!(header.op, 7 | 9)),
+            Ok(Message::Close(_)) | Err(_) => true,
+        }
+    }
+}
 
 /// Poll Twilight while awaiting feature I/O, but retain dispatch order and do
 /// not advance the durable checkpoint ahead of command effects. Capture session
 /// identity at receive time: a later reconnect must not relabel buffered packets.
+/// Stop read-ahead at a reconnect boundary until the loop handles it, otherwise
+/// rebuilding a rejected shard could discard an already-buffered new session.
 async fn poll_while<S, P>(
     stream: &mut S,
     pending: &mut std::collections::VecDeque<P>,
     capture: impl Fn(&S, S::Item) -> P,
+    is_boundary: impl Fn(&P) -> bool,
     operation: impl std::future::Future<Output = Result<(), two_bot_discord::DiscordError>>,
 ) -> Result<(), sqlx::Error>
 where
     S: futures_util::Stream + Unpin,
 {
     tokio::pin!(operation);
+    let timeout = tokio::time::sleep(FEATURE_IO_MAX);
+    tokio::pin!(timeout);
+    let mut paused = pending.iter().any(&is_boundary);
     loop {
         tokio::select! {
             biased;
             result = &mut operation => return result.map_err(|_| sqlx::Error::InvalidArgument("interaction registry publish failed".into())),
-            item = stream.next() => {
+            _ = &mut timeout => return Err(sqlx::Error::InvalidArgument("gateway feature I/O deadline exceeded".into())),
+            item = stream.next(), if !paused => {
                 let item = item.ok_or_else(|| sqlx::Error::InvalidArgument("gateway ended during feature I/O".into()))?;
                 if pending.len() >= MAX_PENDING_PACKETS {
                     return Err(sqlx::Error::InvalidArgument("gateway feature backlog exceeded".into()));
                 }
-                pending.push_back(capture(stream, item));
+                let packet = capture(stream, item);
+                paused = is_boundary(&packet);
+                pending.push_back(packet);
             }
         }
     }
@@ -373,7 +393,14 @@ async fn run_loop(
                         _ => Ok(()),
                     }
                 };
-                poll_while(shard, &mut pending, BufferedPacket::capture, operation).await?;
+                poll_while(
+                    shard,
+                    &mut pending,
+                    BufferedPacket::capture,
+                    BufferedPacket::is_boundary,
+                    operation,
+                )
+                .await?;
             }
         }
         checkpoint_io(
@@ -440,6 +467,97 @@ mod tests {
             listen_addr: "0.0.0.0:8080".to_owned(),
             guild_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn feature_io_keeps_polling_and_preserves_packet_order() {
+        let mut stream = futures_util::stream::iter(0..10).chain(futures_util::stream::pending());
+        let mut pending = std::collections::VecDeque::new();
+        let polled = std::cell::Cell::new(0);
+        poll_while(
+            &mut stream,
+            &mut pending,
+            |_, packet| {
+                polled.set(polled.get() + 1);
+                packet
+            },
+            |_| false,
+            async {
+                // A sleeping feature must not prevent transport/heartbeat polling.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                assert_eq!(polled.get(), 10);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn feature_read_ahead_stops_at_reconnect_boundary() {
+        let mut stream = futures_util::stream::iter([1, 9, 2]);
+        let mut pending = std::collections::VecDeque::new();
+        for _ in 0..2 {
+            poll_while(
+                &mut stream,
+                &mut pending,
+                |_, packet| packet,
+                |packet| *packet == 9,
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(pending.iter().copied().collect::<Vec<_>>(), vec![1, 9]);
+        }
+        // The loop must process the boundary before Twilight reads a new session.
+        assert_eq!(stream.next().await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn feature_backlog_is_bounded_and_fails_closed() {
+        let mut stream = futures_util::stream::iter(0..MAX_PENDING_PACKETS + 1);
+        let mut pending = std::collections::VecDeque::new();
+        let result = poll_while(
+            &mut stream,
+            &mut pending,
+            |_, packet| packet,
+            |_| false,
+            std::future::pending(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(pending.len(), MAX_PENDING_PACKETS);
+    }
+
+    #[test]
+    fn reconnect_packets_are_read_ahead_boundaries() {
+        for text in [r#"{"op":7}"#, r#"{"op":9,"d":false}"#, "invalid"] {
+            assert!(BufferedPacket {
+                message: Ok(Message::Text(text.into())),
+                session: None,
+                resume_url: None,
+            }
+            .is_boundary());
+        }
+        assert!(BufferedPacket {
+            message: Ok(Message::Close(None)),
+            session: None,
+            resume_url: None,
+        }
+        .is_boundary());
+        assert!(!BufferedPacket {
+            message: Ok(Message::Text(r#"{"op":0,"s":2,"t":"RESUMED"}"#.into())),
+            session: None,
+            resume_url: None,
+        }
+        .is_boundary());
     }
 
     #[test]

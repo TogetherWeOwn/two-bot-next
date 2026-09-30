@@ -12,7 +12,9 @@ use sqlx::{
 };
 use twilight_model::application::interaction::Interaction;
 use two_bot_core::{ClassifierConfig, InteractionRouter, RouterGates};
-use two_bot_discord::{rsvp::handle_rsvp_interaction, ActionExecutor};
+use two_bot_discord::{
+    interactions::InteractionRuntime, rsvp::handle_rsvp_interaction, ActionExecutor,
+};
 
 const GUILD: &str = "1545644954272137297";
 const EVENT: &str = "1546451670500642999";
@@ -175,16 +177,20 @@ fn assert_reply(mock: &MockRest, content: &str, deferred: bool) {
     }
 }
 
+fn runtime(pool: &Pool<Postgres>, mock: &MockRest) -> InteractionRuntime {
+    InteractionRuntime {
+        router: router(),
+        pool: pool.clone(),
+        executor: executor(mock),
+        classifier: ClassifierConfig::default(),
+    }
+}
+
 async fn run(pool: &Pool<Postgres>, mock: &MockRest, interaction: &Interaction) {
-    assert!(handle_rsvp_interaction(
-        &router(),
-        pool,
-        &executor(mock),
-        &ClassifierConfig::default(),
-        interaction
-    )
-    .await
-    .expect("handler execution"));
+    assert!(runtime(pool, mock)
+        .handle(interaction)
+        .await
+        .expect("handler execution"));
 }
 
 #[tokio::test]
@@ -292,10 +298,8 @@ async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
             "Unable to validate scheduled event.",
         ),
         (event(9), "Unable to validate scheduled event."),
-        (
-            ScriptedResponse::status(403),
-            "Unable to validate scheduled event.",
-        ),
+        // The shared executor deliberately collapses forbidden and missing reads.
+        (ScriptedResponse::status(403), "Scheduled event not found."),
     ] {
         for interaction in [
             rsvp(200, "going"),
@@ -483,6 +487,84 @@ async fn malformed_inputs_and_failed_ack_do_not_write() {
     assert_eq!(counts(&pool).await, (0, 0, 0));
     cleanup(pool, schema).await;
     denied.shutdown().await;
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_final_reply_does_not_retry_committed_effects() {
+    let Some((pool, schema)) = pool().await else {
+        return;
+    };
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            ScriptedResponse::status(500),
+            // Discord refuses a repeated acknowledgement for the same interaction.
+            ScriptedResponse::status(400),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(500),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(200),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&pool, &mock);
+    let interaction = rsvp(600, "going");
+    assert!(runtime.handle(&interaction).await.is_err());
+    assert_eq!(counts(&pool).await, (1, 1, 0));
+    assert_eq!(mock.requests().len(), 3);
+    assert!(runtime.handle(&interaction).await.is_err());
+    assert_eq!(counts(&pool).await, (1, 1, 0));
+    assert_eq!(mock.requests().len(), 4);
+
+    assert!(runtime
+        .handle(&attendance(601, MANAGE_EVENTS, USER, "weekly"))
+        .await
+        .is_err());
+    assert_eq!(counts(&pool).await, (1, 1, 1));
+    assert_eq!(mock.requests().len(), 6);
+    assert!(runtime
+        .handle(&attendance(602, MANAGE_EVENTS, USER, "weekly"))
+        .await
+        .unwrap());
+    assert_reply(
+        &mock,
+        &two_bot_core::checkin_duplicate_text(USER, "weekly"),
+        true,
+    );
+    assert_eq!(counts(&pool).await, (1, 1, 1));
+    cleanup(pool, schema).await;
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_runtime_publishes_complete_registry_once() {
+    let Some((pool, schema)) = pool().await else {
+        return;
+    };
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!([]))).await;
+    runtime(&pool, &mock).publish(1111).await.unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "PUT");
+    assert_eq!(
+        requests[0].path,
+        format!("/api/v10/applications/1111/guilds/{GUILD}/commands")
+    );
+    let commands: Vec<Value> = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(commands.len(), router().publish_set(&[]).unwrap().len());
+    for name in ["attendance", "rsvp", "rsvp-attendance"] {
+        assert_eq!(commands.iter().filter(|c| c["name"] == name).count(), 1);
+    }
+    let attendance = commands.iter().find(|c| c["name"] == "attendance").unwrap();
+    assert_eq!(
+        attendance["default_member_permissions"],
+        MANAGE_EVENTS.to_string()
+    );
+    assert_eq!(counts(&pool).await, (0, 0, 0));
+    cleanup(pool, schema).await;
     mock.shutdown().await;
 }
 
