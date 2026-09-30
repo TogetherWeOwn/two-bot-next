@@ -49,6 +49,9 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: offline build-cache safety regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -84,19 +87,18 @@ jobs:
           # Host-runner steps reach only this job's published service port.
           # Keep the test guards' required hostname instead of weakening them.
           printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
-          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_tog10090_rsvp_ci
-          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_tog10090_ci
+          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_ci
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
-      # RSVP's unique schemas live in a different database from website resets.
+      # Migrated suites create/drop unique databases; this bootstrap is not reset.
       - name: cargo test (unit and binary, including RSVP store)
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_rsvp_ci
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
 
       - name: cargo test (integration, including website acceptance)
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_ci
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --test '*' --features two-bot-core/db --locked
 
       - name: cargo test (docs)
@@ -109,13 +111,11 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
-      - name: leveling Postgres parity tests
-        env:
-          TWO_LEVELING_TEST_CI: '1'
-        run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
-
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
+
+      - name: legacy copy acceptance (two owned databases on CI service only)
+        run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
 
       - name: channel moderation store clippy
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
@@ -128,13 +128,14 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
 
-      - name: Internal-action durable store regressions (CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-core --features db --locked --test internal_action_store -- --ignored
-
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
+
+      - name: Sticky runtime acceptance tests (CI service only)
+        run: cargo test -p two-bot --locked sticky_runtime_tests -- --ignored --test-threads=1
+
+      - name: Real binary lifecycle acceptance (CI service only, under 60 s)
+        run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
@@ -227,6 +228,8 @@ jobs:
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
       - name: check env bindings are explicit
         run: python3 scripts/check-env-bindings.py wrangler.toml
+      - name: Verify frozen legacy registry export preconditions
+        run: node --test ../scripts/test-export-legacy-registry.mjs
       - name: Verify PR lint event and dispatch paths
         run: python3 ../scripts/test-pr-lint.py
       - name: Verify release reconciliation retries
@@ -235,3 +238,4 @@ jobs:
         run: |
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
+          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs

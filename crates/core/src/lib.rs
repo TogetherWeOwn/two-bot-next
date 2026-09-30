@@ -5,6 +5,7 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod action_outcomes;
 pub mod audit;
 #[cfg(feature = "db")]
 pub mod audit_store;
@@ -69,6 +70,12 @@ pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
 
+pub use action_outcomes::{
+    backoff_ms, classify_kick_status, clear_send_bit, lockdown_overwrite, pace_wait_ms,
+    parse_retry_after_secs, retry_after_ms, set_send_bit, unlock_overwrite, ActionOutcome,
+    KickOutcome, KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
+    MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
+};
 pub use automod::{
     match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
     AutomodExportError, AutomodExportRule, AutomodFilter, AutomodGateError, AutomodMessage,

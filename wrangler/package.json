@@ -7,7 +7,12 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import ./test/cloudflare-loader.mjs --test test/*.test.ts",
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev",
+    "versions": "wrangler versions",
+    "deployments": "wrangler deployments",
+    "rollback": "wrangler rollback",
+    "logs": "wrangler tail",
+    "containers": "wrangler containers"
   },
   "dependencies": {
     "@cloudflare/containers": "0.3.7"
