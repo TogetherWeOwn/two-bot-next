@@ -101,12 +101,12 @@ gates for that integration. Current-public-surface findings are marked explicitl
 | STRIDE | Concrete threat / boundary | Existing control | Residual risk / required evidence |
 | --- | --- | --- | --- |
 | Spoofing | Forge a website request or enumerate accepted key IDs | HMAC-SHA256 on exact bytes; unknown key uses a random decoy; unknown ID and wrong signature return the same auth refusal | Receiver must reject duplicate/coalesced auth headers and preserve values. No user identity or per-principal action scope is supplied by HMAC. P1 F1/F2. |
-| Spoofing | Replay a capture on another environment or under a rotating identity | Timestamp/skew and global nonce burn; durable identity contract requires a stable logical caller | Canonical MAC has no host, environment or caller ID; never reuse secrets across environments or aliases. Preserve nonce and intent ledgers during rotation. F2/F3. |
+| Spoofing | Replay a capture on another environment, under a rotating identity, or after clock rollback | Timestamp/skew and global nonce burn; durable identity contract requires a stable logical caller | Canonical MAC has no host, environment or caller ID; never reuse secrets across environments or aliases. Preserve ledgers during rotation. Expiry then rollback can reopen freshness after a nonce is forgotten; TTL alone is not a clock policy. F2/F3/F8. |
 | Tampering | Change body/action or exploit different HTTP/JSON parsers | MAC signs raw-body SHA256, not parsed/reencoded JSON; validators and allowlists refuse bad fields | `Idempotency-Key` is not signed; trusted transport is required. Duplicate JSON keys are not explicitly refused. Bound collection before hashing and test proxy/path/method semantics. F1/F3. |
 | Tampering | Bypass role/channel maps, foreign-guild fence or protected-target policy | Symbolic role/channel keys, catalog-only settings, moderation adjudication and guild-fenced persistence exist in libraries | Receiver must call every relevant validator and obtain trusted live permission/hierarchy facts; `authorize` alone does not validate action fields. P1 F2. |
 | Repudiation | Retry a destructive action after an ambiguous outcome, or lose audit linkage | Store commits scalar intent and audit atomically; only `Claimed` allows execution; stale/unknown claims require reconciliation | Async store seam is not wired. Request/actor IDs need trusted derivation; no arbitrary provider JSON in terminal records. P1 F2, F5. |
 | Information disclosure | Leak OAuth/bot/signing/DB credentials via errors, tracing or settings | Redacted key/decision Debug, catalog denies environment-only/unknown settings, typed store errors/results | HTTP rejection logger is not implemented. Logging full headers/body/error chains would undo minimization. Source does not prove runtime TLS/custody. F4/F6. |
-| Denial of service | Public probes wake/pin singleton Container or consume pool/crypto/memory | DO path allowlist, six-second readiness probe, redirect bucket, pool/timeouts | Probes have no application auth/rate gate; redirects' isolate bucket is not a global edge limit. Action body cap runs after HMAC and nonce burn; authenticated nonce flood precedes key bucket. F1/F7. |
+| Denial of service | Public probes wake/pin singleton Container or consume pool/crypto/memory | DO path allowlist, six-second readiness probe, redirect bucket, pool/timeouts | Probes have no application auth/rate gate; redirects' isolate bucket is not a global edge limit and its caller map has no cap or expiry, even for 404s. Action body cap runs after HMAC and nonce burn; authenticated nonce flood precedes key bucket. F1/F7. |
 | Denial of service | Spend the same clock interval twice in an action bucket | This change keeps a last-seen clock high-water mark | New regression covers both bucket specs; restart/multi-instance buckets are still local. Future receiver needs bounded ingress/concurrency. F7. |
 | Elevation of privilege | Compromised signer invokes all enabled verbs or changes its own gates | Environment-only approval flags; settings catalog denies `TWO_INTERNAL_*`, `TWO_MODERATION`, secrets and unknown keys; overwrite requires a second flag | Keys have no per-caller capabilities. Mapped roles/configured channels and allowed hot/cold settings still carry privilege; validate policy before enabling. P1 F2. |
 | Elevation of privilege | Treat public wildcard health bind as an approved actions bind | `assert_private_bind` rejects wildcard/public/hostname addresses with no override | Current health listener is deliberately `0.0.0.0`; never reuse it for an unguarded receiver or weaken the bind guard to fit the Worker. P1 F1. |
@@ -179,16 +179,31 @@ are currently parseable but remain distinct signed bytes. ±121, signs, decimal
 fractions, trailing spaces and non-ASCII digits refuse. Both the millisecond and
 whole-second clocks must come from one trusted clock sample, not request data.
 
-A timestamp can remain acceptable across 240 whole seconds plus a fractional
+**With freshness and expiry clocks advancing together without rollback**, a
+timestamp can remain acceptable across 240 whole seconds plus a fractional
 second. Hence the nonce retention minimum is `2 * skew + 1 = 241` seconds, **not
 240**. The in-memory guard keeps a nonce through its inclusive TTL boundary and
 rejects short TTL/wider skew configurations. It is global across key IDs but
-lost on restart. Durable burns store a global nonce digest; expiry replacement
-is atomic and freshness is rechecked against DB time after lock/pool waits
+lost on restart. Saturating subtraction refuses rollback while the nonce is
+still retained; **it cannot restore a nonce already swept**. For example, accept
+at `t`, sweep at `t + 241001 ms`, then roll wall time back to `t`: the original
+capture is fresh again and the synchronous pipeline accepts it. A new fresh
+request's `offer` can perform the same sweep. This is a characterized gap, not
+remediation; finite TTL alone does not establish replay safety under rollback.
+
+Durable burns store a global nonce digest; expiry replacement is atomic and
+freshness is rechecked against DB time after lock/pool waits
 (`crates/core/src/internal_action_store.rs:241`). Only committed `Ok(true)`
-allows continuation; DB errors and ambiguous outcomes refuse. The route must
-insert that async burn **between** signature/freshness and buckets/body parsing,
-not call it only after the current synchronous `authorize` helper.
+allows continuation; DB errors and ambiguous outcomes refuse. DB time rechecking
+also depends on a clock policy: rollback between the expiry predicate and the
+freshness sample can make an old capture fresh again. Existing durable rows are
+not automatically pruned, so ordinary rollback while a row is retained is not
+the memory-sweep case; future cleanup must not reopen it. These durable clock
+cases were assessed from source, not executed against a database. F8 requires
+explicit fail-closed freshness/expiry behavior across rollback, restart and
+failover before receiver activation. The route must insert that async burn **between**
+signature/freshness and buckets/body parsing, not call it only after the current
+synchronous `authorize` helper.
 
 Nonce burn precedes parsing, allowlist and key bucket: an authenticated request
 that is malformed, disabled, oversized or rate-limited has spent its nonce. A
@@ -212,9 +227,13 @@ change the legacy canonical format.
   returns 429 with `Retry-After >= 1`. Bad signatures do not allocate buckets or
   burn nonces; key-ID spoofing cannot exhaust a real caller's bucket.
 - The bucket clock now retains its observed high-water mark on rollback rather
-  than crediting recovery twice. Buckets are per-process and key-ID scoped;
-  restart, horizontal scaling or rotation aliases can multiply quota. They are
-  not a global guild budget or unauthenticated ingress defense.
+  than crediting recovery twice. `Retry-After` rounds up the **combined** time to
+  recover that mark and refill the missing token. Exhaust at 10000 ms and deny
+  at 9000 ms: default waits 2 seconds, add-member 3 seconds, not 1 and 2. This
+  assumes the clock then advances normally and no competing request consumes
+  the refill. Buckets are per-process and key-ID scoped; restart, horizontal
+  scaling or rotation aliases can multiply quota. They are not a global guild
+  budget or unauthenticated ingress defense.
 - The **2 MiB inclusive body cap** currently lives in body parsing, after raw
   bytes have already been collected/hashed. It does not bound HTTP collection,
   crypto work, decompression or connection concurrency. Nonce insertion also
@@ -222,8 +241,16 @@ change the legacy canonical format.
   or the cost of the in-memory full-map sweep. Bound ingress separately (F1/F7).
 - Redirects use a separate per-isolate/per-caller **60 burst, 1/second** bucket
   (`wrangler/src/redirect.ts:105`) and validated invite codes with a fixed Discord
-  destination host (`:74`). Neither this nor `max_instances=1` proves global rate
-  enforcement. Source shows no application gate on public health/readiness.
+  destination host (`:74`). **The caller map has no size cap, idle expiry or
+  eviction**: every distinct caller reaching the throttle allocates retained
+  state before slug validation/lookup, including unknown-path 404s (`:189`). A
+  many-caller client population can grow isolate memory indefinitely until
+  recycle; spoof resistance of caller identification does not cap cardinality.
+  Local handler fixtures retained 4096 synthetic callers after 404s, then 4097
+  after another caller at 30 simulated idle days; no live load was sent. F7
+  requires bounded caller state and safe eviction/overflow behavior. Neither
+  this bucket nor `max_instances=1` proves global rate enforcement. Source shows
+  no application gate on public health/readiness.
 - Executor clones share 110 ms general / 350 ms kick pacing. Internal moderation
   mutations are one attempt with a five-second timeout and no automatic retry;
   generic paced GET/kick helpers have different retry semantics and 429 waits
@@ -287,7 +314,9 @@ was executed. Never hunt for or substitute credentials after an auth failure.
 5. After all signers have switched, drain in-flight requests and allow the last
    old-signed timestamp's complete acceptance interval to close (conservatively
    at least 241 seconds after the last possible old signing, plus bounded
-   transport/clock uncertainty). This interval is not permission to keep a
+   transport/clock uncertainty, under the verified F8 clock policy). Elapsed
+   time alone is not proof of closure if freshness clocks can roll back.
+   This interval is not permission to keep a
    compromised key active: incident revocation takes priority, with explicit
    outage/retry consequences.
 6. Under the same authorization, retire the old receiver key and verify old ID
@@ -302,7 +331,8 @@ intents remain scoped to the stable caller and reconcile without reexecution.
 
 ## Regression evidence and follow-up proposals
 
-Eight new tests in `crates/core/src/internal_actions.rs` pin cheap domain controls:
+Ten new tests in `crates/core/src/internal_actions.rs` pin cheap domain controls
+and characterize the remaining clock-policy gap:
 
 - `signing_preserves_header_values_and_raw_body_bytes`: changed key-ID case,
   timestamp/nonce representation, signature whitespace and JSON-equivalent body
@@ -321,6 +351,13 @@ Eight new tests in `crates/core/src/internal_actions.rs` pin cheap domain contro
   IPv6 and adjacent private/public ranges cannot bypass the literal guard.
 - `buckets_clock_rollback_does_not_refill_spent_tokens_twice`: both bucket specs
   refuse rollback/recovery double-credit, then refill only after new elapsed time.
+- `buckets_retry_after_includes_clock_recovery_and_refill`: both bucket specs
+  include rollback recovery, combine fractional recovery/refill before rounding,
+  and allow the next call after the advertised wait without competing traffic.
+- `pipeline_clock_rollback_after_nonce_expiry_reopens_capture`: retained nonce
+  refuses rollback; after explicit sweep or another fresh request's sweep, the
+  old capture is accepted when wall time rolls back. This regression records
+  the known F8 gap; it does **not** demonstrate rollback-safe replay prevention.
 
 These are source regressions, not HTTP, deployment or DB acceptance tests.
 Existing durable-store CI covers transaction races/restarts/ambiguous outcomes.
@@ -338,10 +375,11 @@ Remaining proposals are intentionally **not implemented** here:
 | F4 / P2 rejection telemetry | Receiver implementer: scalar structured logger with bounded labels/suppression | Capture every rejection class with token/body/SQL marker fixtures; no marker or full input escapes and rejection flood stays bounded. |
 | F5 / P2 action-specific safety | Action owners: mapped event ownership, automation import schema/cardinality/overwrite transaction, key-specific setting validation, tempban recovery and lockdown/unlock overwrite serialization | Unmapped events, excessive imports, protected roles, invalid setting types, conflicting channel intents and unknown outcomes fail closed; legitimate operation/reconciliation has scalar evidence. |
 | F6 / P1 deployment gate | Deployment owner with CISO: verify secret custody, per-environment guild/DB/key bindings, least-privilege DB role and mandatory authenticated TLS for Neon | Record non-secret binding/TLS/role receipts on the deployment card; test only fixtures/CI or explicitly authorized staging. Source URL-prefix validation is not TLS or isolation proof. |
-| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: edge probe limits, global guild/caller quotas, bounded nonce/intent growth and total REST deadlines; preserve gateway resources | Local load fixtures prove bounded collection/state/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. No destructive live load tests. |
+| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: edge probe limits, global guild/caller quotas, bounded redirect caller-map/nonce/intent growth and total REST deadlines; preserve gateway resources | Local many-caller fixtures, including invalid-slug/unknown-campaign 404s and long simulated idle intervals, prove a fixed caller-state ceiling and idle reclamation. Define eviction/overflow behavior so churn cannot reset a depleted caller's quota or create unbounded work. Also prove bounded collection/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. No destructive live load tests. |
+| F8 / P1 receiver clock-policy gate | Receiver/store owners with Security review: define fail-closed behavior for backwards freshness/expiry clocks (including DB time), bounded retention and safe recovery across restart/failover; TTL coverage is conditional | Accept a capture, expire/sweep/replace its nonce, then roll time back into its signed window: memory and durable paths must refuse, including across instance restart/failover and lock waits. Record the trusted clock/high-water or equivalent policy and recovery criteria; cleanup must not erase replay protection. Legitimate traffic resumes only under that verified policy. |
 
-F1/F2 are requirements for the existing receiver slice, not new route work in this
-PR. F6 is evidence required at deployment, not authorization to touch secrets.
+F1/F2/F8 are requirements for the existing receiver slice, not new route work in
+this PR. F6 is evidence required at deployment, not authorization to touch secrets.
 The other rows are follow-up proposals, not granted resources, new holds on
 unrelated staging work or claims of completed remediation. Update this model and
 its regression inventory when a route, action, identity mapping, storage/retention

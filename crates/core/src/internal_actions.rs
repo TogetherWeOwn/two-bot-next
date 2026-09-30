@@ -62,7 +62,9 @@ pub const SKEW_SECONDS: u64 = 120;
 /// [`within_skew`] compares in whole seconds, so a signed timestamp stays
 /// fresh up to a second past its nominal skew distance, and a nonce burned at
 /// delivery must still be live then. 241 s is the smallest TTL that covers
-/// every accepted instant for the default skew.
+/// every accepted instant for the default skew while the clocks advance together
+/// without rollback. Expiry followed by wall-clock rollback can reopen freshness;
+/// the receiver needs an explicit clock policy (see `docs/threat-model.md`, F8).
 pub const NONCE_TTL_SECONDS: u64 = 241;
 /// Diagnostic cutoff for `in_flight` idempotency claims (legacy
 /// `CLAIM_STALE_SECONDS`). Durable stale claims require reconciliation, never
@@ -316,6 +318,10 @@ pub fn valid_nonce_format(nonce: &str) -> bool {
 /// constructor below enforces `ttl >= 2 * skew + 1` and fails loudly
 /// otherwise. Expiry is exclusive on both paths (`offer` and `sweep`),
 /// keeping them consistent: a nonce is live while `now - seen <= ttl`.
+/// This coverage assumes expiry and freshness clocks advance together without
+/// rollback. Saturating subtraction protects retained entries, not entries already
+/// swept; wall-clock rollback can make an expired capture fresh again. The receiver
+/// must supply a clock policy rather than treating TTL coverage as unconditional.
 #[derive(Debug, Clone)]
 pub struct NonceCache {
     seen: HashMap<String, u64>,
@@ -470,7 +476,10 @@ impl TokenBuckets {
                 retry_after_secs: 0,
             };
         }
-        let wait = ((1.0 - bucket.tokens) / spec.refill_per_second).ceil() as u64;
+        // Refill cannot resume until a rolled-back clock reaches the high-water
+        // mark. Retry-After must include that recovery as well as the token wait.
+        let recovery = bucket.updated_ms.saturating_sub(now_ms) as f64 / 1000.0;
+        let wait = (recovery + (1.0 - bucket.tokens) / spec.refill_per_second).ceil() as u64;
         BucketDecision {
             allowed: false,
             retry_after_secs: wait.max(1),
@@ -1967,6 +1976,36 @@ mod tests {
     }
 
     #[test]
+    fn buckets_retry_after_includes_clock_recovery_and_refill() {
+        for (spec, empty_wait, partial_wait) in [(DEFAULT_BUCKET, 2, 1), (ADD_MEMBER_BUCKET, 3, 2)]
+        {
+            for rollback_ms in [9_000, 9_250, 9_999] {
+                let mut buckets = TokenBuckets::new();
+                for _ in 0..spec.capacity as usize {
+                    assert!(buckets.take("k", spec, 10_000).allowed);
+                }
+                let denied = buckets.take("k", spec, rollback_ms);
+                assert!(!denied.allowed);
+                assert_eq!(denied.retry_after_secs, empty_wait);
+                let retry_ms = rollback_ms + denied.retry_after_secs * 1000;
+                assert!(buckets.take("k", spec, retry_ms).allowed);
+            }
+
+            // Round the combined recovery/refill interval, not each separately.
+            let mut buckets = TokenBuckets::new();
+            for _ in 0..spec.capacity as usize {
+                assert!(buckets.take("k", spec, 10_000).allowed);
+            }
+            assert!(!buckets.take("k", spec, 10_500).allowed);
+            let denied = buckets.take("k", spec, 10_250);
+            assert!(!denied.allowed);
+            assert_eq!(denied.retry_after_secs, partial_wait);
+            let retry_ms = 10_250 + denied.retry_after_secs * 1000;
+            assert!(buckets.take("k", spec, retry_ms).allowed);
+        }
+    }
+
+    #[test]
     fn error_code_table() {
         let cases = [
             (ErrorCode::Malformed, 400, false),
@@ -2695,6 +2734,77 @@ mod tests {
                 assert!(nonces.is_empty());
                 assert!(buckets.buckets.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn pipeline_clock_rollback_after_nonce_expiry_reopens_capture() {
+        // Characterize the clock-policy gap, not a deployed replay guarantee:
+        // once swept, a nonce cannot guard a capture made fresh by wall rollback.
+        let vector = vec1();
+        let seen_ms = 1_720_000_000_000;
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        for explicit_sweep in [true, false] {
+            let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+            let mut buckets = TokenBuckets::new();
+            authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                seen_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect("first delivery accepted");
+            let err = authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                seen_ms - 1_000,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect_err("rollback cannot bypass an entry still in memory");
+            assert_eq!(err.code, ErrorCode::Replayed);
+
+            let expired_ms = seen_ms + NONCE_TTL_SECONDS * 1000 + 1;
+            let err = authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                expired_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect_err("old capture is stale before rollback");
+            assert_eq!(err.code, ErrorCode::StaleRequest);
+            if explicit_sweep {
+                nonces.sweep(expired_ms);
+            } else {
+                let nonce = test_nonce();
+                let timestamp = (expired_ms / 1000).to_string();
+                let sig = sign(
+                    vector.secret.as_bytes(),
+                    &timestamp,
+                    &nonce,
+                    vector.body.as_bytes(),
+                );
+                let fresh = signed_headers("web", &timestamp, &nonce, &sig);
+                authorize_for_test(
+                    &fresh,
+                    vector.body.as_bytes(),
+                    expired_ms,
+                    &mut nonces,
+                    &mut buckets,
+                )
+                .expect("another fresh request sweeps expired entries via offer");
+            }
+            assert!(!nonces.seen.contains_key(&vector.nonce));
+            authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                seen_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect("known gap: expiry then rollback makes the capture acceptable again");
         }
     }
 
