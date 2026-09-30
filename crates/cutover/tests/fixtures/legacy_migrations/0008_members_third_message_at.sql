@@ -1,0 +1,24 @@
+-- 0008_members_third_message_at: make AM7's text half exact (TWO-95).
+--
+-- AM7 is "first voice session OR 3 or more messages, within 7 days of joining".
+-- Until now `members` held first_message_at and nothing else, so the text half
+-- admitted anyone who had posted at all. That made the whole metric an UPPER
+-- BOUND - 79 of 166 all-time AM7 members rested on that proxy.
+--
+-- Why a timestamp and not a count. The question is "did the third message land
+-- inside the 7-day window", which a running total cannot answer: a member with
+-- 40 messages today tells you nothing about where they were on day 7. The
+-- moment the third message landed answers it exactly, and it is a value that
+-- only ever gets written once, so it cannot drift.
+--
+-- The ladder position itself is NOT stored here. It is derivable from the
+-- funnel log - first_message / second_message / third_message are once-per-
+-- member events - which keeps `members` a pure projection of `events`, per the
+-- rule in that table's header. This column is the projection of the
+-- `third_message` event, exactly as first_message_at is of `first_message`.
+--
+-- Additive and nullable, so the old code keeps running against this schema
+-- during the deploy (migrations/README.md rule 2). NULL is not "zero messages";
+-- it is "no third message on file", and the report says which it is.
+
+ALTER TABLE members ADD COLUMN IF NOT EXISTS third_message_at TEXT;
