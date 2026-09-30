@@ -316,7 +316,8 @@ mod tests {
             let replacement = if altered.as_bytes()[last_mac_byte] == b'0' { "1" } else { "0" };
             altered.replace_range(last_mac_byte..last_mac_byte + 1, replacement);
             prop_assert!(parse_moderation_audit_reason(Some(&secret), &guild, Some(&altered)).is_none());
-            prop_assert!(parse_moderation_audit_reason(Some(&secret), &format!("{guild}0"), Some(&wire)).is_none());
+            let changed_guild = format!("{guild}0");
+            prop_assert!(parse_moderation_audit_reason(Some(&secret), &changed_guild, Some(&wire)).is_none());
         }
 
         #[test]

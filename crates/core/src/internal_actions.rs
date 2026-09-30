@@ -1648,6 +1648,23 @@ mod tests {
         }
 
         #[test]
+        fn property_valid_key_specs_round_trip_and_enforce_the_minimum(
+            entries in proptest::collection::vec(("[a-z0-9_-]{1,16}", "[a-zA-Z0-9:]{32,80}"), 1..=8),
+            length in 0usize..=64,
+        ) {
+            let wire = entries.iter().map(|(id, secret)| format!(" {id} : {secret} "))
+                .collect::<Vec<_>>().join(",");
+            let expected = entries.iter().map(|(id, secret)| SigningKey {
+                id: id.clone(), secret: secret.as_bytes().to_vec(),
+            }).collect::<Vec<_>>();
+            prop_assert_eq!(parse_keys(&wire), Ok(expected));
+            for n in [0, 1, 31, 32, 33, length] {
+                let spec = format!("fixture:{}", "a".repeat(n));
+                prop_assert_eq!(parse_keys(&spec).is_ok(), n >= 32);
+            }
+        }
+
+        #[test]
         fn property_moderation_numbers_match_inclusive_runtime_bounds(value in any::<i64>()) {
             for (action, min, max) in [
                 (ModerationAction::TempBan, 60, 31_536_000),
