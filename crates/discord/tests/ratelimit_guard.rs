@@ -232,10 +232,7 @@ async fn global_retries_reuse_shared_deadline_across_all_retrying_lanes() {
                     }
                     "kick" => {
                         let result = executor.kick_paced("2222", "3333", "guard test").await;
-                        assert_eq!(
-                            result.outcome,
-                            two_bot_discord::executor::KickOutcome::Kicked
-                        );
+                        assert_eq!(result.outcome, two_bot_core::KickOutcome::Kicked);
                         assert_eq!(result.attempts, 2);
                     }
                     _ => executor
