@@ -58,6 +58,10 @@
 - Upgrade legacy moderation TEXT timestamps in place without reactivating
   quarantined imports, audit accepted effects before completion writes, and
   release idempotency keys after definite pre-dispatch transaction rollback.
+- Audit accepted ban PUTs before confirmation/activation and scheduled DELETEs
+  while their dispatch claims remain held; preserve the required expiry after
+  an authoritatively voided DELETE, and retry never-dispatched fence refusals
+  without releasing the older uncertain operation.
 
 ### Notes
 

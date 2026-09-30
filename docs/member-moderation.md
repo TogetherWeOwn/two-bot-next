@@ -41,7 +41,10 @@ until the shared S4 interaction router and REST executor merge.
   DELETE can still land after a new PUT. Under the member queue, only
   `resolve_uncertain_unban(request_id, claim_token, resolution)` may close this
   uncertainty. `Completed` requires proof the DELETE finished; `Void` requires
-  proof it cannot still land. Current banned status, elapsed time or cancellation
+  proof it cannot still land, and requeues a still-required accepted expiry with
+  a fresh dispatch token on its next sweep. Only an expiry replaced by a newer
+  accepted ban is superseded; voiding a DELETE does not cancel the original
+  temporary ban's expiry obligation. Current banned status, elapsed time or cancellation
   of a local task is not that proof. Disabling moderation must not abandon
   outstanding staged/pending/running or quarantined expiries.
 - S5 owns authenticated audit-reason markers and the operational audit mirror.
@@ -104,8 +107,10 @@ evidence is unavailable, retain the fence and escalate for a recorded security
 disposition. The runtime reconciliation/operator workflow is not implemented by
 this domain/store PR and must exist before enabling moderation.
 
-Accepted effects are audited before their completion writes, including scheduled
-unbans, so completion failure does not skip the audit. Audit loss is logged and
+Accepted ban PUTs are audited immediately after observed Discord acceptance,
+before ownership confirmation or expiry activation. Accepted scheduled DELETEs
+are audited under the member queue while the dispatch token is still held,
+before both normal and failed completion writes. Audit loss is logged and
 cannot cause a duplicate mutation. A completion-write failure keeps the
 destructive claim uncertain. A definite pre-dispatch transaction rollback or
 no-write result releases the idempotency key for retry; ambiguous commit or

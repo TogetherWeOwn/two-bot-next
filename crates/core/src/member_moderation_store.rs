@@ -138,7 +138,7 @@ impl PgMemberModerationStore {
         .await
         .map_err(db_error)?;
         if running {
-            return Err(StoreError::new(
+            return Err(StoreError::rolled_back(
                 "member has an uncertain dispatched unban; resolve it before banning",
             ));
         }
@@ -642,18 +642,32 @@ impl MemberModerationStore for PgMemberModerationStore {
         token: &str,
         resolution: UnbanResolution,
     ) -> Result<(), StoreError> {
-        // Authoritative close of an uncertain dispatched unban. Only a
-        // `running` row with the exact claim token resolves; anything else
-        // errors so a lost, stolen or double-resolved claim surfaces.
-        // `completed`: the DELETE provably landed, job done. `void`: it
-        // provably cannot land, so the job is superseded — clearing the
-        // staging fence without inventing an unban that never happened.
+        // Resolve only the exact dispatched operation. Voiding a DELETE
+        // preserves a trusted expiry unless a newer ACCEPTED ban replaced it;
+        // a prepared newer intent is uncertainty, not a cancelled obligation.
         let state = resolution.as_str();
         let changed = sqlx::query(
-            "UPDATE moderation_scheduled_unbans SET state =
-               CASE WHEN $3 = 'completed' THEN 'done' ELSE 'superseded' END,
-               completed_at = NOW(), claim_token = NULL
-             WHERE request_id = $1 AND state = 'running' AND claim_token = $2 AND guild_id = $4",
+            "WITH resolved AS (
+               SELECT job.request_id,
+                 CASE WHEN $3 = 'completed' THEN 'done'
+                   WHEN EXISTS (
+                     SELECT 1 FROM moderation_member_bans AS intent
+                     WHERE intent.request_id = job.request_id AND intent.guild_id = job.guild_id
+                       AND intent.user_id = job.user_id AND intent.state = 'accepted'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM moderation_member_bans AS newer
+                         WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
+                           AND newer.generation > intent.generation AND newer.state = 'accepted'
+                       )
+                   ) THEN 'pending' ELSE 'superseded' END AS state
+               FROM moderation_scheduled_unbans AS job
+               WHERE job.request_id = $1 AND job.state = 'running'
+                 AND job.claim_token = $2 AND job.guild_id = $4
+             ) UPDATE moderation_scheduled_unbans AS job SET state = resolved.state,
+               completed_at = CASE WHEN resolved.state = 'pending' THEN NULL ELSE NOW() END,
+               claimed_at = NULL, claim_token = NULL
+             FROM resolved WHERE job.request_id = resolved.request_id AND job.guild_id = $4
+               AND job.state = 'running' AND job.claim_token = $2",
         )
         .bind(request)
         .bind(token)

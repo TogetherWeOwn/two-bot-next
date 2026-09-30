@@ -1205,3 +1205,178 @@ async fn postgres_pre_dispatch_rollback_retries_and_completion_loss_keeps_audit(
     assert_eq!(discord.call_count("kick"), 1);
     cleanup(admin, pool, schema).await;
 }
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_accepted_bans_audit_before_confirmation_and_activation() {
+    let (admin, pool, schema) = database().await;
+    let store = PgMemberModerationStore::new(pool.clone(), "100000000000000001");
+    let discord = MockMemberDiscord::new();
+    let svc = MemberModerationService::new(discord.clone(), store, policy(), || 1_700_000_000_000);
+    sqlx::raw_sql(
+        "ALTER TABLE moderation_member_bans ADD CONSTRAINT refuse_confirmation
+           CHECK (request_id <> 'confirmation-loss' OR state <> 'accepted');
+         ALTER TABLE moderation_scheduled_unbans ADD CONSTRAINT refuse_activation
+           CHECK (request_id <> 'activation-loss' OR state <> 'pending');",
+    )
+    .execute(&pool)
+    .await
+    .expect("isolated post-acceptance write failures");
+    let mut counts = Vec::new();
+    for (action, id) in [
+        (ModerationAction::Ban, "confirmation-loss"),
+        (ModerationAction::TempBan, "activation-loss"),
+    ] {
+        let request = execution(action, id);
+        let error = svc
+            .execute(&request)
+            .await
+            .expect_err("accepted PUT, failed bookkeeping");
+        assert!(
+            matches!(error, two_bot_core::member_moderation::MemberError::Store(ref e) if e.message.contains("23514"))
+        );
+        assert!(matches!(
+            svc.execute(&request).await,
+            Err(two_bot_core::member_moderation::MemberError::InFlight)
+        ));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM moderation_audit WHERE request_id = $1 AND outcome = $2",
+        )
+        .bind(id)
+        .bind(if action == ModerationAction::Ban {
+            "banned"
+        } else {
+            "temporarily_banned"
+        })
+        .fetch_one(&pool)
+        .await
+        .expect("observed acceptance audit");
+        counts.push(count);
+    }
+    assert_eq!(discord.call_count("ban"), 2);
+    assert_eq!(ban_state(&pool, "confirmation-loss").await, "prepared");
+    assert_eq!(ban_state(&pool, "activation-loss").await, "accepted");
+    assert_eq!(unban_state(&pool, "activation-loss").await, "staged");
+    cleanup(admin, pool, schema).await;
+    assert_eq!(
+        counts,
+        vec![1, 1],
+        "both observed PUT acceptances must be audited independently"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_unban_audit_precedes_successful_and_failed_completion() {
+    let (admin, pool, schema) = database().await;
+    let store = PgMemberModerationStore::new(pool.clone(), "guild");
+    let discord = MockMemberDiscord::new();
+    let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+        1_700_000_000_000
+    });
+    sqlx::raw_sql(
+        "CREATE TABLE audit_observations (request_id TEXT, schedule_state TEXT, token_present BOOLEAN);
+         CREATE FUNCTION observe_unban_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.action = 'moderation.unban_scheduled' THEN
+             INSERT INTO audit_observations SELECT NEW.request_id, state, claim_token IS NOT NULL
+             FROM moderation_scheduled_unbans WHERE request_id = NEW.idempotency_key;
+           END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER observe_unban_audit BEFORE INSERT ON moderation_audit
+           FOR EACH ROW EXECUTE FUNCTION observe_unban_audit();
+         ALTER TABLE moderation_scheduled_unbans ADD CONSTRAINT refuse_completion
+           CHECK (request_id <> 'completion-loss' OR state <> 'done');",
+    ).execute(&pool).await.expect("observe state at the audit boundary");
+    let mut observations = Vec::new();
+    for request in ["completion-loss", "success"] {
+        accepted_unban(&store, "guild", request, request, NOW, NOW).await;
+        let result = svc.run_due_unbans("guild").await;
+        if request == "completion-loss" {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap(), 1);
+        }
+        let row = sqlx::query(
+            "SELECT schedule_state, token_present FROM audit_observations WHERE request_id = $1",
+        )
+        .bind(format!("{request}:unban"))
+        .fetch_one(&pool)
+        .await
+        .expect("audit attempted for accepted DELETE");
+        observations.push((
+            row.get::<String, _>("schedule_state"),
+            row.get::<bool, _>("token_present"),
+        ));
+    }
+    assert_eq!(unban_state(&pool, "completion-loss").await, "running");
+    assert_eq!(unban_state(&pool, "success").await, "done");
+    assert_eq!(discord.call_count("unban"), 2);
+    cleanup(admin, pool, schema).await;
+    assert_eq!(
+        observations,
+        vec![("running".into(), true), ("running".into(), true)]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_void_requeues_current_expiry_and_fence_refusal_releases_only_new_key() {
+    use two_bot_core::member_moderation::{MemberError, UnbanResolution};
+    let (admin, pool, schema) = database().await;
+    let guild = "100000000000000001";
+    let user = "333333333333333333";
+    let store = PgMemberModerationStore::new(pool.clone(), guild);
+    let discord = MockMemberDiscord::new();
+    let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+        1_700_000_000_000
+    });
+    let mut safe_refusals = Vec::new();
+    for (i, action) in [ModerationAction::Ban, ModerationAction::TempBan]
+        .into_iter()
+        .enumerate()
+    {
+        let old = format!("old-{i}");
+        accepted_unban(&store, guild, user, &old, NOW, NOW).await;
+        discord.fail_with("unban", DiscordError::Timeout);
+        assert!(matches!(
+            svc.run_due_unbans(guild).await,
+            Err(MemberError::Discord(DiscordError::Timeout))
+        ));
+        let token: String = sqlx::query_scalar(
+            "SELECT claim_token FROM moderation_scheduled_unbans WHERE request_id = $1",
+        )
+        .bind(&old)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let fresh = execution(action, &format!("fresh-{i}"));
+        let error = svc
+            .execute(&fresh)
+            .await
+            .expect_err("old dispatch still fenced");
+        safe_refusals.push(matches!(error, MemberError::Store(ref e) if e.is_safe_pre_mutation()));
+        assert_eq!(unban_state(&pool, &old).await, "running");
+        assert!(store.owns_unban_claim(&old, &token).await.unwrap());
+        assert!(store
+            .resolve_uncertain_unban(&old, "wrong", UnbanResolution::Void)
+            .await
+            .is_err());
+        store
+            .resolve_uncertain_unban(&old, &token, UnbanResolution::Void)
+            .await
+            .expect("exact DELETE cannot land");
+        let pending = unban_state(&pool, &old).await;
+        discord.clear_failure("unban");
+        let sweep = svc.run_due_unbans(guild).await.unwrap();
+        let retried = svc.execute(&fresh).await;
+        safe_refusals.push(pending == "pending" && sweep == 1 && retried.is_ok());
+    }
+    cleanup(admin, pool, schema).await;
+    assert_eq!(
+        safe_refusals,
+        vec![true; 4],
+        "preserve expiry and retry the never-dispatched key"
+    );
+}

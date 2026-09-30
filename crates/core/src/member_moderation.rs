@@ -321,8 +321,8 @@ pub struct UnbanJob {
 pub enum UnbanResolution {
     /// The dispatched DELETE provably landed: close the job as done.
     Completed,
-    /// The dispatched DELETE provably cannot land: supersede the job so new
-    /// bans for the member may proceed.
+    /// The dispatched DELETE provably cannot land: requeue a still-required
+    /// accepted expiry, or supersede one replaced by a newer accepted ban.
     Void,
 }
 
@@ -846,22 +846,14 @@ where
             }
         };
 
-        // Discord accepted the action: persist the observed-success audit
-        // FIRST, independently of the completion write. If completion fails
-        // afterward the claim stays uncertain (correct), but the audit of a
-        // successful destructive action already exists. The audit write is
-        // idempotent on `request_id`, so a retry never duplicates it — and a
-        // retry stays `InFlight`, never a second Discord call.
-        if let Err(err) = self
-            .store
-            .record_audit(&self.audit_row(exec, validated, outcome))
-            .await
-        {
-            tracing::error!(
-                request_id = exec.request_id.as_str(),
-                error = err.message.as_str(),
-                "moderation_audit_failed"
-            );
+        // Ban acceptance is audited at the PUT boundary, before confirmation
+        // or expiry activation can fail. Other effects have no intervening
+        // ownership writes, so audit their acceptance here before completion.
+        if !matches!(
+            validated.action,
+            ModerationAction::Ban | ModerationAction::TempBan
+        ) {
+            self.audit_accepted(exec, validated, outcome).await;
         }
         self.store
             .complete(
@@ -898,8 +890,7 @@ where
                         &format_iso_millis((self.now)()),
                     )
                     .await?;
-                self.dispatch_ban(exec, target_id, &validated.reason)
-                    .await?;
+                self.dispatch_ban(exec, target_id, validated).await?;
                 Ok(MemberOutcome::Banned)
             }
             ModerationAction::TempBan => {
@@ -924,8 +915,7 @@ where
                         &format_iso_millis((self.now)()),
                     )
                     .await?;
-                self.dispatch_ban(exec, target_id, &validated.reason)
-                    .await?;
+                self.dispatch_ban(exec, target_id, validated).await?;
                 self.store
                     .activate_staged_unban(
                         &exec.guild_id,
@@ -975,9 +965,13 @@ where
         &self,
         exec: &MemberExecution,
         target: &str,
-        reason: &str,
+        validated: &ValidatedMemberRequest,
     ) -> Result<(), MemberError> {
-        if let Err(err) = self.discord.ban(&exec.guild_id, target, reason).await {
+        if let Err(err) = self
+            .discord
+            .ban(&exec.guild_id, target, &validated.reason)
+            .await
+        {
             if err.is_safe_pre_mutation() {
                 self.store
                     .reject_ban(
@@ -990,6 +984,15 @@ where
             }
             return Err(MemberError::Discord(err));
         }
+        // Observe the accepted PUT independently of every later ledger write.
+        // A failed confirmation/activation must retain the uncertain claim,
+        // not skip this audit or repeat the destructive effect.
+        let outcome = if validated.action == ModerationAction::TempBan {
+            MemberOutcome::TemporarilyBanned
+        } else {
+            MemberOutcome::Banned
+        };
+        self.audit_accepted(exec, validated, outcome).await;
         self.store
             .confirm_ban(
                 &exec.guild_id,
@@ -999,6 +1002,25 @@ where
             )
             .await?;
         Ok(())
+    }
+
+    async fn audit_accepted(
+        &self,
+        exec: &MemberExecution,
+        validated: &ValidatedMemberRequest,
+        outcome: MemberOutcome,
+    ) {
+        if let Err(err) = self
+            .store
+            .record_audit(&self.audit_row(exec, validated, outcome))
+            .await
+        {
+            tracing::error!(
+                request_id = exec.request_id.as_str(),
+                error = err.message.as_str(),
+                "moderation_audit_failed"
+            );
+        }
     }
 
     fn audit_row(
@@ -1024,8 +1046,7 @@ where
     }
 
     async fn run_unban_job(&self, job: &UnbanJob) -> Result<bool, MemberError> {
-        let acted = self
-            .store
+        self.store
             .serialize_member(&job.guild_id, &job.user_id, || async {
                 if !self
                     .store
@@ -1053,22 +1074,13 @@ where
                 // independently of the completion write. If completion fails
                 // afterward the claim stays `running` (uncertain, correct),
                 // but the audit of the successful unban already exists.
-                if let Err(err) = self
-                    .store
+                self.audit_unban_job(job).await;
+                self.store
                     .complete_unban(&job.request_id, &job.claim_token)
-                    .await
-                {
-                    self.audit_unban_job(job).await;
-                    return Err(MemberError::Store(err));
-                }
+                    .await?;
                 Ok(true)
             })
-            .await?;
-        if !acted {
-            return Ok(false);
-        }
-        self.audit_unban_job(job).await;
-        Ok(true)
+            .await
     }
 
     /// Best-effort audit of a dispatched scheduled unban. Idempotent on the
@@ -1187,7 +1199,7 @@ impl MemInner {
         if self.unbans.values().any(|row| {
             row.guild_id == guild && row.user_id == user && row.state == UnbanState::Running
         }) {
-            return Err(StoreError::new(
+            return Err(StoreError::rolled_back(
                 "member has an uncertain dispatched unban; resolve it before banning",
             ));
         }
@@ -1701,6 +1713,17 @@ impl MemberModerationStore for MemMemberStore {
         resolution: UnbanResolution,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
+        // A void dispatch is not a void expiry obligation. Prepared newer
+        // intents only fence it; they are not evidence that it was replaced.
+        let expiry_required = inner.bans.get(request_id).is_some_and(|intent| {
+            intent.state == BanState::Accepted
+                && !inner.bans.values().any(|newer| {
+                    newer.guild_id == intent.guild_id
+                        && newer.user_id == intent.user_id
+                        && newer.generation > intent.generation
+                        && newer.state == BanState::Accepted
+                })
+        });
         match inner.unbans.get_mut(request_id) {
             Some(row)
                 if row.state == UnbanState::Running
@@ -1708,9 +1731,11 @@ impl MemberModerationStore for MemMemberStore {
             {
                 row.state = match resolution {
                     UnbanResolution::Completed => UnbanState::Done,
+                    UnbanResolution::Void if expiry_required => UnbanState::Pending,
                     UnbanResolution::Void => UnbanState::Superseded,
                 };
-                row.completed_at = Some("resolved".to_owned());
+                row.completed_at =
+                    (row.state != UnbanState::Pending).then(|| "resolved".to_owned());
                 row.claim_token = None;
                 Ok(())
             }
@@ -2630,25 +2655,35 @@ mod tests {
                 "uncertain unban must fence fresh bans, got {err:?}"
             );
             assert_eq!(discord.call_count("ban"), bans_before);
-            // The fence refusal is not safe-pre-mutation: the fenced key
-            // stays `in_flight`, so a same-key retry is `InFlight`, never a
-            // duplicate Discord mutation.
+            // Only the OLD dispatch is uncertain. The NEW request wrote no
+            // intent and sent no PUT, so it must release its own key safely.
+            assert!(matches!(
+                err,
+                MemberError::Store(ref error) if error.is_safe_pre_mutation()
+            ));
             assert!(matches!(
                 svc.execute(&fresh).await.expect_err("still fenced"),
-                MemberError::InFlight
+                MemberError::Store(ref error) if error.is_safe_pre_mutation()
             ));
             assert_eq!(discord.call_count("ban"), bans_before);
-            // Authoritative evidence that the DELETE provably never landed:
-            // a void resolution lifts the fence and a new ban proceeds.
+            assert_eq!(store.unban_state("old").as_deref(), Some("running"));
+            assert!(store
+                .owns_unban_claim(&job.request_id, &job.claim_token)
+                .await
+                .unwrap());
+            // Authoritative evidence closes only the old operation. The same
+            // unchanged command/key can now proceed, then replay normally.
             store
-                .resolve_uncertain_unban(&job.request_id, &job.claim_token, UnbanResolution::Void)
+                .resolve_uncertain_unban(
+                    &job.request_id,
+                    &job.claim_token,
+                    UnbanResolution::Completed,
+                )
                 .await
-                .expect("authoritative void");
-            svc.execute(&execution_with_id(action, "new-ban-2"))
-                .await
-                .expect("ban after void");
-            // The void resolution lifted the fence: one ban for `old`, one
-            // for `new-ban-2`, and no unban was ever dispatched.
+                .expect("authoritative completion");
+            assert!(!svc.execute(&fresh).await.expect("same-key retry").replayed);
+            assert!(svc.execute(&fresh).await.expect("replay").replayed);
+            // One old ban, one fresh ban, and no duplicated Discord mutation.
             assert_eq!(discord.call_count("ban"), bans_before + 1);
             assert_eq!(discord.call_count("unban"), 0);
         }
@@ -2960,6 +2995,54 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn void_unban_resolution_preserves_the_current_expiry_obligation() {
+        let store = MemMemberStore::new();
+        let discord = MockMemberDiscord::new();
+        let svc = service(discord.clone(), store.clone());
+        svc.execute(&execution_with_id(ModerationAction::TempBan, "old"))
+            .await
+            .expect("accepted tempban");
+        store.lock().unbans.get_mut("old").unwrap().execute_at = NOW.to_owned();
+        discord.fail_with("unban", DiscordError::Timeout);
+        assert!(matches!(
+            svc.run_due_unbans(GUILD).await,
+            Err(MemberError::Discord(DiscordError::Timeout))
+        ));
+        let token = store.lock().unbans["old"].claim_token.clone().unwrap();
+        assert!(store
+            .resolve_uncertain_unban("old", "wrong", UnbanResolution::Void)
+            .await
+            .is_err());
+        store
+            .resolve_uncertain_unban("old", &token, UnbanResolution::Void)
+            .await
+            .expect("exact DELETE provably cannot land");
+        assert_eq!(store.unban_state("old").as_deref(), Some("pending"));
+        assert!(store.lock().unbans["old"].claim_token.is_none());
+        assert!(store
+            .resolve_uncertain_unban("old", &token, UnbanResolution::Void)
+            .await
+            .is_err());
+        discord.clear_failure("unban");
+        assert_eq!(
+            svc.run_due_unbans(GUILD)
+                .await
+                .expect("expiry still required"),
+            1
+        );
+        assert_eq!(store.unban_state("old").as_deref(), Some("done"));
+        assert_eq!(discord.call_count("unban"), 2);
+        assert_eq!(
+            store
+                .audits()
+                .iter()
+                .filter(|row| row.request_id == "old:unban")
+                .count(),
+            1
+        );
     }
 
     /// Store double that fails selected writes once, to exercise service
