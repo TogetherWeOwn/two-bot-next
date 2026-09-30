@@ -10,6 +10,9 @@
 //!
 //! Dev-only: never ships in the release binary.
 
+// `common` houses both the gateway double and the REST double; each test
+// target uses one half (matches the `interaction_routing` precedent).
+#[allow(dead_code)]
 mod common;
 
 use std::time::{Duration, Instant};

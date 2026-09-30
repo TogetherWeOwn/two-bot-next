@@ -16,11 +16,6 @@
 //!
 //! Dev-only test support: never ships in the release binary.
 
-// Shared by the gateway tests (s2_prototype) and the REST tests
-// (executor_acceptance); each uses a different half, so unused-half
-// warnings are expected per target.
-#![allow(dead_code)]
-
 use std::{
     collections::VecDeque,
     net::SocketAddr,
