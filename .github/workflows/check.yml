@@ -87,3 +87,7 @@ jobs:
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
       - name: check env bindings are explicit
         run: python3 scripts/check-env-bindings.py wrangler.toml
+      - name: Verify offline release lifecycle
+        run: |
+          npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
+          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs

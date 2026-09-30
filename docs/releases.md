@@ -35,6 +35,24 @@ The `0.1.0` manifest is only a seed: it does not assert a published release.
 Features and breaking changes advance the minor version while pre-1.0;
 fixes advance the patch. Production cutover is the deliberate 1.0.0 boundary.
 
+## Offline verification
+
+`scripts/test-release.cjs` uses a fail-closed mock GitHub client and the
+actual repository configuration. It does not use a token or mutate GitHub.
+Install its exact library outside the checkout, then run:
+
+```sh
+npm install --prefix "$RELEASE_TEST_DEPS" --ignore-scripts --no-audit --no-fund release-please@17.6.0
+NODE_PATH="$RELEASE_TEST_DEPS/node_modules" node scripts/test-release.cjs
+```
+
+Set `RELEASE_TEST_DEPS` to a disposable dependency directory (in agent runs,
+use a directory under `PAPERCLIP_RUN_SCRATCH_DIR`). The fixture covers tagged
+and untagged seeds, features in the root/four crates/Worker, breaking changes,
+fixes, Common Changelog headings, the card footer, synchronized manifest and
+lock updates, and exactly one componentless release candidate. Cargo CI still
+validates compilation and the real release flow still validates GitHub writes.
+
 ## Required-check dispatch
 
 `GITHUB_TOKEN`-created PRs do not trigger ordinary PR workflows. The release
