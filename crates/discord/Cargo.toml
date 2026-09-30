@@ -36,6 +36,13 @@ twilight-gateway = { workspace = true }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
+time = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+
+[features]
+default = []
+db = ["two-bot-core/db", "dep:sqlx", "dep:time"]
+
 # S2 prototype only: mock Discord double + measurement driver live in
 # tests/s2_prototype.rs. Nothing here ships in the release binary.
 [dev-dependencies]

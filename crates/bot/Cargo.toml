@@ -14,7 +14,7 @@ path = "src/main.rs"
 # version pins the API contract between crates at a glance.
 [dependencies]
 two-bot-core = { version = "0.1.0", path = "../core", features = ["db"] }
-two-bot-discord = { version = "0.1.0", path = "../discord" }
+two-bot-discord = { version = "0.1.0", path = "../discord", features = ["db"] }
 two-bot-cutover = { version = "0.1.0", path = "../cutover" }
 futures-util = { workspace = true }
 serde = { workspace = true }

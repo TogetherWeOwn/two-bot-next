@@ -9,6 +9,8 @@ pub mod adapter;
 pub mod executor;
 pub mod intents;
 pub mod interactions;
+#[cfg(feature = "db")]
+pub mod lfg_interactions;
 pub mod pipeline;
 
 pub use adapter::event_to_core;
