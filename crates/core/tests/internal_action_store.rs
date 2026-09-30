@@ -89,7 +89,7 @@ impl TestDb {
             .unwrap();
         let pool = Self::connect(&options, &schema).await;
         sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0340_internal_actions.sql"
+            "../../cutover/migrations/0350_internal_actions.sql"
         ))
         .execute(&pool)
         .await
