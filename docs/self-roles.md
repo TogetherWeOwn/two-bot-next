@@ -71,7 +71,18 @@ Do not run it against production or staging. It proves concurrent single
 winners, renewal/strict expiry, original-intent recovery, stale-token refusal,
 chronology, committed empty targets, and atomic settlement rollback.
 
-The router/REST adapter wiring, CI test-service execution, changelog/release
-closeout and non-author exact-SHA review remain delivery steps. No production
-guild, token, staging database or real Discord endpoint was used to verify
-this seam.
+CI explicitly opts into the integration test in a job container with an
+isolated `agent-testdb` Postgres service. No database port is published. The
+required `check` job waits for that result and fails on failure, cancellation
+or skip; the normal workspace test run alone still skips this opt-in test.
+
+The merged gateway/funnel pipeline at `main@0129b58` does not provide the S4
+interaction router or role-action executor. Those are tracked separately by
+TOG-10075 and TOG-10076. This PR remains domain/store-only as permitted by the
+slice contract; wire handlers, partial fetches and compensation through the
+shared seams after both land, never a feature-private dispatcher/HTTP client.
+
+A Common Changelog entry and Conventional Commit feature checkpoints provide
+release notes. Release-please setup/closeout and non-author exact-SHA review
+remain delivery steps. No production guild, token, staging database or real
+Discord endpoint was used to verify this seam.

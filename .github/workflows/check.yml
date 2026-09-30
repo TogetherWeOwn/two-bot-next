@@ -18,11 +18,18 @@ concurrency:
 jobs:
   check:
     name: check
+    needs: self-role-store
+    # A skipped dependency must not make the required check appear green.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
     steps:
+      - name: require self-role store tests to pass
+        if: needs.self-role-store.result != 'success'
+        run: exit 1
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
@@ -59,6 +66,36 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+
+  self-role-store:
+    name: self-role store leases
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # A job container resolves service names directly. The test's fixed
+    # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    services:
+      agent-testdb:
+        image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        with:
+          toolchain: stable
+      - name: self-role claim, renewal, recovery and fencing tests
+        run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
 
   worker:
     name: worker check
