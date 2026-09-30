@@ -74,6 +74,9 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
+      - name: settings database regressions (CI service only)
+        run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
+
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
       - name: cargo-deny
