@@ -265,6 +265,11 @@ def validate(corpus, coverage, spec_bytes):
                 target = expected["casefold_equals"]
                 text(target)
                 require(target.casefold() == target, "case-folded target required")
+                # Folding preserves edge whitespace but can expand characters.
+                # A truncated 100-character output has at least 100 folded chars.
+                require(target.lstrip() == target
+                        and (len(target) >= 100 or target.rstrip() == target),
+                        "untrimmed case-folded target")
                 if "allowed_outputs" in expected:
                     require(any(s.casefold() == target for s in expected["allowed_outputs"]),
                             "contradictory invariant constraints")

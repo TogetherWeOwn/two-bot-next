@@ -88,6 +88,10 @@ Consumers should load the bundle and adapt context to the renderer under test:
    case-folded; if both constraints exist, at least one allowed output must match
    it. Case folding can expand characters, so the target itself may exceed 100
    characters even though every rendered/allowed output remains bounded.
+   Even without an allowed-output set, targets cannot start with whitespace or
+   end with whitespace below 100 folded characters. At or above that length,
+   trailing whitespace may come from a trim-then-truncate boundary; the consumer
+   still enforces the rendered output's 100-character ceiling.
    For each `stability_groups` entry, render all referenced
    cases and require the **same output across the changed contexts**. Do not
    assume distinct seeds necessarily yield different results.
@@ -117,7 +121,8 @@ strings against the specification. V5 trims **before** truncating: a valid
 100-character prefix can therefore end in whitespace. Leading whitespace and
 trailing whitespace below the ceiling remain invalid. Regression controls cover
 that boundary for exact and allowed outputs, mixed ordinary-choice/named-list
-coverage, and compatible/contradictory case-fold invariants.
+coverage, compatible/contradictory case-fold invariants, and standalone folded
+whitespace targets with Unicode expansion (including expanded boundary prefixes).
 
 Key unresolved areas in `coverage.json`: exact NATO spelling/wrap formatting;
 two-game tie ordering/separator; owner-preference and inactive voting; offline

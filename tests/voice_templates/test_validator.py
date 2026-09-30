@@ -189,6 +189,25 @@ class CorpusTests(unittest.TestCase):
                 with self.assertRaisesRegex(validate.FixtureError, message):
                     self.validate_added_case('""rand:room name""', expected, ["style:rand"])
 
+    def test_standalone_casefold_target_shape(self):
+        for output in ["Room Name", "Straße", "ß" * 100, "x" * 99 + " ",
+                       "ß" * 99 + " ", "ß" * 99 + "\t", "ß" * 99 + "\n"]:
+            with self.subTest(output=output):
+                expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
+                            "stable_for_same_context": True, "casefold_equals": output.casefold()}
+                # No allowed-output set: the folded target has its own shape checks.
+                self.validate_added_case('""rand:room name""', expected, ["style:rand"])
+
+    def test_standalone_untrimmed_casefold_target(self):
+        for target in [" room name", "\troom name", "\nroom name", "room name ",
+                       "room name\t", "room name\n", " " + "x" * 99,
+                       " " + "ss" * 100, " " * 100, "x" * 98 + " ", "ss" * 49 + " "]:
+            with self.subTest(target=repr(target)):
+                expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
+                            "stable_for_same_context": True, "casefold_equals": target}
+                with self.assertRaisesRegex(validate.FixtureError, "untrimmed case-folded target"):
+                    self.validate_added_case('""rand:room name""', expected, ["style:rand"])
+
     def test_spec_drift(self):
         with self.assertRaisesRegex(validate.FixtureError, "spec drift"):
             validate.validate(self.corpus, self.coverage, self.spec + b"\nChanged")
