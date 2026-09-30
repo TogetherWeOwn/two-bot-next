@@ -49,11 +49,11 @@
 //! grant/revoke (`MessageReactionAdd/Remove`), and `/rota-acknowledge`
 //! (dropped with the rota stack, matrix §9).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::commands::{
-    merge_commands, CommandDefinition, CustomCommand, RegistryError, PERM_MANAGE_EVENTS,
-    PERM_MANAGE_GUILD,
+    core_commands, merge_commands, CommandDefinition, CustomCommand, RegistryError,
+    PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
 use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
@@ -438,10 +438,14 @@ impl InteractionRouter {
                 gate: RowGate::Always,
                 perm: None,
             },
+            // Scorecard check-in gates `ManageEvents` both in the published
+            // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`
+            // `require_manage_events`): Discord picker hiding is not
+            // authorization, so the router enforces it server-side too.
             "attendance" => Row {
                 handler: HandlerId::ScorecardAttendance,
                 gate: RowGate::Scorecard,
-                perm: None,
+                perm: Some((PERM_MANAGE_EVENTS, RouterRefusal::ManageEventsRequired)),
             },
             "command" | "command-remove" | "command-list" | "schedule" | "schedule-remove"
             | "schedule-list" | "sticky" | "sticky-remove" => Row {
@@ -512,7 +516,7 @@ impl InteractionRouter {
     #[must_use]
     pub fn route_component(&self, custom_id: &str, guild_id: Option<u64>) -> ComponentOutcome {
         let handler = if custom_id == GAME_SELECT_ID {
-            if !self.gates.onboarding_picker {
+            if !self.gates.onboarding_picker || !self.guild_ok(guild_id) {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::GamePicker
@@ -535,7 +539,7 @@ impl InteractionRouter {
             }
             ComponentHandler::LfgSignup
         } else if custom_id.strip_prefix(SELF_ROLE_PREFIX).is_some() {
-            if !self.gates.self_roles {
+            if !self.gates.self_roles || !self.guild_ok(guild_id) {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::SelfRole
