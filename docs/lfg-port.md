@@ -33,7 +33,7 @@ cargo test --workspace --all-features --locked
 cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 ```
 
-The last command uses only `agent-testdb:5432`, user `agent_test`, database `two_bot_test_tog10084`. It never reads `TWO_DATABASE_URL` or an application credential. In the GitHub job, `TWO_LFG_TESTDB_CI=1` selects the fixed loopback endpoint of the ephemeral PostgreSQL service. The migration runner validates all embedded migration checksums; CI starts with a fresh database and applies the migration before exercising transactions.
+The last command uses only `agent-testdb:5432`, user `agent_test`, database `two_bot_test_tog10084`. It never reads `TWO_DATABASE_URL` or an application credential. In the GitHub job, `TWO_LFG_TESTDB_CI=1` selects the fixed loopback endpoint of the ephemeral PostgreSQL service, which shares the single `agent_test` database with the gateway suite. Tests stay isolated through unique post IDs plus per-test cleanup. The migration runner validates all embedded migration checksums; CI starts with a fresh database and applies the migration before exercising transactions.
 
 The store tests cover round trips, guild fencing, leave, capacity, atomic moves, same-role idempotency, simultaneous joins, closure, and close/signup serialization. The workspace suite uses mock Discord, not a live guild.
 

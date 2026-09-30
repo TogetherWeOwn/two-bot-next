@@ -357,9 +357,12 @@ mod tests {
 
     /// Only the agent test host or the ephemeral CI service container.
     /// Never accept an application database URL or inherited credentials.
+    /// CI shares the single `agent_test` service database with the gateway
+    /// suite (which asserts that database name); tests stay isolated through
+    /// unique post IDs plus per-test cleanup.
     fn test_database_url() -> &'static str {
         if std::env::var("TWO_LFG_TESTDB_CI").as_deref() == Ok("1") {
-            "postgres://agent_test@127.0.0.1:5432/two_bot_test_tog10084"
+            "postgres://agent_test@127.0.0.1:5432/agent_test"
         } else {
             "postgres://agent_test@agent-testdb:5432/two_bot_test_tog10084"
         }
