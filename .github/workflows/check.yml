@@ -197,7 +197,9 @@ jobs:
       # TOG-9907: named envs do not inherit bindings; fail if any [env.*]
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
       - name: check env bindings are explicit
-        run: python3 scripts/check-env-bindings.py wrangler.toml
+        run: |
+          python3 scripts/check-env-bindings.py wrangler.toml
+          python3 scripts/test-env-bindings.py
       - name: Verify PR lint event and dispatch paths
         run: python3 ../scripts/test-pr-lint.py
       - name: Verify release reconciliation retries

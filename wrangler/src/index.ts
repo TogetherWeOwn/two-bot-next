@@ -36,6 +36,10 @@ export interface Env {
   GUILD_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
+  /** Consecutive failed probes; default covers ~10 minutes of keepalive ticks. */
+  UNREADY_ALERT_FAILURES?: string;
+  /** Optional Worker secret; never forwarded to the container or logged. */
+  OPS_ALERT_WEBHOOK_URL?: string;
   /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -67,8 +71,20 @@ interface KeepalivePayload {
   startedAt: number;
 }
 
+interface ReadinessState {
+  failures: number;
+  firstFailureAt: number | null;
+  alerted: boolean;
+  lastProbeAt: number;
+  lastStatus: number | null;
+}
+
+type ReadinessEvent = "container_unready_alert" | "container_unready_recovery";
+
 const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
+const DEFAULT_UNREADY_SECONDS = 600;
+const READINESS_KEY = "two-bot:readiness";
 
 function containerPort(raw: string | undefined): number {
   if (raw === undefined) return 8080;
@@ -134,16 +150,105 @@ export class TwoBotContainer extends Container<Env> {
   public async keepalive(payload: KeepalivePayload): Promise<void> {
     this.renewActivityTimeout();
     try {
-      const res = await this.containerFetch("http://c/readyz", {
-        signal: AbortSignal.timeout(6000),
-      });
-      if (!res.ok) {
-        console.warn(`two-bot /readyz unhealthy: ${res.status}`);
+      let status: number | null = null;
+      try {
+        const res = await this.containerFetch("http://c/readyz", {
+          signal: AbortSignal.timeout(6000),
+        });
+        status = res.status;
+        if (!res.ok) {
+          console.warn(`two-bot /readyz unhealthy: ${status}`);
+        }
+        await res.body?.cancel();
+      } catch {
+        console.warn("two-bot keepalive probe failed");
       }
-    } catch (err) {
-      console.warn(`two-bot keepalive probe failed: ${String(err)}`);
+      await this.recordReadiness(status);
+    } finally {
+      // Alerting must never stop the keepalive, including storage failures.
+      // https://developers.cloudflare.com/containers/api/container-class/#schedule
+      await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
     }
-    await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
+  }
+
+  private unreadyAlertFailures(): number {
+    const raw = this.env.UNREADY_ALERT_FAILURES;
+    const count = Number(raw);
+    if (raw && /^\d+$/.test(raw) && Number.isSafeInteger(count) && count > 0) {
+      return count;
+    }
+    return Math.max(1, Math.ceil(DEFAULT_UNREADY_SECONDS / this.keepaliveSeconds()));
+  }
+
+  private async recordReadiness(status: number | null): Promise<void> {
+    const now = Date.now();
+    const ready = status !== null && status >= 200 && status < 300;
+    const threshold = this.unreadyAlertFailures();
+    // Container extends DurableObject; KV survives restarts and DO eviction.
+    // No network await between the read and write: DO storage input gates
+    // protect this transition from interleaving read/modify/write calls.
+    // https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#access-storage
+    const previous = await this.ctx.storage.get<ReadinessState>(READINESS_KEY);
+    const failures = ready ? 0 : (previous?.failures ?? 0) + 1;
+    let event: ReadinessEvent | undefined;
+    if (ready && previous?.alerted) {
+      event = "container_unready_recovery";
+    } else if (!ready && failures >= threshold && !previous?.alerted) {
+      event = "container_unready_alert";
+    }
+    const state: ReadinessState = {
+      failures,
+      firstFailureAt: ready ? null : previous?.firstFailureAt ?? now,
+      alerted: !ready && (previous?.alerted === true || event === "container_unready_alert"),
+      lastProbeAt: now,
+      lastStatus: status,
+    };
+    // Persist the transition BEFORE notifying: at most one attempt per event,
+    // even if the webhook times out after accepting it or an alarm is retried.
+    await this.ctx.storage.put(READINESS_KEY, state);
+    if (!event) return;
+
+    console.warn(JSON.stringify({
+      event,
+      service: "two-bot-next",
+      consecutive_failures: ready ? previous!.failures : failures,
+      threshold,
+      status,
+      first_failure_at: ready ? previous!.firstFailureAt : state.firstFailureAt,
+      observed_at: now,
+    }));
+    await this.postReadinessWebhook(event);
+  }
+
+  private async postReadinessWebhook(event: ReadinessEvent): Promise<void> {
+    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
+    if (!binding) return;
+    try {
+      const url = new URL(binding);
+      if (url.protocol !== "https:" || url.username || url.password) {
+        throw new Error("invalid webhook binding");
+      }
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(6000),
+        body: JSON.stringify({
+          content: event === "container_unready_alert"
+            ? "two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs."
+            : "two-bot-next: Container /readyz is ready again. The unready incident has recovered.",
+          // https://docs.discord.com/developers/resources/webhook#execute-webhook
+          allowed_mentions: { parse: [], replied_user: false },
+        }),
+      });
+      await response.body?.cancel();
+      if (!response.ok) {
+        console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: response.status }));
+      }
+    } catch {
+      // Fetch errors can contain the secret URL. Never log the error or body.
+      console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: null }));
+    }
   }
 
   override onStart(): void {
