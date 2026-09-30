@@ -28,6 +28,7 @@ use crate::gateway::{
 };
 
 mod deadline;
+mod member_journey;
 mod recovery;
 
 const GUILD: &str = "2222";
