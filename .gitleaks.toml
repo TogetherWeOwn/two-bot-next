@@ -1,0 +1,13 @@
+[extend]
+useDefault = true
+
+# Public synthetic snowflake in the legacy signing vector and its unit tests.
+# Include the old source path because CI scans all reachable commits, including
+# ebd7453's five test-only false positives. No real ID or crypto key is allowed.
+[[allowlists]]
+description = "internal-action test snowflake only (including historical fixtures)"
+targetRules = ["discord-client-id"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^crates/core/src/internal_actions\.rs$''', '''^crates/core/tests/fixtures/internal-action-signing\.json$''']
+regexes = ['''^123456789012345678$''']

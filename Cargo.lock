@@ -496,6 +496,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -515,6 +526,7 @@ checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
  "futures-io",
+ "futures-macro",
  "futures-sink",
  "futures-task",
  "memchr",
@@ -1177,6 +1189,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1388,6 +1412,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -2146,6 +2171,7 @@ name = "two-bot"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "rustls",
  "serde_json",
  "tokio",
  "tower",
@@ -2162,8 +2188,11 @@ dependencies = [
 name = "two-bot-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "hex",
  "hmac",
+ "rand",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2173,6 +2202,8 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "unicode-normalization",
+ "url",
 ]
 
 [[package]]
@@ -2187,6 +2218,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "twilight-http",
  "twilight-model",
  "two-bot-core",
@@ -2196,11 +2228,16 @@ dependencies = [
 name = "two-bot-discord"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
+ "rustls",
  "serde",
+ "serde_json",
  "tokio",
+ "tokio-websockets",
  "tracing",
  "twilight-cache-inmemory",
  "twilight-gateway",
+ "twilight-http",
  "twilight-model",
  "two-bot-core",
 ]

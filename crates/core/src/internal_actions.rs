@@ -180,20 +180,20 @@ pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
 /// Rotation-aware verifier. True only for a known key id whose signature
 /// verifies; the caller gets one boolean and no way to tell an unknown id
 /// from a wrong signature apart — unknown ids verify against a decoy secret so
-/// both failures cost the same work.
+/// both failures cost the same work. Unlike legacy's fixed decoy, each keyring
+/// gets a CSPRNG-generated key at construction; it never authenticates callers.
 #[derive(Debug, Clone)]
 pub struct KeyRing {
     keys: HashMap<String, Vec<u8>>,
+    decoy: [u8; 32],
 }
-
-/// A secret used when the key id is unknown (legacy `DECOY_SECRET`).
-pub const DECOY_SECRET: &[u8] = b"unknown-key-id-decoy";
 
 impl KeyRing {
     #[must_use]
     pub fn new(keys: Vec<SigningKey>) -> Self {
         Self {
             keys: keys.into_iter().map(|k| (k.id, k.secret)).collect(),
+            decoy: rand::random(),
         }
     }
 
@@ -223,7 +223,7 @@ impl KeyRing {
     ) -> bool {
         let secret = self.keys.get(key_id);
         let expected = sign(
-            secret.map_or(DECOY_SECRET, Vec::as_slice),
+            secret.map_or(self.decoy.as_slice(), Vec::as_slice),
             timestamp,
             nonce,
             raw,
@@ -776,212 +776,12 @@ pub fn build_channel_keys(spec: &str) -> Result<HashMap<String, String>, KeyMapE
 // Settings-key guard (actions.ts: requireSettingsKey, settingsCatalog.ts)
 // ---------------------------------------------------------------------------
 
-/// Catalog class for one settings key (legacy `SettingClass`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingClass {
-    /// Dashboard-writable.
-    Hot,
-    /// Read once at boot.
-    Cold,
-    /// Secrets, boot inputs, network binds, capability gates: never reachable
-    /// from the dashboard.
-    EnvOnly,
-}
-
-/// Prefixes that are unconditionally environment-only. `TWO_INTERNAL_KEYS`
-/// reaches code through a secret fallback rather than an env read, so the
-/// census never sees it — but it is the signing secret, and the prefix arm
-/// declares it env-only positively rather than by omission.
-pub const ENV_ONLY_KEY_PREFIXES: [&str; 1] = ["TWO_INTERNAL_"];
-
-/// The whole census: every name `src/` reads. `hot` is the residual class (a
-/// key is hot when nothing reads it at boot); `cold` and `env_only` carry the
-/// legacy citation in the module doc below. Counts are asserted in tests
-/// (hot 41 / cold 28 / env_only 47) so drift is caught, not silent.
-///
-/// Legacy source: `src/core/settingsCatalog.ts` `SETTING_CLASSES`.
-fn classify_key(key: &str) -> Option<SettingClass> {
-    use SettingClass::{Cold, EnvOnly, Hot};
-    match key {
-        // ------------------------------------------------------- secrets
-        "DISCORD_BOT_TOKEN"
-        | "DISCORD_TOKEN"
-        | "TWO_MODERATION_AUDIT_SECRET"
-        | "TWO_DATABASE_URL"
-        | "TWO_STAGING_DATABASE_URL"
-        | "DISCORD_STAGING_BOT_TOKEN"
-        | "TWO_BACKUP_S3_ACCESS_KEY_ID"
-        | "TWO_BACKUP_S3_SECRET_ACCESS_KEY" => Some(EnvOnly),
-        // A web-settable bucket or endpoint turns the backup job into an
-        // exfiltration channel — worse than the credentials leaking alone.
-        "TWO_BACKUP_S3_BUCKET"
-        | "TWO_BACKUP_S3_ENDPOINT"
-        | "TWO_BACKUP_S3_PREFIX"
-        | "TWO_BACKUP_S3_REGION" => Some(EnvOnly),
-        // ---------------------------------------------------------- boot
-        "CREDENTIALS_DIRECTORY"
-        | "TWO_DB_POOL_MAX"
-        | "DISCORD_GUILD_ID"
-        | "DISCORD_STAGING_GUILD_ID"
-        | "TWO_STAGING_RESTART_CONTAINMENT"
-        | "TWO_STAGING_RESTART_SYNTHETIC_ACTORS" => Some(EnvOnly),
-        // ------------------------------------------------------- network
-        // `DISCORD_API_BASE` repoints every token-bearing request; settable
-        // from a web UI it redirects them all.
-        "TWO_HEALTH_BIND_HOST"
-        | "TWO_HEALTH_PORT"
-        | "TWO_REDIRECT_BIND_HOST"
-        | "TWO_REDIRECT_PORT"
-        | "DISCORD_API_BASE" => Some(EnvOnly),
-        // ----------------------------- capability gates and their bounds
-        "TWO_INTERNAL_ACTIONS"
-        | "TWO_INTERNAL_ALLOW_ADD_MEMBER"
-        | "TWO_INTERNAL_ALLOW_AUTOMATIONS"
-        | "TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE"
-        | "TWO_INTERNAL_ALLOW_EVENT_CANCEL"
-        | "TWO_INTERNAL_ALLOW_EVENT_READ"
-        | "TWO_INTERNAL_ALLOW_MODERATION"
-        | "TWO_INTERNAL_ALLOW_SETTINGS"
-        | "TWO_INTERNAL_BIND_HOST"
-        | "TWO_INTERNAL_CHANNEL_KEYS"
-        | "TWO_INTERNAL_PORT"
-        | "TWO_INTERNAL_ROLE_KEYS" => Some(EnvOnly),
-        // Outside the namespace, inside the blast radius: TWO_MODERATION
-        // co-gates nine moderation verbs; TWO_ONBOARDING_MODE switches the
-        // join funnel.
-        "TWO_MODERATION" | "TWO_ONBOARDING_MODE" => Some(EnvOnly),
-        // Staging-only collection and notice capabilities, never
-        // dashboard-settable.
-        "TWO_ONBOARDING_ROTA_MEASUREMENT"
-        | "TWO_ONBOARDING_ROTA_NOTICE"
-        | "TWO_ONBOARDING_ROTA_PSEUDONYM_KEY"
-        | "TWO_ONBOARDING_ROTA_PRIMARY_ACTOR_ID"
-        | "TWO_ONBOARDING_ROTA_READER_IDS" => Some(EnvOnly),
-        // These decide who an already-enabled verb may reach; widening them
-        // from the web is the same escalation one step later.
-        "TWO_MODERATION_PROTECTED_ROLE_IDS"
-        | "TWO_OWEN_USER_ID"
-        | "TWO_ANTI_NUKE_PROTECTED_USER_IDS"
-        | "TWO_ANTI_NUKE_TRUSTED_USER_IDS" => Some(EnvOnly),
-        // A filesystem path chosen by a web form is a write primitive.
-        "TWO_ANTI_NUKE_SNAPSHOT_PATH" => Some(EnvOnly),
-        // ---------------------------------------------------------- cold
-        // Read once at boot: feature master switches gate construction or
-        // command registration, and none can flip on a live client.
-        "TWO_AUTOMOD"
-        | "TWO_ANNOUNCEMENTS"
-        | "TWO_AUTOMATIONS"
-        | "TWO_TEXT_COMMANDS"
-        | "TEMP_VOICE_ENABLED"
-        | "TWO_TEMP_VOICE"
-        | "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID"
-        | "TWO_TEMP_VOICE_CATEGORY_ID"
-        | "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS"
-        | "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS"
-        | "TWO_TEMP_VOICE_SWEEP_SECONDS"
-        | "TWO_TEMP_VOICE_MAX_PER_USER"
-        | "TWO_TEMP_VOICE_MAX_PER_GUILD"
-        | "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS"
-        | "TWO_TEMP_VOICE_NAME_TEMPLATE"
-        | "TWO_TEMP_VOICE_PANEL_CHANNEL_ID"
-        | "TWO_TEMP_VOICE_DISABLED_CONTROLS"
-        | "TWO_ANTI_NUKE"
-        | "TWO_ANTI_NUKE_DRY_RUN"
-        | "TWO_COMMUNITY_SCORECARD"
-        | "TWO_COMMUNITY_RECOMMENDATIONS"
-        | "TWO_COMMUNITY_CORRECTION_CYCLES"
-        | "TWO_SELF_ROLE_PANELS"
-        | "TWO_PRESENCE_PROBE"
-        | "TWO_FEED_POLL_SECONDS"
-        | "TWO_INACTIVITY_DAYS"
-        | "TWO_TICKET_COOLDOWN_SECONDS"
-        | "LOG_LEVEL" => Some(Cold),
-        // ----------------------------------------------------------- hot
-        // Channel, role and category ids: read per event, so a saved value
-        // applies on the next poll.
-        "DISCORD_ANCHOR_WELCOME_CHANNEL_ID"
-        | "DISCORD_AUDIT_LOG_CHANNEL_ID"
-        | "DISCORD_GOODBYE_CHANNEL_IDS"
-        | "DISCORD_LANDING_CHANNEL_IDS"
-        | "DISCORD_MODERATION_LOG_CHANNEL_ID"
-        | "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID"
-        | "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID"
-        | "DISCORD_STAFF_ALERT_CHANNEL_ID"
-        | "DISCORD_TICKET_CATEGORY_ID"
-        | "DISCORD_TICKET_PANEL_CHANNEL_ID"
-        | "DISCORD_VOICE_LOG_CHANNEL_ID"
-        | "DISCORD_TICKET_STAFF_ROLE_ID" => Some(Hot),
-        // Raid and join-risk thresholds.
-        "TWO_RAID_JOIN_THRESHOLD"
-        | "TWO_RAID_WINDOW_SECONDS"
-        | "TWO_JOIN_RISK_THRESHOLD"
-        | "TWO_JOIN_RISK_WINDOW_SECONDS" => Some(Hot),
-        // Anti-nuke tuning. The master switch and exempt lists are env_only
-        // above; what is left is genuinely just tuning.
-        "TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS"
-        | "TWO_ANTI_NUKE_HEAT_THRESHOLD"
-        | "TWO_ANTI_NUKE_WINDOW_SECONDS"
-        | "TWO_BULK_JOIN_WINDOW_UNTIL" => Some(Hot),
-        // Automod tuning. The master switch is cold, the tuning is hot — that
-        // split is the whole point of automod being dashboard-usable at all.
-        "TWO_AUTOMOD_ALLOWED_DOMAINS"
-        | "TWO_AUTOMOD_BAD_WORDS"
-        | "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS"
-        | "TWO_AUTOMOD_BYPASS_ROLE_IDS"
-        | "TWO_AUTOMOD_ENFORCE"
-        | "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS"
-        | "TWO_AUTOMOD_MENTION_LIMIT"
-        | "TWO_AUTOMOD_REPEAT_COUNT"
-        | "TWO_AUTOMOD_REPEAT_WINDOW_SECONDS"
-        | "TWO_AUTOMOD_SANCTIONS" => Some(Hot),
-        // Community classifier inputs: read per scorecard run.
-        "TWO_COMMUNITY_AUTOMATION_ACTOR_IDS"
-        | "TWO_COMMUNITY_CLASSIFIER_VERSION"
-        | "TWO_COMMUNITY_HUMAN_CHANNEL_IDS"
-        | "TWO_COMMUNITY_RAID_ACTOR_IDS"
-        | "TWO_COMMUNITY_STAGING_ACTOR_IDS"
-        | "TWO_COMMUNITY_STAGING_GUILD_IDS"
-        | "TWO_COMMUNITY_TEST_ACTOR_IDS"
-        | "TWO_COMMUNITY_WELCOME_CHANNEL_IDS" => Some(Hot),
-        // Dry-run flags, read at the point of the write they suppress.
-        "TWO_ONBOARDING_DRY_RUN" | "TWO_SELF_ROLE_DRY_RUN" | "TWO_REDIRECT_FALLBACK_CODE" => {
-            Some(Hot)
-        }
-        _ => None,
-    }
-}
-
-/// True for a key that must stay in the environment. Unknown keys are
-/// env-only: fail-closed is the only safe census miss.
-#[must_use]
-pub fn is_env_only_key(key: &str) -> bool {
-    if ENV_ONLY_KEY_PREFIXES.iter().any(|p| key.starts_with(p)) {
-        return true;
-    }
-    !matches!(
-        classify_key(key),
-        Some(SettingClass::Hot | SettingClass::Cold)
-    )
-}
-
-/// True when the catalog *declares* the key environment-only, as opposed to
-/// refusing it for never having heard of it. The distinction is for the human
-/// reading the refusal: "environment-only" and "no such setting" send an admin
-/// to two different places.
-#[must_use]
-pub fn is_declared_env_only(key: &str) -> bool {
-    if ENV_ONLY_KEY_PREFIXES.iter().any(|p| key.starts_with(p)) {
-        return true;
-    }
-    matches!(classify_key(key), Some(SettingClass::EnvOnly))
-}
-
-/// True when `settings.set` may store this key. This is the copy that matters
-/// most: it runs before an attacker-supplied key reaches any code that writes.
-#[must_use]
-pub fn is_storable_key(key: &str) -> bool {
-    !is_env_only_key(key)
-}
+// Share the landed settings-store catalogue rather than keeping a second
+// census. This includes the env-only TWO_REDIRECT_TRUSTED_PROXIES row and
+// preserves the same fail-closed policy for unknown keys and future gates.
+pub use super::settings::{
+    is_declared_env_only, is_env_only_key, is_storable_key, SettingClass, ENV_ONLY_KEY_PREFIXES,
+};
 
 /// Shape check for a settings key: the shape of an environment variable, which
 /// is what every reader was written against. A typo lands as a typed
@@ -1661,35 +1461,60 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // Cross-implementation vectors: produced by legacy `node:crypto`
-    // (`signing.ts` `sign` over the same canonical string). If these fail, the
-    // Rust port no longer verifies what the website signs.
-    const VEC1_BODY: &str =
-        r#"{"action":"role.assign","discord_id":"123456789012345678","role_key":"member"}"#;
-    const VEC1_BODY_HASH: &str = "0d467b6aead193be79e9af85b251752c07d91e9ca2aaff0ea9b447375b1c4c66";
-    const VEC1_SIG: &str =
-        "sha256=63286b0771e9601ad29fa5ab36ddac5bb7d06f03369254c9ebc9867f36dfeee4";
-    const VEC1_SECRET: &[u8] = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const VEC1_TS: &str = "1720000000";
-    const VEC1_NONCE: &str = "0123456789abcdef0123456789abcdef";
+    use crate::settings::{classify_key, SETTING_CLASSES};
+    use std::sync::OnceLock;
 
-    const VEC2_BODY: &str = r#"{"action":"settings.get","key":"TWO_RAID_JOIN_THRESHOLD"}"#;
-    const VEC2_BODY_HASH: &str = "cccc068066dd4ce177c75140dc2098ae1b3d2abdf8b4ff6d4304a1dc70963784";
-    const VEC2_SIG: &str =
-        "sha256=041d450e1dfa097f25c8d6ad019c32d6140fa48e8287b3f9d61b5750973cad2c";
-    const VEC2_SECRET: &[u8] = b"second-secret-bbbbbbbbbbbbbbbbbb";
-    const VEC2_TS: &str = "1720000060";
-    const VEC2_NONCE: &str = "abcdef0123456789abcdef0123456789";
+    // Public cross-implementation fixtures, not runtime caller credentials.
+    // Keep the original bytes and independent expected outputs intact. Loading
+    // test data at runtime follows the moderation MAC fixture convention and
+    // keeps fixed test inputs distinct from hard-coded production crypto keys.
+    #[derive(serde::Deserialize)]
+    struct WireVector {
+        body: String,
+        body_hash: String,
+        signature: String,
+        secret: String,
+        timestamp: String,
+        nonce: String,
+    }
+
+    fn vectors() -> &'static [WireVector] {
+        static VECTORS: OnceLock<Vec<WireVector>> = OnceLock::new();
+        VECTORS.get_or_init(|| {
+            #[derive(serde::Deserialize)]
+            struct Fixture {
+                vectors: Vec<WireVector>,
+            }
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/internal-action-signing.json");
+            let raw = std::fs::read_to_string(path).expect("public signing fixture");
+            let fixture: Fixture = serde_json::from_str(&raw).expect("valid signing fixture");
+            assert_eq!(fixture.vectors.len(), 2);
+            fixture.vectors
+        })
+    }
+
+    fn vec1() -> &'static WireVector {
+        &vectors()[0]
+    }
+
+    fn vec2() -> &'static WireVector {
+        &vectors()[1]
+    }
+
+    fn test_nonce(counter: u64) -> String {
+        format!("{counter:032x}")
+    }
 
     fn ring() -> KeyRing {
         KeyRing::new(vec![
             SigningKey {
                 id: "web".to_owned(),
-                secret: VEC1_SECRET.to_vec(),
+                secret: vec1().secret.as_bytes().to_vec(),
             },
             SigningKey {
                 id: "web2".to_owned(),
-                secret: VEC2_SECRET.to_vec(),
+                secret: vec2().secret.as_bytes().to_vec(),
             },
         ])
     }
@@ -1703,35 +1528,66 @@ mod tests {
 
     #[test]
     fn body_hash_matches_node_crypto() {
-        assert_eq!(body_hash(VEC1_BODY.as_bytes()), VEC1_BODY_HASH);
-        assert_eq!(body_hash(VEC2_BODY.as_bytes()), VEC2_BODY_HASH);
+        assert_eq!(body_hash(vec1().body.as_bytes()), vec1().body_hash);
+        assert_eq!(body_hash(vec2().body.as_bytes()), vec2().body_hash);
     }
 
     #[test]
     fn sign_matches_node_crypto() {
         assert_eq!(
-            sign(VEC1_SECRET, VEC1_TS, VEC1_NONCE, VEC1_BODY.as_bytes()),
-            VEC1_SIG
+            sign(
+                vec1().secret.as_bytes(),
+                vec1().timestamp.as_str(),
+                vec1().nonce.as_str(),
+                vec1().body.as_bytes()
+            ),
+            vec1().signature.as_str()
         );
         assert_eq!(
-            sign(VEC2_SECRET, VEC2_TS, VEC2_NONCE, VEC2_BODY.as_bytes()),
-            VEC2_SIG
+            sign(
+                vec2().secret.as_bytes(),
+                vec2().timestamp.as_str(),
+                vec2().nonce.as_str(),
+                vec2().body.as_bytes()
+            ),
+            vec2().signature.as_str()
         );
     }
 
     #[test]
     fn canonical_string_shape() {
         assert_eq!(
-            canonical_string(VEC1_TS, VEC1_NONCE, VEC1_BODY.as_bytes()),
-            format!("POST\n{ACTIONS_PATH}\n{VEC1_TS}\n{VEC1_NONCE}\n{VEC1_BODY_HASH}")
+            canonical_string(
+                vec1().timestamp.as_str(),
+                vec1().nonce.as_str(),
+                vec1().body.as_bytes()
+            ),
+            format!(
+                "POST\n{ACTIONS_PATH}\n{}\n{}\n{}",
+                vec1().timestamp,
+                vec1().nonce,
+                vec1().body_hash
+            )
         );
     }
 
     #[test]
     fn keyring_verifies_known_key() {
         let keys = ring();
-        assert!(keys.verify("web", VEC1_SIG, VEC1_TS, VEC1_NONCE, VEC1_BODY.as_bytes()));
-        assert!(keys.verify("web2", VEC2_SIG, VEC2_TS, VEC2_NONCE, VEC2_BODY.as_bytes()));
+        assert!(keys.verify(
+            "web",
+            vec1().signature.as_str(),
+            vec1().timestamp.as_str(),
+            vec1().nonce.as_str(),
+            vec1().body.as_bytes()
+        ));
+        assert!(keys.verify(
+            "web2",
+            vec2().signature.as_str(),
+            vec2().timestamp.as_str(),
+            vec2().nonce.as_str(),
+            vec2().body.as_bytes()
+        ));
     }
 
     #[test]
@@ -1739,30 +1595,99 @@ mod tests {
         let keys = ring();
         // Unknown id and wrong signature are both plain false — the caller
         // cannot probe which key ids exist.
-        assert!(!keys.verify("nope", VEC1_SIG, VEC1_TS, VEC1_NONCE, VEC1_BODY.as_bytes()));
-        assert!(!keys.verify("web", VEC2_SIG, VEC1_TS, VEC1_NONCE, VEC1_BODY.as_bytes()));
+        assert!(!keys.verify(
+            "nope",
+            vec1().signature.as_str(),
+            vec1().timestamp.as_str(),
+            vec1().nonce.as_str(),
+            vec1().body.as_bytes()
+        ));
+        assert!(!keys.verify(
+            "web",
+            vec2().signature.as_str(),
+            vec1().timestamp.as_str(),
+            vec1().nonce.as_str(),
+            vec1().body.as_bytes()
+        ));
         assert!(!keys.verify(
             "web",
             "sha256=0000000000000000000000000000000000000000000000000000000000000000",
-            VEC1_TS,
-            VEC1_NONCE,
-            VEC1_BODY.as_bytes()
+            vec1().timestamp.as_str(),
+            vec1().nonce.as_str(),
+            vec1().body.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn decoy_signature_never_authenticates_an_unknown_caller() {
+        let keys = ring();
+        let vector = vec1();
+        let signature = sign(
+            &keys.decoy,
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes(),
+        );
+        assert!(!keys.verify(
+            "nope",
+            &signature,
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes()
+        ));
+        // Even signing with a real registered key cannot authenticate another id.
+        assert!(!keys.verify(
+            "nope",
+            &vector.signature,
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes()
+        ));
+        assert!(keys.clone().verify(
+            "web",
+            &vector.signature,
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn empty_keyring_refuses_even_its_decoy_signature() {
+        let keys = KeyRing::new(Vec::new());
+        let vector = vec1();
+        let signature = sign(
+            &keys.decoy,
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes(),
+        );
+        assert!(keys.is_empty());
+        assert_eq!(keys.len(), 0);
+        assert!(!keys.contains("web"));
+        assert!(!keys.verify(
+            "web",
+            &signature,
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes()
         ));
     }
 
     #[test]
     fn signatures_match_rejects_length_mismatch() {
-        assert!(signatures_match(VEC1_SIG, VEC1_SIG));
-        assert!(!signatures_match(VEC1_SIG, "sha256=short"));
-        assert!(!signatures_match("", VEC1_SIG));
+        assert!(signatures_match(
+            vec1().signature.as_str(),
+            vec1().signature.as_str()
+        ));
+        assert!(!signatures_match(vec1().signature.as_str(), "sha256=short"));
+        assert!(!signatures_match("", vec1().signature.as_str()));
     }
 
     #[test]
     fn parse_keys_accepts_rotation_pairs() {
-        let keys = parse_keys(
-            "web:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,web2:second-secret-bbbbbbbbbbbbbbbbbb",
-        )
-        .expect("valid spec parses");
+        let spec = format!("web:{},web2:{}", vec1().secret, vec2().secret);
+        let keys = parse_keys(&spec).expect("valid spec parses");
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].id, "web");
     }
@@ -1798,7 +1723,7 @@ mod tests {
 
     #[test]
     fn nonce_format_is_32_hex() {
-        assert!(valid_nonce_format(VEC1_NONCE));
+        assert!(valid_nonce_format(vec1().nonce.as_str()));
         assert!(valid_nonce_format("ABCDEF0123456789ABCDEF0123456789"));
         assert!(!valid_nonce_format("short"));
         assert!(!valid_nonce_format(&("a".repeat(33))));
@@ -2011,8 +1936,29 @@ mod tests {
 
     #[test]
     fn catalog_counts_match_legacy_census() {
-        // hot 41 / cold 28 / env_only 47 in settingsCatalog.ts SETTING_CLASSES.
-        // Spot-check each class; the full census lives in classify_key.
+        // Shared legacy census: hot 41 / cold 28 / env_only 48. Count the
+        // actual entries, not just representatives of each class.
+        for (class, expected) in [
+            (SettingClass::Hot, 41),
+            (SettingClass::Cold, 28),
+            (SettingClass::EnvOnly, 48),
+        ] {
+            assert_eq!(
+                SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
+                expected
+            );
+        }
+        assert_eq!(
+            classify_key("TWO_REDIRECT_TRUSTED_PROXIES"),
+            Some(SettingClass::EnvOnly)
+        );
+        assert!(is_declared_env_only("TWO_REDIRECT_TRUSTED_PROXIES"));
+        for action in ["settings.get", "settings.set"] {
+            let body = map(json!({"key": "TWO_REDIRECT_TRUSTED_PROXIES"}));
+            let err = require_settings_key(&body, action).expect_err("env-only network boundary");
+            assert_eq!(err.code, ErrorCode::ActionNotAllowed);
+            assert_eq!(err.log_reason, "settings_key_env_only");
+        }
         assert_eq!(
             classify_key("TWO_RAID_JOIN_THRESHOLD"),
             Some(SettingClass::Hot)
@@ -2299,10 +2245,15 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
-        let headers = signed_headers("web", VEC1_TS, VEC1_NONCE, VEC1_SIG);
+        let headers = signed_headers(
+            "web",
+            vec1().timestamp.as_str(),
+            vec1().nonce.as_str(),
+            vec1().signature.as_str(),
+        );
         let decision = authorize(
             &headers,
-            VEC1_BODY.as_bytes(),
+            vec1().body.as_bytes(),
             &keys,
             &flags,
             false,
@@ -2317,10 +2268,15 @@ mod tests {
         assert_eq!(decision.action, "role.assign");
         assert_eq!(decision.key_id, "web");
         // Same nonce again is a replay — burned before the body was read.
-        let headers = signed_headers("web", VEC1_TS, VEC1_NONCE, VEC1_SIG);
+        let headers = signed_headers(
+            "web",
+            vec1().timestamp.as_str(),
+            vec1().nonce.as_str(),
+            vec1().signature.as_str(),
+        );
         let err = authorize(
             &headers,
-            VEC1_BODY.as_bytes(),
+            vec1().body.as_bytes(),
             &keys,
             &flags,
             false,
@@ -2343,10 +2299,10 @@ mod tests {
         let mut buckets = TokenBuckets::new();
         // Stale timestamp AND bad signature: the signature refusal wins,
         // because everything after it trusts the key id.
-        let headers = signed_headers("web", "1000000000", VEC1_NONCE, "sha256=nope");
+        let headers = signed_headers("web", "1000000000", vec1().nonce.as_str(), "sha256=nope");
         let err = authorize(
             &headers,
-            VEC1_BODY.as_bytes(),
+            vec1().body.as_bytes(),
             &keys,
             &flags,
             false,
@@ -2369,11 +2325,16 @@ mod tests {
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
         // Stale but correctly signed → stale_request.
-        let sig = sign(VEC1_SECRET, "1000000000", VEC1_NONCE, VEC1_BODY.as_bytes());
-        let headers = signed_headers("web", "1000000000", VEC1_NONCE, &sig);
+        let sig = sign(
+            vec1().secret.as_bytes(),
+            "1000000000",
+            vec1().nonce.as_str(),
+            vec1().body.as_bytes(),
+        );
+        let headers = signed_headers("web", "1000000000", vec1().nonce.as_str(), &sig);
         let err = authorize(
             &headers,
-            VEC1_BODY.as_bytes(),
+            vec1().body.as_bytes(),
             &keys,
             &flags,
             false,
@@ -2388,13 +2349,14 @@ mod tests {
         assert_eq!(err.code, ErrorCode::StaleRequest);
         // Unknown action → action_not_allowed (never retryable).
         let raw = br#"{"action":"guild.kick_everyone"}"#;
+        let nonce = test_nonce(1);
         let sig = sign(
-            VEC1_SECRET,
-            VEC1_TS,
-            "11111111111111111111111111111111",
+            vec1().secret.as_bytes(),
+            vec1().timestamp.as_str(),
+            &nonce,
             raw,
         );
-        let headers = signed_headers("web", VEC1_TS, "11111111111111111111111111111111", &sig);
+        let headers = signed_headers("web", vec1().timestamp.as_str(), &nonce, &sig);
         let err = authorize(
             &headers,
             raw,
@@ -2422,11 +2384,16 @@ mod tests {
         // Exhaust the 20-burst key bucket with distinct valid nonces.
         for i in 0..20 {
             let nonce = format!("{i:032x}");
-            let sig = sign(VEC1_SECRET, VEC1_TS, &nonce, VEC1_BODY.as_bytes());
-            let headers = signed_headers("web", VEC1_TS, &nonce, &sig);
+            let sig = sign(
+                vec1().secret.as_bytes(),
+                vec1().timestamp.as_str(),
+                &nonce,
+                vec1().body.as_bytes(),
+            );
+            let headers = signed_headers("web", vec1().timestamp.as_str(), &nonce, &sig);
             authorize(
                 &headers,
-                VEC1_BODY.as_bytes(),
+                vec1().body.as_bytes(),
                 &keys,
                 &flags,
                 false,
@@ -2439,12 +2406,17 @@ mod tests {
             )
             .expect("burst allows 20");
         }
-        let nonce = "ffffffffffffffffffffffffffffffff";
-        let sig = sign(VEC1_SECRET, VEC1_TS, nonce, VEC1_BODY.as_bytes());
-        let headers = signed_headers("web", VEC1_TS, nonce, &sig);
+        let nonce = test_nonce(20);
+        let sig = sign(
+            vec1().secret.as_bytes(),
+            vec1().timestamp.as_str(),
+            &nonce,
+            vec1().body.as_bytes(),
+        );
+        let headers = signed_headers("web", vec1().timestamp.as_str(), &nonce, &sig);
         let err = authorize(
             &headers,
-            VEC1_BODY.as_bytes(),
+            vec1().body.as_bytes(),
             &keys,
             &flags,
             false,
@@ -2471,8 +2443,13 @@ mod tests {
                        nonces: &mut NonceCache,
                        buckets: &mut TokenBuckets|
          -> ActionError {
-            let sig = sign(VEC1_SECRET, VEC1_TS, nonce, raw);
-            let headers = signed_headers("web", VEC1_TS, nonce, &sig);
+            let sig = sign(
+                vec1().secret.as_bytes(),
+                vec1().timestamp.as_str(),
+                nonce,
+                raw,
+            );
+            let headers = signed_headers("web", vec1().timestamp.as_str(), nonce, &sig);
             authorize(
                 &headers,
                 raw,
@@ -2489,29 +2466,17 @@ mod tests {
             .expect_err("malformed")
         };
         assert_eq!(
-            attempt(
-                b"not json",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                &mut nonces,
-                &mut buckets
-            )
-            .code,
+            attempt(b"not json", &test_nonce(1), &mut nonces, &mut buckets).code,
             ErrorCode::Malformed
         );
         assert_eq!(
-            attempt(
-                b"[1,2]",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                &mut nonces,
-                &mut buckets
-            )
-            .code,
+            attempt(b"[1,2]", &test_nonce(2), &mut nonces, &mut buckets).code,
             ErrorCode::Malformed
         );
         assert_eq!(
             attempt(
                 br#"{"no_action":1}"#,
-                "cccccccccccccccccccccccccccccccc",
+                &test_nonce(3),
                 &mut nonces,
                 &mut buckets
             )
