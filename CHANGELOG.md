@@ -13,14 +13,16 @@
 - Shared-router custom-command execution adapter with transactional management,
   deferred mention-safe replies, dynamic slash execution auditing, and serialized
   full-registry publication. Add mock REST + isolated testdb runtime fixtures;
-  gateway activation and accepted-prefix integration remain in progress.
+  gateway execution is wired with bounded dispatch/checkpoint ordering.
 - Explicit moderation-acceptance contract and prefix execution through the shared
   REST executor, with immutable pre-send audit reservations preventing replay of
   unknown deliveries. Preserve uncertain transport/timeout/5xx/429 outcomes as
   unresolved rather than auditing a definite failure. Add prefix failure/restart
-  fixtures, dual-gated Message
-  Content intent, and unchanged Worker forwarding of custom-command feature flags.
-  Gateway dispatch and the actual moderation-result producer remain pending.
+  fixtures, dual-gated Message Content intent, and unchanged Worker forwarding of
+  custom-command and automod flags. Add shared bootstrap metadata reads, cold-RESUME
+  context and gateway dispatch under the existing heartbeat-safe checkpoint budget.
+  Prefixes require explicit automod-disabled configuration until the ordinary
+  moderation-result producer is integrated; unknown acceptance stays fail-closed.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 

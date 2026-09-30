@@ -36,6 +36,7 @@ export interface Env {
   GUILD_ID?: string;
   TWO_AUTOMATIONS?: string;
   TWO_TEXT_COMMANDS?: string;
+  TWO_AUTOMOD?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
   /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
@@ -93,6 +94,10 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   }
   if (env.TWO_TEXT_COMMANDS !== undefined) {
     vars["TWO_TEXT_COMMANDS"] = env.TWO_TEXT_COMMANDS;
+  }
+  // Missing moderation configuration must stay missing, not become disabled.
+  if (env.TWO_AUTOMOD !== undefined) {
+    vars["TWO_AUTOMOD"] = env.TWO_AUTOMOD;
   }
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   return vars;

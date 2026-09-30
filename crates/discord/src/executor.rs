@@ -1159,6 +1159,44 @@ impl ActionExecutor {
         }
     }
 
+    /// Bootstrap application identity via `GET /applications/@me`: one
+    /// attempt with the shared 5 s abort and only 200 accepted. Missing or
+    /// invalid metadata refuses with a fixed error, never response content.
+    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/struct.GetUserApplicationInfo.html
+    pub async fn current_application_id(&self) -> Result<u64, DiscordError> {
+        let req = Self::request_of(self.inner.factory.current_user_application())?;
+        let doc = self.call_once(req, &[200]).await?;
+        doc.as_ref()
+            .and_then(|doc| doc.get("id"))
+            .and_then(|id| id.as_str())
+            .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .ok_or_else(|| DiscordError::Rejected("invalid application metadata".to_owned()))
+    }
+
+    /// Bootstrap guild context via `GET /guilds/{id}`: one attempt with the
+    /// shared 5 s abort and only 200 accepted. Requires the requested nonzero
+    /// identity and a nonblank name; malformed metadata never reaches errors.
+    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.GetGuild.html
+    pub async fn guild_name(&self, guild_id: u64) -> Result<String, DiscordError> {
+        let guild = Id::<GuildMarker>::new_checked(guild_id)
+            .ok_or_else(|| DiscordError::Rejected("bad guild id".to_owned()))?;
+        let req = Self::request_of(self.inner.factory.guild(guild))?;
+        let doc = self.call_once(req, &[200]).await?;
+        doc.as_ref()
+            .filter(|doc| {
+                doc.get("id")
+                    .and_then(|id| id.as_str())
+                    .and_then(|id| id.parse::<u64>().ok())
+                    == Some(guild.get())
+            })
+            .and_then(|doc| doc.get("name"))
+            .and_then(|name| name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| DiscordError::Rejected("invalid guild metadata".to_owned()))
+    }
+
     /// Publish the router's full guild command set in one send
     /// (`PUT /applications/{app}/guilds/{guild}/commands`).
     pub async fn publish_guild_commands(

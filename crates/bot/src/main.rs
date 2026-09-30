@@ -7,6 +7,7 @@
 
 mod backup_cli;
 mod gateway;
+mod gateway_commands;
 #[cfg(test)]
 mod gateway_tests;
 #[cfg(test)]
@@ -86,12 +87,26 @@ async fn main() {
                     );
                     let saved = gateway::load_boot_session(&store).await?;
                     let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                    let command_config = gateway_commands::GatewayCommandConfig::from_map(
+                        guild_id,
+                        &std::env::vars().collect(),
+                    )?;
+                    let executor =
+                        two_bot_discord::ActionExecutor::new(token.clone()).map_err(|_| {
+                            sqlx::Error::InvalidArgument("gateway REST executor unavailable".into())
+                        })?;
+                    let commands = gateway_commands::GatewayCommands::bootstrap(
+                        db.pool().clone(),
+                        executor,
+                        command_config,
+                    )
+                    .await?;
                     let shard = build_shard(token, intents_from_env(), saved.as_ref());
                     info!(
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store).await
+                    run_shard(shard, pipeline, Arc::clone(&state), store, Some(commands)).await
                 }
                 .await;
                 if result.is_err() {

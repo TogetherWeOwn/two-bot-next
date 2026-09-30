@@ -39,13 +39,31 @@ It defers responses before transactional work, edits through the shared executor
 suppresses mentions, audits writes/runs, and serializes mutation plus full-set
 publication. A publication failure reports a saved-but-not-synchronized result.
 
-**Not activated in the gateway yet.** READY injection, heartbeat-safe gateway
-execution and a caller supplying the ordinary message path's actual moderation
-decision are still pending. `handle_message` now executes explicitly accepted
-prefixes, but is not an unconditional gateway listener. Do not use `MessageCreate`
-or `capture_only: false` as acceptance. Cold RESUME can lack a cached guild name;
-this adapter refuses rendering without context rather than inventing a `{server}`
-value.
+**Gateway composition is implemented, not yet runtime-verified or deployed.**
+The bot now constructs the shared executor and registered router, bootstraps real
+application/guild context before constructing the shard, and awaits custom-command
+execution after the ordinary pipeline and before checkpoint COMMIT. READY and
+RESUMED both synchronize the complete gated registry. Cold RESUME uses the shared
+executor's fresh guild-name read until the gateway cache supplies a name.
+
+The ordinary message pipeline still has **no automod inspection service**. Prefix
+execution therefore requires an explicit `TWO_AUTOMOD=0`, in addition to both
+custom-command gates. Missing, malformed, or enabled automod configuration yields
+`Unavailable` and no prefix lookup/send. This deliberately stricter interim rule
+must not be presented as automod enforcement or unmatched/exempt integration.
+Neither `MessageCreate` nor `capture_only: false` proves acceptance. Completing
+normal automod-enabled prefix operation still requires the ordinary path's actual
+inspection result, not a second matcher in this custom-command adapter.
+
+Runtime dispatch and checkpoint persistence share one total deadline: the lesser
+of five seconds and one quarter of HELLO's heartbeat interval. Readiness stays
+unavailable during that work; timeout cancels it and stops the shard without
+advancing the checkpoint. There are no detached command jobs. Durable prefix
+reservations survive cancellation and prevent replay of an uncertain POST.
+Returned per-command errors are sanitized and the dispatch is checkpointed rather
+than repeatedly replaying an already acknowledged interaction. Registry-sync
+failure instead stops readiness and leaves its checkpoint unchanged; a restart
+rebuilds the full desired registry from current state.
 
 The following checklist includes both implemented adapter contracts and the
 remaining gateway/accepted-prefix work:
@@ -123,8 +141,9 @@ corresponding gateway replay horizon.
 
 The gateway intent now requests Message Content when both `TWO_AUTOMATIONS=1` and
 `TWO_TEXT_COMMANDS=1`; existing automod/ticket intent reasons are preserved. The
-Worker forwards those two values unchanged on both container startup paths.
-Neither flag is enabled by default, and no deployment settings are changed. The
+Worker forwards those two values and `TWO_AUTOMOD` unchanged on both container
+startup paths; it never fabricates a disabled moderation value. Neither custom
+flag is enabled by default, and no deployment settings are changed. The
 privileged intent must also be authorized for the Discord application before
 operators opt into text commands.
 
@@ -150,4 +169,19 @@ passthrough fixtures are added too; executing them requires the pinned local
 Deferred completion follows Twilight 0.17's documented `update_response` builder:
 https://docs.rs/twilight-http/0.17.0/twilight_http/request/application/interaction/struct.UpdateResponse.html
 
-No production guild/token is needed or authorized for these tests.
+Bootstrap uses Twilight 0.17.1 request builders through the same executor's
+bounded, one-attempt read path; it validates nonzero application identity, exact
+guild identity and a nonblank guild name before constructing the shard:
+- https://docs.rs/twilight-http/0.17.1/twilight_http/request/struct.GetUserApplicationInfo.html
+- https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/struct.GetGuild.html
+
+`crates/discord/tests/bootstrap_context.rs` adds loopback-only metadata validation,
+GET-only routes, no retries and shared-timeout coverage. The hosted workspace
+integration-test step includes them. `crates/bot/src/gateway_tests/commands.rs`
+adds real-shard/mock-REST/testdb fixtures for READY slash and prefix dispatch,
+checkpoint progress, cold RESUME without cached guild context, unavailable
+moderation and feature gates, terminal command errors, delayed POST cancellation
+and replay suppression, registry failure and application-identity mismatch. The
+existing hosted `gateway_tests -- --ignored --test-threads=1` step includes them.
+All new Rust fixtures remain uncompiled/unexecuted locally. No production
+guild/token is needed or authorized for these tests.

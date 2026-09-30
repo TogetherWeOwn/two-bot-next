@@ -26,6 +26,7 @@ use crate::gateway::{
     build_pipeline, ensure_crypto_provider, load_boot_session, run_shard, GatewayState,
 };
 
+mod commands;
 mod deadline;
 mod recovery;
 
@@ -375,6 +376,17 @@ async fn spawn_runner(
     JoinHandle<Result<(), sqlx::Error>>,
     Arc<RwLock<GatewayState>>,
 ) {
+    spawn_runner_with_commands(db, url, None).await
+}
+
+async fn spawn_runner_with_commands(
+    db: &TestDb,
+    url: &str,
+    commands: Option<crate::gateway_commands::GatewayCommands>,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    Arc<RwLock<GatewayState>>,
+) {
     ensure_crypto_provider();
     let saved = load_boot_session(&db.store)
         .await
@@ -388,7 +400,13 @@ async fn spawn_runner(
         db.store.milestones().await.expect("milestones"),
     ));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
-    let task = tokio::spawn(run_shard(shard, pipeline, state.clone(), db.store.clone()));
+    let task = tokio::spawn(run_shard(
+        shard,
+        pipeline,
+        state.clone(),
+        db.store.clone(),
+        commands,
+    ));
     (task, state)
 }
 

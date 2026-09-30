@@ -198,6 +198,23 @@ for (const [automations, textCommands] of [
   });
 }
 
+for (const automod of [undefined, "0", "1", "", "false", " 0", "00"] as const) {
+  for (const path of ["/health", "keepalive"]) {
+    test(`moderation availability passes through unchanged (${JSON.stringify(automod)}, ${path})`, async (t) => {
+      const h = await harness(t, { TWO_AUTOMOD: automod });
+      if (path === "keepalive") {
+        await h.bot.keepalive({ startedAt: 0 });
+      } else {
+        await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+      }
+      const expected: Record<string, string> = { LISTEN_ADDR: "0.0.0.0:8080" };
+      if (automod !== undefined) expected.TWO_AUTOMOD = automod;
+      assert.equal(h.starts.length, 1);
+      assert.deepEqual(h.starts[0]?.env, expected);
+    });
+  }
+}
+
 test("health-only config never fabricates credentials or gateway readiness", async (t) => {
   const h = await harness(t, { DISCORD_TOKEN: "", DATABASE_URL: "", GUILD_ID: "" });
   const response = await h.bot.fetch(new Request("https://worker.invalid/readyz"));

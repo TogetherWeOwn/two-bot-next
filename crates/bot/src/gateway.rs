@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use crate::gateway_commands::GatewayCommands;
+
 use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -140,7 +142,7 @@ struct Hello {
     heartbeat_interval: u64,
 }
 
-/// Bound the entire SQL operation (pool acquire through COMMIT), not each query.
+/// Bound the entire dispatch (feature I/O through SQL COMMIT), not each phase.
 /// Twilight only drives heartbeats while polled, so use at most a quarter of
 /// HELLO's interval and fail closed instead of waiting through missed heartbeats.
 /// Source: https://docs.rs/tokio/1/tokio/time/fn.timeout.html
@@ -172,8 +174,9 @@ pub async fn run_shard(
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
+    commands: Option<GatewayCommands>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store).await;
+    let result = run_loop(&mut shard, &pipeline, &state, &store, commands.as_ref()).await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -183,6 +186,7 @@ async fn run_loop(
     pipeline: &GatewayPipeline,
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
+    commands: Option<&GatewayCommands>,
 ) -> Result<(), sqlx::Error> {
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
@@ -288,17 +292,22 @@ async fn run_loop(
                 "gateway dispatch parse failed; checkpoint unchanged".into(),
             )
         })?;
-        let mut connected = false;
-        if let Some(parsed) = parsed {
-            let event = Event::from(parsed);
-            connected = matches!(event, Event::Ready(_) | Event::Resumed);
-            pipeline.handle(&event);
-        }
-        checkpoint_io(
-            state,
-            deadline,
-            store.commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
-        )
+        let event = parsed.map(Event::from);
+        let connected = matches!(event, Some(Event::Ready(_) | Event::Resumed));
+        // One total budget includes runtime I/O and the checkpoint COMMIT.
+        // Sequential per-phase deadlines could starve Twilight's heartbeat.
+        // No detached feature jobs may outlive cancellation or the checkpoint.
+        checkpoint_io(state, deadline, async {
+            if let Some(event) = &event {
+                pipeline.handle(event);
+                if let Some(commands) = commands {
+                    commands.handle_event(event, pipeline.cache()).await?;
+                }
+            }
+            store
+                .commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch())
+                .await
+        })
         .await?;
         committed = Some(checkpoint);
         if connected {
