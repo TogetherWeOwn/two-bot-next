@@ -36,6 +36,7 @@ pub mod inactivity_store;
 #[cfg(feature = "db")]
 pub mod internal_action_store;
 pub mod internal_actions;
+pub mod internal_settings;
 pub mod invites;
 pub mod leveling;
 #[cfg(feature = "db")]

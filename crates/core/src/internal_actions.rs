@@ -490,6 +490,8 @@ pub enum ErrorCode {
     StaleRequest,
     ActionNotAllowed,
     Replayed,
+    /// A settings row changed since the caller observed it; refresh, do not retry blindly.
+    VersionConflict,
     /// The one 409 that IS retryable: an earlier attempt at this same operation
     /// has not finished yet. Retrying with the same key is exactly right.
     InProgress,
@@ -510,6 +512,7 @@ impl ErrorCode {
             Self::StaleRequest => "stale_request",
             Self::ActionNotAllowed => "action_not_allowed",
             Self::Replayed => "replayed",
+            Self::VersionConflict => "version_conflict",
             Self::InProgress => "in_progress",
             Self::DiscordRejected => "discord_rejected",
             Self::RateLimited => "rate_limited",
@@ -526,7 +529,7 @@ impl ErrorCode {
             Self::Malformed => 400,
             Self::Unauthorized | Self::StaleRequest => 401,
             Self::ActionNotAllowed => 403,
-            Self::Replayed | Self::InProgress => 409,
+            Self::Replayed | Self::VersionConflict | Self::InProgress => 409,
             Self::DiscordRejected => 422,
             Self::RateLimited => 429,
             Self::Internal => 500,
@@ -549,6 +552,7 @@ impl ErrorCode {
             | Self::StaleRequest
             | Self::ActionNotAllowed
             | Self::Replayed
+            | Self::VersionConflict
             | Self::DiscordRejected => false,
         }
     }
@@ -1956,6 +1960,7 @@ mod tests {
             (ErrorCode::StaleRequest, 401, false),
             (ErrorCode::ActionNotAllowed, 403, false),
             (ErrorCode::Replayed, 409, false),
+            (ErrorCode::VersionConflict, 409, false),
             (ErrorCode::InProgress, 409, true),
             (ErrorCode::DiscordRejected, 422, false),
             (ErrorCode::RateLimited, 429, true),

@@ -7,7 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Pool, Postgres, QueryBuilder};
+use two_bot_core::internal_actions::ErrorCode;
+use two_bot_core::internal_settings::SettingsCommand;
 use two_bot_core::settings::SettingsCache;
+use two_bot_cutover::internal_settings::execute_settings;
 use two_bot_cutover::settings::SettingsStore;
 
 const KEY: &str = "TWO_RAID_JOIN_THRESHOLD";
@@ -122,6 +125,203 @@ impl TestDb {
         self.admin.close().await;
         Ok(())
     }
+}
+
+const GUILD: &str = "111111111111111111";
+const ADMIN: &str = "222222222222222222";
+
+fn command(action: &str, body: Value) -> SettingsCommand {
+    SettingsCommand::parse(action, body.as_object().unwrap()).unwrap()
+}
+
+fn save(value: Value, expected_version: Option<i64>) -> SettingsCommand {
+    let mut body = json!({"key": KEY, "value": value, "updated_by": ADMIN});
+    if let Some(version) = expected_version {
+        body["expected_version"] = json!(version);
+    }
+    command("settings.set", body)
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn internal_settings_get_set_delete_preserve_wire_actor_audit_and_poll_version() -> TestResult
+{
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let read = command("settings.get", json!({"key": KEY}));
+    // A configured fallback is intentionally not returned by settings.get.
+    std::env::set_var(KEY, "environment-fallback-must-not-be-returned");
+    let initial = execute_settings(&store, GUILD, &read).await;
+    std::env::remove_var(KEY);
+    let initial = initial?;
+    assert_eq!(
+        initial.result,
+        json!({"key": KEY, "value": null, "source": "unset"})
+    );
+    assert_eq!(initial.observed_version, 0);
+    let before = store.poll_marks().await?;
+
+    let saved = execute_settings(&store, GUILD, &save(json!("8"), Some(0))).await?;
+    assert_eq!(saved.result, json!({"key": KEY, "outcome": "saved"}));
+    assert!(saved.observed_version > 0);
+    assert!(store.poll_marks().await?.0 > before.0);
+    let stored = execute_settings(&store, GUILD, &read).await?;
+    assert_eq!(
+        stored.result.to_string(),
+        r#"{"key":"TWO_RAID_JOIN_THRESHOLD","value":"8","source":"store"}"#
+    );
+    assert_eq!(stored.observed_version, saved.observed_version);
+    let actor: String =
+        sqlx::query_scalar("SELECT updated_by FROM guild_settings WHERE guild_id = $1")
+            .bind(GUILD)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(actor, ADMIN);
+    let other = execute_settings(&store, "333333333333333333", &read).await?;
+    assert_eq!(other.result["source"], "unset");
+
+    let updated =
+        execute_settings(&store, GUILD, &save(json!(9), Some(saved.observed_version))).await?;
+    assert!(updated.observed_version > saved.observed_version);
+    let revision = store.poll_marks().await?.0;
+    let deleted = execute_settings(
+        &store,
+        GUILD,
+        &save(Value::Null, Some(updated.observed_version)),
+    )
+    .await?;
+    assert_eq!(
+        deleted.result.to_string(),
+        r#"{"key":"TWO_RAID_JOIN_THRESHOLD","outcome":"unset"}"#
+    );
+    assert_eq!(deleted.observed_version, 0);
+    assert!(store.poll_marks().await?.0 > revision);
+    assert_eq!(
+        execute_settings(&store, GUILD, &read).await?.result["source"],
+        "unset"
+    );
+    let audit: Vec<(Option<Value>, Option<Value>, String)> = sqlx::query_as(
+        "SELECT old_value, new_value, actor FROM guild_settings_audit WHERE guild_id = $1 ORDER BY id",
+    ).bind(GUILD).fetch_all(&db.pool).await?;
+    assert_eq!(
+        audit,
+        vec![
+            (None, Some(json!("8")), ADMIN.into()),
+            (Some(json!("8")), Some(json!(9)), ADMIN.into()),
+            (Some(json!(9)), None, ADMIN.into()),
+        ]
+    );
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn internal_settings_stale_save_and_delete_leave_no_side_effects() -> TestResult {
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let saved = execute_settings(&store, GUILD, &save(json!(8), Some(0))).await?;
+    let newer =
+        execute_settings(&store, GUILD, &save(json!(9), Some(saved.observed_version))).await?;
+    let marks = store.poll_marks().await?;
+    for value in [json!(10), Value::Null] {
+        let error = execute_settings(&store, GUILD, &save(value, Some(saved.observed_version)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::VersionConflict);
+        assert_eq!(error.status(), 409);
+        assert!(!error.code.retryable());
+        assert_eq!(store.poll_marks().await?, marks);
+        assert_eq!(
+            store.get(GUILD, KEY).await?,
+            Some((json!(9), newer.observed_version))
+        );
+        assert_eq!(db.audit().await?.len(), 2);
+    }
+    // A stale non-zero version cannot recreate a deleted row.
+    execute_settings(
+        &store,
+        GUILD,
+        &save(Value::Null, Some(newer.observed_version)),
+    )
+    .await?;
+    let marks = store.poll_marks().await?;
+    assert_eq!(
+        execute_settings(
+            &store,
+            GUILD,
+            &save(json!(11), Some(newer.observed_version))
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::VersionConflict
+    );
+    assert_eq!(store.poll_marks().await?, marks);
+    assert_eq!(db.audit().await?.len(), 3);
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn internal_settings_concurrent_create_has_one_winner_and_one_audit() -> TestResult {
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let first = save(json!(8), Some(0));
+    let second = save(json!(9), Some(0));
+    let (a, b) = tokio::join!(
+        execute_settings(&store, GUILD, &first),
+        execute_settings(&store, GUILD, &second),
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    let loser = match (a, b) {
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => error,
+        other => panic!("expected one winner and one conflict: {other:?}"),
+    };
+    assert_eq!(loser.code, ErrorCode::VersionConflict);
+    assert_eq!(db.audit().await?.len(), 1);
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn internal_settings_refusals_and_database_failure_do_not_leak_or_mutate() -> TestResult {
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let marks = store.poll_marks().await?;
+    for key in [
+        "DISCORD_TOKEN",
+        "TWO_INTERNAL_KEYS",
+        "TWO_MODERATION",
+        "UNKNOWN_KEY",
+    ] {
+        for action in ["settings.get", "settings.set"] {
+            let body = json!({"key": key, "value": "private-value", "updated_by": ADMIN});
+            let error = SettingsCommand::parse(action, body.as_object().unwrap()).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ActionNotAllowed);
+            assert!(!format!("{error:?}").contains("private-value"));
+        }
+        assert!(store.get(GUILD, key).await.is_err());
+        assert!(store
+            .set(GUILD, key, Some(json!("private-value")), ADMIN)
+            .await
+            .is_err());
+    }
+    assert_eq!(store.poll_marks().await?, marks);
+    assert!(db.audit().await?.is_empty());
+
+    // Force a DB error whose detail contains the submitted row. The action
+    // boundary must sanitize it, and the audit failure must roll back the save.
+    sqlx::query("ALTER TABLE guild_settings_audit ADD CONSTRAINT reject_test_actor CHECK (actor <> '222222222222222222')")
+        .execute(&db.pool).await?;
+    let error = execute_settings(&store, GUILD, &save(json!("private-value"), None))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert!(!format!("{error:?}").contains("private-value"));
+    assert_eq!(store.get(GUILD, KEY).await?, None);
+    assert_eq!(store.poll_marks().await?, marks);
+    assert!(db.audit().await?.is_empty());
+    db.finish().await
 }
 
 #[tokio::test]
