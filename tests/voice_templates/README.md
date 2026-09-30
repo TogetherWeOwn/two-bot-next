@@ -88,10 +88,13 @@ Consumers should load the bundle and adapt context to the renderer under test:
    case-folded; if both constraints exist, at least one allowed output must match
    it. Case folding can expand characters, so the target itself may exceed 100
    characters even though every rendered/allowed output remains bounded.
-   Even without an allowed-output set, targets cannot start with whitespace or
-   end with whitespace below 100 folded characters. At or above that length,
-   trailing whitespace may come from a trim-then-truncate boundary; the consumer
-   still enforces the rendered output's 100-character ceiling.
+   Even without an allowed-output set, the target must have a Unicode case-fold
+   preimage of at most 100 characters. The validator computes possible preimage
+   lengths using Python's Unicode expansion table: 200 `s` characters can come
+   from 100 `ß` characters, but 101 ASCII `x` characters are infeasible.
+   Targets cannot start with whitespace. Trailing whitespace requires a preimage
+   of **exactly 100 characters**, consistent with a trim-then-truncate boundary;
+   the consumer still enforces the rendered output's 100-character ceiling.
    For each `stability_groups` entry, render all referenced
    cases and require the **same output across the changed contexts**. Do not
    assume distinct seeds necessarily yield different results.
@@ -122,7 +125,11 @@ strings against the specification. V5 trims **before** truncating: a valid
 trailing whitespace below the ceiling remain invalid. Regression controls cover
 that boundary for exact and allowed outputs, mixed ordinary-choice/named-list
 coverage, compatible/contradictory case-fold invariants, and standalone folded
-whitespace targets with Unicode expansion (including expanded boundary prefixes).
+target feasibility with two- and three-character Unicode expansion (including
+expanded boundary prefixes). Keyword coverage distinguishes bare `OWNER` from
+`OWNER:id`; comparison coverage requires numeric operands in a conditional
+header, not operator-like literal text in the template or a branch. These are
+fixture coverage controls, not an implementation of the template parser.
 
 Key unresolved areas in `coverage.json`: exact NATO spelling/wrap formatting;
 two-game tie ordering/separator; owner-preference and inactive voting; offline

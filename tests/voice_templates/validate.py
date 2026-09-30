@@ -2,6 +2,7 @@
 """Validate fixture integrity, not renderer conformance. Standard library only."""
 
 import argparse
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -141,6 +142,36 @@ def trimmed_output(value):
     return value.lstrip() == value and (len(value) == 100 or value.rstrip() == value)
 
 
+@lru_cache(maxsize=1)
+def casefold_expansions():
+    # Use Python's Unicode table, not an ASCII length cap or a hand-picked ß rule.
+    expansions = {}
+    for codepoint in range(sys.maxunicode + 1):
+        folded = chr(codepoint).casefold()
+        if len(folded) > 1:
+            expansions.setdefault(len(folded), set()).add(folded)
+    return expansions
+
+
+def folded_output_lengths(target):
+    """Possible preimage lengths up to 100 for an already-folded target."""
+    expansions = casefold_expansions()
+    if len(target) > 100 * max(expansions, default=1):
+        return set()
+    lengths = [set() for _ in range(len(target) + 1)]
+    lengths[0].add(0)
+    for i in range(len(target)):
+        next_lengths = {n + 1 for n in lengths[i] if n < 100}
+        # Identity characters and every multi-character fold each cost one
+        # source character. Track all lengths: a whitespace boundary needs 100,
+        # not merely a shortest preimage under the cap.
+        lengths[i + 1].update(next_lengths)
+        for width, folds in expansions.items():
+            if target[i:i + width] in folds:
+                lengths[i + width].update(next_lengths)
+    return lengths[-1]
+
+
 def spec_inventory(spec):
     """Derive token/keyword/style inventory independently of coverage.json."""
     v5 = spec.split("## V5:", 1)[1].split("## V7:", 1)[0]
@@ -170,14 +201,22 @@ def spec_inventory(spec):
 def feature_used(key, template):
     if key.startswith("token:"):
         return key[6:] in template
-    if key.startswith("condition:"):
-        word = key[10:]
-        pattern = re.escape(word.replace(":id", ":"))
-        if word.endswith(":id"):
-            pattern += r"[a-zA-Z0-9_-]+"
-        return bool(re.search(r"\{\{\s*" + pattern + r"(?=\W|$)", template))
-    if key.startswith("compare:"):
-        return " " + key[8:] + " " in template
+    if key.startswith(("condition:", "compare:")):
+        # Only condition headers count, never ordinary text or branch bodies.
+        # No closing delimiter is required: deferred malformed-block probes can
+        # still exercise a recognizable header without claiming parser validity.
+        headers = re.findall(r"\{\{\s*([^{}?]+?)\s*\?\?", template)
+        if key.startswith("condition:"):
+            word = key[10:]
+            pattern = re.escape(word.replace(":id", ":"))
+            if word.endswith(":id"):
+                pattern += r"[a-zA-Z0-9_-]+"
+            elif word == "GAME":
+                pattern += r"(?:\s*(?::|=|!=)\s*.+)?"
+        else:
+            operand = r"(?:\d+|@@(?:num|limit|slots|hour)@@|\$#)"
+            pattern = operand + r"\s*" + re.escape(key[8:]) + r"\s*" + operand
+        return any(re.fullmatch(pattern, header.strip()) for header in headers)
     if key.startswith("style:"):
         mode = key[6:]
         pattern = r"\d+w" if mode == "<N>w" else re.escape(mode)
@@ -269,6 +308,10 @@ def validate(corpus, coverage, spec_bytes):
                 # A truncated 100-character output has at least 100 folded chars.
                 require(target.lstrip() == target
                         and (len(target) >= 100 or target.rstrip() == target),
+                        "untrimmed case-folded target")
+                lengths = folded_output_lengths(target)
+                require(bool(lengths), "infeasible case-folded target")
+                require(target.rstrip() == target or 100 in lengths,
                         "untrimmed case-folded target")
                 if "allowed_outputs" in expected:
                     require(any(s.casefold() == target for s in expected["allowed_outputs"]),

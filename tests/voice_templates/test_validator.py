@@ -190,8 +190,9 @@ class CorpusTests(unittest.TestCase):
                     self.validate_added_case('""rand:room name""', expected, ["style:rand"])
 
     def test_standalone_casefold_target_shape(self):
-        for output in ["Room Name", "Straße", "ß" * 100, "x" * 99 + " ",
-                       "ß" * 99 + " ", "ß" * 99 + "\t", "ß" * 99 + "\n"]:
+        for output in ["Room Name", "Straße", "ß" * 100, "ﬃ" * 100, "x" * 99 + " ",
+                       "ß" * 99 + " ", "ß" * 99 + "\t", "ß" * 99 + "\n",
+                       "ﬃ" * 99 + " ", "x" * 98 + "ß ", "ss" * 49 + "x "]:
             with self.subTest(output=output):
                 expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
                             "stable_for_same_context": True, "casefold_equals": output.casefold()}
@@ -207,6 +208,50 @@ class CorpusTests(unittest.TestCase):
                             "stable_for_same_context": True, "casefold_equals": target}
                 with self.assertRaisesRegex(validate.FixtureError, "untrimmed case-folded target"):
                     self.validate_added_case('""rand:room name""', expected, ["style:rand"])
+
+    def test_standalone_infeasible_casefold_target(self):
+        for target in ["x" * 101, "ss" * 100 + "x", "ffi" * 100 + "x",
+                       "x" * 99 + "ss ", "x" * 100 + " "]:
+            with self.subTest(target=repr(target)):
+                expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
+                            "stable_for_same_context": True, "casefold_equals": target}
+                with self.assertRaisesRegex(validate.FixtureError, "infeasible case-folded target"):
+                    self.validate_added_case('""rand:room name""', expected, ["style:rand"])
+
+    def test_condition_coverage_distinguishes_forms(self):
+        expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
+                    "stable_for_same_context": True}
+        for template, covers in [("{{OWNER:owner ??yes//no}}", ["condition:OWNER"]),
+                                 ("{{OWNER ??yes//no}}", ["condition:OWNER:id"]),
+                                 ("{{OWNER: ??yes//no}}", ["condition:OWNER:id"]),
+                                 ("{{OWNER:owner! ??yes//no}}", ["condition:OWNER:id"]),
+                                 ("{{OWNER_EXTRA ??yes//no}}", ["condition:OWNER"]),
+                                 ("OWNER", ["condition:OWNER"]),
+                                 ("{{PRIVATE ??OWNER//no}}", ["condition:OWNER"])]:
+            with self.subTest(template=template, covers=covers):
+                with self.assertRaisesRegex(validate.FixtureError, "not exercised"):
+                    self.validate_added_case(template, expected, covers)
+        self.validate_added_case("{{OWNER ??{{OWNER:owner ??yes//no}}//no}}", expected,
+                                 ["condition:OWNER", "condition:OWNER:id"])
+
+    def test_comparison_coverage_requires_conditional_header(self):
+        expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
+                    "stable_for_same_context": True}
+        for op in ["<", ">", "<=", ">=", "=", "!="]:
+            key = "compare:" + op
+            for template in [f"label {op} tag", f"{{{{PRIVATE ??1 {op} 2//no}}}}",
+                             f"{{{{PRIVATE ??yes//1 {op} 2}}}}", f"{{{{1 {op} 2}}}}",
+                             f"{{{{label {op} tag ??yes//no}}}}"]:
+                with self.subTest(op=op, template=template):
+                    with self.assertRaisesRegex(validate.FixtureError, "not exercised"):
+                        self.validate_added_case(template, expected, [key])
+            for template in [f"{{{{1 {op} 2 ??yes//no}}}}",
+                             f"{{{{@@num@@{op}@@limit@@??yes}}}}",
+                             f"{{{{PRIVATE ??yes//{{{{$# {op} 2 ??yes//no}}}}}}}}"]:
+                with self.subTest(op=op, template=template):
+                    self.validate_added_case(template, expected, [key])
+        for key in ["compare:<", "compare:="]:
+            self.assertFalse(validate.feature_used(key, "{{1 <= 2 ??yes//no}}"))
 
     def test_spec_drift(self):
         with self.assertRaisesRegex(validate.FixtureError, "spec drift"):
