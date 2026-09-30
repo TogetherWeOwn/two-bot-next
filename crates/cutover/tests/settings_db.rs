@@ -38,6 +38,11 @@ impl TestDb {
         ))
         .execute(&mut *tx)
         .await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0332_guild_settings_allocator.sql"
+        ))
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await
     }
 
@@ -367,6 +372,123 @@ async fn version_migration_preserves_rows_and_seeds_above_existing_tokens() -> T
     )
     .await?;
     assert!(saved.observed_version > 2000000, "allocator never rewinds");
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn legacy_zero_version_does_not_match_absence_after_upgrade() -> TestResult {
+    let db = TestDb::new_legacy().await?;
+    sqlx::query(
+        "INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
+         VALUES ($1, $2, '8', 0, 'legacy-writer')",
+    )
+    .bind(GUILD)
+    .bind(KEY)
+    .execute(&db.pool)
+    .await?;
+    db.migrate_row_versions().await?;
+    let store = SettingsStore::new(&db.pool);
+    let read = command("settings.get", json!({"key": KEY}));
+    let observed = execute_settings(&store, GUILD, &read).await?;
+    assert_eq!(
+        observed.result,
+        json!({"key": KEY, "value": 8, "source": "store"})
+    );
+    assert_eq!(
+        observed.observed_version, 0,
+        "upgrade does not rewrite row tokens"
+    );
+    let marks = store.poll_marks().await?;
+    for value in [json!(9), Value::Null] {
+        let error = execute_settings(&store, GUILD, &save(value, Some(0)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::VersionConflict);
+        assert_eq!(error.status(), 409);
+        assert!(!error.code.retryable());
+        assert_eq!(store.get(GUILD, KEY).await?, Some((json!(8), 0)));
+        assert_eq!(store.poll_marks().await?, marks);
+        assert!(db.audit().await?.is_empty());
+    }
+    // Only a deliberate legacy unconditional save can update this old row.
+    let saved = execute_settings(&store, GUILD, &save(json!(9), None)).await?;
+    assert!(saved.observed_version > 0);
+    execute_settings(
+        &store,
+        GUILD,
+        &save(Value::Null, Some(saved.observed_version)),
+    )
+    .await?;
+    assert_eq!(store.get(GUILD, KEY).await?, None);
+    assert_eq!(
+        db.audit().await?,
+        vec![(Some(json!(8)), Some(json!(9))), (Some(json!(9)), None)]
+    );
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn qualified_sql_uses_table_allocator_not_shadow_sequence() -> TestResult {
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let saved = execute_settings(&store, GUILD, &save(json!(8), Some(0))).await?;
+    let mut tx = db.pool.begin().await?;
+    sqlx::query("CREATE TEMP SEQUENCE guild_settings_version_seq")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_catalog.setval('pg_temp.guild_settings_version_seq', $1, false)")
+        .bind(saved.observed_version)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_catalog.set_config('search_path', $1, true)")
+        .bind(format!("pg_temp,{}", db.schema))
+        .execute(&mut *tx)
+        .await?;
+    // Only a generated, numeric schema identifier is interpolated. The caller
+    // qualifies the table while a same-named sequence precedes it in lookup.
+    let token: i64 = QueryBuilder::<Postgres>::new("UPDATE ")
+        .push(&db.schema)
+        .push(".guild_settings SET value = '9' WHERE guild_id = ")
+        .push_bind(GUILD)
+        .push(" AND key = ")
+        .push_bind(KEY)
+        .push(" RETURNING version")
+        .build_query_scalar()
+        .fetch_one(&mut *tx)
+        .await?;
+    assert!(
+        token > saved.observed_version,
+        "shadow sequence cannot preserve a stale token"
+    );
+    let shadow: (i64, bool) =
+        sqlx::query_as("SELECT last_value, is_called FROM pg_temp.guild_settings_version_seq")
+            .fetch_one(&mut *tx)
+            .await?;
+    assert_eq!(
+        shadow,
+        (saved.observed_version, false),
+        "shadow sequence was never used"
+    );
+    sqlx::query("DROP SEQUENCE pg_temp.guild_settings_version_seq")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    let marks = store.poll_marks().await?;
+    for value in [json!(10), Value::Null] {
+        let error = execute_settings(&store, GUILD, &save(value, Some(saved.observed_version)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::VersionConflict);
+        assert_eq!(store.get(GUILD, KEY).await?, Some((json!(9), token)));
+        assert_eq!(store.poll_marks().await?, marks);
+        assert_eq!(db.audit().await?.len(), 1);
+    }
+    // A normal caller can use the fresh token after the qualified direct write.
+    execute_settings(&store, GUILD, &save(json!(10), Some(token))).await?;
+    assert_eq!(db.audit().await?[1], (Some(json!(9)), Some(json!(10))));
     db.finish().await
 }
 

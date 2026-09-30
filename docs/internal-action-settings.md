@@ -46,9 +46,12 @@ a validated command is not an authorization grant.
 
 `settings.set` accepts an optional `expected_version` non-negative integer.
 It is the observed **row version**, not the global poll revision. Zero expects
-an absent override. A supplied stale version returns non-retryable HTTP 409
-`version_conflict`; refresh before deliberately submitting a new save. Omitting
-it retains the legacy unconditional-save behavior. The comparison occurs under
+an absent override, never a stored token of zero. A legacy version-zero row
+still returns `source: "store"`; expected-zero saves/deletes refuse it. An
+explicit legacy unconditional save assigns it a new positive token, after which
+version-checked writes work normally. A supplied stale version returns
+non-retryable HTTP 409 `version_conflict`; refresh before deliberately submitting
+a new save. Omitting it retains the legacy unconditional-save behavior. The comparison occurs under
 the existing revision-row lock, before the value, audit or poll revision changes,
 so simultaneous saves against one version cannot both succeed.
 
@@ -63,8 +66,11 @@ one settings transaction. Audit failure rolls back all three. Row versions
 advance on every insert/update, including supported direct SQL writers, via
 migration `0331`'s database-owned row trigger. Caller-supplied versions are
 ignored; the upgrade seeds the allocator above existing row tokens without
-changing migration `0330`. Deletion advances the transactional poll revision.
-No runtime hot-reload consumer is changed here.
+changing migration `0330`. Additive migration `0332` binds allocation to the
+trigger's target table schema, independent of the caller's sequence search path;
+`0330` and `0331` checksums and existing row tokens remain unchanged. Deletion
+advances the transactional poll revision. No runtime hot-reload consumer is
+changed here.
 
 The outer durable store and this transaction are separate. A receiver must not
 re-execute an ambiguous write after losing a terminal-response commit. Its

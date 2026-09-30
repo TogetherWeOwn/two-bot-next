@@ -27,7 +27,7 @@ pub struct SettingsStore<'a> {
 }
 
 impl<'a> SettingsStore<'a> {
-    /// Borrow the pool; migrations (including `0330` and `0331`) are applied by
+    /// Borrow the pool; migrations (including `0330`–`0332`) are applied by
     /// [`crate::CutoverDb::migrate`], not here.
     #[must_use]
     pub fn new(pool: &'a Pool<Postgres>) -> Self {
@@ -147,8 +147,12 @@ impl<'a> SettingsStore<'a> {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let actual_version = previous.as_ref().map_or(0, |(_, version)| *version);
-        if expected_version.is_some_and(|expected| expected != actual_version) {
+        // Zero is an absence precondition, not a row token: legacy direct
+        // writers could store zero before database-owned versions existed.
+        if expected_version.is_some_and(|expected| match previous.as_ref() {
+            None => expected != 0,
+            Some((_, version)) => expected == 0 || expected != *version,
+        }) {
             tx.rollback().await?;
             return Err(SettingsWriteError::VersionConflict);
         }
