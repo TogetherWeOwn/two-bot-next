@@ -1483,6 +1483,103 @@ async fn postgres_unban_audit_precedes_successful_and_failed_completion() {
 
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_staging_and_due_claim_share_the_member_queue() {
+    let (admin, pool, schema) = database().await;
+    let guild = "100000000000000001";
+    let user = "333333333333333333";
+    let store = PgMemberModerationStore::new(pool.clone(), guild);
+    accepted_unban(&store, guild, user, "old-expiry", NOW, NOW).await;
+    store
+        .activate_staged_unban(guild, user, "old-expiry", NOW)
+        .await
+        .expect("pending old expiry");
+    let key = i64::from(rand::random::<u32>() & 0x7fff_ffff);
+    sqlx::raw_sql(
+        "CREATE TABLE staging_latch (key BIGINT NOT NULL);
+         CREATE FUNCTION pause_prepared_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN IF NEW.request_id = 'queue-race' THEN PERFORM pg_advisory_xact_lock((SELECT key FROM staging_latch)); END IF; RETURN NEW; END $$;
+         CREATE TRIGGER pause_prepared_insert BEFORE INSERT ON moderation_member_bans FOR EACH ROW EXECUTE FUNCTION pause_prepared_insert();"
+    ).execute(&pool).await.expect("pause staging after the fence check");
+    sqlx::query("INSERT INTO staging_latch VALUES ($1)")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .expect("random test latch key");
+    let mut locker = admin
+        .acquire()
+        .await
+        .expect("scratch advisory-lock connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(key)
+        .execute(&mut *locker)
+        .await
+        .expect("hold test latch");
+    let discord = MockMemberDiscord::new();
+    let svc = Arc::new(MemberModerationService::new(
+        discord.clone(),
+        store,
+        policy(),
+        || 1_700_000_000_000,
+    ));
+    let ban_svc = svc.clone();
+    let ban = tokio::spawn(async move {
+        ban_svc
+            .execute(&execution(ModerationAction::Ban, "queue-race"))
+            .await
+    });
+    let waiting = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid::bigint = $1 AND NOT granted)")
+                .bind(key).fetch_one(&pool).await.expect("test latch observation");
+            if waiting { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.is_ok();
+    let sweep_svc = svc.clone();
+    let mut sweep = tokio::spawn(async move { sweep_svc.run_due_unbans(guild).await });
+    let sweep_waited = tokio::time::timeout(Duration::from_millis(30), &mut sweep)
+        .await
+        .is_err();
+    let before_commit = unban_state(&pool, "old-expiry").await;
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(&mut *locker)
+        .await
+        .expect("release only the scratch latch");
+    drop(locker);
+    let ban_result = tokio::time::timeout(Duration::from_secs(5), ban)
+        .await
+        .expect("bounded ban")
+        .expect("ban task");
+    let sweep_result = if sweep_waited {
+        Some(
+            tokio::time::timeout(Duration::from_secs(5), sweep)
+                .await
+                .expect("bounded sweep")
+                .expect("sweep task"),
+        )
+    } else {
+        None
+    };
+    let final_state = unban_state(&pool, "old-expiry").await;
+    let next = svc
+        .execute(&execution(ModerationAction::Ban, "after-race"))
+        .await;
+    cleanup(admin, pool, schema).await;
+    assert!(waiting && sweep_waited);
+    assert_eq!(
+        before_commit, "pending",
+        "a queue waiter must not hold a dispatched claim"
+    );
+    assert!(ban_result.is_ok());
+    assert_eq!(sweep_result.expect("waited sweep").expect("sweep"), 0);
+    assert_eq!(final_state, "superseded");
+    assert_eq!(discord.call_count("unban"), 0);
+    assert!(next.is_ok(), "no permanently running undispatched row");
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
 async fn postgres_void_requeues_current_expiry_and_fence_refusal_releases_only_new_key() {
     use two_bot_core::member_moderation::{MemberError, UnbanResolution};
     let (admin, pool, schema) = database().await;

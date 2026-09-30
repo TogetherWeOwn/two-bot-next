@@ -456,7 +456,9 @@ pub trait MemberModerationStore: Send + Sync {
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Claim due accepted expiries in THIS guild only. Recover only staged
-    /// rows with durable acceptance and current generation ownership.
+    /// rows with durable acceptance and current generation ownership. Takes
+    /// each member queue internally and rechecks candidates before marking
+    /// running; do not call from inside `serialize_member` (non-reentrant).
     /// Dispatchers request one job at a time so a cancelled first request
     /// cannot strand a batch of never-dispatched expiries. Running rows are
     /// never reclaimed by age; prepared bans require reconciliation.
@@ -1626,18 +1628,20 @@ impl MemberModerationStore for MemMemberStore {
             })
             .await?;
         }
-        let mut inner = self.lock();
-        let mut due: Vec<(String, UnbanRow)> = inner
-            .unbans
-            .iter()
-            .filter(|(id, r)| {
-                r.guild_id == guild_id
-                    && r.state == UnbanState::Pending
-                    && r.execute_at.as_str() <= now
-                    && inner.accepted_current_ban(id)
-            })
-            .map(|(id, r)| (id.clone(), r.clone()))
-            .collect();
+        let mut due: Vec<(String, UnbanRow)> = {
+            let inner = self.lock();
+            inner
+                .unbans
+                .iter()
+                .filter(|(id, r)| {
+                    r.guild_id == guild_id
+                        && r.state == UnbanState::Pending
+                        && r.execute_at.as_str() <= now
+                        && inner.accepted_current_ban(id)
+                })
+                .map(|(id, r)| (id.clone(), r.clone()))
+                .collect()
+        };
         due.sort_by(|a, b| {
             a.1.execute_at
                 .cmp(&b.1.execute_at)
@@ -1645,21 +1649,34 @@ impl MemberModerationStore for MemMemberStore {
         });
         let mut jobs = Vec::new();
         for (id, row) in due.into_iter().take(limit.clamp(0, 25) as usize) {
-            inner.claim_sequence += 1;
-            let token = format!("mem-{}", inner.claim_sequence);
-            if let Some(stored) = inner.unbans.get_mut(&id) {
-                if stored.state != UnbanState::Pending {
-                    continue;
-                }
-                stored.state = UnbanState::Running;
-                stored.claim_token = Some(token.clone());
-                jobs.push(UnbanJob {
-                    request_id: id,
-                    claim_token: token,
-                    guild_id: row.guild_id,
-                    user_id: row.user_id,
-                    reason: row.reason,
-                });
+            // Selection is advisory. Staging and dispatch ownership transition
+            // share the same queue; recheck after waiting, before marking running.
+            let job = self
+                .serialize_member(&row.guild_id, &row.user_id, || async {
+                    let mut inner = self.lock();
+                    if !inner.accepted_current_ban(&id)
+                        || !inner.unbans.get(&id).is_some_and(|r| {
+                            r.state == UnbanState::Pending && r.execute_at.as_str() <= now
+                        })
+                    {
+                        return None;
+                    }
+                    inner.claim_sequence += 1;
+                    let token = format!("mem-{}", inner.claim_sequence);
+                    let stored = inner.unbans.get_mut(&id).expect("checked schedule");
+                    stored.state = UnbanState::Running;
+                    stored.claim_token = Some(token.clone());
+                    Some(UnbanJob {
+                        request_id: id.clone(),
+                        claim_token: token,
+                        guild_id: row.guild_id.clone(),
+                        user_id: row.user_id.clone(),
+                        reason: stored.reason.clone(),
+                    })
+                })
+                .await;
+            if let Some(job) = job {
+                jobs.push(job);
             }
         }
         Ok(jobs)

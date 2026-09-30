@@ -96,11 +96,16 @@ reconciliation rather than an automatic unban that might undo an existing
 permanent ban. This is a deliberate correction to legacy blind staged recovery.
 Once acceptance is recorded, activation failures/crashes recover safely.
 
-Overlapping sweeps atomically claim due accepted/current jobs with
-`FOR UPDATE SKIP LOCKED`. Claim tokens and current generation fence stale
-ownership/completion/requeue attempts. Only the job immediately being processed
-becomes running; process loss may make that one job uncertain, but does not
-strand the remaining batch. No running claim is reclaimed by age.
+Overlapping sweeps read advisory candidates, then claim each due accepted/current
+job with a conditional UPDATE under its member queue. Staging and the transition
+to dispatch ownership therefore cannot interleave. Ownership/eligibility is
+rechecked after the queue wait; a replaced candidate never becomes running.
+Cancelling a queue waiter leaves it pending without a dispatch token. Claim tokens
+and current generation fence stale ownership/completion/requeue attempts. Only
+the job immediately being processed becomes running; process loss after this
+transition may make that one job uncertain, but does not strand the remaining
+batch. No running claim is reclaimed by age. `claim_due_unbans` acquires member
+queues internally; do not wrap it in another `serialize_member` callback.
 
 Migration 0111 quarantines active imported schedules without a matching trusted
 intent; it neither invents acceptance/order nor deletes their history. Its separate

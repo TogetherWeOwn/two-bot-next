@@ -553,52 +553,76 @@ impl MemberModerationStore for PgMemberModerationStore {
             })
             .await?;
         }
-        let token = format!("{:032x}", rand::random::<u128>());
-        // A single UPDATE owns the rows. SKIP LOCKED permits overlapping
-        // sweeps without ever reclaiming an uncertain running row by age.
-        // Both recovery and claiming are scoped to this consumer's guild.
-        let rows = sqlx::query(
-            "WITH due AS (
-               SELECT job.request_id FROM moderation_scheduled_unbans AS job
-               JOIN moderation_member_bans AS intent ON intent.request_id = job.request_id
-                 AND intent.guild_id = job.guild_id AND intent.user_id = job.user_id
-               WHERE job.guild_id = $1 AND job.state = 'pending' AND intent.state = 'accepted'
-                 AND job.execute_at <= $2::text::timestamptz
-                 AND NOT EXISTS (
-                   SELECT 1 FROM moderation_scheduled_unbans AS uncertain
-                   WHERE uncertain.guild_id = job.guild_id AND uncertain.user_id = job.user_id
-                     AND (uncertain.state = 'running' OR uncertain.dispatch_uncertain)
-                 )
-                 AND NOT EXISTS (
-                   SELECT 1 FROM moderation_member_bans AS newer
-                   WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
-                     AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
+        // Read candidates without claiming. The transition to dispatch ownership
+        // must own the SAME queue as staging, then recheck the candidate: a ban
+        // may commit/supersede it while this sweep waits. Cancellation while
+        // waiting leaves the row pending, never an uncertain running DELETE.
+        let candidates = sqlx::query(
+            "SELECT job.request_id, job.user_id FROM moderation_scheduled_unbans AS job
+             JOIN moderation_member_bans AS intent ON intent.request_id = job.request_id
+               AND intent.guild_id = job.guild_id AND intent.user_id = job.user_id
+             WHERE job.guild_id = $1 AND job.state = 'pending' AND intent.state = 'accepted'
+               AND job.execute_at <= $2::text::timestamptz
+               AND NOT EXISTS (
+                 SELECT 1 FROM moderation_scheduled_unbans AS uncertain
+                 WHERE uncertain.guild_id = job.guild_id AND uncertain.user_id = job.user_id
+                   AND (uncertain.state = 'running' OR uncertain.dispatch_uncertain)
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM moderation_member_bans AS newer
+                 WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
+                   AND (newer.state = 'prepared'
                      OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
-                 )
-               ORDER BY job.execute_at, intent.generation LIMIT $3 FOR UPDATE OF job SKIP LOCKED
-             ) UPDATE moderation_scheduled_unbans AS job SET state = 'running',
-               claimed_at = $2::text::timestamptz, claim_token = $4, dispatch_uncertain = TRUE
-             FROM due WHERE job.request_id = due.request_id AND job.guild_id = $1 AND job.state = 'pending'
-             RETURNING job.request_id, job.guild_id, job.user_id, job.reason, job.claim_token",
+               )
+             ORDER BY job.execute_at, intent.generation LIMIT $3",
         )
         .bind(&self.guild_id)
         .bind(now)
         .bind(limit.clamp(0, 25))
-        .bind(token)
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(UnbanJob {
+        let mut jobs = Vec::new();
+        for candidate in candidates {
+            let request: String = candidate.try_get("request_id").map_err(db_error)?;
+            let user: String = candidate.try_get("user_id").map_err(db_error)?;
+            let job = self.serialize_member(&self.guild_id, &user, || async {
+                let token = format!("{:032x}", rand::random::<u128>());
+                let row = sqlx::query(
+                    "UPDATE moderation_scheduled_unbans AS job SET state = 'running',
+                       claimed_at = $2::text::timestamptz, claim_token = $4, dispatch_uncertain = TRUE
+                     FROM moderation_member_bans AS intent
+                     WHERE job.guild_id = $1 AND job.request_id = $3 AND job.user_id = $5
+                       AND job.state = 'pending' AND job.execute_at <= $2::text::timestamptz
+                       AND intent.request_id = job.request_id AND intent.guild_id = job.guild_id
+                       AND intent.user_id = job.user_id AND intent.state = 'accepted'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM moderation_scheduled_unbans AS uncertain
+                         WHERE uncertain.guild_id = job.guild_id AND uncertain.user_id = job.user_id
+                           AND (uncertain.state = 'running' OR uncertain.dispatch_uncertain)
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM moderation_member_bans AS newer
+                         WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
+                           AND (newer.state = 'prepared'
+                             OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
+                       )
+                     RETURNING job.request_id, job.guild_id, job.user_id, job.reason, job.claim_token",
+                ).bind(&self.guild_id).bind(now).bind(&request).bind(token).bind(&user)
+                    .fetch_optional(&self.pool).await.map_err(db_error)?;
+                row.map(|row| Ok(UnbanJob {
                     request_id: row.try_get("request_id").map_err(db_error)?,
                     claim_token: row.try_get("claim_token").map_err(db_error)?,
                     guild_id: row.try_get("guild_id").map_err(db_error)?,
                     user_id: row.try_get("user_id").map_err(db_error)?,
                     reason: row.try_get("reason").map_err(db_error)?,
-                })
-            })
-            .collect()
+                })).transpose()
+            }).await?;
+            if let Some(job) = job {
+                jobs.push(job);
+            }
+        }
+        Ok(jobs)
     }
 
     async fn owns_unban_claim(&self, request: &str, token: &str) -> Result<bool, StoreError> {

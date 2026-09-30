@@ -134,6 +134,73 @@ async fn newer_expiry_supersedes_older_accepted_crash_staged_jobs() {
 }
 
 #[tokio::test]
+async fn due_claim_waits_in_member_queue_and_cancelled_wait_has_no_dispatch_claim() {
+    let store = MemMemberStore::new();
+    store
+        .stage_unban("guild", "user", NOW, "expiry", "old", NOW)
+        .await
+        .expect("stage");
+    store
+        .confirm_ban("guild", "user", "old", NOW)
+        .await
+        .expect("accepted");
+    store
+        .activate_staged_unban("guild", "user", "old", NOW)
+        .await
+        .expect("pending");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let ban_store = store.clone();
+    let ban_entered = entered.clone();
+    let ban_release = release.clone();
+    let ban = tokio::spawn(async move {
+        ban_store
+            .serialize_member("guild", "user", || async {
+                ban_entered.notify_one();
+                ban_release.notified().await;
+                ban_store
+                    .stage_ban("guild", "user", "new", NOW)
+                    .await
+                    .expect("ban is not fenced by undispatched queue waiter");
+                ban_store
+                    .confirm_ban("guild", "user", "new", NOW)
+                    .await
+                    .expect("new accepted");
+            })
+            .await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("queue held");
+    let sweep_store = store.clone();
+    let mut sweep =
+        tokio::spawn(async move { sweep_store.claim_due_unbans("guild", NOW, 1).await });
+    let blocked = tokio::time::timeout(std::time::Duration::from_millis(20), &mut sweep)
+        .await
+        .is_err();
+    let before_cancel = store.unban_state("old");
+    if blocked {
+        sweep.abort();
+        let _ = sweep.await;
+    }
+    release.notify_one();
+    let ban_result = ban.await;
+    assert!(blocked, "claim must wait for member serialization");
+    assert_eq!(
+        before_cancel.as_deref(),
+        Some("pending"),
+        "queue waiting is not a dispatched DELETE"
+    );
+    ban_result.expect("ban task");
+    assert_eq!(store.unban_state("old").as_deref(), Some("superseded"));
+    assert!(store
+        .claim_due_unbans("guild", NOW, 1)
+        .await
+        .expect("no stale dispatch")
+        .is_empty());
+}
+
+#[tokio::test]
 async fn claims_and_retry_tokens_have_single_owners() {
     let store = MemMemberStore::new();
     let (a, b) = tokio::join!(
