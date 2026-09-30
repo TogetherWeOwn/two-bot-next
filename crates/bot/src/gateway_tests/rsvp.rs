@@ -235,6 +235,32 @@ async fn acknowledged_rsvp_survives_feature_deadline_and_backlog() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn invalid_application_identity_prevents_registry_and_gateway_startup() {
+    let db = TestDb::new().await;
+    for response in [
+        ScriptedResponse::status(403),
+        ScriptedResponse::status(200),
+        ScriptedResponse::json(200, json!({"id":"0"})),
+        ScriptedResponse::json(200, json!({"id":"not-an-id"})),
+    ] {
+        let rest = MockRest::start(vec![response], ScriptedResponse::status(500)).await;
+        let runner = spawn(&db, "ws://127.0.0.1:1", &rest).await;
+        assert!(tokio::time::timeout(Duration::from_secs(10), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        let requests = rest.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert!(db.store.load().await.unwrap().is_none());
+        rest.shutdown().await;
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn resumed_startup_publishes_full_registry_without_ready() {
     let db = TestDb::new().await;
     let mut gateway = MockGateway::new(false, true).await;
@@ -259,7 +285,7 @@ async fn resumed_startup_publishes_full_registry_without_ready() {
     let requests = rest.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].method, "GET");
-    assert_eq!(requests[0].path, "/api/v10/oauth2/applications/@me");
+    assert_eq!(requests[0].path, "/api/v10/applications/@me");
     assert_eq!(requests[1].method, "PUT");
     assert_eq!(
         requests[1].path,
@@ -278,7 +304,15 @@ async fn resumed_startup_publishes_full_registry_without_ready() {
             .count(),
         1
     );
-    assert!(names.contains(&"ping"));
+    assert_eq!(
+        names.len(),
+        runtime(&db, &rest).router.publish_set(&[]).unwrap().len()
+    );
+    assert_eq!(
+        names.iter().filter(|name| **name == "attendance").count(),
+        1
+    );
+    assert!(names.contains(&"rank"));
     runner.abort();
     let _ = runner.await;
     gateway.task.abort();
