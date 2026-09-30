@@ -5,10 +5,12 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod audit;
 pub mod automod;
 pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
+pub mod classify;
 pub mod commands;
 pub mod config;
 pub mod containment;
@@ -20,6 +22,7 @@ pub mod handlers;
 pub mod health;
 pub mod invites;
 pub mod leveling;
+pub mod mac;
 pub mod moderation;
 pub mod onboarding;
 #[cfg(feature = "db")]
@@ -74,7 +77,10 @@ pub use handlers::{
     NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow, VoiceEndedFact,
     VoiceInput, VoiceStartedFact,
 };
-pub use health::{ComponentStatus, HealthReport};
+pub use health::{
+    classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
+    VoiceFailureKind, VoiceHealthReport, VoicePermission, VoicePermissionScope, VoiceReadiness,
+};
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
     summarize_attribution_split, AttributionCategory, AttributionSplit, DowntimeWindow,
