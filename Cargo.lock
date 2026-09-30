@@ -2196,6 +2196,7 @@ dependencies = [
  "base64",
  "hex",
  "hmac",
+ "rand",
  "regex",
  "serde",
  "serde_json",
