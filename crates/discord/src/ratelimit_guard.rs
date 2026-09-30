@@ -36,6 +36,8 @@ pub enum GuardError {
     CircuitOpen,
     #[error("discord bot token is invalid (token_invalid)")]
     TokenInvalid,
+    #[error("discord admission timed out before any wire attempt")]
+    AdmissionTimeout,
 }
 
 /// Low-cardinality counters/gauges for a metrics exporter; no tokens, routes,
@@ -57,6 +59,8 @@ pub struct GuardSnapshot {
 struct State {
     invalid: VecDeque<Instant>,
     global_until: Option<Instant>,
+    pending_global: Vec<(u64, Instant)>,
+    next_global_id: u64,
     counters: GuardSnapshot,
 }
 
@@ -64,6 +68,7 @@ struct State {
 pub struct RateLimitGuard {
     config: GuardConfig,
     state: Mutex<State>,
+    changed: tokio::sync::Notify,
 }
 
 impl RateLimitGuard {
@@ -74,6 +79,7 @@ impl RateLimitGuard {
         Ok(Self {
             config,
             state: Mutex::new(State::default()),
+            changed: tokio::sync::Notify::new(),
         })
     }
 
@@ -114,6 +120,9 @@ impl RateLimitGuard {
     /// They may bypass the invalid budget, never global pauses or token_invalid.
     pub async fn admit(&self, essential: bool) -> Result<(), GuardError> {
         loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let until = {
                 let mut state = self.state.lock().expect("Discord guard state");
                 self.refresh(&mut state, Instant::now());
@@ -128,12 +137,15 @@ impl RateLimitGuard {
                     state.counters.rejected_requests_total += 1;
                     return Err(error);
                 }
-                state.global_until
+                Self::global_deadline(&state, Instant::now())
             };
             match until {
-                // A shared deadline, not one additive sleep per waiter. Recheck
-                // on waking because another in-flight response may extend it.
-                Some(until) => tokio::time::sleep_until(until).await,
+                // Body timing may replace its own provisional header deadline;
+                // another in-flight response may extend the shared pause.
+                Some(until) => tokio::select! {
+                    _ = tokio::time::sleep_until(until) => {},
+                    _ = &mut changed => {},
+                },
                 None => return Ok(()),
             }
         }
@@ -163,24 +175,60 @@ impl RateLimitGuard {
     /// Extend (never shorten) a global pause. Missing/invalid timing fails
     /// closed for a full budget window, rather than repeatedly hitting 429.
     pub fn observe_global(&self, retry_after_secs: Option<f64>) {
+        let observed_at = Instant::now();
+        let id = self.begin_global(retry_after_secs, observed_at);
+        self.finish_global(id, retry_after_secs, observed_at);
+    }
+
+    fn global_deadline(state: &State, now: Instant) -> Option<Instant> {
+        state
+            .global_until
+            .into_iter()
+            .chain(state.pending_global.iter().map(|(_, until)| *until))
+            .filter(|until| *until > now)
+            .max()
+    }
+
+    fn global_until(&self, retry_after_secs: Option<f64>, observed_at: Instant) -> Instant {
         let wait = retry_after_secs
             .filter(|secs| secs.is_finite() && *secs >= 0.0)
             .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
             .and_then(|wait| wait.checked_add(Duration::from_millis(250)))
             .unwrap_or(self.config.window);
-        let now = Instant::now();
-        let until = now.checked_add(wait).unwrap_or(now + self.config.window);
+        observed_at
+            .checked_add(wait)
+            .unwrap_or(observed_at + self.config.window)
+    }
+
+    fn begin_global(&self, timing: Option<f64>, observed_at: Instant) -> u64 {
+        let until = self.global_until(timing, observed_at);
         let mut state = self.state.lock().expect("Discord guard state");
-        self.refresh(&mut state, now);
-        if state.global_until.is_none() {
+        self.refresh(&mut state, observed_at);
+        if Self::global_deadline(&state, observed_at).is_none() {
             state.counters.global_pauses_total += 1;
             tracing::warn!(
                 event = "discord_global_pause",
-                wait_ms = wait.as_millis() as u64,
+                wait_ms = until.duration_since(observed_at).as_millis() as u64,
                 "Discord global REST pause"
             );
         }
+        let id = state.next_global_id;
+        state.next_global_id += 1;
+        state.pending_global.push((id, until));
+        id
+    }
+
+    fn finish_global(&self, id: u64, timing: Option<f64>, observed_at: Instant) {
+        let until = self.global_until(timing, observed_at);
+        let mut state = self.state.lock().expect("Discord guard state");
+        state
+            .pending_global
+            .retain(|(pending_id, _)| *pending_id != id);
+        // Only replace this response's provisional timing. Never shorten a
+        // restriction learned from another response, even while bodies overlap.
         state.global_until = Some(state.global_until.map_or(until, |old| old.max(until)));
+        drop(state);
+        self.changed.notify_waiters();
     }
 
     #[must_use]
@@ -190,8 +238,7 @@ impl RateLimitGuard {
         self.refresh(&mut state, now);
         GuardSnapshot {
             invalid_requests_in_window: state.invalid.len(),
-            global_pause_remaining: state
-                .global_until
+            global_pause_remaining: Self::global_deadline(&state, now)
                 .map_or(Duration::ZERO, |until| until.duration_since(now)),
             ..state.counters
         }
@@ -222,9 +269,9 @@ pub fn process_guard() -> Arc<RateLimitGuard> {
 /// Keeps accounting correct if a response body errors or its future is dropped.
 pub(crate) struct ResponseAccounting<'a> {
     guard: &'a RateLimitGuard,
-    global_header: bool,
+    global_header: Option<u64>,
     retry_after_header: Option<f64>,
-    finished: bool,
+    observed_at: Instant,
 }
 
 impl<'a> ResponseAccounting<'a> {
@@ -240,11 +287,17 @@ impl<'a> ResponseAccounting<'a> {
             && (header("x-ratelimit-global").is_some_and(|v| v.eq_ignore_ascii_case("true"))
                 || header("x-ratelimit-scope").is_some_and(|v| v.eq_ignore_ascii_case("global")));
         let retry_after_header = header("retry-after").and_then(|v| v.parse::<f64>().ok());
+        let observed_at = Instant::now();
+        // Install the restriction before awaiting any body bytes. With no usable
+        // header timing, hold a provisional full-window pause until body timing
+        // is known (or Drop commits the conservative fallback).
+        let global_header =
+            global_header.then(|| guard.begin_global(retry_after_header, observed_at));
         Self {
             guard,
             global_header,
             retry_after_header,
-            finished: false,
+            observed_at,
         }
     }
 
@@ -254,21 +307,25 @@ impl<'a> ResponseAccounting<'a> {
             value.get("global").and_then(|v| v.as_bool()) == Some(true)
                 || value.get("scope").and_then(|v| v.as_str()) == Some("global")
         });
-        if response.status == 429 && (self.global_header || global_body) {
+        if response.status == 429 && (self.global_header.is_some() || global_body) {
             let timing = response
                 .body_retry_after_secs()
                 .filter(|secs| *secs >= 0.0)
                 .or(self.retry_after_header);
-            self.guard.observe_global(timing);
+            let id = self
+                .global_header
+                .take()
+                .unwrap_or_else(|| self.guard.begin_global(timing, self.observed_at));
+            self.guard.finish_global(id, timing, self.observed_at);
         }
-        self.finished = true;
     }
 }
 
 impl Drop for ResponseAccounting<'_> {
     fn drop(&mut self) {
-        if !self.finished && self.global_header {
-            self.guard.observe_global(self.retry_after_header);
+        if let Some(id) = self.global_header.take() {
+            self.guard
+                .finish_global(id, self.retry_after_header, self.observed_at);
         }
     }
 }
@@ -311,6 +368,73 @@ mod tests {
         tokio::time::advance(Duration::from_secs(61)).await;
         task.await.unwrap().unwrap();
         assert_eq!(guard.snapshot().global_pauses_total, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_body_replaces_only_its_own_provisional_pause() {
+        let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap());
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-ratelimit-global", http::HeaderValue::from_static("true"));
+        let mut accounting = ResponseAccounting::new(&guard, 429, &headers, true);
+        assert_eq!(
+            guard.snapshot().global_pause_remaining,
+            INVALID_REQUEST_WINDOW
+        );
+        let waiter = tokio::spawn({
+            let guard = guard.clone();
+            async move { guard.admit(false).await }
+        });
+        tokio::task::yield_now().await;
+        guard.observe_global(Some(2.0));
+        tokio::time::advance(Duration::from_millis(500)).await;
+        accounting.finish(&crate::executor::RawResponse {
+            status: 429,
+            retry_after_header: None,
+            body: br#"{"retry_after":0.1}"#.to_vec(),
+        });
+        drop(accounting);
+        assert_eq!(
+            guard.snapshot().global_pause_remaining,
+            Duration::from_millis(1750)
+        );
+        assert_eq!(guard.snapshot().global_pauses_total, 1);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(Duration::from_millis(1750)).await;
+        waiter.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_body_keeps_header_deadline_without_restarting_it() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-scope",
+            http::HeaderValue::from_static("global"),
+        );
+        headers.insert("retry-after", http::HeaderValue::from_static("2"));
+        let accounting = ResponseAccounting::new(&guard, 429, &headers, true);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(accounting);
+        assert_eq!(
+            guard.snapshot().global_pause_remaining,
+            Duration::from_millis(1250)
+        );
+        assert_eq!(guard.snapshot().global_pauses_total, 1);
+        let accounting = ResponseAccounting::new(
+            &guard,
+            429,
+            &http::HeaderMap::from_iter([(
+                http::header::HeaderName::from_static("x-ratelimit-global"),
+                http::HeaderValue::from_static("true"),
+            )]),
+            true,
+        );
+        drop(accounting);
+        assert_eq!(
+            guard.snapshot().global_pause_remaining,
+            INVALID_REQUEST_WINDOW
+        );
     }
 
     #[tokio::test(start_paused = true)]

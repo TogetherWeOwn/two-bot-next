@@ -476,6 +476,15 @@ impl MockRest {
     /// Bind on 127.0.0.1 and start serving `script` in order; once the queue
     /// is spent, every further request gets `default`.
     pub async fn start(script: Vec<ScriptedResponse>, default: ScriptedResponse) -> Self {
+        Self::start_with_body_delay(script, default, Duration::ZERO).await
+    }
+
+    /// Send headers immediately but hold body bytes to exercise header admission.
+    pub async fn start_with_body_delay(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+        body_delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -483,7 +492,7 @@ impl MockRest {
         let handle = {
             let recorded = Arc::clone(&recorded);
             tokio::spawn(async move {
-                rest_task(listener, recorded, queue, default).await;
+                rest_task(listener, recorded, queue, default, body_delay).await;
             })
         };
         Self {
@@ -516,6 +525,7 @@ async fn rest_task(
     recorded: Arc<Mutex<Vec<RestRequest>>>,
     queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
     default: ScriptedResponse,
+    body_delay: Duration,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -524,7 +534,9 @@ async fn rest_task(
         let recorded = Arc::clone(&recorded);
         let queue = Arc::clone(&queue);
         let default = default.clone();
-        tokio::spawn(async move { handle_rest(stream, recorded, queue, default).await });
+        tokio::spawn(
+            async move { handle_rest(stream, recorded, queue, default, body_delay).await },
+        );
     }
 }
 
@@ -533,6 +545,7 @@ async fn handle_rest(
     recorded: Arc<Mutex<Vec<RestRequest>>>,
     queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
     default: ScriptedResponse,
+    body_delay: Duration,
 ) {
     let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
         return;
@@ -563,6 +576,9 @@ async fn handle_rest(
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
+    if !next.body.is_empty() && !body_delay.is_zero() {
+        tokio::time::sleep(body_delay).await;
+    }
     let _ = stream.write_all(&next.body).await;
 }
 

@@ -154,7 +154,11 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
     let report: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(
         report["components"],
-        serde_json::json!([["process", "ready"], ["gateway", "down"]])
+        serde_json::json!([
+            ["process", "ready"],
+            ["gateway", "down"],
+            ["token_invalid", "ready"]
+        ])
     );
 
     let mut probe = Bot(command(&listen_addr).arg("--healthcheck").spawn().unwrap());

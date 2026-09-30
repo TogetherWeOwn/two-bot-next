@@ -476,19 +476,30 @@ impl ActionExecutor {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn pace(&self, kick_lane: bool) {
+    async fn admit(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
+        let guard = &self.inner.transport.guard;
+        let essential = is_interaction_callback(request);
+        let Some(kick_lane) = lane else {
+            return guard.admit(essential).await;
+        };
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
         } else {
             (&self.inner.pace_last_at, self.inner.pace_interval)
         };
+        // Keep the lane reservation through cooldown and pacing. Timestamp only
+        // the actual dispatch, not each queued caller's pre-cooldown admission.
         let mut last = lock.lock().await;
+        guard.admit(essential).await?;
         let earliest = *last + interval;
         let now = std::time::Instant::now();
         if earliest > now {
             tokio::time::sleep(earliest - now).await;
         }
+        // A global response/breaker may arrive during the lane sleep.
+        guard.admit(essential).await?;
         *last = std::time::Instant::now();
+        Ok(())
     }
 
     fn count(&self) {
@@ -497,18 +508,36 @@ impl ActionExecutor {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    async fn send(&self, request: &Request) -> Result<RawResponse, DiscordError> {
-        self.inner
-            .transport
-            .guard
-            .admit(is_interaction_callback(request))
-            .await?;
+    async fn send_admitted(&self, request: &Request) -> Result<RawResponse, DiscordError> {
         self.count();
         self.inner
             .transport
             .send_request(request)
             .await
             .map_err(DiscordError::Unavailable)
+    }
+
+    async fn send_paced(
+        &self,
+        request: &Request,
+        kick_lane: bool,
+    ) -> Result<RawResponse, DiscordError> {
+        self.admit(request, Some(kick_lane)).await?;
+        self.send_admitted(request).await
+    }
+
+    async fn send_with_timeout(
+        &self,
+        request: &Request,
+        lane: Option<bool>,
+    ) -> Result<RawResponse, DiscordError> {
+        let deadline = tokio::time::Instant::now() + self.inner.moderation_timeout;
+        tokio::time::timeout_at(deadline, self.admit(request, lane))
+            .await
+            .map_err(|_| GuardError::AdmissionTimeout)??;
+        tokio::time::timeout_at(deadline, self.send_admitted(request))
+            .await
+            .map_err(|_| DiscordError::Timeout)?
     }
 
     /// Build a twilight [`Request`] from a builder without sending (keeps
@@ -546,9 +575,7 @@ impl ActionExecutor {
         request: Request,
         accepted: &[u16],
     ) -> Result<RawResponse, DiscordError> {
-        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&request))
-            .await
-            .map_err(|_| DiscordError::Timeout)??;
+        let res = self.send_with_timeout(&request, None).await?;
         if accepted.contains(&res.status) {
             return Ok(res);
         }
@@ -686,7 +713,6 @@ impl ActionExecutor {
         };
         let mut attempts: u32 = 0;
         loop {
-            self.pace(true).await;
             attempts += 1;
             let request = match self.kick_request(&path_guild, &path_user, &reason) {
                 Ok(r) => r,
@@ -699,7 +725,7 @@ impl ActionExecutor {
                     }
                 }
             };
-            let res = match self.send(&request).await {
+            let res = match self.send_paced(&request, true).await {
                 Ok(r) => r,
                 Err(DiscordError::Guard(error)) => {
                     return KickResult {
@@ -816,9 +842,8 @@ impl ActionExecutor {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
         loop {
-            self.pace(false).await;
             let request = Request::from_route(&route);
-            let res = match self.send(&request).await {
+            let res = match self.send_paced(&request, false).await {
                 Ok(r) => r,
                 Err(DiscordError::Guard(error)) => return Err(error.to_string()),
                 Err(detail) => {
@@ -1231,10 +1256,7 @@ impl ActionExecutor {
         // back off within the same budget as kicks.
         let mut attempts: u32 = 0;
         loop {
-            self.pace(false).await;
-            let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
-                .await
-                .map_err(|_| DiscordError::Timeout)??;
+            let res = self.send_with_timeout(&req, Some(false)).await?;
             match res.status {
                 200..=299 => return Ok(()),
                 429 => {
@@ -1274,9 +1296,7 @@ impl ActionExecutor {
                 .create_response(interaction_id, interaction_token, response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
-            .await
-            .map_err(|_| DiscordError::Timeout)??;
+        let res = self.send_with_timeout(&req, None).await?;
         match res.status {
             200..=299 => Ok(()),
             _ => Err(throw_for_status(&res)),

@@ -35,16 +35,27 @@ Discord's IP-level invalid-request limit remains the outer safety boundary.
 Recognize `X-RateLimit-Global: true`, `X-RateLimit-Scope: global`, JSON
 `global: true`, or JSON `scope: "global"` on a 429. Store one shared monotonic
 deadline from body `retry_after` seconds (wins over a valid `Retry-After` header)
-plus **250 ms** padding. Concurrent waiters sleep to that same deadline; they do
-not each add another delay. Overlapping global responses can extend it, never
-shorten it. Local 429s retain the executor's existing lane/retry policy.
+plus **250 ms** padding. Global headers install a pause **before reading the
+body**: header timing when usable, otherwise a provisional full-window pause.
+Body timing replaces only that response's provisional pause; it cannot shorten
+another response's restriction. Deadlines are anchored at header receipt, not
+restarted when a delayed body finishes or is cancelled. Concurrent waiters sleep
+to the same maximum deadline; they do not each add another delay. Body-only global
+signals are recognized when the body arrives. Paced callers retain their lane
+reservation through global admission and recheck after pacing, so cooldown release
+preserves the 110 ms GET / 350 ms kick dispatch spacing. Local 429s retain the
+executor's existing lane/retry policy.
 
 The guard does **not** truncate a global pause to the legacy per-call 60-second
 cap. Missing, invalid, or unrepresentable timing fails closed for 600 seconds.
 If body reading fails/cancels after global headers arrive, use header timing or
 that fallback. Single-attempt calls retain their existing 5-second deadline,
 which can expire while waiting on a longer global cooldown; no wire attempt is
-made in that case. No additional automatic moderation retries are introduced.
+made in that case: return `DiscordError::Guard(GuardError::AdmissionTimeout)`,
+which is safe pre-mutation and does not increment the executor's wire counter.
+Once dispatch starts, expiry remains uncertain `DiscordError::Timeout`. The
+5-second budget includes admission and wire time, not two separate budgets. No
+additional automatic moderation retries are introduced.
 
 ## Fatal bot token and readiness
 
@@ -81,9 +92,10 @@ metrics endpoint exists in this base slice; no new public endpoint is added.
 Local fixtures only:
 
 ```sh
-cargo test -p two-bot-discord --locked --lib --test ratelimit_guard \
-  --test executor_acceptance --test executor_regressions
-cargo test -p two-bot --locked server::tests
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --lib \
+  --test ratelimit_guard --test executor_acceptance --test executor_regressions
+python3 scripts/cargo_cache.py run -- test -p two-bot --test startup
+python3 scripts/cargo_cache.py run -- test -p two-bot server::tests
 ```
 
 The new mock tests inject an explicit shared guard so token failures and short

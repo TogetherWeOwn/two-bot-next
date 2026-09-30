@@ -141,6 +141,118 @@ async fn bot_401_latches_fatal_even_after_window_rollover_and_for_essential_call
     mock.shutdown().await;
 }
 
+#[tokio::test]
+async fn global_headers_block_callers_before_delayed_body_finishes() {
+    for header_timing in [Some("0.8"), None] {
+        let mut response = ScriptedResponse::json(429, serde_json::json!({"retry_after": 0.8}));
+        response
+            .headers
+            .push(("X-RateLimit-Global".into(), "true".into()));
+        if let Some(timing) = header_timing {
+            response.headers.push(("Retry-After".into(), timing.into()));
+        }
+        let mock = MockRest::start_with_body_delay(
+            vec![response],
+            ScriptedResponse::status(204),
+            Duration::from_millis(400),
+        )
+        .await;
+        let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+        let first = executor(&mock, &guard);
+        let second = executor(&mock, &guard);
+        let initial = tokio::spawn(async move { ban(&first).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while guard.snapshot().invalid_requests_total == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let callers = tokio::spawn(async move { tokio::join!(ban(&second), ban(&second)) });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!initial.is_finished(), "body must still be pending");
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "known header restriction bypassed"
+        );
+        assert_eq!(initial.await.unwrap(), Err(DiscordError::RateLimited));
+        let (a, b) = callers.await.unwrap();
+        a.unwrap();
+        b.unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests[1..] {
+            let elapsed = request.received_at.duration_since(requests[0].received_at);
+            assert!(elapsed >= Duration::from_secs(1));
+            assert!(
+                elapsed < Duration::from_millis(1350),
+                "cooldown restarted at body"
+            );
+        }
+        assert_eq!(guard.snapshot().global_pauses_total, 1);
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn cooldown_release_preserves_get_and_kick_wire_spacing() {
+    for kick_lane in [false, true] {
+        let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+        let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+        let executor = executor(&mock, &guard);
+        guard.observe_global(Some(0.5));
+        let start = Instant::now();
+        let call = || async {
+            if kick_lane {
+                assert_eq!(
+                    executor
+                        .kick_paced("2222", "3333", "guard test")
+                        .await
+                        .attempts,
+                    1
+                );
+            } else {
+                executor.get_json("/guilds/2222").await.unwrap();
+            }
+        };
+        tokio::join!(call(), call(), call());
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].received_at.duration_since(start) >= Duration::from_millis(700));
+        let floor = Duration::from_millis(if kick_lane { 330 } else { 100 });
+        for pair in requests.windows(2) {
+            assert!(
+                pair[1].received_at.duration_since(pair[0].received_at) >= floor,
+                "cooldown released queued calls in a burst (kick={kick_lane})"
+            );
+        }
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn admission_timeout_is_safe_and_never_counts_a_wire_attempt() {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let executor = executor(&mock, &guard);
+    guard.observe_global(Some(6.0));
+    let response = pong();
+    let (ban_result, callback_result, publish_result) = tokio::join!(
+        ban(&executor),
+        executor.answer_interaction(1234, "callback-fixture-token", &response),
+        executor.publish_guild_commands(1111, 2222, &[]),
+    );
+    for result in [ban_result, callback_result, publish_result] {
+        let error = result.unwrap_err();
+        assert_eq!(error, DiscordError::Guard(GuardError::AdmissionTimeout));
+        assert!(error.is_safe_pre_mutation());
+    }
+    assert_eq!(executor.requests(), 0);
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
 fn pong() -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::Pong,
