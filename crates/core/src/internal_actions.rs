@@ -66,6 +66,8 @@ pub const CLAIM_STALE_SECONDS: u64 = 60;
 /// A full MEE6 export may hold hundreds of 2,000-character templates.
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// Discord's own message ceiling; rejecting here beats a bare 400 from Discord.
+/// (Same value as [`crate::lfg::MAX_MESSAGE_CHARS`]; each module keeps its own
+/// name because each ceiling documents a different legacy call site.)
 pub const MAX_MESSAGE_CHARS: usize = 2000;
 /// Discord's own event-name ceiling.
 pub const MAX_EVENT_NAME_CHARS: usize = 100;
@@ -131,10 +133,24 @@ pub fn signatures_match(a: &str, b: &str) -> bool {
 }
 
 /// One caller: the value of `X-TWO-Key-Id`, with its secret.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// No derived `Debug`: the derived form would print the raw secret bytes into
+/// any log line that formats the key. The hand-written impl names the key id
+/// (safe: it travels in a header) and the secret length (safe: it is the
+/// public minimum check, not key material).
+#[derive(Clone, PartialEq, Eq)]
 pub struct SigningKey {
     pub id: String,
     pub secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigningKey")
+            .field("id", &self.id)
+            .field("secret_len", &self.secret.len())
+            .finish()
+    }
 }
 
 /// `TWO_INTERNAL_KEYS` entries are `id:secret,id:secret`. Secrets may contain
@@ -182,10 +198,24 @@ pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
 /// from a wrong signature apart — unknown ids verify against a decoy secret so
 /// both failures cost the same work. Unlike legacy's fixed decoy, each keyring
 /// gets a CSPRNG-generated key at construction; it never authenticates callers.
-#[derive(Debug, Clone)]
+///
+/// No derived `Debug`: the map holds every caller secret. The hand-written
+/// impl lists only the key ids, which already travel in request headers.
+#[derive(Clone)]
 pub struct KeyRing {
     keys: HashMap<String, Vec<u8>>,
     decoy: [u8; 32],
+}
+
+impl std::fmt::Debug for KeyRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ids: Vec<&str> = self.keys.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        f.debug_struct("KeyRing")
+            .field("key_ids", &ids)
+            .field("len", &self.keys.len())
+            .finish()
+    }
 }
 
 impl KeyRing {
@@ -266,6 +296,12 @@ pub fn valid_nonce_format(nonce: &str) -> bool {
 /// parameter so tests age entries without sleeping). The durable table version
 /// lands with the db slice; this guard covers auth-only operation and unit
 /// tests exactly the way the legacy `NonceCache` did.
+///
+/// The TTL must cover the whole acceptance interval: [`within_skew`] accepts a
+/// timestamp whose distance from now is *equal* to the skew, so a nonce burned
+/// then must still be live when that same signed request is still fresh.
+/// Expiry is exclusive on both paths (`offer` and `sweep`), keeping them
+/// consistent: a nonce is live while `now - seen <= ttl`.
 #[derive(Debug, Clone)]
 pub struct NonceCache {
     seen: HashMap<String, u64>,
@@ -290,7 +326,7 @@ impl NonceCache {
             // Saturating: a backwards clock yields 0, which is inside the TTL
             // and therefore a denial — matching legacy `t - prev < ttlMs`,
             // where a negative difference is also a replay refusal.
-            if now_ms.saturating_sub(prev) < self.ttl_ms {
+            if now_ms.saturating_sub(prev) <= self.ttl_ms {
                 return false;
             }
         }
@@ -312,7 +348,7 @@ impl NonceCache {
     /// by the request rate over one TTL rather than growing forever.
     pub fn sweep(&mut self, now_ms: u64) {
         self.seen
-            .retain(|_, &mut at| now_ms.saturating_sub(at) < self.ttl_ms);
+            .retain(|_, &mut at| now_ms.saturating_sub(at) <= self.ttl_ms);
     }
 }
 
@@ -845,6 +881,15 @@ pub fn is_snowflake(value: &str) -> bool {
     (17..=20).contains(&bytes.len()) && bytes.iter().all(|b| b.is_ascii_digit())
 }
 
+/// Length in UTF-16 code units — the unit JavaScript's `string.length` counts
+/// and the unit the legacy TypeScript ceilings enforce. `str::len` counts
+/// UTF-8 bytes and would refuse non-ASCII text the website accepts (é is 1
+/// unit but 2 bytes). Astral-plane characters count 2, exactly like legacy.
+#[must_use]
+pub fn utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
 /// Non-empty string field, else `malformed`.
 pub fn require_field_str<'a>(
     body: &'a Map<String, Value>,
@@ -1032,7 +1077,7 @@ pub fn validate_event_input(
 ) -> Result<EventInput, ActionError> {
     use time::format_description::well_known::Rfc3339;
     let name = require_field_str(body, "name")?;
-    if name.len() > MAX_EVENT_NAME_CHARS {
+    if utf16_len(name) > MAX_EVENT_NAME_CHARS {
         return Err(ActionError::new(
             ErrorCode::Malformed,
             format!(r#""name" is longer than {MAX_EVENT_NAME_CHARS} characters"#),
@@ -1056,7 +1101,7 @@ pub fn validate_event_input(
         None => None,
         Some(_) => {
             let s = require_field_str(body, "description")?;
-            if s.len() > MAX_EVENT_DESCRIPTION_CHARS {
+            if utf16_len(s) > MAX_EVENT_DESCRIPTION_CHARS {
                 return Err(ActionError::new(
                     ErrorCode::Malformed,
                     format!(
@@ -1150,7 +1195,7 @@ pub fn validate_announcement<'a>(
             )
         })?;
     let content = require_field_str(body, "body")?;
-    if content.len() > MAX_MESSAGE_CHARS {
+    if utf16_len(content) > MAX_MESSAGE_CHARS {
         return Err(ActionError::new(
             ErrorCode::Malformed,
             format!(r#""body" is longer than {MAX_MESSAGE_CHARS} characters"#),
@@ -1222,43 +1267,49 @@ pub fn normalise_bind_host(host: &str) -> String {
 
 /// Loopback, RFC 1918, CGNAT, link-local, and IPv6 loopback / unique-local
 /// (legacy `isPrivateAddress`).
+///
+/// Only parsed IP literals classify as private: a bare hostname — even one
+/// that *starts* with `fc`/`fd` — is refused, because it may resolve to a
+/// public address. IPv4 is parsed strictly (four decimal octets, no leading
+/// zeros, so `017.0.0.1` cannot slip in as an octal literal); IPv6 goes
+/// through the standard parser.
 #[must_use]
 pub fn is_private_address(addr: &str) -> bool {
     let host = normalise_bind_host(addr);
-    if host == "::1" {
-        return true;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_private_ip(ip);
     }
-    if host.starts_with("fc") || host.starts_with("fd") {
-        return true;
-    }
-    if host.starts_with("fe80:") {
-        return true;
-    }
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return false;
-    }
-    let mut octets = [0u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        if part.len() > 3 || part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return false;
+    // No dotted-quad or IPv6 literal survived the parse, so this is a
+    // hostname (or garbage): never a validated private bind.
+    false
+}
+
+#[must_use]
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr::{V4, V6};
+    match ip {
+        V4(v4) => is_private_ipv4(v4),
+        V6(v6) => {
+            let s = v6.segments();
+            v6.is_loopback()
+                // fc00::/7 unique-local.
+                || (s[0] & 0xfe00) == 0xfc00
+                // fe80::/10 link-local.
+                || (s[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(is_private_ipv4)
         }
-        let parsed: u16 = match part.parse() {
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        if parsed > 255 {
-            return false;
-        }
-        octets[i] = parsed as u8;
     }
-    let (a, b) = (octets[0], octets[1]);
-    a == 127
-        || a == 10
-        || (a == 192 && b == 168)
-        || (a == 172 && (16..=31).contains(&b))
-        || (a == 100 && (64..=127).contains(&b))
-        || (a == 169 && b == 254)
+}
+
+#[must_use]
+fn is_private_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 127
+        || o[0] == 10
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || (o[0] == 169 && o[1] == 254)
 }
 
 /// Throw unless `host` is a specific private address. The wildcards are
@@ -1321,11 +1372,27 @@ pub struct AuthHeaders<'a> {
 /// applies them. The idempotency claim and the Discord run happen after this
 /// returns; the parsed body travels along so the claim can hash the same raw
 /// bytes it verified.
-#[derive(Debug, Clone)]
+///
+/// No derived `Debug`: the body may carry the `guild.add_member`
+/// `access_token`, which must never reach logs (see
+/// [`validate_guild_add_member`]). The hand-written impl names the routing
+/// fields and the body's top-level key count — enough to trace a request,
+/// never its secrets.
+#[derive(Clone)]
 pub struct AuthDecision {
     pub key_id: String,
     pub action: String,
     pub body: Map<String, Value>,
+}
+
+impl std::fmt::Debug for AuthDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthDecision")
+            .field("key_id", &self.key_id)
+            .field("action", &self.action)
+            .field("body_fields", &self.body.len())
+            .finish()
+    }
 }
 
 /// Authorise one request against the load-bearing check order:
@@ -1736,8 +1803,12 @@ mod tests {
         assert!(cache.offer("n1", 1_000));
         assert!(!cache.offer("n1", 2_000));
         assert!(cache.offer("n2", 2_000));
-        // 240 s later the first nonce is usable again.
-        assert!(cache.offer("n1", 1_000 + 240_000));
+        // The boundary is inclusive: exactly one TTL later the nonce is still
+        // live, so the same signed request — still fresh at the skew edge —
+        // is a replay, not a second acceptance.
+        assert!(!cache.offer("n1", 1_000 + 240_000));
+        // Past the TTL it is usable again.
+        assert!(cache.offer("n1", 1_000 + 240_001));
         assert_eq!(cache.len(), 2);
     }
 
@@ -2189,6 +2260,50 @@ mod tests {
     }
 
     #[test]
+    fn bind_guard_rejects_hostnames_and_accepts_literals() {
+        // Hostnames never classify as private — not even ones that merely
+        // start with `fc`/`fd`. They may resolve to a public address.
+        assert!(assert_private_bind("fc-public.example.com").is_err());
+        assert!(assert_private_bind("fd-public.example.com").is_err());
+        assert!(assert_private_bind("example.com").is_err());
+        assert!(assert_private_bind("localhost").is_err());
+        // Parsed literals still classify.
+        assert_eq!(
+            assert_private_bind("127.0.0.1").expect("loopback"),
+            "127.0.0.1"
+        );
+        assert_eq!(assert_private_bind("::1").expect("v6 loopback"), "::1");
+        assert_eq!(
+            assert_private_bind("fc00::1").expect("unique-local"),
+            "fc00::1"
+        );
+        assert_eq!(
+            assert_private_bind("[fd00::2]").expect("bracketed"),
+            "fd00::2"
+        );
+        assert_eq!(
+            assert_private_bind("fe80::1").expect("link-local"),
+            "fe80::1"
+        );
+        assert_eq!(
+            assert_private_bind("::ffff:10.0.0.1").expect("mapped"),
+            "10.0.0.1"
+        );
+        assert_eq!(
+            assert_private_bind("100.64.0.1").expect("cgnat"),
+            "100.64.0.1"
+        );
+        assert_eq!(
+            assert_private_bind("169.254.1.1").expect("link-local v4"),
+            "169.254.1.1"
+        );
+        // Public literals stay refused, including behind mapped prefixes.
+        assert!(assert_private_bind("8.8.8.8").is_err());
+        assert!(assert_private_bind("2606:4700:4700::1111").is_err());
+        assert!(assert_private_bind("::ffff:8.8.8.8").is_err());
+    }
+
+    #[test]
     fn bind_guard_refuses_wildcard_and_public() {
         assert!(assert_private_bind("0.0.0.0").is_err());
         assert!(assert_private_bind("::").is_err());
@@ -2211,6 +2326,96 @@ mod tests {
             assert_private_bind("0.0.0.0"),
             Err(BindError::Wildcard(_))
         ));
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets_and_tokens() {
+        // Generated synthetic bytes: never production keys, never fixtures.
+        // Exact-shape assertions: any future field addition that leaks key
+        // material fails loudly here instead of in a log.
+        let secret: Vec<u8> = (0..32u8).collect();
+        let key = SigningKey {
+            id: "web".to_owned(),
+            secret,
+        };
+        assert_eq!(
+            format!("{key:?}"),
+            r#"SigningKey { id: "web", secret_len: 32 }"#
+        );
+        let keys = KeyRing::new(vec![key]);
+        assert_eq!(
+            format!("{keys:?}"),
+            r#"KeyRing { key_ids: ["web"], len: 1 }"#
+        );
+        // A live OAuth token in the body must never reach Debug output.
+        let marker = "oauth-marker-abcdef0123456789";
+        let body = map(json!({
+            "action": "guild.add_member",
+            "discord_id": "123456789012345678",
+            "access_token": marker,
+        }));
+        let decision = AuthDecision {
+            key_id: "web".to_owned(),
+            action: "guild.add_member".to_owned(),
+            body,
+        };
+        let rendered = format!("{decision:?}");
+        assert!(rendered.contains("guild.add_member"));
+        assert!(rendered.contains("body_fields"));
+        assert!(!rendered.contains(marker));
+        assert!(!rendered.contains("access_token"));
+    }
+
+    #[test]
+    fn character_ceilings_count_utf16_units_like_legacy() {
+        // é is 1 UTF-16 unit but 2 UTF-8 bytes: legacy's 2000-character
+        // ceiling accepts 1100 of them; a byte count would refuse.
+        assert_eq!("é".encode_utf16().count(), 1);
+        assert_eq!("é".len(), 2);
+        let channels = build_channel_keys("ann:333333333333333333").expect("valid");
+        let accepted = "é".repeat(1100);
+        let body = map(json!({"channel_key": "ann", "body": accepted}));
+        assert!(validate_announcement(&body, &channels).is_ok());
+        let refused = "é".repeat(2001);
+        let body = map(json!({"channel_key": "ann", "body": refused}));
+        assert_eq!(
+            validate_announcement(&body, &channels)
+                .expect_err("over ceiling")
+                .code,
+            ErrorCode::Malformed
+        );
+        // Event-name ceiling: 51 non-ASCII units pass a unit count, fail a
+        // byte count.
+        let mut event = map(json!({
+            "name": "é".repeat(51),
+            "starts_at": "2026-10-01T18:00:00Z",
+            "ends_at": "2026-10-01T20:00:00Z",
+            "channel_key": "ann",
+        }));
+        assert!(validate_event_input(&event, &channels).is_ok());
+        event.insert("name".to_owned(), json!("é".repeat(101)));
+        assert_eq!(
+            validate_event_input(&event, &channels)
+                .expect_err("name over ceiling")
+                .code,
+            ErrorCode::Malformed
+        );
+        // Description ceiling likewise.
+        let mut event = map(json!({
+            "name": "Party",
+            "starts_at": "2026-10-01T18:00:00Z",
+            "ends_at": "2026-10-01T20:00:00Z",
+            "channel_key": "ann",
+            "description": "é".repeat(1000),
+        }));
+        assert!(validate_event_input(&event, &channels).is_ok());
+        event.insert("description".to_owned(), json!("é".repeat(1001)));
+        assert_eq!(
+            validate_event_input(&event, &channels)
+                .expect_err("description over ceiling")
+                .code,
+            ErrorCode::Malformed
+        );
     }
 
     #[test]
@@ -2288,6 +2493,54 @@ mod tests {
             &mut buckets,
         )
         .expect_err("replay");
+        assert_eq!(err.code, ErrorCode::Replayed);
+    }
+
+    #[test]
+    fn pipeline_replays_boundary_fresh_request() {
+        // A request signed at the far skew edge (ts = now + 120) is fresh
+        // both at issue time and at its last accepted instant (ts + 120).
+        // The nonce must survive that whole interval: the second delivery —
+        // same headers, same body, refilled buckets — is a replay.
+        let keys = ring();
+        let flags = InternalFlags::from_map(&HashMap::new());
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let raw = br#"{"action":"role.assign"}"#;
+        let nonce = test_nonce(41);
+        let sig = sign(vec1().secret.as_bytes(), "1000120", &nonce, raw);
+        let headers = signed_headers("web", "1000120", &nonce, &sig);
+        authorize(
+            &headers,
+            raw,
+            &keys,
+            &flags,
+            false,
+            false,
+            SKEW_SECONDS,
+            1_000_000,
+            1_000_000_000,
+            &mut nonces,
+            &mut buckets,
+        )
+        .expect("boundary-fresh request authorizes");
+        // Same request at its last fresh instant, buckets refilled.
+        let mut buckets = TokenBuckets::new();
+        let headers = signed_headers("web", "1000120", &nonce, &sig);
+        let err = authorize(
+            &headers,
+            raw,
+            &keys,
+            &flags,
+            false,
+            false,
+            SKEW_SECONDS,
+            1_000_240,
+            1_000_240_000,
+            &mut nonces,
+            &mut buckets,
+        )
+        .expect_err("boundary replay");
         assert_eq!(err.code, ErrorCode::Replayed);
     }
 

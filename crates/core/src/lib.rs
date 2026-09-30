@@ -127,7 +127,7 @@ pub use internal_actions::{
     assert_allowed, assert_private_bind, auth_failure, authorize, body_hash, build_channel_keys,
     build_key_map, build_role_keys, canonical_string, check_setting_value_size, is_private_address,
     new_request_id, normalise_bind_host, parse_keys, require_field_str, require_reason,
-    require_settings_key, require_snowflake, require_timestamp, sign, signatures_match,
+    require_settings_key, require_snowflake, require_timestamp, sign, signatures_match, utf16_len,
     valid_idempotency_key, valid_nonce_format, validate_announcement, validate_event_input,
     validate_guild_add_member, validate_idempotency_key, validate_moderation_numbers,
     validate_role_assign, within_skew, ActionError, AuthDecision, AuthHeaders, BindError,
@@ -159,7 +159,7 @@ pub use lfg::{
     spec_roles, valid_role_key, validate_title, LfgPermissionError, LfgPost, LfgRole, LfgRoleSpec,
     LfgSelectAction, LfgSelectOption, LfgSignup, LfgStatus, RoleSpecError, SignupOutcome,
     StartsAtError, TitleError, LFG_LEAVE_VALUE, LFG_SELECT_PREFIX, MAX_LFG_ROLES,
-    MAX_MESSAGE_CHARS, MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
+    MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
 };
 pub use moderation::{
     assert_moderation_allowed, moderation_commands, moderation_target_protection,
