@@ -157,6 +157,82 @@ async fn cli(host: &str, source: &str, target: &str, expected: i32) -> TestResul
     Ok(())
 }
 
+async fn json_marker_scenarios(
+    source: &mut PgConnection,
+    target: &mut PgConnection,
+    host: &str,
+    source_name: &str,
+    target_name: &str,
+) -> TestResult {
+    let cases = [
+        (r#"{"$serde_json::private::Number":"123"}"#, "123", false),
+        (
+            r#"{"$serde_json::private::Number":"123"}"#,
+            r#"{"$serde_json::private::Number":"123"}"#,
+            true,
+        ),
+        (
+            r#"{"$serde_json::private::Number":"not a number"}"#,
+            r#"{"$serde_json::private::Number":"not a number"}"#,
+            true,
+        ),
+        (
+            r#"{"nested":[{"$serde_json::private::Number":"123"}]}"#,
+            r#"{"nested":[123]}"#,
+            false,
+        ),
+        (
+            r#"{"z":[{"$serde_json::private::Number":"not a number"},{"$serde_json::private::Number":"123"}],"a":1.00}"#,
+            r#"{"a":1,"z":[{"$serde_json::private::Number":"not a number"},{"$serde_json::private::Number":"123"}]}"#,
+            true,
+        ),
+        (r#"{"$serde_json::private::RawValue":"123"}"#, "123", false),
+        (
+            r#"{"$serde_json::private::RawValue":"not a number"}"#,
+            r#"{"$serde_json::private::RawValue":"not a number"}"#,
+            true,
+        ),
+    ];
+    for pg_type in ["json", "jsonb"] {
+        let mut spec = MappingSpec::parse(include_str!("../mappings/example.json"))?;
+        let metadata = spec.tables[0]
+            .columns
+            .iter_mut()
+            .find(|column| column.source == "metadata")
+            .unwrap();
+        metadata.pg_type = pg_type.to_owned();
+        for (left, right, matches) in cases {
+            sqlx::query("UPDATE legacy_members SET metadata = $1 WHERE id = '3'")
+                .bind(left)
+                .execute(&mut *source)
+                .await?;
+            sqlx::query("UPDATE next_members SET metadata = $1::jsonb WHERE member_id = 3")
+                .bind(right)
+                .execute(&mut *target)
+                .await?;
+            let result = verify(source, target, &spec, &[], 10).await?;
+            assert_eq!(result.matches, matches, "{pg_type}: {left} versus {right}");
+            let table = &result.tables[0];
+            assert_eq!((table.source_rows, table.target_rows), (3, 3));
+            assert_eq!(table.missing_in_target.count, 0);
+            assert_eq!(table.extra_in_target.count, 0);
+            for column in &table.columns {
+                assert_eq!(column.matches, column.source != "metadata" || matches);
+            }
+            if pg_type == "jsonb" {
+                cli(host, source_name, target_name, if matches { 0 } else { 1 }).await?;
+            }
+        }
+    }
+    sqlx::query("UPDATE legacy_members SET metadata = NULL WHERE id = '3'")
+        .execute(source)
+        .await?;
+    sqlx::query("UPDATE next_members SET metadata = NULL WHERE member_id = 3")
+        .execute(target)
+        .await?;
+    Ok(())
+}
+
 async fn scenarios(
     options: PgConnectOptions,
     host: String,
@@ -272,6 +348,8 @@ async fn scenarios(
     sqlx::query("INSERT INTO next_members VALUES (2,false,'2026-09-30T00:00:01Z','null','null')")
         .execute(&mut target)
         .await?;
+
+    json_marker_scenarios(&mut source, &mut target, &host, &source_name, &target_name).await?;
 
     // Cross the 1024-row cursor boundary with fixtures in different insert order.
     sqlx::query("INSERT INTO legacy_members SELECT n::text,'true','2026-09-30T00:00:00Z','{}',n::text FROM generate_series(10,1110) n ORDER BY n DESC").execute(&mut source).await?;

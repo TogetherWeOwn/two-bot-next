@@ -1,9 +1,9 @@
 //! Independent, read-only database parity checks. No migration or copy path.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, Postgres, Row, Transaction};
 use thiserror::Error;
@@ -31,6 +31,8 @@ pub enum VerifyError {
     SampleLimit,
     #[error("JSON number exponent is outside the supported range")]
     Number,
+    #[error("JSON nesting exceeds 128 levels")]
+    JsonDepth,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,7 +206,7 @@ async fn inventory(
                 let value: Option<String> = row.try_get(i)?;
                 cells.push(match value {
                     Some(text) if matches!(column.pg_type.as_str(), "json" | "jsonb") => {
-                        Some(canonical_json(&serde_json::from_str(&text)?)?)
+                        Some(canonical_json(&text)?)
                     }
                     other => other,
                 });
@@ -298,35 +300,47 @@ fn compare(
 
 /// Canonical object keys and exact decimal numbers, without f64 rounding.
 /// Array order and string contents are significant. JSON null != SQL NULL.
-fn canonical_json(value: &Value) -> Result<String, VerifyError> {
-    Ok(match value {
-        Value::Null => "null".into(),
-        Value::Bool(value) => value.to_string(),
-        Value::String(value) => serde_json::to_string(value)?,
-        Value::Number(value) => canonical_number(&value.to_string())?,
-        Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(canonical_json)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(",")
-        ),
-        Value::Object(values) => {
-            let mut pairs = values.iter().collect::<Vec<_>>();
-            pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
-            let fields = pairs
+fn canonical_json(text: &str) -> Result<String, VerifyError> {
+    let value: &RawValue = serde_json::from_str(text)?;
+    canonical_json_raw(value, 0)
+}
+
+fn canonical_json_raw(value: &RawValue, depth: usize) -> Result<String, VerifyError> {
+    // RawValue validates syntax without converting numbers or interpreting
+    // private marker properties. Its scanner is iterative, so bound our recursion.
+    if depth > 128 {
+        return Err(VerifyError::JsonDepth);
+    }
+    let text = value.get();
+    Ok(match text.as_bytes()[0] {
+        b'n' | b't' | b'f' => text.to_owned(),
+        b'"' => serde_json::to_string(&serde_json::from_str::<String>(text)?)?,
+        b'[' => {
+            let values: Vec<&RawValue> = serde_json::from_str(text)?;
+            format!(
+                "[{}]",
+                values
+                    .into_iter()
+                    .map(|value| canonical_json_raw(value, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(",")
+            )
+        }
+        b'{' => {
+            let values: BTreeMap<String, &RawValue> = serde_json::from_str(text)?;
+            let fields = values
                 .into_iter()
                 .map(|(key, value)| {
                     Ok(format!(
                         "{}:{}",
-                        serde_json::to_string(key)?,
-                        canonical_json(value)?
+                        serde_json::to_string(&key)?,
+                        canonical_json_raw(value, depth + 1)?
                     ))
                 })
                 .collect::<Result<Vec<_>, VerifyError>>()?;
             format!("{{{}}}", fields.join(","))
         }
+        _ => canonical_number(text)?,
     })
 }
 
@@ -363,7 +377,7 @@ mod tests {
 
     #[test]
     fn json_is_canonical_without_losing_large_numbers() {
-        let normalize = |s| canonical_json(&serde_json::from_str(s).unwrap()).unwrap();
+        let normalize = |s| canonical_json(s).unwrap();
         assert_eq!(
             normalize(r#"{"z":[1.00,{"b":true,"a":null}],"a":-0.0}"#),
             normalize(r#"{"a":0,"z":[1,{"a":null,"b":true}]}"#)
@@ -374,6 +388,41 @@ mod tests {
         );
         assert_ne!(normalize("[1,2]"), normalize("[2,1]"));
         assert_ne!(normalize(r#""null""#), normalize("null"));
+    }
+
+    #[test]
+    fn json_marker_properties_remain_literal_objects() {
+        let normalize = |s| canonical_json(s).unwrap();
+        for key in [
+            "$serde_json::private::Number",
+            "$serde_json::private::RawValue",
+        ] {
+            let numeric = format!(r#"{{"{key}":"123"}}"#);
+            let nonnumeric = format!(r#"{{"{key}":"not a number"}}"#);
+            assert_eq!(normalize(&numeric), numeric);
+            assert_eq!(normalize(&nonnumeric), nonnumeric);
+            assert_ne!(normalize(&numeric), normalize("123"));
+            assert_ne!(normalize(&numeric), normalize(r#""123""#));
+            assert_ne!(normalize(&numeric), normalize(&nonnumeric));
+            assert_eq!(
+                normalize(&format!(r#"{{"z":[{numeric},{nonnumeric}],"a":1.00}}"#)),
+                normalize(&format!(r#"{{"a":1,"z":[{numeric},{nonnumeric}]}}"#))
+            );
+            assert_ne!(normalize(&format!(r#"[{numeric}]"#)), normalize("[123]"));
+        }
+    }
+
+    #[test]
+    fn raw_json_validation_and_recursion_are_bounded() {
+        for text in ["", "01", "true false", "[1,]", r#"{"key":}"#] {
+            assert!(canonical_json(text).is_err());
+        }
+        assert_eq!(canonical_json(" \n 123.00 \t ").unwrap(), "123e0");
+        assert!(canonical_json(&format!("{}0{}", "[".repeat(128), "]".repeat(128))).is_ok());
+        assert!(matches!(
+            canonical_json(&format!("{}0{}", "[".repeat(129), "]".repeat(129))),
+            Err(VerifyError::JsonDepth)
+        ));
     }
 
     #[test]

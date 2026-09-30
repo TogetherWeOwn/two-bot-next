@@ -104,6 +104,8 @@ computes exact differences. Counts include every row, not only the samples.
 - JSON casts discard insignificant whitespace/object insertion order. Recursive
   canonicalization sorts object keys, preserves array order and string contents,
   and canonicalizes decimal numbers **without floating-point precision loss**.
+  Literal objects, including serde_json's private marker keys, remain objects,
+  never scalar numbers. Nesting beyond 128 levels is refused.
   Numeric columns remove insignificant trailing zeroes. TEXT remains byte-exact;
   choose JSON normalization deliberately for legacy JSON stored as text.
 - SQL NULL, JSON null, the string `"null"`, and an empty string remain distinct.
@@ -145,6 +147,8 @@ python3 scripts/cargo_cache.py run -- clippy -p two-bot-cutover --all-targets --
 | Given / when | Required observable result |
 | --- | --- |
 | Identical mapped data with different booleans, timestamp offsets and JSON layout | All checksums equal; 3 rows per side; CLI exit 0 |
+| JSON marker object versus scalar, including nested arrays, mapped as json and jsonb | Equal counts/keys; only metadata mismatches; jsonb CLI exit 1 |
+| Equal numeric/nonnumeric marker objects, including nested arrays, mapped as json and jsonb | All checksums equal; jsonb CLI exit 0 |
 | Target lacks key 2 | One missing key, sample `["2"]`; target count 2; CLI exit 1 |
 | Target changes only display_name | Equal keys/counts; only that column mismatches; CLI exit 1 |
 | Target adds key 4 | One extra key, sample `["4"]`; target count 4; CLI exit 1 |

@@ -17,8 +17,8 @@ license.workspace = true
 two-bot-core = { version = "0.2.0", path = "../core" }
 hex = { workspace = true }
 serde = { workspace = true }
-# Canonical parity checks must not round large JSON numbers through f64.
-serde_json = { workspace = true, features = ["arbitrary_precision"] }
+# Preserve JSON syntax kinds and exact numeric tokens during parity checks.
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
