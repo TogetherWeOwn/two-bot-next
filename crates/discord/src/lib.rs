@@ -6,6 +6,8 @@
 //! without a gateway connection.
 
 pub mod adapter;
+#[cfg(feature = "db")]
+pub mod custom_commands;
 pub mod executor;
 pub mod intents;
 pub mod interactions;

@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+db = ["two-bot-core/db", "dep:sqlx"]
+
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.
 [dependencies]
@@ -28,6 +32,7 @@ hyper-util = { version = "0.1", default-features = false, features = [
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

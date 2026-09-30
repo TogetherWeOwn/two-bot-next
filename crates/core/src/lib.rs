@@ -23,6 +23,8 @@ pub mod community_store;
 pub mod config;
 pub mod containment;
 #[cfg(feature = "db")]
+pub mod custom_command_service;
+#[cfg(feature = "db")]
 pub mod custom_command_store;
 pub mod custom_commands;
 pub mod events;

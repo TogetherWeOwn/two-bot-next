@@ -10,6 +10,10 @@
 - Postgres custom-command and shared audit persistence, migration `0130`,
   transaction-compatible capacity locking, and a credential-free database
   regression test against agent-testdb or a CI service container.
+- Shared-router custom-command execution adapter with transactional management,
+  deferred mention-safe replies, dynamic slash execution auditing, and serialized
+  full-registry publication. Add mock REST + isolated testdb runtime fixtures;
+  gateway activation and accepted-prefix integration remain in progress.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 

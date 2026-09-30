@@ -143,6 +143,9 @@ jobs:
       - name: custom-command Postgres proof
         run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
 
+      - name: custom-command routed runtime proof (mock Discord and CI Postgres only)
+        run: cargo test -p two-bot-discord --features db --locked --test custom_command_runtime -- --include-ignored
+
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
       - name: cargo-deny

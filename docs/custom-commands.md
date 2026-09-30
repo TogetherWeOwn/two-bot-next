@@ -33,9 +33,20 @@ need no live service; the explicit database test fails loudly when unavailable.
 ## Shared router/executor handoff
 
 The shared S4 interaction router and REST executor are now present on `main`.
-This domain/store slice does **not** yet publish commands or reply to Discord.
-Runtime integration remains a follow-up through those shared interfaces; do not
-add a private dispatcher or HTTP client.
+`two-bot-discord::custom_commands::CustomCommandRuntime` (feature `db`) now
+consumes their routing decisions and executes management/dynamic-slash handlers.
+It defers responses before transactional work, edits through the shared executor,
+suppresses mentions, audits writes/runs, and serializes mutation plus full-set
+publication. A publication failure reports a saved-but-not-synchronized result.
+
+**Not activated in the gateway yet.** READY injection, safe asynchronous gateway
+execution and an explicitly automod-accepted prefix hook are still pending.
+Do not use unconditional `MessageCreate` or `capture_only: false` as acceptance.
+Cold RESUME can lack a cached guild name; this adapter refuses rendering without
+context rather than inventing a `{server}` value.
+
+The following checklist includes both implemented adapter contracts and the
+remaining gateway/accepted-prefix work:
 
 1. Scope admin interactions to the configured guild, enforce ManageGuild at
    runtime, and call `require_automations_enabled` before any admin read/write.
@@ -70,6 +81,17 @@ SQLx 0.9's documented `Executor` contract supports both pools and transaction
 connections; dereference transactions as `&mut *tx`:
 https://docs.rs/sqlx/0.9.0/sqlx/trait.Executor.html
 
-The registry tests prove **intent and rebuilt contents**, not a live Discord
-republish. Transport-level mock proofs remain part of the wiring commit.
+Transport-level runtime fixtures are in
+`crates/discord/tests/custom_command_runtime.rs`; hosted CI runs them explicitly
+with `--features db --test custom_command_runtime -- --include-ignored`. They
+use the loopback mock REST double and a single testdb connection with session-local
+`pg_temp` tables. Unlike the store-only fixture, those tables survive service
+commits and disappear when the pool closes. No application credentials are read.
+They cover routing refusals, full-set publication, dynamic rendering, safe reply
+edits, audit rollback and honest publication/delivery failures. These fixtures
+are **added, not locally executed**, while the controller cache pool is absent.
+
+Deferred completion follows Twilight 0.17's documented `update_response` builder:
+https://docs.rs/twilight-http/0.17.0/twilight_http/request/application/interaction/struct.UpdateResponse.html
+
 No production guild/token is needed or authorized for these tests.
