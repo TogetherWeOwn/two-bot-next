@@ -18,7 +18,8 @@ cutover runner discovers it automatically.
 The migration reuses `operational_audit_log` and `audit_kill_switch` from frozen
 legacy two-bot `b0a26a5e3882dd0784d208079f309893e2ede7e8`, including timestamp,
 string-snowflake, destination, nonce, search-boundary, message-ID and mirror-check
-columns. New columns are `delivery_generation` and `delivery_accepted_at`.
+columns. New columns are `delivery_generation`, `delivery_accepted_at` and
+`delivery_deferred_until` (preflight retry scheduling; never a POST attempt count).
 Migration replay preserves populated legacy rows and the presence-based halt.
 Existing delivered rows stay delivered; no historical delivery is requeued.
 Legacy `rota_notice` rows are retained but excluded from claims/queue discovery.
@@ -41,10 +42,12 @@ instants round-trip as UTC ISO strings with millisecond precision, matching lega
 - `get(entry_id) -> Option<StoredAudit>`: durable facts and delivery metadata,
   including attempts, boundary, accepted message ID/time, and completion time.
 - `pending_ids() -> Vec<String>`: discovery only, maximum 25; excludes terminal,
-  store-only and unsupported kinds. Each candidate still requires a claim.
+  store-only, unsupported kinds and preflight-deferred rows whose backoff has
+  not expired. Each candidate still requires a claim.
 - `claim(entry_id) -> Option<AuditClaim>`: five-minute lease with opaque random
   owner token and monotonic generation. Only the winning UPDATE returns a claim.
   A claim exposes a read-only row and `intent()`, never public fencing fields.
+  Claiming clears any preflight deferral on the row.
 - `prepare_send(claim, search_before) -> PrepareSend`: `Prepared` is the only
   successful send preparation. It commits the boundary, attempted timestamp and
   incremented attempt count **before** a POST. `Halted` or `LostClaim` means no
@@ -57,7 +60,13 @@ instants round-trip as UTC ISO strings with millisecond precision, matching lega
   Clears ownership, preserves evidence, sets completion time. Completion is
   terminal: no API reclaims, releases, quarantines or rewrites a delivered row.
 - `release_unattempted(claim) -> bool`: releases preflight/held claims only when
-  no boundary or acceptance exists. Does not count a send attempt.
+  no boundary or acceptance exists. Does not count a send attempt. Keeps the
+  row's queue position; use `defer_preflight` for destination-tied preflight
+  failures that must rotate the queue.
+- `defer_preflight(claim) -> bool`: parks a preflight-failed claim out of queue
+  discovery for `PREFLIGHT_DEFER_SECONDS` (60 s) without counting a POST
+  attempt, so a repeatedly failing destination cannot starve healthy rows in
+  the bounded batch. The next successful claim clears the deferral.
 - `fail_attempt(claim, DeliveryFailure) -> bool`: authoritative
   `DefinitelyRejected` (including a guaranteed not-sent request) clears the
   sending owner's boundary and permits retry. `UncertainAcceptance` retains it
@@ -142,7 +151,11 @@ Sources for the SQL/driver patterns:
   a waiting updater re-evaluates its predicate against the committed row version.
 - [Postgres locking](https://www.postgresql.org/docs/current/explicit-locking.html):
   transaction-scoped advisory locks serialize switch changes even when its row
-  is absent; owner writes use conditional updates on token and generation.
+  is absent. Every owner mutation takes the audit row lock first (halt-advisory
+  first, then the row lock), so token, generation, state and the current lease
+  are evaluated at mutation time; a lone conditional UPDATE would evaluate the
+  lease before contending for the row lock and let an expired lease validate
+  pre-lock behind an unchanged locker.
 - [Frozen legacy store](https://github.com/TogetherWeOwn/two-bot/blob/b0a26a5e3882dd0784d208079f309893e2ede7e8/src/audit/store.ts):
   table meanings, deterministic nonce, durable recovery boundary and halt presence.
 

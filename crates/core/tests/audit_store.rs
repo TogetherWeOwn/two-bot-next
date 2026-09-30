@@ -64,6 +64,10 @@ impl TestDb {
             .build()
             .execute(&admin)
             .await?;
+        // Tag every pool connection with the owned schema so contention tests
+        // can attribute `pg_stat_activity` lock waits to this test alone when
+        // other suites run against the same cluster in parallel.
+        let options = options.application_name(&schema);
         let pool = Self::connect(&options, &schema).await?;
         if migrate {
             sqlx::raw_sql(MIGRATION).execute(&pool).await?;
@@ -580,7 +584,9 @@ async fn populated_legacy_upgrade_preserves_inflight_recovery_and_halt() -> Test
           delivery_attempts INTEGER NOT NULL DEFAULT 0, delivery_attempted_at TIMESTAMPTZ,
           delivery_last_error TEXT, delivery_lease_until TIMESTAMPTZ, mirrored_at TIMESTAMPTZ,
           delivery_nonce TEXT, mirror_message_id TEXT, delivery_search_before TEXT,
-          delivery_claim_token TEXT, mirror_checked_at TIMESTAMPTZ);
+          delivery_claim_token TEXT, mirror_checked_at TIMESTAMPTZ,
+          delivery_generation BIGINT NOT NULL DEFAULT 0,
+          delivery_accepted_at TIMESTAMPTZ);
          INSERT INTO operational_audit_log (entry_id,event_kind,guild_id,occurred_at,
           metadata_json,created_at,mirror_channel_id,delivery_state,delivery_attempts,
           delivery_lease_until,delivery_nonce,delivery_search_before,delivery_claim_token)
@@ -606,5 +612,119 @@ async fn populated_legacy_upgrade_preserves_inflight_recovery_and_halt() -> Test
     );
     assert!(store.note_accepted(&claim, "333").await?);
     assert!(store.complete(&claim).await?);
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
+async fn stale_owner_blocked_behind_unchanged_locker_cannot_mutate_after_expiry() -> TestResult {
+    let db = TestDb::new(true).await?;
+    let store = AuditStore::new(&db.pool);
+    store.record(&event("lock-race"), Some("123")).await?;
+    let owner = store.claim("lock-race").await?.unwrap();
+    // One-second active lease: the owner mutation below must evaluate it only
+    // after it holds the row lock.
+    sqlx::query("UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() + interval '1 second' WHERE entry_id = 'lock-race'")
+        .execute(&db.pool).await?;
+    // An unrelated transaction parks on the row without changing it.
+    let locker_pool = db.peer().await?;
+    let mut locker = locker_pool.begin().await?;
+    sqlx::query("SELECT 1 FROM operational_audit_log WHERE entry_id = 'lock-race' FOR UPDATE")
+        .fetch_all(&mut *locker)
+        .await?;
+    // The owner mutation starts while the lease is active and blocks on the row.
+    let worker = AuditStore::new(&db.pool);
+    let claim = owner.clone();
+    let renewing = tokio::spawn(async move { worker.renew(&claim).await });
+    // Wait until the owner's connection is actually blocked on the row lock,
+    // attributed to this test alone through the schema-tagged application name.
+    let mut waited = 0;
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'",
+        ).bind(&db.schema).fetch_one(&db.pool).await?;
+        if blocked >= 1 {
+            break;
+        }
+        if waited >= 100 {
+            panic!("owner mutation never blocked on the row lock");
+        }
+        waited += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Hold the unchanged locker until the lease has expired.
+    let mut expired = 0;
+    loop {
+        let done: bool = sqlx::query_scalar(
+            "SELECT (delivery_lease_until <= clock_timestamp()) FROM operational_audit_log WHERE entry_id = 'lock-race'",
+        ).fetch_one(&db.pool).await?;
+        if done {
+            break;
+        }
+        if expired >= 100 {
+            panic!("lease never expired while blocked");
+        }
+        expired += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Release the row unchanged; the waiting owner must now see an expired lease.
+    locker.commit().await?;
+    assert!(!renewing.await.unwrap()?);
+    assert_eq!(
+        store.prepare_send(&owner, "0").await?,
+        PrepareSend::LostClaim
+    );
+    assert!(!store.release_unattempted(&owner).await?);
+    let row = store.get("lock-race").await?.unwrap();
+    assert_eq!(row.state, DeliveryState::Delivering);
+    assert_eq!(row.attempts, 0);
+    assert!(row.search_before.is_none());
+    locker_pool.close().await;
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
+async fn preflight_deferral_rotates_the_bounded_queue_without_counting_attempts() -> TestResult {
+    let db = TestDb::new(true).await?;
+    let store = AuditStore::new(&db.pool);
+    for i in 0..26 {
+        store
+            .record(&event(&format!("defer-{i:02}")), Some("123"))
+            .await?;
+    }
+    assert_eq!(store.pending_ids().await?.len(), 25);
+    // Every row in the first batch hits a destination-tied preflight failure;
+    // parking them must not count a POST attempt.
+    for id in store.pending_ids().await? {
+        let claim = store.claim(&id).await?.unwrap();
+        assert!(store.defer_preflight(&claim).await?);
+    }
+    // The healthy 26th row is now the only discoverable candidate.
+    assert_eq!(store.pending_ids().await?, vec!["defer-25".to_owned()]);
+    for id in ["defer-00", "defer-01"] {
+        assert_eq!(store.get(id).await?.unwrap().attempts, 0);
+    }
+    let healthy = store.claim("defer-25").await?.unwrap();
+    assert_eq!(
+        store.prepare_send(&healthy, "0").await?,
+        PrepareSend::Prepared
+    );
+    // After the backoff expires the parked row is retryable, and the new claim
+    // clears the deferral.
+    sqlx::query("UPDATE operational_audit_log SET delivery_deferred_until = clock_timestamp() - interval '1 second' WHERE entry_id = 'defer-00'")
+        .execute(&db.pool).await?;
+    let retried = store.claim("defer-00").await?.unwrap();
+    assert_eq!(retried.row().attempts, 0);
+    let cleared: bool = sqlx::query_scalar(
+        "SELECT delivery_deferred_until IS NULL FROM operational_audit_log WHERE entry_id = 'defer-00'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(cleared);
+    assert_eq!(
+        store.prepare_send(&retried, "1").await?,
+        PrepareSend::Prepared
+    );
     db.finish().await
 }

@@ -1,7 +1,10 @@
 //! Durable operational audit rows; no Discord client or runtime activation.
 //!
 //! `record` must succeed before downstream delivery. Every claim is an atomic
-//! UPDATE RETURNING, and all owner writes compare both token and generation.
+//! UPDATE RETURNING, and all owner writes lock the row before comparing token,
+//! generation and the current lease: a lone conditional UPDATE evaluates the
+//! lease before the row lock is granted, which lets an expired lease validate
+//! pre-lock and mutate post-expiry behind an unchanged locker.
 //! Prepared/accepted deliveries can only be reconciled, never blindly resent.
 //! See `docs/audit-store.md` for the downstream protocol and failure policies.
 
@@ -12,6 +15,9 @@ use crate::audit::{delivery_nonce, AuditChannel, AuditEvent, AuditKind};
 
 pub const DELIVERY_LEASE_SECONDS: i64 = 300;
 pub const MAX_PENDING_ROWS: i64 = 25;
+/// Preflight-only failures park the row out of queue discovery for this long.
+/// Retry scheduling, never a POST attempt count; a later preparation clears it.
+pub const PREFLIGHT_DEFER_SECONDS: i64 = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuditStoreError {
@@ -203,12 +209,16 @@ impl AuditStore {
 
     /// Bounded queue discovery, not ownership or send authorization. A switch
     /// engaged after discovery is observed again by each claim/prepare.
+    /// Preflight-deferred rows stay hidden until their backoff expires; the
+    /// backoff is retry scheduling, never a POST attempt count.
     pub async fn pending_ids(&self) -> Result<Vec<String>, AuditStoreError> {
         Ok(sqlx::query_scalar(
             "SELECT entry_id FROM operational_audit_log
              WHERE mirror_channel_id IS NOT NULL AND event_kind = ANY($1)
                AND (delivery_state = 'pending' OR (delivery_state = 'delivering'
                  AND delivery_lease_until <= clock_timestamp()))
+               AND (delivery_deferred_until IS NULL
+                 OR delivery_deferred_until <= clock_timestamp())
                AND NOT EXISTS (SELECT 1 FROM audit_kill_switch WHERE id = 1)
              ORDER BY delivery_attempted_at NULLS FIRST, created_at, entry_id LIMIT 25",
         )
@@ -219,18 +229,26 @@ impl AuditStore {
 
     /// UPDATE RETURNING returns only this winner's ownership. Lease expiry
     /// rotates both fences but retains every ambiguity/acceptance marker.
+    /// The row lock is taken before the expiry predicate is evaluated, so a
+    /// claimant blocked behind an unchanged locker cannot win on a stale read.
     pub async fn claim(&self, entry_id: &str) -> Result<Option<AuditClaim>, AuditStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_halt(&mut tx, false).await?;
+        if !lock_row(&mut tx, entry_id).await? {
+            return Ok(None);
+        }
         let row = sqlx::query(
             "UPDATE operational_audit_log SET delivery_state = 'delivering',
                delivery_claim_token = gen_random_uuid()::text,
                delivery_generation = delivery_generation + 1,
                delivery_lease_until = clock_timestamp() + interval '5 minutes',
-               delivery_nonce = COALESCE(delivery_nonce, $2)
+               delivery_nonce = COALESCE(delivery_nonce, $2),
+               delivery_deferred_until = NULL
              WHERE entry_id = $1 AND mirror_channel_id IS NOT NULL AND event_kind = ANY($3)
                AND (delivery_state = 'pending' OR (delivery_state = 'delivering'
                  AND delivery_lease_until <= clock_timestamp()))
+               AND (delivery_deferred_until IS NULL
+                 OR delivery_deferred_until <= clock_timestamp())
                AND NOT EXISTS (SELECT 1 FROM audit_kill_switch WHERE id = 1)
              RETURNING *, to_char(occurred_at AT TIME ZONE 'UTC',
                'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS occurred_iso",
@@ -277,6 +295,9 @@ impl AuditStore {
             tx.commit().await?;
             return Ok(PrepareSend::Halted);
         }
+        // Time-dependent ownership is evaluated only after the row lock below
+        // is held; see `lock_row`.
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
         let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_search_before = $4,
                delivery_attempts = delivery_attempts + 1,
@@ -313,7 +334,9 @@ impl AuditStore {
         if !snowflake_id(message_id) {
             return Err(AuditStoreError::Invalid("accepted message ID"));
         }
-        Ok(sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let updated = sqlx::query(
             "UPDATE operational_audit_log SET mirror_message_id = $4,
                delivery_accepted_at = clock_timestamp(), delivery_last_error = NULL
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
@@ -324,16 +347,20 @@ impl AuditStore {
         .bind(&claim.token)
         .bind(claim.generation)
         .bind(message_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     /// Complete only persisted acceptance. Recovery can finish an earlier
     /// accepted ID after restart. Delivered rows are terminal and immutable.
     pub async fn complete(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
-        Ok(sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_state = 'delivered',
                mirrored_at = clock_timestamp(), delivery_last_error = NULL,
                delivery_claim_token = NULL, delivery_lease_until = NULL
@@ -344,16 +371,22 @@ impl AuditStore {
         .bind(&claim.row.event.entry_id)
         .bind(&claim.token)
         .bind(claim.generation)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(updated)
     }
 
-    /// Release only a claim for which no send was prepared. Safe for halt or
-    /// preflight failure; never clears earlier ambiguous acceptance evidence.
+    /// Release only a claim for which no send was prepared. Safe for a halt
+    /// that arrived before preparation; never clears earlier ambiguous
+    /// acceptance evidence. A preflight failure that should rotate the queue
+    /// uses `defer_preflight` instead so the row does not keep its priority.
     pub async fn release_unattempted(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
-        Ok(sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_state = 'pending',
                delivery_claim_token = NULL, delivery_lease_until = NULL
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
@@ -363,10 +396,42 @@ impl AuditStore {
         .bind(&claim.row.event.entry_id)
         .bind(&claim.token)
         .bind(claim.generation)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    /// Park a preflight-failed claim out of queue discovery for
+    /// `PREFLIGHT_DEFER_SECONDS` without counting a POST attempt. The next
+    /// claim clears the deferral. Use this when mirror preflight (permissions,
+    /// history read, halt observed before preparation) fails for a reason tied
+    /// to the destination rather than the row: the bounded queue then rotates
+    /// to healthy rows instead of returning the same failing batch every tick.
+    pub async fn defer_preflight(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let updated = sqlx::query(
+            "UPDATE operational_audit_log SET delivery_state = 'pending',
+               delivery_claim_token = NULL, delivery_lease_until = NULL,
+               delivery_deferred_until =
+                 clock_timestamp() + ($4::double precision * interval '1 second')
+             WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
+               AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
+               AND delivery_search_before IS NULL AND mirror_message_id IS NULL",
+        )
+        .bind(&claim.row.event.entry_id)
+        .bind(&claim.token)
+        .bind(claim.generation)
+        .bind(PREFLIGHT_DEFER_SECONDS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     /// Only an authoritative non-acceptance permits another send. Uncertainty
@@ -384,7 +449,9 @@ impl AuditStore {
         if definite && claim.intent() != DeliveryIntent::Send {
             return Ok(false);
         }
-        Ok(sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_state = 'pending',
                delivery_claim_token = NULL, delivery_lease_until = NULL,
                delivery_last_error = $4,
@@ -402,21 +469,27 @@ impl AuditStore {
             "discord_post_ambiguous"
         })
         .bind(definite)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     /// Renew an active owner only; expiration cannot be undone by a stale
     /// worker. Recovery may renew while scanning, but may never POST.
     pub async fn renew(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
-        Ok(sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() + interval '5 minutes'
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
                AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()",
         ).bind(&claim.row.event.entry_id).bind(&claim.token).bind(claim.generation)
-            .execute(&self.pool).await?.rows_affected() == 1)
+            .execute(&mut *tx).await?.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     pub async fn quarantine(
@@ -424,7 +497,9 @@ impl AuditStore {
         claim: &AuditClaim,
         reason: QuarantineReason,
     ) -> Result<bool, AuditStoreError> {
-        Ok(sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        lock_row(&mut tx, &claim.row.event.entry_id).await?;
+        let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_state = 'quarantined',
                delivery_last_error = $4, delivery_claim_token = NULL, delivery_lease_until = NULL
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
@@ -434,10 +509,12 @@ impl AuditStore {
         .bind(&claim.token)
         .bind(claim.generation)
         .bind(reason.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     /// Return errors unchanged. The pure core models legacy switch-read
@@ -485,6 +562,25 @@ impl AuditStore {
         tx.commit().await?;
         Ok(removed)
     }
+}
+
+// A lone conditional owner UPDATE evaluates its snapshot predicates (notably
+// the lease comparison) before contending for the row lock. A worker blocked
+// behind a locker that commits without changing the tuple would then mutate
+// a lease that expired while it waited. Every owner mutation takes this row
+// lock first, so token, generation, state and the current lease are always
+// evaluated against the row version current at mutation time. Lock order is
+// always halt-advisory first, then this row lock, so concurrent owners and
+// halt writers cannot deadlock. Returns false when the row does not exist.
+// Source: https://www.postgresql.org/docs/current/explicit-locking.html
+async fn lock_row(tx: &mut Transaction<'_, Postgres>, entry_id: &str) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query("SELECT 1 FROM operational_audit_log WHERE entry_id = $1 FOR UPDATE")
+            .bind(entry_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+    )
 }
 
 // Serialize halt changes with claim/send preparation even when the switch row

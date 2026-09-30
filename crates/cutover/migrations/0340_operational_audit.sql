@@ -34,7 +34,11 @@ ALTER TABLE operational_audit_log
     -- Each new owner also advances a monotonic fence. Neither is public input.
     ADD COLUMN IF NOT EXISTS delivery_generation BIGINT NOT NULL DEFAULT 0,
     -- Discord's returned/reconciled message ID is persisted before completion.
-    ADD COLUMN IF NOT EXISTS delivery_accepted_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS delivery_accepted_at TIMESTAMPTZ,
+    -- Preflight-only release parks the row out of queue discovery until this
+    -- bound expires. Retry scheduling only, never a POST attempt count; a
+    -- later preparation clears it.
+    ADD COLUMN IF NOT EXISTS delivery_deferred_until TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_operational_audit_time
     ON operational_audit_log (guild_id, occurred_at);
