@@ -164,13 +164,18 @@ async fn checkpoint_io<T>(
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
 /// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
+///
+/// `sticky` is the S4 sticky runtime (TOG-10309): `dispatch` spawns detached
+/// work so this loop never awaits a REST call or store write — twilight only
+/// drives heartbeats while the shard is polled.
 pub async fn run_shard(
     mut shard: Shard,
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
+    sticky: Option<Arc<crate::sticky_runtime::StickyRuntime>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store).await;
+    let result = run_loop(&mut shard, &pipeline, &state, &store, sticky.as_ref()).await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -180,6 +185,7 @@ async fn run_loop(
     pipeline: &GatewayPipeline,
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
+    sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
 ) -> Result<(), sqlx::Error> {
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
@@ -290,6 +296,11 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
+            // Detached dispatch only: awaiting sticky work inline would stall
+            // heartbeat polling (see `run_shard` docs).
+            if let Some(runtime) = sticky {
+                runtime.dispatch(&event);
+            }
         }
         checkpoint_io(
             state,
