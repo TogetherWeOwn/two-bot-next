@@ -41,7 +41,12 @@ method alone does not release a runtime lane: runtime handlers must use `finish`
 
 Isolated test-service coverage proves distinct-key exclusion, safe release,
 immutable completion, audit failure rollback, stale-ticket/action rejection and
-recovery-generation rollback. End-to-end router/mock REST coverage is still pending.
+recovery-generation rollback. Router/mock REST acceptance additionally proves
+permission/feature/guild gates, required reasons and numeric bounds, purge affected
+counts, stored-result replay, first seed persistence before PUT acceptance, repeated
+lock preservation, exact restore/delete, and untracked unlock refusal. 5xx, 429 and
+five-second timeout cases retain the lane and recovery state across same/different
+keys. Injected audit failures retry only finalization or retain the lane if exhausted.
 
 ## Shared member ledger compatibility — schema contract aligned
 
@@ -64,10 +69,16 @@ key-only APIs must not replace channel ticket-fenced completion/release.
 
 ## Next implementation step
 
-Add the channel runtime adapter, registering four handlers on the shared router,
-extracting and validating reason/count/seconds, and using the shared executor.
-Claim before effects, take the durable lane, preserve the first seed before PUT,
-restore exactly before `finish`, and retain both claim and lane on ambiguity.
-Add gate/refusal/success/affected-count/replay mock REST tests and shared-schema
-compatibility regressions; then wire startup/READY and asynchronous gateway dispatch.
-Ship one PR, exact-head CI, and independent Code Reviewer squash merge.
+The feature-gated `discord::ChannelModerationRuntime` and shared-router registration
+are implemented; they never create a private router or HTTP client. The runtime
+finishes accepted effects atomically and retries that persistence step only. A proven
+rejected first lock retires its newly recorded seed because the original overwrite
+was never changed; a rejected repeated lock keeps the original recovery seed.
+
+Remaining: startup composition, complete-set publication on READY and bounded async
+gateway dispatch. Defer an ephemeral response before REST/SQL waits, then edit through
+the shared executor; suppress mentions. Do not block the heartbeat/checkpoint loop.
+The current executor has no original-response edit method, so add that shared seam
+with mock coverage rather than a private client. Exercise both actual stores once
+the member slice merges. Then ship one PR, exact-head CI and independent Code Reviewer
+squash merge. No startup activation, PR review or merge is claimed yet.

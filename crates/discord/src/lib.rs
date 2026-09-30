@@ -6,7 +6,14 @@
 //! without a gateway connection.
 
 pub mod adapter;
+#[cfg(feature = "db")]
+pub mod channel_moderation;
 pub mod executor;
+
+#[cfg(feature = "db")]
+pub use channel_moderation::{
+    register_channel_handlers, ChannelModerationRuntime, ChannelReply, ChannelRuntimeError,
+};
 pub mod intents;
 pub mod interactions;
 pub mod pipeline;

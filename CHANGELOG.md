@@ -32,8 +32,15 @@
   unlock recovery cleanup (migration 0123). Runtime router/executor wiring remains
   in progress.
 
+- Register channel moderation adapters on the shared interaction router and execute
+  purge, slowmode, lockdown and recorded-state unlock through the shared REST executor.
+  Verify gates, exact overwrite recovery, durable retry exclusion and finalization-only
+  retries with mock REST and isolated PostgreSQL tests. Startup activation remains pending.
+
 ### Fixed
 
+- Align channel/member shared audit and idempotency timestamps with an additive,
+  row-preserving migration and explicit SQL timestamp casts (migration 0124).
 - Match legacy ECMAScript whitespace trimming for LFG roles, slot numbers, and titles, including BOM and NEL edge cases.
 - Detect settings changes with a commit-ordered transactional revision instead of a sequence maximum, including deletes and late commits with lower row versions.
 - Serialize settings reads, writes, and audits, including concurrent inserts into absent keys; load cache rows and revision from one consistent database snapshot.

@@ -128,6 +128,13 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
 
+      - name: channel moderation shared-router REST acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
+        run: >-
+          env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS cargo test -p two-bot-discord
+          --features db --locked --test channel_moderation_runtime -- --include-ignored
+
       - name: Internal-action durable store regressions (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
