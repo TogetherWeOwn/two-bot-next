@@ -1,94 +1,33 @@
 //! Explicitly requested tests require the authorized test container; never skip
-//! configured failures or consult a production/staging URL. Each test owns a schema.
+//! configured failures or consult a production/staging URL. Each test owns a disposable database.
 #![cfg(feature = "db")]
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
-use std::sync::atomic::{AtomicU64, Ordering};
 use two_bot_core::internal_action_store::{
     AuditSubject, DiscordId, ExecutionClaim, InternalActionStore, InternalClaim,
     InternalStoreError, ReconciliationEvidence, RequestIdentity, TerminalFailure, TerminalResponse,
 };
 use two_bot_core::{body_hash, CLAIM_STALE_SECONDS, NONCE_TTL_SECONDS, SKEW_SECONDS};
-
-#[path = "support/test_database.rs"]
-mod test_database;
-use test_database::test_options;
-
-fn schema_name() -> String {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!(
-        "ia10606_{}_{now}_{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-fn ddl(sql: &str, schema: &str) -> sqlx::AssertSqlSafe<String> {
-    assert!(schema.starts_with("ia10606_") && schema.len() <= 63);
-    assert!(schema
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
-    // Only a generated, strictly guarded owned schema interpolates into DDL.
-    sqlx::AssertSqlSafe(format!("{sql} {schema}"))
-}
+use two_bot_testsupport::TestDatabase;
 
 struct TestDb {
-    admin: PgPool,
+    fixture: TestDatabase,
     pool: PgPool,
-    options: PgConnectOptions,
-    schema: String,
 }
 
 impl TestDb {
     async fn new() -> Self {
         let url = std::env::var("TWO_TEST_DATABASE_URL")
-            .expect("explicit DB test requires TWO_TEST_DATABASE_URL (agent-testdb only)");
-        let options = test_options(&url).expect("refusing non-test-container target");
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options.clone())
+            .expect("explicit DB test requires TWO_TEST_DATABASE_URL (test bootstrap only)");
+        let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
             .await
             .unwrap();
-        let schema = schema_name();
-        sqlx::query(ddl("CREATE SCHEMA", &schema))
-            .execute(&admin)
-            .await
-            .unwrap();
-        let pool = Self::connect(&options, &schema).await;
-        sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0350_internal_actions.sql"
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
-        Self {
-            admin,
-            pool,
-            options,
-            schema,
-        }
-    }
-
-    async fn connect(options: &PgConnectOptions, schema: &str) -> PgPool {
-        PgPoolOptions::new()
-            .max_connections(6)
-            .connect_with(
-                options
-                    .clone()
-                    .application_name(schema)
-                    .options([("search_path", schema)]),
-            )
-            .await
-            .unwrap()
+        let pool = fixture.pool().clone();
+        Self { fixture, pool }
     }
 
     async fn independent_pool(&self) -> PgPool {
-        Self::connect(&self.options, &self.schema).await
+        self.fixture.independent_pool().await.unwrap()
     }
 
     fn store(&self) -> InternalActionStore {
@@ -96,13 +35,7 @@ impl TestDb {
     }
 
     async fn cleanup(self) {
-        self.pool.close().await;
-        let drop_schema = ddl("DROP SCHEMA", &self.schema);
-        sqlx::query(sqlx::AssertSqlSafe(format!("{} CASCADE", drop_schema.0)))
-            .execute(&self.admin)
-            .await
-            .unwrap();
-        self.admin.close().await;
+        self.fixture.close().await.unwrap();
     }
 }
 
@@ -117,16 +50,16 @@ async fn db_now_secs(pool: &PgPool) -> i64 {
 }
 
 async fn wait_for_uniqueness_lock(db: &TestDb, table: &str) {
-    // Observe only this owned test schema's sessions. Bounded synchronization
+    // Observe only this owned test database's sessions. Bounded synchronization
     // proves the VALUES clock was sampled before rollback; no timing-only sleep.
     for _ in 0..100 {
         let blocked: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = $1 \
              AND wait_event_type = 'Lock' AND query LIKE '%' || $2 || '%')",
         )
-        .bind(&db.schema)
+        .bind(db.fixture.name())
         .bind(table)
-        .fetch_one(&db.admin)
+        .fetch_one(&db.pool)
         .await
         .unwrap();
         if blocked {
@@ -138,12 +71,11 @@ async fn wait_for_uniqueness_lock(db: &TestDb, table: &str) {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn rollback_wait_starts_retention_and_staleness_after_winning_insert() {
     let db = TestDb::new().await;
     let second = db.independent_pool().await;
     let store = InternalActionStore::new(second.clone());
-    let nonce = body_hash(schema_name().as_bytes())[..32].to_owned();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
     let nonce_hash = body_hash(nonce.as_bytes());
     let mut blocker = db.pool.begin().await.unwrap();
     sqlx::query(
@@ -241,68 +173,6 @@ fn success() -> TerminalResponse {
     }
 }
 
-#[test]
-fn test_guard_rejects_redirects_credentials_and_non_test_targets() {
-    assert!(test_options("postgres://agent_test:@agent-testdb:5432/agent_test").is_ok());
-    for url in [
-        "postgres://agent_test@agent-testdb:5432/agent_test",
-        "postgres://agent_test:other@agent-testdb:5432/agent_test",
-        "postgres://agent_test:@staging:5432/agent_test",
-        "postgres://agent_test:@agent-testdb:5433/agent_test",
-        "postgres://other:@agent-testdb:5432/agent_test",
-        "postgres://agent_test:@agent-testdb:5432/production",
-        "postgres://agent_test:@agent-testdb:5432/agent_test?hostaddr=127.0.0.1",
-        "postgres://agent_test:@agent-testdb:5432/agent_test#fragment",
-    ] {
-        assert!(test_options(url).is_err());
-    }
-}
-
-/// Child-process probe: with an inherited `PGPASSWORD` the guard must reject
-/// the approved URL. Runs only when `IA10606_GUARD_PROBE` is set (see the
-/// parent test below); a no-op in the normal suite. Opens no connection and
-/// prints no credential value.
-#[test]
-fn guard_probe_rejects_inherited_password_child() {
-    if std::env::var("IA10606_GUARD_PROBE").is_err() {
-        return;
-    }
-    // The parent supplies a synthetic sentinel, never a real credential.
-    assert!(
-        test_options("postgres://agent_test:@agent-testdb:5432/agent_test").is_err(),
-        "guard accepted an inherited nonempty password"
-    );
-}
-
-/// Parent: re-run only the probe above in a child test-binary process with a
-/// synthetic `PGPASSWORD` sentinel. A separate process avoids process-global
-/// environment races with the parallel suite. Credential-free: no connection
-/// is opened in either process.
-#[test]
-fn test_guard_rejects_inherited_nonempty_password() {
-    if std::env::var("IA10606_GUARD_PROBE").is_ok() {
-        return; // child run: covered by the probe test above
-    }
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "guard_probe_rejects_inherited_password_child",
-            "--exact",
-            "--nocapture",
-        ])
-        .env("IA10606_GUARD_PROBE", "1")
-        .env("PGPASSWORD", "synthetic-sentinel-never-a-credential")
-        .env("PGPASSFILE", "/dev/null")
-        .output()
-        .expect("run isolated guard probe");
-    assert!(
-        output.status.success(),
-        "guard probe failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // And this process (no PG* env) still accepts the approved URL.
-    assert!(test_options("postgres://agent_test:@agent-testdb:5432/agent_test").is_ok());
-}
-
 /// A replay that is fresh before an async wait but stale after it must be
 /// refused, never granted a second burn. Seeds a live row expiring ~2s out,
 /// holds the writer behind a controlled row lock for 3s (crossing both the
@@ -310,12 +180,11 @@ fn test_guard_rejects_inherited_nonempty_password() {
 /// and that the original burn stands untouched. A fresh attempt against the
 /// same expired row still wins a genuine replacement afterwards.
 #[tokio::test]
-#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn stale_wait_cannot_win_second_nonce_burn() {
     let db = TestDb::new().await;
     let second = db.independent_pool().await;
     let store = InternalActionStore::new(second.clone());
-    let nonce = body_hash(schema_name().as_bytes())[..32].to_owned();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
     let nonce_hash = body_hash(nonce.as_bytes());
     let start = db_now_secs(&db.pool).await;
     sqlx::query(
@@ -369,13 +238,12 @@ async fn stale_wait_cannot_win_second_nonce_burn() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn nonce_race_restart_and_expiry_window() {
     let db = TestDb::new().await;
     let second = db.independent_pool().await;
     let a = db.store();
     let b = InternalActionStore::new(second.clone());
-    let nonce = body_hash(schema_name().as_bytes())[..32].to_owned();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
     let attempt = db_now_secs(&db.pool).await.to_string();
     let mut tasks = Vec::new();
     for i in 0..24 {
@@ -429,7 +297,6 @@ async fn nonce_race_restart_and_expiry_window() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn claims_race_bind_payload_action_caller_and_replay_after_restart() {
     let db = TestDb::new().await;
     let second = db.independent_pool().await;
@@ -522,7 +389,6 @@ async fn claims_race_bind_payload_action_caller_and_replay_after_restart() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn stale_and_unknown_claims_never_reexecute_and_reconciliation_is_terminal() {
     let db = TestDb::new().await;
     let a = db.store();
@@ -601,7 +467,6 @@ async fn stale_and_unknown_claims_never_reexecute_and_reconciliation_is_terminal
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn audit_failures_roll_back_claim_and_terminal_without_leaking_details() {
     let db = TestDb::new().await;
     let store = db.store();
@@ -670,7 +535,7 @@ async fn audit_failures_roll_back_claim_and_terminal_without_leaking_details() {
         store.claim(&id, &subject()).await,
         Err(InternalStoreError::Unavailable)
     ));
-    let nonce = body_hash(schema_name().as_bytes())[..32].to_owned();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
     assert_eq!(
         store.burn_nonce(&nonce, &attempt).await,
         Err(InternalStoreError::Unavailable)
@@ -683,7 +548,6 @@ async fn audit_failures_roll_back_claim_and_terminal_without_leaking_details() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn discord_event_dedup_is_atomic_global_and_durable() {
     let db = TestDb::new().await;
     let second = db.independent_pool().await;
@@ -715,7 +579,6 @@ async fn discord_event_dedup_is_atomic_global_and_durable() {
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn completion_and_reconciliation_race_cannot_overwrite_terminal() {
     let db = TestDb::new().await;
     let second = db.independent_pool().await;
