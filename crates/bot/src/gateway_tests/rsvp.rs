@@ -46,13 +46,8 @@ fn runtime(db: &TestDb, rest: &MockRest) -> Arc<InteractionRuntime> {
 async fn spawn(db: &TestDb, url: &str, rest: &MockRest) -> JoinHandle<Result<(), sqlx::Error>> {
     ensure_crypto_provider();
     let saved = load_boot_session(&db.store).await.unwrap();
-    let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
-    let shard = Shard::with_config(
-        ShardId::ONE,
-        ConfigBuilder::from(config)
-            .proxy_url(url.to_owned())
-            .build(),
-    );
+    let shard =
+        crate::gateway::build_shard(TOKEN.into(), Intents::empty(), saved.as_ref(), Some(url));
     tokio::spawn(run_shard(
         shard,
         Arc::new(build_pipeline(db.store.milestones().await.unwrap())),

@@ -6,10 +6,15 @@
 
 - Wire `/sticky` and `/sticky-remove` through the shared interaction router and drive accepted-message re-posts through the shared REST executor. The runtime claims one re-post window atomically per burst, validates and records the replacement id before retiring the previous sticky (best-effort), releases the claim and audits `post_failed` on REST failure, and deletes an orphaned replacement when the claim moved on. Commands defer ephemerally before I/O and edit the original reply; refusals are limited to owned sticky commands. `TWO_AUTOMATIONS` gates both surfaces; ManageGuild is required, and `/sticky` validates a 1–2000 UTF-16 body with a 1–300 s debounce (default 5 s). Covered by isolated Postgres and mock REST acceptance tests.
 - Wire RSVP, namespaced RSVP totals and ManageEvents-gated host attendance through the shared interaction router, sqlx stores and REST executor, with ephemeral deferred replies and test-container/mock-Discord acceptance. Publish the full shared command registry before gateway startup, including persisted-session RESUMED boots. Defer queued commands at receipt, keep effects/checkpoints in dispatch order, and drain accepted work rather than cancel it at the feature deadline or backlog limit.
+- Add the audit mirror delivery service over the shared REST executor: record-before-deliver, private guild-fenced destinations, enforced nonce/mention suppression, kill-switch enforcement, crash-safe marker reconciliation and quarantine. Revalidate prepared ownership after shared transport pacing, preserve interrupted dedup adoption evidence, treat malformed history as uncertain, and run service fault-injection regressions in CI. Runtime wiring and activation remain deferred.
 
 ### Notes
 
 - RSVP and host check-in now use the shared S4 router and REST executor; other feature integrations remain follow-up slices. RSVP mutations validate live events with legacy missing/cancelled/error replies, while totals remain readable from persisted rows without Discord event access. Automated scorecard and probe collection are not enabled by this change.
+
+### Fixed
+
+- Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 
@@ -59,6 +64,7 @@
 - Port join-burst detection, join-risk scoring and mention-suppressed staff alert proposals to the Rust domain core, with occurrence/processing clock boundaries and mock acceptance. No gateway, durable store, alert delivery or anti-nuke activation is added.
 - Port game/session picker decisions, legacy/session/anchor welcome modes, rules-gate prompt eligibility and mention-free session goodbyes to the Rust domain core. Preserve legacy funnel rows with a sqlx prompt guard, migration 0190 and isolated agent-testdb/mock delivery tests. Runtime router/REST wiring remains a follow-up.
 - Port sticky-message domain logic, debounce claims and PostgreSQL persistence, with a legacy timestamp upgrade and UTF-16-compatible body limits. Discord command and REST wiring remains in the S4 integration slices.
+- Feed command and polling plans, bounded RSS/YouTube/Twitch XML parsing, public-IP/redirect fetch policy, and guild-scoped, fenced delivery storage with crash-reconciliation outcomes. Runtime transport wiring remains default-off pending the shared router and REST executor.
 - RSVP domain logic and database store for going, interested and declined responses, namespaced attendance totals, and ManageEvents-gated host check-in facts, with legacy-compatible tables and replies.
 - Port website-contract counter, rank and scheduled-events domain logic and transactional storage, with legacy-shaped read views. Runtime job wiring remains deferred.
 - Port the guild-settings catalogue, 15-second poll contract, cache, sqlx store, and migration to Rust. Runtime ticker and interaction integration remain follow-up work.
