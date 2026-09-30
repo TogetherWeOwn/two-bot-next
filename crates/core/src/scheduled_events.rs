@@ -130,12 +130,15 @@ pub fn normalize_events(raw: &[RawScheduledEvent]) -> Option<Vec<ScheduledEvent>
     raw.iter().map(normalize_event).collect()
 }
 
-/// Parse any reasonable ISO-8601 instant and render UTC millis (legacy
-/// `new Date(s).toISOString()`). Routes through [`crate::funnel`]: the S3
-/// slice landed the same parse/render pair first, so this module reuses it
-/// instead of owning a duplicate (offsets like `+01:00` render back to `Z`).
+/// Parse the complete RFC 3339 instant fallibly, then reuse the UTC millis
+/// renderer (legacy `new Date(s).toISOString()`). Malformed timestamps must
+/// reject the whole response, not panic or silently ignore trailing input.
+/// Source: https://docs.rs/time/0.3.55/time/format_description/well_known/struct.Rfc3339.html
 fn normalize_timestamp(s: &str) -> Option<String> {
-    crate::funnel::parse_iso_millis(s).map(crate::funnel::format_iso_millis)
+    let instant =
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
+    let millis = i64::try_from(instant.unix_timestamp_nanos().div_euclid(1_000_000)).ok()?;
+    Some(crate::funnel::format_iso_millis(millis))
 }
 
 #[cfg(test)]
@@ -187,6 +190,62 @@ mod tests {
         assert_eq!(event.starts_at, "2026-09-06T17:30:00.000Z");
         assert_eq!(event.status, EventStatus::Scheduled);
         assert_eq!(event.channel_id.as_deref(), Some("voice-1"));
+    }
+
+    #[test]
+    fn fractions_and_pre_epoch_instants_keep_millisecond_precision() {
+        for (start, expected) in [
+            ("2026-09-06T18:00:00.123456Z", "2026-09-06T18:00:00.123Z"),
+            ("2026-09-06T18:00:00.1-01:30", "2026-09-06T19:30:00.100Z"),
+            ("1969-12-31T23:59:59.999999Z", "1969-12-31T23:59:59.999Z"),
+        ] {
+            let event = normalize_event(&raw("x", "Good event", start, 1)).expect("normalizes");
+            assert_eq!(event.starts_at, expected, "{start}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_timestamp_shapes_and_dates() {
+        for start in [
+            "2026-09-06T18:00:00.123.extraZ",
+            "2026-09-06T18:00:00+0é0",
+            "2026-09-06T18:00:00.123Zextra",
+            "2026-09-06T18:00:00.Z",
+            "2026-09-06T18:00:00+24:00",
+            "2026-09-06T18:00:00+01:60",
+            "2026-02-30T18:00:00Z",
+            "9223372036854775807-09-06T18:00:00Z",
+            "é026-09-06T18:00:00Z",
+            "2026-09-06T18:00:00",
+        ] {
+            assert!(
+                normalize_event(&raw("x", "Bad event", start, 1)).is_none(),
+                "{start}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_offset_rejects_the_whole_snapshot_without_panicking() {
+        let response = [
+            raw("good", "Good event", "2026-09-06T18:00:00.000Z", 1),
+            raw("bad", "Malformed offset", "2026-09-06T18:00:00+0é0", 1),
+        ];
+        assert!(normalize_events(&response).is_none());
+    }
+
+    #[test]
+    fn trailing_fraction_garbage_rejects_the_whole_snapshot() {
+        let response = [
+            raw("good", "Good event", "2026-09-06T18:00:00.000Z", 1),
+            raw(
+                "bad",
+                "Malformed fraction",
+                "2026-09-06T18:00:00.123.extraZ",
+                1,
+            ),
+        ];
+        assert!(normalize_events(&response).is_none());
     }
 
     #[test]

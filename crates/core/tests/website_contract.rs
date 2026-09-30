@@ -756,6 +756,19 @@ async fn events_mirror_swaps_atomically_and_keeps_last_good_on_failure() {
         .is_none(),
         "one malformed event rejects the snapshot"
     );
+    for malformed_start in ["2026-09-06T18:00:00+0é0", "2026-09-06T18:00:00.123.extraZ"] {
+        let response = [
+            raw_event("good", "2026-09-06T18:00:00.000Z", 1),
+            raw_event("bad", malformed_start, 1),
+        ];
+        let _guard = gate.try_acquire().expect("acquire");
+        if let Some(events) = normalize_events(&response) {
+            replace_events(&pool, GUILD, OBSERVED_AT, &events)
+                .await
+                .expect("swap validated response");
+            panic!("malformed timestamp accepted: {malformed_start}");
+        }
+    }
     let ids: Vec<String> = sqlx::query_as::<_, (String,)>("SELECT event_id FROM scheduled_events")
         .fetch_all(&pool)
         .await
