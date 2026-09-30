@@ -250,7 +250,7 @@ async fn post_message_suppresses_mentions() {
         format!("/api/v10/channels/{CHANNEL}/messages")
     );
     let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("post body is JSON");
-    assert_eq!(body["content"], "hello @everyone");
+    assert_eq!(body["content"], "hello @\u{200b}everyone");
     assert_eq!(
         body["allowed_mentions"]["parse"],
         serde_json::json!([]),
