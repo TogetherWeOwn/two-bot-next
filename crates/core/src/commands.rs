@@ -274,8 +274,8 @@ mod tests {
             // serde round trip alone compares two copies of the already-built
             // value and would still pass if a builder dropped, clamped or
             // truncated a bound.
-            prop_assert_eq!(option.name, name);
-            prop_assert_eq!(option.description, description);
+            prop_assert_eq!(&option.name, &name);
+            prop_assert_eq!(&option.description, &description);
             prop_assert_eq!(option.kind, CommandOptionType::Integer.as_u8());
             prop_assert_eq!(option.required, Some(true));
             prop_assert_eq!(option.min_value, Some(min));
@@ -283,7 +283,7 @@ mod tests {
             prop_assert_eq!(option.max_length, Some(length));
             let wire = serde_json::to_vec(&option).unwrap();
             let decoded: CommandOption = serde_json::from_slice(&wire).unwrap();
-            prop_assert_eq!(decoded, option);
+            prop_assert_eq!(&decoded, &option);
             prop_assert_eq!(decoded.min_value, Some(min));
             prop_assert_eq!(decoded.max_value, Some(max));
             prop_assert_eq!(decoded.max_length, Some(length));
@@ -366,7 +366,7 @@ mod tests {
                 // implementation would surface "second-payload" here.
                 if let Ok(ref merged) = actual {
                     let pinned = merged.iter().find(|d| d.name == "zzpropdup").unwrap();
-                    prop_assert_eq!(pinned.description, "first-payload");
+                    prop_assert_eq!(&pinned.description, "first-payload");
                 }
                 prop_assert_eq!(actual, Ok(expected));
             }
