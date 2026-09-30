@@ -5,8 +5,12 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod action_outcomes;
 pub mod audit;
+#[cfg(feature = "db")]
+pub mod audit_store;
 pub mod automod;
+pub mod backup;
 pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
@@ -29,6 +33,9 @@ pub mod health;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
+#[cfg(feature = "db")]
+pub mod internal_action_store;
+pub mod internal_actions;
 pub mod invites;
 pub mod leveling;
 #[cfg(feature = "db")]
@@ -59,6 +66,12 @@ pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
 
+pub use action_outcomes::{
+    backoff_ms, classify_kick_status, clear_send_bit, lockdown_overwrite, pace_wait_ms,
+    parse_retry_after_secs, retry_after_ms, set_send_bit, unlock_overwrite, ActionOutcome,
+    KickOutcome, KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
+    MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
+};
 pub use automod::{
     match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
     AutomodExportError, AutomodExportRule, AutomodFilter, AutomodGateError, AutomodMessage,
@@ -122,6 +135,21 @@ pub use inactivity::{
     select_inactive, should_flag, FlaggedMember, InactivityCandidate, InactivityOutcome,
     INACTIVITY_EVENT_SOURCE, INACTIVITY_EVENT_TYPE, INACTIVITY_SWEEP_INTERVAL_MS,
 };
+pub use internal_actions::{
+    assert_allowed, assert_private_bind, auth_failure, authorize, body_hash, build_channel_keys,
+    build_key_map, build_role_keys, canonical_string, check_setting_value_size, is_private_address,
+    new_request_id, normalise_bind_host, parse_keys, require_field_str, require_reason,
+    require_settings_key, require_snowflake, require_timestamp, sign, signatures_match, utf16_len,
+    valid_idempotency_key, valid_nonce_format, validate_announcement, validate_event_input,
+    validate_guild_add_member, validate_idempotency_key, validate_moderation_numbers,
+    validate_role_assign, within_skew, ActionError, AuthDecision, AuthHeaders, BindError,
+    BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace, InternalFlags, KeyMapError,
+    KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets, ACTIONS_PATH, ADD_MEMBER_BUCKET,
+    AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET, IMPLEMENTED_ACTIONS, MAX_BODY_BYTES,
+    MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS, MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN,
+    MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN, MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY,
+    NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS, REQUEST_ID_LEN, SKEW_SECONDS,
+};
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
     summarize_attribution_split, AttributionCategory, AttributionSplit, DowntimeWindow,
@@ -143,7 +171,7 @@ pub use lfg::{
     spec_roles, valid_role_key, validate_title, LfgPermissionError, LfgPost, LfgRole, LfgRoleSpec,
     LfgSelectAction, LfgSelectOption, LfgSignup, LfgStatus, RoleSpecError, SignupOutcome,
     StartsAtError, TitleError, LFG_LEAVE_VALUE, LFG_SELECT_PREFIX, MAX_LFG_ROLES,
-    MAX_MESSAGE_CHARS, MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
+    MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
 };
 pub use moderation::{
     assert_moderation_allowed, moderation_commands, moderation_target_protection,
