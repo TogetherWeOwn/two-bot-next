@@ -71,7 +71,8 @@ reviewed operator change.
 
 Normal PUBLIC catalog reads/functions remain available. No group may own a
 system-schema relation, function or schema (ownership grants implicit DDL and
-grant authority even when EXECUTE already belongs to PUBLIC). Additional system-schema
+grant authority even when EXECUTE already belongs to PUBLIC), except the migrator's
+automatically transferred TOAST storage/indexes of allowlisted bot tables. Additional system-schema
 relation, column, function and schema grants are checked against PostgreSQL's
 `pg_init_privs` initial PUBLIC ACLs (or its default ACL where no initial ACL exists),
 not the possibly drifted current PUBLIC grants. Built-in `information_schema`

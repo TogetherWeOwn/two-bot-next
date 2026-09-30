@@ -84,13 +84,20 @@ system_acls AS (
     WHERE NOT EXISTS (SELECT FROM app_schemas a WHERE a.oid = n.oid)
 ),
 system_owners AS (
-    SELECT c.oid::regclass::text AS target, c.relowner AS owner FROM pg_class c
-    WHERE NOT EXISTS (SELECT FROM app_schemas n WHERE n.oid = c.relnamespace)
+    SELECT c.oid::regclass::text AS target, c.relowner AS owner,
+        EXISTS (
+            SELECT FROM objects o JOIN pg_class base ON base.oid = o.oid
+            WHERE o.kind IN ('table', 'ledger') AND base.reltoastrelid <> 0
+              AND (c.oid = base.reltoastrelid OR EXISTS (
+                  SELECT FROM pg_index i WHERE i.indexrelid = c.oid AND i.indrelid = base.reltoastrelid
+              ))
+        ) AS bot_storage
+    FROM pg_class c WHERE NOT EXISTS (SELECT FROM app_schemas n WHERE n.oid = c.relnamespace)
     UNION ALL
-    SELECT p.oid::regprocedure::text, p.proowner FROM pg_proc p
+    SELECT p.oid::regprocedure::text, p.proowner, false FROM pg_proc p
     WHERE NOT EXISTS (SELECT FROM app_schemas n WHERE n.oid = p.pronamespace)
     UNION ALL
-    SELECT n.nspname, n.nspowner FROM pg_namespace n
+    SELECT n.nspname, n.nspowner, false FROM pg_namespace n
     WHERE NOT EXISTS (SELECT FROM app_schemas a WHERE a.oid = n.oid)
 ),
 findings AS (
@@ -112,6 +119,9 @@ findings AS (
     UNION ALL
     SELECT 'unexpected system owner: ' || r.rolname || '/' || o.target
     FROM system_owners o JOIN roles r ON r.oid = o.owner
+    -- ALTER TABLE OWNER also transfers its TOAST table/index; those are the
+    -- migrator's allowlisted table storage, not authority over catalog objects.
+    WHERE NOT (r.rolname = 'two_bot_migrator' AND o.bot_storage)
     UNION ALL
     SELECT 'unexpected system privilege: ' || r.rolname || '/' || a.target || '/' || x.privilege_type
     FROM system_acls a CROSS JOIN LATERAL aclexplode(a.acl) x JOIN roles r ON x.grantee IN (0, r.oid)
