@@ -2652,6 +2652,266 @@ mod tests {
         }
     }
 
+    // F1 (timeout after dispatch): the sweep dispatches the DELETE, Discord
+    // times out, and the ledger row stays `running` with its claim token.
+    // A fresh permanent ban must refuse — with no Discord PUT at all — and
+    // only `resolve_uncertain_unban(Completed)` closes the old row. A
+    // subsequent confirmation must NOT supersede the authoritative close.
+    #[tokio::test]
+    async fn timed_out_unban_fences_fresh_ban_until_authoritative_close() {
+        let discord = MockMemberDiscord::new();
+        let store = MemMemberStore::new();
+        let svc = service(discord.clone(), store.clone());
+        svc.execute(&execution_with_id(ModerationAction::TempBan, "old"))
+            .await
+            .expect("old tempban");
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            let row = inner.unbans.get_mut("old").expect("staged");
+            row.execute_at = NOW.to_owned();
+        }
+        // The sweep dispatches the DELETE; the remote effect times out.
+        discord.fail_with("unban", DiscordError::Timeout);
+        let err = svc.run_due_unbans(GUILD).await.expect_err("timeout");
+        assert!(
+            matches!(err, MemberError::Discord(DiscordError::Timeout)),
+            "timed-out DELETE must surface, got {err:?}"
+        );
+        discord.clear_failure("unban");
+        assert_eq!(store.unban_state("old").as_deref(), Some("running"));
+        // Fresh permanent ban refuses; no PUT reaches Discord.
+        let bans_before = discord.call_count("ban");
+        let fresh = execution_with_id(ModerationAction::Ban, "fresh");
+        assert!(
+            svc.execute(&fresh).await.is_err(),
+            "running DELETE must fence the fresh ban"
+        );
+        assert_eq!(discord.call_count("ban"), bans_before);
+        // Authoritative evidence that the DELETE provably landed closes the
+        // row — only `resolve_uncertain_unban` may close `running`.
+        let token = store
+            .inner
+            .lock()
+            .expect("lock")
+            .unbans
+            .get("old")
+            .expect("running row")
+            .claim_token
+            .clone()
+            .expect("claim token retained");
+        store
+            .resolve_uncertain_unban("old", &token, UnbanResolution::Completed)
+            .await
+            .expect("authoritative completion");
+        assert_eq!(store.unban_state("old").as_deref(), Some("done"));
+        // With the uncertainty closed, a fresh ban proceeds exactly once —
+        // and its confirmation leaves the authoritatively closed row
+        // untouched (the narrowed `confirm_ban` supersedes only
+        // never-dispatched schedules).
+        svc.execute(&execution_with_id(ModerationAction::Ban, "fresh-2"))
+            .await
+            .expect("ban after close");
+        assert_eq!(discord.call_count("ban"), bans_before + 1);
+        assert_eq!(store.unban_state("old").as_deref(), Some("done"));
+    }
+
+    // F1 (confirm narrowing, store level): a newer prepared intent confirmed
+    // while the older schedule is `running` must NOT supersede it — the
+    // dispatched DELETE may still land. The token and the fence survive the
+    // confirmation; only `resolve_uncertain_unban` may close the row.
+    #[tokio::test]
+    async fn confirm_ban_never_supersedes_a_running_schedule() {
+        let store = MemMemberStore::new();
+        store
+            .stage_unban(GUILD, TARGET_ID, NOW, "expiry", "old", NOW)
+            .await
+            .expect("stage");
+        store
+            .confirm_ban(GUILD, TARGET_ID, "old", NOW)
+            .await
+            .expect("accepted");
+        let job = store
+            .claim_due_unbans(GUILD, NOW, 25)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("job");
+        // A newer prepared intent that predates the dispatch window: insert
+        // it directly, the way a staging path that ran before the claim
+        // would have left it (staging itself now refuses `running` rows).
+        let old_generation = {
+            let mut inner = store.inner.lock().expect("lock");
+            let old_generation = inner.bans.get("old").expect("old intent").generation;
+            inner.ban_sequence += 1;
+            let generation = inner.ban_sequence;
+            inner.bans.insert(
+                "new".to_owned(),
+                BanRow {
+                    guild_id: GUILD.to_owned(),
+                    user_id: TARGET_ID.to_owned(),
+                    generation,
+                    state: BanState::Prepared,
+                },
+            );
+            old_generation
+        };
+        assert!(old_generation < store.inner.lock().expect("lock").bans["new"].generation);
+        store
+            .confirm_ban(GUILD, TARGET_ID, "new", NOW)
+            .await
+            .expect("newer acceptance");
+        // The newer ban is accepted, but the uncertain row is neither closed
+        // nor token-stripped: the fence holds for the late DELETE.
+        assert_eq!(store.unban_state("old").as_deref(), Some("running"));
+        assert_eq!(
+            store
+                .inner
+                .lock()
+                .expect("lock")
+                .unbans
+                .get("old")
+                .expect("running row")
+                .claim_token
+                .as_deref(),
+            Some(job.claim_token.as_str())
+        );
+        // The newer accepted intent correctly fences the old claim (the old
+        // generation is no longer current, so neither `complete_unban` nor
+        // a fresh `owns` succeeds) — but the row is still `running` with
+        // its token, not superseded: only authoritative evidence closes it.
+        assert!(!store
+            .owns_unban_claim(&job.request_id, &job.claim_token)
+            .await
+            .expect("ownership"));
+        // Only authoritative evidence closes it.
+        store
+            .resolve_uncertain_unban(&job.request_id, &job.claim_token, UnbanResolution::Void)
+            .await
+            .expect("authoritative void");
+        assert_eq!(store.unban_state("old").as_deref(), Some("superseded"));
+    }
+
+    // F1 (task cancellation): the sweep claims the job, dispatches the
+    // DELETE, and hangs inside it; the consumer task is aborted exactly like
+    // a cancelled worker. The ledger row stays `running` with its token, the
+    // fence holds a fresh permanent ban, and no late `confirm_ban` may close
+    // the uncertain row — only `resolve_uncertain_unban` may.
+    #[tokio::test]
+    async fn cancelled_unban_dispatch_keeps_the_fence_and_its_token() {
+        struct HangingDiscord {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        impl std::fmt::Debug for HangingDiscord {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("HangingDiscord").finish()
+            }
+        }
+        impl MemberDiscord for HangingDiscord {
+            async fn ban(&self, _: &str, _: &str, _: &str) -> Result<(), DiscordError> {
+                Ok(())
+            }
+            async fn unban(&self, _: &str, _: &str, _: &str) -> Result<(), DiscordError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+            async fn kick(&self, _: &str, _: &str, _: &str) -> Result<(), DiscordError> {
+                Ok(())
+            }
+            async fn timeout(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), DiscordError> {
+                Ok(())
+            }
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let store = MemMemberStore::new();
+        let setup = service(MockMemberDiscord::new(), store.clone());
+        setup
+            .execute(&execution_with_id(ModerationAction::TempBan, "old"))
+            .await
+            .expect("old tempban");
+        {
+            let mut inner = store.inner.lock().expect("lock");
+            let row = inner.unbans.get_mut("old").expect("staged");
+            row.execute_at = NOW.to_owned();
+        }
+        // The sweep task owns its service so the future is `'static`; it
+        // claims the due job and hangs inside the dispatched DELETE.
+        let sweep_store = store.clone();
+        let sweep_entered = entered.clone();
+        let sweep_release = release.clone();
+        let sweep = tokio::spawn(async move {
+            let svc = MemberModerationService::new(
+                HangingDiscord {
+                    entered: sweep_entered,
+                    release: sweep_release,
+                },
+                sweep_store,
+                policy(),
+                || 1_700_000_000_000,
+            );
+            svc.run_due_unbans(GUILD).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("sweep must dispatch without panicking");
+        sweep.abort();
+        assert!(
+            sweep.await.expect_err("aborted").is_cancelled(),
+            "sweep task must die by cancellation, not by result"
+        );
+        release.notify_one();
+        // The dispatched-but-hung DELETE leaves the row `running` with its
+        // claim token: the uncertainty survives the cancellation.
+        assert_eq!(store.unban_state("old").as_deref(), Some("running"));
+        let token = store
+            .inner
+            .lock()
+            .expect("lock")
+            .unbans
+            .get("old")
+            .expect("running row")
+            .claim_token
+            .clone()
+            .expect("claim token retained");
+        // A fresh permanent ban refuses; no PUT reaches Discord.
+        let bans = MockMemberDiscord::new();
+        let fresh_svc = service(bans.clone(), store.clone());
+        assert!(
+            fresh_svc
+                .execute(&execution_with_id(ModerationAction::Ban, "fresh"))
+                .await
+                .is_err(),
+            "cancelled dispatch must fence the fresh ban"
+        );
+        assert_eq!(bans.call_count("ban"), 0);
+        // A late confirmation for the same expiry cannot close the uncertain
+        // row either: the token and the fence survive it.
+        assert!(store
+            .confirm_ban(GUILD, TARGET_ID, "old", NOW)
+            .await
+            .is_err());
+        assert_eq!(store.unban_state("old").as_deref(), Some("running"));
+        // Only authoritative evidence closes the row; a void resolution lifts
+        // the fence and the fresh ban proceeds exactly once.
+        store
+            .resolve_uncertain_unban("old", &token, UnbanResolution::Void)
+            .await
+            .expect("authoritative void");
+        fresh_svc
+            .execute(&execution_with_id(ModerationAction::Ban, "fresh-2"))
+            .await
+            .expect("ban after void");
+        assert_eq!(bans.call_count("ban"), 1);
+    }
+
     // F1 (store level): staging refuses while a `running` row exists even
     // when the caller never observed the job — the fence lives in the
     // ledger, not in the claim handle.
@@ -2673,12 +2933,7 @@ mod tests {
             .pop()
             .expect("job");
         // A fresh ban intent refuses; nothing is staged for it.
-        assert!(
-            store
-                .stage_ban(GUILD, TARGET_ID, "new", NOW)
-                .await
-                .is_err()
-        );
+        assert!(store.stage_ban(GUILD, TARGET_ID, "new", NOW).await.is_err());
         // `completed` resolution closes the old job; the fence lifts and the
         // same staging succeeds without a new request id.
         store
@@ -2695,16 +2950,14 @@ mod tests {
             .await
             .expect("fence lifted");
         // Double resolution surfaces instead of vanishing.
-        assert!(
-            store
-                .resolve_uncertain_unban(
-                    &job.request_id,
-                    &job.claim_token,
-                    UnbanResolution::Completed
-                )
-                .await
-                .is_err()
-        );
+        assert!(store
+            .resolve_uncertain_unban(
+                &job.request_id,
+                &job.claim_token,
+                UnbanResolution::Completed
+            )
+            .await
+            .is_err());
     }
 
     /// Store double that fails selected writes once, to exercise service
@@ -2715,6 +2968,7 @@ mod tests {
         fail_complete_once: Arc<std::sync::atomic::AtomicBool>,
         fail_stage_once: Arc<std::sync::atomic::AtomicBool>,
         fail_audit_once: Arc<std::sync::atomic::AtomicBool>,
+        fail_complete_unban_once: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FaultyStore {
@@ -2725,6 +2979,7 @@ mod tests {
                 fail_complete_once: Arc::new(AtomicBool::new(false)),
                 fail_stage_once: Arc::new(AtomicBool::new(false)),
                 fail_audit_once: Arc::new(AtomicBool::new(false)),
+                fail_complete_unban_once: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -2744,6 +2999,11 @@ mod tests {
 
         fn arm_audit(&self) {
             self.fail_audit_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn arm_complete_unban(&self) {
+            self.fail_complete_unban_once
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -2782,15 +3042,17 @@ mod tests {
                 return Err(StoreError::new("injected completion failure"));
             }
             self.inner
-                .complete(guild_id, idempotency_key, outcome, result_json, completed_at)
+                .complete(
+                    guild_id,
+                    idempotency_key,
+                    outcome,
+                    result_json,
+                    completed_at,
+                )
                 .await
         }
 
-        async fn release(
-            &self,
-            guild_id: &str,
-            idempotency_key: &str,
-        ) -> Result<(), StoreError> {
+        async fn release(&self, guild_id: &str, idempotency_key: &str) -> Result<(), StoreError> {
             self.inner.release(guild_id, idempotency_key).await
         }
 
@@ -2813,13 +3075,7 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.inner
                 .add_warning(
-                    warning_id,
-                    guild_id,
-                    user_id,
-                    actor_id,
-                    reason,
-                    request_id,
-                    created_at,
+                    warning_id, guild_id, user_id, actor_id, reason, request_id, created_at,
                 )
                 .await
         }
@@ -2867,12 +3123,7 @@ mod tests {
             }
             self.inner
                 .stage_unban(
-                    guild_id,
-                    user_id,
-                    execute_at,
-                    reason,
-                    request_id,
-                    created_at,
+                    guild_id, user_id, execute_at, reason, request_id, created_at,
                 )
                 .await
         }
@@ -2923,6 +3174,9 @@ mod tests {
             request_id: &str,
             claim_token: &str,
         ) -> Result<(), StoreError> {
+            if Self::fail_once(&self.fail_complete_unban_once) {
+                return Err(StoreError::new("injected unban completion failure"));
+            }
             self.inner.complete_unban(request_id, claim_token).await
         }
 
@@ -2976,6 +3230,73 @@ mod tests {
         );
         assert_eq!(discord.call_count("kick"), 1);
         assert_eq!(store.inner.audits().len(), 1);
+    }
+
+    // F3 (scheduled effect): a completion failure after the dispatched
+    // DELETE landed must still leave the unban audit row behind. The claim
+    // stays `running` (uncertain, correct — the next sweep reconciles it via
+    // ownership, never by repeating the DELETE), but the audit of the
+    // successful unban already exists.
+    #[tokio::test]
+    async fn accepted_scheduled_unban_is_audited_when_completion_fails() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let clock = AtomicI64::new(1_700_000_000_000);
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            clock.load(Ordering::SeqCst)
+        });
+        let mut tempban = execution(ModerationAction::TempBan);
+        tempban.request_id = "req-tempban-9".to_owned();
+        tempban.idempotency_key = "key-tempban-9".to_owned();
+        svc.execute(&tempban).await.expect("tempban");
+        {
+            let mut inner = store.inner.inner.lock().expect("lock");
+            let row = inner.unbans.get_mut("req-tempban-9").expect("staged");
+            row.execute_at = NOW.to_owned();
+        }
+        // Only the scheduled completion fails; the dispatched DELETE lands.
+        store.arm_complete_unban();
+        let err = svc
+            .run_due_unbans(GUILD)
+            .await
+            .expect_err("completion fails");
+        assert!(
+            matches!(err, MemberError::Store(_)),
+            "completion loss must surface, got {err:?}"
+        );
+        assert_eq!(discord.call_count("unban"), 1);
+        // The DELETE landed exactly once and its audit row exists; the claim
+        // stays `running` so nothing replays or repeats it.
+        assert_eq!(
+            store.inner.unban_state("req-tempban-9").as_deref(),
+            Some("running")
+        );
+        let audits = store.inner.audits();
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[1].request_id, "req-tempban-9:unban");
+        assert_eq!(audits[1].action, "moderation.unban_scheduled");
+        assert_eq!(audits[1].outcome, "unbanned");
+        // A second sweep does not repeat the DELETE: the uncertain row still
+        // needs authoritative resolution, but the audit is never duplicated.
+        let token = store
+            .inner
+            .inner
+            .lock()
+            .expect("lock")
+            .unbans
+            .get("req-tempban-9")
+            .expect("running row")
+            .claim_token
+            .clone()
+            .expect("claim token retained");
+        store
+            .inner
+            .resolve_uncertain_unban("req-tempban-9", &token, UnbanResolution::Completed)
+            .await
+            .expect("authoritative completion");
+        assert_eq!(discord.call_count("unban"), 1);
+        assert_eq!(store.inner.audits().len(), 2);
     }
 
     // F3 (audit path unchanged): audit loss alone never fails an accepted

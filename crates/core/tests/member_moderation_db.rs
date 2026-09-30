@@ -19,7 +19,7 @@ const DUE: &str = "2023-11-14T23:13:20.000Z";
 
 // No DATABASE_URL or inherited credentials: tests accept only the approved
 // agent container or the ephemeral Postgres service in GitHub Actions.
-async fn database() -> (PgPool, PgPool, String) {
+async fn database_schema() -> (PgPool, PgPool, String) {
     let host = match std::env::var("MEMBER_TESTDB").as_deref() {
         Ok("agent-testdb") => "agent-testdb",
         Ok("ci") if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => "localhost",
@@ -62,6 +62,11 @@ async fn database() -> (PgPool, PgPool, String) {
         .connect_with(options)
         .await
         .expect("schema pool");
+    (admin, pool, schema)
+}
+
+async fn database() -> (PgPool, PgPool, String) {
+    let (admin, pool, schema) = database_schema().await;
     for _ in 0..2 {
         for migration in [
             include_str!("../../cutover/migrations/0110_moderation_member.sql"),
@@ -344,9 +349,20 @@ async fn postgres_member_ledger() {
         .await
         .expect("no running takeover")
         .is_empty());
+    assert!(g2
+        .stage_unban("g2", "u2", DUE, "extension", "new", NOW)
+        .await
+        .is_err());
+    g2.resolve_uncertain_unban(
+        &next.request_id,
+        &next.claim_token,
+        two_bot_core::member_moderation::UnbanResolution::Void,
+    )
+    .await
+    .expect("authoritative no-late-DELETE evidence clears the running fence");
     g2.stage_unban("g2", "u2", DUE, "extension", "new", NOW)
         .await
-        .expect("new stage");
+        .expect("new stage after reconciliation");
     // Even before acceptance, the newer prepared intent fences the old claim.
     assert!(!g2
         .owns_unban_claim(&next.request_id, &next.claim_token)
@@ -457,7 +473,7 @@ async fn postgres_guild_bound_sweep_and_write_fences() {
     let g1 = PgMemberModerationStore::new(pool.clone(), "g1");
     let g2 = PgMemberModerationStore::new(pool.clone(), "g2");
     accepted_unban(&g1, "g1", "same-member", "own-expiry", NOW, NOW).await;
-    accepted_unban(&g2, "g2", "same-member", "foreign-expiry", NOW, NOW).await;
+    accepted_unban(&g2, "g2", "expiry-member", "foreign-expiry", NOW, NOW).await;
     accepted_unban(&g2, "g2", "other-member", "foreign-running", NOW, NOW).await;
     let foreign_jobs = g2
         .claim_due_unbans("g2", NOW, 25)
@@ -487,7 +503,9 @@ async fn postgres_guild_bound_sweep_and_write_fences() {
             })
             .await;
     });
-    ready.notified().await;
+    tokio::time::timeout(Duration::from_secs(2), ready.notified())
+        .await
+        .expect("foreign task must acquire its queue without panicking");
     let discord = MockMemberDiscord::new();
     let svc =
         MemberModerationService::new(discord.clone(), g1.clone(), policy(), || 1_700_003_600_000);
@@ -502,7 +520,7 @@ async fn postgres_guild_bound_sweep_and_write_fences() {
     assert_eq!(unban_state(&pool, "own-expiry").await, "done");
     assert_eq!(unban_state(&pool, "foreign-staged").await, "staged");
     assert_eq!(unban_state(&pool, "foreign-expiry").await, "running");
-    assert!(!g2
+    assert!(g2
         .owns_unban_claim(
             &foreign_jobs
                 .iter()
@@ -516,7 +534,7 @@ async fn postgres_guild_bound_sweep_and_write_fences() {
                 .claim_token,
         )
         .await
-        .expect("prepared foreign ban fences its older expiry"));
+        .expect("own sweep leaves the foreign running claim unchanged"));
 
     // Guild-taking entry points reject before any insert, update or delete.
     g2.claim("g2", "foreign-key", "moderation.ban", "hash", NOW)
@@ -775,21 +793,29 @@ async fn postgres_permanent_ban_supersession_and_failed_confirmation_fence() {
     assert_eq!(running.request_id, "running-expiry");
     sqlx::query("ALTER TABLE moderation_scheduled_unbans ADD CONSTRAINT test_refuse_supersession CHECK (state <> 'superseded') NOT VALID")
         .execute(&pool).await.expect("inject scratch confirmation write failure");
-    for (user, request) in [
-        ("pending-user", "permanent-pending"),
-        ("running-user", "permanent-running"),
-    ] {
-        store
-            .stage_ban("guild", user, request, NOW)
-            .await
-            .expect("permanent prepared before Discord");
-        let error = store
-            .confirm_ban("guild", user, request, NOW)
-            .await
-            .expect_err("confirmation rollback");
-        assert_eq!(error.message, "postgres moderation ledger: 23514");
-        assert_eq!(ban_state(&pool, request).await, "prepared");
-    }
+    store
+        .stage_ban("guild", "pending-user", "permanent-pending", NOW)
+        .await
+        .expect("permanent prepared before Discord");
+    let error = store
+        .confirm_ban("guild", "pending-user", "permanent-pending", NOW)
+        .await
+        .expect_err("confirmation rollback");
+    assert_eq!(error.message, "postgres moderation ledger: 23514");
+    assert_eq!(ban_state(&pool, "permanent-pending").await, "prepared");
+    // Running claims now refuse staging altogether, before any intent/PUT.
+    assert!(store
+        .stage_ban("guild", "running-user", "permanent-running", NOW)
+        .await
+        .is_err());
+    // Inject a pre-existing prepared intent to check late confirmation cannot
+    // erase a dispatched claim, even on an inconsistent imported ledger.
+    sqlx::query("INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('permanent-running', 'guild', 'running-user', 'prepared', $1::text::timestamptz)")
+        .bind(NOW).execute(&pool).await.expect("scratch late intent");
+    store
+        .confirm_ban("guild", "running-user", "permanent-running", NOW)
+        .await
+        .expect("running row is not superseded by confirmation");
     assert_eq!(unban_state(&pool, "pending-expiry").await, "pending");
     assert_eq!(unban_state(&pool, "running-expiry").await, "running");
     assert!(!store
@@ -805,17 +831,42 @@ async fn postgres_permanent_ban_supersession_and_failed_confirmation_fence() {
         .execute(&pool)
         .await
         .expect("allow explicit reconciliation");
-    for (user, request, expiry) in [
-        ("pending-user", "permanent-pending", "pending-expiry"),
-        ("running-user", "permanent-running", "running-expiry"),
-    ] {
-        store
-            .confirm_ban("guild", user, request, DUE)
-            .await
-            .expect("reconciled permanent acceptance");
-        assert_eq!(ban_state(&pool, request).await, "accepted");
-        assert_eq!(unban_state(&pool, expiry).await, "superseded");
-    }
+    store
+        .confirm_ban("guild", "pending-user", "permanent-pending", DUE)
+        .await
+        .expect("reconciled permanent acceptance");
+    assert_eq!(ban_state(&pool, "permanent-pending").await, "accepted");
+    assert_eq!(unban_state(&pool, "pending-expiry").await, "superseded");
+    assert_eq!(ban_state(&pool, "permanent-running").await, "accepted");
+    assert_eq!(unban_state(&pool, "running-expiry").await, "running");
+    let retained: String = sqlx::query_scalar(
+        "SELECT claim_token FROM moderation_scheduled_unbans WHERE request_id = 'running-expiry'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("uncertain token preserved");
+    assert_eq!(retained, running.claim_token);
+    assert!(store
+        .stage_ban("guild", "running-user", "still-fenced", DUE)
+        .await
+        .is_err());
+    assert!(store
+        .resolve_uncertain_unban(
+            &running.request_id,
+            "wrong-token",
+            two_bot_core::member_moderation::UnbanResolution::Void
+        )
+        .await
+        .is_err());
+    store
+        .resolve_uncertain_unban(
+            &running.request_id,
+            &running.claim_token,
+            two_bot_core::member_moderation::UnbanResolution::Void,
+        )
+        .await
+        .expect("only authoritative reconciliation closes dispatched uncertainty");
+    assert_eq!(unban_state(&pool, "running-expiry").await, "superseded");
     assert!(store
         .complete_unban(&running.request_id, &running.claim_token)
         .await
@@ -1008,5 +1059,149 @@ async fn postgres_imported_unbans_are_quarantined_without_acceptance_inference()
         .expect("only explicit accepted intent recovers");
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].request_id, "accepted-staged");
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_legacy_text_timestamps_upgrade_without_reactivating_imports() {
+    let (admin, pool, schema) = database_schema().await;
+    sqlx::raw_sql(include_str!("fixtures/member_moderation_legacy.sql"))
+        .execute(&pool)
+        .await
+        .expect("legacy-shaped schema with eight TEXT timestamp columns");
+    for state in ["staged", "pending", "running", "done"] {
+        sqlx::query("INSERT INTO moderation_scheduled_unbans (request_id, guild_id, user_id, execute_at, reason, state, created_at, completed_at, claimed_at, claim_token) VALUES ($1, 'guild', $1, $2, 'preserved reason', $3, $2, $4, $2, 'preserved-token')")
+            .bind(format!("legacy-{state}"))
+            .bind(NOW)
+            .bind(state)
+            .bind((state == "done").then_some(DUE))
+            .execute(&pool).await.expect("imported schedule");
+    }
+    sqlx::query("INSERT INTO moderation_warnings (id, guild_id, user_id, actor_id, reason, request_id, created_at) VALUES ('w', 'guild', 'user', 'actor', 'reason', 'w', $1)")
+        .bind(NOW).execute(&pool).await.expect("legacy warning");
+    sqlx::query("INSERT INTO moderation_audit (request_id, guild_id, actor_id, action, reason, outcome, idempotency_key, metadata_json, created_at) VALUES ('a', 'guild', 'actor', 'moderation.warn', 'reason', 'warned', 'a', '{}', $1)")
+        .bind(NOW).execute(&pool).await.expect("legacy audit");
+    sqlx::query("INSERT INTO moderation_idempotency (guild_id, idempotency_key, action, request_hash, state, outcome, result_json, claimed_at, completed_at) VALUES ('guild', 'key', 'moderation.warn', 'hash', 'done', 'warned', '{}', $1, $2)")
+        .bind(NOW).bind(DUE).execute(&pool).await.expect("legacy completed claim");
+    for migration in [
+        include_str!("../../cutover/migrations/0110_moderation_member.sql"),
+        include_str!("../../cutover/migrations/0111_moderation_ban_ownership.sql"),
+    ] {
+        sqlx::raw_sql(migration)
+            .execute(&pool)
+            .await
+            .expect("pre-upgrade migrations");
+    }
+    let store = PgMemberModerationStore::new(pool.clone(), "guild");
+    let error = store
+        .claim_due_unbans("guild", DUE, 25)
+        .await
+        .expect_err("quarantine alone cannot fix TEXT timestamp comparisons");
+    assert_eq!(error.message, "postgres moderation ledger: 42883");
+    for _ in 0..2 {
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0112_moderation_legacy_timestamps.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("repeat-safe TEXT upgrade");
+    }
+    let timestamps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = $1 AND table_name IN ('moderation_warnings', 'moderation_scheduled_unbans', 'moderation_audit', 'moderation_idempotency') AND data_type = 'timestamp with time zone'")
+        .bind(&schema).fetch_one(&pool).await.expect("all legacy timestamp types upgraded");
+    assert_eq!(timestamps, 8);
+    for state in ["staged", "pending", "running", "done"] {
+        let request = format!("legacy-{state}");
+        assert_eq!(
+            unban_state(&pool, &request).await,
+            if state == "done" {
+                "done"
+            } else {
+                "quarantined"
+            }
+        );
+        let row = sqlx::query("SELECT reason, claim_token, execute_at = $2::text::timestamptz AND created_at = $2::text::timestamptz AND claimed_at = $2::text::timestamptz AS preserved, completed_at = $3::text::timestamptz AS completed FROM moderation_scheduled_unbans WHERE request_id = $1")
+            .bind(&request).bind(NOW).bind(DUE).fetch_one(&pool).await.expect("timestamp and evidence preservation");
+        assert_eq!(row.get::<String, _>("reason"), "preserved reason");
+        assert_eq!(row.get::<String, _>("claim_token"), "preserved-token");
+        assert!(row.get::<bool, _>("preserved"));
+        assert_eq!(
+            row.get::<Option<bool>, _>("completed"),
+            (state == "done").then_some(true)
+        );
+    }
+    let preserved: bool = sqlx::query_scalar("SELECT (SELECT created_at = $1::text::timestamptz FROM moderation_warnings WHERE id = 'w') AND (SELECT created_at = $1::text::timestamptz FROM moderation_audit WHERE request_id = 'a') AND (SELECT claimed_at = $1::text::timestamptz AND completed_at = $2::text::timestamptz FROM moderation_idempotency WHERE idempotency_key = 'key')")
+        .bind(NOW).bind(DUE).fetch_one(&pool).await.expect("all ledgers retain their timestamps");
+    assert!(preserved);
+    assert!(store
+        .claim_due_unbans("guild", DUE, 25)
+        .await
+        .expect("quarantined imports stay inert")
+        .is_empty());
+    assert_eq!(
+        store
+            .claim("guild", "key", "moderation.warn", "hash", NOW)
+            .await
+            .expect("legacy replay"),
+        ClaimState::Replayed {
+            outcome: "warned".into()
+        }
+    );
+    accepted_unban(&store, "guild", "fresh-user", "fresh", NOW, NOW).await;
+    let jobs = store
+        .claim_due_unbans("guild", DUE, 25)
+        .await
+        .expect("fresh typed schedule works");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].request_id, "fresh");
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_pre_dispatch_rollback_retries_and_completion_loss_keeps_audit() {
+    let (admin, pool, schema) = database().await;
+    let store = PgMemberModerationStore::new(pool.clone(), "100000000000000001");
+    let discord = MockMemberDiscord::new();
+    let svc = MemberModerationService::new(discord.clone(), store, policy(), || 1_700_000_000_000);
+    sqlx::query("ALTER TABLE moderation_scheduled_unbans ADD CONSTRAINT refuse_stage CHECK (request_id <> 'stage-loss')")
+        .execute(&pool).await.expect("scratch stage failure");
+    let request = execution(ModerationAction::TempBan, "stage-loss");
+    assert!(svc.execute(&request).await.is_err());
+    assert_eq!(discord.call_count("ban"), 0);
+    let intents: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM moderation_member_bans WHERE request_id = 'stage-loss'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("stage transaction rolled back");
+    assert_eq!(intents, 0);
+    let claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM moderation_idempotency WHERE idempotency_key = 'stage-loss'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("pre-dispatch claim released");
+    assert_eq!(claims, 0);
+    sqlx::query("ALTER TABLE moderation_scheduled_unbans DROP CONSTRAINT refuse_stage")
+        .execute(&pool)
+        .await
+        .expect("repair scratch stage failure");
+    svc.execute(&request)
+        .await
+        .expect("same-key retry after definite rollback");
+    assert_eq!(discord.call_count("ban"), 1);
+    sqlx::query("ALTER TABLE moderation_idempotency ADD CONSTRAINT refuse_completion CHECK (state <> 'done') NOT VALID")
+        .execute(&pool).await.expect("scratch completion failure");
+    let kick = execution(ModerationAction::Kick, "completion-loss");
+    assert!(svc.execute(&kick).await.is_err());
+    let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM moderation_audit WHERE request_id = 'completion-loss' AND outcome = 'kicked'")
+        .fetch_one(&pool).await.expect("accepted kick audited before failing completion");
+    assert_eq!(audits, 1);
+    assert!(matches!(
+        svc.execute(&kick).await,
+        Err(two_bot_core::member_moderation::MemberError::InFlight)
+    ));
+    assert_eq!(discord.call_count("kick"), 1);
     cleanup(admin, pool, schema).await;
 }
