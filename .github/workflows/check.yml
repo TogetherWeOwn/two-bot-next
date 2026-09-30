@@ -207,3 +207,4 @@ jobs:
         run: |
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
+          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs

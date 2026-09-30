@@ -1,14 +1,18 @@
-# Changelog
+:robot: I have created a release *beep* *boop*
 
-## Unreleased
+## Summary
 
-### Added
+Publish the next synchronized Rust workspace release through release-please.
 
-- Wire RSVP, namespaced RSVP totals and ManageEvents-gated host attendance through the shared interaction router, sqlx stores and REST executor, with ephemeral deferred replies and test-container/mock-Discord acceptance. Publish the shared command registry on READY and keep polling gateway heartbeats during feature I/O without checkpointing ahead of command effects.
+## Changes
 
-### Notes
+Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
 
-- RSVP and host check-in now use the shared S4 router and REST executor; other feature integrations remain follow-up slices. RSVP mutations validate live events with legacy missing/cancelled/error replies, while totals remain readable from persisted rows without Discord event access. Automated scorecard and probe collection are not enabled by this change.
+## Testing
+
+Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
+---
+
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 
@@ -98,3 +102,6 @@
 ### Notes
 
 - Command/component wiring and the Discord REST reads stay on the S4 interaction router and REST executor slices; the outcome enums are the integration surface until they land. Scorecard and probe collection are not enabled by this change.
+
+---
+Refs: TOG-9865
