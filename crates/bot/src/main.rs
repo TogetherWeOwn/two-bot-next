@@ -12,6 +12,9 @@ mod gateway_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 mod server;
+mod sticky_runtime;
+#[cfg(test)]
+mod sticky_runtime_tests;
 
 use std::sync::Arc;
 
@@ -86,12 +89,20 @@ async fn main() {
                     );
                     let saved = gateway::load_boot_session(&store).await?;
                     let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                    // S4 sticky runtime (TOG-10309): shared router + REST
+                    // executor over the same pool. `None` on bad env gates —
+                    // the shard still boots without the sticky surface.
+                    let sticky = sticky_runtime::StickyRuntime::from_env(
+                        db.pool().clone(),
+                        &token,
+                        guild_id,
+                    );
                     let shard = build_shard(token, intents_from_env(), saved.as_ref());
                     info!(
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store).await
+                    run_shard(shard, pipeline, Arc::clone(&state), store, sticky).await
                 }
                 .await;
                 if result.is_err() {

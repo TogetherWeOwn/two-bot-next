@@ -165,6 +165,13 @@ pub enum ChannelCall {
         content: String,
         nonce: Option<String>,
     },
+    /// `DELETE /channels/{c}/messages/{m}` (legacy automation cleanup —
+    /// sticky retirement removes the previous re-post).
+    DeleteMessage {
+        channel_id: String,
+        message_id: String,
+        reason: String,
+    },
 }
 
 /// One observed HTTP exchange: status plus parsed bodies the retry policy
@@ -1028,6 +1035,29 @@ impl ActionExecutor {
         Ok(ids.len() as u64)
     }
 
+    /// Delete one message (legacy `ModerationDiscord` single delete — the
+    /// same request purge's one-id arm makes). Best-effort cleanup callers
+    /// (sticky retirement) treat `Rejected`/`Http` as a miss, not a crash.
+    pub async fn delete_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<(), DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let message: Id<MessageMarker> = snowflake(message_id)?;
+        let reason = audit_reason(reason)?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .delete_message(channel, message)
+                .reason(&reason),
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
+        self.call_once(req, &[200, 204]).await?;
+        Ok(())
+    }
+
     /// Post a message with mention suppression (legacy
     /// `allowed_mentions: { parse: [] }`). Asserts the legacy 2000 UTF-16-unit
     /// ceiling before sending; returns the message id (`""` when Discord
@@ -1155,6 +1185,14 @@ impl ActionExecutor {
                 Ok(ChannelCallOutcome::Posted {
                     message_id: self.send_message(channel_id, content, value).await?,
                 })
+            }
+            ChannelCall::DeleteMessage {
+                channel_id,
+                message_id,
+                reason,
+            } => {
+                self.delete_message(channel_id, message_id, reason).await?;
+                Ok(ChannelCallOutcome::MessageDeleted)
             }
         }
     }
@@ -1332,6 +1370,7 @@ pub enum ChannelCallOutcome {
     OverwriteWritten,
     OverwriteDeleted,
     Posted { message_id: String },
+    MessageDeleted,
 }
 
 /// @everyone overwrite masks (decimal strings, legacy schema).
