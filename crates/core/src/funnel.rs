@@ -225,9 +225,13 @@ pub fn parse_iso_millis(s: &str) -> Option<i64> {
                 idx = Some(i);
             }
         }
-        let i = idx?;
-        let (core, zone) = rest.split_at(i);
-        (core, parse_zone(zone)?)
+        match idx {
+            Some(i) => {
+                let (core, zone) = rest.split_at(i);
+                (core, parse_zone(zone)?)
+            }
+            None => return None,
+        }
     };
     let (h, mi, sec, millis) = parse_time(time_part)?;
     let days = days_from_civil(y, mo, d)?;
