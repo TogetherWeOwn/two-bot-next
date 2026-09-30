@@ -24,7 +24,7 @@ fn command(listen_addr: &str) -> Command {
         .env_clear()
         .env("LISTEN_ADDR", listen_addr)
         .env("GUILD_ID", "not-a-snowflake")
-        .env("DISCORD_TOKEN", "synthetic-token-must-not-connect")
+        .env("DISCORD_TOKEN", "INVALID")
         .env("DATABASE_URL", "synthetic-database-must-not-connect")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
