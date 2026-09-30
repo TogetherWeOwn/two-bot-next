@@ -1266,6 +1266,72 @@ impl ActionExecutor {
         }
     }
 
+    /// Read the complete guild registry, including localization dictionaries.
+    /// A failed/malformed read is never interpreted as an empty registry.
+    pub async fn guild_commands(
+        &self,
+        application_id: u64,
+        guild_id: u64,
+    ) -> Result<Vec<twilight_model::application::command::Command>, DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".into()))?;
+        let guild = Id::<GuildMarker>::new_checked(guild_id)
+            .ok_or_else(|| DiscordError::Rejected("bad guild id".into()))?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .interaction(application)
+                .guild_commands(guild)
+                .with_localizations(true),
+        )?;
+        for attempt in 0..MAX_HTTP_TRIES {
+            self.pace(false).await;
+            let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
+                .await
+                .map_err(|_| DiscordError::Timeout)?
+                .map_err(DiscordError::Unavailable)?;
+            match res.status {
+                200..=299 => {
+                    return serde_json::from_slice(&res.body).map_err(|_| {
+                        DiscordError::Unavailable("invalid guild command response".into())
+                    })
+                }
+                429 if attempt < MAX_HTTP_TRIES - 1 => {
+                    tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                }
+                429 => return Err(DiscordError::RateLimited),
+                500..=599 if attempt < MAX_HTTP_TRIES - 1 => {
+                    tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                }
+                other => return Err(throw_for_status(&res).into_other(other)),
+            }
+        }
+        Err(DiscordError::Unavailable(
+            "guild command read exhausted".into(),
+        ))
+    }
+
+    /// Shared dry-run/boot workflow. Fetch-and-hash on every invocation detects
+    /// out-of-band changes and survives restarts without a stale DB hash cache.
+    /// Returns the pre-write diff and whether a full bulk overwrite was sent.
+    pub async fn sync_guild_commands(
+        &self,
+        application_id: u64,
+        guild_id: u64,
+        commands: &[twilight_model::application::command::Command],
+        apply: bool,
+    ) -> Result<(crate::command_registry::RegistryDiff, bool), DiscordError> {
+        let current = self.guild_commands(application_id, guild_id).await?;
+        let diff = crate::command_registry::diff_commands(&current, commands)
+            .map_err(|_| DiscordError::Rejected("cannot canonicalize command registry".into()))?;
+        let publish = apply && diff.current_hash != diff.compiled_hash;
+        if publish {
+            self.publish_guild_commands(application_id, guild_id, commands)
+                .await?;
+        }
+        Ok((diff, publish))
+    }
+
     /// Publish the router's full guild command set in one send
     /// (`PUT /applications/{app}/guilds/{guild}/commands`).
     pub async fn publish_guild_commands(

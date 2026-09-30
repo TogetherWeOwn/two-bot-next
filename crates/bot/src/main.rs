@@ -6,6 +6,7 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod backup_cli;
+mod commands_cli;
 mod gateway;
 #[cfg(test)]
 mod gateway_tests;
@@ -41,6 +42,9 @@ async fn main() {
     // No subcommand falls through to the gateway path below. sqlx is linked
     // (core `db` feature) so these paths can open Postgres directly.
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_args.first().is_some_and(|arg| arg == "commands") {
+        std::process::exit(commands_cli::dispatch(&cli_args[1..]).await);
+    }
     if !cli_args.is_empty() && cli_args[0] != "--help" && cli_args[0] != "-h" {
         let code = backup_cli::dispatch(&cli_args).await;
         // 100 = not a backup subcommand: fall through to serve.
@@ -100,6 +104,9 @@ async fn main() {
             let state = Arc::clone(&state);
             Some(tokio::spawn(async move {
                 let result: Result<(), sqlx::Error> = async {
+                    commands_cli::publish_on_boot(&token, guild_id)
+                        .await
+                        .map_err(sqlx::Error::Protocol)?;
                     let db =
                         two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
                             .await?;
@@ -163,8 +170,9 @@ async fn main() {
     }
 }
 
-/// `--help` covers both the gateway server and the backup CLI.
+/// `--help` covers the gateway server and both operator CLI surfaces.
 async fn print_backup_help_and_exit() -> ! {
+    print!("{}", commands_cli::USAGE);
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
 }
