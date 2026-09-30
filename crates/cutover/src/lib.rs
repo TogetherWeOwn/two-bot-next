@@ -30,6 +30,7 @@ pub mod message_scan;
 pub mod parse;
 pub mod rest;
 pub mod settings;
+pub mod voice_rooms;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
 pub use db::{

@@ -666,6 +666,25 @@ struct QueueInner {
     failed: Vec<FailedAction>,
 }
 
+impl QueueInner {
+    fn requeue(&mut self, mut action: QueuedAction) {
+        let lanes = match action.action.lane() {
+            Lane::Urgent => &mut self.urgent,
+            Lane::Deferred => &mut self.deferred,
+        };
+        let queue = lanes.entry(action.guild_id).or_default();
+        if let RoomAction::RenameRoom { channel_id, .. } = &action.action {
+            if let Some(index) = queue
+                .iter()
+                .position(|q| q.action.channel_id() == Some(*channel_id))
+            {
+                action.action = queue.remove(index).expect("pending rename").action;
+            }
+        }
+        queue.push_front(action);
+    }
+}
+
 /// Per-guild ordered action queue with 429 retry-after (spec "Discord API
 /// notes": per-guild ordered queues, honour retry-after on 429).
 ///
@@ -774,9 +793,10 @@ impl ActionQueue {
         true
     }
 
-    /// The executor hit a 429: hold the whole guild for `retry_after_ms`
-    /// and requeue the action at the front of its lane. Rate limits do not
-    /// consume the transient-failure budget.
+    /// Retry a route-scoped 429. Lifecycle writes hold the guild; a rename
+    /// holds only its deferred lane so it cannot delay creates/deletes.
+    /// Global rate limits must additionally be honoured by the HTTP adapter.
+    /// Rate limits do not consume the transient-failure budget.
     pub fn mark_rate_limited(
         &self,
         guild_id: Snowflake,
@@ -788,14 +808,14 @@ impl ActionQueue {
         if guild_id != action.guild_id || !Self::release(&mut inner, &action) {
             return false;
         }
-        inner
-            .guild_not_before_ms
-            .insert(guild_id, now_ms.saturating_add(retry_after_ms));
-        let lane = match action.action.lane() {
-            Lane::Urgent => &mut inner.urgent,
-            Lane::Deferred => &mut inner.deferred,
-        };
-        lane.entry(guild_id).or_default().push_front(action);
+        let not_before_ms = now_ms.saturating_add(retry_after_ms);
+        if action.action.lane() == Lane::Urgent {
+            inner.guild_not_before_ms.insert(guild_id, not_before_ms);
+        }
+        inner.requeue(QueuedAction {
+            not_before_ms,
+            ..action
+        });
         true
     }
 
@@ -815,17 +835,11 @@ impl ActionQueue {
             });
             return true;
         }
-        let lane = match action.action.lane() {
-            Lane::Urgent => &mut inner.urgent,
-            Lane::Deferred => &mut inner.deferred,
-        };
-        lane.entry(action.guild_id)
-            .or_default()
-            .push_front(QueuedAction {
-                attempts,
-                not_before_ms: now_ms.saturating_add(fail_backoff_ms(attempts)),
-                ..action
-            });
+        inner.requeue(QueuedAction {
+            attempts,
+            not_before_ms: now_ms.saturating_add(fail_backoff_ms(attempts)),
+            ..action
+        });
         true
     }
 
@@ -1427,6 +1441,41 @@ mod tests {
         assert_eq!(delete.action, RoomAction::DeleteRoom { channel_id: 501 });
         q.mark_succeeded(&delete);
         assert_eq!(q.pop_due(GUILD, 1), None);
+    }
+
+    #[test]
+    fn rate_limited_in_flight_rename_keeps_latest_name_and_allows_deletion() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "Old".to_owned(),
+            },
+        );
+        let old = q.pop_due(GUILD, 0).expect("old rename");
+        q.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "Latest".to_owned(),
+            },
+        );
+        q.mark_rate_limited(GUILD, 600_000, 0, old);
+        assert_eq!(q.pending_counts(GUILD), (0, 1));
+        q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        let delete = q.pop_due(GUILD, 1).expect("rename cannot delay delete");
+        assert_eq!(delete.action, RoomAction::DeleteRoom { channel_id: 501 });
+        q.mark_succeeded(&delete);
+        assert_eq!(q.pop_due(GUILD, 599_999), None);
+        let retry = q.pop_due(GUILD, 600_000).expect("rename retry");
+        assert_eq!(
+            retry.action,
+            RoomAction::RenameRoom {
+                channel_id: 500,
+                name: "Latest".to_owned()
+            }
+        );
     }
 
     #[test]
