@@ -18,6 +18,7 @@ pub mod backfill_plan;
 pub mod cli;
 pub mod db;
 pub mod dedupe;
+pub mod gateway_session;
 pub mod invite;
 pub mod mee6_names;
 pub mod mee6_rewards;
@@ -25,6 +26,7 @@ pub mod mee6_xp;
 pub mod message_scan;
 pub mod parse;
 pub mod rest;
+pub mod settings;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
 pub use db::{
@@ -59,6 +61,7 @@ pub use parse::{
     MemberLogRecord, MessageView, VoiceKind, VoiceRecord,
 };
 pub use rest::{iso_to_millis, timestamp_ms, RestClient, RestError, ScanPage};
+pub use settings::{log_refresh_report, SettingsStore, SettingsWriteError};
 
 /// Live TWO guild: every CLI refuses it without `--allow-live-guild`
 /// (legacy `LIVE_GUILD_ID` in `src/staging/spec.ts`).

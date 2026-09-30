@@ -1,0 +1,171 @@
+name: release
+
+# release-please (TOG-9865, TOG-10035): one root rust release strategy,
+# synchronized workspace versions, Common Changelog and flat vX.Y.Z tags.
+# Stay 0.x until production cutover. No App keys or PATs in Actions.
+# GITHUB_TOKEN-created PRs need explicit required-check workflow dispatch.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: release-please
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      pr_available: ${{ steps.select.outputs.pr_available }}
+      pr: ${{ steps.select.outputs.pr }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Inspect existing release PR
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/release-pr-state.cjs plan
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          # Keep publication enabled. Only skip PR regeneration when its branch
+          # already includes this main snapshot, including our migrated notes.
+          skip-github-pull-request: ${{ steps.plan.outputs.reuse_pr == 'true' }}
+
+      # Query independently of prs_created: a failed migration can leave an
+      # unchanged native PR, so action outputs alone cannot drive recovery.
+      - name: Select open release PR
+        id: select
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/release-pr-state.cjs select
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.select.outputs.pr_available == 'true'
+        with:
+          ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
+      - name: Preserve bootstrap release notes
+        if: steps.select.outputs.pr_available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ fromJSON(steps.select.outputs.pr).number }}
+          HEAD_BRANCH: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
+        run: |
+          set -euo pipefail
+          BODY_FILE="$RUNNER_TEMP/release-pr-body.md"
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          NOTES_BRANCH="$HEAD_BRANCH--release-notes"
+          gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq .body > "$BODY_FILE"
+          cp "$BODY_FILE" "$BODY_FILE.before"
+          # Native overflow stores oversized full notes in release-notes.md on
+          # a derived notes branch (`$HEAD_BRANCH--release-notes`) and leaves
+          # only a single-line link in the visible PR body (see native
+          # FilePullRequestOverflowHandler). Reconcile the stored notes (the
+          # Release-notes source of truth) only when the visible body IS that
+          # link: a stale notes branch alongside a normal body is left alone,
+          # and a dangling link fails closed here before any push or dispatch.
+          NOTES_ARG=()
+          if node -e "process.exit(require('./scripts/migrate-release-notes.cjs').parseOverflowLink(require('node:fs').readFileSync(process.argv[1], 'utf8')) ? 0 : 1)" "$BODY_FILE"; then
+            # Documented Contents boundary (docs.github.com/rest/repos/contents):
+            # object bodies above 1 MiB arrive as content "" / encoding "none",
+            # so a --jq .content read silently resolves empty notes at that
+            # size. Read the authenticated raw representation instead, which
+            # carries the bytes at any size; an empty body fails closed before
+            # any push, PUT or dispatch.
+            gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" -H "Accept: application/vnd.github.raw" > "$NOTES_FILE"
+            python3 -c 'import pathlib, sys; assert pathlib.Path(sys.argv[1]).read_text().strip(), "Missing stored release notes"' "$NOTES_FILE"
+            cp "$NOTES_FILE" "$NOTES_FILE.before"
+            NOTES_ARG=("$NOTES_FILE")
+          fi
+          node scripts/migrate-release-notes.cjs CHANGELOG.md "$BODY_FILE" "${NOTES_ARG[@]}"
+          if ! git diff --quiet -- CHANGELOG.md; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add CHANGELOG.md
+            git commit -m 'chore(release): preserve bootstrap release notes' -m 'Co-Authored-By: Paperclip <noreply@paperclip.ing>'
+            git push origin HEAD
+          fi
+          # Body reconciliation is independent of the file diff: a retry after
+          # a successful push but failed PATCH must still repair Release notes.
+          if [ "${#NOTES_ARG[@]}" -gt 0 ]; then
+            # Overflow: restore the native stored-body representation through
+            # its own branch so the link keeps resolving; the PR body link is
+            # native-owned and never PATCHed.
+            if ! cmp -s "$NOTES_FILE.before" "$NOTES_FILE"; then
+              # The Contents API reads the branch from the JSON payload: with
+              # --input, gh puts -f field flags into the URL query instead, so
+              # the branch MUST be part of the payload (gh api --help).
+              NOTES_BRANCH="$NOTES_BRANCH" python3 -c 'import base64, json, os, pathlib, sys; print(json.dumps({"message": "chore(release): preserve bootstrap release notes", "content": base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode(), "branch": os.environ["NOTES_BRANCH"]}))' "$NOTES_FILE" > "$NOTES_FILE.json"
+              NOTES_SHA=$(gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" --jq .sha)
+              python3 -c 'import json, pathlib, sys; payload = json.loads(pathlib.Path(sys.argv[1]).read_text()); payload["sha"] = sys.argv[2]; pathlib.Path(sys.argv[1]).write_text(json.dumps(payload))' "$NOTES_FILE.json" "$NOTES_SHA"
+              gh api --method PUT "repos/$GH_REPO/contents/release-notes.md" --input "$NOTES_FILE.json" --silent
+            fi
+          elif ! cmp -s "$BODY_FILE.before" "$BODY_FILE"; then
+            # Migration can grow a large normal body past the native PR-body
+            # limit; GitHub would reject that PATCH, and retries would repeat
+            # the same request indefinitely. Route the reconciled output through
+            # the same overflow representation native uses: full notes in
+            # release-notes.md on the derived notes branch, visible body as the
+            # single-line link (which the next run resolves like a native
+            # overflow).
+            if [ "$(node -e "process.stdout.write(require('./scripts/migrate-release-notes.cjs').selectBodyWrite(require('node:fs').readFileSync(process.argv[1], 'utf8')))" "$BODY_FILE")" = "overflow" ]; then
+              # Migration-created overflow: native emitted a normal body, so the
+              # derived notes branch does not exist yet and the Contents API
+              # cannot create a file on a missing ref. Mirror native forkBranch
+              # (createFileOnNewBranch): create the notes branch from the
+              # default branch, reusing it when a retried run already created
+              # it. Either step failing fails the run here, before any PUT or
+              # check dispatch.
+              BASE_SHA=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+              if ! gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/heads/$NOTES_BRANCH" -f sha="$BASE_SHA" --silent 2>/dev/null; then
+                gh api "repos/$GH_REPO/git/ref/heads/$NOTES_BRANCH" --jq .object.sha > /dev/null
+              fi
+              # The file may not exist yet, so the sha lookup tolerates
+              # a missing file and the payload carries a sha only on update.
+              NOTES_SHA=$(gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" --jq .sha 2>/dev/null || true)
+              NOTES_BRANCH="$NOTES_BRANCH" NOTES_SHA="$NOTES_SHA" python3 -c 'import base64, json, os, pathlib, sys; payload = {"message": "chore(release): preserve bootstrap release notes", "content": base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode(), "branch": os.environ["NOTES_BRANCH"]}; sha = os.environ["NOTES_SHA"]; print(json.dumps({**payload, **({"sha": sha} if sha else {})}))' "$BODY_FILE" > "$NOTES_FILE.json"
+              gh api --method PUT "repos/$GH_REPO/contents/release-notes.md" --input "$NOTES_FILE.json" --silent
+              NOTES_BRANCH="$NOTES_BRANCH" node -e "require('node:fs').writeFileSync(process.argv[1], require('./scripts/migrate-release-notes.cjs').buildOverflowBody(process.env.GH_REPO, process.env.NOTES_BRANCH) + '\n')" "$BODY_FILE"
+            fi
+            python3 -c 'import json, pathlib, sys; print(json.dumps({"body": pathlib.Path(sys.argv[1]).read_text()}))' "$BODY_FILE" > "$BODY_FILE.json"
+            gh api --method PATCH "repos/$GH_REPO/pulls/$PR_NUMBER" --input "$BODY_FILE.json" --silent
+          fi
+
+  dispatch-checks:
+    name: dispatch-checks
+    needs: release-please
+    if: needs.release-please.outputs.pr_available == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job: gh needs the repo named explicitly.
+          GH_REPO: ${{ github.repository }}
+          PR_JSON: ${{ needs.release-please.outputs.pr }}
+        run: |
+          set -euo pipefail
+          read -r PR_NUMBER HEAD_BRANCH < <(python3 -c "
+          import json, os
+          pr = json.loads(os.environ['PR_JSON'])
+          print(pr['number'], pr['headBranchName'])
+          ")
+          echo "Release PR #$PR_NUMBER on branch $HEAD_BRANCH; dispatching required checks."
+          gh workflow run check.yml --ref "$HEAD_BRANCH"
+          gh workflow run secret-scan.yml --ref "$HEAD_BRANCH"
+          gh workflow run pr-lint.yml --ref "$HEAD_BRANCH" -f pr_number="$PR_NUMBER"

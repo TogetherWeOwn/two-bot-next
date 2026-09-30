@@ -738,6 +738,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1186,6 +1187,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -2159,9 +2172,13 @@ name = "two-bot"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "rustls",
+ "serde",
  "serde_json",
+ "sqlx",
  "tokio",
+ "tokio-websockets",
  "tower",
  "tower-http",
  "tracing",
@@ -2169,6 +2186,7 @@ dependencies = [
  "twilight-cache-inmemory",
  "twilight-gateway",
  "two-bot-core",
+ "two-bot-cutover",
  "two-bot-discord",
 ]
 
@@ -2176,12 +2194,31 @@ dependencies = [
 name = "two-bot-core"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64",
+ "bytes",
+ "flate2",
+ "futures-util",
+ "hex",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rand",
+ "regex",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
+ "subtle",
  "thiserror",
+ "time",
  "tokio",
  "tracing",
+ "unicode-normalization",
+ "url",
 ]
 
 [[package]]
@@ -2196,6 +2233,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "twilight-http",
  "twilight-model",
  "two-bot-core",
@@ -2205,10 +2243,17 @@ dependencies = [
 name = "two-bot-discord"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "rustls",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-websockets",
  "tracing",
@@ -2218,6 +2263,10 @@ dependencies = [
  "twilight-model",
  "two-bot-core",
 ]
+
+[[package]]
+name = "two-bot-next"
+version = "0.1.0"
 
 [[package]]
 name = "typenum"
