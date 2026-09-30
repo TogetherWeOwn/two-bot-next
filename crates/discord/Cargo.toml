@@ -39,6 +39,7 @@ twilight-model = { workspace = true }
 # S2 prototype only: mock Discord double + measurement driver live in
 # tests/s2_prototype.rs. Nothing here ships in the release binary.
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 futures-util = { workspace = true, features = ["sink"] }
 rustls = { workspace = true }
 serde_json = { workspace = true }

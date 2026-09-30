@@ -13,7 +13,8 @@
 //! - **Moderation lane** (ban/unban/timeout/member-kick): one attempt, 5 s
 //!   abort, no auto-retry (legacy `ModerationDiscord` `timeoutMs ?? 5000`).
 //!   Failures map to [`DiscordError`] so the idempotency claim decides the
-//!   retry posture: only [`DiscordError::Rejected`] is safe pre-mutation.
+//!   retry posture: [`DiscordError::Rejected`] and local guard refusals are
+//!   safe pre-mutation.
 //!
 //! Transport notes (verified against twilight-http 0.17.1 sources):
 //! - `ResponseFuture` re-sends 429 internally when a ratelimiter is
@@ -35,6 +36,7 @@
 //!   ping `@everyone`), via client-level
 //!   `default_allowed_mentions(AllowedMentions { parse: vec![], .. })`.
 
+use crate::ratelimit_guard::{process_guard, GuardError, RateLimitGuard};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,7 +76,7 @@ pub const MAX_MESSAGE_CHARS: usize = 2000;
 pub enum DiscordError {
     /// Discord refused the request (non-429 4xx): provably no mutation
     /// happened, so the claim is safe to release (legacy `discord_rejected`).
-    /// This is the ONLY retry-safe failure.
+    /// Local guard refusals are also safe: they never reached the wire.
     #[error("discord refused the request: {0}")]
     Rejected(String),
     /// Discord did not answer in time (legacy `upstream_timeout`): the
@@ -88,6 +90,9 @@ pub enum DiscordError {
     /// Rate limited (legacy `rate_limited`): uncertain, paced per §6.
     #[error("discord rate-limited this request")]
     RateLimited,
+    /// Refused locally before any wire attempt; safe to release a claim.
+    #[error(transparent)]
+    Guard(#[from] GuardError),
 }
 
 impl DiscordError {
@@ -95,7 +100,7 @@ impl DiscordError {
     /// `isSafePreMutationFailure`).
     #[must_use]
     pub fn is_safe_pre_mutation(&self) -> bool {
-        matches!(self, Self::Rejected(_))
+        matches!(self, Self::Rejected(_) | Self::Guard(_))
     }
 }
 
@@ -225,6 +230,7 @@ pub struct HyperTransport {
     scheme_http: bool,
     host: String,
     token: String,
+    guard: Arc<RateLimitGuard>,
 }
 
 impl HyperTransport {
@@ -284,6 +290,7 @@ impl HyperTransport {
             scheme_http,
             host,
             token,
+            guard: process_guard(),
         })
     }
 
@@ -350,6 +357,12 @@ impl HyperTransport {
             .await
             .map_err(|e| format!("transport: {e}"))?;
         let status = response.status().as_u16();
+        let mut accounting = crate::ratelimit_guard::ResponseAccounting::new(
+            &self.guard,
+            status,
+            response.headers(),
+            !is_interaction_callback(request),
+        );
         let retry_after_header = response
             .headers()
             .get("retry-after")
@@ -360,12 +373,18 @@ impl HyperTransport {
             .collect()
             .await
             .map_err(|e| format!("read body: {e}"))?;
-        Ok(RawResponse {
+        let response = RawResponse {
             status,
             retry_after_header,
             body: collected.to_bytes().to_vec(),
-        })
+        };
+        accounting.finish(&response);
+        Ok(response)
     }
+}
+
+fn is_interaction_callback(request: &Request) -> bool {
+    request.path().starts_with("interactions/") && request.path().ends_with("/callback")
 }
 
 /// The S4 REST executor: paced lane + moderation lane over one transport.
@@ -398,7 +417,18 @@ impl ActionExecutor {
     /// Build with an optional API-host override (legacy `DISCORD_API_BASE`;
     /// tests point this at the mock double).
     pub fn with_proxy(token: String, proxy_url: Option<String>) -> Result<Self, String> {
-        let transport = HyperTransport::with_proxy(token.clone(), proxy_url.clone())?;
+        Self::with_proxy_and_guard(token, proxy_url, process_guard())
+    }
+
+    /// Explicit shared guard injection for isolated mock tests or embedding.
+    /// Production callers must reuse one guard for every executor in a process.
+    pub fn with_proxy_and_guard(
+        token: String,
+        proxy_url: Option<String>,
+        guard: Arc<RateLimitGuard>,
+    ) -> Result<Self, String> {
+        let mut transport = HyperTransport::with_proxy(token.clone(), proxy_url.clone())?;
+        transport.guard = guard;
         let mut builder = TwilightClient::builder()
             .token(token)
             .ratelimiter(None)
@@ -467,9 +497,18 @@ impl ActionExecutor {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    async fn send(&self, request: &Request) -> Result<RawResponse, String> {
+    async fn send(&self, request: &Request) -> Result<RawResponse, DiscordError> {
+        self.inner
+            .transport
+            .guard
+            .admit(is_interaction_callback(request))
+            .await?;
         self.count();
-        self.inner.transport.send_request(request).await
+        self.inner
+            .transport
+            .send_request(request)
+            .await
+            .map_err(DiscordError::Unavailable)
     }
 
     /// Build a twilight [`Request`] from a builder without sending (keeps
@@ -509,8 +548,7 @@ impl ActionExecutor {
     ) -> Result<RawResponse, DiscordError> {
         let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&request))
             .await
-            .map_err(|_| DiscordError::Timeout)?
-            .map_err(DiscordError::Unavailable)?;
+            .map_err(|_| DiscordError::Timeout)??;
         if accepted.contains(&res.status) {
             return Ok(res);
         }
@@ -663,6 +701,14 @@ impl ActionExecutor {
             };
             let res = match self.send(&request).await {
                 Ok(r) => r,
+                Err(DiscordError::Guard(error)) => {
+                    return KickResult {
+                        outcome: KickOutcome::Failed,
+                        status: None,
+                        detail: error.to_string(),
+                        attempts,
+                    };
+                }
                 Err(detail) => {
                     if attempts > MAX_HTTP_TRIES - 1 {
                         return KickResult {
@@ -774,9 +820,10 @@ impl ActionExecutor {
             let request = Request::from_route(&route);
             let res = match self.send(&request).await {
                 Ok(r) => r,
+                Err(DiscordError::Guard(error)) => return Err(error.to_string()),
                 Err(detail) => {
                     if attempt >= MAX_HTTP_TRIES - 1 {
-                        return Err(detail);
+                        return Err(detail.to_string());
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
                     attempt += 1;
@@ -1187,8 +1234,7 @@ impl ActionExecutor {
             self.pace(false).await;
             let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
                 .await
-                .map_err(|_| DiscordError::Timeout)?
-                .map_err(DiscordError::Unavailable)?;
+                .map_err(|_| DiscordError::Timeout)??;
             match res.status {
                 200..=299 => return Ok(()),
                 429 => {
@@ -1230,8 +1276,7 @@ impl ActionExecutor {
         // request_of maps pre-send build failures to Rejected (finding 7).
         let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
             .await
-            .map_err(|_| DiscordError::Timeout)?
-            .map_err(DiscordError::Unavailable)?;
+            .map_err(|_| DiscordError::Timeout)??;
         match res.status {
             200..=299 => Ok(()),
             _ => Err(throw_for_status(&res)),

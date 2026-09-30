@@ -10,6 +10,7 @@ pub mod executor;
 pub mod intents;
 pub mod interactions;
 pub mod pipeline;
+pub mod ratelimit_guard;
 
 pub use adapter::event_to_core;
 pub use executor::{

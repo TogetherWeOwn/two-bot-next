@@ -20,10 +20,18 @@ pub type SharedState = Arc<RwLock<GatewayState>>;
 
 /// Build the router (split out for tests: no socket needed).
 pub fn router(state: SharedState) -> Router {
+    router_with_guard(state, two_bot_discord::ratelimit_guard::process_guard())
+}
+
+fn router_with_guard(
+    state: SharedState,
+    guard: Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/readyz", get(readyz))
         .with_state(state)
+        .layer(axum::Extension(guard))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -33,11 +41,20 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn readyz(
     axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::Extension(guard): axum::Extension<Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>>,
 ) -> (StatusCode, Json<HealthReport>) {
     let gateway = *state.read().await;
     let report = HealthReport::new(vec![
         ("process".to_owned(), ComponentStatus::Ready),
         ("gateway".to_owned(), gateway.status()),
+        (
+            "token_invalid".to_owned(),
+            if guard.snapshot().token_invalid {
+                ComponentStatus::Down
+            } else {
+                ComponentStatus::Ready
+            },
+        ),
     ]);
     let code = if report.ready() {
         StatusCode::OK
@@ -79,6 +96,44 @@ mod tests {
 
     fn state(s: GatewayState) -> SharedState {
         Arc::new(RwLock::new(s))
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_fatal_bot_token_while_health_stays_live() {
+        let guard = Arc::new(
+            two_bot_discord::ratelimit_guard::RateLimitGuard::new(Default::default()).unwrap(),
+        );
+        guard.observe_status(401, true);
+        let app = router_with_guard(state(GatewayState::Connected), guard);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["components"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(["token_invalid", "down"])));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
