@@ -915,7 +915,10 @@ where
                         &execute_at,
                         &format!("Temporary ban expired: {}", validated.reason)
                             .chars()
-                            .take(512)
+                            .scan(0, |units, ch| {
+                                *units += ch.len_utf16();
+                                (*units <= 512).then_some(ch)
+                            })
                             .collect::<String>(),
                         &exec.request_id,
                         &format_iso_millis((self.now)()),

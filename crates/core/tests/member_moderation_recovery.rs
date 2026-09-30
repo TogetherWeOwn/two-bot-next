@@ -89,7 +89,7 @@ async fn generated_expiry_reason_is_bounded_and_unicode_safe() {
         svc.execute(&req).await.expect("valid max reason");
         let jobs = store.claim_due_unbans(GUILD, DUE, 1).await.expect("expiry");
         assert_eq!(jobs.len(), 1);
-        assert!(jobs[0].reason.chars().count() <= 512);
+        assert!(jobs[0].reason.encode_utf16().count() <= 512);
         assert!(jobs[0].reason.starts_with("Temporary ban expired: "));
         assert!(jobs[0].reason.ends_with(text));
     }
