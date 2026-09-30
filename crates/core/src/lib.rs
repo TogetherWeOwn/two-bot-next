@@ -5,12 +5,15 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod audit;
+pub mod classify;
 pub mod commands;
 pub mod config;
 pub mod events;
 pub mod feature_commands;
 pub mod health;
 pub mod leveling;
+pub mod mac;
 pub mod moderation;
 
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
