@@ -290,7 +290,9 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             checkpoint_io(state, deadline, async {
-                pipeline.handle(&event).await.map_err(|_| {
+                pipeline.handle(&event).await.map_err(|error| {
+                    // Runtime Display is sanitized; never log its SQL/HTTP source.
+                    tracing::warn!(error = %error, "gateway leveling dispatch failed");
                     sqlx::Error::InvalidArgument(
                         "leveling gateway dispatch failed; checkpoint unchanged".into(),
                     )

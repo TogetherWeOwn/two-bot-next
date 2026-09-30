@@ -18,8 +18,7 @@ use twilight_model::{
 };
 use two_bot_core::{
     leveling::{
-        leaderboard_reply, level_role_writes_allowed, plan_reward_roles, rank_reply, XpAward,
-        LEADERBOARD_DEFAULT_LIMIT,
+        leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
     FunnelHandlers, FunnelStore, HandlerId, InteractionHandler, InteractionRouter, LevelOutcome,
@@ -120,7 +119,7 @@ pub struct LevelingRuntime {
     pool: PgPool,
     executor: Arc<ActionExecutor>,
     router: InteractionRouter,
-    session_mode: bool,
+    onboarding: two_bot_core::OnboardingGates,
 }
 
 impl LevelingRuntime {
@@ -128,7 +127,7 @@ impl LevelingRuntime {
         pool: PgPool,
         executor: Arc<ActionExecutor>,
         mut router: InteractionRouter,
-        session_mode: bool,
+        onboarding: two_bot_core::OnboardingGates,
     ) -> Self {
         router.register(Box::new(LevelingHandler(HandlerId::Rank)));
         router.register(Box::new(LevelingHandler(HandlerId::Leaderboard)));
@@ -136,7 +135,7 @@ impl LevelingRuntime {
             pool,
             executor,
             router,
-            session_mode,
+            onboarding,
         }
     }
 
@@ -170,7 +169,10 @@ impl LevelingRuntime {
                 .await?
             }
         };
-        if result.leveled_up && level_role_writes_allowed(self.session_mode) {
+        if result.leveled_up
+            && !self.onboarding.dry_run
+            && two_bot_core::onboarding::level_role_writes_allowed(self.onboarding.mode)
+        {
             let rewards = leveling_store::role_rewards(&self.pool, &guild).await?;
             if !rewards.is_empty() {
                 let held = self

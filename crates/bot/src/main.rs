@@ -92,8 +92,9 @@ async fn main() {
                             )
                         })?,
                     );
-                    let session_mode =
-                        std::env::var("TWO_ONBOARDING_MODE").as_deref() == Ok("session");
+                    let onboarding = two_bot_core::OnboardingGates::from_env().map_err(|_| {
+                        sqlx::Error::InvalidArgument("invalid onboarding mode".into())
+                    })?;
                     let router = two_bot_core::InteractionRouter::new(two_bot_core::RouterGates {
                         configured_guild: Some(guild_id),
                         scorecard: false,
@@ -103,13 +104,13 @@ async fn main() {
                         tickets: false,
                         self_roles: false,
                         onboarding_picker: false,
-                        session_picker: session_mode,
+                        session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                     });
                     let runtime = two_bot_discord::LevelingRuntime::new(
                         db.pool().clone(),
                         executor,
                         router,
-                        session_mode,
+                        onboarding,
                     );
                     let pipeline =
                         Arc::new(build_pipeline(store.milestones().await?, Some(runtime)));
