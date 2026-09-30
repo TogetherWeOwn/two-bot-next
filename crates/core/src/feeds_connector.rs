@@ -381,8 +381,34 @@ fn normalized_host(host: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Owning iterator over one request's pinned addresses. Handing out the `Arc`
+/// bumps a refcount instead of copying the address list for every dial
+/// attempt, and the iterator stays `Send` so hyper can move it across threads.
+#[derive(Debug)]
+struct PinnedAddrs {
+    addrs: Arc<[SocketAddr]>,
+    next: usize,
+}
+
+impl Iterator for PinnedAddrs {
+    type Item = SocketAddr;
+
+    fn next(&mut self) -> Option<SocketAddr> {
+        let addr = self.addrs.get(self.next).copied()?;
+        self.next += 1;
+        Some(addr)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.addrs.len().saturating_sub(self.next);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for PinnedAddrs {}
+
 impl Service<Name> for PinnedResolver {
-    type Response = std::vec::IntoIter<SocketAddr>;
+    type Response = PinnedAddrs;
     type Error = io::Error;
     type Future = std::future::Ready<Result<Self::Response, io::Error>>;
 
@@ -392,7 +418,10 @@ impl Service<Name> for PinnedResolver {
 
     fn call(&mut self, name: Name) -> Self::Future {
         if normalized_host(name.as_str()) == self.host {
-            std::future::ready(Ok(self.addrs.to_vec().into_iter()))
+            std::future::ready(Ok(PinnedAddrs {
+                addrs: Arc::clone(&self.addrs),
+                next: 0,
+            }))
         } else {
             // The dialer must never resolve a name the request did not pin;
             // refusal fails the connection before any socket opens.
@@ -423,35 +452,32 @@ impl PinnedHttpsConnector {
 }
 
 impl FeedConnector for PinnedHttpsConnector {
-    fn get<'a>(
+    async fn get<'a>(
         &'a self,
         request: &'a PublicRequest,
-    ) -> impl Future<Output = Result<FeedResponse, FeedConnectError>> + Send + 'a {
-        async move {
-            // The resolver answers only this request's pinned addresses, so
-            // happy-eyeballs races and retries can only ever touch them.
-            let mut http = HttpConnector::new_with_resolver(PinnedResolver::new(request));
-            // The Uri still carries `https`; without this the connector
-            // refuses the scheme before dialling.
-            http.enforce_http(false);
-            http.set_nodelay(true);
-            let https = HttpsConnectorBuilder::new()
-                .with_webpki_roots()
-                .https_only()
-                .enable_http1()
-                .wrap_connector(http);
-            // A fresh Client per request: the pool is empty at build and
-            // dropped at drop, so no connection survives across requests or
-            // across differently-pinned hosts.
-            let client: Client<_, Empty<Bytes>> =
-                Client::builder(TokioExecutor::new()).build(https);
-            let req = Self::build_request(request.url())?;
-            let res = client
-                .request(req)
-                .await
-                .map_err(|err| FeedConnectError::Transport(err.to_string()))?;
-            Ok(FeedResponse::from_hyper(res))
-        }
+    ) -> Result<FeedResponse, FeedConnectError> {
+        // The resolver answers only this request's pinned addresses, so
+        // happy-eyeballs races and retries can only ever touch them.
+        let mut http = HttpConnector::new_with_resolver(PinnedResolver::new(request));
+        // The Uri still carries `https`; without this the connector
+        // refuses the scheme before dialling.
+        http.enforce_http(false);
+        http.set_nodelay(true);
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_only()
+            .enable_http1()
+            .wrap_connector(http);
+        // A fresh Client per request: the pool is empty at build and
+        // dropped at drop, so no connection survives across requests or
+        // across differently-pinned hosts.
+        let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+        let req = Self::build_request(request.url())?;
+        let res = client
+            .request(req)
+            .await
+            .map_err(|err| FeedConnectError::Transport(err.to_string()))?;
+        Ok(FeedResponse::from_hyper(res))
     }
 }
 
