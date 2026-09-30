@@ -145,7 +145,10 @@ python3 scripts/container-smoke.py two-bot:ci --binary-max-bytes 1
 The CI job exercises those two deliberately broken budgets against the real
 image and fails if either violation is accepted. Offline Python fixtures also
 cover missing binary, root runtime, unhealthy/false-ready endpoints, broken
-healthcheck, OOM, and shutdown exit/timeout failures:
+healthcheck, OOM, shutdown exit/timeout failures, startup transport retries
+(early-close loopback peer), redirect rejection (live `/readyz` 302 → `/other`
+503 full-contract test), and named/capped auxiliary-container cleanup under
+injected Docker-client timeouts:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v

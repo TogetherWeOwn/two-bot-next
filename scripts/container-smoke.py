@@ -1,13 +1,13 @@
 """Smoke-test a locally loaded runtime image, without Discord or a database."""
 
 import argparse
+import http.client
 import json
 import os
 from pathlib import Path
 import subprocess
 import time
-import urllib.error
-import urllib.request
+from urllib.parse import urlsplit
 import uuid
 
 MIB = 1024 * 1024
@@ -35,23 +35,43 @@ def report(message):
 
 
 def http_response(url):
+    # A hand-rolled connection (not urlopen) so any 3xx is returned as-is;
+    # following a redirect would let one healthy endpoint masquerade as
+    # another and falsely satisfy the contract.
+    parts = urlsplit(url)
+    connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=2)
     try:
-        with urllib.request.urlopen(url, timeout=2) as response:
+        connection.request("GET", parts.path or "/")
+        response = connection.getresponse()
+        try:
             return response.status, json.loads(response.read())
-    except urllib.error.HTTPError as response:
-        with response:
-            return response.code, json.loads(response.read())
-    except (urllib.error.URLError, TimeoutError):
+        except ValueError:
+            # A status with no JSON body (e.g. a bare 3xx) is still an
+            # answer; the caller's exact status/body assertions reject it.
+            return response.status, None
+    except (OSError, TimeoutError, http.client.HTTPException):
+        # The server may still be starting (connection refused/reset by peer)
+        # or slow to answer; the caller retries until its deadline. A 4xx/5xx
+        # is a real answer, not a transport failure, so it is returned above.
         return None, None
+    finally:
+        connection.close()
 
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
     metadata = json.loads(docker("image", "inspect", image).stdout)[0]
     image_bytes = metadata["Size"]
-    binary_bytes = int(docker(
-        "run", "--rm", "--network", "none", "--entrypoint", "stat", image,
-        "-c", "%s", BINARY,
-    ).stdout)
+    # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
+    # orphan behind; same memory cap as the main run.
+    measure = "two-bot-measure-" + uuid.uuid4().hex
+    try:
+        binary_bytes = int(docker(
+            "run", "--name", measure, "--memory", "256m",
+            "--network", "none", "--entrypoint", "stat", image,
+            "-c", "%s", BINARY,
+        ).stdout)
+    finally:
+        docker("rm", "--force", measure, check=False)
     for label, size, limit in (
         ("image (uncompressed Docker Size)", image_bytes, image_max_bytes),
         ("release binary", binary_bytes, binary_max_bytes),
@@ -107,8 +127,18 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
 
         # A fresh no-network process has no listening server: liveness must
         # fail honestly rather than being an unconditional success command.
-        result = docker("run", "--rm", "--network", "none", image, "--healthcheck", check=False)
-        require(result.returncode == 1, "--healthcheck without a server must exit 1")
+        # Named (not --rm/unnamed) so a timed-out Docker client cannot leave
+        # an orphan behind; cleaned with the same memory cap as the main run.
+        probe = name + "-probe"
+        try:
+            result = docker(
+                "run", "--name", probe, "--memory", "256m",
+                "--network", "none", image, "--healthcheck",
+                timeout=30, check=False,
+            )
+            require(result.returncode == 1, "--healthcheck without a server must exit 1")
+        finally:
+            docker("rm", "--force", probe, check=False)
         report("PASS --healthcheck exits 1 without a listening server")
 
         # Send SIGTERM directly; no docker stop fallback may hide SIGKILL.

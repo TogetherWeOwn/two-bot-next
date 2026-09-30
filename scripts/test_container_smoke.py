@@ -5,9 +5,11 @@ import importlib.util
 import io
 import json
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -29,7 +31,10 @@ class DockerFixture:
         self.health_status = "healthy"
         self.exit_code = "0"
         self.oom = False
+        self.port = "127.0.0.1:32768\n"
         self.wait_timeout = False
+        self.probe_timeout = False
+        self.measure_timeout = False
         self.stopped = False
 
     def __call__(self, *args, **kwargs):
@@ -41,9 +46,11 @@ class DockerFixture:
                 "User": self.user, "Healthcheck": {"Test": self.health_command},
             }}])
         elif args[0] == "run" and "stat" in args:
+            if self.measure_timeout:
+                raise subprocess.TimeoutExpired(["docker", *args], kwargs.get("timeout"))
             output = str(self.binary_size)
         elif args[0] == "port":
-            output = "127.0.0.1:32768\n"
+            output = self.port
         elif args[0] == "inspect":
             output = json.dumps([{"State": {
                 "Running": not self.stopped, "OOMKilled": self.oom,
@@ -54,6 +61,8 @@ class DockerFixture:
         elif args[0] == "exec":
             code = self.live_health_exit
         elif args[0] == "run" and "--healthcheck" in args:
+            if self.probe_timeout:
+                raise subprocess.TimeoutExpired(["docker", *args], kwargs.get("timeout"))
             code = self.dead_health_exit
         elif args[0] == "wait":
             if self.wait_timeout:
@@ -61,6 +70,88 @@ class DockerFixture:
             self.stopped = True
             output = self.exit_code
         return subprocess.CompletedProcess(args, code, output, "")
+
+    def removals(self):
+        return [args for args, _ in self.calls if args[:2] == ("rm", "--force")]
+
+
+def serve_in_thread(handler_class):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def server_url(server, path):
+    return f"http://127.0.0.1:{server.server_address[1]}{path}"
+
+
+def json_reply(handler, status, body):
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+class FlakyHealthHandler(BaseHTTPRequestHandler):
+    """Closes the first /health connection unanswered (RemoteDisconnected)."""
+
+    unanswered = True
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/health" and type(self).unanswered:
+            type(self).unanswered = False
+            self.connection.close()
+            return
+        json_reply(self, 200, b'{"status": "ok"}')
+
+
+class RedirectReadyzHandler(BaseHTTPRequestHandler):
+    """/readyz 302 -> /other 503 with the expected JSON (the review repro)."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/readyz":
+            self.send_response(302)
+            self.send_header("Location", "/other")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/other":
+            json_reply(self, 503, b'{"components": [["process", "ready"], ["gateway", "down"]]}')
+        else:
+            json_reply(self, 200, b'{"status": "ok"}')
+
+
+class HttpHelperTests(unittest.TestCase):
+    def tearDown(self):
+        FlakyHealthHandler.unanswered = True
+
+    def test_early_close_is_a_retryable_miss_not_a_crash(self):
+        server = serve_in_thread(FlakyHealthHandler)
+        try:
+            url = server_url(server, "/health")
+            self.assertEqual(smoke.http_response(url), (None, None))
+            self.assertEqual(smoke.http_response(url), (200, {"status": "ok"}))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_redirect_is_returned_not_followed(self):
+        server = serve_in_thread(RedirectReadyzHandler)
+        try:
+            code, body = smoke.http_response(server_url(server, "/readyz"))
+            self.assertEqual(code, 302)
+            self.assertIsNone(body)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class ContainerSmokeTests(unittest.TestCase):
@@ -73,9 +164,14 @@ class ContainerSmokeTests(unittest.TestCase):
         self.clock += 1
         return self.clock
 
-    def run_smoke(self, **kwargs):
+    def run_smoke(self, live_http=False, **kwargs):
+        if live_http:
+            http_patcher = contextlib.nullcontext()
+        else:
+            http_patcher = patch.object(
+                smoke, "http_response", side_effect=lambda url: self.http(url))
         with patch.object(smoke, "docker", self.fixture), \
-                patch.object(smoke, "http_response", side_effect=lambda url: self.http(url)), \
+                http_patcher, \
                 patch.object(smoke.time, "monotonic", side_effect=self.tick), \
                 patch.object(smoke.time, "sleep"), \
                 patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
@@ -181,6 +277,46 @@ class ContainerSmokeTests(unittest.TestCase):
         with self.assertRaises(subprocess.TimeoutExpired):
             self.run_smoke()
         self.assertEqual(self.fixture.calls[-1][0][:2], ("rm", "--force"))
+
+    def test_auxiliary_containers_are_named_capped_and_removed(self):
+        self.run_smoke()
+        runs = [args for args, _ in self.fixture.calls if args[0] == "run"]
+        self.assertEqual(len(runs), 3)  # measure, detached main, probe
+        names = set()
+        for args in runs:
+            self.assertNotIn("--rm", args)
+            self.assertIn("--name", args)
+            self.assertIn("256m", args)
+            names.add(args[args.index("--name") + 1])
+        self.assertEqual(len(names), 3)
+        removed = {args[2] for args in self.fixture.removals()}
+        self.assertEqual(removed, names)
+
+    def test_probe_timeout_still_removes_probe_and_main(self):
+        self.fixture.probe_timeout = True
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.run_smoke()
+        # Measure was already removed before the probe ran; the probe and
+        # the main container must both still be cleaned up on timeout.
+        removed = {args[2] for args in self.fixture.removals()}
+        self.assertEqual(len(removed), 3)
+
+    def test_measure_timeout_still_removes_measure_container(self):
+        self.fixture.measure_timeout = True
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.run_smoke()
+        self.assertEqual(len(self.fixture.removals()), 1)
+
+    def test_redirecting_readyz_is_rejected_live(self):
+        server = serve_in_thread(RedirectReadyzHandler)
+        try:
+            self.fixture.port = f"127.0.0.1:{server.server_address[1]}\n"
+            with self.assertRaisesRegex(RuntimeError, "/readyz must be 503"):
+                self.run_smoke(live_http=True)
+            self.assertEqual(self.fixture.calls[-1][0][:2], ("rm", "--force"))
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_oom_not_accepted(self):
         self.fixture.oom = True
