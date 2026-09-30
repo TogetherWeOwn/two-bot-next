@@ -18,6 +18,7 @@ pub mod backfill_plan;
 pub mod cli;
 pub mod db;
 pub mod dedupe;
+pub mod gateway_session;
 pub mod invite;
 pub mod mee6_names;
 pub mod mee6_rewards;

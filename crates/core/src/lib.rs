@@ -9,12 +9,15 @@ pub mod audit;
 pub mod automod;
 pub mod classify;
 pub mod commands;
+pub mod community_snapshots;
 pub mod config;
 pub mod containment;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod funnel;
+pub mod gateway_funnel;
+pub mod gateway_session;
 pub mod handlers;
 pub mod health;
 pub mod invites;
@@ -26,13 +29,19 @@ pub mod moderation;
 pub mod onboarding;
 #[cfg(feature = "db")]
 pub mod onboarding_store;
+pub mod raid;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
+pub mod scheduled_events;
 pub mod settings;
 pub mod sticky;
 pub mod voice;
+pub mod voice_config;
 pub mod voice_ownership;
+pub mod voice_vote_kick;
+#[cfg(feature = "db")]
+pub mod website_store;
 
 pub use automod::{
     match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
@@ -41,6 +50,12 @@ pub use automod::{
     DEFAULT_SANCTIONS,
 };
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
+pub use community_snapshots::{
+    build_community_snapshot, build_counter_reading, match_rank_roles, window_bounds,
+    CommunitySnapshot, CounterReading, CounterSkip, JobGate, JobGuard, MemberRank, RaidAnomaly,
+    RaidWindow, RankKey, RankRole, RankRow, RankSkip, RosterMember, LIVE_COUNTER_INTERVAL_MS,
+    RAID_ANOMALIES, RANK_SNAPSHOT_INTERVAL_MS,
+};
 pub use config::Config;
 pub use containment::{
     plan_quarantine, quarantine_outcome, role_removal_status, ClaimedContainmentEvent,
@@ -110,6 +125,12 @@ pub use onboarding_store::{
     begin_prompt, has_onboarding_prompt, record_channel_routed, record_game_selected,
     record_prompted, record_session_routed, OnboardingStoreError, PromptGuard,
 };
+pub use raid::{
+    count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,
+    RaidAlert, RaidConfigError, RaidTuning, RaidWatch, RecordedJoinRisk, StaffAlertMessage,
+    DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS, DEFAULT_RAID_COOLDOWN_SECONDS,
+    DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
+};
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
     checkin_idempotency_key, checkin_metadata_json, checkin_recorded_text, checkin_source,
@@ -121,6 +142,10 @@ pub use rsvp::{
 #[cfg(feature = "db")]
 pub use rsvp_store::{
     list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+};
+pub use scheduled_events::{
+    normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
+    ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 pub use settings::{
     assert_storable_key, classify_key, is_declared_env_only, is_env_only_key, is_storable_key,
@@ -140,4 +165,13 @@ pub use voice::{
     known_voice_durations, parse_voice_end_metadata, resolve_voice_end, summarize_voice_durations,
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
+};
+pub use voice_vote_kick::{
+    RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
+    VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts, VOTE_KICK_TTL_MS,
+};
+#[cfg(feature = "db")]
+pub use website_store::{
+    apply_web_contract, read_raid_windows, replace_events, write_counter, write_rank_snapshot,
+    WebsiteStoreError, WEB_CONTRACT_VERSION, WEB_CONTRACT_VIEWS,
 };
