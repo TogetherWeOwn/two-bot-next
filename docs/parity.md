@@ -8,7 +8,7 @@
 
 Conventions: `src/…` paths are legacy `two-bot` files. Permissions are Discord permission flags unless noted.
 
-## 1. Slash / prefix commands (31 + dynamic)
+## 1. Slash / prefix commands (30 rows, including dynamic/prefix and one drop)
 
 Registry: `CORE_COMMAND_DATA` (always published) = leveling only; community/rota/automation/announcement/moderation slices merge via `additionalBuiltins` (`src/index.ts:660-666`, `src/discord/commandNames.ts`). All guild-only, DM off.
 
@@ -44,6 +44,19 @@ Registry: `CORE_COMMAND_DATA` (always published) = leveling only; community/rota
 | 28 | `/feed-add` | `kind` req (`rss`/`youtube`/`twitch`), `source` req | `ManageGuild` | **S4** |
 | 29 | `/feed-remove` | `id` req | `ManageGuild` | **S4** |
 | 30 | `/feed-list` | none | `ManageGuild` | **S4** |
+
+Runtime permission contract: `crates/core/src/command_permissions.rs` represents
+all 30 rows (27 retained builtins, the dropped rota command, custom slash commands,
+and prefix triggers). The router checks the invoking interaction's resolved
+`member.permissions`, not bot permissions or command-picker defaults, before
+returning a builtin handler. Missing restricted bits produce an ephemeral refusal
+and a metadata-only `command_permission_denied` tracing audit event (command,
+guild, required/resolved bits; no tokens, options or user text). This is a security
+log, not a claim of durable operational-audit-store or gateway-dispatch wiring.
+Member-target moderation retains its self-target, protected-role/owner/bot and
+hierarchy checks in `assert_moderation_allowed`. Dynamic/prefix feature gates and
+the dropped rota disposition are unchanged. Tests compare every row with this
+section and all published permission bitfields, including Twilight wire JSON.
 
 ## 2. Non-command interactions (buttons / selects / reactions)
 

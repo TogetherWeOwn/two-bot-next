@@ -15,6 +15,7 @@ pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;
+pub mod command_permissions;
 pub mod commands;
 pub mod community;
 pub mod community_snapshots;
