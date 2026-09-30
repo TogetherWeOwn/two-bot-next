@@ -2172,10 +2172,13 @@ name = "two-bot"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "rustls",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-websockets",
  "tower",
  "tower-http",
  "tracing",
@@ -2183,6 +2186,7 @@ dependencies = [
  "twilight-cache-inmemory",
  "twilight-gateway",
  "two-bot-core",
+ "two-bot-cutover",
  "two-bot-discord",
 ]
 
