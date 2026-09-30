@@ -14,8 +14,6 @@
 
 ### Fixed
 
-- Serialize configuration tests that mutate shared environment variables so parallel test execution cannot erase the invalid-guild fixture.
-
 - Detect settings changes with a commit-ordered transactional revision instead of a sequence maximum, including deletes and late commits with lower row versions.
 - Serialize settings reads, writes, and audits, including concurrent inserts into absent keys; load cache rows and revision from one consistent database snapshot.
 - Refuse environment-only and unknown settings through the cache getter as well as environment snapshots.
