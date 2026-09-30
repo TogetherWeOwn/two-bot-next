@@ -2214,6 +2214,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "twilight-http",
  "twilight-model",
  "two-bot-core",

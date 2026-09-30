@@ -26,6 +26,7 @@ pub mod onboarding_store;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
+pub mod settings;
 pub mod sticky;
 pub mod voice;
 
@@ -99,6 +100,12 @@ pub use rsvp::{
 #[cfg(feature = "db")]
 pub use rsvp_store::{
     list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+};
+pub use settings::{
+    assert_storable_key, classify_key, is_declared_env_only, is_env_only_key, is_storable_key,
+    to_env_string, validate_write, EnvOnlyKeyError, IgnoreReason, IgnoredChange, KeyChange,
+    RefreshReport, SettingClass, SettingRow, SettingsCache, SettingsSnapshot, ValidatedWrite,
+    WriteAction, WriteRefusal, ENV_ONLY_KEY_PREFIXES, HOT_WIRED, POLL_SECONDS, SETTING_CLASSES,
 };
 pub use sticky::{
     activity_eligible, automations_enabled, claim_blocks, decide_activity, normalize_debounce,
