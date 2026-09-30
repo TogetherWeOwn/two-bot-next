@@ -165,7 +165,7 @@ pub fn decide_prompt(is_bot: bool, pending: bool, already_prompted: bool) -> Pro
 /// invite screen arrive ungated (`Joined { pending: false }`); everyone else
 /// prompts when `pending` flips true → false (`GateCleared`). A gated join
 /// prompts nobody — `GuildMemberUpdate` picks them up later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MembershipTrigger {
     Joined { pending: bool },
     GateCleared,

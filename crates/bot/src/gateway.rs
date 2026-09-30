@@ -11,7 +11,10 @@
 //! funnel batch commits with its checkpoint; persistence/dispatch failures
 //! stop the runner rather than checkpointing ahead of uncommitted effects.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use crate::onboarding::OnboardingJob;
 
 use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
@@ -22,7 +25,7 @@ use two_bot_core::gateway_session::{
     boot_action, dispatch_action, invalidates_session, BootAction, DispatchAction, GatewaySession,
 };
 use two_bot_core::{ComponentStatus, Config, FunnelEvent};
-use two_bot_cutover::gateway_session::GatewaySessionStore;
+use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
 use two_bot_discord::{
     gateway_intents, needs_message_content, NoClassification, NoInvites, Pipeline,
 };
@@ -187,13 +190,64 @@ async fn run_loop(
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
     let mut feature_jobs = tokio::task::JoinSet::new();
+    let mut live_interactions = HashMap::new();
+    let mut queue_dirty = true;
+    let mut queue_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    queue_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    if onboarding.is_some() {
+        checkpoint_io(state, deadline, store.recover_onboarding_jobs()).await?;
+    }
     loop {
+        if let Some(runtime) = onboarding {
+            // Poll Twilight between claims, rather than spend 32 consecutive
+            // SQL deadlines without driving the shard's heartbeat machinery.
+            if queue_dirty && feature_jobs.len() < 32 {
+                if let Some(saved) =
+                    checkpoint_io(state, deadline, store.claim_onboarding_job()).await?
+                {
+                    let job = if let Some(job) = live_interactions.remove(&saved.id) {
+                        Some(job)
+                    } else {
+                        OnboardingJob::recover(&saved.payload).map_err(|_| {
+                            sqlx::Error::InvalidArgument("invalid durable onboarding job".into())
+                        })?
+                    };
+                    if let Some(job) = job {
+                        let runtime = Arc::clone(runtime);
+                        feature_jobs.spawn(async move {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(90),
+                                runtime.handle(job, saved.occurred_at_ms),
+                            )
+                            .await
+                            .map_err(|_| crate::onboarding::RuntimeError::Discord)??;
+                            Ok::<_, crate::onboarding::RuntimeError>(saved.id)
+                        });
+                    } else {
+                        // Callback credentials never survive a process boundary.
+                        // Keep an interruption receipt, not a guessed role replay.
+                        checkpoint_io(state, deadline, store.finish_onboarding_job(saved.id, true))
+                            .await?;
+                        warn!(job_id = saved.id, "onboarding interaction interrupted; member must reselect");
+                    }
+                } else {
+                    queue_dirty = false;
+                }
+            }
+        }
         let item = tokio::select! {
             item = shard.next() => item,
+            _ = queue_tick.tick(), if onboarding.is_some() && queue_dirty && feature_jobs.len() < 32 => {
+                continue;
+            },
             result = feature_jobs.join_next(), if !feature_jobs.is_empty() => {
-                if !matches!(result, Some(Ok(Ok(())))) {
-                    warn!("onboarding worker failed; no successful delivery inferred");
-                }
+                let Some(Ok(Ok(id))) = result else {
+                    return Err(sqlx::Error::InvalidArgument(
+                        "onboarding worker failed; durable job retained for bounded restart recovery".into(),
+                    ));
+                };
+                checkpoint_io(state, deadline, store.finish_onboarding_job(id, false)).await?;
+                queue_dirty = true;
                 continue;
             }
         };
@@ -306,31 +360,35 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             onboarding_job = onboarding.and_then(|runtime| runtime.capture(&event, pipeline));
-            if onboarding_job.is_some() && feature_jobs.len() >= 32 {
-                return Err(sqlx::Error::InvalidArgument(
-                    "onboarding worker capacity exceeded; checkpoint unchanged".into(),
-                ));
-            }
             pipeline.handle(&event);
         }
-        checkpoint_io(
+        let durable_job = onboarding_job
+            .as_ref()
+            .map(|job| {
+                job.durable_payload()
+                    .map(|payload| GatewayJob {
+                        payload,
+                        occurred_at_ms: checkpoint.updated_at_ms,
+                    })
+                    .map_err(|_| sqlx::Error::InvalidArgument("invalid onboarding job".into()))
+            })
+            .transpose()?;
+        let (_, job_id) = checkpoint_io(
             state,
             deadline,
-            store.commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
+            store.commit_dispatch_with_job(
+                &checkpoint,
+                pipeline.handlers().store().take_batch(),
+                durable_job,
+            ),
         )
         .await?;
         committed = Some(checkpoint);
-        if let (Some(runtime), Some(job)) = (onboarding, onboarding_job) {
-            let runtime = Arc::clone(runtime);
-            let now_ms = two_bot_core::funnel::now_millis_for_test();
-            feature_jobs.spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(90),
-                    runtime.handle(job, now_ms),
-                )
-                .await
-                .map_err(|_| crate::onboarding::RuntimeError::Discord)?
-            });
+        if let Some(id) = job_id {
+            if let Some(job @ OnboardingJob::Interaction(_)) = onboarding_job {
+                live_interactions.insert(id, job);
+            }
+            queue_dirty = true;
         }
         if connected {
             *state.write().await = GatewayState::Connected;

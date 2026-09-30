@@ -31,7 +31,7 @@ const CONFIG_KEYS: &[&str] = &[
 
 /// Values own pre-pipeline state: cache updates/removals cannot erase the
 /// pending transition or joined-at used by the asynchronous feature worker.
-#[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum OnboardingJob {
     Welcome {
         guild_id: u64,
@@ -47,7 +47,31 @@ pub enum OnboardingJob {
         bot: bool,
         joined_at_ms: Option<i64>,
     },
+    #[serde(skip)]
     Interaction(Box<Interaction>),
+}
+
+impl OnboardingJob {
+    /// Persist captured member state, but never a component callback credential.
+    /// Interrupted components require a fresh member submission after restart;
+    /// replaying an uncertain defer or partial role mutation is not safe.
+    pub fn durable_payload(&self) -> Result<String, serde_json::Error> {
+        match self {
+            Self::Interaction(interaction) => serde_json::to_string(&serde_json::json!({
+                "interrupted_interaction": interaction.id.to_string(),
+            })),
+            _ => serde_json::to_string(self),
+        }
+    }
+
+    pub fn recover(payload: &str) -> Result<Option<Self>, serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(payload)?;
+        if value["interrupted_interaction"].as_str().is_some() {
+            Ok(None)
+        } else {
+            serde_json::from_value(value).map(Some)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -56,6 +80,7 @@ pub enum RuntimeError {
     Settings,
     Identity,
     Member,
+    Role,
     Discord,
     Store,
 }
@@ -205,7 +230,27 @@ impl OnboardingRuntime {
                     .guild_id
                     .is_some_and(|guild| guild.get() == self.guild_id) =>
             {
-                Some(OnboardingJob::Interaction(Box::new(interaction.0.clone())))
+                let router = InteractionRouter::new(RouterGates {
+                    configured_guild: Some(self.guild_id),
+                    scorecard: false,
+                    automations: false,
+                    announcements: false,
+                    moderation: false,
+                    tickets: false,
+                    self_roles: false,
+                    onboarding_picker: true,
+                    session_picker: true,
+                });
+                matches!(
+                    route_interaction(&router, &interaction.0, None),
+                    RoutedInteraction::Component {
+                        outcome: ComponentOutcome::Handled {
+                            handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
+                        },
+                        ..
+                    }
+                )
+                .then(|| OnboardingJob::Interaction(Box::new(interaction.0.clone())))
             }
             _ => None,
         }
@@ -355,22 +400,12 @@ impl OnboardingRuntime {
             )
             .await
             .map_err(|_| RuntimeError::Discord)?;
-        guard
-            .record_sent(&channel_id, at)
-            .await
-            .map_err(|_| RuntimeError::Store)?;
         if config.gates.mode == OnboardingMode::Anchor {
-            let plan = GameSelection {
-                role_ids: vec![],
-                destinations: vec![],
-                channel_ids: vec![channel_id],
-                unknown_keys: vec![],
-                degraded_count: 0,
-            };
-            record_channel_routed(&self.pool, &guild, &member, &plan, at)
-                .await
-                .map_err(|_| RuntimeError::Store)?;
+            guard.record_anchor_sent(&channel_id, at).await
+        } else {
+            guard.record_sent(&channel_id, at).await
         }
+        .map_err(|_| RuntimeError::Store)?;
         Ok(())
     }
 
@@ -416,15 +451,63 @@ impl OnboardingRuntime {
         if user.bot {
             return Ok(());
         }
-        self.executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &defer_ephemeral())
-            .await
-            .map_err(|_| RuntimeError::Discord)?;
+        // A rejected callback may be a replay of an already-deferred click.
+        // Try an edit, but never apply the user's role command in that case.
+        let deferred = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.executor.answer_interaction(
+                interaction.id.get(),
+                &interaction.token,
+                &defer_ephemeral(),
+            ),
+        )
+        .await;
+        if !matches!(deferred, Ok(Ok(()))) {
+            return self
+                .reply(
+                    interaction,
+                    "I couldn't confirm this interaction. Your selection may already have been processed, so I won't apply it again. Please open the menu and try again.",
+                )
+                .await;
+        }
         let keys: Vec<_> = values.iter().map(String::as_str).collect();
+        // Keep the error boundary outside the processing timeout: cancellation
+        // drops uncommitted success rows before we try to finish the defer.
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            self.process_selection(config, interaction, handler, &keys, user.id.get(), at),
+        )
+        .await
+        .unwrap_or(Err(RuntimeError::Discord));
+        if let Err(error) = result {
+            tracing::warn!(?error, ?handler, "onboarding picker failed; attempting deferred error reply");
+            let content = if matches!(error, RuntimeError::Role) {
+                PICKER_ROLE_FAILURE_REPLY
+            } else if handler == ComponentHandler::GamePicker {
+                "I couldn't finish your selection. Some game roles may already have changed. Please open the menu and try again."
+            } else {
+                "I couldn't finish routing your session selection. Please open the menu and try again."
+            };
+            // A delivered failure reply is terminal, not a reason to replay a
+            // member's command. Only failure to finish the defer stays retryable.
+            return self.reply(interaction, content).await;
+        }
+        Ok(())
+    }
+
+    async fn process_selection(
+        &self,
+        config: &OnboardingConfig,
+        interaction: &Interaction,
+        handler: ComponentHandler,
+        keys: &[&str],
+        member_id: u64,
+        at: &str,
+    ) -> Result<(), RuntimeError> {
         let guild = config.guild_id.to_string();
-        let member = user.id.to_string();
+        let member = member_id.to_string();
         if handler == ComponentHandler::SessionPicker {
-            let access = MemberAccess::load(&self.executor, config.guild_id, user.id.get())
+            let access = MemberAccess::load(&self.executor, config.guild_id, member_id)
                 .await
                 .ok_or(RuntimeError::Member)?;
             let mut visible = HashSet::new();
@@ -437,15 +520,25 @@ impl OnboardingRuntime {
                 }
             }
             let outcome = adjudicate_session_select(
-                &keys,
+                keys,
                 &|channel| visible.contains(channel),
                 &config.session_picks,
             );
-            self.reply(interaction, &outcome.reply).await?;
             if outcome.record_routed {
-                record_session_routed(&self.pool, &guild, &member, &outcome.routed, at)
-                    .await
-                    .map_err(|_| RuntimeError::Store)?;
+                let mut transaction = self.pool.begin().await.map_err(|_| RuntimeError::Store)?;
+                record_session_routed_in_transaction(
+                    &mut transaction,
+                    &guild,
+                    &member,
+                    &outcome.routed,
+                    at,
+                )
+                .await
+                .map_err(|_| RuntimeError::Store)?;
+                self.reply(interaction, &outcome.reply).await?;
+                transaction.commit().await.map_err(|_| RuntimeError::Store)?;
+            } else {
+                self.reply(interaction, &outcome.reply).await?;
             }
             return Ok(());
         }
@@ -460,24 +553,21 @@ impl OnboardingRuntime {
         let roles = if config.gates.dry_run {
             vec![]
         } else {
-            match MemberAccess::load(&self.executor, config.guild_id, user.id.get()).await {
+            match MemberAccess::load(&self.executor, config.guild_id, member_id).await {
                 Some(access) => access.role_ids,
-                None => {
-                    self.reply(interaction, PICKER_ROLE_FAILURE_REPLY).await?;
-                    return Err(RuntimeError::Member);
-                }
+                None => return Err(RuntimeError::Member),
             }
         };
         let role_refs: Vec<_> = roles.iter().map(String::as_str).collect();
         let Some(outcome) = adjudicate_game_select(
             config.gates.mode,
-            &keys,
+            keys,
             &role_refs,
             &|_| false,
             config.guild_id,
             config.gates.dry_run,
         ) else {
-            return Ok(());
+            return Err(RuntimeError::Config);
         };
         for (role, add) in outcome
             .add_role_ids
@@ -491,14 +581,13 @@ impl OnboardingRuntime {
                 .await
                 .is_err()
             {
-                self.reply(interaction, PICKER_ROLE_FAILURE_REPLY).await?;
-                return Err(RuntimeError::Discord);
+                return Err(RuntimeError::Role);
             }
         }
         if !outcome.record_selected {
             return self.reply(interaction, &outcome.reply).await;
         }
-        let access = MemberAccess::load(&self.executor, config.guild_id, user.id.get())
+        let access = MemberAccess::load(&self.executor, config.guild_id, member_id)
             .await
             .ok_or(RuntimeError::Member)?;
         let mut visible = HashSet::new();
@@ -516,7 +605,7 @@ impl OnboardingRuntime {
                 visible.insert(channel.to_owned());
             }
         }
-        let mut plan = plan_game_selection(&keys, &|channel| visible.contains(channel));
+        let mut plan = plan_game_selection(keys, &|channel| visible.contains(channel));
         let selected: Vec<_> = plan
             .destinations
             .iter()
@@ -538,28 +627,26 @@ impl OnboardingRuntime {
         } else {
             game_picker_reply(&plan, config.guild_id)
         };
-        self.reply(interaction, &reply).await?;
-        record_game_selected(&self.pool, &guild, &member, &selected, at)
+        record_game_selection_in_transaction(&mut lock, &guild, &member, &selected, &plan, at)
             .await
             .map_err(|_| RuntimeError::Store)?;
-        if !plan.channel_ids.is_empty() {
-            record_channel_routed(&self.pool, &guild, &member, &plan, at)
-                .await
-                .map_err(|_| RuntimeError::Store)?;
-        }
+        self.reply(interaction, &reply).await?;
         lock.commit().await.map_err(|_| RuntimeError::Store)?;
         Ok(())
     }
 
     async fn reply(&self, interaction: &Interaction, content: &str) -> Result<(), RuntimeError> {
-        self.executor
-            .edit_interaction_response(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.executor.edit_interaction_response(
                 interaction.application_id.get(),
                 &interaction.token,
                 content,
                 &[],
-            )
-            .await
-            .map_err(|_| RuntimeError::Discord)
+            ),
+        )
+        .await
+        .map_err(|_| RuntimeError::Discord)?
+        .map_err(|_| RuntimeError::Discord)
     }
 }

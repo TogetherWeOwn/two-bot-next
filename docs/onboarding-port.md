@@ -120,15 +120,49 @@ routing, hot settings, anchor attachments, empty goodbye mentions, pre-update
 capture, and single-owned S3 facts. They do not prove deployment or crash-safe
 gateway feature delivery.
 
-**Remaining before readiness:** feature jobs currently start after the gateway
-checkpoint commits, and exist only in memory. A process restart can therefore
-lose an already-checkpointed welcome/goodbye/interaction; replay is suppressed
-by S3's sequence fence. Worker failures also need an explicit delivery
-resumption policy. Resolve and test that checkpoint-to-worker gap before
-removing the draft gate. Also verify full gateway/shard integration, deferred
-error replies, and the anchor marker/routing-record transaction boundary.
-Do not enable this checkpoint as a live onboarding flow or claim runtime parity
-yet.
+## Delivery recovery checkpoint
+
+Migration `0360_gateway_onboarding_jobs.sql` stores captured welcome/goodbye
+state and component delivery receipts in the **same transaction** as the S3
+funnel batch and sequence. Workers claim committed rows, not an in-memory copy
+of a member cache. The original dispatch clock remains stable on retry. Session
+reset/expiry clears only the gateway session, never these delivery rows.
+
+A single shard owner may have at most 32 unfinished rows/workers. Queue capacity
+failure rolls back the dispatch, including its checkpoint. Worker errors/timeouts
+stop the essential runner, leaving the captured job for Container restart.
+Restart reclaims interrupted workers, at most three attempts per job; exhaustion
+fails closed until an authorized correction addresses the cause and resets that
+specific failed job. Never substitute credentials or repeatedly restart to
+conceal a permissions/configuration failure. Completion clears the payload and
+keeps a receipt; `completed` means worker handling ended, not necessarily that a
+message was sent (dry-run/duplicate/ignored/error-replied commands are terminal).
+
+Interaction callbacks are deliberately **not replayed after process restart**.
+No callback token, full interaction payload or bot token is written to the queue.
+An ID-only receipt is marked `interrupted` when the process-local callback is
+unavailable. The member must open the menu and submit a fresh selection; a
+component's three-second initial acknowledgement deadline and potentially
+partial role writes cannot safely be reconstructed from its gateway sequence.
+Interrupted receipt counts are operational evidence, not successful responses.
+Within a live process, uncertain callbacks attempt an error edit without role
+replay; post-defer errors/timeouts get one bounded honest error edit. A delivered
+error reply is terminal and writes no successful selection/routing rows.
+
+Anchor `onboarding_prompted` and `channel_routed` now commit together under the
+PromptGuard. Game selection/routing and session routing success rows are staged
+inside their processing transaction, which rolls back when the final response
+fails. Discord acceptance versus database commit remains a cross-system
+ambiguity: neither the queue nor these transactions claims exactly-once sends
+across a crash in that window. Session goodbyes are at-least-once across such a
+crash; the legacy welcome marker suppresses retries after its successful commit.
+
+**Not review-ready:** the new recovery and deferred-error changes require exact
+head CI validation and independent review. Local Rust compilation has no
+certified bounded admission in this workspace; use the existing authorized CI
+service containers, never a speculative local build or target-directory bypass.
+Do not enable this checkpoint as a live onboarding flow or claim deployment
+parity.
 
 Framework references:
 

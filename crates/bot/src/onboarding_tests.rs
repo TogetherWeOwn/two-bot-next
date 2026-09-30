@@ -56,17 +56,24 @@ impl TestSchema {
     }
 
     async fn pool(schema: &str) -> PgPool {
+        Self::pool_with_lock_timeout(schema, "0").await
+    }
+
+    async fn pool_with_lock_timeout(schema: &str, lock_timeout: &str) -> PgPool {
         assert!(schema
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'));
         let schema = schema.to_owned();
+        let lock_timeout = lock_timeout.to_owned();
         PgPoolOptions::new()
             .max_connections(4)
             .after_connect(move |connection, _| {
                 let schema = schema.clone();
+                let lock_timeout = lock_timeout.clone();
                 Box::pin(async move {
-                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                    sqlx::query("SELECT set_config('search_path', $1, false), set_config('lock_timeout', $2, false)")
                         .bind(schema)
+                        .bind(lock_timeout)
                         .execute(connection)
                         .await?;
                     Ok(())
@@ -110,6 +117,13 @@ struct DiscordState {
     roles: HashSet<String>,
     reject_next_post: bool,
     reject_roles: bool,
+    member_reads: usize,
+    reject_member_read: Option<usize>,
+    reject_next_reply: bool,
+    reject_replies: bool,
+    reject_callback: bool,
+    reply_delay: Duration,
+    close_pool_on_callback: Option<PgPool>,
 }
 
 async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
@@ -125,6 +139,12 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
             }
             ("GET", path) if path.starts_with("/guilds/22/members/") => {
                 let id = path.strip_prefix("/guilds/22/members/").unwrap();
+                if id == "44" {
+                    state.member_reads += 1;
+                    if state.reject_member_read == Some(state.member_reads) {
+                        return ScriptedResponse::status(403);
+                    }
+                }
                 ScriptedResponse::json(200, json!({"user":{"id":id},"roles":if id == "999" { vec![] } else { state.roles.iter().cloned().collect::<Vec<_>>() }}))
             }
             ("GET", path) if path.starts_with("/channels/") => {
@@ -149,8 +169,21 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
                 if state.reject_next_post { state.reject_next_post = false; return ScriptedResponse::status(403); }
                 ScriptedResponse::json(201, json!({"id":"99"})).delayed(Duration::from_millis(25))
             }
-            ("POST", path) if path.ends_with("/callback") => ScriptedResponse::status(204),
-            ("PATCH", path) if path.ends_with("/messages/@original") => ScriptedResponse::json(200, json!({"id":"98"})),
+            ("POST", path) if path.ends_with("/callback") => {
+                if state.reject_callback { return ScriptedResponse::status(403); }
+                if let Some(pool) = state.close_pool_on_callback.take() {
+                    tokio::spawn(async move { pool.close().await });
+                    return ScriptedResponse::status(204).delayed(Duration::from_millis(100));
+                }
+                ScriptedResponse::status(204)
+            }
+            ("PATCH", path) if path.ends_with("/messages/@original") => {
+                if state.reject_replies || state.reject_next_reply {
+                    state.reject_next_reply = false;
+                    return ScriptedResponse::status(403);
+                }
+                ScriptedResponse::json(200, json!({"id":"98"})).delayed(state.reply_delay)
+            }
             _ => panic!("unexpected mock Discord route: {} {}", request.method, path),
         }
     }).await
@@ -263,11 +296,12 @@ async fn onboarding_runtime_failed_send_retry_and_concurrent_process_guards() {
             ..Default::default()
         }));
         let mock = discord(state).await;
-        let first = Arc::new(runtime(&db.pool, &mock, &vars("legacy", false)));
+        let first = Arc::new(runtime(&db.pool, &mock, &vars("anchor", false)));
         assert!(first.handle(welcome(44), NOW).await.is_err());
         assert!(!has_onboarding_prompt(&db.pool, "22", "44").await.unwrap());
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
         let second_pool = TestSchema::pool(&db.schema).await;
-        let second = Arc::new(runtime(&second_pool, &mock, &vars("legacy", false)));
+        let second = Arc::new(runtime(&second_pool, &mock, &vars("anchor", false)));
         let mut jobs = vec![];
         for i in 0..12 {
             let runtime = Arc::clone(if i % 2 == 0 { &first } else { &second });
@@ -284,6 +318,15 @@ async fn onboarding_runtime_failed_send_retry_and_concurrent_process_guards() {
             "one rejected post, one accepted post across two pools"
         );
         assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 1);
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
+        let transactions: Vec<String> = sqlx::query_scalar(
+            "SELECT xmin::text FROM events WHERE member_id = '44'",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions[0], transactions[1], "anchor rows commit together");
         first.handle(welcome(44), NOW + 2).await.unwrap();
         assert_eq!(posts(&mock).len(), 2);
         second_pool.close().await;
@@ -394,13 +437,18 @@ async fn onboarding_runtime_failed_role_writes_record_nothing() {
         })))
         .await;
         let runtime = runtime(&db.pool, &mock, &vars("legacy", false));
-        assert!(runtime
+        runtime
             .handle(component(GAME_SELECT_ID, &["shooters"]), NOW)
             .await
-            .is_err());
+            .unwrap();
         assert_eq!(db.count(EVENT_GAME_ROLES_SELECTED).await, 0);
         assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
         let requests = mock.requests();
+        assert_eq!(
+            requests.iter().filter(|request| request.method == "PATCH").count(),
+            1,
+            "role failure is handled once and is terminal after the error edit",
+        );
         let reply: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
         assert_eq!(reply["content"], PICKER_ROLE_FAILURE_REPLY);
     })
@@ -573,6 +621,236 @@ async fn onboarding_runtime_hot_settings_and_live_channel_fences() {
     if let Err(error) = result {
         std::panic::resume_unwind(error);
     }
+}
+
+fn replies(mock: &MockRest) -> Vec<RestRequest> {
+    mock.requests()
+        .into_iter()
+        .filter(|request| request.method == "PATCH")
+        .collect()
+}
+
+async fn assert_picker_failure(db: &TestSchema, mock: &MockRest, reply_count: usize) {
+    assert_eq!(db.count(EVENT_GAME_ROLES_SELECTED).await, 0);
+    assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
+    let requests = mock.requests();
+    let defer: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(defer["type"], 5);
+    assert_eq!(defer["data"]["flags"], 64);
+    let replies = replies(mock);
+    assert_eq!(replies.len(), reply_count);
+    let reply = replies.last().unwrap();
+    assert_eq!(reply.path, "/api/v10/webhooks/111/mock-callback/messages/@original");
+    assert!(reply.header("authorization").is_none());
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert!(body["content"].as_str().unwrap().contains("couldn't"));
+    assert!(!body["content"].as_str().unwrap().contains("Done."));
+    assert_eq!(body["allowed_mentions"], json!({"parse":[],"users":[],"roles":[],"replied_user":false}));
+    assert!(posts(mock).is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_anchor_route_insert_failure_rolls_back_prompt() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        sqlx::query("ALTER TABLE events ADD CONSTRAINT reject_route CHECK (event_type <> 'channel_routed')")
+            .execute(&db.pool).await.unwrap();
+        let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+        let runtime = runtime(&db.pool, &mock, &vars("anchor", false));
+        assert!(runtime.handle(welcome(44), NOW).await.is_err());
+        assert_eq!(posts(&mock).len(), 1, "Discord accepted the anchor welcome");
+        assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 0);
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
+        let guard = two_bot_core::onboarding_store::begin_prompt(&db.pool, "22", "44")
+            .await.unwrap().expect("route failure did not consume the marker or lock");
+        drop(guard);
+        sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_route")
+            .execute(&db.pool).await.unwrap();
+        // Discord and Postgres are not one transaction: the unrecorded send is
+        // eligible for retry, but a committed retry must suppress redelivery.
+        runtime.handle(welcome(44), NOW + 1).await.unwrap();
+        runtime.handle(welcome(44), NOW + 2).await.unwrap();
+        assert_eq!(posts(&mock).len(), 2);
+        assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 1);
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
+    }).catch_unwind().await;
+    db.close().await;
+    if let Err(error) = result { std::panic::resume_unwind(error); }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_member_read_failures_finish_the_defer_without_success_rows() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        for (mode, custom_id, key, failed_read) in [
+            ("session", SESSION_SELECT_ID, "find-players", 1),
+            ("legacy", GAME_SELECT_ID, "shooters", 1),
+            ("legacy", GAME_SELECT_ID, "shooters", 2),
+        ] {
+            let state = Arc::new(Mutex::new(DiscordState {
+                reject_member_read: Some(failed_read),
+                ..Default::default()
+            }));
+            let mock = discord(Arc::clone(&state)).await;
+            runtime(&db.pool, &mock, &vars(mode, false))
+                .handle(component(custom_id, &[key]), NOW).await.unwrap();
+            assert_picker_failure(&db, &mock, 1).await;
+            assert_eq!(state.lock().unwrap().member_reads, failed_read);
+            let role_calls = mock.requests().iter()
+                .filter(|request| matches!(request.method.as_str(), "PUT" | "DELETE"))
+                .count();
+            assert_eq!(role_calls, usize::from(failed_read == 2));
+            if failed_read == 2 {
+                let body: Value = serde_json::from_slice(&replies(&mock)[0].body).unwrap();
+                assert!(body["content"].as_str().unwrap().contains("may already have changed"));
+            }
+        }
+    }).catch_unwind().await;
+    db.close().await;
+    if let Err(error) = result { std::panic::resume_unwind(error); }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_picker_insert_and_commit_failures_are_atomic_and_terminal() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        for deferred in [false, true] {
+            if deferred {
+                sqlx::raw_sql("CREATE FUNCTION reject_route() RETURNS trigger LANGUAGE plpgsql AS $$
+                    BEGIN IF NEW.event_type = 'channel_routed' THEN RAISE EXCEPTION 'test route failure'; END IF;
+                    RETURN NEW; END $$;
+                    CREATE CONSTRAINT TRIGGER reject_route AFTER INSERT ON events DEFERRABLE INITIALLY DEFERRED
+                    FOR EACH ROW EXECUTE FUNCTION reject_route();")
+                    .execute(&db.pool).await.unwrap();
+            } else {
+                sqlx::query("ALTER TABLE events ADD CONSTRAINT reject_route CHECK (event_type <> 'channel_routed')")
+                    .execute(&db.pool).await.unwrap();
+            }
+            for (mode, custom_id, key) in [
+                ("legacy", GAME_SELECT_ID, "shooters"),
+                ("session", SESSION_SELECT_ID, "find-players"),
+            ] {
+                let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+                runtime(&db.pool, &mock, &vars(mode, false))
+                    .handle(component(custom_id, &[key]), NOW).await.unwrap();
+                assert_picker_failure(&db, &mock, if deferred { 2 } else { 1 }).await;
+            }
+            if deferred {
+                sqlx::raw_sql("DROP TRIGGER reject_route ON events; DROP FUNCTION reject_route();")
+                    .execute(&db.pool).await.unwrap();
+            } else {
+                sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_route")
+                    .execute(&db.pool).await.unwrap();
+            }
+        }
+    }).catch_unwind().await;
+    db.close().await;
+    if let Err(error) = result { std::panic::resume_unwind(error); }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_picker_begin_and_lock_failures_finish_the_defer() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let runtime_pool = TestSchema::pool(&db.schema).await;
+        let mock = discord(Arc::new(Mutex::new(DiscordState {
+            close_pool_on_callback: Some(runtime_pool.clone()),
+            ..Default::default()
+        }))).await;
+        runtime(&runtime_pool, &mock, &vars("legacy", false))
+            .handle(component(GAME_SELECT_ID, &["shooters"]), NOW).await.unwrap();
+        assert!(runtime_pool.is_closed(), "DB begin fails only after the callback");
+        assert_picker_failure(&db, &mock, 1).await;
+
+        let runtime_pool = TestSchema::pool_with_lock_timeout(&db.schema, "100ms").await;
+        let mut held = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind("22:44:game_picker").execute(&mut *held).await.unwrap();
+        let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+        runtime(&runtime_pool, &mock, &vars("legacy", false))
+            .handle(component(GAME_SELECT_ID, &["shooters"]), NOW).await.unwrap();
+        assert_picker_failure(&db, &mock, 1).await;
+        assert!(!mock.requests().iter().any(|request| request.method == "GET"),
+            "lock failure precedes all member/role REST reads");
+        held.rollback().await.unwrap();
+        runtime_pool.close().await;
+    }).catch_unwind().await;
+    db.close().await;
+    if let Err(error) = result { std::panic::resume_unwind(error); }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_reply_failures_roll_back_success_and_attempt_one_error_edit() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        for (mode, custom_id, key) in [
+            ("legacy", GAME_SELECT_ID, "shooters"),
+            ("session", SESSION_SELECT_ID, "find-players"),
+        ] {
+            for reject_replies in [false, true] {
+                let mock = discord(Arc::new(Mutex::new(DiscordState {
+                    reject_next_reply: true,
+                    reject_replies,
+                    ..Default::default()
+                }))).await;
+                let result = runtime(&db.pool, &mock, &vars(mode, false))
+                    .handle(component(custom_id, &[key]), NOW).await;
+                assert_eq!(result.is_err(), reject_replies,
+                    "only an undelivered error reply remains retryable");
+                assert_picker_failure(&db, &mock, 2).await;
+            }
+        }
+    }).catch_unwind().await;
+    db.close().await;
+    if let Err(error) = result { std::panic::resume_unwind(error); }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_uncertain_callback_edits_without_replaying_roles() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        for reject_replies in [false, true] {
+            let mock = discord(Arc::new(Mutex::new(DiscordState {
+                reject_callback: true,
+                reject_replies,
+                ..Default::default()
+            }))).await;
+            let result = runtime(&db.pool, &mock, &vars("legacy", false))
+                .handle(component(GAME_SELECT_ID, &["shooters"]), NOW).await;
+            assert_eq!(result.is_err(), reject_replies);
+            assert_picker_failure(&db, &mock, 1).await;
+            assert_eq!(mock.requests().len(), 2, "callback failure never replays role work");
+        }
+    }).catch_unwind().await;
+    db.close().await;
+    if let Err(error) = result { std::panic::resume_unwind(error); }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_deferred_error_reply_is_bounded() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mock = discord(Arc::new(Mutex::new(DiscordState {
+            reject_member_read: Some(1),
+            reply_delay: Duration::from_secs(8),
+            ..Default::default()
+        }))).await;
+        let runtime = runtime(&db.pool, &mock, &vars("session", false));
+        let result = tokio::time::timeout(Duration::from_secs(7),
+            runtime.handle(component(SESSION_SELECT_ID, &["find-players"]), NOW))
+            .await.expect("error reply must not hold the worker indefinitely");
+        assert!(result.is_err(), "undelivered failure reply is retryable");
+        assert_picker_failure(&db, &mock, 1).await;
+    }).catch_unwind().await;
+    db.close().await;
+    if let Err(error) = result { std::panic::resume_unwind(error); }
 }
 
 #[tokio::test]
