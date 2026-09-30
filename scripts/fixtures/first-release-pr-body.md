@@ -1,4 +1,18 @@
-# Changelog
+:robot: I have created a release *beep* *boop*
+
+## Summary
+
+Publish the next synchronized Rust workspace release through release-please.
+
+## Changes
+
+Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
+
+## Testing
+
+Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
+---
+
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 
@@ -88,3 +102,6 @@
 ### Notes
 
 - Command/component wiring and the Discord REST reads stay on the S4 interaction router and REST executor slices; the outcome enums are the integration surface until they land. Scorecard and probe collection are not enabled by this change.
+
+---
+Refs: TOG-9865

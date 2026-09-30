@@ -113,8 +113,24 @@ function migrateReleaseNotes(changelog, body) {
   assert(releases.length > 0, 'Missing versioned changelog entry');
   const start = releases[0].index;
   const end = releases[1]?.index ?? changelog.length;
-  const notes = changelog.slice(start, end).trim();
-  const heading = releases[0][0];
+  // This repository's 0.1.0 is an unpublished seed, not a tag. Native
+  // regeneration must not restore a dangling first-release comparison link.
+  const originalHeading = releases[0][0];
+  const heading = releases.length === 1
+    ? originalHeading.replace(/(https:\/\/github\.com\/TogetherWeOwn\/two-bot-next)\/compare\/v0\.1\.0\.\.\.(v\d+\.\d+\.\d+)/, '$1/releases/tag/$2')
+    : originalHeading;
+  if (heading !== originalHeading) {
+    changelog = changelog.slice(0, start) + changelog.slice(start).replace(originalHeading, heading);
+  }
+  const seedHeading = releases.length === 1
+    ? heading.replace(/(https:\/\/github\.com\/TogetherWeOwn\/two-bot-next)\/releases\/tag\/(v\d+\.\d+\.\d+)/, '$1/compare/v0.1.0...$2')
+    : heading;
+  if (seedHeading !== heading && body.includes(seedHeading)) {
+    assert(!body.includes(heading), 'Ambiguous release notes in PR body');
+    assert.equal(body.split(seedHeading).length, 2, 'Ambiguous release notes in PR body');
+    body = body.replace(seedHeading, heading);
+  }
+  const notes = changelog.slice(start, end + heading.length - originalHeading.length).trim();
   const bodyIndex = body.indexOf(heading);
   assert(bodyIndex >= 0, 'Generated release notes missing from PR body');
   assert.equal(body.indexOf(heading, bodyIndex + heading.length), -1, 'Ambiguous release notes in PR body');
