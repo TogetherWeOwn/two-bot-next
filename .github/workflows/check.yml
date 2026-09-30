@@ -109,6 +109,10 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
+      - name: LFG actual-router and mock-Discord regressions
+        run: >-
+          cargo test -p two-bot-discord --features db --locked --test lfg_interactions -- --ignored --test-threads=1
+
       - name: leveling Postgres parity tests
         env:
           TWO_LEVELING_TEST_CI: '1'

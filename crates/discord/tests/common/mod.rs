@@ -384,6 +384,8 @@ pub struct ScriptedResponse {
     pub body: Vec<u8>,
     /// Delay before answering (drives the 5 s abort test).
     pub delay: Duration,
+    /// Optional deterministic acceptance gate for persist-before-send tests.
+    pub gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl ScriptedResponse {
@@ -394,6 +396,7 @@ impl ScriptedResponse {
             headers: Vec::new(),
             body: Vec::new(),
             delay: Duration::ZERO,
+            gate: None,
         }
     }
 
@@ -404,6 +407,7 @@ impl ScriptedResponse {
             headers: Vec::new(),
             body: body.to_string().into_bytes(),
             delay: Duration::ZERO,
+            gate: None,
         }
     }
 
@@ -417,7 +421,14 @@ impl ScriptedResponse {
                 .to_string()
                 .into_bytes(),
             delay: Duration::ZERO,
+            gate: None,
         }
+    }
+
+    /// Answer only after the test explicitly releases acceptance.
+    pub fn gated(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Answer only after `delay` (the abort test uses a delay past 5 s).
@@ -549,6 +560,9 @@ async fn handle_rest(
         .expect("queue")
         .pop_front()
         .unwrap_or_else(|| default.clone());
+    if let Some(gate) = &next.gate {
+        gate.notified().await;
+    }
     if !next.delay.is_zero() {
         tokio::time::sleep(next.delay).await;
     }
