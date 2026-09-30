@@ -95,12 +95,20 @@ jobs:
                       or parts is None or not parts.netloc
                       or overflow_branch != f"{head_ref}--release-notes"):
                   raise SystemExit("Overflow link must resolve to this PR's notes branch")
-              encoded = subprocess.check_output([
+              # Documented Contents boundary
+              # (docs.github.com/rest/repos/contents): object bodies above
+              # 1 MiB arrive as content "" / encoding "none", so a --jq
+              # .content read silently resolves empty notes at that size.
+              # Read the authenticated raw representation instead, which
+              # carries the bytes at any size; an empty body still fails
+              # closed before the card-reference gate.
+              stored = subprocess.check_output([
                   "gh", "api", f"repos/{repo}/contents/release-notes.md?ref={overflow_branch}",
-                  "--jq", ".content",
+                  "-H", "Accept: application/vnd.github.raw",
               ], text=True)
-              import base64
-              return base64.b64decode("".join(encoded.split())).decode("utf-8")
+              if not stored.strip():
+                  raise SystemExit("Missing stored release notes")
+              return stored
 
           if event == "workflow_dispatch":
               number = os.environ["PR_NUMBER"]

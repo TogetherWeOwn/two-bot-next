@@ -74,8 +74,19 @@ class PRLintTests(unittest.TestCase):
             if args[:2] == ["gh", "pr"]:
                 return json.dumps(pr or PR)
             self.assertEqual(args[:2], ["gh", "api"])
-            self.assertIn("contents/release-notes.md", args[2])
+            url = next(arg for arg in args[2:] if "contents/release-notes.md" in arg)
+            self.assertIn("contents/release-notes.md", url)
             assert stored_notes is not None, "Unexpected stored-notes fetch"
+            if "Accept: application/vnd.github.raw" in args:
+                # Raw media carries the bytes at any size.
+                return stored_notes
+            # Documented Contents JSON boundary
+            # (docs.github.com/rest/repos/contents): object bodies above 1 MiB
+            # arrive as content "" / encoding "none". A JSON-path regression
+            # therefore resolves empty notes at that size and fails the
+            # description/card-reference gates loudly instead of passing.
+            if len(stored_notes.encode()) > 1024 * 1024:
+                return "\n"
             return base64.b64encode(stored_notes.encode()).decode() + "\n"
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             output = Path(tmp) / "output"
@@ -213,6 +224,30 @@ class PRLintTests(unittest.TestCase):
         metadata = self.resolve({**PR, "body": OVERFLOW_LINK}, stored_notes=big_notes)
         self.assertEqual(metadata["body"], big_notes)
         self.validate_subprocess(metadata)
+
+    def test_dispatch_overflow_above_contents_json_limit_resolves_via_raw(self):
+        # Documented Contents JSON boundary
+        # (docs.github.com/rest/repos/contents): object bodies above 1 MiB
+        # arrive as content "" / encoding "none". A 1,215,083-byte fixture
+        # proves the resolver reads the raw representation on the dispatch
+        # path: full notes (with card footer) survive lint. Reverting to a
+        # --jq .content read resolves empty notes and fails this test.
+        big_notes = STORED_NOTES + "x" * (1215083 - len(STORED_NOTES))
+        self.assertGreater(len(big_notes.encode()), 1024 * 1024)
+        metadata = self.resolve({**PR, "body": OVERFLOW_LINK}, stored_notes=big_notes)
+        self.assertEqual(metadata["body"], big_notes)
+        self.validate(metadata)
+
+    def test_pr_event_overflow_above_contents_json_limit_resolves_via_raw(self):
+        # Same boundary on the pull_request event path: an edited/reopened
+        # overflow PR resolves full stored notes through the same raw read.
+        big_notes = STORED_NOTES + "x" * (1215083 - len(STORED_NOTES))
+        self.assertGreater(len(big_notes.encode()), 1024 * 1024)
+        metadata = self.resolve(EVENT_NAME="pull_request", EVENT_BODY=OVERFLOW_LINK,
+                                EVENT_AUTHOR="github-actions[bot]", stored_notes=big_notes)
+        self.assertEqual(metadata["body"], big_notes)
+        self.assertEqual(metadata["event"], "pull_request")
+        self.validate(metadata)
 
     def test_pr_event_overflow_resolves_stored_notes(self):
         # The reviewer's pull_request-event P2: an edited/reopened release PR

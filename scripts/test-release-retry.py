@@ -96,8 +96,19 @@ elif args[:4] == ["api", "--method", "POST", repo + "/git/refs"]:
 elif "/contents/release-notes.md?ref=" in args[1]:
     if state.get("notes") is None:
         sys.exit(1)
-    if args[3] == ".content":
-        print(base64.b64encode(state["notes"].encode()).decode())
+    if "Accept: application/vnd.github.raw" in args:
+        # Raw media carries the bytes at any size.
+        sys.stdout.write(state["notes"])
+    elif args[3] == ".content":
+        # Documented Contents JSON boundary
+        # (docs.github.com/rest/repos/contents): object bodies above 1 MiB
+        # arrive as content "" / encoding "none". A JSON read therefore
+        # resolves empty notes at that size and fails reconciliation loudly
+        # before any push, PUT or dispatch, instead of publishing emptiness.
+        if len(state["notes"].encode()) > 1024 * 1024:
+            print("")
+        else:
+            print(base64.b64encode(state["notes"].encode()).decode())
     elif args[3] == ".sha":
         print(state["notes_sha"])
     else:
@@ -479,6 +490,24 @@ class ReleaseRetryTests(unittest.TestCase):
         self.fresh_checkout()
         self.reconcile()
         self.assertEqual(self.state(), before, "No push, PUT, create or PATCH on unchanged overflow rerun")
+
+    def test_overflow_above_contents_json_limit_reconciles_via_raw(self):
+        # Documented Contents JSON boundary
+        # (docs.github.com/rest/repos/contents): object bodies above 1 MiB
+        # arrive as content "" / encoding "none". A 1,215,083-byte fixture
+        # proves reconciliation reads the raw representation: the full stored
+        # notes (with one RSVP repair) reconcile while the visible link stays
+        # untouched. Reverting to a --jq .content read fails this test before
+        # any push, PUT or dispatch.
+        big_notes = BODY + "x" * (1215083 - len(BODY))
+        self.assertGreater(len(big_notes.encode()), 1024 * 1024)
+        self.state(body=OVERFLOW_BODY, notes=big_notes)
+        self.reconcile()
+        self.assertEqual(self.state()["pushes"], 1)
+        self.assertEqual(self.state()["patches"], 0)
+        self.assertEqual(self.state()["notes_puts"], 1)
+        self.assertEqual(self.state()["notes"].count("- historical RSVP repair"), 1)
+        self.assertEqual(self.state()["body"], OVERFLOW_BODY)
 
     def test_normal_body_stays_on_patch_path(self):
         self.assertLess(len(BODY), 65536)
