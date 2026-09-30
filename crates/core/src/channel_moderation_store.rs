@@ -344,10 +344,29 @@ mod tests {
             test_database_url_allowed(&url, ci),
             "non-test database refused"
         );
-        let admin = ChannelModerationStore::connect(&url, 1)
+        assert!(
+            std::env::var_os("PGOPTIONS").is_none(),
+            "PGOPTIONS is not allowed in isolated tests"
+        );
+        // Do not consult .pgpass or inherit a password, host, role, or TLS key.
+        let host = if url.contains("@127.0.0.1:") {
+            "127.0.0.1"
+        } else {
+            "agent-testdb"
+        };
+        let base_options = PgConnectOptions::new_without_pgpass()
+            .host(host)
+            .port(5432)
+            .username("agent_test")
+            .password("")
+            .database("agent_test")
+            .ssl_mode(sqlx::postgres::PgSslMode::Disable)
+            .application_name("channel_moderation_test");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(base_options.clone())
             .await
-            .expect("connects to test service")
-            .pool;
+            .expect("connects to test service with the mandated empty password");
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -358,9 +377,7 @@ mod tests {
             .execute(&admin)
             .await
             .expect("creates isolated test schema");
-        let options = PgConnectOptions::from_str(&url)
-            .expect("valid test URL")
-            .options([("search_path", schema.clone())]);
+        let options = base_options.options([("search_path", schema.clone())]);
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect_with(options)
