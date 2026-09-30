@@ -265,6 +265,24 @@ async fn malformed_overwrite_rows_refuse_without_mutation() {
             "missing id",
             serde_json::json!([{"type": 0, "allow": "0", "deny": "0"}]),
         ),
+        // Finding 3 identity validation: string shape is not identity —
+        // empty, nonnumeric, zero, and overflowing ids are unreadable.
+        (
+            "empty id",
+            serde_json::json!([{"id": "", "type": 0, "allow": "0", "deny": "0"}]),
+        ),
+        (
+            "nonnumeric id",
+            serde_json::json!([{"id": "not-a-snowflake", "type": 0, "allow": "0", "deny": "0"}]),
+        ),
+        (
+            "zero id",
+            serde_json::json!([{"id": "0", "type": 0, "allow": "0", "deny": "0"}]),
+        ),
+        (
+            "overflowing id",
+            serde_json::json!([{"id": "18446744073709551616", "type": 0, "allow": "0", "deny": "0"}]),
+        ),
     ];
     for (name, overwrites) in cases {
         let channel_body = serde_json::json!({
@@ -326,6 +344,60 @@ async fn valid_non_target_rows_still_lock_down() {
     let reqs = mock.requests();
     assert_eq!(reqs.len(), 2, "read then PUT");
     assert_eq!(reqs[1].method, "PUT");
+    mock.shutdown().await;
+}
+
+// Finding 3 identity validation: the read compares normalized snowflakes,
+// not raw strings, so a noncanonical caller guild id ("02222") still finds
+// the existing @everyone row ("2222") and preserves its masks instead of
+// writing a fabricated zero-mask overwrite.
+#[tokio::test]
+async fn noncanonical_guild_id_preserves_existing_masks() {
+    let channel_body = serde_json::json!({
+        "id": CHANNEL,
+        "permission_overwrites": [
+            {"id": GUILD, "type": 0, "allow": "1024", "deny": "64"},
+        ],
+    });
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, channel_body)],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let exec = ModerationExecution {
+        guild_id: format!("0{GUILD}"),
+        channel_id: Some(CHANNEL.to_owned()),
+        action: ModerationAction::Lockdown,
+        target_user_id: None,
+        reason: REASON.to_owned(),
+        duration_seconds: None,
+        count: None,
+        seconds: None,
+    };
+    executor_for(&mock)
+        .execute_outcome(
+            &exec,
+            &ActionOutcome::LockedDown {
+                channel_id: CHANNEL.to_owned(),
+            },
+        )
+        .await
+        .expect("noncanonical guild id resolves to the same target");
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 2, "read then PUT");
+    assert_eq!(reqs[1].method, "PUT");
+    let body: serde_json::Value =
+        serde_json::from_slice(&reqs[1].body).expect("overwrite body is JSON");
+    assert_eq!(
+        body["allow"],
+        serde_json::json!("1024"),
+        "existing allow bits preserved"
+    );
+    assert_eq!(
+        body["deny"],
+        serde_json::json!("2112"),
+        "existing deny bits preserved with the send bit set"
+    );
     mock.shutdown().await;
 }
 

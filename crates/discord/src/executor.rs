@@ -809,6 +809,12 @@ impl ActionExecutor {
         guild_id: &str,
     ) -> Result<Option<EveryoneOverwrite>, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        // The requested guild identity is validated with the same snowflake
+        // rules the PUT target uses, before any I/O: the read must compare
+        // normalized identities, not raw strings, so a noncanonical caller
+        // id (e.g. "02222") resolves to the same target the mutation uses
+        // (finding 3 identity validation).
+        let target: Id<GuildMarker> = snowflake(guild_id)?;
         let req = Self::request_of(self.inner.factory.channel(channel))?;
         // Reads use the paced lane with a single attempt (channel verbs run
         // under the router's own pacing; the 5 s abort still applies). The
@@ -843,7 +849,7 @@ impl ActionExecutor {
                     "unreadable channel {channel_id}: permission_overwrites[{index}] is not an object"
                 ))
             })?;
-            let id = row.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+            let id_raw = row.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
                 DiscordError::Rejected(format!(
                     "unreadable channel {channel_id}: permission_overwrites[{index}] has a non-string id"
                 ))
@@ -853,7 +859,17 @@ impl ActionExecutor {
                     "unreadable channel {channel_id}: permission_overwrites[{index}] has a non-numeric type"
                 ))
             })?;
-            if id == guild_id && kind == 0 {
+            // String shape is not identity: empty, nonnumeric, zero, and
+            // overflowing ids must refuse, and the comparison must use the
+            // normalized snowflake — comparing raw strings would miss a row
+            // whose id normalizes to the same target the PUT uses (finding 3
+            // identity validation).
+            let id: Id<GuildMarker> = snowflake(id_raw).map_err(|_| {
+                DiscordError::Rejected(format!(
+                    "unreadable channel {channel_id}: permission_overwrites[{index}] has an invalid id"
+                ))
+            })?;
+            if id == target && kind == 0 {
                 let mask = |field: &str| {
                     entry
                         .get(field)
