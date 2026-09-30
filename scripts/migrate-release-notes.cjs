@@ -90,6 +90,10 @@ function migrateReleaseNotes(changelog, body) {
       const start = entries[0].index;
       const end = entries[1]?.index ?? changelog.length;
       manual = changelog.slice(unreleasedPrefix.length, start).trim();
+      // Native can insert the generated entry INSIDE a pending code fence
+      // before a version-shaped example. Regex boundaries cannot prove those
+      // notes complete, so fenced pending notes require manual reconciliation.
+      assert(!/^\s*(?:`{3,}|~{3,})/m.test(manual), 'Ambiguous fenced Unreleased notes');
       original = changelog.slice(start, end).trim();
       history = changelog.slice(end);
     } else {

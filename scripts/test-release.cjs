@@ -223,6 +223,23 @@ assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n-
 assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n- pending', '## Changelog\n\n### Added\n\n- pending'), pendingBody), /historical release/);
 console.log('PASS post-release Unreleased prefix: native layout, history, body/footer, partial retries, next release, empty prefix, 5 fail-closed guards');
 
+// Native treats a version-shaped line in a pending fence as a release boundary
+// and can insert its generated entry inside the fence. Refuse this admission
+// before returning either output, rather than silently publishing partial notes.
+for (const fence of ['```markdown', '````markdown', '~~~markdown', '   ```markdown']) {
+  const pending = `### Notes\n\n- Pending formatting example:\n\n${fence}\n## 1.2.3\n${fence.trim().startsWith('~') ? '~~~' : '````'}\n\n- pending caveat AFTER example`;
+  const snapshot = `# Changelog\n\n## Unreleased\n\n${pending}\n\n${publishedHistory}`;
+  const generated = new Changelog({version: Version.parse('0.3.0'), changelogEntry: nextBody}).updateContent(snapshot);
+  assert(generated.includes(`${fence}\n${nextBody}`), 'Pinned native updater must reproduce insertion inside the pending fence');
+  assert(generated.includes('- pending caveat AFTER example'));
+  assert(generated.endsWith(publishedHistory));
+  assert.throws(() => migrateReleaseNotes(generated, pendingBody), /Ambiguous fenced Unreleased notes/);
+  assert.throws(() => migrateReleaseNotes(generated, pendingBody), /Ambiguous fenced Unreleased notes/, 'Retry must fail closed too');
+}
+const fencedWithoutVersion = pendingChangelog.replace('- pending caveat', '```text\nexample\n```\n\n- pending caveat');
+assert.throws(() => migrateReleaseNotes(fencedWithoutVersion, pendingBody), /Ambiguous fenced Unreleased notes/, 'The supported prefix contract requires unfenced notes, even without a version-shaped example');
+console.log('PASS fenced pending notes: 4 native version-heading reproductions and retries fail closed; ordinary fenced prefix refused explicitly');
+
 // Overflow link parsing retains the exact native single-line contract.
 const overflowUrl = `https://github.com/fixture/two-bot-next/blob/${NATIVE_NOTES_BRANCH}/release-notes.md`;
 const overflowBody = `${NATIVE_OVERFLOW_SENTENCE} ${overflowUrl}`;

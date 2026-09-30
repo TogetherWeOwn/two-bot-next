@@ -362,6 +362,29 @@ class ReleaseRetryTests(unittest.TestCase):
         self.assertEqual(self.state(), before, "Completed prefix reconciliation is a no-op")
         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_fenced_unreleased_notes_fail_before_any_write(self):
+        current = "## 0.3.0\n\n### Added\n\n* generated feature"
+        history = "## 0.2.0\n\n### Fixed\n\n- published repair\n"
+        for fence in ["```markdown", "~~~markdown", "   ````markdown"]:
+            with self.subTest(fence=fence):
+                # Exact layout emitted by native 17.6.0: it inserts the release
+                # inside the pending fence before the version-shaped example.
+                changelog = f"# Changelog\n\n## Unreleased\n\n### Notes\n\n- Pending example:\n\n{fence}\n{current}\n\n## 1.2.3\n{fence}\n\n- pending caveat AFTER example\n\n{history}"
+                body = f":robot: release\n---\n\n{current}\n\n---\nRefs: TOG-9865\n"
+                (self.repo / "CHANGELOG.md").write_text(changelog)
+                self.git("add", "CHANGELOG.md")
+                self.git("commit", "-m", "chore(main): release 0.3.0")
+                self.git("push", "origin", "HEAD")
+                self.state(body=body)
+                before = self.state()
+                head = self.git("rev-parse", "HEAD")
+                for _ in range(2):
+                    self.reconcile(False)
+                    self.assertEqual((self.repo / "CHANGELOG.md").read_text(), changelog)
+                    self.assertEqual(self.state(), before, "No push, PATCH, PUT or branch creation before rejection, including retries")
+                    self.assertEqual(self.git("rev-parse", "HEAD"), head)
+                    self.assertEqual(self.git("status", "--porcelain"), "")
+
     def test_new_main_snapshot_regenerates_native_pr(self):
         new_main = self.git("commit-tree", "HEAD^{tree}", "-p", self.main, input="feat: next main snapshot\n").strip()
         self.env["GITHUB_SHA"] = new_main
