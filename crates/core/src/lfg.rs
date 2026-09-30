@@ -81,6 +81,27 @@ pub enum RoleSpecError {
     DuplicateKey(String),
 }
 
+/// ECMAScript WhiteSpace + LineTerminator for legacy `trim()` / `Number()`.
+/// Unlike Rust whitespace, this includes BOM and excludes U+0085 (NEL).
+fn trim_ecmascript(value: &str) -> &str {
+    value.trim_matches(|ch| {
+        matches!(
+            ch,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    })
+}
+
 /// Parse a `tank:Tank:2,healer:Healer:2,dps:DPS:6` role spec (legacy
 /// `parseRoleSpec` + `normalizeRoles`).
 pub fn parse_role_spec(spec: &str) -> Result<Vec<LfgRoleSpec>, RoleSpecError> {
@@ -96,11 +117,11 @@ pub fn parse_role_spec(spec: &str) -> Result<Vec<LfgRoleSpec>, RoleSpecError> {
             return Err(RoleSpecError::BadShape);
         }
         let raw_key = fields[0];
-        let key = raw_key.trim().to_lowercase();
+        let key = trim_ecmascript(raw_key).to_lowercase();
         if !valid_role_key(&key) {
             return Err(RoleSpecError::BadKey(raw_key.to_owned()));
         }
-        let label = fields[1].trim();
+        let label = trim_ecmascript(fields[1]);
         if label.is_empty() || label.encode_utf16().count() > 80 {
             return Err(RoleSpecError::BadLabel);
         }
@@ -137,7 +158,7 @@ fn parse_radix_number(digits: &str, radix: u32) -> Option<f64> {
 /// Legacy `Number(fields[2])`: decimal/exponent and unsigned radix forms,
 /// followed by the integer/range check. Empty and non-finite values fail.
 fn parse_slots(raw: &str) -> Option<u8> {
-    let trimmed = raw.trim();
+    let trimmed = trim_ecmascript(raw);
     if trimmed.is_empty() {
         return None;
     }
@@ -177,7 +198,7 @@ pub enum TitleError {
 
 /// Trim and enforce the legacy 1–100 UTF-16 code-unit title limit.
 pub fn validate_title(title: &str) -> Result<String, TitleError> {
-    let trimmed = title.trim();
+    let trimmed = trim_ecmascript(title);
     if trimmed.is_empty() || trimmed.encode_utf16().count() > MAX_TITLE_CHARS {
         return Err(TitleError::BadTitle);
     }
@@ -602,6 +623,84 @@ mod tests {
         assert_eq!(roles[0].key, "tank");
         assert_eq!(roles[0].label, "Main Tank");
         assert_eq!(roles[0].slots, 4);
+    }
+
+    #[test]
+    fn ecmascript_whitespace_is_trimmed_from_roles_slots_and_titles() {
+        // ECMAScript WhiteSpace + LineTerminator, including BOM (not Rust whitespace).
+        for ch in [
+            '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{00a0}',
+            '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}',
+            '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}',
+            '\u{202f}', '\u{205f}', '\u{3000}', '\u{feff}',
+        ] {
+            let roles = parse_role_spec(&format!("{ch}Tank{ch}:{ch}Main Tank{ch}:{ch}2{ch}"))
+                .expect("legacy trims this character");
+            assert_eq!(roles[0].key, "tank", "{ch:?}");
+            assert_eq!(roles[0].label, "Main Tank", "{ch:?}");
+            assert_eq!(roles[0].slots, 2, "{ch:?}");
+            assert_eq!(
+                validate_title(&format!("{ch}Friday raid{ch}")),
+                Ok("Friday raid".to_owned()),
+                "{ch:?}"
+            );
+            assert_eq!(validate_title(&ch.to_string()), Err(TitleError::BadTitle));
+            assert_eq!(
+                parse_role_spec(&format!("tank:{ch}:2")),
+                Err(RoleSpecError::BadLabel),
+                "{ch:?}"
+            );
+            assert_eq!(
+                parse_role_spec(&format!("tank:Tank:{ch}")),
+                Err(RoleSpecError::BadSlots),
+                "{ch:?}"
+            );
+        }
+        assert_eq!(
+            parse_role_spec("\u{feff}Tank:Tank:1,tank:Other:1"),
+            Err(RoleSpecError::DuplicateKey("tank".to_owned()))
+        );
+    }
+
+    #[test]
+    fn non_ecmascript_whitespace_is_preserved() {
+        // NEL is Rust whitespace but not ECMAScript whitespace; neither are
+        // Mongolian vowel separator and zero-width space.
+        for ch in ['\u{0085}', '\u{180e}', '\u{200b}'] {
+            let key = format!("{ch}tank{ch}");
+            assert_eq!(
+                parse_role_spec(&format!("{key}:Tank:2")),
+                Err(RoleSpecError::BadKey(key)),
+                "{ch:?}"
+            );
+            let label = format!("{ch}Tank{ch}");
+            assert_eq!(
+                parse_role_spec(&format!("tank:{label}:2")).expect("label preserved")[0].label,
+                label,
+                "{ch:?}"
+            );
+            assert_eq!(
+                parse_role_spec(&format!("tank:Tank:{ch}2{ch}")),
+                Err(RoleSpecError::BadSlots),
+                "{ch:?}"
+            );
+            assert_eq!(validate_title(&ch.to_string()), Ok(ch.to_string()));
+        }
+    }
+
+    #[test]
+    fn ecmascript_trimming_preserves_interior_whitespace() {
+        let roles = parse_role_spec("tank:Main\u{feff}Tank:2").expect("label preserved");
+        assert_eq!(roles[0].label, "Main\u{feff}Tank");
+        assert_eq!(
+            validate_title("Friday\u{feff}raid"),
+            Ok("Friday\u{feff}raid".to_owned())
+        );
+        assert!(parse_role_spec("ta\u{feff}nk:Tank:2").is_err());
+        assert_eq!(
+            parse_role_spec("tank:Tank:2\u{feff}0"),
+            Err(RoleSpecError::BadSlots)
+        );
     }
 
     #[test]

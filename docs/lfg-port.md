@@ -10,7 +10,7 @@ This is the self-contained domain/store portion of TOG-10084. The legacy behavio
 
 Same-role selection returns `joined` without changing the original signup timestamp. Moving into a full role preserves the existing signup. Close and signup share the same advisory-lock key so a close cannot race a capacity decision. A foreign-guild upsert is refused before role replacement. Closed posts keep existing signups but remove select options and refuse new signups; leave remains allowed as in legacy.
 
-Role keys, duplicate detection, JavaScript numeric slot forms, and UTF-16 title/label limits follow legacy. Message truncation keeps the legacy UTF-16 cap without emitting half a surrogate pair. Start-time input deliberately accepts RFC-3339 ISO-8601 timestamps only; it does not reproduce `Date.parse`'s undocumented natural-language/date-format acceptance.
+Role keys, duplicate detection, JavaScript numeric slot forms, and UTF-16 title/label limits follow legacy. Keys, labels, slots, and titles use ECMAScript WhiteSpace/LineTerminator trimming, including BOM (U+FEFF) and excluding NEL (U+0085); interior characters are preserved. Message truncation keeps the legacy UTF-16 cap without emitting half a surrogate pair. Start-time input deliberately accepts RFC-3339 ISO-8601 timestamps only; it does not reproduce `Date.parse`'s undocumented natural-language/date-format acceptance.
 
 ## Runtime integration still required
 
