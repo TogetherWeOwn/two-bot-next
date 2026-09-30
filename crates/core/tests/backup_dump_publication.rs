@@ -149,7 +149,7 @@ async fn cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dum
              code TEXT, entry_id TEXT, created_at TIMESTAMPTZ, execute_at TIMESTAMPTZ, \
              request_id TEXT, channel_id TEXT, idempotency_key TEXT, occurred_at TIMESTAMPTZ, \
              audit_entry_id TEXT, started_at TIMESTAMPTZ, event_id TEXT, joined_at TIMESTAMPTZ, \
-             name TEXT, ticket_id TEXT, user_id TEXT, message_id TEXT, panel_id TEXT, body TEXT)"
+             name TEXT, ticket_id TEXT, user_id TEXT, message_id TEXT, panel_id TEXT, generation BIGSERIAL, body TEXT)"
         )))
         .execute(&pool)
         .await

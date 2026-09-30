@@ -42,8 +42,24 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-All 22 bot-owned tables are dumped (see `DUMP_TABLES` in
+All 23 bot-owned tables are dumped (see `DUMP_TABLES` in
 `crates/core/src/backup/dump_file.rs`); the website's tables are not ours.
+This includes `moderation_member_bans`: acceptance, insertion-order generation
+and prepared/rejected fences are read in the same repeatable-read snapshot as
+scheduled unbans and idempotency. Restore replaces destination ownership rather
+than merging it, then resets its generation sequence after the restored MAX
+(empty ownership restarts at 1). Stop the target consumer before a restore;
+a restored running claim remains uncertain, never automatically retried.
+
+The frozen 22-table v3 envelope remains readable without the additive ownership
+table. Restoring it **clears all destination ownership** and quarantines staged,
+pending or running expiries lacking matching ownership; it never invents
+acceptance or order from timestamps/request IDs. Imported running DELETEs keep
+their independent uncertainty fence, original claim token and timestamps through
+quarantine. The CLI warns on absent ownership and reports the quarantine count;
+row-count verification is data fidelity, **not** moderation-enable approval.
+Keep `TWO_MODERATION` off until authoritative reconciliation records the actual
+Discord outcomes. Every other v3 table remains mandatory.
 
 ## Nightly DB backup — daily 04:17
 

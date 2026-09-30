@@ -48,6 +48,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "operational_audit_log",
     "moderation_warnings",
     "moderation_scheduled_unbans",
+    "moderation_member_bans",
     "moderation_audit",
     "moderation_lockdowns",
     "moderation_idempotency",
@@ -681,9 +682,12 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
+    // The ownership ledger is additive to the frozen 22-table v3 envelope.
+    // Old dumps remain readable, but restore clears destination ownership and
+    // quarantines their orphan expiries; absence never proves acceptance.
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
-        .filter(|name| !names.contains(**name))
+        .filter(|name| **name != "moderation_member_bans" && !names.contains(**name))
         .copied()
         .collect();
     if !missing.is_empty() {

@@ -55,6 +55,7 @@ fn order_for(table: &str, columns: &[String]) -> String {
         "operational_audit_log" => "entry_id",
         "moderation_warnings" => "created_at, id",
         "moderation_scheduled_unbans" => "execute_at, request_id",
+        "moderation_member_bans" => "guild_id, user_id, generation",
         "moderation_audit" => "created_at, request_id",
         "moderation_lockdowns" => "guild_id, channel_id",
         "moderation_idempotency" => "guild_id, idempotency_key",
@@ -250,6 +251,10 @@ pub struct RestoreReport {
     pub manifest: DumpManifest,
     pub restored: BTreeMap<String, u64>,
     pub dropped_columns: BTreeMap<String, Vec<String>>,
+    /// Old v3 has no acceptance/generation evidence. Never reuse target rows.
+    pub missing_member_ban_ownership: bool,
+    /// Orphan expiry rows retained but made non-executable for reconciliation.
+    pub quarantined_unbans: u64,
     pub ok: bool,
 }
 
@@ -368,12 +373,42 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         }
     }
 
+    // As in migration 0111: unknown acceptance/order cannot be reconstructed
+    // from request IDs or timestamps. Retain orphan expiries for reconciliation,
+    // including the independent fence of any imported running DELETE.
+    sqlx::query(
+        "UPDATE moderation_scheduled_unbans SET dispatch_uncertain = TRUE
+         WHERE state = 'running'
+            OR (state = 'quarantined' AND (claim_token IS NOT NULL OR claimed_at IS NOT NULL))",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let quarantined_unbans = sqlx::query(
+        "UPDATE moderation_scheduled_unbans AS job SET state = 'quarantined'
+         WHERE job.state IN ('staged', 'pending', 'running')
+           AND NOT EXISTS (
+             SELECT 1 FROM moderation_member_bans AS intent
+             WHERE intent.request_id = job.request_id AND intent.guild_id = job.guild_id
+               AND intent.user_id = job.user_id
+           )",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
     // Put the id sequence back past the restored high-water mark, or the
     // first write after the restore collides with a row we just put back.
     sqlx::query(
         "SELECT setval(pg_get_serial_sequence('events', 'id'), \
          GREATEST((SELECT COALESCE(MAX(id), 0) FROM events), 1), \
          (SELECT COUNT(*) FROM events) > 0)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "SELECT setval(pg_get_serial_sequence('moderation_member_bans', 'generation'), \
+         GREATEST((SELECT COALESCE(MAX(generation), 0) FROM moderation_member_bans), 1), \
+         EXISTS (SELECT 1 FROM moderation_member_bans))",
     )
     .execute(&mut *tx)
     .await?;
@@ -398,10 +433,16 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         restored.insert(table.name.clone(), count);
     }
 
+    let missing_member_ban_ownership = !manifest
+        .tables
+        .iter()
+        .any(|table| table.name == "moderation_member_bans");
     Ok(RestoreReport {
         manifest,
         restored,
         dropped_columns,
+        missing_member_ban_ownership,
+        quarantined_unbans,
         ok,
     })
 }

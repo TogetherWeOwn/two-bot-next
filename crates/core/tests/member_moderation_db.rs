@@ -14,6 +14,9 @@ use two_bot_core::member_moderation::{
 use two_bot_core::member_moderation_store::PgMemberModerationStore;
 use two_bot_core::{ModerationAction, ModerationActor, ModerationPolicy, ModerationTarget};
 
+#[path = "support/member_moderation_backup.rs"]
+mod backup;
+
 const NOW: &str = "2023-11-14T22:13:20.000Z";
 const DUE: &str = "2023-11-14T23:13:20.000Z";
 

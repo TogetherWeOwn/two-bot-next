@@ -62,6 +62,10 @@
   while their dispatch claims remain held; preserve the required expiry after
   an authoritatively voided DELETE, and retry never-dispatched fence refusals
   without releasing the older uncertain operation.
+- Preserve ban ownership, generations and expiry eligibility in consistent
+  backups; replace stale destination ownership and reset generation sequences
+  on restore. Old v3 restores quarantine unknown expiries without inventing
+  acceptance or discarding running DELETE fences.
 
 ### Notes
 
