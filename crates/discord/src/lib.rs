@@ -6,10 +6,17 @@
 //! without a gateway connection.
 
 pub mod adapter;
+pub mod executor;
 pub mod intents;
 pub mod pipeline;
 
 pub use adapter::event_to_core;
+pub use executor::{
+    lockdown_masks, pace_delay_ms, paced_step, throw_for_status, timeout_until_iso, unlock_masks,
+    ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall, DiscordError, EveryoneOverwrite,
+    PacedStep, RawResponse, KICK_INTERVAL_MS, MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS,
+    MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
+};
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use pipeline::{
     build_cache, ChannelClassifier, InviteSource, MemPipeline, NoClassification, NoInvites,

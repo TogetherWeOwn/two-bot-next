@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(retry_after_ms(Some(2.0), None), 2250);
         // Body wins when present (kick.ts); fractional seconds ceil.
         assert_eq!(retry_after_ms(Some(5.0), Some(1.5)), 1750);
-        assert_eq!(retry_after_ms(Some(1.0), Some(6.457)), 6957);
+        assert_eq!(retry_after_ms(Some(1.0), Some(6.457)), 6707);
         // Missing header defaults to 1s + 250.
         assert_eq!(retry_after_ms(None, None), 1250);
         // Garbage / negative falls back to 1s + 250.

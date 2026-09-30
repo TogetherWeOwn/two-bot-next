@@ -16,9 +16,16 @@
 //!
 //! Dev-only test support: never ships in the release binary.
 
+// Shared by the gateway tests (s2_prototype) and the REST tests
+// (executor_acceptance); each uses a different half, so unused-half
+// warnings are expected per target.
+#![allow(dead_code)]
+
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -358,4 +365,271 @@ async fn handle_http(mut stream: TcpStream, recorded: Arc<Mutex<Vec<RecordedRequ
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.write_all(&payload).await;
+}
+
+// ── Scripted REST mock (TOG-10076) ───────────────────────────────────────
+// The REST side of the mock Discord double: a plain-HTTP listener that
+// replays a scripted response queue (status + headers + body + optional
+// delay) while recording every request — method, path, headers, body, and
+// mock-side arrival time — for assertions.
+//
+// The S4 executor points at this via `DISCORD_API_BASE`
+// (`ActionExecutor::with_proxy(token, Some(origin))`). Arrival times let
+// the acceptance tests pin pacing (110 ms / 350 ms), 429 waits
+// (`retry-after + 250 ms`) and 5xx backoff (`500 * 2^attempt`) on the wire
+// without trusting client-side timers.
+//
+// Dev-only test support: never ships in the release binary.
+
+/// One scripted HTTP response: popped in order, one per request.
+#[derive(Debug, Clone)]
+pub struct ScriptedResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// Delay before answering (drives the 5 s abort test).
+    pub delay: Duration,
+}
+
+impl ScriptedResponse {
+    /// Bare status with an empty body.
+    pub fn status(status: u16) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: Vec::new(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// JSON status with a JSON body.
+    pub fn json(status: u16, body: serde_json::Value) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// 429 whose JSON `retry_after` body (seconds) wins over `header_secs`
+    /// per legacy `kick.ts` — lets tests prove body-beats-header on the wire.
+    pub fn rate_limited(body_secs: f64, header_secs: &str) -> Self {
+        Self {
+            status: 429,
+            headers: vec![("retry-after".to_owned(), header_secs.to_owned())],
+            body: serde_json::json!({"retry_after": body_secs, "global": false})
+                .to_string()
+                .into_bytes(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// Answer only after `delay` (the abort test uses a delay past 5 s).
+    pub fn delayed(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
+}
+
+/// One recorded REST request, with the mock-side arrival time.
+#[derive(Debug, Clone)]
+pub struct RestRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub received_at: std::time::Instant,
+}
+
+impl RestRequest {
+    /// Case-insensitive header lookup (hyper lowercases wire names).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// The running scripted REST double.
+pub struct MockRest {
+    /// Listener address; `origin()` renders the `DISCORD_API_BASE` override.
+    pub addr: SocketAddr,
+    recorded: Arc<Mutex<Vec<RestRequest>>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl MockRest {
+    /// Bind on 127.0.0.1 and start serving `script` in order; once the queue
+    /// is spent, every further request gets `default`.
+    pub async fn start(script: Vec<ScriptedResponse>, default: ScriptedResponse) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
+        let addr = listener.local_addr().expect("rest addr");
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let queue = Arc::new(Mutex::new(VecDeque::from(script)));
+        let handle = {
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                rest_task(listener, recorded, queue, default).await;
+            })
+        };
+        Self {
+            addr,
+            recorded,
+            handle: Some(handle),
+        }
+    }
+
+    /// `http://127.0.0.1:PORT` for `ActionExecutor::with_proxy`.
+    pub fn origin(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Snapshot of recorded REST requests in arrival order.
+    pub fn requests(&self) -> Vec<RestRequest> {
+        self.recorded.lock().expect("recorded").clone()
+    }
+
+    /// Stop the listener.
+    pub async fn shutdown(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+async fn rest_task(
+    listener: TcpListener,
+    recorded: Arc<Mutex<Vec<RestRequest>>>,
+    queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    default: ScriptedResponse,
+) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        let recorded = Arc::clone(&recorded);
+        let queue = Arc::clone(&queue);
+        let default = default.clone();
+        tokio::spawn(async move { handle_rest(stream, recorded, queue, default).await });
+    }
+}
+
+async fn handle_rest(
+    mut stream: TcpStream,
+    recorded: Arc<Mutex<Vec<RestRequest>>>,
+    queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    default: ScriptedResponse,
+) {
+    let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
+        return;
+    };
+    recorded.lock().expect("recorded").push(RestRequest {
+        method,
+        path,
+        headers,
+        body,
+        received_at: std::time::Instant::now(),
+    });
+    let next = queue
+        .lock()
+        .expect("queue")
+        .pop_front()
+        .unwrap_or_else(|| default.clone());
+    if !next.delay.is_zero() {
+        tokio::time::sleep(next.delay).await;
+    }
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+        next.status,
+        reason_phrase(next.status),
+        next.body.len(),
+    );
+    for (name, value) in &next.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(&next.body).await;
+}
+
+/// Read one HTTP/1.1 request: request line, all headers, `content-length`
+/// body. Returns `None` on a dead or oversized stream.
+async fn read_rest_request(
+    stream: &mut TcpStream,
+) -> Option<(String, String, Vec<(String, String)>, Vec<u8>)> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let Ok(n) = stream.read(&mut chunk).await else {
+            return None;
+        };
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 64 * 1024 {
+            return None;
+        }
+    }
+    let head_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or("").to_owned();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_owned();
+    let path = parts.next().unwrap_or("").to_owned();
+    let mut headers = Vec::new();
+    let mut content_len = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_lowercase();
+        let value = value.trim().to_owned();
+        if name == "content-length" {
+            content_len = value.parse::<usize>().unwrap_or(0).min(1024 * 1024);
+        }
+        headers.push((name, value));
+    }
+    let mut body = buf[head_end..].to_vec();
+    while body.len() < content_len {
+        let Ok(n) = stream.read(&mut chunk).await else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_len);
+    Some((method, path, headers, body))
 }

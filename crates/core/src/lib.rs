@@ -5,8 +5,8 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
-pub mod commands;
 pub mod action_outcomes;
+pub mod commands;
 pub mod config;
 pub mod events;
 pub mod expected_joins;
@@ -19,13 +19,13 @@ pub mod leveling;
 pub mod moderation;
 pub mod voice;
 
-pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use action_outcomes::{
-    backoff_ms, classify_kick_status, clear_send_bit, lockdown_overwrite, parse_retry_after_secs,
-    pace_wait_ms, retry_after_ms, set_send_bit, unlock_overwrite, ActionOutcome, KickOutcome,
-    KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
+    backoff_ms, classify_kick_status, clear_send_bit, lockdown_overwrite, pace_wait_ms,
+    parse_retry_after_secs, retry_after_ms, set_send_bit, unlock_overwrite, ActionOutcome,
+    KickOutcome, KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
     MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS, SEND_MESSAGES_BIT,
 };
+pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
