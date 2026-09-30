@@ -182,6 +182,9 @@ impl FileAudit {
             let mut text = String::new();
             file.read_to_string(&mut text)
                 .map_err(|_| "cannot read audit file")?;
+            if !text.is_empty() && !text.ends_with('\n') {
+                return Err("unterminated audit record; repair evidence before resuming".into());
+            }
             let mut done = HashSet::new();
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 // Fail closed on damaged evidence; never hide a successful kick.

@@ -129,6 +129,19 @@ mod tests {
     }
 
     #[test]
+    fn shared_kick_policy_preserves_350ms_floor_and_four_retries() {
+        use crate::{backoff_ms, pace_wait_ms, MAX_HTTP_TRIES};
+        assert_eq!(pace_wait_ms(1000, 350, 1000), 350);
+        assert_eq!(pace_wait_ms(1000, 350, 1349), 1);
+        assert_eq!(pace_wait_ms(1000, 350, 1350), 0);
+        assert_eq!(MAX_HTTP_TRIES, 5);
+        assert_eq!(
+            (0..4).map(backoff_ms).collect::<Vec<_>>(),
+            vec![500, 1000, 2000, 4000]
+        );
+    }
+
+    #[test]
     fn terminal_outcome_stays_settled_even_in_a_later_dry_run() {
         for mode in [RemovalMode::DryRun, RemovalMode::Execute] {
             assert_eq!(

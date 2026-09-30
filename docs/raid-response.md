@@ -16,11 +16,33 @@ The core [raid-watch and join-risk contracts](raid-port.md) remain alert/flag-on
 
 Execution requires `--execute --expect N`, where N is the exact unique input count, and a moderation `--reason`. Neither an environment variable nor a risk score can arm removal. The live-guild fence must also be deliberately opened with `--allow-live-guild`; that flag is a technical guard, not moderation authorization or cutover approval.
 
+Example (supply the approved guild/window/count, never copy a historical count):
+
+```sh
+umask 077
+mkdir -p data
+cargo run -p two-bot-cutover --bin raid-list -- --guild "$GUILD" \
+  --from "$FROM" --to "$TO" --format json > data/raid-cohort.json
+cargo run -p two-bot-cutover --bin raid-remove -- --guild "$GUILD" \
+  --ids-from data/raid-cohort.json --audit data/raid-cohort-audit.jsonl
+# Only after reviewing the file and authorizing the unique count:
+cargo run -p two-bot-cutover --bin raid-remove -- --guild "$GUILD" \
+  --ids-from data/raid-cohort.json --audit data/raid-cohort-audit.jsonl \
+  --execute --expect "$APPROVED_COUNT" --reason "$APPROVED_REASON" \
+  --protected-roles "$PROTECTED_ROLE_IDS"
+```
+
+`--protected-roles` is optional but should include community-specific protected roles. Guild owner, the executing bot, all bots, staff roles with dangerous moderation/management permissions, and targets at or above the bot's highest role are always protected. Unknown roles, missing bot permissions or unreadable safety responses stop the run. CSV is `guild_id,member_id,joined_at,score`; JSON also includes source/reason evidence. A plain string-ID array or one-ID-per-line file (comments allowed) is accepted for hand-reviewed cohorts. Bad entries and cross-guild JSON/CSV refuse the whole file. An empty report is valid evidence of no cohort, but removal refuses an empty list.
+
+The list query suppresses bots, members already left, and accounts with recorded message/voice participation in the projection or funnel. This is intentionally stricter than blindly removing every risk flag. The list uses the existing schema read-only (no automatic migrations); migration `0360_join_risk_flags.sql` provides the legacy evidence shape for cutover. It does not create flags or activate the containment runtime. An absent schema fails loudly rather than emitting an empty cohort.
+
+Exit codes: `0` clean; `1` reached-account failures/abort; `2` refusal or audit failure. Dry-run summary includes reached/skipped/failure counts; per-account intent is in the private JSONL audit. Execution requires only `DISCORD_TOKEN`, never a fallback credential. Neither the CLI nor its environment can redirect that token to an arbitrary API host; loopback mock injection is a library-test seam only.
+
 It **kicks, never bans**. A kicked account can rejoin through the rules gate. There is no automatic escalation from kick to ban.
 
 ## Audit and resume
 
-Keep one audit file per approved cohort. Every reached target has an outcome, including dry-run intent, protection refusals, missing members and transport failures. The file is appended and fsynced before the next target is considered. A write failure ends the run; it must never silently proceed without an audit.
+Keep one audit file per approved cohort. Every reached target has an outcome, including dry-run intent, protection refusals, missing members and transport failures. The file is appended and fsynced before the next target is considered. A write failure ends the run; it must never silently proceed without an audit. A malformed or unterminated prior record refuses resume until the evidence is inspected and repaired; the tool never truncates or silently repairs it.
 
 Execute outcomes `kicked` and `already_gone` are terminal for that guild/member in that audit file. A later dry-run line cannot re-arm an earlier kick. Resume with the same input and audit file: settled targets are skipped without Discord requests; failures remain retryable. If an approved target genuinely rejoins, review it as a new cohort with a new audit file. A crash between kick and audit converges through a fresh membership 404 on resume.
 

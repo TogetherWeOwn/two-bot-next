@@ -199,6 +199,84 @@ async fn forbidden_read_is_not_missing_and_aborts_without_credential_retry_or_de
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn settled_replay_and_dry_run_make_no_requests_even_with_executor_present() {
+    let (ex, requests, task) = mock(vec![]).await;
+    task.await.unwrap();
+    let ids = vec![A.into()];
+    let done = HashSet::from([A.into()]);
+    let empty = HashSet::new();
+    for mode in [RemovalMode::DryRun, RemovalMode::Execute] {
+        let summary = remove_accounts(
+            RemovalRun {
+                guild: G,
+                ids: &ids,
+                mode,
+                reason: "reviewed",
+                run_id: "test",
+                done: &done,
+                protected: &empty,
+            },
+            Some(&ex),
+            |_| panic!("settled target must not append a new record"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.skipped_done, 1);
+    }
+    let summary = remove_accounts(
+        RemovalRun {
+            guild: G,
+            ids: &ids,
+            mode: RemovalMode::DryRun,
+            reason: "reviewed",
+            run_id: "test",
+            done: &empty,
+            protected: &empty,
+        },
+        Some(&ex),
+        |r| {
+            assert_eq!(r.outcome, "would_kick");
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.reached, 1);
+    assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(ex.requests(), 0);
+}
+
+#[tokio::test]
+async fn audit_failure_after_kick_stops_before_next_member_read() {
+    let mut steps = safety(A, json!([]));
+    steps.push(step(
+        format!("DELETE /api/v10/guilds/{G}/members/{A}"),
+        204,
+        Value::Null,
+    ));
+    let (ex, requests, task) = mock(steps).await;
+    let ids = vec![A.into(), B.into()];
+    let empty = HashSet::new();
+    let result = remove_accounts(
+        RemovalRun {
+            guild: G,
+            ids: &ids,
+            mode: RemovalMode::Execute,
+            reason: "reviewed",
+            run_id: "test",
+            done: &empty,
+            protected: &empty,
+        },
+        Some(&ex),
+        |_| Err("disk full".into()),
+    )
+    .await;
+    task.await.unwrap();
+    assert!(result.is_err());
+    assert_eq!(requests.lock().unwrap().len(), 6);
+}
+
 #[test]
 fn file_audit_is_durable_locked_and_terminal_ever_scoped_by_guild() {
     let root = std::env::var_os("PAPERCLIP_SCRATCH_DIR")
@@ -237,7 +315,20 @@ fn file_audit_is_durable_locked_and_terminal_ever_scoped_by_guild() {
     let audit = FileAudit::open(&path, "100000000000000011").unwrap();
     assert!(audit.done.is_empty());
     drop(audit);
-    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.lines().count(), 2);
+    std::fs::write(&path, text.trim_end_matches('\n')).unwrap();
+    for _ in 0..2 {
+        // Refusal must also release the lock so repaired evidence can resume.
+        assert!(FileAudit::open(&path, G)
+            .err()
+            .unwrap()
+            .contains("unterminated audit record"));
+    }
+    std::fs::write(&path, text).unwrap();
+    let audit = FileAudit::open(&path, G).unwrap();
+    assert!(audit.done.contains(A));
+    drop(audit);
     std::fs::remove_file(path).unwrap();
 }
 
