@@ -22,6 +22,7 @@ sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+tracing = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
