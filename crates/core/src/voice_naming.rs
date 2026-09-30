@@ -809,8 +809,13 @@ fn render_segments<E: ExtensionPolicy>(
                     PluralCounter::Others => others_count(ctx),
                     PluralCounter::Party => largest_party(ctx).map_or(0, |p| p.size),
                 };
-                let branch = if count == 1 { singular } else { plural };
-                out.push_str(&render_segments(&branch.0, ctx, ext, dice_index));
+                out.push_str(&render_selected_branch(
+                    [singular, plural],
+                    usize::from(count != 1),
+                    ctx,
+                    ext,
+                    dice_index,
+                ));
             }
             Segment::Choice(choice) => {
                 let index = *dice_index;
@@ -820,7 +825,13 @@ fn render_segments<E: ExtensionPolicy>(
                         if !options.is_empty() {
                             let mut dice = Dice::new(ctx.seed, index);
                             let pick = dice.below(options.len());
-                            out.push_str(&render_segments(&options[pick].0, ctx, ext, dice_index));
+                            out.push_str(&render_selected_branch(
+                                options.iter(),
+                                pick,
+                                ctx,
+                                ext,
+                                dice_index,
+                            ));
                         }
                     }
                     Choice::NamedList(name) => {
@@ -834,12 +845,13 @@ fn render_segments<E: ExtensionPolicy>(
                 }
             }
             Segment::Resting { resting, in_use } => {
-                let branch = if ctx.member_count > 0 {
-                    in_use
-                } else {
-                    resting
-                };
-                out.push_str(&render_segments(&branch.0, ctx, ext, dice_index));
+                out.push_str(&render_selected_branch(
+                    [resting, in_use],
+                    usize::from(ctx.member_count > 0),
+                    ctx,
+                    ext,
+                    dice_index,
+                ));
             }
             Segment::Extension(Extension::Conditional { source }) => {
                 out.push_str(&ext.conditional(source, ctx));
@@ -851,6 +863,46 @@ fn render_segments<E: ExtensionPolicy>(
             }) => {
                 out.push_str(&ext.styled(modes, body, source, ctx));
             }
+        }
+    }
+    out
+}
+
+// Reserve random positions in every branch, including inactive branches.
+// Otherwise a headcount change can re-roll choices later in the template.
+fn random_choice_count(template: &Template) -> u64 {
+    template
+        .0
+        .iter()
+        .map(|segment| match segment {
+            Segment::Choice(Choice::Options(options)) => {
+                1 + options.iter().map(random_choice_count).sum::<u64>()
+            }
+            Segment::Choice(Choice::NamedList(_)) => 1,
+            Segment::Plural {
+                singular, plural, ..
+            } => random_choice_count(singular) + random_choice_count(plural),
+            Segment::Resting { resting, in_use } => {
+                random_choice_count(resting) + random_choice_count(in_use)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+fn render_selected_branch<'a, E: ExtensionPolicy>(
+    branches: impl IntoIterator<Item = &'a Template>,
+    selected: usize,
+    ctx: &RoomContext,
+    ext: &E,
+    dice_index: &mut u64,
+) -> String {
+    let mut out = String::new();
+    for (index, branch) in branches.into_iter().enumerate() {
+        if index == selected {
+            out = render_segments(&branch.0, ctx, ext, dice_index);
+        } else {
+            *dice_index += random_choice_count(branch);
         }
     }
     out
@@ -1188,6 +1240,29 @@ mod tests {
         let mut renamed = c.clone();
         renamed.member_count = 7;
         assert_eq!(name, render_str(template, &renamed));
+    }
+
+    #[test]
+    fn random_picks_stay_stable_when_branches_change() {
+        for seed in 0..100 {
+            let mut c = ctx();
+            c.seed = seed;
+            for template in [
+                "<<[[one/two]]/many>> · [[a/b/c/d/e/f/g]]",
+                "__[[rest/idle]]/in use__ · [[a/b/c/d/e/f/g]]",
+                "<<one/[[many/several]]>> · [[a/b/c/d/e/f/g]]",
+            ] {
+                c.member_count = 0;
+                let empty = render_str(template, &c);
+                c.member_count = 1;
+                let solo = render_str(template, &c);
+                c.member_count = 4;
+                let occupied = render_str(template, &c);
+                let pick = |name: &str| name.rsplit(" · ").next().unwrap().to_string();
+                assert_eq!(pick(&empty), pick(&solo), "seed {seed}, {template}");
+                assert_eq!(pick(&solo), pick(&occupied), "seed {seed}, {template}");
+            }
+        }
     }
 
     // -- numbering ------------------------------------------------------------
