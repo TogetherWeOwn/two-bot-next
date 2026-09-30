@@ -51,7 +51,11 @@ Counts distinguish mapped expectations from executed/verified parity.
   punctuation/angles, zero-width splitting, email/source/filename guards. Extra
   WHATWG-host cases cover userinfo, host suffix attacks, queries, IDNA and invalid
   hosts. Replacement hosts retain relevant `.gg`, `.net` and `.com` suffixes;
-  using only `.example` would remove legacy bare-domain candidates.
+  using only `.example` would remove legacy bare-domain candidates. A denied bare
+  domain inside an allowed URL's query still triggers the separate bare-domain
+  scan; a plain-text query is clean. This is preserved legacy behavior, not a
+  WHATWG-host parsing divergence. Both outcomes were checked against the pinned
+  legacy matcher itself.
 - Attachments: uppercase, multi-dot, safe PNG, extensionless/trailing-dot and empty
   lists, plus every one of the eleven default blocked extensions.
 - First-hit filter precedence and explicit repeat sequences: same-ID edits,

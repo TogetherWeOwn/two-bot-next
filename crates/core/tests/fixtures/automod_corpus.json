@@ -467,6 +467,10 @@
       "messages": [
         {
           "content": "https://allowed.example.com?q=denied.example.com",
+          "expected": "external_link"
+        },
+        {
+          "content": "https://allowed.example.com?q=harmless-text",
           "expected": null
         }
       ]
