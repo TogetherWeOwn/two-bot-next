@@ -25,6 +25,7 @@ pub mod rsvp;
 pub mod rsvp_store;
 pub mod sticky;
 pub mod voice;
+pub mod voice_config;
 
 pub use automod::{
     match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
