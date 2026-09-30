@@ -139,6 +139,9 @@ jobs:
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
+      - name: Sticky runtime acceptance tests (CI service only)
+        run: cargo test -p two-bot --locked sticky_runtime_tests -- --ignored --test-threads=1
+
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
       - name: cargo-deny

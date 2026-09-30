@@ -36,7 +36,8 @@ fn sends_message(call: &ChannelCall) -> bool {
         ChannelCall::Purge { .. }
         | ChannelCall::Slowmode { .. }
         | ChannelCall::PutOverwrite { .. }
-        | ChannelCall::DeleteOverwrite { .. } => false,
+        | ChannelCall::DeleteOverwrite { .. }
+        | ChannelCall::DeleteMessage { .. } => false,
     }
 }
 
@@ -45,7 +46,7 @@ async fn every_message_sending_action_carries_explicit_mention_policy() {
     let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "99"}))).await;
     let exec = ActionExecutor::with_proxy("fixture-token".to_owned(), Some(mock.origin())).unwrap();
     // Direct creation, numeric nonce, audit string nonce, and every sending
-    // ChannelCall variant. Edits are currently interaction UpdateMessage only.
+    // ChannelCall variant, interaction UpdateMessage, and original-response edit.
     exec.post_message("4444", INJECTION, None).await.unwrap();
     exec.post_message("4444", INJECTION, Some(42))
         .await
@@ -82,8 +83,11 @@ async fn every_message_sending_action_carries_explicit_mention_policy() {
             .await
             .unwrap();
     }
+    exec.edit_interaction_response(5555, "fixture-interaction-token", INJECTION)
+        .await
+        .unwrap();
     let requests = mock.requests();
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 9);
     for request in requests {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_safe(if body.get("type").is_some() {
@@ -150,6 +154,24 @@ async fn interaction_limits_are_applied_before_twilight_validation() {
         text_len(response.data.unwrap().content.as_deref().unwrap()),
         2002
     );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn original_response_edits_bound_text_after_neutralization() {
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "99"}))).await;
+    let exec = ActionExecutor::with_proxy("fixture-token".to_owned(), Some(mock.origin())).unwrap();
+    let input = "😀".repeat(995) + "@everyone😀";
+    exec.edit_interaction_response(5555, "fixture-interaction-token", &input)
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "PATCH");
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_safe(&body);
+    assert_eq!(body["content"], "😀".repeat(995) + "@\u{200b}everyone");
+    assert_eq!(text_len(body["content"].as_str().unwrap()), CONTENT_LIMIT);
     mock.shutdown().await;
 }
 
