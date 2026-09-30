@@ -17,6 +17,8 @@ pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod funnel;
+pub mod gateway_funnel;
+pub mod gateway_session;
 pub mod handlers;
 pub mod health;
 pub mod invites;
@@ -32,7 +34,9 @@ pub mod rsvp_store;
 pub mod settings;
 pub mod sticky;
 pub mod voice;
+pub mod voice_config;
 pub mod voice_ownership;
+pub mod voice_vote_kick;
 
 pub use automod::{
     match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
@@ -132,4 +136,8 @@ pub use voice::{
     known_voice_durations, parse_voice_end_metadata, resolve_voice_end, summarize_voice_durations,
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
+};
+pub use voice_vote_kick::{
+    RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
+    VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts, VOTE_KICK_TTL_MS,
 };
