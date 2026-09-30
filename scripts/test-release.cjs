@@ -168,7 +168,7 @@ async function simulate(snapshot, {message, file, tagged, bootstrap}) {
   return Object.freeze(content);
 }
 
-const bootstrap = '# Changelog\n\n## 0.2.0\n\n### Added\n\n* generated feature\n\n## Changelog\n\n## Unreleased\n\n### Fixed\n\n- historical repair\n';
+const bootstrap = '# Changelog\n\n## 0.2.0\n\n### Added\n\n* generated feature\n\n## Changelog\n\n## Unreleased\n\n### Fixed\n\n- historical repair\n\n### Notes\n\n- historical caveat\n';
 const bootstrapBody = '## 0.2.0\n\n### Added\n\n* generated feature\n';
 assert.throws(() => migrateReleaseNotes(bootstrap.replace('## Changelog\n\n## Unreleased', '## Unreleased'), bootstrapBody), /layout/);
 assert.throws(() => migrateReleaseNotes(bootstrap + '\n## 0.1.0\n', bootstrapBody), /historical release/);
@@ -176,13 +176,16 @@ assert.throws(() => migrateReleaseNotes(bootstrap.replace('### Fixed', '### Unkn
 assert.throws(() => migrateReleaseNotes(bootstrap, bootstrapBody + bootstrapBody), /Ambiguous/);
 const {Changelog} = require(path.join(library, 'build/src/updaters/changelog'));
 const firstRelease = migrateReleaseNotes(bootstrap, bootstrapBody);
+assert(firstRelease.changelog.includes('### Notes'), 'Migrated changelog must preserve the bootstrap Notes tail');
+assert(firstRelease.body.includes('- historical caveat'), 'Migrated PR body must preserve the bootstrap Notes tail');
 const nextBody = '## 0.3.0\n\n### Fixed\n\n* later repair';
 const nextChangelog = new Changelog({version: Version.parse('0.3.0'), changelogEntry: nextBody}).updateContent(firstRelease.changelog);
 assert.deepEqual(migrateReleaseNotes(nextChangelog, nextBody), {changelog: nextChangelog, body: nextBody});
 assert.equal((nextChangelog.match(/^# Changelog$/gm) || []).length, 1);
 assert.equal(nextChangelog.split('- historical repair').length - 1, 1);
 assert(!nextBody.includes('- historical repair'), 'Later release must not repeat bootstrap notes');
-console.log('PASS 5 bootstrap migration guards: layout, history, section, ambiguous body, subsequent release');
+assert(!nextBody.includes('- historical caveat'), 'Later release must not repeat bootstrap Notes');
+console.log('PASS 6 bootstrap migration guards: layout, history, section, ambiguous body, notes tail, subsequent release');
 
 // Overflow link parsing retains the exact native single-line contract.
 const overflowUrl = `https://github.com/fixture/two-bot-next/blob/${NATIVE_NOTES_BRANCH}/release-notes.md`;

@@ -29,8 +29,23 @@ axum = { version = "0.8", default-features = false, features = [
     "tracing",
 ] }
 base64 = "0.22"
+bytes = "1"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 hex = "0.4"
 hmac = "0.13"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "http1",
+    "ring",
+    "webpki-roots",
+] }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "tokio",
+    "client-legacy",
+    "http1",
+] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: serde_json maps keep insertion order (IndexMap) instead of
@@ -69,6 +84,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "io-util",
+    "process",
 ] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-http = { version = "0.7", default-features = false, features = ["trace"] }
