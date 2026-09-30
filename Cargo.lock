@@ -2200,6 +2200,7 @@ dependencies = [
  "tracing-subscriber",
  "twilight-cache-inmemory",
  "twilight-gateway",
+ "twilight-http",
  "twilight-model",
  "two-bot-core",
  "two-bot-cutover",
@@ -2258,6 +2259,7 @@ dependencies = [
  "two-bot-core",
  "two-bot-discord",
  "two-bot-testsupport",
+ "url",
 ]
 
 [[package]]

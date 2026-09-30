@@ -51,9 +51,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::command_permissions::command_permission;
 use super::commands::{
     core_commands, merge_commands, CommandDefinition, CustomCommand, RegistryError,
-    PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
 use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
@@ -326,8 +326,26 @@ impl InteractionRouter {
         guild_id.is_some_and(|g| Some(g) == self.gates.configured_guild)
     }
 
-    fn has_perm(actor_permissions: Option<u64>, required: u64) -> bool {
-        actor_permissions.is_some_and(|bits| bits & required == required)
+    fn permission_allowed(
+        name: &str,
+        guild_id: Option<u64>,
+        actor_permissions: Option<u64>,
+    ) -> bool {
+        let row = command_permission(name).expect("builtin command has a permission row");
+        if row.allows(actor_permissions) {
+            return true;
+        }
+        // Metadata-only security audit: never include interaction tokens,
+        // options, message bodies, or target/member display names.
+        tracing::warn!(
+            target: "two_bot_core::command_permissions",
+            command = row.command,
+            guild_id = ?guild_id,
+            required_permissions = row.required_permissions,
+            actor_permissions = ?actor_permissions,
+            "command_permission_denied"
+        );
+        false
     }
 
     /// Route one slash command through fence → gate → permission checks.
@@ -382,7 +400,7 @@ impl InteractionRouter {
                     refusal: RouterRefusal::ModerationDisabled,
                 });
             }
-            if !Self::has_perm(actor_permissions, action.required_permission()) {
+            if !Self::permission_allowed(name, guild_id, actor_permissions) {
                 return Some(SlashOutcome::Refuse {
                     refusal: RouterRefusal::ModerationPermission(*action),
                 });
@@ -424,19 +442,19 @@ impl InteractionRouter {
         struct Row {
             handler: HandlerId,
             gate: RowGate,
-            perm: Option<(u64, RouterRefusal)>,
+            permission_refusal: Option<RouterRefusal>,
         }
 
         let row = match name {
             "rank" => Row {
                 handler: HandlerId::Rank,
                 gate: RowGate::Always,
-                perm: None,
+                permission_refusal: None,
             },
             "leaderboard" => Row {
                 handler: HandlerId::Leaderboard,
                 gate: RowGate::Always,
-                perm: None,
+                permission_refusal: None,
             },
             // Scorecard check-in gates `ManageEvents` both in the published
             // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`
@@ -445,18 +463,18 @@ impl InteractionRouter {
             "attendance" => Row {
                 handler: HandlerId::ScorecardAttendance,
                 gate: RowGate::Scorecard,
-                perm: Some((PERM_MANAGE_EVENTS, RouterRefusal::ManageEventsRequired)),
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
             "command" | "command-remove" | "command-list" | "schedule" | "schedule-remove"
             | "schedule-list" | "sticky" | "sticky-remove" => Row {
                 handler: HandlerId::AutomationAdmin,
                 gate: RowGate::Automations,
-                perm: Some((PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)),
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             "rsvp" => Row {
                 handler: HandlerId::Rsvp,
                 gate: RowGate::Announcements,
-                perm: None,
+                permission_refusal: None,
             },
             // Namespaced: legacy RSVP-totals `attendance` collides with the
             // scorecard `attendance` on `guild.commands.set` — see
@@ -464,32 +482,32 @@ impl InteractionRouter {
             "rsvp-attendance" => Row {
                 handler: HandlerId::RsvpAttendance,
                 gate: RowGate::Announcements,
-                perm: None,
+                permission_refusal: None,
             },
             "lfg" => Row {
                 handler: HandlerId::Lfg,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_EVENTS, RouterRefusal::ManageEventsRequired)),
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
             "lfg-close" => Row {
                 handler: HandlerId::LfgClose,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_EVENTS, RouterRefusal::ManageEventsRequired)),
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
             "feed-add" => Row {
                 handler: HandlerId::FeedAdd,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)),
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             "feed-remove" => Row {
                 handler: HandlerId::FeedRemove,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)),
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             "feed-list" => Row {
                 handler: HandlerId::FeedList,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)),
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             _ => return None,
         };
@@ -502,10 +520,12 @@ impl InteractionRouter {
                 refusal: row.gate.refusal().expect("gated row has a refusal"),
             });
         }
-        if let Some((bits, refusal)) = row.perm {
-            if !Self::has_perm(actor_permissions, bits) {
-                return Some(SlashOutcome::Refuse { refusal });
-            }
+        if !Self::permission_allowed(name, guild_id, actor_permissions) {
+            return Some(SlashOutcome::Refuse {
+                refusal: row
+                    .permission_refusal
+                    .expect("restricted command has a permission refusal"),
+            });
         }
         Some(SlashOutcome::Handled {
             handler: row.handler,

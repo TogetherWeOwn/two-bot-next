@@ -18,7 +18,8 @@ two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
 two-bot-discord = { version = "0.2.0", path = "../discord" }
 hex = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# Preserve JSON syntax kinds and exact numeric tokens during parity checks.
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
@@ -27,6 +28,11 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
+url = { workspace = true }
+
+[[bin]]
+name = "legacy_verify"
+path = "src/bin/legacy_verify.rs"
 
 [dev-dependencies]
 rustls = { workspace = true }

@@ -117,6 +117,11 @@ jobs:
       - name: legacy copy acceptance (two owned databases on CI service only)
         run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
 
+      - name: Legacy verification acceptance (two disposable CI databases)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test legacy_verify_db --locked -- --ignored
+
       - name: channel moderation store clippy
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
 
@@ -151,6 +156,45 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+
+  container:
+    name: container smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Offline smoke-test regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
+      - name: Set up BuildKit
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build runtime image (local only)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: two-bot:ci
+          cache-from: type=gha,scope=two-bot-runtime-amd64
+          cache-to: type=gha,mode=max,scope=two-bot-runtime-amd64
+      - name: Runtime contract and size budgets
+        run: python3 scripts/container-smoke.py two-bot:ci
+      - name: Prove deliberate budget breakage fails
+        run: |
+          set -euo pipefail
+          for budget in image binary; do
+            log="$RUNNER_TEMP/container-negative-$budget.log"
+            if python3 scripts/container-smoke.py two-bot:ci "--$budget-max-bytes" 1 >"$log" 2>&1; then
+              printf 'FAIL: deliberate %s budget violation was accepted\n' "$budget"
+              exit 1
+            fi
+            grep -F "exceeds size budget" "$log"
+            printf 'PASS: deliberate %s budget violation rejected\n' "$budget"
+          done
 
   community-db:
     name: community db
