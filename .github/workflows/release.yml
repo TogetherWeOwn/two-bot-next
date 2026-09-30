@@ -58,6 +58,8 @@ jobs:
         if: steps.select.outputs.pr_available == 'true'
         with:
           ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
+      # Env expressions are evaluated even on a skipped step. Selection emits
+      # valid {} JSON when publication leaves no open PR; the guard stays false.
       - name: Preserve bootstrap release notes
         if: steps.select.outputs.pr_available == 'true'
         env:

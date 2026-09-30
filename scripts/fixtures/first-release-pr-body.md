@@ -1,23 +1,18 @@
-# Changelog
+:robot: I have created a release *beep* *boop*
 
-## Unreleased
+## Summary
 
-### Added
+Publish the next synchronized Rust workspace release through release-please.
 
-- Add a durable channel-mutation lane that blocks different request keys after
-  ambiguous outcomes, plus atomic claim completion, audit insertion and confirmed
-  unlock recovery cleanup (migration 0123).
-- Register channel moderation adapters on the shared interaction router and execute
-  purge, slowmode, lockdown and recorded-state unlock through the shared REST executor.
-  Verify gates, exact overwrite recovery, durable retry exclusion and finalization-only
-  retries with mock REST and isolated PostgreSQL tests. Defer ephemerally before SQL/REST
-  work, then edit the original response without mentions or effect retries.
-  Startup activation remains pending.
+## Changes
 
-### Fixed
+Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
 
-- Align channel/member shared audit and idempotency timestamps with an additive,
-  row-preserving migration and explicit SQL timestamp casts (migration 0124).
+## Testing
+
+Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
+---
+
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 
@@ -80,6 +75,7 @@
   unlock (or a retried cleanup whose earlier result was lost) reports stale instead of
   deleting a later lockdown cycle's seed. Repeated lockdowns preserve the original
   generation alongside the original seed (migration 0122).
+
 ### Fixed
 
 * **build:** refresh stale Cargo.lock so --locked Docker build passes ([#19](https://github.com/TogetherWeOwn/two-bot-next/issues/19)) ([1aa9ce8](https://github.com/TogetherWeOwn/two-bot-next/commit/1aa9ce819d802fe8b9f387eb4cae329d8af5f9d2))
@@ -106,3 +102,6 @@
 ### Notes
 
 - Command/component wiring and the Discord REST reads stay on the S4 interaction router and REST executor slices; the outcome enums are the integration surface until they land. Scorecard and probe collection are not enabled by this change.
+
+---
+Refs: TOG-9865
