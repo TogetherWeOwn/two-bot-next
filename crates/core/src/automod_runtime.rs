@@ -47,7 +47,81 @@ pub struct MessageDelivery {
     pub channel_id: String,
     pub message_id: String,
     pub snapshot: Option<AutomodMessage>,
+    /// Discord's stable edit timestamp, not the gateway receipt timestamp.
+    pub edited_timestamp_ms: Option<u64>,
     pub observed_timestamp_ms: u64,
+}
+
+/// Receipt timestamps are deliberately excluded: gateway retries must retain
+/// identity. Creates key on message ID; edits key on stable revision + facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryKey {
+    pub guild_id: String,
+    pub message_id: String,
+    pub kind: MessageDeliveryKind,
+    pub dry_run: bool,
+    pub request_hash: String,
+}
+
+impl DeliveryKey {
+    #[must_use]
+    pub fn from_delivery(delivery: &MessageDelivery, dry_run: bool) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        let message = delivery.snapshot.as_ref()?;
+        let guild_id = delivery.guild_id.as_ref()?;
+        if &message.guild_id != guild_id
+            || message.channel_id != delivery.channel_id
+            || message.message_id != delivery.message_id
+        {
+            return None;
+        }
+        let mut roles = message.role_ids.clone();
+        let mut mentions = message.mentioned_user_ids.clone();
+        let mut attachments = message.attachment_names.clone();
+        roles.sort();
+        mentions.sort();
+        attachments.sort();
+        let revision = match delivery.kind {
+            MessageDeliveryKind::Create => {
+                serde_json::json!(["create", guild_id, delivery.message_id])
+            }
+            MessageDeliveryKind::Update => serde_json::json!([
+                "update",
+                guild_id,
+                delivery.message_id,
+                delivery.channel_id,
+                message.author_id,
+                message.author_is_bot,
+                roles,
+                mentions,
+                attachments,
+                message.content,
+                delivery.edited_timestamp_ms,
+            ]),
+        };
+        let request_hash = hex::encode(Sha256::digest(revision.to_string().as_bytes()));
+        Some(Self {
+            guild_id: guild_id.clone(),
+            message_id: delivery.message_id.clone(),
+            kind: delivery.kind,
+            dry_run,
+            request_hash,
+        })
+    }
+
+    #[must_use]
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            MessageDeliveryKind::Create => "create",
+            MessageDeliveryKind::Update => "update",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViolationRecord {
+    pub count: u64,
+    pub inserted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,9 +274,10 @@ impl AutomodRuntime {
     pub fn plan(
         &self,
         matched: &AutomodMatch,
-        violation_count: u64,
+        violation: ViolationRecord,
         facts: Option<&TargetFacts>,
     ) -> EnforcementPlan {
+        let violation_count = violation.count;
         let gate = self.target_gate(matched, facts);
         let sanction = sanction_for(violation_count, &self.config.policy.sanctions);
         let mut plan = EnforcementPlan {
@@ -215,6 +290,15 @@ impl AutomodRuntime {
             outcome: PlanOutcome::Ready,
             effects: Vec::new(),
         };
+        if matches!(gate, TargetGate::Allowed | TargetGate::Protected(_)) && !violation.inserted {
+            plan.outcome = PlanOutcome::AlreadyProcessed;
+            return plan;
+        }
+        if gate == TargetGate::Allowed && violation_count == 0 {
+            plan.outcome = PlanOutcome::Unavailable;
+            plan.violation_count = None;
+            return plan;
+        }
         match gate {
             TargetGate::DryRun => plan.outcome = PlanOutcome::DryRun,
             TargetGate::Unavailable => plan.outcome = PlanOutcome::Unavailable,
@@ -270,6 +354,7 @@ pub enum AutomodEffect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanOutcome {
+    AlreadyProcessed,
     DryRun,
     Unavailable,
     Protected(TargetProtection),

@@ -29,6 +29,7 @@ fn delivery(kind: MessageDeliveryKind, content: &str) -> MessageDelivery {
         channel_id: "222222222222222222".into(),
         message_id: "333333333333333333".into(),
         observed_timestamp_ms: 1_000_000,
+        edited_timestamp_ms: None,
         snapshot: Some(AutomodMessage {
             guild_id: STAGING_GUILD_ID.into(),
             channel_id: "222222222222222222".into(),
@@ -93,7 +94,14 @@ fn dry_run_has_no_effect_or_ledger_increment_and_needs_no_resolver() {
     );
     assert_eq!(runtime.target_gate(&matched, None), TargetGate::DryRun);
     for count in [0, 1, 2, 3, 99] {
-        let plan = runtime.plan(&matched, count, None);
+        let plan = runtime.plan(
+            &matched,
+            ViolationRecord {
+                count,
+                inserted: true,
+            },
+            None,
+        );
         assert_eq!(plan.outcome, PlanOutcome::DryRun);
         assert!(plan.effects.is_empty());
         assert_eq!(plan.violation_count, None);
@@ -110,15 +118,42 @@ fn enforce_plans_exact_delete_then_ladder_effect() {
     );
     let facts = facts();
     assert_eq!(
-        runtime.plan(&matched, 1, Some(&facts)).effects,
+        runtime
+            .plan(
+                &matched,
+                ViolationRecord {
+                    count: 1,
+                    inserted: true
+                },
+                Some(&facts)
+            )
+            .effects,
         vec![AutomodEffect::DeleteMessage]
     );
     assert_eq!(
-        runtime.plan(&matched, 2, Some(&facts)).effects,
+        runtime
+            .plan(
+                &matched,
+                ViolationRecord {
+                    count: 2,
+                    inserted: true
+                },
+                Some(&facts)
+            )
+            .effects,
         vec![AutomodEffect::DeleteMessage, AutomodEffect::WarnMember]
     );
     assert_eq!(
-        runtime.plan(&matched, 3, Some(&facts)).effects,
+        runtime
+            .plan(
+                &matched,
+                ViolationRecord {
+                    count: 3,
+                    inserted: true
+                },
+                Some(&facts)
+            )
+            .effects,
         vec![
             AutomodEffect::DeleteMessage,
             AutomodEffect::TimeoutMember { seconds: 600 }
@@ -147,7 +182,14 @@ fn every_protected_target_is_untouched_even_on_delete_rung() {
             TargetProtection::StaffRole => facts.target.role_ids.push("666666666666666666".into()),
         }
         for count in [1, 2, 3] {
-            let plan = runtime.plan(&matched, count, Some(&facts));
+            let plan = runtime.plan(
+                &matched,
+                ViolationRecord {
+                    count,
+                    inserted: true,
+                },
+                Some(&facts),
+            );
             assert_eq!(plan.outcome, PlanOutcome::Protected(protection));
             assert!(plan.effects.is_empty());
             assert_eq!(plan.violation_count, Some(count));
@@ -165,7 +207,14 @@ fn unresolved_or_wrong_author_fails_closed_before_delete() {
     let mut facts = facts();
     facts.target.user_id = "someone-else".into();
     for target in [None, Some(&facts)] {
-        let plan = runtime.plan(&matched, 0, target);
+        let plan = runtime.plan(
+            &matched,
+            ViolationRecord {
+                count: 0,
+                inserted: true,
+            },
+            target,
+        );
         assert_eq!(plan.outcome, PlanOutcome::Unavailable);
         assert!(plan.effects.is_empty());
         assert_eq!(plan.violation_count, None);
@@ -182,13 +231,29 @@ fn hierarchy_and_permission_gate_followup_sanction_not_exact_delete() {
     );
     let mut facts = facts();
     facts.target.highest_role_position = facts.bot_highest_role_position;
-    let plan = runtime.plan(&matched, 3, Some(&facts));
+    let plan = runtime.plan(
+        &matched,
+        ViolationRecord {
+            count: 3,
+            inserted: true,
+        },
+        Some(&facts),
+    );
     assert_eq!(plan.outcome, PlanOutcome::SanctionRefused);
     assert_eq!(plan.effects, vec![AutomodEffect::DeleteMessage]);
     facts.target.highest_role_position = 1;
     facts.bot_permissions = 0;
     assert_eq!(
-        runtime.plan(&matched, 2, Some(&facts)).outcome,
+        runtime
+            .plan(
+                &matched,
+                ViolationRecord {
+                    count: 2,
+                    inserted: true
+                },
+                Some(&facts)
+            )
+            .outcome,
         PlanOutcome::SanctionRefused
     );
 }
@@ -265,6 +330,46 @@ fn staging_fence_enforce_is_not_live_approval_and_dms_are_ignored() {
     assert_eq!(runtime.inspect(&msg), Inspection::Ignore);
     msg.guild_id = Some(LIVE_GUILD_ID.into());
     assert_eq!(runtime.inspect(&msg), Inspection::Ignore);
+}
+
+#[test]
+fn keys_dedupe_receipt_retries_but_not_edit_revisions_or_modes() {
+    let mut msg = delivery(MessageDeliveryKind::Create, "hello");
+    let original = DeliveryKey::from_delivery(&msg, false).unwrap();
+    msg.observed_timestamp_ms += 1_000;
+    msg.snapshot.as_mut().unwrap().content = "blocked".into();
+    assert_eq!(DeliveryKey::from_delivery(&msg, false).unwrap(), original);
+    assert_ne!(DeliveryKey::from_delivery(&msg, true).unwrap(), original);
+    msg.kind = MessageDeliveryKind::Update;
+    msg.edited_timestamp_ms = Some(2_000_000);
+    let edit = DeliveryKey::from_delivery(&msg, false).unwrap();
+    assert_ne!(edit, original);
+    msg.observed_timestamp_ms += 1_000;
+    assert_eq!(DeliveryKey::from_delivery(&msg, false).unwrap(), edit);
+    msg.edited_timestamp_ms = Some(2_001_000);
+    assert_ne!(DeliveryKey::from_delivery(&msg, false).unwrap(), edit);
+    msg.snapshot = None;
+    assert!(DeliveryKey::from_delivery(&msg, false).is_none());
+}
+
+#[test]
+fn already_counted_message_never_repeats_effects_on_a_different_edit() {
+    let mut runtime = runtime(true);
+    let matched = matched(
+        &mut runtime,
+        &delivery(MessageDeliveryKind::Update, "blocked"),
+    );
+    let plan = runtime.plan(
+        &matched,
+        ViolationRecord {
+            count: 3,
+            inserted: false,
+        },
+        Some(&facts()),
+    );
+    assert_eq!(plan.outcome, PlanOutcome::AlreadyProcessed);
+    assert!(plan.effects.is_empty());
+    assert_eq!(plan.funnel, FunnelDisposition::None);
 }
 
 #[test]

@@ -7,6 +7,8 @@
 
 pub mod automod;
 pub mod automod_runtime;
+#[cfg(feature = "db")]
+pub mod automod_store;
 pub mod commands;
 pub mod config;
 pub mod events;

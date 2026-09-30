@@ -923,6 +923,22 @@ mod tests {
     }
 
     #[test]
+    fn repeat_sweep_expires_inactive_authors_without_another_message() {
+        let policy = policy();
+        let mut repeats = RepeatTracker::default();
+        let msg = message("same text");
+        repeats.observe(&msg, "same text", &policy);
+        let mut other = msg.clone();
+        other.author_id = "other".to_owned();
+        repeats.observe(&other, "same text", &policy);
+        assert_eq!(repeats.rows.len(), 2);
+        repeats.expire(msg.observed_timestamp_ms + 30_000, 30);
+        assert_eq!(repeats.rows.len(), 2);
+        repeats.expire(msg.observed_timestamp_ms + 30_001, 30);
+        assert!(repeats.rows.is_empty());
+    }
+
+    #[test]
     fn mention_spam_uses_explicit_mentions_only() {
         let mut msg = message("hey everyone");
         let policy = policy();

@@ -1,0 +1,123 @@
+use std::collections::HashMap;
+use twilight_model::{
+    channel::Message,
+    gateway::{
+        event::Event,
+        payload::incoming::{MessageCreate, MessageUpdate},
+    },
+    id::Id,
+};
+use two_bot_core::automod_runtime::{
+    AutomodRuntime, AutomodScope, DeliveryKey, FunnelDisposition, Inspection, MessageDeliveryKind,
+    STAGING_GUILD_ID,
+};
+use two_bot_core::{AutomodConfig, AutomodFilter};
+use two_bot_discord::automod::{event_to_automod, with_fetched_message};
+
+fn message() -> Message {
+    serde_json::from_value(serde_json::json!({
+        "id": "333333333333333333", "channel_id": "222222222222222222",
+        "guild_id": STAGING_GUILD_ID, "type": 0, "content": "clean",
+        "author": {"id": "444444444444444444", "username": "mock", "discriminator": "0", "avatar": null, "bot": false},
+        "member": {"roles": ["555555555555555555"], "joined_at": null, "deaf": false, "mute": false, "flags": 0},
+        "timestamp": "2026-09-30T00:00:00.000000+00:00", "edited_timestamp": null,
+        "mention_everyone": false, "mentions": [], "mention_roles": [],
+        "attachments": [], "embeds": [], "pinned": false, "tts": false
+    })).unwrap()
+}
+
+fn runtime() -> AutomodRuntime {
+    let vars = HashMap::from([
+        ("TWO_AUTOMOD".into(), "1".into()),
+        ("TWO_AUTOMOD_BAD_WORDS".into(), "blocked".into()),
+    ]);
+    AutomodRuntime::new(
+        AutomodConfig::from_map(&vars).unwrap(),
+        AutomodScope {
+            guild_id: STAGING_GUILD_ID.into(),
+            live_approved: false,
+        },
+    )
+}
+
+#[test]
+fn create_keeps_content_role_mention_attachment_and_message_time_facts() {
+    let mut msg = message();
+    msg.content = "blocked".into();
+    let event = Event::MessageCreate(Box::new(MessageCreate(msg)));
+    let delivery = event_to_automod(&event, 9_000_000).unwrap();
+    assert_eq!(delivery.kind, MessageDeliveryKind::Create);
+    let snapshot = delivery.snapshot.as_ref().unwrap();
+    assert_eq!(snapshot.content, "blocked");
+    assert_eq!(snapshot.role_ids, vec!["555555555555555555"]);
+    assert_eq!(snapshot.observed_timestamp_ms, 1_790_726_400_000);
+    assert!(
+        matches!(runtime().inspect(&delivery), Inspection::Matched(m) if m.funnel == FunnelDisposition::CaptureOnly)
+    );
+}
+
+#[test]
+fn update_requests_fetch_then_reinspects_at_receipt_time_without_funnel() {
+    let mut msg = message();
+    msg.content = "blocked".into();
+    let event = Event::MessageUpdate(Box::new(MessageUpdate(msg.clone())));
+    let delivery = event_to_automod(&event, 1_790_726_401_000).unwrap();
+    assert!(delivery.snapshot.is_none());
+    assert!(DeliveryKey::from_delivery(&delivery, true).is_none());
+    assert!(matches!(
+        runtime().inspect(&delivery),
+        Inspection::FetchMessage { .. }
+    ));
+    // REST has no guild/member: identity comes from the exact fetch request and
+    // the authoritative member resolver, not missing-field defaults.
+    msg.guild_id = None;
+    msg.member = None;
+    let complete = with_fetched_message(&delivery, &msg, &["555555555555555555".into()]).unwrap();
+    assert_eq!(
+        complete.snapshot.as_ref().unwrap().observed_timestamp_ms,
+        delivery.observed_timestamp_ms
+    );
+    assert!(
+        matches!(runtime().inspect(&complete), Inspection::Matched(m) if m.funnel == FunnelDisposition::None)
+    );
+    msg.id = Id::new(999);
+    assert!(with_fetched_message(&delivery, &msg, &[]).is_none());
+}
+
+#[test]
+fn missing_member_roles_requests_fetch_instead_of_bypassing_protection() {
+    let mut msg = message();
+    msg.member = None;
+    let event = Event::MessageCreate(Box::new(MessageCreate(msg)));
+    let delivery = event_to_automod(&event, 1_790_726_401_000).unwrap();
+    assert!(delivery.snapshot.is_none());
+    assert!(matches!(
+        runtime().inspect(&delivery),
+        Inspection::FetchMessage { .. }
+    ));
+}
+
+#[test]
+fn mock_attachment_is_blocked_and_reply_without_ping_is_not_mention_spam() {
+    let mut value = serde_json::to_value(message()).unwrap();
+    value["attachments"] = serde_json::json!([{
+        "id": "888888888888888888", "filename": "Setup.EXE", "size": 1,
+        "url": "http://mock.invalid/file", "proxy_url": "http://mock.invalid/file"
+    }]);
+    value["message_reference"] = serde_json::json!({"message_id": "777777777777777777"});
+    let msg: Message = serde_json::from_value(value).unwrap();
+    let delivery = event_to_automod(
+        &Event::MessageCreate(Box::new(MessageCreate(msg))),
+        1_790_726_401_000,
+    )
+    .unwrap();
+    assert!(delivery
+        .snapshot
+        .as_ref()
+        .unwrap()
+        .mentioned_user_ids
+        .is_empty());
+    assert!(
+        matches!(runtime().inspect(&delivery), Inspection::Matched(m) if m.filter == AutomodFilter::AttachmentType)
+    );
+}

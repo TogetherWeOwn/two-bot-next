@@ -6,6 +6,7 @@
 //! without a gateway connection.
 
 pub mod adapter;
+pub mod automod;
 pub mod intents;
 
 pub use adapter::event_to_core;
