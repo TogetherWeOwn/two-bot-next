@@ -270,7 +270,7 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
     assert_eq!(restricted.len(), 23);
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
-            for permissions in [None, Some(0), Some(u64::MAX & !row.required_permissions)] {
+            for permissions in [None, Some(0), Some(!row.required_permissions)] {
                 // Discord delivered a real ApplicationCommand despite the picker
                 // defaults; bot permissions must not authorize the invoker.
                 let mut interaction = slash(row.command, permissions);

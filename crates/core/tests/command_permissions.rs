@@ -157,12 +157,7 @@ fn every_retained_command_rechecks_resolved_permissions_before_returning_a_handl
             // Even a same-named enabled custom row cannot bypass a builtin.
             custom_row: Some(true),
         };
-        for permissions in [
-            None,
-            Some(0),
-            Some(1 << 3),
-            Some(u64::MAX & !row.required_permissions),
-        ] {
+        for permissions in [None, Some(0), Some(1 << 3), Some(!row.required_permissions)] {
             let outcome = router.route_slash(&ctx(permissions));
             if row.required_permissions == 0 {
                 assert!(
