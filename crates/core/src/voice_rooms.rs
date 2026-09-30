@@ -554,6 +554,13 @@ impl RenameCoalescer {
         due
     }
 
+    /// Forget a deleted channel, including its pending name and budget.
+    pub fn forget(&self, channel_id: Snowflake) {
+        let mut inner = self.inner.lock().expect("coalescer lock");
+        inner.pending.remove(&channel_id);
+        inner.applied_at_ms.remove(&channel_id);
+    }
+
     /// Pending renames held back by the budget. Diagnostics and tests.
     #[must_use]
     pub fn pending_count(&self) -> usize {
