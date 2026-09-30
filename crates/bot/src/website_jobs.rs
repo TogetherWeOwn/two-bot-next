@@ -153,6 +153,8 @@ pub async fn serve(
     serve_jobs(registered, status, shutdown, http).await
 }
 
+pub(crate) const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Own the production spawn/cancel/join path independently of job registration.
 pub(crate) async fn serve_jobs(
     registered: Vec<Job>,
@@ -162,10 +164,30 @@ pub(crate) async fn serve_jobs(
 ) -> std::io::Result<()> {
     let shutdown = Shutdown(shutdown);
     let supervisor = tokio::spawn(jobs::supervise(registered, status, shutdown.0.subscribe()));
-    let result = http.await;
+    let result = drain_http(http, shutdown.0.subscribe()).await;
     shutdown.0.send_replace(true);
     let _ = supervisor.await;
     result
+}
+
+/// Bound only HTTP draining; the owner must still join job cleanup afterward.
+async fn drain_http(
+    http: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    tokio::pin!(http);
+    tokio::select! {
+        biased;
+        result = &mut http => result,
+        _ = server::shutdown_requested(shutdown) => {
+            tokio::time::timeout(HTTP_DRAIN_TIMEOUT, &mut http)
+                .await
+                .unwrap_or_else(|_| Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "HTTP shutdown drain timed out",
+                )))
+        }
+    }
 }
 
 async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, ErrorClass> {

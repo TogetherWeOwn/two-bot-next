@@ -51,10 +51,13 @@ Job failures **never** change the HTTP readiness code; the gateway remains the
 essential readiness gate. SIGTERM/SIGINT broadcasts cancellation before HTTP
 drains; shutdown aborts and joins in-flight attempts and starts no more work.
 An HTTP bind failure or gateway termination also signals cancellation. Gateway
-termination waits for HTTP shutdown and the job supervisor's abort-and-join
-cleanup before returning the restart error; the HTTP-first path aborts and joins
-the gateway. Cancellation remains sticky even before the HTTP future's first
-poll, and a job awaiting the status lock cannot schedule a post-stop attempt.
+termination allows HTTP up to five seconds to drain after cancellation, then
+returns the restart error once the job supervisor's abort-and-join cleanup is
+complete. Only the inner HTTP future has a drain deadline: expiry drops it but
+never abandons the independent job join. SIGTERM/SIGINT uses the same bound;
+a stalled drain returns a fixed timeout error. The HTTP-first path aborts and
+joins the gateway. Cancellation remains sticky even before the HTTP future's
+first poll, and a job awaiting the status lock cannot schedule a post-stop attempt.
 
 Cadences cannot be overridden in a deployed binary. Test builds alone accept
 positive `TWO_TEST_COUNTER_INTERVAL_MS`, `TWO_TEST_RANK_INTERVAL_MS`, and
@@ -62,13 +65,16 @@ positive `TWO_TEST_COUNTER_INTERVAL_MS`, `TWO_TEST_RANK_INTERVAL_MS`, and
 jitter bounds, overrun skips, timeouts, panic isolation and shutdown. The REST
 adapter integration test uses the existing mock double and the shared strict
 website test-database guard, applying migrations in a unique schema. Run it
-with an explicitly disposable database only:
+with an explicitly disposable database only. On the persistent controller, use
+the bounded-cache wrapper (see [build-cache.md](build-cache.md)); refusal is not
+permission to fall back to direct Cargo:
 
 ```sh
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090 \
-  cargo test -p two-bot --bin two-bot --locked website_jobs::
-cargo test -p two-bot --bin two-bot --locked jobs::
-cargo test -p two-bot --bin two-bot --locked server::
+  python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot website_jobs::
+python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot jobs::
+python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot server::
+python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot lifecycle_tests::
 ```
 
 Without `TWO_TEST_DATABASE_URL`, the database test explicitly skips locally
