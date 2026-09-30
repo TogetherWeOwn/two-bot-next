@@ -294,16 +294,16 @@ async function overflowLifecycle() {
 }
 
 async function migrationGrowthOverflowLifecycle() {
-  // The reviewer's P2: a real native normal body (351 conventional commits,
-  // 65,109 chars) that bootstrap migration grows past the 65,536-char PR
-  // limit. The reconciled output must take the overflow representation, and
-  // the next run must resolve it like a native overflow.
+  // The reviewer's P2: a real native normal body (351 conventional commits)
+  // that bootstrap migration grows past the 65,536-char PR limit. Include
+  // the configured template header in the boundary calibration. Reconciled
+  // output must overflow, and the next run must resolve it like native overflow.
   const snapshot = {...bootstrapSnapshot};
   const content = {...snapshot};
   // Calibrated so the real native body lands just under the 65,536-char
   // limit while the migrated body (native notes + bootstrap RSVP notes)
-  // crosses it: 351 commits at this padding yield ~65.1k chars in-suite.
-  const pad = i => `feat: scoped release item ${String(i).padStart(3, '0')} ${'x'.repeat(57)}`;
+  // crosses it: 351 commits at this padding yield ~65.3k chars in-suite.
+  const pad = i => `feat: scoped release item ${String(i).padStart(3, '0')} ${'x'.repeat(56)}`;
   const github = {
     repository: {owner: 'fixture', repo: 'two-bot-next'},
     async getFileJson(file) { return JSON.parse(content[file]); },
