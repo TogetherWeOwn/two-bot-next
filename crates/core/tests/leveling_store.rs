@@ -39,7 +39,7 @@ async fn pool() -> (PgPool, PgPool, String) {
         .port(5432)
         .username("agent_test")
         .password("")
-        .database("agent_test")
+        .database(if ci { "postgres" } else { "agent_test" })
         .options([("statement_timeout", "5000ms")]);
     let admin = PgPoolOptions::new()
         .max_connections(1)
