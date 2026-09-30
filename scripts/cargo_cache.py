@@ -35,14 +35,19 @@ def real_directory(path):
 
 def usage(path):
     """Allocated blocks, not logical lengths (sparse files do not fake usage)."""
+    path = real_directory(path)
     total = 0
     seen = set()
     def unreadable(error):
-        raise Refusal(f'incomplete cache scan: {error.filename}')
+        if not isinstance(error, FileNotFoundError):
+            raise Refusal(f'incomplete cache scan: {error.filename}')
 
     for base, dirs, files in os.walk(path, followlinks=False, onerror=unreadable):
         for item in [Path(base)] + [Path(base) / name for name in files + dirs]:
-            info = item.lstat()
+            try:
+                info = item.lstat()
+            except FileNotFoundError:
+                continue  # Cargo renamed/removed a temporary output during sampling.
             if stat.S_ISLNK(info.st_mode):
                 raise Refusal(f'symlink in cache: {item}')
             key = (info.st_dev, info.st_ino)
@@ -61,11 +66,15 @@ def load_policy(pool):
     policy = json.loads((pool / 'policy.json').read_text())
     if policy.get('version') != 1:
         raise Refusal('unsupported pool policy')
-    for field in ('slots', 'slot_budget_bytes', 'min_available_bytes'):
+    for field in ('slots', 'slot_budget_bytes', 'min_available_bytes', 'hard_limit_bytes'):
         if type(policy.get(field)) is not int or policy[field] <= 0:
             raise Refusal(f'invalid policy {field}')
     if policy['slots'] > 8:
         raise Refusal('more than 8 slots is not a bounded TWO pool')
+    if policy['slots'] * policy['slot_budget_bytes'] > policy['hard_limit_bytes']:
+        raise Refusal('slot budgets exceed the attested hard limit')
+    if not isinstance(policy.get('quota_receipt'), str) or not policy['quota_receipt'].strip():
+        raise Refusal('Operator quota receipt required; sampled checks are not a hard limit')
     expected = {'policy.json'} | {f'slot-{n}' for n in range(policy['slots'])}
     if {p.name for p in pool.iterdir()} != expected:
         raise Refusal('pool contents do not match immutable policy')
@@ -84,12 +93,14 @@ def acquire(pool, policy):
         except BlockingIOError:
             os.close(fd)
             continue
-        if (slot / 'lease.json').exists():
+        try:
+            usable = not (slot / 'lease.json').exists() and usage(target) < policy['slot_budget_bytes']
+        except Exception:
             os.close(fd)
-            continue  # Interrupted run: Operator must inspect it, never steal it.
-        if usage(target) >= policy['slot_budget_bytes']:
+            raise
+        if not usable:
             os.close(fd)
-            continue
+            continue  # Interrupted/oversized run: Operator must inspect it.
         return slot, target, fd
     raise Refusal('no idle, below-budget slot; no per-worktree fallback')
 
@@ -133,6 +144,10 @@ def run_cargo(pool, args, cargo='cargo', interval=1):
     pool = real_directory(pool)
     workspace = real_directory(Path.cwd())
     validate_cargo_args(args, workspace)
+    if args[0] != 'fmt':
+        cargo_flags = args[:args.index('--')] if '--' in args else args
+        required = [flag for flag in ('--offline', '--locked') if flag not in cargo_flags]
+        args = [args[0]] + required + args[1:]
     policy = load_policy(pool)
     if available(pool) < policy['min_available_bytes']:
         raise Refusal('backing filesystem has insufficient user-available bytes')

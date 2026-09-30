@@ -27,7 +27,8 @@ class CacheTests(unittest.TestCase):
         self.pool = self.root / 'pool'
         self.pool.mkdir()
         self.policy = {'version': 1, 'slots': 2, 'slot_budget_bytes': 256 * 1024,
-                       'min_available_bytes': 1}
+                       'min_available_bytes': 1, 'hard_limit_bytes': 1024 * 1024,
+                       'quota_receipt': 'synthetic fixture; not a real quota receipt'}
         self.save_policy()
         for number in range(2):
             slot = self.pool / f'slot-{number}'
@@ -49,14 +50,15 @@ class CacheTests(unittest.TestCase):
     def save_policy(self):
         (self.pool / 'policy.json').write_text(json.dumps(self.policy))
 
-    def start_fake(self):
+    def start_fake(self, workspace=None):
         driver = ('import cargo_cache as c; from pathlib import Path; '
                   'c.run_cargo(Path(__import__("sys").argv[1]), ["check"], '
                   'cargo=__import__("sys").argv[2], interval=.02)')
         env = os.environ.copy()
         env['PYTHONPATH'] = str(SCRIPT.parent)
         child = subprocess.Popen([sys.executable, '-c', driver, str(self.pool), str(self.fake)],
-                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                 env=env, cwd=workspace or self.root,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         def finish():
             for slot in self.pool.glob('slot-*'):
@@ -76,9 +78,15 @@ class CacheTests(unittest.TestCase):
             time.sleep(.01)
 
     def test_two_concurrent_slots_and_third_refused(self):
-        first = self.start_fake()
-        second = self.start_fake()
+        workspaces = [self.root / 'isolated-a', self.root / 'isolated-b']
+        for workspace in workspaces:
+            workspace.mkdir()
+        first = self.start_fake(workspaces[0])
+        second = self.start_fake(workspaces[1])
         self.wait_ready(2)
+        leases = [json.loads(p.read_text()) for p in self.pool.glob('slot-*/lease.json')]
+        self.assertEqual({lease['workspace'] for lease in leases}, {str(p) for p in workspaces})
+        self.assertFalse(any((p / 'target').exists() for p in workspaces))
         self.assertIsNone(first.poll())
         self.assertIsNone(second.poll())
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
@@ -119,6 +127,21 @@ class CacheTests(unittest.TestCase):
         self.policy['slot_budget_bytes'] = 1
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
             cache.acquire(self.pool, self.policy)
+
+    def test_absent_quota_attestation_refuses_admission(self):
+        del self.policy['quota_receipt']
+        self.save_policy()
+        with self.assertRaisesRegex(cache.Refusal, 'quota receipt'):
+            cache.load_policy(self.pool)
+
+    def test_signal_stops_build_and_leaves_crash_sentinel(self):
+        child = self.start_fake()
+        self.wait_ready(1)
+        child.terminate()
+        _, error = child.communicate(timeout=5)
+        self.assertNotEqual(child.returncode, 0)
+        self.assertIn(b'interrupted by signal', error)
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
 
     def test_low_disk_prevents_launch(self):
         with patch.object(cache, 'available', return_value=0):
@@ -261,6 +284,24 @@ class RetentionTests(unittest.TestCase):
         (pid / 'maps').write_text(f'100-200 r--p 00000000 '
                                  f'{os.major(info.st_dev):x}:{os.minor(info.st_dev):x} '
                                  f'{info.st_ino} /different/container/mount/cache\n')
+        self.assertIn('actual process', self.reason())
+
+    def test_real_linux_process_fd_and_mmap_are_detected(self):
+        child = subprocess.Popen([sys.executable, '-c',
+                                  'import mmap,sys,time; '
+                                  'f=open(sys.argv[1], "rb"); '
+                                  'm=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); '
+                                  'print("ready",flush=True); time.sleep(30)',
+                                  str(self.target / 'fixture')], cwd=self.root,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        def finish():
+            child.terminate()
+            child.communicate(timeout=5)
+
+        self.addCleanup(finish)
+        self.assertEqual(child.stdout.readline().strip(), b'ready')
+        (self.proc / str(child.pid)).symlink_to(Path('/proc') / str(child.pid))
         self.assertIn('actual process', self.reason())
 
     def test_denied_process_scan_refuses_all_reclamation(self):
