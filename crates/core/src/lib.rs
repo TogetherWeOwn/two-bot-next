@@ -27,6 +27,7 @@ pub mod onboarding;
 #[cfg(feature = "db")]
 pub mod onboarding_store;
 pub mod raid;
+pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
@@ -110,6 +111,13 @@ pub use raid::{
     RaidAlert, RaidConfigError, RaidTuning, RaidWatch, RecordedJoinRisk, StaffAlertMessage,
     DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS, DEFAULT_RAID_COOLDOWN_SECONDS,
     DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
+};
+pub use router::{
+    ComponentHandler, ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter,
+    RouterGates, RouterRefusal, SlashContext, SlashOutcome, SurfaceFlags,
+    ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY, GUILD_RESTRICTED_REPLY, LFG_PREFIX,
+    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
+    SCORECARD_DISABLED_REPLY, SELF_ROLE_PREFIX, TICKET_CLAIM_ID, TICKET_CLOSE_ID, TICKET_OPEN_ID,
 };
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
