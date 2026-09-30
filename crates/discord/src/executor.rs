@@ -486,7 +486,10 @@ impl ActionExecutor {
 
     async fn send(&self, request: &Request) -> Result<RawResponse, String> {
         self.count();
-        self.inner.transport.send_request(request).await
+        let mut attempt = crate::executor_metrics::Attempt::new(request);
+        let response = self.inner.transport.send_request(request).await;
+        attempt.finish(response.as_ref().ok().map(|response| response.status));
+        response
     }
 
     /// Build a twilight [`Request`] from a builder without sending (keeps

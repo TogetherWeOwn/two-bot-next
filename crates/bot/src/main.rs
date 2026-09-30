@@ -7,10 +7,12 @@
 
 mod backup_cli;
 mod gateway;
+mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+mod metrics_http;
 mod preflight;
 mod server;
 mod sticky_runtime;
@@ -107,6 +109,7 @@ async fn main() {
                     let db =
                         two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
                             .await?;
+                    metrics_http::register_pool(db.pool().clone());
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
                         db.pool().clone(),
                         guild_id.to_string(),

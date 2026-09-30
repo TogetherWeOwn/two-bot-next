@@ -29,6 +29,15 @@ pub const EVENTS: &[&str] = &[
     "other",
 ];
 pub const REST_ROUTES: &[&str] = &[
+    "GET /channels/:channel",
+    "GET /channels/:channel/messages",
+    "GET /guilds/:guild",
+    "GET /guilds/:guild/members",
+    "GET /guilds/:guild/scheduled-events",
+    "DELETE /guilds/:guild/bans/:member",
+    "DELETE /channels/:channel/permissions/:overwrite",
+    "PUT /applications/:application/commands",
+    "POST /interactions/:interaction/:token/callback",
     "POST /channels/:channel/messages",
     "DELETE /channels/:channel/messages/:message",
     "DELETE /guilds/:guild/members/:member",
