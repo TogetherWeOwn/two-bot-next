@@ -136,6 +136,11 @@ def validate_context(context):
                 string_array(value, empty=True)
 
 
+def trimmed_output(value):
+    # Truncation follows trim, so a 100-character prefix may end in whitespace.
+    return value.lstrip() == value and (len(value) == 100 or value.rstrip() == value)
+
+
 def spec_inventory(spec):
     """Derive token/keyword/style inventory independently of coverage.json."""
     v5 = spec.split("## V5:", 1)[1].split("## V7:", 1)[0]
@@ -181,7 +186,7 @@ def feature_used(key, template):
         separator = {"members": "/", "others": "\\", "party": "|"}[key[7:]]
         return bool(re.search(r"<<[^<>]*" + re.escape(separator) + r"[^<>]*>>", template))
     if key == "random:choice":
-        return "[[" in template and "[[list:" not in template
+        return bool(re.search(r"\[\[(?!list:)[^\[\]]*\]\]", template))
     if key == "random:list":
         return "[[list:" in template
     if key == "state:resting":
@@ -244,7 +249,7 @@ def validate(corpus, coverage, spec_bytes):
             fields(expected, ["kind", "output"])
             text(expected["output"])
             require(len(expected["output"]) <= 100, "output exceeds 100 characters")
-            require(expected["output"].strip() == expected["output"], "untrimmed output")
+            require(trimmed_output(expected["output"]), "untrimmed output")
         elif kind == "invariant":
             fields(expected, ["kind", "nonempty", "max_characters", "stable_for_same_context"],
                    ["allowed_outputs", "casefold_equals"])
@@ -254,10 +259,15 @@ def validate(corpus, coverage, spec_bytes):
             require(expected["stable_for_same_context"] is True, "stability invariant required")
             if "allowed_outputs" in expected:
                 string_array(expected["allowed_outputs"])
-                require(all(len(s) <= 100 and s.strip() == s for s in expected["allowed_outputs"]),
+                require(all(len(s) <= 100 and trimmed_output(s) for s in expected["allowed_outputs"]),
                         "invalid allowed output")
             if "casefold_equals" in expected:
-                text(expected["casefold_equals"])
+                target = expected["casefold_equals"]
+                text(target)
+                require(target.casefold() == target, "case-folded target required")
+                if "allowed_outputs" in expected:
+                    require(any(s.casefold() == target for s in expected["allowed_outputs"]),
+                            "contradictory invariant constraints")
         else:
             fields(expected, ["kind", "ambiguity_id"])
             text(expected["ambiguity_id"])

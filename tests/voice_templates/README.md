@@ -83,8 +83,12 @@ Consumers should load the bundle and adapt context to the renderer under test:
 
 1. For `expected.kind == exact`, render and compare the string byte-for-byte.
 2. For `invariant`, enforce nonempty output, the specified 100-character ceiling,
-   repeat-render equality, and optional `allowed_outputs` membership or
-   `casefold_equals`. For each `stability_groups` entry, render all referenced
+   repeat-render equality, and any supplied `allowed_outputs` membership and
+   `casefold_equals` constraints together. The case-fold target must already be
+   case-folded; if both constraints exist, at least one allowed output must match
+   it. Case folding can expand characters, so the target itself may exceed 100
+   characters even though every rendered/allowed output remains bounded.
+   For each `stability_groups` entry, render all referenced
    cases and require the **same output across the changed contexts**. Do not
    assume distinct seeds necessarily yield different results.
 3. For `deferred`, report the ambiguity ID; do not silently count a probe as
@@ -109,7 +113,11 @@ inventory and reverse indexes, duplicate/conflicting expectations, seed-group
 integrity, spec drift and deterministic serialization. It **does not evaluate
 templates** or establish that the authored expected strings are correct by
 running an implementation. The Code Reviewer must independently check those
-strings against the specification.
+strings against the specification. V5 trims **before** truncating: a valid
+100-character prefix can therefore end in whitespace. Leading whitespace and
+trailing whitespace below the ceiling remain invalid. Regression controls cover
+that boundary for exact and allowed outputs, mixed ordinary-choice/named-list
+coverage, and compatible/contradictory case-fold invariants.
 
 Key unresolved areas in `coverage.json`: exact NATO spelling/wrap formatting;
 two-game tie ordering/separator; owner-preference and inactive voting; offline

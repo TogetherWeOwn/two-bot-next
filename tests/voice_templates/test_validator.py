@@ -122,6 +122,73 @@ class CorpusTests(unittest.TestCase):
             row["expected"]["stable_for_same_context"] = False
         self.assert_bad(mutate, "stability invariant required")
 
+    def validate_added_case(self, template, expected, covers):
+        corpus, coverage = copy.deepcopy(self.corpus), copy.deepcopy(self.coverage)
+        corpus["contexts"]["regression-control"] = copy.deepcopy(corpus["contexts"]["solo"])
+        corpus["contexts"]["regression-control"]["seed"] = "regression-control"
+        case = {"id": "regression-control", "input": template, "context": "regression-control",
+                "expected": expected, "covers": covers}
+        corpus["cases"].append(case)
+        for feature in coverage["features"]:
+            if feature["id"] in covers:
+                feature["case_ids"].append(case["id"])
+        return validate.validate(corpus, coverage, self.spec)
+
+    def test_trim_before_truncate_boundary(self):
+        # V5 trims before truncation: cutting just before y exposes whitespace.
+        template = "x" * 99 + " y"
+        output = "x" * 99 + " "
+        for kind in ["exact", "invariant"]:
+            for whitespace in [" ", "\t", "\n"]:
+                with self.subTest(kind=kind, whitespace=whitespace):
+                    expected = {"kind": "exact", "output": output[:-1] + whitespace}
+                    if kind == "invariant":
+                        expected = {"kind": kind, "nonempty": True, "max_characters": 100,
+                                    "stable_for_same_context": True,
+                                    "allowed_outputs": [output[:-1] + whitespace]}
+                    self.validate_added_case(template[:-2] + whitespace + "y", expected,
+                                             ["rule:trim", "rule:truncate"])
+            for invalid in ["x" * 98 + " ", " " + "x" * 99, " " * 100, "x" * 100 + " "]:
+                with self.subTest(kind=kind, invalid=repr(invalid)):
+                    expected = {"kind": "exact", "output": invalid}
+                    if kind == "invariant":
+                        expected = {"kind": kind, "nonempty": True, "max_characters": 100,
+                                    "stable_for_same_context": True, "allowed_outputs": [invalid]}
+                    with self.assertRaises(validate.FixtureError):
+                        self.validate_added_case(template, expected, ["rule:truncate"])
+
+    def test_mixed_random_blocks(self):
+        template = "[[den/crew]] [[list:rooms]]"
+        self.assertTrue(validate.feature_used("random:choice", template))
+        self.assertTrue(validate.feature_used("random:list", template))
+        self.assertFalse(validate.feature_used("random:choice", "[[list:rooms]]"))
+        self.assertFalse(validate.feature_used("random:choice", "unfinished [[den/crew"))
+        expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
+                    "stable_for_same_context": True}
+        self.validate_added_case(template, expected, ["random:choice", "random:list"])
+
+    def test_compatible_invariant_constraints(self):
+        for outputs, target in [(["ROOM NAME", "Room Name"], "room name"),
+                                (["den", "CREW"], "crew"), (["Straße"], "strasse"),
+                                (["ß" * 100], "ss" * 100),
+                                (["x" * 99 + " "], "x" * 99 + " ")]:
+            with self.subTest(outputs=outputs):
+                expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
+                            "stable_for_same_context": True, "allowed_outputs": outputs,
+                            "casefold_equals": target}
+                self.validate_added_case('""rand:room name""', expected, ["style:rand"])
+
+    def test_contradictory_invariant_constraints(self):
+        for outputs, target, message in [(["den"], "room name", "contradictory invariant"),
+                                         (["ROOM NAME"], "Room Name", "case-folded target"),
+                                         (["Straße"], "straße", "case-folded target")]:
+            with self.subTest(outputs=outputs, target=target):
+                expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
+                            "stable_for_same_context": True, "allowed_outputs": outputs,
+                            "casefold_equals": target}
+                with self.assertRaisesRegex(validate.FixtureError, message):
+                    self.validate_added_case('""rand:room name""', expected, ["style:rand"])
+
     def test_spec_drift(self):
         with self.assertRaisesRegex(validate.FixtureError, "spec drift"):
             validate.validate(self.corpus, self.coverage, self.spec + b"\nChanged")
