@@ -12,6 +12,9 @@ pub mod feature_commands;
 pub mod health;
 pub mod leveling;
 pub mod moderation;
+pub mod rsvp;
+#[cfg(feature = "db")]
+pub mod rsvp_store;
 
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
@@ -26,4 +29,16 @@ pub use moderation::{
     require_moderation_reason, ModerationAction, ModerationActor, ModerationGateError,
     ModerationGates, ModerationPolicy, ModerationRequest, ModerationTarget, PolicyError,
     ReasonError, TargetProtection,
+};
+pub use rsvp::{
+    attendance_totals_text, checkin_classification, checkin_duplicate_text,
+    checkin_idempotency_key, checkin_metadata_json, checkin_recorded_text, checkin_source,
+    checkin_source_event_id, is_snowflake, partition_rsvps, require_manage_events, rsvp_saved_text,
+    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceProof,
+    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
+    ATTENDANCE_EVENT_TYPE, RSVP_AUDIT_ACTION,
+};
+#[cfg(feature = "db")]
+pub use rsvp_store::{
+    list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
 };
