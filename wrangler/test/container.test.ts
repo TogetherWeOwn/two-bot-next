@@ -42,11 +42,14 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV) {
   const requests: { pathname: string; port: number }[] = [];
   const values = new Map<string, unknown>();
   const gates: Promise<unknown>[] = [];
+  let listenerPort = 8080;
   const runtime = {
     running: false,
     start(options: StartConfig) {
       assert.equal(this.running, false, "must not start an already-running container");
       starts.push(structuredClone(options));
+      // Model Rust's LISTEN_ADDR (or the image default), not the SDK target.
+      listenerPort = Number(options.env?.LISTEN_ADDR?.split(":").at(-1) ?? 8080);
       this.running = true;
     },
     // A running container's monitor stays pending until it stops.
@@ -55,6 +58,7 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV) {
       async fetch(input: string | Request) {
         const pathname = new URL(typeof input === "string" ? input : input.url).pathname;
         requests.push({ pathname, port });
+        if (port !== listenerPort) throw new Error("connection refused: wrong container port");
         // Liveness is not readiness, even with a configured token. Preserve
         // gateway-down; a synthetic env fixture is NOT proof of a READY event.
         const response = new Response(null, {
@@ -115,6 +119,41 @@ test("cold keepalive passes env through the SDK's string-URL fetch path", async 
   assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV);
   assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
 });
+
+for (const port of ["9090", "1", "65535", "09090"]) {
+  for (const path of ["/health", "/readyz", "keepalive"]) {
+    test(`cold ${path} uses BOT_PORT=${port} for both listener and SDK target`, async (t) => {
+      const h = await harness(t, { ...WORKER_ENV, BOT_PORT: port });
+      if (path === "keepalive") {
+        await h.bot.keepalive({ startedAt: 0 });
+        assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
+        assert.ok(!h.logs.some((line) => line.includes("probe failed")));
+      } else {
+        const response = await h.bot.fetch(new Request(`https://worker.invalid${path}`, {
+          signal: AbortSignal.timeout(1000),
+        }));
+        assert.equal(response.status, path === "/readyz" ? 503 : 200);
+      }
+      assert.equal(h.starts.length, 1);
+      assert.deepEqual(h.starts[0]?.env, {
+        ...EXPECTED_ENV,
+        LISTEN_ADDR: `0.0.0.0:${Number(port)}`,
+      });
+      assert.equal(h.bot.defaultPort, Number(port));
+      assert.ok(h.requests.length > 0);
+      assert.ok(h.requests.every((request) => request.port === Number(port)));
+    });
+  }
+}
+
+for (const port of ["", "0", "65536", "-1", "8080.5", "NaN", "Infinity", " 9090 ", "0x2382", "1e3"]) {
+  test(`invalid BOT_PORT ${JSON.stringify(port)} fails before native startup`, async (t) => {
+    await assert.rejects(harness(t, { ...WORKER_ENV, BOT_PORT: port }), {
+      name: "Error",
+      message: "BOT_PORT must be an integer between 1 and 65535",
+    });
+  });
+}
 
 test("missing optionals are omitted; token and guild work without DATABASE_URL", async (t) => {
   const h = await harness(t, {
