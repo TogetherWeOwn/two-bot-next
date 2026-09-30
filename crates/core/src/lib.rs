@@ -11,6 +11,7 @@ pub mod channel_moderation;
 pub mod channel_moderation_store;
 pub mod commands;
 pub mod config;
+pub mod containment;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
@@ -26,8 +27,10 @@ pub mod onboarding_store;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
+pub mod settings;
 pub mod sticky;
 pub mod voice;
+pub mod voice_ownership;
 
 pub use automod::{
     match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
@@ -49,6 +52,12 @@ pub use channel_moderation_store::{
 };
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
+pub use containment::{
+    plan_quarantine, quarantine_outcome, role_removal_status, ClaimedContainmentEvent,
+    ContainmentDisposition, ContainmentEventState, ContainmentIncident, ContainmentIncidentState,
+    ContainmentPolicy, ContainmentPolicyError, ContainmentReason, ContainmentRole,
+    DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan, QuarantineRefusal,
+};
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
@@ -111,6 +120,12 @@ pub use rsvp::{
 #[cfg(feature = "db")]
 pub use rsvp_store::{
     list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+};
+pub use settings::{
+    assert_storable_key, classify_key, is_declared_env_only, is_env_only_key, is_storable_key,
+    to_env_string, validate_write, EnvOnlyKeyError, IgnoreReason, IgnoredChange, KeyChange,
+    RefreshReport, SettingClass, SettingRow, SettingsCache, SettingsSnapshot, ValidatedWrite,
+    WriteAction, WriteRefusal, ENV_ONLY_KEY_PREFIXES, HOT_WIRED, POLL_SECONDS, SETTING_CLASSES,
 };
 pub use sticky::{
     activity_eligible, automations_enabled, claim_blocks, decide_activity, normalize_debounce,
