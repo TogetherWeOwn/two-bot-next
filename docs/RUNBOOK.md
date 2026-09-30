@@ -7,7 +7,13 @@ The singleton Durable Object's existing keepalive probes `/readyz` on each tick
 and records the result in its own durable storage (not the bot database).
 Non-2xx responses and exceptions/timeouts count as failures. A 2xx result resets
 the streak. Inbound `/health` and `/readyz` requests do **not** count as monitoring
-samples; the keepalive loop is the single sampling source.
+samples; the keepalive loop is the single sampling source. Arming checks the
+SDK's persisted schedule before inserting a task and coalesces concurrent
+callers. Container startup, health traffic and DO reconstruction reuse the
+pending task without postponing it. Each firing replaces its task (and any old
+duplicate chains) with one successor; stale callbacks from the SDK's due-task
+snapshot do not probe or record another sample. Nonempty readiness JSON is
+drained, not cancelled, so the SDK's response proxy can settle cleanly.
 
 ### Threshold and notifications
 
@@ -82,14 +88,22 @@ python3 wrangler/scripts/check-env-bindings.py wrangler/wrangler.toml
 python3 wrangler/scripts/test-env-bindings.py
 ```
 
-Worker tests use the installed Container SDK with in-memory runtime/storage and
-synthetic probe/webhook responses. They never contact Discord or deployed
-Workers, and never use staging/production databases.
+Worker tests use the installed Container SDK with in-memory runtime/KV, real
+in-memory SQLite for schedule persistence, and synthetic probe/webhook responses.
+Fake-clock regressions invoke the SDK's actual alarm handler to prove one sample
+per interval through concurrent traffic, startup, eviction and old duplicate
+chains; nonempty JSON exercises its real response pipe. They never contact
+Discord or deployed Workers, and never use staging/production databases.
 
 ### API references
 
 - Container subclasses retain Durable Object storage and use `schedule()`, not
   an overridden `alarm()`: <https://developers.cloudflare.com/containers/api/container-class/#schedule>.
+- Pinned SDK 0.3.7 source (`schedule`, `listSchedules`, `deleteSchedules`,
+  due-task snapshots and the HTTP response pipe):
+  <https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts>.
+  The public API docs do not describe deduplication; tests exercise the pinned
+  implementation rather than assuming that identical callbacks coalesce.
 - Storage input/output gates protect the persisted state transition:
   <https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#access-storage>.
 - Discord webhook JSON supports `content` and `allowed_mentions`:

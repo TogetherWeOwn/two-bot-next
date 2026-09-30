@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline regressions for optional alert bindings. No Worker API calls."""
 import importlib.util
+import re
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,14 @@ spec = importlib.util.spec_from_file_location(
 )
 checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
-BASE = Path(__file__).parents[1].joinpath("wrangler.toml").read_text()
+# Optional operator tuning in the real config must not create duplicate keys
+# in our synthetic fixtures or change the omitted-binding test's meaning.
+BASE = re.sub(
+    r"^(?:UNREADY_ALERT_FAILURES|OPS_ALERT_WEBHOOK_URL)\s*=.*(?:\n|$)",
+    "",
+    Path(__file__).parents[1].joinpath("wrangler.toml").read_text(),
+    flags=re.MULTILINE,
+)
 
 
 class AlertBindingTests(unittest.TestCase):

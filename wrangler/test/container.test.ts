@@ -7,6 +7,8 @@
  */
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
+import { setImmediate } from "node:timers/promises";
 import { TwoBotContainer, type Env } from "../src/index.ts";
 
 const WORKER_ENV = {
@@ -37,7 +39,10 @@ async function harness(
   t: TestContext,
   env: Partial<Env> = WORKER_ENV,
   values = new Map<string, unknown>(),
+  sqlStore?: DatabaseSync,
 ) {
+  const database = sqlStore ?? new DatabaseSync(":memory:");
+  if (!sqlStore) t.after(() => database.close());
   const logs: string[] = [];
   for (const method of ["log", "warn", "error"] as const) {
     t.mock.method(console, method, (...args: unknown[]) => {
@@ -48,6 +53,7 @@ async function harness(
   const requests: { pathname: string; port: number }[] = [];
   const gates: Promise<unknown>[] = [];
   let listenerPort = 8080;
+  let probeStatus = 503;
   const runtime = {
     running: false,
     start(options: StartConfig) {
@@ -67,9 +73,8 @@ async function harness(
         if (port !== listenerPort) throw new Error("connection refused: wrong container port");
         // Liveness is not readiness, even with a configured token. Preserve
         // gateway-down; a synthetic env fixture is NOT proof of a READY event.
-        const response = new Response(null, {
-          status: pathname === "/readyz" ? 503 : 200,
-        });
+        const status = pathname === "/readyz" ? probeStatus : 200;
+        const response = Response.json({ ready: status === 200, gateway_connected: status === 200 }, { status });
         Object.defineProperty(response, "webSocket", { value: null });
         return response;
       },
@@ -81,10 +86,14 @@ async function harness(
       get: async (key: string) => values.get(key),
       put: async (key: string, value: unknown) => { values.set(key, value); },
       kv: { get: (key: string) => values.get(key) },
-      // Scheduling persistence is outside this regression; the SDK still
-      // executes its SQL, state transitions and alarm calls against this seam.
-      sql: { exec: () => [] },
+      // Execute the SDK's unmodified schedule SQL in real in-memory SQLite.
+      sql: {
+        exec(query: string, ...bindings: (string | number | null)[]) {
+          return database.prepare(query).all(...bindings);
+        },
+      },
       setAlarm: async () => {},
+      deleteAlarm: async () => {},
       sync: async () => {},
     },
     blockConcurrencyWhile<T>(callback: () => Promise<T>) {
@@ -98,7 +107,18 @@ async function harness(
     env as Env,
   );
   await Promise.all(gates);
-  return { bot, runtime, starts, requests, logs, values, ctx };
+  return {
+    bot, runtime, starts, requests, logs, values, ctx, database,
+    setProbeStatus: (status: number) => { probeStatus = status; },
+    pending: () => database.prepare("SELECT * FROM container_schedules WHERE callback = 'keepalive'").all(),
+  };
+}
+
+async function tickKeepalive(bot: TwoBotContainer) {
+  await bot.onStart();
+  const [pending] = await bot.listSchedules<{ startedAt: number }>("keepalive");
+  assert.ok(pending);
+  await bot.keepalive(pending.payload!, pending);
 }
 
 for (const path of ["/health", "/readyz"]) {
@@ -120,7 +140,7 @@ for (const path of ["/health", "/readyz"]) {
 
 test("cold keepalive passes env through the SDK's string-URL fetch path", async (t) => {
   const h = await harness(t);
-  await h.bot.keepalive({ startedAt: 0 });
+  await tickKeepalive(h.bot);
   assert.equal(h.starts.length, 1);
   assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV);
   assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
@@ -131,7 +151,7 @@ for (const port of ["9090", "1", "65535", "09090"]) {
     test(`cold ${path} uses BOT_PORT=${port} for both listener and SDK target`, async (t) => {
       const h = await harness(t, { ...WORKER_ENV, BOT_PORT: port });
       if (path === "keepalive") {
-        await h.bot.keepalive({ startedAt: 0 });
+        await tickKeepalive(h.bot);
         assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
         assert.ok(!h.logs.some((line) => line.includes("probe failed")));
       } else {
@@ -226,7 +246,8 @@ async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map
     if (status instanceof Error) throw status;
     return new Response(null, { status });
   });
-  const schedules = t.mock.method(h.bot, "schedule", async () => ({}));
+  await h.bot.onStart();
+  const schedules = t.mock.method(h.bot, "schedule");
   const posts: { url: string; init: RequestInit }[] = [];
   t.mock.method(globalThis, "fetch", async (url: URL, init: RequestInit) => {
     posts.push({ url: String(url), init });
@@ -237,12 +258,135 @@ async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map
     posts,
     schedules,
     setStatus: (next: number | Error) => { status = next; },
-    tick: () => h.bot.keepalive({ startedAt: 0 }),
+    tick: () => tickKeepalive(h.bot),
     events: () => h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line)),
   };
 }
 
 const ALERT_ENV = { UNREADY_ALERT_FAILURES: "3", OPS_ALERT_WEBHOOK_URL: WORKER_ENV.OPS_ALERT_WEBHOOK_URL };
+
+async function fireSdkAlarm(t: TestContext, bot: TwoBotContainer) {
+  const firing = bot.alarm();
+  await setImmediate();
+  // The SDK waits until its next task is due before finishing the alarm.
+  t.mock.timers.tick(60_000);
+  await firing;
+  await setImmediate();
+}
+
+test("real SDK keeps one persistent chain across concurrent health traffic, restart and eviction", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("no external fetch allowed"); });
+  const env = { KEEPALIVE_SECONDS: "60" };
+  const first = await harness(t, env);
+  const responses = await Promise.all(Array.from({ length: 10 }, () =>
+    first.bot.fetch(new Request("https://worker.invalid/health"))));
+  await Promise.all(responses.map((response) => response.arrayBuffer()));
+  assert.equal(first.starts.length, 1, "cold startup also invokes onStart");
+  assert.equal(first.pending().length, 1);
+  const initialTask = first.pending()[0];
+  await Promise.all(Array.from({ length: 5 }, () => first.bot.onStart()));
+  assert.deepEqual(first.pending(), [initialTask], "restart must not postpone the pending tick");
+
+  const h = await harness(t, env, first.values, first.database);
+  await h.bot.onStart();
+  assert.deepEqual(h.pending(), [initialTask], "eviction must reuse the persisted task");
+  t.mock.timers.tick(60_000);
+  for (let failures = 1; failures <= 10; failures++) {
+    await fireSdkAlarm(t, h.bot);
+    assert.equal(h.values.get("two-bot:readiness")?.failures, failures);
+    assert.equal(h.pending().length, 1, "exactly one successor per firing");
+    assert.equal(h.requests.filter((r) => r.pathname === "/readyz").length, failures);
+    const events = h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
+    assert.equal(events.length, failures === 10 ? 1 : 0, "traffic must not accelerate the threshold");
+  }
+  h.setProbeStatus(200);
+  await fireSdkAlarm(t, h.bot);
+  await fireSdkAlarm(t, h.bot);
+  assert.deepEqual(h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line).event),
+    ["container_unready_alert", "container_unready_recovery"]);
+});
+
+test("real SDK collapses old duplicate chains and ignores snapshotted stale callbacks", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const h = await harness(t, { KEEPALIVE_SECONDS: "60" });
+  for (let i = 0; i < 11; i++) await h.bot.schedule(60, "keepalive", { startedAt: i });
+  await h.bot.schedule(3600, "onStop", {});
+  assert.equal(h.pending().length, 11);
+  t.mock.timers.tick(60_000);
+  await fireSdkAlarm(t, h.bot);
+  assert.equal(h.values.get("two-bot:readiness")?.failures, 1);
+  assert.equal(h.requests.filter((r) => r.pathname === "/readyz").length, 1);
+  assert.equal(h.pending().length, 1);
+  assert.equal((await h.bot.listSchedules("onStop")).length, 1, "unrelated SDK schedules are preserved");
+  await fireSdkAlarm(t, h.bot);
+  assert.equal(h.values.get("two-bot:readiness")?.failures, 2);
+  assert.equal(h.pending().length, 1);
+});
+
+test("health traffic and onStart during an in-flight SDK alarm do not arm another chain", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const h = await harness(t, { KEEPALIVE_SECONDS: "60" });
+  await h.bot.onStart();
+  const getTcpPort = h.runtime.getTcpPort;
+  let release: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let probing = false;
+  t.mock.method(h.runtime, "getTcpPort", (port: number) => ({
+    async fetch(input: string | Request) {
+      if (new URL(typeof input === "string" ? input : input.url).pathname === "/readyz") {
+        probing = true;
+        await gate;
+      }
+      return getTcpPort(port).fetch(input);
+    },
+  }));
+  t.mock.timers.tick(60_000);
+  const firing = h.bot.alarm();
+  await setImmediate();
+  assert.ok(probing);
+  const responses = await Promise.all(Array.from({ length: 10 }, () =>
+    h.bot.fetch(new Request("https://worker.invalid/health"))));
+  await Promise.all(responses.map((response) => response.arrayBuffer()));
+  await h.bot.onStart();
+  assert.equal(h.pending().length, 1, "only the currently executing task exists");
+  release!();
+  await setImmediate();
+  t.mock.timers.tick(60_000);
+  await firing;
+  assert.equal(h.pending().length, 1, "only one successor remains");
+  assert.equal(h.values.get("two-bot:readiness")?.failures, 1);
+});
+
+test("real SDK still has one successor when readiness persistence fails", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const h = await harness(t, { KEEPALIVE_SECONDS: "60", UNREADY_ALERT_FAILURES: "1" });
+  const put = h.ctx.storage.put;
+  t.mock.method(h.ctx.storage, "put", async (key: string, value: unknown) => {
+    if (key === "two-bot:readiness") throw new Error("synthetic readiness storage failure");
+    return put(key, value);
+  });
+  await h.bot.onStart();
+  t.mock.timers.tick(60_000);
+  await fireSdkAlarm(t, h.bot);
+  assert.equal(h.pending().length, 1);
+  assert.ok(h.logs.some((line) => line.includes("synthetic readiness storage failure")));
+  assert.ok(!h.logs.some((line) => line.includes("container_unready_alert")));
+});
+
+for (const status of [200, 503]) {
+  test(`real SDK drains nonempty /readyz JSON (${status}) without cancelling the proxy pipe`, async (t) => {
+    const h = await harness(t, { KEEPALIVE_SECONDS: "60", UNREADY_ALERT_FAILURES: "1" });
+    h.setProbeStatus(status);
+    await tickKeepalive(h.bot);
+    await setImmediate();
+    assert.equal(h.bot["inflightRequests"], 0, "proxy pipe must settle cleanly");
+    assert.equal(h.values.get("two-bot:readiness")?.lastStatus, status);
+    assert.equal(h.values.get("two-bot:readiness")?.failures, status === 200 ? 0 : 1);
+    assert.ok(!h.logs.some((line) => line.includes("probe failed")));
+    assert.equal(h.pending().length, 1, "onStart during a cold tick must not create another chain");
+  });
+}
 
 test("default threshold is ten failed minute ticks; absent binding is log-only", async (t) => {
   const h = await alertHarness(t);

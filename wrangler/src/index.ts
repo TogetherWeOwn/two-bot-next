@@ -120,20 +120,31 @@ export class TwoBotContainer extends Container<Env> {
     const url = new URL(request.url);
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {
-      this.armKeepalive();
+      await this.armKeepalive();
       return this.containerFetch(request);
     }
 
     return new Response("not found", { status: 404 });
   }
 
-  /** Arm the self-perpetuating schedule() keepalive (idempotent). */
-  private armKeepalive(): void {
-    // schedule() rejects while an identical pending task exists — that just
-    // means the loop is already armed.
-    void this.schedule(this.keepaliveSeconds(), "keepalive", {
-      startedAt: Date.now(),
-    } satisfies KeepalivePayload).catch(() => undefined);
+  private keepaliveArming: Promise<void> | undefined;
+  private keepaliveRunning = false;
+
+  /** Arm one persistent chain, including after Container restart/DO eviction. */
+  private armKeepalive(): Promise<void> {
+    if (this.keepaliveRunning) return Promise.resolve();
+    if (this.keepaliveArming) return this.keepaliveArming;
+    // SDK 0.3.7 creates a new task ID on EVERY schedule() call. Coalesce local
+    // callers and check persisted schedules before inserting a new task.
+    // Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
+    this.keepaliveArming = (async () => {
+      if ((await this.listSchedules("keepalive")).length === 0) {
+        await this.schedule(this.keepaliveSeconds(), "keepalive", {
+          startedAt: Date.now(),
+        } satisfies KeepalivePayload);
+      }
+    })().finally(() => { this.keepaliveArming = undefined; });
+    return this.keepaliveArming;
   }
 
   private keepaliveSeconds(): number {
@@ -147,27 +158,43 @@ export class TwoBotContainer extends Container<Env> {
    * idles out from under the gateway) and probes /readyz; then re-arms.
    * Invoked by name via schedule() — keep public.
    */
-  public async keepalive(payload: KeepalivePayload): Promise<void> {
-    this.renewActivityTimeout();
+  public async keepalive(payload: KeepalivePayload, schedule?: { taskId: string }): Promise<void> {
+    // SDK 0.3.7 passes undefined when an earlier callback deleted a row in
+    // its due-task snapshot. Such stale callbacks must not sample or re-arm.
+    if (!schedule || this.keepaliveRunning) return;
+    this.keepaliveRunning = true;
     try {
-      let status: number | null = null;
+      await this.keepaliveArming;
+      const [pending] = await this.listSchedules("keepalive");
+      if (pending?.taskId !== schedule.taskId) return;
+      this.renewActivityTimeout();
       try {
-        const res = await this.containerFetch("http://c/readyz", {
-          signal: AbortSignal.timeout(6000),
-        });
-        status = res.status;
-        if (!res.ok) {
-          console.warn(`two-bot /readyz unhealthy: ${status}`);
+        let status: number | null = null;
+        try {
+          const res = await this.containerFetch("http://c/readyz", {
+            signal: AbortSignal.timeout(6000),
+          });
+          status = res.status;
+          if (!res.ok) {
+            console.warn(`two-bot /readyz unhealthy: ${status}`);
+          }
+          // /readyz is a small JSON response. Drain rather than cancel: SDK
+          // 0.3.7's proxy pipe has an unhandled rejection on cancellation.
+          await res.arrayBuffer();
+        } catch {
+          status = null;
+          console.warn("two-bot keepalive probe failed");
         }
-        await res.body?.cancel();
-      } catch {
-        console.warn("two-bot keepalive probe failed");
+        await this.recordReadiness(status);
+      } finally {
+        // Replace the executing row AND any legacy duplicate chains with one
+        // successor. onStart/inbound requests must not arm during this tick.
+        // https://developers.cloudflare.com/containers/api/container-class/#schedule
+        this.deleteSchedules("keepalive");
+        await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
       }
-      await this.recordReadiness(status);
     } finally {
-      // Alerting must never stop the keepalive, including storage failures.
-      // https://developers.cloudflare.com/containers/api/container-class/#schedule
-      await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
+      this.keepaliveRunning = false;
     }
   }
 
@@ -251,9 +278,9 @@ export class TwoBotContainer extends Container<Env> {
     }
   }
 
-  override onStart(): void {
+  override async onStart(): Promise<void> {
     console.log("two-bot container started");
-    this.armKeepalive();
+    await this.armKeepalive();
   }
 
   override onStop(): void {
