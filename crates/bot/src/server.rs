@@ -141,6 +141,7 @@ mod tests {
         assert!(readiness_report(GatewayState::Connected, true).ready());
         assert!(!readiness_report(GatewayState::Connected, false).ready());
         assert!(!readiness_report(GatewayState::Unconfigured, true).ready());
+        assert!(!readiness_report(GatewayState::Draining, true).ready());
     }
 
     #[tokio::test]

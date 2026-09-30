@@ -27,6 +27,7 @@ use crate::gateway::{
 };
 
 mod deadline;
+mod persistent;
 mod recovery;
 
 const GUILD: &str = "2222";
@@ -95,9 +96,9 @@ impl TestDb {
             .schema
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {}_web_v1 CASCADE; DROP SCHEMA {} CASCADE",
+            self.schema, self.schema
         )))
         .execute(&self.admin)
         .await

@@ -121,11 +121,23 @@ where
         worker.await.map_err(|_| "dispatch worker failed")?;
         result
     };
-    match tokio::time::timeout(drain_max, drain).await {
-        Ok(result) => result,
-        Err(_) => {
-            cancelled.store(true, Ordering::Release);
-            Err("dispatch drain deadline exceeded")
+    futures_util::pin_mut!(drain);
+    let drain_deadline = tokio::time::Instant::now() + drain_max;
+    loop {
+        let active_deadline = *deadline.borrow_and_update();
+        let next_deadline = active_deadline.map_or(drain_deadline, |at| at.min(drain_deadline));
+        tokio::select! {
+            biased;
+            result = &mut drain => return result,
+            _ = tokio::time::sleep_until(next_deadline) => {
+                cancelled.store(true, Ordering::Release);
+                return Err(if next_deadline == drain_deadline {
+                    "dispatch drain deadline exceeded"
+                } else {
+                    "dispatch I/O deadline exceeded"
+                });
+            }
+            _ = deadline.changed() => {}
         }
     }
 }
@@ -218,6 +230,136 @@ mod tests {
         assert!(!exited_before_commit, "fatal return detached pending work");
         assert_eq!(result, Err("dispatch backlog full"));
         assert_eq!(*observed.lock().unwrap(), vec![0, 1, 2]);
+    }
+
+    // No handler-side timer: release only AFTER fatal recovery has completed.
+    // Otherwise the fixture itself could hide an unbounded dispatcher.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn never_completing_handler_exits_essential_supervisor_without_overflow() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (stopped, mut stop) = tokio::sync::oneshot::channel();
+        let stream = futures_util::stream::once(async { 1 }).chain(futures_util::stream::pending());
+        let mut started = Some(started);
+        let worker = tokio::spawn(async move {
+            dispatch_bounded(
+                stream,
+                8,
+                move |_| {
+                    started.take().unwrap().send(()).unwrap();
+                    wait.recv().unwrap();
+                },
+                || async move {
+                    stopped.send(()).unwrap();
+                },
+                Duration::from_millis(40),
+                Duration::from_secs(2),
+            )
+            .await
+            .map_err(|reason| sqlx::Error::InvalidArgument(reason.into()))
+        });
+        start.await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::supervise_gateway(worker, std::future::pending()),
+        )
+        .await;
+        let stopped = stop.try_recv();
+        release.send(()).unwrap();
+        assert!(stopped.is_ok(), "readiness stop must precede fatal return");
+        assert!(
+            result.unwrap().is_err(),
+            "supervisor must terminate without releasing the handler"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overflow_tail_enqueue_has_total_deadline_and_immediate_readiness_loss() {
+        let state = Arc::new(tokio::sync::RwLock::new(
+            crate::gateway::GatewayState::Connected,
+        ));
+        let stop_state = Arc::clone(&state);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (stopped, mut stop) = tokio::sync::oneshot::channel();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let rows = Arc::clone(&observed);
+        let stream = futures_util::stream::unfold((0, Some(start)), |(n, mut start)| async move {
+            if n == 1 {
+                start.take().unwrap().await.unwrap();
+            }
+            assert!(n < 3, "reception must stop after the overflow tail");
+            Some((n, (n + 1, start)))
+        });
+        let mut started = Some(started);
+        let mut task = tokio::spawn(dispatch_bounded(
+            stream,
+            1,
+            move |n| {
+                if n == 0 {
+                    started.take().unwrap().send(()).unwrap();
+                    wait.recv().unwrap();
+                }
+                rows.lock().unwrap().push(n);
+            },
+            || async move {
+                *stop_state.write().await = crate::gateway::GatewayState::Draining;
+                stopped.send(()).unwrap();
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), &mut stop)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*state.read().await, crate::gateway::GatewayState::Draining);
+        assert_ne!(
+            state.read().await.status(),
+            two_bot_core::ComponentStatus::Ready
+        );
+        assert!(!task.is_finished(), "stop notification must precede drain");
+        assert!(observed.lock().unwrap().is_empty());
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+        // Always release before asserting, even if the tested timeout regresses.
+        release.send(()).unwrap();
+        assert_eq!(
+            result.unwrap().unwrap(),
+            Err("dispatch drain deadline exceeded")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finite_stream_join_is_bounded_even_without_an_overflow_tail() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let stream =
+            futures_util::stream::unfold((false, Some(start)), |(sent, mut start)| async move {
+                if sent {
+                    start.take().unwrap().await.unwrap();
+                    None
+                } else {
+                    Some((1, (true, start)))
+                }
+            });
+        let mut started = Some(started);
+        let task = tokio::spawn(dispatch_bounded(
+            stream,
+            8,
+            move |_| {
+                started.take().unwrap().send(()).unwrap();
+                wait.recv().unwrap();
+            },
+            || async {},
+            Duration::from_secs(2),
+            Duration::from_millis(40),
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(1), task).await;
+        release.send(()).unwrap();
+        assert_eq!(
+            result.unwrap().unwrap(),
+            Err("dispatch drain deadline exceeded")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

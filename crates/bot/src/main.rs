@@ -117,7 +117,10 @@ async fn main() {
                 tracing::error!(
                     "durable gateway failed; checkpoint unchanged, readiness unavailable"
                 );
-                *state.write().await = GatewayState::Armed;
+                let mut state = state.write().await;
+                if *state != GatewayState::Draining {
+                    *state = GatewayState::Armed;
+                }
             }
             result
         }))

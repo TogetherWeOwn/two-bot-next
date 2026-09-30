@@ -34,25 +34,46 @@ retain the existing website role's SELECT-only grants and lack of base-table
 access. No roles, grants or credentials are created by this implementation.
 
 The runtime pool is capped at **5**, with a **15-second statement timeout** and
-10-second acquire timeout. Boot applies migrations and contract before admitting
-any gateway dispatch. Missing DB configuration parks the gateway; configured
-initialization failure exits nonzero for supervisor restart. Migration errors
-remain fail closed; there is no in-memory fallback. `/health` stays process-only; `/readyz` checks both the
-gateway and a live DB ping (2-second bound). HTTP readiness exposes no connection
-strings or database error text. Invite REST failure/timeout/incomplete counters
-retain the last persisted snapshot instead of fabricating an empty listing.
+10-second acquire timeout. Whole foundation initialization and the S5 migration
+chain each have a **30-second client deadline**. Boot applies both independent
+ledgers and the contract before admitting dispatches; configured startup failure
+exits nonzero. With no token the gateway stays parked; a token requires DB and
+guild configuration. There is no ephemeral persistence fallback. `/health` stays
+process-only; `/readyz` checks gateway state and a live DB ping (2-second bound).
+HTTP readiness exposes no connection strings or database error text. Invite REST
+failure/timeout/incomplete counters retain the durable baseline rather than
+fabricating an empty listing.
 
-Core store traits are synchronous. The bridge requires a Tokio multi-thread
-runtime (`block_in_place`), as used by the binary and DB tests. A synchronous
-store failure panics: release aborts and the container must restart; the debug
-supervisor exits nonzero if its task dies. Shard reception remains independently
-polled while a single blocking worker dispatches in order. The backlog is bounded
-at 64 events; a full backlog exits rather than blocking heartbeat polls or
-silently dropping events. Continuing after a partially advanced in-memory
-dispatch would be unsafe. Observed bots are persisted before unconditional leave
-logging, including a bot first seen in MemberRemove after restart, and are never
-demoted by missing member data; human web views exclude those projections. Async callers can use
-`PgFunnelStore::try_record` for an explicit error result.
+The S5/S6 runtime stages each dispatch's funnel events, recency, bot flags and
+invite snapshot changes in `GatewayFunnelBuffer`, hydrated from Postgres at boot.
+One ordered blocking worker commits these effects **together with the gateway
+sequence**, through `GatewaySessionStore`. Its client-side checkpoint deadline
+covers acquire, all queries and COMMIT, including a silent acquired connection:
+**at most 5 seconds**, capped at one quarter of HELLO's heartbeat interval.
+Checkpoint failure never advances the durable replay cursor. No-op and unmapped
+dispatches still checkpoint their sequences; duplicate sequences do not mutate
+baselines. A restart resumes from the last committed cursor at its stored URL;
+READY/RESUMED still discard open voice durations.
+
+Shard reception remains independently polled. Queue capacity is **64**; overflow
+stops reception and immediately sets gateway state to **Draining** (unready),
+retains the received tail, and drains accepted work in order. An individual
+handler has a **20-second watchdog** (REST is bounded to 10 seconds); the whole
+drain, including tail enqueue and worker join, is bounded to **30 seconds**.
+Successful checkpoint completion cannot restore readiness during drain.
+Timeout/failure is fatal, not an in-process reconnect: a running `spawn_blocking`
+handler cannot be forcibly cancelled. The essential-task supervisor exits the
+process nonzero rather than waiting for Tokio shutdown or admitting a second
+writer; uncommitted sequences replay after restart. On a deadline, full drain is
+not guaranteed and must not be reported as complete. Observed bot classification
+commits with departure projection, including MemberRemove first seen after a
+restart, and human views exclude the bot. Receipt timestamps travel with queued
+payloads; payload-provided timestamps take precedence.
+
+The standalone `PgFunnelStore`/`PgInviteSnapshots` synchronous bridges remain
+available to non-gateway callers on a multi-thread Tokio runtime. Their SQL
+failures panic; async callers can use `PgFunnelStore::try_record` for an explicit
+error result. The gateway does not call these unbounded standalone bridges.
 
 Feature-owned moderation, automod, audit and settings migrations remain with
 those slices; guild-settings hot reload is TOG-10096. Temporary voice rooms are

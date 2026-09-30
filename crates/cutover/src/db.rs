@@ -390,6 +390,12 @@ pub async fn role_rewards(
 /// Replace the full reward configuration atomically: last row per level wins
 /// in the input, then delete-all + insert in one transaction (legacy
 /// `replaceRoleRewards`).
+///
+/// Takes the same per-guild advisory lock as the runtime writer
+/// (`two-bot-core::leveling_store::replace_role_rewards`) with the same key:
+/// with an empty ladder two concurrent replacements otherwise both finish
+/// `DELETE` before either `INSERT`s and commit the union of two independent
+/// configurations (TOG-10359). Keep both key strings in sync.
 pub async fn replace_role_rewards(
     db: &CutoverDb,
     guild_id: &str,
@@ -412,6 +418,11 @@ pub async fn replace_role_rewards(
         normalized.insert(r.level, r.role_id.as_str());
     }
     let mut tx = db.pool.begin().await.map_err(ReplaceRewardsError::Db)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("{guild_id}:level_role_rewards"))
+        .execute(&mut *tx)
+        .await
+        .map_err(ReplaceRewardsError::Db)?;
     sqlx::query("DELETE FROM level_role_rewards WHERE guild_id = $1")
         .bind(guild_id)
         .execute(&mut *tx)

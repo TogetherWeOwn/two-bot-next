@@ -326,7 +326,14 @@ pub async fn run_shard<I: InviteSource + 'static>(
         crate::dispatch::DISPATCH_DRAIN_MAX,
     )
     .await;
-    *state.write().await = GatewayState::Armed;
+    // A timed-out blocking handler can still be running until process exit.
+    // Keep Draining sticky so it cannot restore Connected in that interval.
+    if !matches!(
+        result,
+        Err("dispatch I/O deadline exceeded" | "dispatch drain deadline exceeded")
+    ) {
+        *state.write().await = GatewayState::Armed;
+    }
     result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()))
 }
 
@@ -501,6 +508,40 @@ mod tests {
         })
         .await;
         assert!(result.is_err());
+        assert_eq!(*state.read().await, GatewayState::Armed);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_completion_cannot_restore_readiness_after_reception_stops() {
+        let state = RwLock::new(GatewayState::Connected);
+        checkpoint_io(&state, CHECKPOINT_IO_MAX, async {
+            *state.write().await = GatewayState::Draining;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(*state.read().await, GatewayState::Draining);
+        assert_eq!(state.read().await.status(), ComponentStatus::Down);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_timeout_cancels_never_completing_client_operation() {
+        struct Cancelled(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Cancelled {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Cancelled(Arc::clone(&cancelled));
+        let state = RwLock::new(GatewayState::Connected);
+        let result = checkpoint_io(&state, std::time::Duration::from_millis(10), async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), sqlx::Error>>().await
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(*state.read().await, GatewayState::Armed);
     }
 
