@@ -119,6 +119,60 @@ fn configured_gateway_initialization_failure_exits_nonzero() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn non_unicode_gateway_override_exits_without_logging_its_value() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    let override_url = OsString::from_vec(b"ws://127.0.0.1:1/synthetic-secret-\xff".to_vec());
+    let mut bot = Bot(command("127.0.0.1:0")
+        .env("DISCORD_TOKEN", "INVALID")
+        .env("DATABASE_URL", "synthetic-database-must-not-connect")
+        .env("GUILD_ID", "123")
+        .env("DISCORD_GATEWAY_URL", override_url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start test bot"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = bot.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "invalid gateway override stayed alive"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut logs = String::new();
+    bot.0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    bot.0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "child logs: {logs}");
+    assert!(
+        logs.contains("DISCORD_GATEWAY_URL must be valid UTF-8"),
+        "child logs: {logs}"
+    );
+    assert!(
+        !logs.contains("synthetic-secret"),
+        "override value leaked: {logs}"
+    );
+    assert!(
+        !logs.contains("durable gateway"),
+        "gateway initialized before rejection: {logs}"
+    );
+}
+
 fn assert_parked_gateway(vars: &[(&str, &str)]) {
     // Reserve a non-default local port; no deployed service is contacted.
     let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");

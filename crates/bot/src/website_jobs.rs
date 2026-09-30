@@ -93,6 +93,7 @@ impl Drop for Shutdown {
 
 pub async fn serve(
     config: &Config,
+    listener: tokio::net::TcpListener,
     gateway: server::SharedState,
     shutdown: watch::Sender<bool>,
 ) -> std::io::Result<()> {
@@ -144,12 +145,7 @@ pub async fn serve(
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
     let status = jobs::statuses(&NAMES, registered.is_empty());
-    let http = server::serve(
-        &config.listen_addr,
-        gateway,
-        status.clone(),
-        shutdown.clone(),
-    );
+    let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
     serve_jobs(registered, status, shutdown, http).await
 }
 

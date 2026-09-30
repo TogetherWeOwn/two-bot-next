@@ -73,6 +73,27 @@ async fn main() {
     });
 
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
+    let listener = server::bind(&config.listen_addr)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::error!(error = %err, "container listener failed");
+            std::process::exit(1);
+        });
+    let gateway_url = match std::env::var("DISCORD_GATEWAY_URL") {
+        Ok(url) => Some(url),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::error!("DISCORD_GATEWAY_URL must be valid UTF-8");
+            std::process::exit(1);
+        }
+    };
+    if gateway_url
+        .as_deref()
+        .is_some_and(|url| !gateway::is_loopback_gateway(url))
+    {
+        tracing::error!("DISCORD_GATEWAY_URL must be a loopback mock websocket address");
+        std::process::exit(1);
+    }
 
     let gateway_task = match gateway_prerequisites(&config) {
         Ok((token, url, guild_id)) => {
@@ -99,7 +120,12 @@ async fn main() {
                         &token,
                         guild_id,
                     );
-                    let shard = build_shard(token, intents_from_env(), saved.as_ref());
+                    let shard = build_shard(
+                        token,
+                        intents_from_env(),
+                        saved.as_ref(),
+                        gateway_url.as_deref(),
+                    );
                     info!(
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
@@ -129,7 +155,7 @@ async fn main() {
     };
 
     let (shutdown, _) = tokio::sync::watch::channel(false);
-    let http = serve(&config, state, shutdown.clone());
+    let http = serve(&config, listener, state, shutdown.clone());
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, shutdown).await,
         None => http.await,

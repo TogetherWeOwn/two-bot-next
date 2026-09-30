@@ -27,6 +27,7 @@ pub fn router(state: SharedState) -> Router {
 pub fn router_with_jobs(state: SharedState, jobs: crate::jobs::SharedStatus) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/healthz", get(health))
         .route("/readyz", get(readyz))
         .with_state((state, jobs))
         .layer(TraceLayer::new_for_http())
@@ -69,15 +70,20 @@ async fn readyz(
     )
 }
 
+/// Bind before starting the gateway so liveness never waits for Discord.
+pub async fn bind(addr: &str) -> std::io::Result<TcpListener> {
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!(addr, "listening");
+    Ok(listener)
+}
+
 /// Serve until externally stopped or SIGTERM/SIGINT, notifying jobs before draining.
 pub async fn serve(
-    addr: &str,
+    listener: TcpListener,
     state: SharedState,
     jobs: crate::jobs::SharedStatus,
     shutdown: tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!(addr, "listening");
     axum::serve(listener, router_with_jobs(state, jobs).into_make_service())
         .with_graceful_shutdown(async move {
             tokio::select! {

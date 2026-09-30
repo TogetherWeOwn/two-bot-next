@@ -20,6 +20,7 @@ pub mod db;
 pub mod dedupe;
 pub mod gateway_session;
 pub mod invite;
+pub mod legacy_copy;
 pub mod mee6_names;
 pub mod mee6_rewards;
 pub mod mee6_xp;

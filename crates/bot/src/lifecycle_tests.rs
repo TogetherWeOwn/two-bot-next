@@ -191,7 +191,7 @@ async fn http_server_observes_stop_before_first_poll() {
     tokio::time::timeout(
         Duration::from_secs(2),
         server::serve(
-            "127.0.0.1:0",
+            server::bind("127.0.0.1:0").await.unwrap(),
             Arc::new(RwLock::new(GatewayState::Armed)),
             crate::jobs::statuses(&[], true),
             shutdown,
