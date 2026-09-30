@@ -12,6 +12,9 @@ mod gateway_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 mod server;
+mod sticky_runtime;
+#[cfg(test)]
+mod sticky_runtime_tests;
 
 use std::sync::Arc;
 
@@ -68,6 +71,27 @@ async fn main() {
     });
 
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
+    let listener = server::bind(&config.listen_addr)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::error!(error = %err, "container listener failed");
+            std::process::exit(1);
+        });
+    let gateway_url = match std::env::var("DISCORD_GATEWAY_URL") {
+        Ok(url) => Some(url),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::error!("DISCORD_GATEWAY_URL must be valid UTF-8");
+            std::process::exit(1);
+        }
+    };
+    if gateway_url
+        .as_deref()
+        .is_some_and(|url| !gateway::is_loopback_gateway(url))
+    {
+        tracing::error!("DISCORD_GATEWAY_URL must be a loopback mock websocket address");
+        std::process::exit(1);
+    }
 
     let gateway_task = match gateway_prerequisites(&config) {
         Ok((token, url, guild_id)) => {
@@ -86,12 +110,25 @@ async fn main() {
                     );
                     let saved = gateway::load_boot_session(&store).await?;
                     let pipeline = Arc::new(build_pipeline(store.milestones().await?));
-                    let shard = build_shard(token, intents_from_env(), saved.as_ref());
+                    // S4 sticky runtime (TOG-10309): shared router + REST
+                    // executor over the same pool. `None` on bad env gates —
+                    // the shard still boots without the sticky surface.
+                    let sticky = sticky_runtime::StickyRuntime::from_env(
+                        db.pool().clone(),
+                        &token,
+                        guild_id,
+                    );
+                    let shard = build_shard(
+                        token,
+                        intents_from_env(),
+                        saved.as_ref(),
+                        gateway_url.as_deref(),
+                    );
                     info!(
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store).await
+                    run_shard(shard, pipeline, Arc::clone(&state), store, sticky).await
                 }
                 .await;
                 if result.is_err() {
@@ -115,7 +152,7 @@ async fn main() {
         }
     };
 
-    let http = serve(&config.listen_addr, state);
+    let http = serve(listener, state);
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http).await,
         None => http.await,

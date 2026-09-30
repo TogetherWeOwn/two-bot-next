@@ -25,6 +25,10 @@ pub mod containment;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
+pub mod feeds;
+pub mod feeds_http;
+#[cfg(feature = "db")]
+pub mod feeds_store;
 pub mod funnel;
 pub mod gateway_funnel;
 pub mod gateway_session;
