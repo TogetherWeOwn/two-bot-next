@@ -127,6 +127,13 @@ pub fn valid_role_key(key: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
+fn parse_radix_number(digits: &str, radix: u32) -> Option<f64> {
+    if digits.starts_with('+') || digits.starts_with('-') {
+        return None;
+    }
+    Some(u64::from_str_radix(digits, radix).ok()? as f64)
+}
+
 /// Legacy `Number(fields[2])`: decimal/exponent and unsigned radix forms,
 /// followed by the integer/range check. Empty and non-finite values fail.
 fn parse_slots(raw: &str) -> Option<u8> {
@@ -138,17 +145,17 @@ fn parse_slots(raw: &str) -> Option<u8> {
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
     {
-        u64::from_str_radix(digits, 16).ok()? as f64
+        parse_radix_number(digits, 16)?
     } else if let Some(digits) = trimmed
         .strip_prefix("0b")
         .or_else(|| trimmed.strip_prefix("0B"))
     {
-        u64::from_str_radix(digits, 2).ok()? as f64
+        parse_radix_number(digits, 2)?
     } else if let Some(digits) = trimmed
         .strip_prefix("0o")
         .or_else(|| trimmed.strip_prefix("0O"))
     {
-        u64::from_str_radix(digits, 8).ok()? as f64
+        parse_radix_number(digits, 8)?
     } else {
         trimmed.parse::<f64>().ok()?
     };
@@ -375,9 +382,21 @@ pub fn role_fill(signups: &[LfgSignup], role_key: &str) -> usize {
     signups.iter().filter(|s| s.role_key == role_key).count()
 }
 
+/// Cap UTF-16 length like legacy without splitting a Unicode scalar.
+fn truncate_utf16(value: &str, limit: usize) -> String {
+    let mut used = 0;
+    value
+        .chars()
+        .take_while(|ch| {
+            used += ch.len_utf16();
+            used <= limit
+        })
+        .collect()
+}
+
 /// Post body (legacy `renderLfg` content): title, state, Discord timestamp,
 /// and one `**label** n/slots[ — mentions]` line per role, capped at 2000
-/// chars (code points — identical to legacy UTF-16 slicing for BMP text).
+/// UTF-16 code units.
 #[must_use]
 pub fn lfg_content(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> String {
     use time::format_description::well_known::Rfc3339;
@@ -401,7 +420,7 @@ pub fn lfg_content(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> 
         lines.push(line);
     }
     let content = lines.join("\n");
-    content.chars().take(MAX_MESSAGE_CHARS).collect()
+    truncate_utf16(&content, MAX_MESSAGE_CHARS)
 }
 
 /// One signup-select option (plain data; the adapter maps this to the
@@ -427,15 +446,15 @@ pub fn lfg_select_options(
     let mut options: Vec<LfgSelectOption> = roles
         .iter()
         .map(|role| {
-            let label: String = format!(
-                "{} ({}/{})",
-                role.label,
-                role_fill(signups, &role.role_key),
-                role.slots
-            )
-            .chars()
-            .take(MAX_OPTION_LABEL_CHARS)
-            .collect();
+            let label = truncate_utf16(
+                &format!(
+                    "{} ({}/{})",
+                    role.label,
+                    role_fill(signups, &role.role_key),
+                    role.slots
+                ),
+                MAX_OPTION_LABEL_CHARS,
+            );
             LfgSelectOption {
                 label,
                 value: role.role_key.clone(),
@@ -807,6 +826,33 @@ mod tests {
             "lfg-proof",
             &parse_role_spec("tank:Tank:1,dps:DPS:1").expect("parses"),
         )
+    }
+
+    #[test]
+    fn rendered_unicode_stays_within_legacy_limits() {
+        assert_eq!(truncate_utf16("x😀y", 2), "x");
+        assert_eq!(truncate_utf16("x😀y", 3), "x😀");
+        let mut post = sample_post(LfgStatus::Open);
+        post.title = "😀".repeat(50);
+        let spec = (0..20)
+            .map(|i| format!("r{i}:{}:2", "😀".repeat(40)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let roles = spec_roles(&post.id, &parse_role_spec(&spec).expect("valid roles"));
+        let signups = roles
+            .iter()
+            .map(|role| LfgSignup {
+                lfg_id: post.id.clone(),
+                user_id: "555555555555555555".to_owned(),
+                role_key: role.role_key.clone(),
+                joined_at: post.created_at.clone(),
+            })
+            .collect::<Vec<_>>();
+        let content = lfg_content(&post, &roles, &signups);
+        assert!((1999..=2000).contains(&content.encode_utf16().count()));
+        assert!(lfg_select_options(LfgStatus::Open, &roles, &signups)
+            .iter()
+            .all(|option| option.label.encode_utf16().count() <= MAX_OPTION_LABEL_CHARS));
     }
 
     #[test]

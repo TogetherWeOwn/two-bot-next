@@ -355,11 +355,18 @@ mod tests {
     use super::*;
     use crate::lfg::{parse_role_spec, spec_roles};
 
-    /// Fixed test-only connection: never inherit an application database URL.
-    const TEST_DATABASE_URL: &str = "postgres://agent_test@agent-testdb:5432/two_bot_test_tog10084";
+    /// Only the agent test host or the ephemeral CI service container.
+    /// Never accept an application database URL or inherited credentials.
+    fn test_database_url() -> &'static str {
+        if std::env::var("TWO_LFG_TESTDB_CI").as_deref() == Ok("1") {
+            "postgres://agent_test@127.0.0.1:5432/two_bot_test_tog10084"
+        } else {
+            "postgres://agent_test@agent-testdb:5432/two_bot_test_tog10084"
+        }
+    }
 
     async fn test_pool() -> sqlx::PgPool {
-        let pool = sqlx::PgPool::connect(TEST_DATABASE_URL)
+        let pool = sqlx::PgPool::connect(test_database_url())
             .await
             .expect("agent-testdb reachable");
         // Exercise the real migration files (0001 + 0002 + 0170), so a broken
@@ -405,7 +412,7 @@ mod tests {
     /// atomically`: overflow refused, same-role re-signup joins, switching
     /// roles moves, and the signup list reflects the move.
     #[tokio::test]
-    #[ignore = "needs agent-testdb (TWO_DATABASE_URL or default scratch DB)"]
+    #[ignore = "needs agent-testdb or the CI service container"]
     async fn slots_reject_overflow_and_moves_are_atomic() {
         let pool = test_pool().await;
         let id = "lfg-store-overflow";
@@ -488,7 +495,7 @@ mod tests {
     /// the post, the second close reports false, and unknown roles/posts
     /// answer missing.
     #[tokio::test]
-    #[ignore = "needs agent-testdb (TWO_DATABASE_URL or default scratch DB)"]
+    #[ignore = "needs agent-testdb or the CI service container"]
     async fn close_locks_signups_and_second_close_is_false() {
         let pool = test_pool().await;
         let id = "lfg-store-close";
@@ -658,7 +665,7 @@ mod tests {
     /// come back in position order, the guild fence holds, and deletes
     /// cascade.
     #[tokio::test]
-    #[ignore = "needs agent-testdb (TWO_DATABASE_URL or default scratch DB)"]
+    #[ignore = "needs agent-testdb or the CI service container"]
     async fn post_round_trips_and_fence_holds() {
         let pool = test_pool().await;
         let id = "lfg-store-roundtrip";
