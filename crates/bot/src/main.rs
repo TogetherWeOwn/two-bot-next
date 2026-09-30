@@ -45,7 +45,9 @@ async fn main() {
         Config {
             discord_token: None,
             database_url: None,
-            listen_addr: "0.0.0.0:8080".to_owned(),
+            // Gateway config errors must not move the listener away from
+            // the Worker probes and Docker healthcheck's configured address.
+            listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
             guild_id: None,
         }
     });
