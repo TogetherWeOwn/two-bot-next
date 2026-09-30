@@ -8,6 +8,7 @@
   exact lockdown overwrite recovery, refusal of unlock without recorded state,
   generation-fenced idempotency claims and audit rows. Router/REST execution wiring follows when
   the shared S4 seams are merged.
+- Port sticky-message domain logic, debounce claims and PostgreSQL persistence, with a legacy timestamp upgrade and UTF-16-compatible body limits. Discord command and REST wiring remains in the S4 integration slices.
 - RSVP domain logic and database store for going, interested and declined responses, namespaced attendance totals, and ManageEvents-gated host check-in facts, with legacy-compatible tables and replies.
 
 ### Fixed

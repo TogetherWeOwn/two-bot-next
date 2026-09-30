@@ -62,11 +62,13 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      # Compile optional stores and run their non-network safety tests too.
+      # Live store tests remain explicitly ignored (agent-testdb only).
       - name: cargo clippy -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features two-bot-core/db -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --features two-bot-core/db --locked
 
       - name: channel moderation store clippy
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
