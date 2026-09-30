@@ -213,7 +213,7 @@ Full catalogue: legacy `src/core/settingsCatalog.ts` (~90 keys in `env_only`/`co
 
 1. Rota measurement stack (observer, notice delivery, `/rota-acknowledge`, 0028–0033 migrations, 60s ticker) — staging-only experiment, never prod-enabled.
 2. Staging restart containment gateway filter — superseded by session persist (**S5**) + staging guild (**S6**).
-3. Read-only operator reports (funnel/gate/attribution/roster/dashboard/scorecard/presence/growth/raid-list) — ad-hoc queries, not runtime.
+3. Read-only operator reports (funnel/gate/attribution/roster/dashboard/scorecard/presence/growth) — ad-hoc queries, not runtime. Exception: `raid-list` and `raid-remove` are manual cutover-style tools ([TOG-10867](/TOG/issues/TOG-10867), [runbook](raid-response.md)); neither is a scheduled runtime feature.
 4. Staging provision/verify/reset scripts + e2e harness — replaced by mock-discord acceptance + **S6** cutover.
 5. `reconcile` script — absent/broken upstream.
 6. Temp-voice runtime — never shipped on legacy `main`; only the staging shape-check ports (**S6**).

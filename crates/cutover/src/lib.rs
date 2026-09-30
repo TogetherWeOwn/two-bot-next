@@ -28,6 +28,7 @@ pub mod mee6_rewards;
 pub mod mee6_xp;
 pub mod message_scan;
 pub mod parse;
+pub mod raid_tools;
 pub mod rest;
 pub mod settings;
 

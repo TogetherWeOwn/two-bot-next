@@ -14,7 +14,7 @@ The core [raid-watch and join-risk contracts](raid-port.md) remain alert/flag-on
 
 `raid-remove` reads a reviewed file; it never discovers additional targets. The default is a **network-free dry run**: no Discord client, token or membership request is constructed. A dry run reports intent, not a verified promise that every target is removable. Execution re-reads membership and protection immediately before each kick, and may keep members that changed roles after the report.
 
-Execution requires `--execute --expect N`, where N is the exact unique input count, and a moderation `--reason`. Neither an environment variable nor a risk score can arm removal. The live-guild fence must also be deliberately opened with `--allow-live`; that flag is a technical guard, not moderation authorization or cutover approval.
+Execution requires `--execute --expect N`, where N is the exact unique input count, and a moderation `--reason`. Neither an environment variable nor a risk score can arm removal. The live-guild fence must also be deliberately opened with `--allow-live-guild`; that flag is a technical guard, not moderation authorization or cutover approval.
 
 It **kicks, never bans**. A kicked account can rejoin through the rules gate. There is no automatic escalation from kick to ban.
 

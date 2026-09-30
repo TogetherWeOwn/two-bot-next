@@ -818,6 +818,28 @@ impl ActionExecutor {
         }
     }
 
+    /// Safety-critical operator read. Only 404 is absence; authorization,
+    /// rate-limit, malformed JSON and upstream failures must stop the caller.
+    /// Uses the shared paced transport, without silently retrying credentials.
+    pub async fn get_json_strict(
+        &self,
+        path: &str,
+    ) -> Result<Option<serde_json::Value>, DiscordError> {
+        let route = raw_get_route(path).map_err(DiscordError::Rejected)?;
+        self.pace(false).await;
+        let res = self
+            .send(&Request::from_route(&route))
+            .await
+            .map_err(DiscordError::Unavailable)?;
+        match res.status {
+            200..=299 => serde_json::from_slice(&res.body)
+                .map(Some)
+                .map_err(|_| DiscordError::Unavailable("invalid JSON response".into())),
+            404 => Ok(None),
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
     /// Channel GET with the paced lane (legacy `getEveryoneOverwrite` reads
     /// `permission_overwrites` off the channel).
     pub async fn get_everyone_overwrite(
@@ -1616,6 +1638,9 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
         Some((b, q)) => (b, q),
         None => (path, ""),
     };
+    if base == "/users/@me" && query.is_empty() {
+        return Ok(Route::GetCurrentUser);
+    }
     // Route borrows nothing here (u64/bool fields); the 'static bound is
     // satisfied because no borrowed variant is constructed.
     if let Some(id) = base.strip_prefix("/guilds/") {
@@ -1637,6 +1662,18 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
                 guild_id,
                 limit: query_param(query, "limit").and_then(|v| v.parse().ok()),
             }),
+            Some("roles") if query.is_empty() => Ok(Route::GetGuildRoles { guild_id }),
+            Some(member) if member.starts_with("members/") && query.is_empty() => {
+                let user_id = member
+                    .strip_prefix("members/")
+                    .unwrap()
+                    .parse::<u64>()
+                    .map_err(|_| err())?;
+                if user_id == 0 {
+                    return Err(err());
+                }
+                Ok(Route::GetMember { guild_id, user_id })
+            }
             Some("scheduled-events") => Ok(Route::GetGuildScheduledEvents {
                 guild_id,
                 with_user_count: query_param(query, "with_user_count").is_some_and(|v| v == "true"),
