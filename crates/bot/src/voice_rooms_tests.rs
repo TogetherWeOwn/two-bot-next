@@ -1273,3 +1273,167 @@ async fn runtime_worker_status_reports_live_actor() {
     assert_eq!(status.tracked_rooms, 0);
     assert!(!status.halted);
 }
+
+struct Replies {
+    trace: Trace,
+    defer_error: Option<RoomHttpError>,
+    complete_error: Option<RoomHttpError>,
+    completed: Mutex<Vec<InteractionResponse>>,
+}
+
+impl Replies {
+    fn new(trace: Trace) -> Self {
+        Self {
+            trace,
+            defer_error: None,
+            complete_error: None,
+            completed: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl InteractionReplies for Replies {
+    async fn defer(&self, _: &Interaction) -> Result<(), RoomHttpError> {
+        self.trace.lock().unwrap().push("defer".to_owned());
+        self.defer_error.map_or(Ok(()), Err)
+    }
+
+    async fn complete(
+        &self,
+        _: &Interaction,
+        response: InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        self.trace.lock().unwrap().push("complete".to_owned());
+        self.completed.lock().unwrap().push(response);
+        self.complete_error.map_or(Ok(()), Err)
+    }
+}
+
+fn create_interaction() -> Interaction {
+    voice_interaction(
+        Some(command_data(
+            "create",
+            vec![command_option("name", "lobby")],
+        )),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    )
+}
+
+#[tokio::test]
+async fn responder_defers_before_any_create_and_completes_once() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let replies = Replies::new(trace.clone());
+    VoiceResponder::respond(&runtime, &replies, &create_interaction()).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["defer", "create", "add_creator:500", "complete"]
+    );
+    let completed = replies.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert!(response_text(&completed[0]).contains("Created <#500>"));
+}
+
+#[tokio::test]
+async fn responder_failed_or_ambiguous_ack_never_executes_or_retries() {
+    for error in [
+        RoomHttpError::UnknownOutcome,
+        RoomHttpError::Unauthorized,
+        RoomHttpError::RateLimited {
+            retry_after_ms: 5000,
+            global: false,
+        },
+        RoomHttpError::Rejected {
+            status: 400,
+            code: 40060,
+        },
+    ] {
+        let trace = Trace::default();
+        let runtime = test_runtime(trace.clone());
+        let mut replies = Replies::new(trace.clone());
+        replies.defer_error = Some(error);
+        VoiceResponder::respond(&runtime, &replies, &create_interaction()).await;
+        assert_eq!(*trace.lock().unwrap(), ["defer"]);
+        assert!(replies.completed.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn responder_completion_failure_does_not_repeat_channel_creation() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let mut replies = Replies::new(trace.clone());
+    replies.complete_error = Some(RoomHttpError::UnknownOutcome);
+    VoiceResponder::respond(&runtime, &replies, &create_interaction()).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["defer", "create", "add_creator:500", "complete"]
+    );
+}
+
+#[tokio::test]
+async fn gateway_sink_routes_setup_without_blocking_and_ignores_other_commands() {
+    use twilight_model::gateway::payload::incoming::InteractionCreate;
+    let trace = Trace::default();
+    let runtime = Arc::new(test_runtime(trace.clone()));
+    let replies = Arc::new(Replies::new(trace.clone()));
+    let sink = VoiceResponder::new(runtime, replies.clone());
+    let cache = DefaultInMemoryCache::new();
+    for (name, with_guild) in [("other", true), ("setup", false)] {
+        sink.handle(
+            &Event::InteractionCreate(Box::new(InteractionCreate(voice_interaction(
+                Some(command_data(name, Vec::new())),
+                None,
+                with_guild,
+            )))),
+            &cache,
+        );
+    }
+    tokio::task::yield_now().await;
+    assert!(trace.lock().unwrap().is_empty());
+    sink.handle(
+        &Event::InteractionCreate(Box::new(InteractionCreate(voice_interaction(
+            Some(command_data("setup", Vec::new())),
+            None,
+            true,
+        )))),
+        &cache,
+    );
+    // Work has not run synchronously on the gateway loop.
+    assert!(trace.lock().unwrap().is_empty());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while replies.completed.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(*trace.lock().unwrap(), ["defer", "complete"]);
+    assert!(response_text(&replies.completed.lock().unwrap()[0]).contains("Voice rooms"));
+}
+
+#[tokio::test]
+async fn disabled_gateway_responder_does_not_acknowledge() {
+    use twilight_model::gateway::payload::incoming::InteractionCreate;
+    let trace = Trace::default();
+    let factory_trace = trace.clone();
+    let runtime = Arc::new(VoiceRuntime::new(
+        move || {
+            (
+                Store::new(factory_trace.clone()),
+                Http::new(factory_trace.clone()),
+            )
+        },
+        Duration::from_millis(250),
+        false,
+    ));
+    let replies = Arc::new(Replies::new(trace.clone()));
+    let sink = VoiceResponder::new(runtime, replies);
+    sink.handle(
+        &Event::InteractionCreate(Box::new(InteractionCreate(create_interaction()))),
+        &DefaultInMemoryCache::new(),
+    );
+    tokio::task::yield_now().await;
+    assert!(trace.lock().unwrap().is_empty());
+}

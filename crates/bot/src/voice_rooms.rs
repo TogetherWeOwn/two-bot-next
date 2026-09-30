@@ -20,6 +20,7 @@ use std::{
 };
 
 use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
@@ -1412,18 +1413,21 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
     }
 }
 
-/// Build the production runtime: sqlx store over `pool`, single-attempt HTTP
-/// over `token`. The caller clones the pair per guild actor.
+/// Build the production sink: lifecycle actors plus the S4 responder.
 pub fn build_production_runtime(
     token: &str,
     pool: sqlx::PgPool,
-) -> Result<VoiceRuntime<PgRoomStore, RoomHttp>, RoomHttpError> {
-    let http = RoomHttp::new(token.to_owned())?;
+) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
+    let replies = RoomHttp::new(token.to_owned())?;
+    let http = replies.clone();
     let store = PgRoomStore::new(pool);
-    Ok(VoiceRuntime::new(
-        move || (store.clone(), http.clone()),
-        Duration::from_millis(250),
-        true,
+    Ok(VoiceResponder::new(
+        Arc::new(VoiceRuntime::new(
+            move || (store.clone(), http.clone()),
+            Duration::from_millis(250),
+            true,
+        )),
+        Arc::new(replies),
     ))
 }
 
@@ -1839,6 +1843,114 @@ where
             };
             reply(ephemeral_response(&text)).await;
             true
+        }
+    }
+}
+
+/// Reply seam for deterministic responder tests; errors are sanitized.
+pub trait InteractionReplies: Send + Sync {
+    fn defer(
+        &self,
+        interaction: &Interaction,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    fn complete(
+        &self,
+        interaction: &Interaction,
+        response: InteractionResponse,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+}
+
+impl InteractionReplies for RoomHttp {
+    async fn defer(&self, interaction: &Interaction) -> Result<(), RoomHttpError> {
+        let response = InteractionResponse {
+            kind: InteractionResponseType::DeferredChannelMessageWithSource,
+            data: Some(InteractionResponseData {
+                flags: Some(MessageFlags::EPHEMERAL),
+                ..Default::default()
+            }),
+        };
+        self.respond_interaction(
+            interaction.application_id,
+            interaction.id,
+            &interaction.token,
+            &response,
+        )
+        .await
+    }
+
+    async fn complete(
+        &self,
+        interaction: &Interaction,
+        response: InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        let content = response
+            .data
+            .as_ref()
+            .and_then(|data| data.content.as_deref())
+            .unwrap_or_default();
+        // Discord limits message content to 2000 characters, including setup
+        // listings. Keep the transport valid even in a large guild.
+        let content: String = content.chars().take(2000).collect();
+        self.complete_interaction(interaction.application_id, &interaction.token, &content)
+            .await
+    }
+}
+
+/// Gateway wrapper: retain lifecycle publication, spawn command work off-loop.
+/// Discord accepts one initial callback per interaction, so a rejected or
+/// ambiguous acknowledgement must never execute a non-idempotent create.
+pub struct VoiceResponder<S, H, R> {
+    runtime: Arc<VoiceRuntime<S, H>>,
+    replies: Arc<R>,
+}
+
+impl<S, H, R> VoiceResponder<S, H, R>
+where
+    S: RoomPersistence + 'static,
+    H: RoomWrites + 'static,
+    R: InteractionReplies + 'static,
+{
+    pub fn new(runtime: Arc<VoiceRuntime<S, H>>, replies: Arc<R>) -> Self {
+        Self { runtime, replies }
+    }
+
+    async fn respond(runtime: &VoiceRuntime<S, H>, replies: &R, interaction: &Interaction) {
+        if let Err(error) = replies.defer(interaction).await {
+            warn!(interaction_id = interaction.id.get(), %error,
+                "voice acknowledgement failed; command not executed");
+            return;
+        }
+        handle_voice_interaction(runtime, interaction, |response| async move {
+            if let Err(error) = replies.complete(interaction, response).await {
+                warn!(interaction_id = interaction.id.get(), %error,
+                    "voice response completion failed; not retried");
+            }
+        })
+        .await;
+    }
+}
+
+impl<S, H, R> VoiceEventSink for VoiceResponder<S, H, R>
+where
+    S: RoomPersistence + 'static,
+    H: RoomWrites + 'static,
+    R: InteractionReplies + 'static,
+{
+    fn handle(&self, event: &Event, cache: &DefaultInMemoryCache) {
+        self.runtime.handle(event, cache);
+        if !self.runtime.enabled {
+            return;
+        }
+        if let Event::InteractionCreate(created) = event {
+            if parse_voice_command(&created.0).is_none() {
+                return;
+            }
+            let interaction = created.0.clone();
+            let runtime = Arc::clone(&self.runtime);
+            let replies = Arc::clone(&self.replies);
+            tokio::spawn(async move {
+                Self::respond(&runtime, &replies, &interaction).await;
+            });
         }
     }
 }

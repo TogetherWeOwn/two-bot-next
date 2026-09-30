@@ -32,6 +32,7 @@ struct RecordedRequest {
     path: String,
     body: Value,
     at: Instant,
+    bot_authenticated: bool,
 }
 
 #[derive(Clone)]
@@ -78,6 +79,7 @@ async fn handle(
     State(state): State<MockState>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
     state.recorded.lock().unwrap().push(RecordedRequest {
@@ -85,6 +87,7 @@ async fn handle(
         path: uri.path().to_owned(),
         body: serde_json::from_slice(&body).unwrap_or(Value::Null),
         at: Instant::now(),
+        bot_authenticated: headers.contains_key(AUTHORIZATION),
     });
     let next = state
         .script
@@ -126,6 +129,126 @@ fn attributes() -> RoomChannelAttributes {
 
 fn created_channel() -> Value {
     json!({ "id": "600", "guild_id": "100", "type": 2, "name": "room" })
+}
+
+fn deferred_response() -> InteractionResponse {
+    use twilight_model::{
+        channel::message::MessageFlags,
+        http::interaction::{InteractionResponseData, InteractionResponseType},
+    };
+    InteractionResponse {
+        kind: InteractionResponseType::DeferredChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
+#[tokio::test]
+async fn ephemeral_defer_then_edit_original_use_token_only_and_no_mentions() {
+    let mock = Mock::start(vec![response(204, Value::Null), response(200, json!({}))]).await;
+    mock.api
+        .respond_interaction(
+            Id::new(1),
+            Id::new(2),
+            "interaction-token",
+            &deferred_response(),
+        )
+        .await
+        .unwrap();
+    mock.api
+        .complete_interaction(Id::new(1), "interaction-token", "Created <#600>")
+        .await
+        .unwrap();
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, Method::POST);
+    assert_eq!(
+        requests[0].path,
+        "/api/v10/interactions/2/interaction-token/callback"
+    );
+    assert_eq!(requests[0].body, json!({"type": 5, "data": {"flags": 64}}));
+    assert_eq!(requests[1].method, Method::PATCH);
+    assert_eq!(
+        requests[1].path,
+        "/api/v10/webhooks/1/interaction-token/messages/@original"
+    );
+    assert_eq!(requests[1].body["content"], "Created <#600>");
+    assert_eq!(requests[1].body["allowed_mentions"]["parse"], json!([]));
+    assert!(requests.iter().all(|request| !request.bot_authenticated));
+}
+
+#[tokio::test]
+async fn callback_429_is_single_attempt_and_does_not_set_bot_global_backoff() {
+    let mock = Mock::start(vec![
+        response(429, json!({"retry_after": 600, "global": true})),
+        response(204, Value::Null),
+    ])
+    .await;
+    assert_eq!(
+        mock.api
+            .respond_interaction(
+                Id::new(1),
+                Id::new(2),
+                "interaction-token",
+                &deferred_response()
+            )
+            .await,
+        Err(RoomHttpError::RateLimited {
+            retry_after_ms: 600000,
+            global: true
+        })
+    );
+    tokio::time::timeout(Duration::from_secs(1), mock.api.delete_room(600, || true))
+        .await
+        .unwrap()
+        .unwrap();
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].bot_authenticated);
+}
+
+#[tokio::test]
+async fn expired_interaction_token_does_not_halt_bot_credentials() {
+    let mock = Mock::start(vec![response(401, json!({})), response(204, Value::Null)]).await;
+    assert_eq!(
+        mock.api
+            .respond_interaction(
+                Id::new(1),
+                Id::new(2),
+                "expired-token",
+                &deferred_response()
+            )
+            .await,
+        Err(RoomHttpError::Unauthorized)
+    );
+    mock.api.delete_room(600, || true).await.unwrap();
+    assert_eq!(mock.state.recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn callback_bypasses_bot_backoff_and_credential_halt_without_substitution() {
+    let mock = Mock::start(vec![response(204, Value::Null)]).await;
+    *mock.api.global_not_before.lock().unwrap() = Some(Instant::now() + Duration::from_secs(600));
+    mock.api.unauthorized.store(true, Ordering::Relaxed);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        mock.api.respond_interaction(
+            Id::new(1),
+            Id::new(2),
+            "interaction-token",
+            &deferred_response(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!mock.state.recorded.lock().unwrap()[0].bot_authenticated);
+    assert_eq!(
+        mock.api.delete_room(600, || true).await,
+        Err(RoomHttpError::Unauthorized)
+    );
 }
 
 #[tokio::test]

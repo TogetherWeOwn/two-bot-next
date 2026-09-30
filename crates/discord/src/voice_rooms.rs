@@ -29,12 +29,17 @@ use serde::Deserialize;
 use tokio::time::Instant;
 use twilight_http::{error::ErrorType, request::TryIntoRequest, Client};
 use twilight_model::{
+    channel::message::AllowedMentions,
     channel::{
         permission_overwrite::{PermissionOverwrite, PermissionOverwriteType},
         Channel, ChannelType, VideoQualityMode,
     },
     guild::{Permissions, Role},
-    id::{marker::RoleMarker, Id},
+    http::interaction::InteractionResponse,
+    id::{
+        marker::{ApplicationMarker, InteractionMarker, RoleMarker},
+        Id,
+    },
 };
 use two_bot_core::{
     voice_rooms::{parse_retry_after_ms, CreatorChannel, MAX_USER_LIMIT},
@@ -226,9 +231,21 @@ impl RoomHttp {
         request: twilight_http::request::Request,
         still_valid: impl Fn() -> bool + Send,
     ) -> Result<Bytes, RoomHttpError> {
-        // Global backoff is shared by clones/guild workers, not only the guild
-        // that received the 429. The queue owns route/guild backoff.
+        self.send_request(request, still_valid, true).await
+    }
+
+    async fn send_request(
+        &self,
+        request: twilight_http::request::Request,
+        still_valid: impl Fn() -> bool + Send,
+        bot_authenticated: bool,
+    ) -> Result<Bytes, RoomHttpError> {
+        // Interaction callbacks/webhooks use their own token, not the bot
+        // credential or its global rate limit. Never log their request paths.
         loop {
+            if !bot_authenticated {
+                break;
+            }
             if self.unauthorized.load(Ordering::Relaxed) {
                 return Err(RoomHttpError::Unauthorized);
             }
@@ -244,8 +261,10 @@ impl RoomHttp {
         let mut wire = Request::builder()
             .method(request.method().name())
             .uri(format!("{}/{}", self.origin, request.path()))
-            .header(AUTHORIZATION, self.authorization.clone())
             .header(CONTENT_TYPE, "application/json");
+        if bot_authenticated {
+            wire = wire.header(AUTHORIZATION, self.authorization.clone());
+        }
         if let Some(headers) = request.headers() {
             for (name, value) in headers {
                 wire = wire.header(name, value);
@@ -264,7 +283,9 @@ impl RoomHttp {
                 .map_err(|_| RoomHttpError::UnknownOutcome)?;
             let status = response.status().as_u16();
             if status == 401 {
-                self.unauthorized.store(true, Ordering::Relaxed);
+                if bot_authenticated {
+                    self.unauthorized.store(true, Ordering::Relaxed);
+                }
                 return Err(RoomHttpError::Unauthorized);
             }
             let header_delay = response
@@ -292,7 +313,7 @@ impl RoomHttp {
             {
                 *retry_after_ms = (*retry_after_ms).max(header_delay.unwrap_or(0));
                 *global |= global_header;
-                if *global {
+                if *global && bot_authenticated {
                     let until = Instant::now()
                         .checked_add(Duration::from_millis(*retry_after_ms))
                         .ok_or(RoomHttpError::InvalidRequest)?;
@@ -305,6 +326,50 @@ impl RoomHttp {
         .await
         .map_err(|_| RoomHttpError::UnknownOutcome)?;
         response
+    }
+
+    /// One callback attempt, bounded below Discord's three-second deadline.
+    /// No bot authorization, global bot backoff, or internal 429 retries.
+    pub async fn respond_interaction(
+        &self,
+        application: Id<ApplicationMarker>,
+        interaction: Id<InteractionMarker>,
+        token: &str,
+        response: &InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        let request = self
+            .http
+            .interaction(application)
+            .create_response(interaction, token, response)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        tokio::time::timeout(
+            Duration::from_millis(2500),
+            self.send_request(request, || true, false),
+        )
+        .await
+        .map_err(|_| RoomHttpError::UnknownOutcome)??;
+        Ok(())
+    }
+
+    /// Complete the deferred response, never a second initial response.
+    pub async fn complete_interaction(
+        &self,
+        application: Id<ApplicationMarker>,
+        token: &str,
+        content: &str,
+    ) -> Result<(), RoomHttpError> {
+        let mentions = AllowedMentions::default();
+        let request = self
+            .http
+            .interaction(application)
+            .update_response(token)
+            .content(Some(content))
+            .allowed_mentions(Some(&mentions))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send_request(request, || true, false).await?;
+        Ok(())
     }
 
     pub async fn create_room(
