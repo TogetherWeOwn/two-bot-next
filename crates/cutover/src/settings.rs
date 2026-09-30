@@ -27,7 +27,7 @@ pub struct SettingsStore<'a> {
 }
 
 impl<'a> SettingsStore<'a> {
-    /// Borrow the pool; migrations (including `0330`–`0332`) are applied by
+    /// Borrow the pool; migrations (including `0330`–`0333`) are applied by
     /// [`crate::CutoverDb::migrate`], not here.
     #[must_use]
     pub fn new(pool: &'a Pool<Postgres>) -> Self {

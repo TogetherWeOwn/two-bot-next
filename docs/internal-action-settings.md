@@ -51,9 +51,10 @@ still returns `source: "store"`; expected-zero saves/deletes refuse it. An
 explicit legacy unconditional save assigns it a new positive token, after which
 version-checked writes work normally. A supplied stale version returns
 non-retryable HTTP 409 `version_conflict`; refresh before deliberately submitting
-a new save. Omitting it retains the legacy unconditional-save behavior. The comparison occurs under
-the existing revision-row lock, before the value, audit or poll revision changes,
-so simultaneous saves against one version cannot both succeed.
+a new save. Omitting it retains the legacy unconditional-save behavior. The
+comparison occurs under the existing revision-row lock, before the value, audit
+or poll revision changes, so simultaneous saves against one version cannot both
+succeed.
 
 `SettingsOutcome.observed_version` exposes the observed/committed version to a
 future HTTP adapter as metadata, not an extra field in the legacy `result`.
@@ -67,10 +68,15 @@ advance on every insert/update, including supported direct SQL writers, via
 migration `0331`'s database-owned row trigger. Caller-supplied versions are
 ignored; the upgrade seeds the allocator above existing row tokens without
 changing migration `0330`. Additive migration `0332` binds allocation to the
-trigger's target table schema, independent of the caller's sequence search path;
-`0330` and `0331` checksums and existing row tokens remain unchanged. Deletion
-advances the transactional poll revision. No runtime hot-reload consumer is
-changed here.
+trigger's target table schema, independent of the caller's sequence search path.
+Additive migration `0333` locks settings DML and reseeds that canonical allocator
+above existing tokens (including intervening shadow-issued `0331` tokens) and
+unused allocations without rewinding it. It also binds the statement trigger's
+revision table to the target schema: qualified direct writers lock/advance the
+same revision used by store CAS and polling, not a caller's shadow table. A
+missing target revision row still refuses the statement. Applied `0330`–`0332`
+checksums and existing row tokens remain unchanged. Deletion advances the
+transactional poll revision. No runtime hot-reload consumer is changed here.
 
 The outer durable store and this transaction are separate. A receiver must not
 re-execute an ambiguous write after losing a terminal-response commit. Its

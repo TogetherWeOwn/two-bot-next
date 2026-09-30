@@ -32,17 +32,19 @@ impl TestDb {
     }
 
     async fn migrate_row_versions(&self) -> Result<(), sqlx::Error> {
+        for migration in [
+            include_str!("../migrations/0331_guild_settings_versions.sql"),
+            include_str!("../migrations/0332_guild_settings_allocator.sql"),
+            include_str!("../migrations/0333_guild_settings_revision.sql"),
+        ] {
+            self.migrate(migration).await?;
+        }
+        Ok(())
+    }
+
+    async fn migrate(&self, migration: &'static str) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        sqlx::raw_sql(include_str!(
-            "../migrations/0331_guild_settings_versions.sql"
-        ))
-        .execute(&mut *tx)
-        .await?;
-        sqlx::raw_sql(include_str!(
-            "../migrations/0332_guild_settings_allocator.sql"
-        ))
-        .execute(&mut *tx)
-        .await?;
+        sqlx::raw_sql(migration).execute(&mut *tx).await?;
         tx.commit().await
     }
 
@@ -377,6 +379,119 @@ async fn version_migration_preserves_rows_and_seeds_above_existing_tokens() -> T
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn schema_binding_upgrade_reseeds_shadow_tokens_and_blocks_dml() -> TestResult {
+    for unused_allocations in [false, true] {
+        let db = TestDb::new_legacy().await?;
+        db.migrate(include_str!(
+            "../migrations/0331_guild_settings_versions.sql"
+        ))
+        .await?;
+        sqlx::query("SELECT nextval('guild_settings_version_seq') FROM generate_series(1, 9)")
+            .execute(&db.pool)
+            .await?;
+        let canonical: i64 =
+            sqlx::query_scalar("SELECT last_value FROM guild_settings_version_seq")
+                .fetch_one(&db.pool)
+                .await?;
+        let mut tx = db.pool.begin().await?;
+        sqlx::query("CREATE TEMP SEQUENCE guild_settings_version_seq")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "SELECT nextval('pg_temp.guild_settings_version_seq') FROM generate_series(1::bigint, $1)",
+        )
+        .bind(canonical)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT set_config('search_path', $1, true)")
+            .bind(format!("pg_temp,{}", db.schema))
+            .execute(&mut *tx)
+            .await?;
+        // A real intervening write on installed 0331, before 0332 is applied.
+        let shadow_token: i64 = QueryBuilder::<Postgres>::new("INSERT INTO ")
+            .push(&db.schema)
+            .push(".guild_settings (guild_id, key, value, updated_by) VALUES (")
+            .push_bind(GUILD)
+            .push(", ")
+            .push_bind(KEY)
+            .push(", '8', 'legacy-writer') RETURNING version")
+            .build_query_scalar()
+            .fetch_one(&mut *tx)
+            .await?;
+        assert_eq!(shadow_token, canonical + 1);
+        sqlx::query("DROP SEQUENCE pg_temp.guild_settings_version_seq")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        db.migrate(include_str!(
+            "../migrations/0332_guild_settings_allocator.sql"
+        ))
+        .await?;
+        if unused_allocations {
+            sqlx::query("SELECT nextval('guild_settings_version_seq') FROM generate_series(1, 25)")
+                .execute(&db.pool)
+                .await?;
+        }
+        let allocated: i64 =
+            sqlx::query_scalar("SELECT last_value FROM guild_settings_version_seq")
+                .fetch_one(&db.pool)
+                .await?;
+        let store = SettingsStore::new(&db.pool);
+        let before = store.poll_marks().await?;
+        let mut upgrade = db.pool.begin().await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0333_guild_settings_revision.sql"
+        ))
+        .execute(&mut *upgrade)
+        .await?;
+        assert_eq!(store.get(GUILD, KEY).await?, Some((json!(8), shadow_token)));
+        assert_eq!(store.poll_marks().await?, before);
+        assert!(db.audit().await?.is_empty());
+
+        // The store acquires the revision lock before waiting on the DML lock.
+        // Upgrade commit must not need that revision lock or deadlock with it.
+        let pool = db.pool.clone();
+        let writer = tokio::spawn(async move {
+            execute_settings(
+                &SettingsStore::new(&pool),
+                GUILD,
+                &save(json!(9), Some(shadow_token)),
+            )
+            .await
+        });
+        db.wait_for_writers(1).await?;
+        upgrade.commit().await?;
+        let saved = tokio::time::timeout(Duration::from_secs(5), writer).await???;
+        assert!(saved.observed_version > shadow_token.max(allocated));
+        let marks = store.poll_marks().await?;
+        for value in [json!(10), Value::Null] {
+            let error = execute_settings(&store, GUILD, &save(value, Some(shadow_token)))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::VersionConflict);
+            assert_eq!(error.status(), 409);
+            assert!(!error.code.retryable());
+            assert_eq!(
+                store.get(GUILD, KEY).await?,
+                Some((json!(9), saved.observed_version))
+            );
+            assert_eq!(store.poll_marks().await?, marks);
+            assert_eq!(db.audit().await?, vec![(Some(json!(8)), Some(json!(9)))]);
+        }
+        execute_settings(
+            &store,
+            GUILD,
+            &save(json!(10), Some(saved.observed_version)),
+        )
+        .await?;
+        assert_eq!(db.audit().await?[1], (Some(json!(9)), Some(json!(10))));
+        db.finish().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
 async fn legacy_zero_version_does_not_match_absence_after_upgrade() -> TestResult {
     let db = TestDb::new_legacy().await?;
     sqlx::query(
@@ -430,11 +545,19 @@ async fn legacy_zero_version_does_not_match_absence_after_upgrade() -> TestResul
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or the CI Postgres service"]
-async fn qualified_sql_uses_table_allocator_not_shadow_sequence() -> TestResult {
+async fn qualified_sql_uses_target_allocator_and_revision_not_shadows() -> TestResult {
     let db = TestDb::new().await?;
     let store = SettingsStore::new(&db.pool);
     let saved = execute_settings(&store, GUILD, &save(json!(8), Some(0))).await?;
+    let before = store.poll_marks().await?;
+    let mut cache = SettingsCache::load(&store.load_snapshot().await?);
     let mut tx = db.pool.begin().await?;
+    sqlx::raw_sql(
+        "CREATE TEMP TABLE guild_settings_revision (singleton BOOLEAN PRIMARY KEY, revision BIGINT);
+         INSERT INTO guild_settings_revision VALUES (TRUE, 41);",
+    )
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("CREATE TEMP SEQUENCE guild_settings_version_seq")
         .execute(&mut *tx)
         .await?;
@@ -471,12 +594,29 @@ async fn qualified_sql_uses_table_allocator_not_shadow_sequence() -> TestResult 
         (saved.observed_version, false),
         "shadow sequence was never used"
     );
-    sqlx::query("DROP SEQUENCE pg_temp.guild_settings_version_seq")
-        .execute(&mut *tx)
-        .await?;
+    let shadow_revision: i64 =
+        sqlx::query_scalar("SELECT revision FROM pg_temp.guild_settings_revision")
+            .fetch_one(&mut *tx)
+            .await?;
+    assert_eq!(shadow_revision, 41, "shadow revision was never changed");
+    assert_eq!(
+        store.poll_marks().await?,
+        before,
+        "uncommitted is invisible"
+    );
+    sqlx::raw_sql(
+        "DROP SEQUENCE pg_temp.guild_settings_version_seq;
+         DROP TABLE pg_temp.guild_settings_revision;",
+    )
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
 
     let marks = store.poll_marks().await?;
+    assert_eq!(marks, (before.0 + 1, before.1));
+    assert!(cache.needs_refresh(marks.0, marks.1));
+    cache.refresh(&store.load_snapshot().await?);
+    assert_eq!(cache.get(GUILD, KEY), Some(&json!(9)));
     for value in [json!(10), Value::Null] {
         let error = execute_settings(&store, GUILD, &save(value, Some(saved.observed_version)))
             .await
@@ -489,6 +629,114 @@ async fn qualified_sql_uses_table_allocator_not_shadow_sequence() -> TestResult 
     // A normal caller can use the fresh token after the qualified direct write.
     execute_settings(&store, GUILD, &save(json!(10), Some(token))).await?;
     assert_eq!(db.audit().await?[1], (Some(json!(9)), Some(json!(10))));
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn qualified_writer_waits_on_target_revision_lock() -> TestResult {
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let saved = execute_settings(&store, GUILD, &save(json!(8), Some(0))).await?;
+    let before = store.poll_marks().await?;
+    let mut gate = db.pool.begin().await?;
+    sqlx::query("SELECT revision FROM guild_settings_revision WHERE singleton = TRUE FOR UPDATE")
+        .fetch_one(&mut *gate)
+        .await?;
+    let pool = db.pool.clone();
+    let schema = db.schema.clone();
+    let writer = tokio::spawn(async move {
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE guild_settings_revision (singleton BOOLEAN PRIMARY KEY, revision BIGINT);
+             INSERT INTO guild_settings_revision VALUES (TRUE, 41);",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT set_config('search_path', $1, true)")
+            .bind(format!("pg_temp,{schema}"))
+            .execute(&mut *tx)
+            .await?;
+        let token: i64 = QueryBuilder::<Postgres>::new("UPDATE ")
+            .push(&schema)
+            .push(".guild_settings SET value = '9' WHERE guild_id = ")
+            .push_bind(GUILD)
+            .push(" AND key = ")
+            .push_bind(KEY)
+            .push(" RETURNING version")
+            .build_query_scalar()
+            .fetch_one(&mut *tx)
+            .await?;
+        let shadow: i64 =
+            sqlx::query_scalar("SELECT revision FROM pg_temp.guild_settings_revision")
+                .fetch_one(&mut *tx)
+                .await?;
+        assert_eq!(shadow, 41);
+        sqlx::query("DROP TABLE pg_temp.guild_settings_revision")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(token)
+    });
+    db.wait_for_writers(1).await?;
+    assert_eq!(
+        store.get(GUILD, KEY).await?,
+        Some((json!(8), saved.observed_version))
+    );
+    assert_eq!(store.poll_marks().await?, before);
+    gate.commit().await?;
+    let token = tokio::time::timeout(Duration::from_secs(5), writer).await???;
+    assert!(token > saved.observed_version);
+    assert_eq!(store.poll_marks().await?, (before.0 + 1, before.1));
+    assert_eq!(store.get(GUILD, KEY).await?, Some((json!(9), token)));
+    execute_settings(&store, GUILD, &save(json!(10), Some(token))).await?;
+    assert_eq!(db.audit().await?[1], (Some(json!(9)), Some(json!(10))));
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn missing_target_revision_refuses_qualified_write_despite_shadow() -> TestResult {
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let saved = execute_settings(&store, GUILD, &save(json!(8), Some(0))).await?;
+    let before = store.poll_marks().await?;
+    let mut tx = db.pool.begin().await?;
+    sqlx::raw_sql(
+        "CREATE TEMP TABLE guild_settings_revision (singleton BOOLEAN PRIMARY KEY, revision BIGINT);
+         INSERT INTO guild_settings_revision VALUES (TRUE, 41);",
+    )
+    .execute(&mut *tx)
+    .await?;
+    QueryBuilder::<Postgres>::new("DELETE FROM ")
+        .push(&db.schema)
+        .push(".guild_settings_revision")
+        .build()
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT set_config('search_path', $1, true)")
+        .bind(format!("pg_temp,{}", db.schema))
+        .execute(&mut *tx)
+        .await?;
+    let error = QueryBuilder::<Postgres>::new("UPDATE ")
+        .push(&db.schema)
+        .push(".guild_settings SET value = '9'")
+        .build()
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    let sqlx::Error::Database(error) = error else {
+        panic!("expected missing revision rejection");
+    };
+    assert_eq!(error.code().as_deref(), Some("P0001"));
+    assert_eq!(error.message(), "guild_settings revision row is missing");
+    tx.rollback().await?;
+    assert_eq!(
+        store.get(GUILD, KEY).await?,
+        Some((json!(8), saved.observed_version))
+    );
+    assert_eq!(store.poll_marks().await?, before);
+    assert_eq!(db.audit().await?, vec![(None, Some(json!(8)))]);
     db.finish().await
 }
 
