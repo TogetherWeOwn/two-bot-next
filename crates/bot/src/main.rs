@@ -5,6 +5,7 @@
 //! `/readyz` reports `gateway: down` (HTTP 503) — the Container boots healthy
 //! on staging config either way.
 
+mod dispatch;
 mod gateway;
 mod server;
 
@@ -54,8 +55,8 @@ async fn main() {
             Err(_) => {
                 // No URL or server error text: either may contain credentials
                 // or row data. A failed migration never admits gateway writes.
-                tracing::error!("database initialization failed; gateway parked");
-                None
+                tracing::error!("database initialization failed; exiting for supervisor restart");
+                std::process::exit(1);
             }
         },
         None => {
@@ -79,10 +80,10 @@ async fn main() {
         info!("persistent store ready; gateway shard connecting");
         let task = tokio::spawn(run_shard(shard, pipeline, Arc::clone(&gateway)));
         tokio::spawn(async move {
-            if task.await.is_err() {
-                *gateway.write().await = GatewayState::Armed;
-                tracing::error!("gateway task stopped; restart required");
-            }
+            let _ = task.await;
+            *gateway.write().await = GatewayState::Armed;
+            tracing::error!("gateway task stopped; exiting for supervisor restart");
+            std::process::exit(1);
         });
     } else {
         info!(status = ?ComponentStatus::Down, "gateway parked, /readyz reports down");

@@ -105,42 +105,50 @@ pub fn intents_from_env() -> Intents {
     gateway_intents(message_content)
 }
 
-/// Run the shard event loop until the stream ends or fatally closes.
-///
-/// Dispatches every event to `pipeline`; receive/parse failures log at warn
-/// (legacy `Error` → `client_error` row) and the loop continues — a single
-/// poisoned dispatch must not kill the funnel. Updates `state` so /readyz
-/// tracks the connection.
+/// Poll the shard independently of one ordered, bounded dispatch worker.
+/// Parse errors are skipped; overload/store failure requires process restart.
 pub async fn run_shard<S, L, F, I, C, P>(
-    mut shard: Shard,
+    shard: Shard,
     pipeline: Arc<Pipeline<S, L, F, I, C, P>>,
     state: Arc<RwLock<GatewayState>>,
-) where
-    S: FunnelStore,
-    L: LevelingHook,
-    F: FactsSink,
-    I: InviteSource,
-    C: ChannelClassifier,
-    P: InviteSnapshotStore + Send + Sync,
+) -> Result<(), &'static str>
+where
+    S: FunnelStore + 'static,
+    L: LevelingHook + 'static,
+    F: FactsSink + 'static,
+    I: InviteSource + 'static,
+    C: ChannelClassifier + 'static,
+    P: InviteSnapshotStore + Send + Sync + 'static,
 {
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
-    while let Some(item) = shard.next_event(EventTypeFlags::all()).await {
-        match item {
-            Ok(event) => {
-                if matches!(event, Event::Ready(_)) {
-                    *state.write().await = GatewayState::Connected;
+    let receive_state = Arc::clone(&state);
+    let events = futures_util::stream::unfold(shard, move |mut shard| {
+        let state = Arc::clone(&receive_state);
+        async move {
+            while let Some(item) = shard.next_event(EventTypeFlags::all()).await {
+                match item {
+                    Ok(event) => {
+                        if matches!(event, Event::Ready(_)) {
+                            *state.write().await = GatewayState::Connected;
+                        }
+                        return Some((event, shard));
+                    }
+                    Err(source) => {
+                        warn!(error = ?source, "gateway dispatch failed; skipping event");
+                    }
                 }
-                pipeline.handle(&event);
             }
-            Err(source) => {
-                // Parity matrix §3 `Error` row: legacy logged client_error;
-                // here the droppable dispatch is skipped and the loop lives.
-                warn!(error = ?source, "gateway dispatch failed; skipping event");
-            }
+            None
         }
-    }
-    warn!("gateway shard stream ended; supervisor reports down until restart");
+    });
+    let result = crate::dispatch::dispatch_ordered(
+        events,
+        crate::dispatch::DISPATCH_BACKLOG,
+        move |event| pipeline.handle(&event),
+    )
+    .await;
     *state.write().await = GatewayState::Armed;
+    result
 }
 
 /// Build the supervisor's shard: single-shard deployment (one guild, ADR

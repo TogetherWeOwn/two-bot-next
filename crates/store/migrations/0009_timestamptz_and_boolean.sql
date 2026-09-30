@@ -4,7 +4,6 @@
 -- Malformed legacy values fail the transaction; no data is silently repaired.
 DO $$
 DECLARE c record;
-DECLARE v record;
 BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
@@ -13,14 +12,14 @@ BEGIN
        AND ((column_name LIKE '%\_at' ESCAPE '\' AND data_type = 'text')
          OR (column_name = 'is_bot' AND data_type <> 'boolean'))
   ) THEN
-    -- Dependent views must be recreated after a type change. The bot applies
-    -- the contract only after the entire migration chain succeeds.
-    FOR v IN
-      SELECT DISTINCT vns.nspname AS schema_name, vc.relname AS view_name
+    -- Boot cannot safely recreate arbitrary consumers, owners or grants.
+    -- Reject before any conversion; an authorized schema transition must
+    -- preserve these dependencies separately. Never DROP ... CASCADE here.
+    IF EXISTS (
+      SELECT 1
         FROM pg_depend d
         JOIN pg_rewrite rw ON rw.oid = d.objid
-        JOIN pg_class vc ON vc.oid = rw.ev_class AND vc.relkind = 'v'
-        JOIN pg_namespace vns ON vns.oid = vc.relnamespace
+        JOIN pg_class vc ON vc.oid = rw.ev_class AND vc.relkind IN ('v', 'm')
         JOIN pg_class src ON src.oid = d.refobjid
         JOIN pg_namespace sns ON sns.oid = src.relnamespace
        WHERE d.classid = 'pg_rewrite'::regclass
@@ -28,9 +27,9 @@ BEGIN
          AND src.relname IN ('events', 'members', 'invite_snapshots')
          AND sns.nspname = current_schema()
          AND vc.oid <> src.oid
-    LOOP
-      EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', v.schema_name, v.view_name);
-    END LOOP;
+    ) THEN
+      RAISE EXCEPTION 'legacy normalization requires an authorized dependency-preserving schema transition';
+    END IF;
   END IF;
 
   FOR c IN

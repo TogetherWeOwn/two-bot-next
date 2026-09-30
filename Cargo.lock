@@ -2171,6 +2171,7 @@ name = "two-bot"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "rustls",
  "serde_json",
  "sqlx",

@@ -19,6 +19,10 @@ edit an applied migration: add a new version. `build.rs` tracks directory change
 so adding a migration refreshes the embedded runner. Tests exercise both orders
 of application with the cutover tool chain; this is not proof that an arbitrary
 existing production schema or historical migration ledger is compatible.
+Normalization explicitly rejects legacy types with dependent views (including
+materialized views) before conversion. Boot never drops/recreates consumers or
+their grants. Such schemas need a separately authorized dependency-preserving
+transition; this implementation does not provide or authorize that transition.
 
 `sql/web_v1.sql` preserves the existing website contract. Application is atomic
 and repeatable. `public` tables publish `web_v1`; a separate table schema publishes
@@ -31,8 +35,9 @@ access. No roles, grants or credentials are created by this implementation.
 
 The runtime pool is capped at **5**, with a **15-second statement timeout** and
 10-second acquire timeout. Boot applies migrations and contract before admitting
-any gateway dispatch. Missing/failed DB configuration parks the gateway; there
-is no in-memory fallback. `/health` stays process-only; `/readyz` checks both the
+any gateway dispatch. Missing DB configuration parks the gateway; configured
+initialization failure exits nonzero for supervisor restart. Migration errors
+remain fail closed; there is no in-memory fallback. `/health` stays process-only; `/readyz` checks both the
 gateway and a live DB ping (2-second bound). HTTP readiness exposes no connection
 strings or database error text. Invite REST failure/timeout/incomplete counters
 retain the last persisted snapshot instead of fabricating an empty listing.
@@ -40,8 +45,13 @@ retain the last persisted snapshot instead of fabricating an empty listing.
 Core store traits are synchronous. The bridge requires a Tokio multi-thread
 runtime (`block_in_place`), as used by the binary and DB tests. A synchronous
 store failure panics: release aborts and the container must restart; the debug
-supervisor marks the gateway non-ready if its task dies. Continuing after a
-partially advanced in-memory dispatch would be unsafe. Async callers can use
+supervisor exits nonzero if its task dies. Shard reception remains independently
+polled while a single blocking worker dispatches in order. The backlog is bounded
+at 64 events; a full backlog exits rather than blocking heartbeat polls or
+silently dropping events. Continuing after a partially advanced in-memory
+dispatch would be unsafe. Observed bots are persisted before unconditional leave
+logging, including a bot first seen in MemberRemove after restart, and are never
+demoted by missing member data; human web views exclude those projections. Async callers can use
 `PgFunnelStore::try_record` for an explicit error result.
 
 Feature-owned moderation, automod, audit and settings migrations remain with
@@ -84,7 +94,9 @@ probes. Tests continue to run on test containers only.
 - [ ] Preserve the current staging image/config and a provider-managed database
       restore point through the authorized operator path before boot migrations.
       Establish the approved schema/search_path; do not blindly replay against
-      an arbitrary legacy migration ledger. 0009 may recreate dependent views.
+      an arbitrary legacy migration ledger. 0009 refuses legacy conversion with
+      dependent views; arrange a separately authorized dependency-preserving
+      transition instead of dropping views, grants or editing checksums.
 - [ ] Record the versioned image and deploy through the normal staging workflow.
       Confirm migration/contract startup success from sanitized runtime logs and
       `/readyz` database+gateway state. Failed startup is a failed gate, not a

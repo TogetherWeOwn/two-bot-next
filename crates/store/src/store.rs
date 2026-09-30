@@ -30,8 +30,8 @@ use two_bot_core::{
 ///
 /// Holds the pool plus a `tokio::runtime::Handle` for the sync→async bridge
 /// (see crate docs): each trait method dispatches its query with
-/// `block_in_place`, so the gateway thread parks while runtime worker threads
-/// drive the I/O. Construct with [`PgFunnelStore::new`] from inside a tokio
+/// `block_in_place`, so the dispatch worker waits while runtime threads
+/// drive the I/O. Shard polling stays independent. Construct with [`PgFunnelStore::new`] from inside a tokio
 /// runtime (the bot binary, tests); the handle is `Handle::current()`.
 #[derive(Debug, Clone)]
 pub struct PgFunnelStore {
@@ -242,6 +242,20 @@ async fn advance_activity(
 }
 
 impl FunnelStore for PgFunnelStore {
+    fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake) {
+        self.block_on(async {
+            sqlx::query(
+                "INSERT INTO members (guild_id, member_id, is_bot) VALUES ($1, $2, TRUE)
+                 ON CONFLICT (guild_id, member_id) DO UPDATE SET is_bot = TRUE",
+            )
+            .bind(snowflake_text(guild_id))
+            .bind(snowflake_text(member_id))
+            .execute(&self.pool)
+            .await
+        })
+        .expect("funnel mark_bot failed");
+    }
+
     /// Insert-or-ignore by idempotency key; projection runs for the winner.
     ///
     /// # Panics

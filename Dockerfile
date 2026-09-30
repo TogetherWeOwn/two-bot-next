@@ -18,11 +18,13 @@ COPY crates/core/Cargo.toml crates/core/
 COPY crates/discord/Cargo.toml crates/discord/
 COPY crates/bot/Cargo.toml crates/bot/
 COPY crates/cutover/Cargo.toml crates/cutover/
-RUN mkdir -p crates/core/src crates/discord/src crates/bot/src crates/cutover/src \
+COPY crates/store/Cargo.toml crates/store/
+RUN mkdir -p crates/core/src crates/discord/src crates/bot/src crates/cutover/src crates/store/src \
     && echo 'fn main(){}' > crates/bot/src/main.rs \
     && echo '' > crates/core/src/lib.rs \
     && echo '' > crates/discord/src/lib.rs \
     && echo '' > crates/cutover/src/lib.rs \
+    && echo '' > crates/store/src/lib.rs \
     && cargo fetch --locked
 
 # Real sources; the release profile (opt-level=z, lto, strip) targets the

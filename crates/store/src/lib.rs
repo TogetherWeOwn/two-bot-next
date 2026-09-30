@@ -13,8 +13,8 @@
 //! while the runtime's other threads drive the I/O. **Never call a store
 //! method from inside an async task on a `current_thread` runtime** — there
 //! is no other thread to drive the future and `block_in_place` will panic.
-//! In practice the pipeline calls from the sync shard loop, whose runtime is
-//! multi-thread (the bot binary uses `rt-multi-thread`).
+//! The runtime pipeline calls from one ordered blocking dispatch worker;
+//! the shard is polled independently on the multi-thread Tokio runtime.
 
 pub mod migrations;
 pub mod pool;

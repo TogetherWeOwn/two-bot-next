@@ -140,6 +140,71 @@ async fn migrations_contract_and_checksum_guard() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires authorized TEST_DATABASE_URL"]
+async fn legacy_normalization_rejects_dependencies_without_losing_views_or_grants() {
+    let f = Fixture::new().await;
+    let mut legacy = sqlx::migrate::Migrator::with_migrations(
+        two_bot_store::MIGRATOR
+            .iter()
+            .filter(|m| m.version < 9)
+            .cloned()
+            .collect(),
+    );
+    legacy.dangerous_set_table_name(two_bot_store::TABLE_NAME);
+    legacy.run(&f.pool).await.unwrap();
+    let web = format!("{}_web_v1", f.schema);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA {web};
+         CREATE VIEW {web}.members AS SELECT member_id, joined_at FROM members;
+         GRANT SELECT ON {web}.members TO PUBLIC;
+         CREATE VIEW consumer AS SELECT * FROM {web}.members"
+    )))
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let before: (String, String, String, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT oid::text, relowner::text, relacl::text, pg_get_viewdef(oid)
+         FROM pg_class WHERE oid = '{web}.members'::regclass"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    let error = migrate(&f.pool).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("authorized dependency-preserving schema transition"));
+    let after: (String, String, String, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT oid::text, relowner::text, relacl::text, pg_get_viewdef(oid)
+         FROM pg_class WHERE oid = '{web}.members'::regclass"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        before, after,
+        "view identity, owner, ACL and definition must survive"
+    );
+    let columns: (String, String) = sqlx::query_as(
+        "SELECT
+          (SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'members' AND column_name = 'joined_at'),
+          (SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'members' AND column_name = 'is_bot')"
+    ).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(columns, ("text".to_owned(), "smallint".to_owned()));
+    let applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM _two_bot_migrations WHERE version = 9 AND success)",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert!(!applied);
+    sqlx::query("SELECT * FROM consumer")
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires authorized TEST_DATABASE_URL"]
 async fn existing_cutover_schema_is_preserved_in_both_orders() {
     for cutover_first in [true, false] {
         let f = Fixture::new().await;
@@ -272,6 +337,95 @@ async fn invite_snapshots_survive_reconstruction_and_delete_is_guild_scoped() {
     restarted.delete_missing(123, &HashSet::new());
     assert!(restarted.load(123).is_empty());
     assert_eq!(restarted.load(124).len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires authorized TEST_DATABASE_URL"]
+async fn bot_departures_are_logged_but_excluded_from_human_web_projections() {
+    use twilight_model::gateway::{event::Event, payload::incoming::MemberRemove};
+    use two_bot_core::{NoopFacts, NoopLeveling};
+    use two_bot_discord::{NoClassification, Pipeline, ScriptedInvites};
+
+    let f = Fixture::new().await;
+    migrate(&f.pool).await.unwrap();
+    two_bot_store::apply_web_contract(&f.pool).await.unwrap();
+    // Simulate a pre-existing row that lacked classification before restart.
+    let mut old = event(EventType::MemberJoin, "2026-09-29T12:00:00.000Z");
+    old.member_id = Some(900);
+    PgFunnelStore::new(f.pool.clone()).record(old);
+    let pipeline = Pipeline::with_snapshots(
+        PgFunnelStore::new(f.pool.clone()),
+        Some(NoopLeveling),
+        Some(NoopFacts),
+        ScriptedInvites::new(),
+        NoClassification,
+        PgInviteSnapshots::new(f.pool.clone()),
+    );
+    for (id, bot) in [(456, true), (900, true), (789, false)] {
+        let remove: MemberRemove = serde_json::from_value(serde_json::json!({
+            "guild_id":"123", "user":{"id":id.to_string(), "username":"fixture",
+            "discriminator":"0", "avatar":null, "bot":bot}
+        }))
+        .unwrap();
+        pipeline.handle(&Event::MemberRemove(remove));
+    }
+    let members: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT member_id, is_bot, left_at IS NOT NULL FROM members ORDER BY member_id",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        members,
+        vec![
+            ("456".to_owned(), true, true),
+            ("789".to_owned(), false, true),
+            ("900".to_owned(), true, true)
+        ]
+    );
+    let leaves: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'member_leave'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        leaves, 3,
+        "bot departures must remain in the unconditional log"
+    );
+    let web = format!("{}_web_v1", f.schema);
+    for view in ["members", "member_milestones"] {
+        let humans: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT member_id FROM {web}.{view} ORDER BY member_id"
+        )))
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(humans, vec!["789"]);
+    }
+    let counts: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT sum(joins)::bigint, sum(leaves)::bigint FROM {web}.funnel_daily"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 1));
+    let sources: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {web}.funnel_by_source"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(sources, 0);
+    // A later member-less observation must not demote the persisted bot.
+    pipeline
+        .handlers()
+        .on_leave(123, 456, Some("2026-09-30T12:00:00.000Z".to_owned()), None);
+    let bot: bool = sqlx::query_scalar("SELECT is_bot FROM members WHERE member_id = '456'")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert!(bot);
     f.finish().await;
 }
 

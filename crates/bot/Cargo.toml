@@ -18,6 +18,7 @@ two-bot-discord = { version = "0.1.0", path = "../discord" }
 two-bot-store = { version = "0.1.0", path = "../store" }
 sqlx = { workspace = true }
 axum = { workspace = true }
+futures-util = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
 # exactly one provider feature enabled. Declared here (not on a lib) so the
 # release binary and `cargo test` share the same provider.
