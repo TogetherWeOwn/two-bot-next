@@ -73,6 +73,13 @@ impl Options {
         if out.plan && out.apply {
             return Err("--plan cannot be combined with --apply");
         }
+        if out.groups.iter().any(|name| {
+            name != "ready"
+                && name != "all"
+                && !mapping::GROUPS.iter().any(|group| group.name == name)
+        }) {
+            return Err("unknown table group (see --plan)");
+        }
         Ok(out)
     }
 
