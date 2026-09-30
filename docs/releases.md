@@ -58,7 +58,8 @@ changelog, then feeds a second native release to verify the post-release state.
 `security` entries appear under Fixed and advance the patch.
 Before dispatching checks, `scripts/migrate-release-notes.cjs` consumes the
 native updater's first-release bootstrap tail: it merges the existing RSVP
-Added/Fixed notes into the generated version section and the release PR body,
+Added/Fixed notes (plus the hand-written Notes tail the live changelog carries)
+into the generated version section and the release PR body,
 removing the duplicate title and Unreleased section. The PR body matters because
 release-please uses it, not the changelog file, for GitHub Release notes. The
 changelog and body are reconciled independently, so retries recover if only one
