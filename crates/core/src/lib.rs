@@ -5,7 +5,9 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod audit;
 pub mod automod;
+pub mod classify;
 pub mod commands;
 pub mod config;
 pub mod containment;
@@ -17,6 +19,7 @@ pub mod handlers;
 pub mod health;
 pub mod invites;
 pub mod leveling;
+pub mod mac;
 pub mod moderation;
 pub mod onboarding;
 #[cfg(feature = "db")]
