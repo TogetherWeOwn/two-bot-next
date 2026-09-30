@@ -19,6 +19,9 @@ use twilight_model::{
     id::{marker::ChannelMarker, marker::MessageMarker, Id},
 };
 use two_bot_core::internal_actions::{is_snowflake, validate_announcement, ErrorCode};
+use two_bot_core::send_admission::{
+    is_loopback_http, AdmissionError, SendAdmission, SendCooldown, TokenKey,
+};
 
 pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post"];
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -38,6 +41,7 @@ pub enum Refusal {
     ActionNotAllowed,
     InvalidChannelConfiguration,
     LocalConfiguration,
+    SendAdmissionBlocked,
     DiscordRejected,
 }
 
@@ -110,6 +114,7 @@ pub struct AnnouncementExecutor {
     channel_keys: HashMap<String, String>,
     timeout: Duration,
     api_origin: String,
+    admission: Option<Arc<dyn SendAdmission>>,
 }
 
 impl AnnouncementExecutor {
@@ -129,7 +134,24 @@ impl AnnouncementExecutor {
             channel_keys,
             timeout: Duration::from_secs(10),
             api_origin: "https://discord.com".to_owned(),
+            admission: None,
         }
+    }
+
+    /// Production bootstrap: bind this executor to the credential's shared
+    /// database lane. `new` without admission refuses all non-loopback sends.
+    pub fn with_admission(
+        twilight: Arc<TwilightClient>,
+        channel_keys: HashMap<String, String>,
+        admission: Arc<dyn SendAdmission>,
+    ) -> Result<Self, AdmissionError> {
+        let token = twilight.token().ok_or(AdmissionError::Configuration)?;
+        if admission.token_key() != &TokenKey::for_bot_token(token)? {
+            return Err(AdmissionError::Configuration);
+        }
+        let mut executor = Self::new(twilight, channel_keys);
+        executor.admission = Some(admission);
+        Ok(executor)
     }
 
     #[must_use]
@@ -203,6 +225,41 @@ impl AnnouncementExecutor {
         };
 
         let deadline = tokio::time::Instant::now() + self.timeout;
+        let permit = match &self.admission {
+            Some(admission) => match tokio::time::timeout_at(deadline, admission.admit()).await {
+                Ok(Ok(permit)) => Some(permit),
+                _ => return ExecutionOutcome::NoEffect(Refusal::SendAdmissionBlocked),
+            },
+            None if is_loopback_http(&self.api_origin) => None,
+            None => return ExecutionOutcome::NoEffect(Refusal::LocalConfiguration),
+        };
+        let outcome = self.post_admitted(outbound, channel_id, deadline).await;
+        if let Some(permit) = permit {
+            let cooldown = match outcome {
+                ExecutionOutcome::RateLimited(cooldown) => Some(match cooldown.retry_after_ms {
+                    Some(ms) => SendCooldown::FiniteMs(ms),
+                    None => SendCooldown::Indefinite,
+                }),
+                _ => None,
+            };
+            // Unknown/cancelled effects retain the admission row, not just the
+            // receiver claim. A definitive 429 stays no-effect even if storage
+            // fails: the already-committed occupied row blocks other sends.
+            if !matches!(outcome, ExecutionOutcome::Unknown(_)) {
+                if !matches!(tokio::time::timeout_at(deadline, permit.complete(cooldown)).await, Ok(Ok(()))) {
+                    tracing::warn!("internal-action admission completion unavailable; lane held");
+                }
+            }
+        }
+        outcome
+    }
+
+    async fn post_admitted(
+        &self,
+        outbound: http::Request<Full<Bytes>>,
+        channel_id: Id<ChannelMarker>,
+        deadline: tokio::time::Instant,
+    ) -> ExecutionOutcome {
         let response = match tokio::time::timeout_at(deadline, self.http.request(outbound)).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => return ExecutionOutcome::Unknown(UnknownReason::Transport),

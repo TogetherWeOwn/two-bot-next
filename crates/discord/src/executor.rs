@@ -232,6 +232,7 @@ pub struct HyperTransport {
     scheme_http: bool,
     host: String,
     token: String,
+    admission: Option<Arc<dyn two_bot_core::send_admission::SendAdmission>>,
 }
 
 impl HyperTransport {
@@ -245,6 +246,30 @@ impl HyperTransport {
     /// bare `host:port`; the scheme prefix is stripped (twilight's `proxy`
     /// takes the host only) and selects plain-HTTP transport.
     pub fn with_proxy(token: String, proxy_url: Option<String>) -> Result<Self, String> {
+        Self::build(token, proxy_url, None)
+    }
+
+    pub fn with_admission(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Arc<dyn two_bot_core::send_admission::SendAdmission>,
+    ) -> Result<Self, String> {
+        Self::build(token, proxy_url, Some(admission))
+    }
+
+    fn build(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Option<Arc<dyn two_bot_core::send_admission::SendAdmission>>,
+    ) -> Result<Self, String> {
+        use two_bot_core::send_admission::{is_loopback_http, TokenKey};
+        if let Some(admission) = &admission {
+            if admission.token_key() != &TokenKey::for_bot_token(&token).map_err(|e| e.to_string())? {
+                return Err("Discord send admission token mismatch".to_owned());
+            }
+        } else if !proxy_url.as_deref().is_some_and(is_loopback_http) {
+            return Err("shared durable Discord send admission required".to_owned());
+        }
         use hyper_rustls::ConfigBuilderExt as _;
         let (scheme_http, host) = match proxy_url {
             None => (false, "discord.com".to_owned()),
@@ -285,12 +310,15 @@ impl HyperTransport {
         let inner: HyperClient<
             hyper_rustls::HttpsConnector<HttpConnector>,
             http_body_util::Full<bytes::Bytes>,
-        > = HyperClient::builder(TokioExecutor::new()).build(connector);
+        > = HyperClient::builder(TokioExecutor::new())
+            .retry_canceled_requests(false)
+            .build(connector);
         Ok(Self {
             inner,
             scheme_http,
             host,
             token,
+            admission,
         })
     }
 
@@ -351,6 +379,10 @@ impl HyperTransport {
         let hyper_req = builder
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
+        let permit = match &self.admission {
+            Some(admission) => Some(admission.admit().await.map_err(|e| e.to_string())?),
+            None => None, // Constructor restricts ungoverned transport to loopback fixtures.
+        };
         let response = self
             .inner
             .request(hyper_req)
@@ -362,16 +394,31 @@ impl HyperTransport {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let collected = response
-            .into_body()
+        let collected = http_body_util::Limited::new(response.into_body(), 64 * 1024)
             .collect()
-            .await
-            .map_err(|e| format!("read body: {e}"))?;
-        Ok(RawResponse {
-            status,
-            retry_after_header,
-            body: collected.to_bytes().to_vec(),
-        })
+            .await;
+        let body = match collected {
+            Ok(body) => body.to_bytes().to_vec(),
+            // 429 is definitive no-effect even with a broken/oversized body.
+            // Missing timing installs an indefinite hold instead of a default.
+            Err(_) if status == 429 => Vec::new(),
+            Err(_) => return Err("Discord response body unavailable".to_owned()),
+        };
+        let res = RawResponse { status, retry_after_header, body };
+        if let Some(permit) = permit {
+            let cooldown = (status == 429).then(|| {
+                two_bot_core::send_admission::cooldown_from_delays(
+                    res.retry_after_header.as_deref().and_then(|value| value.parse().ok()),
+                    res.body_retry_after_secs(),
+                )
+            });
+            if let Err(error) = permit.complete(cooldown).await {
+                tracing::warn!(%error, "Discord send admission completion failed; lane held");
+                // Retain a definitive 429, never turn it into a transport retry.
+                if status != 429 { return Err(error.to_string()); }
+            }
+        }
+        Ok(res)
     }
 }
 
@@ -405,7 +452,24 @@ impl ActionExecutor {
     /// Build with an optional API-host override (legacy `DISCORD_API_BASE`;
     /// tests point this at the mock double).
     pub fn with_proxy(token: String, proxy_url: Option<String>) -> Result<Self, String> {
-        let transport = HyperTransport::with_proxy(token.clone(), proxy_url.clone())?;
+        Self::build(token, proxy_url, None)
+    }
+
+    /// Mandatory for non-loopback sends; every retry uses this same lane.
+    pub fn with_admission(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Arc<dyn two_bot_core::send_admission::SendAdmission>,
+    ) -> Result<Self, String> {
+        Self::build(token, proxy_url, Some(admission))
+    }
+
+    fn build(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Option<Arc<dyn two_bot_core::send_admission::SendAdmission>>,
+    ) -> Result<Self, String> {
+        let transport = HyperTransport::build(token.clone(), proxy_url.clone(), admission)?;
         let mut builder = TwilightClient::builder()
             .token(token)
             .ratelimiter(None)
