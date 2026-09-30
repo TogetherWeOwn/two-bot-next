@@ -1189,6 +1189,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1400,6 +1412,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -2158,6 +2171,7 @@ name = "two-bot"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "rustls",
  "serde_json",
  "tokio",
  "tower",
@@ -2174,18 +2188,15 @@ dependencies = [
 name = "two-bot-core"
 version = "0.1.0"
 dependencies = [
- "hex",
- "hmac",
- "rand",
+ "regex",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "sqlx",
- "subtle",
  "thiserror",
- "time",
  "tokio",
  "tracing",
+ "unicode-normalization",
+ "url",
 ]
 
 [[package]]
