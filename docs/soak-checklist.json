@@ -1,0 +1,1703 @@
+{
+  "schema_version": 1,
+  "source": "docs/parity.md §§1–8 (legacy frozen d5d11793)",
+  "sections": {
+    "1": "Slash / prefix commands",
+    "2": "Non-command interactions",
+    "3": "Gateway event handlers",
+    "4": "Scheduled jobs & timers",
+    "5": "DB tables & queries",
+    "6": "External integrations",
+    "7": "Config / env",
+    "8": "Observable behaviours"
+  },
+  "instructions": [
+    "This is the **unexecuted** B4 coverage plan for [TOG-9699](/TOG/issues/TOG-9699), authored under [TOG-10885](/TOG/issues/TOG-10885). Running the soak is out of scope. `manual`/`automated`/`waived` describe the verification method, not PASS. No row has been executed by writing this checklist.",
+    "",
+    "## Safety and execution contract",
+    "",
+    "- Follow [staging-soak.md](staging-soak.md) for lifecycle and rollback mechanics: its S2 acceptance is seven consecutive days with zero missed events and redeploy gap <60s. B4 separately requires its 48h watch log; neither substitutes for the other. [gateway-recovery.md](gateway-recovery.md) is the current session-persistence reference. Verify the deployed SHA, staging guild allowlist, permitted disposable accounts/channels and enabled slice before any Discord action. A missing slice, unapproved destructive scenario or missing fixture is NEEDS WORK, not a silent waiver.",
+    "- **No tests, SQL, probes, migrations, imports, backup or restore against staging/production databases.** Only agent-testdb/agent-testredis or ephemeral CI service containers may be used for data assertions. No alternate credential after an auth failure: stop, record the exact error and owner; never log credentials. Discord fixture actions require the separate soak authorization and must never target real members/live guilds.",
+    "- Negative/destructive/retry/clock/SSRF scenarios use local mock fixtures. Do not change the host clock, manufacture raids, delete real roles/channels, change live enforcement, or call live internal-action mutation endpoints. Restore approved disposable configuration through its normal UI/API after evidence; no database reset.",
+    "- Voice is owned by [TOG-10119](/TOG/issues/TOG-10119): consume its exact-SHA receipt, do not duplicate voice join/leave/restart steps here. Mixed rows still require their non-voice assertions.",
+    "- A `waived` entry is a **proposed waiver of staging execution**, not removal of parity or authority to approve it. B4 records the reason and accepting actor plus the owning slice’s isolated fixture evidence; until then the row is unresolved/NEEDS WORK. Backup/config/import evidence belongs to [TOG-9881](/TOG/issues/TOG-9881)/[TOG-9882](/TOG/issues/TOG-9882). No new spend, buckets, secret handling or host jobs is authorized here.",
+    "- Evidence table columns: checklist ID; deployed/reviewed SHA; actual command/action and fixture IDs; UTC window; expected vs actual; redacted screenshot/log/CI receipt URL; PASS/NEEDS WORK or accepted waiver with reason/actor; cleanup/rollback result. Attach it to B4 before its verdict. A CI unit result alone does not prove a staging Discord effect.",
+    "",
+    "## Maintaining coverage",
+    "",
+    "JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only DROP-prefixed Maps without an S/B/NEW slice or TOG owner are excluded; mixed mapped/DROP rows remain covered in either order, including mapped replacement work. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries.",
+    "",
+    "Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, empty steps/evidence, invalid statuses, reasonless waivers, missing automated commands, missing voice links or Markdown drift fail the gate.",
+    "",
+    "## Existing fixture entry points",
+    "",
+    "Run compiling commands on the controller through `python3 scripts/cargo_cache.py run -- test ...` from an isolated workspace; never Cargo directly or another target/cache. Hosted CI retains its own Cargo commands. Attach actual executed commands and results, not this list as proof. An ignored/skipped DB test is not evidence. Configure only the named test-container URL required by each test guard; never inherit a live TWO_DATABASE_URL.",
+    "",
+    "- Command dispatch: `-p two-bot-discord --test interaction_routing`; REST: `-p two-bot-discord --test executor_acceptance` and `--test executor_regressions`; funnel replay: `-p two-bot-discord --test funnel_replay`.",
+    "- Leveling: `-p two-bot-core --test leveling_golden`; onboarding: `--test onboarding_effects`; raids/containment: `--test raid_acceptance` and `--test containment_acceptance` (all core targets).",
+    "- Test DB receipts: `-p two-bot-core --features db --test leveling_store -- --ignored`; `--test onboarding_store -- --ignored`; `--test audit_store -- --ignored`; LFG `-p two-bot-core --features db lfg_store:: -- --ignored --test-threads=1`. Each needs its own safe container configuration.",
+    "- Community/presence/inactivity fixture filters: `-p two-bot-core --features db --lib community_store`, `presence_store`, `inactivity_store` separately; settings classification: `-p two-bot-core --lib settings::tests` and `config::tests` separately.",
+    "- Backup/snapshot fixture targets: `-p two-bot-core --test backup_transport`, `--test guild_config_regressions`; backup roundtrip `-p two-bot-core --features db --test backup_roundtrip -- --nocapture` requires TWO_BOT_TEST_DATABASE_URL on test containers. See [backup.md](backup.md). Import parsers: `-p two-bot-cutover mee6_xp::tests` and `mee6_rewards::tests` separately; dry-run import CLI can still enter migrations, so never aim it at staging/production."
+  ],
+  "entries": [
+    {
+      "id": "s1-01",
+      "parity": {
+        "section": 1,
+        "row": [
+          "1",
+          "`/rank`",
+          "`member` User opt",
+          "everyone"
+        ]
+      },
+      "status": "manual",
+      "action": "As a normal fixture member invoke /rank, then /rank member:<other-fixture-member>.",
+      "expected": "Both replies identify the selected member with the expected fixture XP/rank; no other guild data.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-02",
+      "parity": {
+        "section": 1,
+        "row": [
+          "2",
+          "`/leaderboard`",
+          "none",
+          "everyone"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /leaderboard as a normal fixture member after two approved fixture XP awards.",
+      "expected": "Ordering, tie handling and displayed ranks agree with the fixture awards.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-03",
+      "parity": {
+        "section": 1,
+        "row": [
+          "3",
+          "`/ban`",
+          "`target` User req, `reason` String req ≤512",
+          "`BanMembers` + hierarchy/protected-role policy"
+        ]
+      },
+      "status": "manual",
+      "action": "In the disposable guild invoke /ban target:<disposable-member> reason:soak; repeat as unprivileged member and against a protected/higher-role fixture.",
+      "expected": "Only the permitted disposable target is banned; denied paths do not mutate membership; one correlated moderation audit.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-04",
+      "parity": {
+        "section": 1,
+        "row": [
+          "4",
+          "`/tempban`",
+          "`target` req, `duration_seconds` Int req ≥60, `reason` req",
+          "`BanMembers`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /tempban target:<disposable-member> duration_seconds:60 reason:soak; wait for the 30s unban sweep after expiry.",
+      "expected": "Target is banned once and unbanned after expiry; no duplicate action on retry.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-05",
+      "parity": {
+        "section": 1,
+        "row": [
+          "5",
+          "`/kick`",
+          "`target` req, `reason` req",
+          "`KickMembers`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /kick target:<disposable-member> reason:soak; repeat without KickMembers and with a protected fixture.",
+      "expected": "Only the allowed target is kicked; permission/hierarchy protections hold.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-06",
+      "parity": {
+        "section": 1,
+        "row": [
+          "6",
+          "`/timeout`",
+          "`target` req, `duration_seconds` ≥60, `reason` req",
+          "`ModerateMembers`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /timeout target:<disposable-member> duration_seconds:60 reason:soak, then use an unprivileged and protected-target fixture.",
+      "expected": "Allowed timeout expires; denied cases do not change the target; correlated audit.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-07",
+      "parity": {
+        "section": 1,
+        "row": [
+          "7",
+          "`/warn`",
+          "`target` req, `reason` req",
+          "`ModerateMembers`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /warn target:<fixture-member> reason:soak; repeat without ModerateMembers.",
+      "expected": "One permitted warning and audit; unauthorized warning refused.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-08",
+      "parity": {
+        "section": 1,
+        "row": [
+          "8",
+          "`/purge`",
+          "`count` Int 1–100 req, `reason` req",
+          "`ManageMessages`"
+        ]
+      },
+      "status": "manual",
+      "action": "Create three fixture messages; invoke /purge count:3 reason:soak in that disposable channel; exercise boundaries 1 and 100 in fixtures.",
+      "expected": "Only requested eligible messages are removed; bounds and permission errors are explicit.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-09",
+      "parity": {
+        "section": 1,
+        "row": [
+          "9",
+          "`/slowmode`",
+          "`seconds` Int 0–21600 req, `reason` req",
+          "`ManageChannels`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /slowmode seconds:10 reason:soak, then seconds:0; use a member without ManageChannels for the denied case.",
+      "expected": "Channel slowmode changes to 10 then 0; denial preserves state; upper bound 21600 validated.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-10",
+      "parity": {
+        "section": 1,
+        "row": [
+          "10",
+          "`/lockdown`",
+          "`reason` req (current channel)",
+          "`ManageChannels`"
+        ]
+      },
+      "status": "manual",
+      "action": "Save the disposable channel overwrite through Discord UI, invoke /lockdown reason:soak.",
+      "expected": "Send restriction is applied once and prior overwrite retained for unlock; protected actors remain protected.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-11",
+      "parity": {
+        "section": 1,
+        "row": [
+          "11",
+          "`/unlock`",
+          "`reason` req (current channel)",
+          "`ManageChannels`"
+        ]
+      },
+      "status": "manual",
+      "action": "After command-10 invoke /unlock reason:soak twice and compare the saved channel overwrite.",
+      "expected": "Original overwrite restored exactly; second invocation is harmless.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-12",
+      "parity": {
+        "section": 1,
+        "row": [
+          "12",
+          "`/attendance` (scorecard)",
+          "`event-occurrence` String req, `member` User req",
+          "`ManageEvents`"
+        ]
+      },
+      "status": "manual",
+      "action": "Using the published scorecard attendance command name, invoke event-occurrence:<fixture-occurrence> member:<fixture-member> as host and as non-host; record actual registry name.",
+      "expected": "Host produces one verified-attendance fact; denial produces none; name is distinct from RSVP totals command-25.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-13",
+      "parity": {
+        "section": 1,
+        "row": [
+          "14",
+          "`/command`",
+          "`name` req, `template` req (`{user} {username} {server} {channel}`), `description` opt, `text-trigger` opt",
+          "`ManageGuild` (builder + runtime)"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /command name:soak-faq template:\"{user} {username} {server} {channel}\" description:soak text-trigger:soakfaq as manager; repeat as normal member.",
+      "expected": "Template stored and published only for manager; unsupported tokens/names rejected; runtime covered separately.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-14",
+      "parity": {
+        "section": 1,
+        "row": [
+          "15",
+          "`/command-remove`",
+          "`name` req",
+          "`ManageGuild`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /command-remove name:soak-faq, then invoke the removed command.",
+      "expected": "Definition disappears from registry/list; removed invocation cannot execute.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-15",
+      "parity": {
+        "section": 1,
+        "row": [
+          "16",
+          "`/command-list`",
+          "none",
+          "`ManageGuild`"
+        ]
+      },
+      "status": "manual",
+      "action": "Create soak-faq and invoke /command-list as manager and normal member.",
+      "expected": "Manager sees the fixture definition without secrets; normal member is denied.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-16",
+      "parity": {
+        "section": 1,
+        "row": [
+          "17",
+          "`/schedule`",
+          "`body` req; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required)",
+          "`ManageGuild`, runs in invoking channel"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /schedule body:soak-once in-minutes:1; also create body:soak-repeat every-minutes:60; try neither option and below-minimum intervals.",
+      "expected": "Valid messages are queued for invoking channel, one-shot fires once; invalid cadence rejected; recurring schedule removed after evidence.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-17",
+      "parity": {
+        "section": 1,
+        "row": [
+          "18",
+          "`/schedule-remove`",
+          "`id` req (prefix-resolved)",
+          "`ManageGuild`"
+        ]
+      },
+      "status": "manual",
+      "action": "Take the fixture schedule ID from /schedule-list; invoke /schedule-remove id:<unique-prefix>, then an ambiguous/unknown prefix fixture.",
+      "expected": "Unique ID is removed; ambiguous or unknown ID is rejected without touching another schedule.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-18",
+      "parity": {
+        "section": 1,
+        "row": [
+          "19",
+          "`/schedule-list`",
+          "none",
+          "`ManageGuild`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor.",
+      "expected": "Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-19",
+      "parity": {
+        "section": 1,
+        "row": [
+          "20",
+          "`/sticky`",
+          "`body` req, `debounce` 1–300 default 5 opt",
+          "`ManageGuild`, current channel"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /sticky body:soak-sticky debounce:1; send two fixture messages in the disposable channel.",
+      "expected": "One latest sticky reappears after debounce, old sticky is replaced, no recursive bot repost storm.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-20",
+      "parity": {
+        "section": 1,
+        "row": [
+          "21",
+          "`/sticky-remove`",
+          "none (current channel)",
+          "`ManageGuild`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /sticky-remove in the fixture channel and send another fixture message.",
+      "expected": "No further sticky repost; other channels remain unchanged.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-21",
+      "parity": {
+        "section": 1,
+        "row": [
+          "22",
+          "`/<custom>` (dynamic, DB-backed via `/command`)",
+          "none (template render)",
+          "everyone while automations enabled; refused when disabled"
+        ]
+      },
+      "status": "manual",
+      "action": "Create /soak-faq with /command; invoke it as a normal member with automations enabled, then under the approved disabled configuration.",
+      "expected": "Enabled invocation renders all four template values; disabled invocation refuses without posting.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-22",
+      "parity": {
+        "section": 1,
+        "row": [
+          "23",
+          "`!<trigger>` (prefix, e.g. `!faq`)",
+          "first token only",
+          "everyone; requires `TWO_TEXT_COMMANDS=1`; builtin names excluded"
+        ]
+      },
+      "status": "manual",
+      "action": "With approved TWO_TEXT_COMMANDS=1 send !soakfaq extra words, unknown !name and a builtin-name trigger; repeat with flag off.",
+      "expected": "Only configured first-token trigger runs; builtin/unknown/disabled triggers do not run.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-23",
+      "parity": {
+        "section": 1,
+        "row": [
+          "24",
+          "`/rsvp`",
+          "`event-id` String req, `status` req (`going`/`interested`/`declined`)",
+          "everyone"
+        ]
+      },
+      "status": "manual",
+      "action": "For a disposable future event invoke /rsvp event-id:<id> status:going, interested, declined; retry the last choice.",
+      "expected": "Latest status replaces earlier status once; totals have no duplicate attendee; malformed event-id or unknown-status fixture refused (shape contract only — the port performs no event-time check).",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-24",
+      "parity": {
+        "section": 1,
+        "row": [
+          "25",
+          "`/attendance` (RSVP totals)",
+          "`event-id` String req",
+          "everyone"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke the published RSVP totals command for event-id:<fixture-id> after command-24; capture actual published name.",
+      "expected": "Totals match the three-status fixture history; command is not overwritten by scorecard attendance command-12.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-25",
+      "parity": {
+        "section": 1,
+        "row": [
+          "26",
+          "`/lfg`",
+          "`title` req, `starts-at` ISO-8601 req, `roles` req (`tank:Tank:2,…`)",
+          "`ManageEvents` (builder + runtime)"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /lfg title:soak starts-at:<future ISO-8601> roles:tank:Tank:2 as event manager; try invalid dates and actor without ManageEvents.",
+      "expected": "One valid role menu appears with capacity 2; malformed/unauthorized creation rejected.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-26",
+      "parity": {
+        "section": 1,
+        "row": [
+          "27",
+          "`/lfg-close`",
+          "`id` req",
+          "`ManageEvents`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /lfg-close id:<fixture-lfg-id> and try signing up again.",
+      "expected": "Menu closes, future signups refused; repeated close is harmless.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-27",
+      "parity": {
+        "section": 1,
+        "row": [
+          "28",
+          "`/feed-add`",
+          "`kind` req (`rss`/`youtube`/`twitch`), `source` req",
+          "`ManageGuild`"
+        ]
+      },
+      "status": "manual",
+      "action": "Add one approved public fixture source per kind with /feed-add kind:rss|youtube|twitch source:<public-fixture>; use local fixtures for private-IP rejection.",
+      "expected": "Valid sources become guild-scoped relays; malformed/SSRF-private sources rejected without network access to private hosts.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-28",
+      "parity": {
+        "section": 1,
+        "row": [
+          "29",
+          "`/feed-remove`",
+          "`id` req",
+          "`ManageGuild`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /feed-remove id:<fixture-relay-id>; wait one configured poll interval.",
+      "expected": "Relay disappears and no new posts are delivered for the removed source.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s1-29",
+      "parity": {
+        "section": 1,
+        "row": [
+          "30",
+          "`/feed-list`",
+          "none",
+          "`ManageGuild`"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke /feed-list before/after relay changes and as actor without ManageGuild.",
+      "expected": "List matches this guild only; unauthorized actor refused; no credentials in output.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s2-01",
+      "parity": {
+        "section": 2,
+        "row": [
+          "Game picker `two:onboarding:games`",
+          "add/remove game roles to match menu, ephemeral reply"
+        ]
+      },
+      "status": "manual",
+      "action": "Select two approved game roles in two:onboarding:games, then deselect one.",
+      "expected": "Member roles match selection exactly; ephemeral acknowledgement; unrelated roles preserved.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s2-02",
+      "parity": {
+        "section": 2,
+        "row": [
+          "Session picker (`SESSION_SELECT_ID`)",
+          "ephemeral ack + routed record, no roles"
+        ]
+      },
+      "status": "manual",
+      "action": "Use SESSION_SELECT_ID twice with the approved two-pick session fixture.",
+      "expected": "Ephemeral acknowledgement and routed session record; no role mutation.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s2-03",
+      "parity": {
+        "section": 2,
+        "row": [
+          "Self-role buttons/selects",
+          "claimed add/remove/replace + validation/hierarchy checks"
+        ]
+      },
+      "status": "manual",
+      "action": "Click configured self-role add/remove buttons, then replace via select; exercise unknown and above-bot-role fixtures.",
+      "expected": "Claimed actions are idempotent; unrelated roles preserved; invalid/hierarchy cases refused.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s2-04",
+      "parity": {
+        "section": 2,
+        "row": [
+          "`MessageReactionAdd/Remove`",
+          "reaction-role grant/revoke (partial fetch, idempotent plan)"
+        ]
+      },
+      "status": "manual",
+      "action": "React then remove reaction on the fixture role panel; replay add/remove using the mock partial-message fixture.",
+      "expected": "Role granted then revoked once; partial fetch works and gateway retry does not duplicate audit.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s2-05",
+      "parity": {
+        "section": 2,
+        "row": [
+          "Ticket buttons `open/claim/close`",
+          "ticket lifecycle + 5m recovery / 60m purge timers"
+        ]
+      },
+      "status": "manual",
+      "action": "Open, claim and close a disposable ticket; restart with an open ticket, then wait 5m recovery and 60m purge.",
+      "expected": "Single lifecycle/channel ownership survives restart; transcript retained/purged per policy; no leaked content outside fixture channel.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s2-06",
+      "parity": {
+        "section": 2,
+        "row": [
+          "LFG select menus",
+          "signup flows"
+        ]
+      },
+      "status": "manual",
+      "action": "Choose Tank on fixture LFG menu as two members, then a third; change/cancel one signup.",
+      "expected": "Capacity enforced, duplicate signup not counted, released slot available.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s2-07",
+      "parity": {
+        "section": 2,
+        "row": [
+          "`/attendance` host check-in → community attendance store",
+          "verified-attendance fact"
+        ]
+      },
+      "status": "manual",
+      "action": "As authorized host check in fixture member for fixture occurrence, then retry and attempt as non-host.",
+      "expected": "Exactly one verified-attendance fact; unauthorized/duplicate interactions cannot inflate attendance.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-01",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`ClientReady`",
+          "log `ready`; per-guild invite snapshot for join attribution (skipped in containment)"
+        ]
+      },
+      "status": "manual",
+      "action": "Start the approved contained staging deployment; capture ready log and invite snapshot activity with containment off, then on.",
+      "expected": "Ready logged once per session; invite baseline collected only when allowed; containment skips snapshot.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-02",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`ClientReady`",
+          "ticket recovery + panel ensure + transcript purge; command publish (`guild.commands.set`)"
+        ]
+      },
+      "status": "manual",
+      "action": "Restart with a fixture open ticket and existing panel; capture published command registry.",
+      "expected": "Recovery does not duplicate tickets/panels; purge runs; unique command names include both attendance variants.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-03",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`ready`",
+          "`audit.retryPending()` once + 30s sweep"
+        ]
+      },
+      "status": "manual",
+      "action": "Restart with mock pending operational audit delivery; advance the fixture clock through 30s.",
+      "expected": "Initial retry runs once; bounded sweep recurs and does not duplicate delivered entries.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-04",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`GuildMemberAdd`",
+          "funnel: invite diff vs `expectedJoins`, `onJoin`, instant `onGateCleared` if `!pending`, raid-burst + join-risk scoring"
+        ]
+      },
+      "status": "manual",
+      "action": "Have a disposable account join via one fixture invite; test pending and non-pending variants with mock guild-member events.",
+      "expected": "Invite diff/expectedJoins attribution and join funnel occur once; non-pending immediately gate-clears; risk flags are flag-only.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-05",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`GuildMemberAdd`",
+          "legacy / session / anchor welcome (mode switch `TWO_ONBOARDING_MODE`)"
+        ]
+      },
+      "status": "manual",
+      "action": "Join with a disposable member under each approved onboarding mode configuration.",
+      "expected": "Correct legacy/session/anchor welcome only; no DM or duplicate prompt.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-06",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`GuildMemberUpdate`",
+          "rules-gate `pending:true→false` → rota `gateCleared` + `onGateCleared`; role/nickname diff → `member_update` audit"
+        ]
+      },
+      "status": "manual",
+      "action": "Clear screening for a pending fixture member; change a fixture nickname and role.",
+      "expected": "One gate-clear fact; metadata-only member_update audit; no duplicate on unchanged update.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-07",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`GuildMemberUpdate`",
+          "welcome prompt on gate-clear (per mode)"
+        ]
+      },
+      "status": "manual",
+      "action": "Clear screening under each approved onboarding mode; replay the same update in mock fixtures.",
+      "expected": "Exactly one mode-specific welcome prompt; dry-run honoured.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-08",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`GuildMemberRemove`",
+          "funnel `onLeave`"
+        ]
+      },
+      "status": "manual",
+      "action": "Have disposable member leave the fixture guild after joining.",
+      "expected": "One leave funnel fact; member projection reflects leave, retries do not duplicate.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-09",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`GuildMemberRemove`",
+          "session goodbye post (no ping)"
+        ]
+      },
+      "status": "manual",
+      "action": "Have a session-mode disposable member leave.",
+      "expected": "Single goodbye post without ping/DM; other modes do not emit session goodbye.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-10",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`MessageCreate`",
+          "automod inspect → rota reserve → funnel `onMessage` + level hook; rejected → `captureOnly` row"
+        ]
+      },
+      "status": "manual",
+      "action": "Send one acceptable and one configured automod-rejected fixture message; retry both as mock gateway events.",
+      "expected": "Accepted message reaches funnel/level hook once; rejected message has captureOnly, no accepted XP/sticky/trigger side effects.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-11",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`automationMessageAccepted` (internal)",
+          "sticky re-post + `!` text triggers"
+        ]
+      },
+      "status": "manual",
+      "action": "Send an accepted fixture trigger then an automod-rejected trigger in the sticky fixture channel.",
+      "expected": "Only automationMessageAccepted drives prefix/sticky actions; no action on rejected message.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-12",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`Raw`",
+          "message delete/edit audit without cached message"
+        ]
+      },
+      "status": "manual",
+      "action": "Delete and edit fixture messages after clearing mock message cache; dispatch raw payloads.",
+      "expected": "Metadata-only delete/edit audit without cached content; no invented actor/content.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-13",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`MessageUpdate`",
+          "fetch partial + automod re-inspect on edit"
+        ]
+      },
+      "status": "manual",
+      "action": "Edit a benign fixture message to a configured automod violation using partial-message mock fixture.",
+      "expected": "Partial fetch and reinspection enforce/dry-run according to configuration, retry is idempotent.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-14",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`VoiceStateUpdate`",
+          "channel-change only; `voice_join/leave/move` audit; `onVoiceLeave`→`onVoiceJoin` + level hook"
+        ]
+      },
+      "status": "manual",
+      "action": "Attach the VoiceStateUpdate row evidence from the dedicated voice soak; do not run a second voice scenario here.",
+      "expected": "TOG-10119 demonstrates channel-change-only audit, leave/join ordering and XP hook; mute-only update has no session transition.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s3-15",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`ShardResume`/`ShardReady`",
+          "drop all open voice sessions (no outage-inflated durations)"
+        ]
+      },
+      "status": "manual",
+      "action": "Attach ShardResume/ShardReady evidence from the dedicated voice soak; do not duplicate its restart procedure.",
+      "expected": "TOG-10119 demonstrates all open voice sessions dropped, with no outage-inflated duration or XP.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s3-16",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`InviteCreate`",
+          "re-snapshot invites (attribution freshness)"
+        ]
+      },
+      "status": "manual",
+      "action": "Create one disposable staging invite then join via it.",
+      "expected": "Invite baseline refreshed; subsequent attribution uses fresh invite counts.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-17",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`GuildAuditLogEntryCreate`",
+          "MAC-verified moderation audit → operational audit"
+        ]
+      },
+      "status": "manual",
+      "action": "Trigger one permitted fixture moderation action; replay a forged/invalid MAC audit-entry payload only in local mock.",
+      "expected": "Valid bot-action MAC correlates once into audit; forged entry is not trusted.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-18",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`GuildAuditLogEntryCreate`",
+          "anti-nuke containment filter → `containment.observe`"
+        ]
+      },
+      "status": "manual",
+      "action": "Replay threshold anti-nuke audit entries in local mock with alerts-only configuration; one benign entry in disposable guild.",
+      "expected": "Filter calls containment observer for relevant actions; logs alerts without destructive enforcement or pings.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-19",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`InteractionCreate`",
+          "all slices (§1–§2 dispatch)"
+        ]
+      },
+      "status": "manual",
+      "action": "Invoke a slash command, a role button and a select in approved disposable channels.",
+      "expected": "InteractionCreate dispatches each to exactly one correct handler; unrelated interaction refused/ignored safely.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-20",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`Error`",
+          "`client_error` log"
+        ]
+      },
+      "status": "manual",
+      "action": "Inject mock gateway error (do not break the live connection or credentials).",
+      "expected": "Structured client_error tracing is present without tokens or message content.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s3-21",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`Dispatch/Ready/Closed/Hello/Resumed/…` staging-restart containment filter",
+          "allowlisted guild/actor payloads only"
+        ]
+      },
+      "status": "manual",
+      "action": "Attach the approved staging lifecycle receipt for persisted session plus RESUME across a Container restart (see gateway-recovery.md), including staging guild/actor allowlist checks. Use local fixtures for rejected guild/actor payloads; do not reintroduce the dropped legacy restart filter.",
+      "expected": "S5 session persistence and S6 staging containment replace the legacy filter: the approved staging session resumes and disallowed fixture payloads have no side effects. The legacy runtime filter remains dropped; voice reset evidence comes only from TOG-10119.",
+      "evidence": "Record the deployed SHA, staging identity/allowlist receipt, restart and RESUME UTC timestamps, correlated sanitized logs and local rejection-fixture result. Cross-link the existing lifecycle receipt and TOG-10119 voice receipt; no second voice procedure or production restart.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — consume its voice reset receipt; non-voice replacement assertions remain on this row."
+    },
+    {
+      "id": "s4-01",
+      "parity": {
+        "section": 4,
+        "row": [
+          "presenceProbe (`GET /guilds/{id}?with_counts=true` → `presence_probe`; reader: `presence-trend` only)",
+          "1h, bot-floor re-list 24h"
+        ]
+      },
+      "status": "manual",
+      "action": "Observe one approved staging presence tick at 1h; replay 24h bot-floor relist using fixture clock.",
+      "expected": "Count probe contains expected human/bot separation; bot-floor refreshed at 24h.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-02",
+      "parity": {
+        "section": 4,
+        "row": [
+          "communitySnapshots counter tick → `guild_counters` + `counter_snapshots` (website `live_counts`)",
+          "60s"
+        ]
+      },
+      "status": "manual",
+      "action": "Observe two 60s counter ticks with one disposable member/message change.",
+      "expected": "Published live_counts progresses consistently; counter snapshot captured once per tick.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-03",
+      "parity": {
+        "section": 4,
+        "row": [
+          "communitySnapshots rank tick → `rank_snapshots` + `member_ranks` (skips raid windows)",
+          "10m"
+        ]
+      },
+      "status": "manual",
+      "action": "Observe 10m rank tick after fixture XP awards; replay a raid window in local fixture.",
+      "expected": "Rank output agrees with awards; raid-window update skipped.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-04",
+      "parity": {
+        "section": 4,
+        "row": [
+          "scheduled-events poller → atomic `scheduled_events` mirror (website feed)",
+          "10m"
+        ]
+      },
+      "status": "manual",
+      "action": "Create/change/cancel a disposable scheduled event and observe 10m poll.",
+      "expected": "Website event feed shows atomic replacement with no partial/inconsistent event set.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-05",
+      "parity": {
+        "section": 4,
+        "row": [
+          "communityScorecard Monday 06:15 UTC week run",
+          "60s tick, weekly fire"
+        ]
+      },
+      "status": "manual",
+      "action": "Use local fixture clock for Monday 06:15 UTC; replay adjacent 60s ticks. Do not change host clock.",
+      "expected": "One weekly scorecard run/alert, not one per tick; rerun does not duplicate.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-06",
+      "parity": {
+        "section": 4,
+        "row": [
+          "inactivity `flagInactive()` (read-only, never DMs)",
+          "hourly from `index.ts`"
+        ]
+      },
+      "status": "manual",
+      "action": "Observe hourly inactivity job against approved synthetic membership fixture, never real-member outreach.",
+      "expected": "Flags/report only; no DMs or membership mutation.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-07",
+      "parity": {
+        "section": 4,
+        "row": [
+          "automation scheduled-message ticker (15s, `next_run_at` queue)",
+          "15s"
+        ]
+      },
+      "status": "manual",
+      "action": "Queue a fixture one-shot due message and observe 15s ticker; retry/restart through mock fixture.",
+      "expected": "One post per due item; next_run_at advances or one-shot retires, no duplicate on claim/restart.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-08",
+      "parity": {
+        "section": 4,
+        "row": [
+          "feed poller (RSS/YouTube/Twitch → `feed_deliveries` + relay)",
+          "`TWO_FEED_POLL_SECONDS` default 300s"
+        ]
+      },
+      "status": "manual",
+      "action": "Configure approved public fixture feeds and observe TWO_FEED_POLL_SECONDS (default 300s); replay same item.",
+      "expected": "One feed_deliveries claim/relay per item; unchanged item not reposted.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-09",
+      "parity": {
+        "section": 4,
+        "row": [
+          "operational-audit retry sweep (≤25 claims)",
+          "30s"
+        ]
+      },
+      "status": "manual",
+      "action": "Queue 26 mock pending audit deliveries; advance 30s clock across retries.",
+      "expected": "Sweep claims at most 25; retryable failures stay pending; successful mirrors delivered once.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-10",
+      "parity": {
+        "section": 4,
+        "row": [
+          "moderation unban sweep (`moderation_scheduled_unbans`)",
+          "30s"
+        ]
+      },
+      "status": "manual",
+      "action": "After command-04 observe successive 30s unban sweeps across expiry.",
+      "expected": "Only expired tempban is unbanned once; unexpired item retained.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-11",
+      "parity": {
+        "section": 4,
+        "row": [
+          "ticket recovery / transcript purge",
+          "5m / 60m"
+        ]
+      },
+      "status": "manual",
+      "action": "Restart with open/closed disposable tickets, observe recovery at 5m and purge at 60m.",
+      "expected": "Recovery is idempotent, only policy-expired fixture transcripts purged.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-12",
+      "parity": {
+        "section": 4,
+        "row": [
+          "settings version poll (`guild_settings` hot reload)",
+          "15s"
+        ]
+      },
+      "status": "manual",
+      "action": "Change one permitted hot guild setting via dashboard, then wait at least 15s.",
+      "expected": "Version advances and runtime uses new setting without restart; unchanged version not reloaded.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-13",
+      "parity": {
+        "section": 4,
+        "row": [
+          "self-role claim renewal / automod repeat-tracker expiry / per-request fetch timeouts",
+          "lease/timeout driven"
+        ]
+      },
+      "status": "manual",
+      "action": "In local fixtures advance self-role lease, automod repeat TTL and fetch timeout clocks; retry expired claim.",
+      "expected": "Lease renewal and expiry bounded; repeat tracker cleaned; timed-out request aborts without duplicate effect.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s4-14",
+      "parity": {
+        "section": 4,
+        "row": [
+          "systemd `two-bot-backup.timer` (nightly DB→S3)",
+          "daily 04:17"
+        ]
+      },
+      "status": "waived",
+      "action": "Use an authorized test-container backup fixture at simulated daily 04:17; capture its TOG-9881 receipt.",
+      "expected": "Dump/upload timer equivalent invokes once with integrity receipt; no staging/production DB connection.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s4-15",
+      "parity": {
+        "section": 4,
+        "row": [
+          "systemd `two-bot-guild-config-backup.timer` (sealed Discord config snapshot)",
+          "daily 04:31 UTC"
+        ]
+      },
+      "status": "waived",
+      "action": "Use disposable guild-config snapshot fixture at simulated daily 04:31 UTC under TOG-9881.",
+      "expected": "Sealed snapshot timer equivalent invokes once; allowlisted metadata only, no secret/log leakage.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s4-16",
+      "parity": {
+        "section": 4,
+        "row": [
+          "systemd `two-bot-restore-drill.timer`",
+          "monthly"
+        ]
+      },
+      "status": "waived",
+      "action": "Attach TOG-9881 monthly restore-drill receipt from agent-testdb/CI services only.",
+      "expected": "Restore verifies integrity and fixture row counts in isolated test DB; never replaces staging or production.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-01",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`events`, `members`, `invite_snapshots`",
+          "append-only funnel log + member projection + invite snapshots"
+        ]
+      },
+      "status": "waived",
+      "action": "Replay synthetic joins/messages/leaves and invite snapshots using the authorized test-container funnel store fixture.",
+      "expected": "Append-only events and member/invite projections are idempotent and guild-scoped.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-02",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`internal_nonces`, `internal_idempotency`, `internal_action_log`, `internal_discord_events`",
+          "website-callback replay guard, idempotency, audit, dedupe"
+        ]
+      },
+      "status": "waived",
+      "action": "Send signed synthetic actions, replay nonce/idempotency key, and repeat Discord callback in CI store fixtures.",
+      "expected": "Durable nonce refusal, stable replay response and one action/event audit across restart.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-03",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`web_contract_meta`, `guild_counters`, `rank_ladder`, `rank_snapshots`, `member_ranks`, `scheduled_events`",
+          "website read contract"
+        ]
+      },
+      "status": "waived",
+      "action": "Load website contract fixture on agent-testdb/CI and query every web_v1 read contract view there.",
+      "expected": "Contract metadata, counters, ranks and scheduled events agree atomically; no staging database queried.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-04",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`presence_probe`",
+          "hourly presence series"
+        ]
+      },
+      "status": "waived",
+      "action": "Run presence-series fixture ticks at 1h in authorized test DB.",
+      "expected": "One bounded presence row per tick with correct series ordering.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-05",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`counter_snapshots`, `member_exclusions`",
+          "live-count audit history, raid exclusions"
+        ]
+      },
+      "status": "waived",
+      "action": "Run counter snapshot and raid-exclusion fixtures in authorized test DB.",
+      "expected": "Excluded members do not inflate live counts; history preserves prior snapshots.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-06",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`invite_campaigns` (`go.two.gg/<slug>`)",
+          "tracked short links"
+        ]
+      },
+      "status": "waived",
+      "action": "Use redirect campaign fixture slug against local fixture store, then unknown slug.",
+      "expected": "Known slug records invite_click once and redirects; unknown slug uses fallback without invented attribution.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-07",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`member_levels`, `xp_cooldowns` (60s msg/voice), `xp_awards`, `level_role_rewards`, `level_import_runs`",
+          "leveling, MEE6-compat (5 XP/min voice)"
+        ]
+      },
+      "status": "waived",
+      "action": "Use synthetic message XP cooldowns and approved MEE6/reward import fixture in authorized test DB; attach the voice XP portion from TOG-10119 rather than duplicating its voice scenario.",
+      "expected": "60s cooldown, 5 XP/min voice compatibility, reward idempotency and import-run ledger match fixture expectations.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-08",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`moderation_warnings`, `moderation_scheduled_unbans`, `moderation_audit`, `moderation_lockdowns`, `moderation_idempotency`",
+          "moderation ledger, tempban queue, lockdown state, claim table"
+        ]
+      },
+      "status": "waived",
+      "action": "Run synthetic warnings/tempbans/lockdowns and duplicate moderation claim fixtures on test DB.",
+      "expected": "Ledger, expiry queue, prior overwrite and idempotency claim persist across replay.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-09",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`operational_audit_log` (states `none/pending/delivering/delivered/quarantined`, 5-min lease, hourly mirror recheck)",
+          "metadata-only Discord-event parity audit"
+        ]
+      },
+      "status": "waived",
+      "action": "Run audit-state fixture transitions with 5m claim expiry and 1h mirror recheck in test DB.",
+      "expected": "Only valid none/pending/delivering/delivered/quarantined transitions; expired claim recoverable and duplicates blocked.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-10",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`automod_violations`, `automod_processed_messages`",
+          "sanctions ladder, gateway-retry dedupe"
+        ]
+      },
+      "status": "waived",
+      "action": "Run accepted/rejected/edit/retry automod fixtures on test DB.",
+      "expected": "One processed-message claim; violation ladder advances only for distinct qualifying violations.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-11",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`tickets`, `ticket_transcripts`",
+          "ticket lifecycle + transcripts"
+        ]
+      },
+      "status": "waived",
+      "action": "Run open/claim/close/recovery/transcript-expiry fixture in test DB.",
+      "expected": "Lifecycle and transcript retention persist through restart; duplicate open does not create second ticket.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-12",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`containment_events`, `containment_incidents`, `join_risk_flags`",
+          "anti-nuke signals/incidents, join-risk (flag-only, never kicks)"
+        ]
+      },
+      "status": "waived",
+      "action": "Run alerts-only anti-nuke and join-burst fixtures on test DB.",
+      "expected": "Signals/incidents/risk flags persist; join-risk never kicks.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-13",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`automation_commands`, `scheduled_messages`, `sticky_messages`, `automation_audit_log`",
+          "custom commands, schedule queue, stickies"
+        ]
+      },
+      "status": "waived",
+      "action": "Run create/remove/custom-trigger/schedule/sticky fixtures on test DB.",
+      "expected": "Definitions, due queue, last sticky and audit persist with guild isolation and idempotent claims.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-14",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`self_role_audit`, `self_role_panel_claims`",
+          "self-role audit + claim leases"
+        ]
+      },
+      "status": "waived",
+      "action": "Run role add/remove/replace and claim-renewal fixtures on test DB.",
+      "expected": "Claim lease prevents duplicate role action; metadata-only audit persists.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-15",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`community_facts`, `community_stream_heartbeats`, `community_scorecard_runs/alerts`",
+          "scorecard facts/runs/alerts"
+        ]
+      },
+      "status": "waived",
+      "action": "Run fact/heartbeat/weekly-scorecard fixtures on test DB, excluding dropped rota extensions.",
+      "expected": "Facts and stream liveness yield one weekly run/alert; dropped rota tables are not required.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-16",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`event_rsvps`, `lfg_posts/roles/signups`, `feed_relays`, `feed_deliveries`, `announcements_audit_log`",
+          "RSVP, LFG, feed relay + delivery claims"
+        ]
+      },
+      "status": "waived",
+      "action": "Run RSVP replacement, LFG capacity, feed dedupe and announcement audit fixtures on test DB.",
+      "expected": "Latest RSVP, bounded signups, single delivery and idempotent announcement audit persist.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-17",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`guild_settings`, `guild_settings_audit`",
+          "dashboard-writable hot settings"
+        ]
+      },
+      "status": "waived",
+      "action": "Run permitted/forbidden setting changes and version-poll fixtures on test DB.",
+      "expected": "Guild setting version and audit advance together for attributed hot/cold writes; wired hot changes apply live, cold changes require restart; env_only and unknown writes are refused before persistence/audit.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s5-18",
+      "parity": {
+        "section": 5,
+        "row": [
+          "`audit_kill_switch` (presence = halt; audit fail-open, rota fail-closed)",
+          "audit pipeline kill switch"
+        ]
+      },
+      "status": "waived",
+      "action": "Insert/remove the kill-switch fixture only in authorized test DB; simulate pending audit delivery.",
+      "expected": "Presence halts the audit pipeline; absence permits resume; failure mode matches audit policy.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s6-01",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Discord REST (`/api/v10`, `DISCORD_API_BASE` override)",
+          "guild/members/scheduled-events reads; 110ms pacing, 429 `retry-after+250ms`, 5xx exp backoff ≤4; kicks 350ms pacing, 4 retries; moderation REST 5s abort, no auto-retry"
+        ]
+      },
+      "status": "automated",
+      "action": "Against mock-discord REST double, script success/429/5xx/timeout/kick/moderation responses; attach fixture timestamps. Use only benign permitted staging REST during command scenarios.",
+      "expected": "110ms pacing, retry-after+250ms, ≤4 exponential retries; kick 350ms/4 retries; moderation aborts at 5s without automatic retry.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test executor_acceptance && python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test executor_regressions"
+    },
+    {
+      "id": "s6-02",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Discord gateway (discord.js → twilight)",
+          "intents §3; session persist + RESUME across Container restarts (restart-storage precedent)"
+        ]
+      },
+      "status": "manual",
+      "action": "Attach approved lifecycle deployment receipt for ready→restart→RESUME with persisted session; cross-link voice reset evidence.",
+      "expected": "Required intents gated; persisted session resumes instead of reconnect loop; voice effects proven by TOG-10119.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s6-03",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Discord CDN emoji fetch (guild-config snapshot)",
+          "`GUILD_CONFIG_CDN_BASE` override"
+        ]
+      },
+      "status": "automated",
+      "action": "Run backup_transport::guild_config_capture_plan_apply_round_trip, which supplies loopback Discord/CDN doubles and passes the CDN override to GuildConfigDiscordApi; no external CDN or real guild call.",
+      "expected": "The loopback CDN override is honoured: captured unmanaged emoji image starts with data:image/png;base64, and the snapshot seal verifies. This fixture does not prove oversize, timeout, invalid-content-type or deployed-network behaviour; do not claim those from its PASS.",
+      "evidence": "Attach the exact-head filtered command, executed test count (one, not zero), result and assertions at crates/core/tests/backup_transport.rs:394–420. Fixture capture/override and seal proof only, not a deployed-network or negative-validation soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test backup_transport guild_config_capture_plan_apply_round_trip -- --exact"
+    },
+    {
+      "id": "s6-04",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Feeds RSS/YouTube/Twitch (UA `Owen/1.0`, SSRF public-IP guard, `MAX_FEED_BYTES`)",
+          "poll → `feed_deliveries` → relay"
+        ]
+      },
+      "status": "manual",
+      "action": "Poll approved public RSS/YouTube/Twitch fixture; use local mocks for redirect/private-IP/oversize cases.",
+      "expected": "Owen/1.0 UA, public-IP SSRF guard and MAX_FEED_BYTES enforced; one relay per item.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s6-05",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Website → bot `POST /internal/actions` (HMAC-SHA256 `sha256=` over `POST\\npath\\nts\\nnonce\\nsha256(body)`; `TWO_INTERNAL_KEYS`; skew+nonce replay guard; buckets 20 burst/1/s, `guild.add_member` 10/0.5s; 18 actions: `role.assign`, `guild.add_member`, `announcement.post`, `event.upsert/cancel`, `automations.import/export`, `settings.get/set`, `moderation.*` ×9)",
+          "web callbacks incl. `identify guilds.join` auto-join path"
+        ]
+      },
+      "status": "waived",
+      "action": "In local mock/CI replay all 18 signed internal actions plus bad signature, stale timestamp, reused nonce and rate-bound fixtures; do not call live mutation endpoints.",
+      "expected": "POST canonical HMAC, replay/skew rejection, durable idempotency; 20 burst/1s and add_member 10/0.5s buckets; nine moderation actions keep protection.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s6-06",
+      "parity": {
+        "section": 6,
+        "row": [
+          "`go.two.gg` redirect (`GET /<slug>` → `invite_click` → 302; unknown → fallback code)",
+          "~450-line server + campaigns"
+        ]
+      },
+      "status": "manual",
+      "action": "Use approved staging redirect origin with a disposable registered slug and unknown slug; never send traffic to production go.two.gg for this check.",
+      "expected": "302 destination and fallback match fixture; invite_click is attributable without leaking personal tokens.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s6-07",
+      "parity": {
+        "section": 6,
+        "row": [
+          "S3-compatible backup (SigV4 single-PUT, `TWO_BACKUP_S3_*`)",
+          "nightly dump upload"
+        ]
+      },
+      "status": "automated",
+      "action": "Attach TOG-9881 SigV4 single-PUT fixture receipt from an approved local S3 double, not a real bucket.",
+      "expected": "Request canonicalization/signature and integrity checks pass; no production object or credential changes.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test backup_transport"
+    },
+    {
+      "id": "s6-08",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Postgres (`TWO_DATABASE_URL`, staging guard; pool max 5, `statement_timeout`)",
+          "direct from Container (no Hyperdrive)"
+        ]
+      },
+      "status": "waived",
+      "action": "Run pool/timeout/staging-guard negative fixtures with no live URLs; test connectivity only to agent-testdb/CI.",
+      "expected": "Wrong stage/guild guard refuses before connect; configured pool ≤5 and statement timeout bounded.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s6-09",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Health endpoint (`TWO_HEALTH_PORT`, `503 gateway_disconnected` pre-ready)",
+          "Container probe"
+        ]
+      },
+      "status": "manual",
+      "action": "In contained staging observe /readyz before gateway ready, after ready and during approved restart; pair with local pre-ready fixture.",
+      "expected": "503 with per-component JSON pre-ready (process ready, gateway starting/down); 200 only when every component reports ready; no secret/session data in body. `gateway_disconnected` is the legacy matrix label, not the deployed body — see docs/staging-soak.md.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s6-10",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Operational-audit mirror channel (retryable delivery, `allowedMentions:{parse:[]}`, nonce-enforced)",
+          "tamper-evident Discord mirror"
+        ]
+      },
+      "status": "manual",
+      "action": "Cause retryable mirror failure only in local REST mock; deliver one metadata-only fixture audit message to approved staging audit channel.",
+      "expected": "Retry durable, nonce-enforced delivery once, allowedMentions parse empty and no message content.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s6-11",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Moderation-audit MAC (`[two-audit:v1:token:action:actor:mac]`, HMAC-SHA256 `TWO_MODERATION_AUDIT_SECRET`, `timingSafeEqual`)",
+          "bot-action correlation"
+        ]
+      },
+      "status": "manual",
+      "action": "Run valid/tampered/wrong-actor MAC fixtures locally; correlate one permitted disposable moderation action.",
+      "expected": "Exact two-audit:v1 envelope validates constant-time; forged audit marker never trusted.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s6-12",
+      "parity": {
+        "section": 6,
+        "row": [
+          "Inbound webhook classification only (bot-posts-via-webhook detection for classifier)",
+          "no outbound webhook calls exist"
+        ]
+      },
+      "status": "manual",
+      "action": "Replay fixture webhook-authored and regular bot messages in local classifier.",
+      "expected": "Webhook bot-post classification correct; no outbound webhook request introduced.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s7-01",
+      "parity": {
+        "section": 7,
+        "row": [
+          "Config / env catalogue"
+        ]
+      },
+      "status": "manual",
+      "action": "With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD), a cold key (TWO_FEED_POLL_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.",
+      "expected": "Catalogued hot and cold keys are writable, versioned and audited; wired hot keys apply live, cold and hot-but-unwired keys are marked next-restart and do not apply live. Env_only and unknown writes are refused before persistence/audit; env-only values remain private.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s8-01",
+      "parity": {
+        "section": 8,
+        "row": [
+          "Structured JSON logs (`{ts,level,msg,…}`, `debug/info/error`, `LOG_LEVEL`)",
+          "~208 line names: lifecycle, funnel, onboarding, audit mirror, alerts, automod/moderation, rota, REST/backoff"
+        ]
+      },
+      "status": "manual",
+      "action": "Capture structured logs for startup, one command, one denied request and mock retry with each approved LOG_LEVEL.",
+      "expected": "JSON has timestamp/level/message fields; lifecycle/funnel/audit/backoff equivalents observable; no secrets or message content.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s8-02",
+      "parity": {
+        "section": 8,
+        "row": [
+          "Audit channels (audit/voice/moderation, metadata-only `key=value`, 300/2000 truncation, audit-event identity prefix)",
+          "arches fallback voice/moderation → audit"
+        ]
+      },
+      "status": "manual",
+      "action": "Deliver a fixture audit message with long metadata; use local fixture for fallback/truncation, attach voice channel portion from TOG-10119.",
+      "expected": "Metadata-only key=value, 300/2000 truncation, event identity prefix; voice/moderation fallback to audit; no mentions.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s8-03",
+      "parity": {
+        "section": 8,
+        "row": [
+          "Audit kill switch (`audit-switch --halt/--resume/--status`)",
+          "presence = halt"
+        ]
+      },
+      "status": "waived",
+      "action": "Run audit-switch halt/status/resume against local authorized test-container fixture only, never staging/production DB.",
+      "expected": "Switch presence halts, status reports accurately, resume clears only the fixture switch and pending audit resumes safely.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    },
+    {
+      "id": "s8-04",
+      "parity": {
+        "section": 8,
+        "row": [
+          "Rate limits: staging-verifier 3 retries ≤30s; REST pacing §6; internal buckets §6; raid-watch 5 joins/60s + 900s cooldown; ticket cooldown 300s; containment per-executor cooldown",
+          "alert cooldowns + sweep/lease bounds (audit 5-min lease, 1-h recheck, claim ≤25)"
+        ]
+      },
+      "status": "manual",
+      "action": "Use mock clocks/REST for verifier retries, REST/internal buckets, raid burst, ticket/containment cooldown and audit sweep leases.",
+      "expected": "3 verifier retries ≤30s; REST/internal §6 bounds; 5 joins/60s +900s raid cooldown; ticket 300s; executor cooldown; 5m audit lease,1h recheck,≤25 claims.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s8-05",
+      "parity": {
+        "section": 8,
+        "row": [
+          "Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete)",
+          "bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist"
+        ]
+      },
+      "status": "manual",
+      "action": "In disposable approved staging channel with dryRun enabled, send one benign fixture per six configured filters; use local mocks for enforced ladder and protected-target deletion.",
+      "expected": "NFKC words/invite/link/attachment checks classify; default no sanctions; ENFORCE=1 requires separate live approval, ladder delete/warn/600s timeout and protection tested locally.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s8-06",
+      "parity": {
+        "section": 8,
+        "row": [
+          "Anti-nuke (default alerts-only; weights kick/ban/webhook=1, channel/role delete=3; quarantine strips dangerous perms below bot hierarchy; join-risk flag-only)",
+          "`containment_alert` always logged; `**Join burst**` raid alerts, no DMs/pings"
+        ]
+      },
+      "status": "manual",
+      "action": "Replay kick/ban/webhook/channel-delete/role-delete threshold fixtures locally with alerts-only setting; one benign staging join-burst fixture only if authorized.",
+      "expected": "Weights 1/3, containment_alert always present; Join burst no ping/DM; quarantine hierarchy tested locally; never kicks join-risk member.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s8-07",
+      "parity": {
+        "section": 8,
+        "row": [
+          "Onboarding modes (`legacy` catalog + hub routing / `session` roleless two-pick LIVE / anchor Sunday-Squad one-message)",
+          "no-DM, idempotent `onboarding_prompted`, dry-run aware"
+        ]
+      },
+      "status": "manual",
+      "action": "Under separately approved mode configuration, join and gate-clear disposable member for legacy/session/anchor; repeat through mock fixture.",
+      "expected": "Correct hub/two-pick/Sunday-Squad one-message prompt; no DM, idempotent onboarding_prompted and dry-run awareness.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s8-08",
+      "parity": {
+        "section": 8,
+        "row": [
+          "Operator scripts (82 files)",
+          "schedule/backfill/migration one-shots → **[TOG-9882](/TOG/issues/TOG-9882)** (MEE6 XP, rewards, history backfill, dedupe, message-milestone scan, join capture); backup/restore/snapshot → [TOG-9881](/TOG/issues/TOG-9881); read-only reports (funnel, gate, attribution, roster, dashboard, scorecard, presence-trend, growth-review) → **DROP** as runtime (query Postgres/`web_v1` on demand); manual raid-list/raid-remove → [TOG-10867](/TOG/issues/TOG-10867) ([runbook](raid-response.md)), not scheduled runtime; staging provision/verify/reset + e2e harness → **DROP** (replaced by mock-discord acceptance + **S6** cutover plan); `reconcile` → **DROP** (absent/broken upstream); guild-config snapshot/restore → [TOG-9881](/TOG/issues/TOG-9881); temp-voice → staging shape-check only, no runtime on legacy `main` (TOG-3471 unmerged) → port the check under **S6**, no runtime row"
+        ]
+      },
+      "status": "waived",
+      "action": "Attach TOG-9882 import/backfill/dedupe fixture receipts and TOG-9881 backup/restore/config receipts; attach [TOG-10867](/TOG/issues/TOG-10867) raid-removal loopback/CLI and disposable raid-list DB fixture receipts; attach S6 temp-voice shape-check via TOG-10119. Do not run dropped scripts or live removals.",
+      "expected": "Ported one-shots preserve fixture totals/reward/history idempotency; sealed restore validated in test DB; manual raid tools default to dry-run, fence live guild access, protect staff on every retry and audit each reached target; other reports/reconcile/rota stay dropped; temp-voice has no runtime promise.",
+      "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
+    }
+  ]
+}
