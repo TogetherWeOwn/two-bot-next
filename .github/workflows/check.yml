@@ -94,6 +94,11 @@ jobs:
       - name: cargo test (docs)
         run: cargo test --workspace --doc --features two-bot-core/db --locked
 
+      - name: leveling Postgres parity tests
+        env:
+          TWO_LEVELING_TEST_CI: '1'
+        run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
+
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
