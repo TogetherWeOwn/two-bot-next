@@ -95,6 +95,12 @@ fn verify_sigv4(secret: &str, method: &str, path: &str, body: &[u8], headers: &H
     {
         return false;
     }
+    // SigV4 requires alphabetic order, not merely a self-consistent HMAC.
+    // Refuse a sender that signs a noncanonical ordering, even if its hash matches.
+    let names: Vec<&str> = signed.split(';').collect();
+    if names.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return false;
+    }
     let canonical_headers: String = signed
         .split(';')
         .map(|h| {

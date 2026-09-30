@@ -311,14 +311,16 @@ pub fn sign_put(
         canonical_path(&format!("{endpoint_prefix}{resource}"))
     };
 
-    let headers = vec![
+    let mut headers = vec![
         ("host".to_owned(), host.to_owned()),
         ("content-length".to_owned(), body.len().to_string()),
         ("x-amz-content-sha256".to_owned(), payload_hash.clone()),
         ("x-amz-date".to_owned(), amz_date.to_owned()),
     ];
 
-    // BTreeMap-equivalent ordering: header names are already sorted.
+    // CanonicalHeaders and SignedHeaders must share alphabetic name order.
+    // https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html#create-canonical-request
+    headers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let canonical_headers: String = headers
         .iter()
         .map(|(name, value)| format!("{name}:{}\n", value.trim()))
@@ -495,8 +497,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "host",
                 "content-length",
+                "host",
                 "x-amz-content-sha256",
                 "x-amz-date",
                 "authorization"
@@ -510,7 +512,12 @@ mod tests {
             .1
             .clone();
         assert!(auth.contains("Credential=AKIDEXAMPLE/20260903/auto/s3/aws4_request"));
-        assert!(auth.contains("SignedHeaders=host;content-length;x-amz-content-sha256;x-amz-date"));
+        assert!(auth.contains("SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date"));
+        // Independent Python hashlib/hmac reconstruction of AWS's canonical
+        // request rules with this public fixture, path, body, date and region.
+        assert!(auth.ends_with(
+            "Signature=f9da93cb5b1845ff516a66c7ad796c368d68e9a4f33fead4163d2501988f40db"
+        ));
     }
 
     #[test]

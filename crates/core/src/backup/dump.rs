@@ -28,8 +28,8 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 
 use super::dump_file::{
-    finish_gzip, inspect, is_dump_table, new_encoder, write_line, DumpContents, DumpError,
-    DumpManifest, DumpTableInfo, DUMP_TABLES, DUMP_VERSION,
+    cell_input, finish_gzip, inspect, is_dump_table, new_encoder, write_line, DumpContents,
+    DumpError, DumpManifest, DumpTableInfo, DUMP_TABLES, DUMP_VERSION,
 };
 use super::guild_config::unix_now_iso;
 
@@ -166,27 +166,21 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
     let seq: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(id), 0) FROM events")
         .fetch_one(&mut *tx)
         .await?;
-    // The manifest records the source's applied migrations for diagnosing
-    // an old backup. Only an ABSENT record table (SQLSTATE 42P01) falls back
-    // to an empty list — a fresh source whose migration runner has not
-    // created its ledger yet, matching legacy's `.catch(() => [])`. Any other
-    // failure propagates: silently writing a manifest that claims nothing was
-    // applied would lie to whoever diagnoses the restore (PR #11 review).
-    let migrations: Vec<(String,)> =
-        match sqlx::query_as("SELECT id::text FROM schema_migrations ORDER BY id")
+    // An absent ledger is valid on a fresh source. Check before selecting:
+    // catching 42P01 inside this transaction would leave every later query
+    // aborted (25P02). Errors from an existing ledger still propagate.
+    let (has_ledger,): (bool,) =
+        sqlx::query_as("SELECT to_regclass('schema_migrations') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await?;
+    let migrations: Vec<(String,)> = if has_ledger {
+        sqlx::query_as("SELECT id::text FROM schema_migrations ORDER BY id")
             .fetch_all(&mut *tx)
             .await
-        {
-            Ok(rows) => rows,
-            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P01") => {
-                Vec::new()
-            }
-            Err(e) => {
-                return Err(DbDumpError::Refused(format!(
-                    "cannot read schema_migrations: {e}"
-                )));
-            }
-        };
+            .map_err(|e| DbDumpError::Refused(format!("cannot read schema_migrations: {e}")))?
+    } else {
+        Vec::new()
+    };
 
     let manifest = DumpManifest {
         kind: "manifest".to_owned(),
@@ -357,12 +351,14 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
                     let target_type = target_types.get(col.as_str()).copied().unwrap_or("text");
                     tuple.push(format!("${index}::{target_type}"));
                     index += 1;
-                    // `inspect` refused every non-string/non-null cell before
-                    // the transaction opened, so `as_str` here only maps
-                    // JSON null to SQL NULL — it can never silently wipe a
-                    // value (PR #11 review; see `inspect_bytes`).
-                    let value = row.get(*col).and_then(Value::as_str).map(str::to_owned);
-                    params.push(value);
+                    let cell = row.get(*col).ok_or_else(|| {
+                        DbDumpError::Refused(format!("{}: missing cell {col}", table.name))
+                    })?;
+                    params.push(cell_input(
+                        cell,
+                        target_type,
+                        !table.column_types.is_empty(),
+                    )?);
                 }
                 placeholders.push(format!("({})", tuple.join(", ")));
             }

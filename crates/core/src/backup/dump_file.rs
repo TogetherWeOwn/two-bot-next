@@ -19,11 +19,14 @@
 //! manifest. Restore re-applies the value with a `$n::type` cast, so the
 //! round trip is faithful for every type the bot owns (text, integers,
 //! timestamptz, booleans, json/jsonb, bytea hex, arrays, enums, intervals)
-//! without per-type Rust decoding. `columnTypes` is additive to the legacy v3
-//! envelope; a legacy-written dump restores with its types inferred as `text`.
+//! without per-type Rust decoding. `column_types` is additive to legacy v3.
+//! Frozen legacy dumps omit it and contain native numbers/booleans; restore
+//! converts these to PostgreSQL input text using the target's column types.
+//! JSON-looking TEXT stays unchanged; native JSON cells are serialized only
+//! for a JSON/JSONB target. Unsupported composite cells refuse, never become NULL.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
 use flate2::read::GzDecoder;
@@ -99,11 +102,88 @@ pub struct DumpManifest {
     pub schema_migrations: Vec<String>,
 }
 
-/// Largest dump `inspect` will buffer: the reader holds the whole file and
-/// the restore holds every row, so an unbounded read lets a swapped-in wrong
-/// file eat the host's RAM. Nightly dumps of the bot's 22 tables are
-/// megabytes; anything past a gibibyte is not ours (PR #11 review).
+/// Maximum compressed AND decoded bytes. Files are streamed rather than
+/// loading the compressed input alongside every retained row.
 pub const MAX_DUMP_BYTES: u64 = 1024 * 1024 * 1024;
+/// Check before growing the line buffer, including on highly compressible input.
+pub const MAX_DUMP_LINE_BYTES: u64 = 8 * 1024 * 1024;
+/// Conservative retained-value budget, counting keys and per-value overhead,
+/// not merely their serialized bytes. Restore still buffers validated rows.
+pub const MAX_DUMP_RETAINED_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct InspectLimits {
+    decoded: u64,
+    line: u64,
+    retained: u64,
+}
+
+const INSPECT_LIMITS: InspectLimits = InspectLimits {
+    decoded: MAX_DUMP_BYTES,
+    line: MAX_DUMP_LINE_BYTES,
+    retained: MAX_DUMP_RETAINED_BYTES,
+};
+
+fn read_capped_line(
+    reader: &mut impl BufRead,
+    decoded: &mut u64,
+    limits: InspectLimits,
+) -> Result<Option<Vec<u8>>, DumpError> {
+    let mut line = Vec::new();
+    loop {
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let n = bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| i + 1);
+        if line.len() as u64 + n as u64 > limits.line {
+            return Err(refuse(format!(
+                "dump decoded line exceeds {}-byte cap",
+                limits.line
+            )));
+        }
+        if *decoded + n as u64 > limits.decoded {
+            return Err(refuse(format!(
+                "dump decoded content exceeds {}-byte cap",
+                limits.decoded
+            )));
+        }
+        let complete = bytes[n - 1] == b'\n';
+        line.extend_from_slice(&bytes[..n]);
+        reader.consume(n);
+        *decoded += n as u64;
+        if complete {
+            return Ok(Some(line));
+        }
+    }
+}
+
+// Deliberately over-count value/map/vector bookkeeping so tiny native JSON
+// nodes cannot evade the cumulative cap. Per-line input is bounded separately.
+fn retained_weight(value: &Value) -> u64 {
+    128 + match value {
+        Value::String(s) => s.capacity() as u64,
+        Value::Array(items) => items.iter().map(retained_weight).sum(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| k.capacity() as u64 + retained_weight(v))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn retain_within_cap(retained: &mut u64, value: &Value, limit: u64) -> Result<(), DumpError> {
+    *retained += retained_weight(value);
+    if *retained > limit {
+        return Err(refuse(format!(
+            "dump retained data exceeds {limit}-byte cap"
+        )));
+    }
+    Ok(())
+}
 
 fn ensure_within_size_cap(len: u64, what: &str) -> Result<(), DumpError> {
     if len > MAX_DUMP_BYTES {
@@ -186,20 +266,26 @@ pub struct DumpContents {
 /// real check of the backup rather than a check that a URL parses.
 pub fn inspect_bytes(bytes: &[u8]) -> Result<DumpContents, DumpError> {
     ensure_within_size_cap(bytes.len() as u64, "dump")?;
-    let decoder = GzDecoder::new(bytes);
-    let reader = std::io::BufReader::new(decoder);
+    inspect_reader(bytes, INSPECT_LIMITS)
+}
+
+fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContents, DumpError> {
+    let decoder = GzDecoder::new(input);
+    let mut reader = std::io::BufReader::new(decoder);
     let mut manifest: Option<DumpManifest> = None;
     let mut saw_end = false;
     let mut declared_rows: u64 = 0;
     let mut buffers: BTreeMap<String, Vec<Map<String, Value>>> = BTreeMap::new();
+    let mut decoded = 0;
+    let mut retained = 0;
+    let mut line_no = 0;
 
-    for (index, line) in reader.lines().enumerate() {
-        let line_no = (index + 1) as u64;
-        let line = line.map_err(|e| DumpError::Gzip(format!("line {line_no}: {e}")))?;
-        if line.trim().is_empty() {
+    while let Some(line) = read_capped_line(&mut reader, &mut decoded, limits)? {
+        line_no += 1;
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let obj: Value = serde_json::from_str(&line).map_err(|e| DumpError::Json {
+        let mut obj: Value = serde_json::from_slice(&line).map_err(|e| DumpError::Json {
             line: line_no,
             message: e.to_string(),
         })?;
@@ -218,44 +304,53 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<DumpContents, DumpError> {
                         "dump version {version}, this build reads {DUMP_VERSION}"
                     )));
                 }
+                retain_within_cap(&mut retained, &obj, limits.retained)?;
                 manifest = Some(validate_manifest(&obj)?);
             }
             "row" => {
                 let Some(m) = manifest.as_ref() else {
                     return Err(refuse("dump row appears before the manifest"));
                 };
-                let table = obj.get("table").and_then(Value::as_str).unwrap_or("");
-                if !is_dump_table(table) {
+                let table = obj
+                    .get("table")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if !is_dump_table(&table) {
                     return Err(refuse(format!(
                         "row: {table:?} is not a table this backup format owns \
                          (expected one of {})",
                         DUMP_TABLES.join(", ")
                     )));
                 }
-                if !m.tables.iter().any(|t| t.name == table) {
-                    return Err(refuse(format!(
-                        "row table {table} is not declared in the manifest"
-                    )));
-                }
-                let data = obj
-                    .get("data")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| refuse("dump row has no data object"))?
-                    .clone();
-                // This build stores Postgres text-output form (strings and
-                // nulls only). A native JSON cell — a number, boolean, array
-                // or object — would reach the restore as a bound NULL,
-                // silently wiping the value. Refuse the file instead of
-                // restoring a corruption (PR #11 review).
-                for (col, value) in &data {
-                    if !(value.is_string() || value.is_null()) {
-                        return Err(refuse(format!(
-                            "{table} row on line {line_no}: column {col:?} is not a string or null; \
-                             refusing rather than restoring it as NULL"
-                        )));
+                let info = m.tables.iter().find(|t| t.name == table).ok_or_else(|| {
+                    refuse(format!("row table {table} is not declared in the manifest"))
+                })?;
+                retain_within_cap(&mut retained, &obj, limits.retained)?;
+                let data = match obj.get_mut("data").map(Value::take) {
+                    Some(Value::Object(data)) => data,
+                    _ => return Err(refuse("dump row has no data object")),
+                };
+                // Frozen v3 has native driver-decoded cells and no type metadata.
+                // This port's text-output encoding must remain strings/nulls.
+                if !info.column_types.is_empty() {
+                    for (col, value) in &data {
+                        if !(value.is_string() || value.is_null()) {
+                            return Err(refuse(format!(
+                                "{table} row on line {line_no}: column {col:?} is not a string or null \
+                                 in a text-encoded dump"
+                            )));
+                        }
                     }
                 }
-                buffers.entry(table.to_owned()).or_default().push(data);
+                let rows = buffers.entry(table).or_default();
+                if rows.len() as u64 >= info.count {
+                    return Err(refuse(format!(
+                        "{}: rows exceed manifest count {}",
+                        info.name, info.count
+                    )));
+                }
+                rows.push(data);
             }
             "end" => {
                 saw_end = true;
@@ -308,11 +403,13 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<DumpContents, DumpError> {
 
 /// Read and validate a dump file from disk.
 pub fn inspect(path: &Path) -> Result<DumpContents, DumpError> {
-    if let Ok(meta) = std::fs::metadata(path) {
-        ensure_within_size_cap(meta.len(), &format!("dump file {}", path.display()))?;
-    }
-    let bytes = std::fs::read(path)?;
-    inspect_bytes(&bytes)
+    let file = std::fs::File::open(path)?;
+    ensure_within_size_cap(
+        file.metadata()?.len(),
+        &format!("dump file {}", path.display()),
+    )?;
+    // Also bound reads if a file grows after the metadata check.
+    inspect_reader(file.take(MAX_DUMP_BYTES), INSPECT_LIMITS)
 }
 
 fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
@@ -366,6 +463,32 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         )));
     }
     serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
+}
+
+/// Convert a validated cell to bound PostgreSQL input, never coercing an
+/// unsupported native value into SQL NULL. Legacy's driver used native scalar
+/// JSON; this port marks its PostgreSQL text-output encoding with column types.
+#[cfg(any(feature = "db", test))]
+pub(crate) fn cell_input(
+    value: &Value,
+    target_type: &str,
+    text_encoded: bool,
+) -> Result<Option<String>, DumpError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if !text_encoded && matches!(target_type, "json" | "jsonb") {
+        return serde_json::to_string(value)
+            .map(Some)
+            .map_err(|e| refuse(format!("cannot encode native JSON cell: {e}")));
+    }
+    match value {
+        Value::String(s) => Ok(Some(s.clone())),
+        Value::Number(_) | Value::Bool(_) if !text_encoded => Ok(Some(value.to_string())),
+        _ => Err(refuse(format!(
+            "cannot encode native cell for PostgreSQL {target_type}; refusing rather than restoring NULL"
+        ))),
+    }
 }
 
 /// Fresh gzip encoder at the legacy compression level (9).
@@ -498,10 +621,9 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_row_with_a_native_json_cell() {
-        // This build stores Postgres text-output form (strings and nulls).
-        // A native number/boolean would restore as a bound NULL, silently
-        // wiping the value — refuse the file instead.
+    fn refuses_a_native_cell_in_a_text_encoded_dump() {
+        // Native cells are valid in legacy dumps, not in this port's
+        // explicitly marked PostgreSQL text-output encoding.
         let mut over = BTreeMap::new();
         over.insert("events", (vec!["id"], 1));
         let bytes = gzip_lines(&[
@@ -511,6 +633,88 @@ mod tests {
         ]);
         let err = inspect_bytes(&bytes).expect_err("native cell must be refused");
         assert!(err.to_string().contains("not a string or null"), "{err}");
+    }
+
+    #[test]
+    fn legacy_cells_decode_using_target_types_without_null_coercion() {
+        for (value, ty, expected) in [
+            (serde_json::json!(42), "bigint", "42"),
+            (serde_json::json!(false), "boolean", "false"),
+            (serde_json::json!(true), "boolean", "true"),
+            (serde_json::json!("{\"k\":1}"), "text", "{\"k\":1}"),
+            (serde_json::json!("hello"), "jsonb", "\"hello\""),
+            (serde_json::json!({"k":1}), "jsonb", "{\"k\":1}"),
+            (serde_json::json!([true, 2]), "json", "[true,2]"),
+        ] {
+            assert_eq!(
+                cell_input(&value, ty, false).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(cell_input(&Value::Null, "text", false).unwrap(), None);
+        assert_eq!(
+            cell_input(&serde_json::json!("{\"k\":1}"), "jsonb", true)
+                .unwrap()
+                .as_deref(),
+            Some("{\"k\":1}")
+        );
+        assert!(cell_input(&serde_json::json!({"k":1}), "text", false).is_err());
+        assert!(cell_input(&serde_json::json!(42), "bigint", true).is_err());
+    }
+
+    #[test]
+    fn caps_a_highly_compressible_line_before_unbounded_allocation() {
+        let mut enc = new_encoder();
+        enc.write_all(&vec![b' '; 32 * 1024]).unwrap();
+        let bytes = finish_gzip(enc).unwrap();
+        assert!(bytes.len() < 1024);
+        let limits = InspectLimits {
+            line: 1024,
+            ..INSPECT_LIMITS
+        };
+        let err = inspect_reader(bytes.as_slice(), limits).unwrap_err();
+        assert!(err.to_string().contains("decoded line exceeds"), "{err}");
+    }
+
+    #[test]
+    fn caps_cumulative_decoded_bytes_even_when_each_line_is_small() {
+        let mut enc = new_encoder();
+        enc.write_all(&vec![b'\n'; 32 * 1024]).unwrap();
+        let bytes = finish_gzip(enc).unwrap();
+        assert!(bytes.len() < 1024);
+        let limits = InspectLimits {
+            decoded: 1024,
+            ..INSPECT_LIMITS
+        };
+        let err = inspect_reader(bytes.as_slice(), limits).unwrap_err();
+        assert!(err.to_string().contains("decoded content exceeds"), "{err}");
+    }
+
+    #[test]
+    fn caps_cumulative_retained_rows_including_value_overhead() {
+        let mut objs = good_dump();
+        objs[0]["tables"][0]["count"] = serde_json::json!(2);
+        objs.insert(2, objs[1].clone());
+        objs[3]["rows"] = serde_json::json!(2);
+        let weight = retained_weight(&objs[0]) + 2 * retained_weight(&objs[1]);
+        let bytes = gzip_lines(&objs);
+        inspect_reader(
+            bytes.as_slice(),
+            InspectLimits {
+                retained: weight,
+                ..INSPECT_LIMITS
+            },
+        )
+        .unwrap();
+        let err = inspect_reader(
+            bytes.as_slice(),
+            InspectLimits {
+                retained: weight - 1,
+                ..INSPECT_LIMITS
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("retained data exceeds"), "{err}");
     }
 
     #[test]
