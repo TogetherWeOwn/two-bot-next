@@ -69,7 +69,8 @@ jobs:
         run: cargo test --workspace --all-features --locked
 
       - name: LFG store regressions (CI service container only)
-        run: cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
+        run: >-
+          cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.

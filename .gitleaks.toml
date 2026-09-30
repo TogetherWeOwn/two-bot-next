@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+# docs/lfg-port.md documents this public boolean test-container switch.
+# Match only the literal identifier/value, never a path, commit, or rule.
+[[allowlists]]
+description = "Public LFG CI boolean switch, not an API credential"
+regexTarget = "secret"
+regexes = ['^TWO_LFG_TESTDB_CI=1$']
