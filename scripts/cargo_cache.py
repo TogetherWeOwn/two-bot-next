@@ -165,10 +165,15 @@ def run_cargo(pool, args, cargo='cargo', interval=1):
             json.dump({'workspace': str(workspace), 'wrapper_pid': os.getpid(),
                        'started_at': time.time()}, output)
         env = os.environ.copy()
+        # Repository tests prefer PAPERCLIP_RUN_SCRATCH_DIR over temp_dir
+        # (crates/core/src/mac.rs), so repository scratch selectors must also
+        # point at lease scratch. Child-only overrides; the parent is unchanged.
         env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_TARGET_DIR=str(target),
                    CARGO_BUILD_BUILD_DIR=str(target),
                    TMPDIR=str(slot / 'scratch'), TMP=str(slot / 'scratch'),
                    TEMP=str(slot / 'scratch'),
+                   PAPERCLIP_RUN_SCRATCH_DIR=str(slot / 'scratch'),
+                   PAPERCLIP_SCRATCH_DIR=str(slot / 'scratch'),
                    CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0',
                    CARGO_PROFILE_TEST_DEBUG='0')
         # Pass the lease FD to Cargo as well: wrapper SIGKILL must not free it.
@@ -193,13 +198,21 @@ def run_cargo(pool, args, cargo='cargo', interval=1):
                 return result
             time.sleep(interval)
     finally:
-        if child is not None and not clean_exit:
-            stop_group(child)
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-        if clean_exit:
-            (slot / 'lease.json').unlink()
-        os.close(fd)
+        try:
+            if child is not None and not clean_exit:
+                # The raising handler above is still installed: a second
+                # SIGINT/SIGTERM during the SIGTERM wait would raise out of
+                # cleanup before SIGKILL and leave a writer alive. Hold
+                # termination signals until the process group is dead.
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    signal.signal(sig, signal.SIG_IGN)
+                stop_group(child)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+            if clean_exit:
+                (slot / 'lease.json').unlink()
+            os.close(fd)
 
 
 def process_references(proc_root):
@@ -243,6 +256,60 @@ def within(path, root):
     return Path(path).is_relative_to(root)
 
 
+# Top-level entries Cargo itself creates in a target directory. A .gitignore
+# entry proves nothing about provenance, so any other top-level entry is
+# foreign material and vetoes retention eligibility.
+CARGO_TARGET_TOP_LEVEL = frozenset(
+    {'debug', 'release', 'doc', 'package', 'tmp',
+     '.rustc_info.json', '.cargo-lock', 'CACHEDIR.TAG'})
+# File kinds that must never be treated as regenerable build output.
+PROTECTED_SUFFIXES = frozenset(
+    {'.rs', '.md', '.markdown', '.toml', '.bak', '.orig', '.rej', '.pem', '.key'})
+# Directory names that suggest preserved evidence/backups/archives.
+PROTECTED_DIR_NAMES = frozenset(
+    {'evidence', 'backup', 'backups', 'archive', 'archives',
+     'incident', 'incidents', 'receipt', 'receipts'})
+
+
+def preservation_veto(target):
+    """Reason a target's contents veto retention, or None when build-output-only.
+
+    Calibrated against real Cargo output: a genuine target holds only
+    debug/release/doc/package/tmp trees at top level. Nested build-script
+    codegen (debug/build/*/out/*.rs) is expected; .rs anywhere else is not
+    Cargo output. Unknown foreign top-level entries fail closed to a veto.
+    """
+    def unreadable(error):
+        raise Refusal(f'incomplete target scan: {error.filename}')
+
+    first = True
+    for base, dirs, files in os.walk(target, followlinks=False, onerror=unreadable):
+        if first:
+            for name in dirs + files:
+                if name not in CARGO_TARGET_TOP_LEVEL:
+                    return f'preserved foreign top-level entry: {name}'
+            first = False
+        under_codegen_out = (
+            Path(base).name == 'out'
+            and 'build' in Path(base).relative_to(target).parts)
+        for name in dirs:
+            if name.lower() in PROTECTED_DIR_NAMES:
+                return f'preserved directory in target: {name}'
+        for name in files:
+            lowered = name.lower()
+            stem = lowered
+            while '.' in stem:
+                stem = stem.rsplit('.', 1)[0]
+            if stem in PROTECTED_DIR_NAMES:
+                return f'preserved file in target: {name}'
+            suffix = Path(lowered).suffix
+            if suffix in PROTECTED_SUFFIXES:
+                if suffix == '.rs' and under_codegen_out:
+                    continue  # build-script codegen output, not stashed source
+                return f'preserved file in target: {name}'
+    return None
+
+
 def workspace_inodes(workspace):
     # Includes source/evidence, so a process working anywhere in the workspace
     # vetoes retention, even when container path spellings differ from the host.
@@ -274,13 +341,19 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         raise Refusal('inventory workspaces must be a list')
     indexed = {}
     for row in rows:
-        path = row['path']
-        if path in indexed or type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
+        raw = row['path']
+        # Raw inventory strings can spell one directory two ways
+        # ('/worktrees/a' vs '/worktrees/./a'); canonicalize and reject
+        # duplicate identities so a conflicting live row cannot be ignored.
+        canonical = os.path.normpath(raw)
+        if raw != canonical or canonical in indexed:
+            raise Refusal('ambiguous workspace attribution')
+        if type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
             raise Refusal('ambiguous workspace attribution')
         if not row.get('issue_id') or row.get('status') not in TERMINAL | {
                 'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
             raise Refusal('missing issue attribution/status')
-        indexed[path] = row
+        indexed[canonical] = row
     refs = process_references(proc_root)
     results = []
     for workspace in sorted(worktrees.iterdir()):
@@ -306,6 +379,13 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'])
         if tracked.stdout or ignored.returncode != 0:
             result['reason'] = 'tracked or not ignored'
+            continue
+        # .gitignore proves nothing about provenance: an ignored target can
+        # still hold preserved evidence/backups/sources. Only Cargo's own
+        # top-level output entries pass; anything else vetoes eligibility.
+        veto = preservation_veto(target)
+        if veto is not None:
+            result['reason'] = veto
             continue
         nodes = workspace_inodes(workspace)
         if any(within(path, workspace) or (device, inode) in nodes for path, device, inode in refs):

@@ -135,11 +135,16 @@ each and block on tiny fixture markers. It proves two isolated invocations run
 simultaneously in different slots, a third is refused, whole-slot allocated bytes
 stay below the fixture budgets, oversized target **and scratch** writers are
 stopped, and signals leave a crash sentinel. It also tests inherited external
-Cargo/temp overrides, real `tempfile` placement, unchanged parent environment,
-missing/symlink scratch refusal, retained-scratch admission limits, missing
-scratch-coverage attestation, and preservation of the three external path fixtures. Retention tests
+Cargo/temp/**repository-scratch** overrides
+(`PAPERCLIP_RUN_SCRATCH_DIR`/`PAPERCLIP_SCRATCH_DIR`, which `mac.rs` tests
+prefer over `temp_dir`), real `tempfile` placement, unchanged parent
+environment, repeated signals during shutdown, missing/symlink scratch refusal,
+retained-scratch admission limits, missing scratch-coverage attestation, and
+preservation of the three external path fixtures. Retention tests
 include an **actual Linux child process with an open FD and mmap**, plus container
-path aliases checked by device/inode identity. All fixtures live in the run scratch
+path aliases checked by device/inode identity, build-output-only preservation
+vetoes for material stashed inside ignored targets, and refusal of noncanonical
+or aliased inventory rows. All fixtures live in the run scratch
 folder when `PAPERCLIP_RUN_SCRATCH_DIR` is set. No Rust build, multi-GiB fixture,
 network, Discord or production/staging store is required. These tests do **not**
 measure real Rust peak size or prove a production quota. The Operator must record
@@ -195,8 +200,17 @@ python3 scripts/cargo_cache.py audit \
 
 Output is JSON with `audit_only: true`; **the tool never deletes anything**.
 An eligible candidate needs terminal issue attribution, no live run/reference,
-zero tracked target files, a Git-ignored target, no symlink, and no actual process
-reference anywhere in its workspace (source/evidence included). A complete control-
+zero tracked target files, a Git-ignored target, no symlink, no actual process
+reference anywhere in its workspace (source/evidence included), and
+**build-output-only target contents**: only Cargo's own top-level entries
+(`debug`, `release`, `doc`, `package`, `tmp`, `.rustc_info.json`, `.cargo-lock`,
+`CACHEDIR.TAG`), with nested build-script codegen (`debug`/`release`
+`build/*/out/*.rs`) expected. A `.gitignore` entry
+proves nothing about provenance, so preserved evidence/backups/archives/sources
+or any other foreign entry inside `target/` vetoes eligibility (fail closed).
+Inventory paths must be canonical and unique: noncanonical spellings
+(`/worktrees/./a`) or duplicate identities with conflicting rows refuse the whole
+audit. A complete control-
 plane snapshot and a proc scan are still not atomic with future dispatch. Therefore
 an audit receipt is not deletion authority. For any approved deletion, the Operator
 must hold TWO build/dispatch admission, re-export and re-audit immediately before

@@ -154,15 +154,20 @@ class CacheTests(unittest.TestCase):
         external.mkdir()
         overrides = {key: str(external) for key in (
             'CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR',
-            'TMPDIR', 'TMP', 'TEMP')}
+            'TMPDIR', 'TMP', 'TEMP',
+            'PAPERCLIP_RUN_SCRATCH_DIR', 'PAPERCLIP_SCRATCH_DIR')}
         self.fake.write_text('#!' + sys.executable + '\n'
                              'import os,pathlib,tempfile\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
+                             'scratch=target.parent/"scratch"\n'
                              'assert os.environ["CARGO_BUILD_TARGET_DIR"] == str(target)\n'
                              'assert os.environ["CARGO_BUILD_BUILD_DIR"] == str(target)\n'
                              'assert os.environ["TMPDIR"] == os.environ["TMP"] == os.environ["TEMP"]\n'
+                             'assert os.environ["TMPDIR"] == str(scratch)\n'
+                             'assert os.environ["PAPERCLIP_RUN_SCRATCH_DIR"] == str(scratch)\n'
+                             'assert os.environ["PAPERCLIP_SCRATCH_DIR"] == str(scratch)\n'
                              'with tempfile.NamedTemporaryFile() as f:\n'
-                             ' assert pathlib.Path(f.name).parent == target.parent/"scratch"\n'
+                             ' assert pathlib.Path(f.name).parent == scratch\n'
                              ' f.write(b"x"*4096)\n')
         with patch.dict(os.environ, overrides):
             self.assertEqual(cache.run_cargo(self.pool, ['check'], cargo=str(self.fake)), 0)
@@ -205,6 +210,27 @@ class CacheTests(unittest.TestCase):
         self.wait_ready(1)
         child.terminate()
         _, error = child.communicate(timeout=5)
+        self.assertNotEqual(child.returncode, 0)
+        self.assertIn(b'interrupted by signal', error)
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_repeated_signal_during_shutdown_still_kills_group(self):
+        # A fake Cargo that ignores SIGTERM, with the driver sent a second
+        # SIGTERM during the wait: shutdown must still SIGKILL the group and
+        # retain the crash sentinel instead of raising out of cleanup.
+        self.fake.write_text('#!' + sys.executable + '\n'
+                             'import os,signal,time,pathlib\n'
+                             'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                             'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
+                             'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
+                             '(target/"ready").write_text("ready")\n'
+                             'while not (target/"release").exists(): time.sleep(.01)\n')
+        child = self.start_fake()
+        self.wait_ready(1)
+        child.terminate()
+        time.sleep(.2)
+        child.terminate()  # second signal lands during cleanup
+        _, error = child.communicate(timeout=10)
         self.assertNotEqual(child.returncode, 0)
         self.assertIn(b'interrupted by signal', error)
         self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
@@ -273,8 +299,8 @@ class RetentionTests(unittest.TestCase):
         subprocess.run(['git', 'init', '-q', str(self.workspace)], check=True)
         (self.workspace / '.gitignore').write_text('/target/\n')
         self.target = self.workspace / 'target'
-        self.target.mkdir()
-        (self.target / 'fixture').write_bytes(b'x' * 4096)
+        (self.target / 'debug').mkdir(parents=True)
+        (self.target / 'debug' / 'fixture').write_bytes(b'x' * 4096)
         (self.workspace / 'evidence.md').write_text('preserve me')
         self.proc = self.root / 'proc'
         self.proc.mkdir()
@@ -304,8 +330,24 @@ class RetentionTests(unittest.TestCase):
         receipt = self.audit()
         self.assertTrue(receipt['audit_only'])
         self.assertTrue(receipt['candidates'][0]['eligible'])
-        self.assertTrue((self.target / 'fixture').exists())
+        self.assertTrue((self.target / 'debug' / 'fixture').exists())
         self.assertEqual((self.workspace / 'evidence.md').read_text(), 'preserve me')
+
+    def test_preserved_material_inside_ignored_target_vetoes_eligibility(self):
+        # .gitignore proves nothing about provenance: evidence, sources and
+        # backups stashed inside target/ must veto retention, fail closed.
+        (self.target / 'evidence').mkdir()
+        (self.target / 'evidence' / 'incident.md').write_bytes(b'x' * 64)
+        self.assertIn('preserved', self.reason())
+        (self.target / 'evidence' / 'incident.md').unlink()
+        (self.target / 'evidence').rmdir()
+        (self.target / 'debug' / 'stashed-source.rs').write_bytes(b'x' * 64)
+        self.assertIn('preserved', self.reason())
+        (self.target / 'debug' / 'stashed-source.rs').unlink()
+        (self.target / 'incident-report.md').write_bytes(b'x' * 64)
+        self.assertIn('preserved', self.reason())
+        (self.target / 'incident-report.md').unlink()
+        self.assertTrue(self.audit()['candidates'][0]['eligible'])
 
     def test_live_runs_and_referenced_terminal_workspaces_preserved(self):
         for key in ('live_run', 'referenced'):
@@ -326,8 +368,21 @@ class RetentionTests(unittest.TestCase):
         self.inventory['workspaces'] = []
         self.assertEqual(self.reason(), 'unattributed')
 
+    def test_noncanonical_and_aliased_inventory_rows_refused(self):
+        # '/worktrees/./a' spells the same directory as '/worktrees/a'; raw
+        # noncanonical paths are refused outright, as are duplicate canonical
+        # identities with conflicting live/reference rows.
+        alias = str(self.workspace) + '/.'
+        self.inventory['workspaces'] = [self.row | {'path': alias}]
+        with self.assertRaisesRegex(cache.Refusal, 'ambiguous'):
+            self.audit()
+        live = self.row | {'live_run': True, 'referenced': True}
+        self.inventory['workspaces'] = [self.row, live]
+        with self.assertRaisesRegex(cache.Refusal, 'ambiguous'):
+            self.audit()
+
     def test_tracked_target_preserved(self):
-        subprocess.run(['git', '-C', str(self.workspace), 'add', '-f', 'target/fixture'], check=True)
+        subprocess.run(['git', '-C', str(self.workspace), 'add', '-f', 'target/debug/fixture'], check=True)
         self.assertEqual(self.reason(), 'tracked or not ignored')
 
     def test_unignored_target_preserved(self):
@@ -342,10 +397,10 @@ class RetentionTests(unittest.TestCase):
 
     def test_open_fd_and_mmap_veto_retention(self):
         pid = self.fake_pid()
-        (pid / 'fd' / '7').symlink_to(self.target / 'fixture')
+        (pid / 'fd' / '7').symlink_to(self.target / 'debug' / 'fixture')
         self.assertIn('actual process', self.reason())
         (pid / 'fd' / '7').unlink()
-        info = (self.target / 'fixture').stat()
+        info = (self.target / 'debug' / 'fixture').stat()
         # Container path differs from host; dev/inode identity must still veto.
         (pid / 'maps').write_text(f'100-200 r--p 00000000 '
                                  f'{os.major(info.st_dev):x}:{os.minor(info.st_dev):x} '
@@ -358,7 +413,7 @@ class RetentionTests(unittest.TestCase):
                                   'f=open(sys.argv[1], "rb"); '
                                   'm=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); '
                                   'print("ready",flush=True); time.sleep(30)',
-                                  str(self.target / 'fixture')], cwd=self.root,
+                                  str(self.target / 'debug' / 'fixture')], cwd=self.root,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         def finish():
@@ -384,7 +439,8 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(cache.process_references(self.proc), [])
 
     def test_symlink_target_preserved(self):
-        (self.target / 'fixture').unlink()
+        (self.target / 'debug' / 'fixture').unlink()
+        (self.target / 'debug').rmdir()
         self.target.rmdir()
         self.target.symlink_to(self.root)
         self.assertEqual(self.reason(), 'symlink')
