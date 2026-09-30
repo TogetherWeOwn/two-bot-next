@@ -14,6 +14,8 @@ struct Corpus {
     version: u32,
     legacy_revision: String,
     sources: HashMap<String, Vec<u32>>,
+    expanded_checks: usize,
+    expanded_site_multiplicities: HashMap<String, HashMap<u32, u32>>,
     cases: Vec<Case>,
 }
 
@@ -40,6 +42,12 @@ enum Check {
     Config {
         enabled: bool,
         dry_run: bool,
+    },
+    ConfigError {
+        contains: String,
+    },
+    Policy {
+        expected: serde_json::Value,
     },
     Sanction {
         count: u64,
@@ -105,8 +113,37 @@ fn legacy_automod_core_decisions() {
     let mut executed = 0;
     let mut deferred = 0;
     for case in &corpus.cases {
+        if let Check::ConfigError { contains } = &case.check {
+            let error = AutomodConfig::from_map(&case.env).expect_err(&case.id);
+            assert!(error.to_string().contains(contains), "{}: {error}", case.id);
+            executed += 1;
+            continue;
+        }
         let config = AutomodConfig::from_map(&case.env).expect(&case.id);
         match &case.check {
+            Check::ConfigError { .. } => unreachable!("handled above"),
+            Check::Policy { expected } => {
+                let actual = serde_json::json!({
+                    "bad_words": config.policy.bad_words,
+                    "blocked_attachment_extensions": config.policy.blocked_attachment_extensions,
+                    "allowed_domains": config.policy.allowed_domains,
+                    "repeated_message_count": config.policy.repeated_message_count,
+                    "repeated_message_window_seconds": config.policy.repeated_message_window_seconds,
+                    "mention_limit": config.policy.mention_limit,
+                    "sanctions": config.policy.sanctions.iter().map(|s| serde_json::json!({
+                        "violations": s.violations,
+                        "action": s.action.as_str(),
+                        "timeout_seconds": s.timeout_seconds,
+                    })).collect::<Vec<_>>(),
+                });
+                let fields = expected
+                    .as_object()
+                    .expect("policy expectation is an object");
+                assert!(!fields.is_empty(), "{}: empty policy expectation", case.id);
+                for (field, value) in fields {
+                    assert_eq!(&actual[field], value, "{}: {field}", case.id);
+                }
+            }
             Check::Match { messages } => {
                 assert!(!messages.is_empty(), "{}: empty sequence", case.id);
                 let mut repeats = RepeatTracker::default();
@@ -217,11 +254,29 @@ fn every_legacy_assertion_is_mapped_once_or_more() {
         .legacy_revision
         .bytes()
         .all(|b| b.is_ascii_hexdigit()));
-    let expected: HashSet<String> = corpus
-        .sources
-        .iter()
-        .flat_map(|(file, lines)| lines.iter().map(move |line| format!("{file}:{line}")))
-        .collect();
+    let mut expected = HashSet::new();
+    for (file, lines) in &corpus.sources {
+        for line in lines {
+            let count = corpus
+                .expanded_site_multiplicities
+                .get(file)
+                .and_then(|counts| counts.get(line))
+                .copied()
+                .unwrap_or(1);
+            assert!(count > 0, "{file}:{line}: zero multiplicity");
+            for iteration in 1..=count {
+                let reference = if count == 1 {
+                    format!("{file}:{line}")
+                } else {
+                    format!("{file}:{line}#{iteration}")
+                };
+                assert!(expected.insert(reference), "duplicate source assertion");
+            }
+        }
+    }
+    assert_eq!(corpus.sources.values().map(Vec::len).sum::<usize>(), 123);
+    assert_eq!(corpus.expanded_checks, 212);
+    assert_eq!(expected.len(), corpus.expanded_checks);
     let mut mapped = HashSet::new();
     let mut ids = HashSet::new();
     for case in &corpus.cases {
@@ -235,6 +290,16 @@ fn every_legacy_assertion_is_mapped_once_or_more() {
                 case.id
             );
             mapped.insert(assertion.clone());
+        }
+        if let Check::Match { messages } = &case.check {
+            if !case.assertions.is_empty() {
+                assert_eq!(
+                    messages.len(),
+                    case.assertions.len(),
+                    "{}: assertion/row count",
+                    case.id
+                );
+            }
         }
         if let Check::Deferred {
             issue,
@@ -253,6 +318,18 @@ fn every_legacy_assertion_is_mapped_once_or_more() {
                 "{}: missing legacy outcome",
                 case.id
             );
+            if !case.assertions.is_empty() {
+                let checks = legacy_expected["checks"]
+                    .as_object()
+                    .expect("deferred checks");
+                let references: HashSet<_> = case.assertions.iter().map(String::as_str).collect();
+                assert_eq!(
+                    checks.keys().map(String::as_str).collect::<HashSet<_>>(),
+                    references,
+                    "{}: every deferred assertion needs its own expected outcome",
+                    case.id
+                );
+            }
         }
     }
     let missing: Vec<_> = expected.difference(&mapped).collect();
