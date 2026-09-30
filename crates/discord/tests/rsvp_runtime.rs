@@ -213,7 +213,6 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
             event(1),
             ScriptedResponse::status(200),
             ScriptedResponse::status(204),
-            event(1),
             ScriptedResponse::status(200),
         ],
         ScriptedResponse::status(500),
@@ -270,8 +269,10 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         );
     }
     let requests = mock.requests();
-    assert_eq!(requests.len(), 15);
-    for chunk in requests.chunks(3) {
+    assert_eq!(requests.len(), 14);
+    assert_eq!(requests[12].method, "POST");
+    assert_eq!(requests[13].method, "PATCH");
+    for chunk in requests[..12].chunks(3) {
         let ack: Value = serde_json::from_slice(&chunk[0].body).unwrap();
         assert_eq!(ack["type"], 5);
         assert_eq!(ack["data"]["flags"], 64);
@@ -291,39 +292,100 @@ async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
         return;
     };
     for (lookup, reply) in [
-        (ScriptedResponse::status(404), "Scheduled event not found."),
-        (event(4), "Scheduled event is cancelled."),
+        (
+            ScriptedResponse::status(404),
+            "No scheduled event with that id exists in this server.",
+        ),
+        (event(4), "That scheduled event is cancelled."),
         (
             ScriptedResponse::json(200, json!({"id": EVENT, "guild_id": "999", "status": 1})),
-            "Unable to validate scheduled event.",
+            "Discord returned an invalid scheduled event status.",
         ),
-        (event(9), "Unable to validate scheduled event."),
-        // The shared executor deliberately collapses forbidden and missing reads.
-        (ScriptedResponse::status(403), "Scheduled event not found."),
+        (
+            event(9),
+            "Discord returned an invalid scheduled event status.",
+        ),
+        (
+            ScriptedResponse {
+                body: b"invalid-json".to_vec(),
+                ..ScriptedResponse::status(200)
+            },
+            "Discord returned an invalid scheduled event status.",
+        ),
+        (
+            ScriptedResponse::status(403),
+            "Discord request failed: HTTP 403",
+        ),
+        (
+            ScriptedResponse::status(429),
+            "Discord request failed: HTTP 429",
+        ),
+        (
+            ScriptedResponse::status(503),
+            "Discord request failed: HTTP 503",
+        ),
     ] {
-        for interaction in [
-            rsvp(200, "going"),
-            slash(
-                201,
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::status(204),
+                lookup,
+                ScriptedResponse::status(200),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        run(&pool, &mock, &rsvp(200, "going")).await;
+        assert_reply(&mock, reply, true);
+        assert_eq!(mock.requests().len(), 3);
+        assert_eq!(counts(&pool).await, (0, 0, 0));
+        mock.shutdown().await;
+    }
+    cleanup(pool, schema).await;
+}
+
+#[tokio::test]
+async fn totals_remain_readable_without_live_event_access() {
+    let Some((pool, schema)) = pool().await else {
+        return;
+    };
+    two_bot_core::put_rsvp(
+        &pool,
+        &two_bot_core::RsvpRecord {
+            guild_id: GUILD.into(),
+            event_id: EVENT.into(),
+            user_id: USER.into(),
+            status: two_bot_core::RsvpStatus::Going,
+            responded_at: two_bot_core::now_iso(),
+        },
+    )
+    .await
+    .unwrap();
+    for unavailable in [
+        ScriptedResponse::status(404),
+        event(4),
+        ScriptedResponse::status(403),
+    ] {
+        let mock = MockRest::start(
+            vec![ScriptedResponse::status(204), ScriptedResponse::status(200)],
+            unavailable,
+        )
+        .await;
+        run(
+            &pool,
+            &mock,
+            &slash(
+                202,
                 "rsvp-attendance",
                 0,
                 json!([{ "name": "event-id", "type": 3, "value": EVENT }]),
             ),
-        ] {
-            let mock = MockRest::start(
-                vec![
-                    ScriptedResponse::status(204),
-                    lookup.clone(),
-                    ScriptedResponse::status(200),
-                ],
-                ScriptedResponse::status(500),
-            )
-            .await;
-            run(&pool, &mock, &interaction).await;
-            assert_reply(&mock, reply, true);
-            assert_eq!(counts(&pool).await, (0, 0, 0));
-            mock.shutdown().await;
-        }
+        )
+        .await;
+        assert_reply(&mock, "Going: 1\nInterested: 0\nDeclined: 0", true);
+        assert_eq!(mock.requests().len(), 2);
+        assert!(mock.requests().iter().all(|r| r.method != "GET"));
+        assert_eq!(counts(&pool).await, (1, 0, 0));
+        mock.shutdown().await;
     }
     cleanup(pool, schema).await;
 }

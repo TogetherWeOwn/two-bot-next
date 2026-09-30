@@ -47,4 +47,4 @@
 
 ### Notes
 
-- Command/component wiring and the Discord REST reads stay on the S4 interaction router and REST executor slices; the outcome enums are the integration surface until they land. Scorecard and probe collection are not enabled by this change.
+- RSVP and host check-in now use the shared S4 router and REST executor; other feature integrations remain follow-up slices. RSVP mutations validate live events with legacy missing/cancelled/error replies, while totals remain readable from persisted rows without Discord event access. Automated scorecard and probe collection are not enabled by this change.

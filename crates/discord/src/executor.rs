@@ -801,6 +801,36 @@ impl ActionExecutor {
         }
     }
 
+    /// Announcement RSVP's single paced lookup: only 404 means absent. Unlike
+    /// the generic legacy REST GET, HTTP failures and malformed JSON must not
+    /// masquerade as a missing event. Never expose transport details in replies.
+    pub async fn get_scheduled_event(
+        &self,
+        guild_id: &str,
+        event_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let guild = snowflake::<GuildMarker>(guild_id).map_err(|_| "Invalid guild id.")?;
+        let event = snowflake::<twilight_model::id::marker::ScheduledEventMarker>(event_id)
+            .map_err(|_| "Invalid scheduled event id.")?;
+        let request = Request::from_route(&Route::GetGuildScheduledEvent {
+            guild_id: guild.get(),
+            scheduled_event_id: event.get(),
+            with_user_count: false,
+        });
+        self.pace(false).await;
+        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&request))
+            .await
+            .map_err(|_| "Unable to validate scheduled event.")?
+            .map_err(|_| "Unable to validate scheduled event.")?;
+        match res.status {
+            404 => Ok(None),
+            200..=299 => serde_json::from_slice(&res.body)
+                .map(Some)
+                .map_err(|_| "Discord returned an invalid scheduled event status.".to_owned()),
+            status => Err(format!("Discord request failed: HTTP {status}")),
+        }
+    }
+
     /// Channel GET with the paced lane (legacy `getEveryoneOverwrite` reads
     /// `permission_overwrites` off the channel).
     pub async fn get_everyone_overwrite(

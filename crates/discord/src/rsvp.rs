@@ -111,54 +111,50 @@ async fn execute(
         HandlerId::Rsvp | HandlerId::RsvpAttendance => {
             let event_id =
                 validate_event_id(string_option("event-id")?).map_err(|e| e.to_string())?;
-            let status = if handler == HandlerId::Rsvp {
-                Some(RsvpStatus::parse(string_option("status")?).map_err(|e| e.to_string())?)
-            } else {
-                None
-            };
+            // Legacy totals read persisted responses even after cancellation or
+            // deletion; only an RSVP mutation requires live-event validation.
+            if handler == HandlerId::RsvpAttendance {
+                let rows = list_rsvps(pool, &guild_id, &event_id)
+                    .await
+                    .map_err(|_| "Unable to read RSVP totals.")?;
+                return Ok(attendance_totals_text(&partition_rsvps(&rows)));
+            }
+            let status = RsvpStatus::parse(string_option("status")?).map_err(|e| e.to_string())?;
             let event = executor
-                .get_json(&format!("/guilds/{guild_id}/scheduled-events/{event_id}"))
-                .await
-                .map_err(|_| "Unable to validate scheduled event.")?
-                .ok_or("Scheduled event not found.")?;
+                .get_scheduled_event(&guild_id, &event_id)
+                .await?
+                .ok_or("No scheduled event with that id exists in this server.")?;
             // A malformed or mismatched response is not evidence of a live event.
             if event["id"].as_str() != Some(&event_id)
                 || event["guild_id"].as_str() != Some(&guild_id)
             {
-                return Err("Unable to validate scheduled event.".to_owned());
+                return Err("Discord returned an invalid scheduled event status.".to_owned());
             }
             match event["status"].as_u64() {
-                Some(4) => return Err("Scheduled event is cancelled.".to_owned()),
+                Some(4) => return Err("That scheduled event is cancelled.".to_owned()),
                 Some(1..=3) => {}
-                _ => return Err("Unable to validate scheduled event.".to_owned()),
+                _ => return Err("Discord returned an invalid scheduled event status.".to_owned()),
             }
-            if let Some(status) = status {
-                let record = RsvpRecord {
-                    guild_id,
-                    event_id,
-                    user_id: interaction
-                        .author_id()
-                        .ok_or("Missing command member.")?
-                        .to_string(),
-                    status,
-                    responded_at: now_iso(),
-                };
-                put_rsvp(pool, &record)
-                    .await
-                    .map_err(|_| "Unable to save RSVP.")?;
-                write_audit(
-                    pool,
-                    &RsvpAudit::for_rsvp(&format!("rsvp:{}", interaction.id), &record),
-                )
+            let record = RsvpRecord {
+                guild_id,
+                event_id,
+                user_id: interaction
+                    .author_id()
+                    .ok_or("Missing command member.")?
+                    .to_string(),
+                status,
+                responded_at: now_iso(),
+            };
+            put_rsvp(pool, &record)
                 .await
-                .map_err(|_| "Unable to audit RSVP.")?;
-                Ok(rsvp_saved_text(status))
-            } else {
-                let rows = list_rsvps(pool, &guild_id, &event_id)
-                    .await
-                    .map_err(|_| "Unable to read RSVP totals.")?;
-                Ok(attendance_totals_text(&partition_rsvps(&rows)))
-            }
+                .map_err(|_| "Unable to save RSVP.")?;
+            write_audit(
+                pool,
+                &RsvpAudit::for_rsvp(&format!("rsvp:{}", interaction.id), &record),
+            )
+            .await
+            .map_err(|_| "Unable to audit RSVP.")?;
+            Ok(rsvp_saved_text(status))
         }
         HandlerId::ScorecardAttendance => {
             require_manage_events(
@@ -217,7 +213,7 @@ async fn execute(
                 },
             )
             .await
-            .map_err(|_| "Unable to record attendance.")?;
+            .map_err(|_| "Attendance was not recorded.")?;
             Ok(if inserted {
                 checkin_recorded_text(&member_id.to_string(), &occurrence)
             } else {
