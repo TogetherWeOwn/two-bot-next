@@ -832,9 +832,27 @@ impl ActionExecutor {
                 "unreadable channel {channel_id}: permission_overwrites is not an array"
             ))
         })?;
-        for entry in overwrites {
-            let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let kind = entry.get("type").and_then(|v| v.as_u64()).unwrap_or(99);
+        for (index, entry) in overwrites.iter().enumerate() {
+            // Every row must carry a readable identity before it can count as
+            // "not @everyone": a malformed row (non-object, missing/non-string
+            // id, missing/non-numeric type) makes the document unreadable, so
+            // refuse rather than treating it as proven-absent and PUTting a
+            // fabricated zero-mask overwrite (finding 3 follow-up).
+            let row = entry.as_object().ok_or_else(|| {
+                DiscordError::Rejected(format!(
+                    "unreadable channel {channel_id}: permission_overwrites[{index}] is not an object"
+                ))
+            })?;
+            let id = row.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                DiscordError::Rejected(format!(
+                    "unreadable channel {channel_id}: permission_overwrites[{index}] has a non-string id"
+                ))
+            })?;
+            let kind = row.get("type").and_then(|v| v.as_u64()).ok_or_else(|| {
+                DiscordError::Rejected(format!(
+                    "unreadable channel {channel_id}: permission_overwrites[{index}] has a non-numeric type"
+                ))
+            })?;
             if id == guild_id && kind == 0 {
                 let mask = |field: &str| {
                     entry

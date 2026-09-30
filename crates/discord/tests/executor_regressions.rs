@@ -241,6 +241,94 @@ async fn non_numeric_overwrite_masks_refuse_without_mutation() {
     mock.shutdown().await;
 }
 
+// Finding 3 follow-up: every overwrite row must carry a readable
+// identity before it can count as "not @everyone". A malformed row is
+// unreadable state — refuse with the one read on the wire, never PUT a
+// fabricated zero-mask overwrite.
+#[tokio::test]
+async fn malformed_overwrite_rows_refuse_without_mutation() {
+    let cases: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "missing type",
+            serde_json::json!([{"id": GUILD, "allow": "0", "deny": "0"}]),
+        ),
+        (
+            "string type",
+            serde_json::json!([{"id": GUILD, "type": "role", "allow": "0", "deny": "0"}]),
+        ),
+        (
+            "numeric id",
+            serde_json::json!([{"id": 2222, "type": 0, "allow": "0", "deny": "0"}]),
+        ),
+        ("null row", serde_json::json!([null])),
+        (
+            "missing id",
+            serde_json::json!([{"type": 0, "allow": "0", "deny": "0"}]),
+        ),
+    ];
+    for (name, overwrites) in cases {
+        let channel_body = serde_json::json!({
+            "id": CHANNEL,
+            "permission_overwrites": overwrites,
+        });
+        let mock = MockRest::start(
+            vec![ScriptedResponse::json(200, channel_body)],
+            ScriptedResponse::status(204),
+        )
+        .await;
+        let result = executor_for(&mock)
+            .execute_outcome(
+                &context(ModerationAction::Lockdown, None),
+                &ActionOutcome::LockedDown {
+                    channel_id: CHANNEL.to_owned(),
+                },
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "{name} produced {result:?}; {} wire requests",
+            mock.requests().len()
+        );
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "{name}: the read stays on the wire; no mutation follows"
+        );
+        mock.shutdown().await;
+    }
+}
+
+// Finding 3 follow-up (control): valid rows for other targets still count
+// as proven-absent and lock down — only *malformed* rows refuse.
+#[tokio::test]
+async fn valid_non_target_rows_still_lock_down() {
+    let channel_body = serde_json::json!({
+        "id": CHANNEL,
+        "permission_overwrites": [
+            {"id": "9999", "type": 0, "allow": "0", "deny": "0"},
+            {"id": GUILD, "type": 1, "allow": "0", "deny": "0"},
+        ],
+    });
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, channel_body)],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    executor_for(&mock)
+        .execute_outcome(
+            &context(ModerationAction::Lockdown, None),
+            &ActionOutcome::LockedDown {
+                channel_id: CHANNEL.to_owned(),
+            },
+        )
+        .await
+        .expect("valid non-target rows are proven-absent and lock down");
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 2, "read then PUT");
+    assert_eq!(reqs[1].method, "PUT");
+    mock.shutdown().await;
+}
+
 // Finding 3 (control): a proven-absent @everyone entry still writes the
 // lockdown masks — only *unreadable* state refuses.
 #[tokio::test]
