@@ -5,7 +5,7 @@ use two_bot_core::member_moderation::{ClaimState, MemMemberStore, MemberModerati
 const NOW: &str = "2023-11-14T22:13:20.000Z";
 
 #[tokio::test]
-async fn sweep_does_not_recover_a_live_staged_ban() {
+async fn sweep_does_not_recover_a_live_prepared_ban() {
     let store = MemMemberStore::new();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -21,19 +21,57 @@ async fn sweep_does_not_recover_a_live_staged_ban() {
                     .expect("stage");
                 ban_entered.notify_one();
                 ban_release.notified().await;
-                // A live Discord call definitively rejected the ban.
                 ban_store
-                    .cancel_staged_unban("live", NOW)
+                    .reject_ban("guild", "user", "live", NOW)
                     .await
-                    .expect("cancel");
+                    .expect("reject");
+            })
+            .await;
+    });
+    entered.notified().await;
+    assert!(store
+        .claim_due_unbans("guild", NOW, 25)
+        .await
+        .expect("prepared excluded")
+        .is_empty());
+    release.notify_one();
+    ban.await.expect("ban task");
+    assert!(store
+        .claim_due_unbans("guild", NOW, 25)
+        .await
+        .expect("rejected excluded")
+        .is_empty());
+    assert_eq!(store.unban_state("live").as_deref(), Some("cancelled"));
+}
+
+#[tokio::test]
+async fn accepted_recovery_waits_on_owning_member_queue() {
+    let store = MemMemberStore::new();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let ban_store = store.clone();
+    let ban_entered = entered.clone();
+    let ban_release = release.clone();
+    let ban = tokio::spawn(async move {
+        ban_store
+            .serialize_member("guild", "user", || async {
+                ban_store
+                    .stage_unban("guild", "user", NOW, "expiry", "accepted", NOW)
+                    .await
+                    .expect("stage");
+                ban_store
+                    .confirm_ban("guild", "user", "accepted", NOW)
+                    .await
+                    .expect("acceptance");
+                ban_entered.notify_one();
+                ban_release.notified().await;
             })
             .await;
     });
     entered.notified().await;
     let sweep_store = store.clone();
-    let mut sweep = tokio::spawn(async move { sweep_store.claim_due_unbans(NOW, 25).await });
-    // Without the member queue, the sweep would immediately activate the
-    // staged row and return a job while the ban was still awaiting Discord.
+    let mut sweep =
+        tokio::spawn(async move { sweep_store.claim_due_unbans("guild", NOW, 25).await });
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(20), &mut sweep)
             .await
@@ -41,12 +79,11 @@ async fn sweep_does_not_recover_a_live_staged_ban() {
     );
     release.notify_one();
     ban.await.expect("ban task");
-    assert!(sweep.await.expect("sweep task").expect("claim").is_empty());
-    assert_eq!(store.unban_state("live").as_deref(), Some("cancelled"));
+    assert_eq!(sweep.await.expect("sweep task").expect("recovery").len(), 1);
 }
 
 #[tokio::test]
-async fn newer_expiry_supersedes_older_crash_staged_jobs() {
+async fn newer_expiry_supersedes_older_accepted_crash_staged_jobs() {
     let store = MemMemberStore::new();
     let later = "2023-11-14T23:13:20.000Z";
     for user in ["activated", "recovered"] {
@@ -55,18 +92,19 @@ async fn newer_expiry_supersedes_older_crash_staged_jobs() {
         store
             .stage_unban("guild", user, NOW, "old expiry", &old, NOW)
             .await
-            .expect("old crash");
+            .expect("old stage");
         store
-            .stage_unban(
-                "guild",
-                user,
-                later,
-                "new expiry",
-                &new,
-                "2023-11-14T22:13:21.000Z",
-            )
+            .confirm_ban("guild", user, &old, NOW)
+            .await
+            .expect("old accepted");
+        store
+            .stage_unban("guild", user, later, "extension", &new, NOW)
             .await
             .expect("new stage");
+        store
+            .confirm_ban("guild", user, &new, NOW)
+            .await
+            .expect("new accepted");
         if user == "activated" {
             store
                 .activate_staged_unban("guild", user, &new, NOW)
@@ -75,7 +113,7 @@ async fn newer_expiry_supersedes_older_crash_staged_jobs() {
         }
     }
     assert!(store
-        .claim_due_unbans(NOW, 25)
+        .claim_due_unbans("guild", NOW, 25)
         .await
         .expect("no early expiry")
         .is_empty());
@@ -88,7 +126,7 @@ async fn newer_expiry_supersedes_older_crash_staged_jobs() {
         Some("superseded")
     );
     let due = store
-        .claim_due_unbans(later, 25)
+        .claim_due_unbans("guild", later, 25)
         .await
         .expect("later expiry");
     assert_eq!(due.len(), 2);
@@ -108,10 +146,14 @@ async fn claims_and_retry_tokens_have_single_owners() {
         .stage_unban("guild", "user", NOW, "expiry", "request", NOW)
         .await
         .expect("stage");
-    let job = store
-        .claim_due_unbans(NOW, 25)
+    store
+        .confirm_ban("guild", "user", "request", NOW)
         .await
-        .expect("crash recovery")
+        .expect("acceptance");
+    let job = store
+        .claim_due_unbans("guild", NOW, 25)
+        .await
+        .expect("recovery")
         .pop()
         .expect("job");
     store
@@ -119,11 +161,11 @@ async fn claims_and_retry_tokens_have_single_owners() {
         .await
         .expect("safe retry");
     let next = store
-        .claim_due_unbans(NOW, 25)
+        .claim_due_unbans("guild", NOW, 25)
         .await
         .expect("new claim")
         .pop()
-        .expect("new job");
+        .expect("job");
     assert_ne!(job.claim_token, next.claim_token);
     assert!(!store
         .owns_unban_claim(&job.request_id, &job.claim_token)
@@ -142,7 +184,7 @@ async fn claims_and_retry_tokens_have_single_owners() {
         .await
         .expect("new owner preserved"));
     assert!(store
-        .claim_due_unbans("2024-11-14T22:13:20.000Z", 25)
+        .claim_due_unbans("guild", "2024-11-14T22:13:20.000Z", 25)
         .await
         .expect("no timed takeover")
         .is_empty());

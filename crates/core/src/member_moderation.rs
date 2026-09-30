@@ -20,13 +20,14 @@
 //! - Discord calls: `src/moderation/discord.ts` (`ModerationDiscordClient`
 //!   member methods; default 5 s abort).
 //!
-//! Ordering guarantees ported verbatim:
-//! - the idempotency claim lands BEFORE any Discord mutation; a retry replays
-//!   the stored outcome or gets `in_progress`, never a second mutation.
-//! - tempban stages the unban row BEFORE the ban, activates it after: a crash
-//!   after the ban still leaves a job that fires, never a permanent ban the
-//!   moderator asked to be temporary.
-//! - sweep claims are atomic: two overlapping sweeps cannot process one job.
+//! Ordering guarantees:
+//! - idempotency claims land BEFORE Discord; retries replay or refuse.
+//! - both ban kinds persist a prepared generation BEFORE Discord. Accepted
+//!   generations fence older expiries; definite refusals restore eligibility.
+//! - only durable acceptance permits staged recovery. Prepared/uncertain
+//!   bans require reconciliation, never a guessed unban of an existing ban.
+//! - sweeps claim atomically, one job immediately before processing, and only
+//!   within their owning guild. Running claims have no timer takeover.
 //!
 //! Staging gate: serving requires [`crate::moderation::ModerationGates`] enabled
 //! (`TWO_MODERATION=1`); this module carries no gate check itself — the
@@ -349,8 +350,28 @@ pub trait MemberModerationStore: Send + Sync {
         created_at: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Persist a `staged` unban job BEFORE the Discord ban (legacy
-    /// `stageUnban`).
+    /// Persist a prepared permanent-ban intent BEFORE Discord, fencing any
+    /// older expiry until this intent is explicitly confirmed or rejected.
+    fn stage_ban(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        request_id: &str,
+        created_at: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Record observed Discord acceptance and supersede strictly older
+    /// schedules atomically. Order is persisted, not derived from wall time.
+    fn confirm_ban(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        request_id: &str,
+        completed_at: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Persist a prepared intent and `staged` expiry together BEFORE Discord.
+    /// A prepared intent is uncertain, never automatically activated.
     fn stage_unban(
         &self,
         guild_id: &str,
@@ -361,10 +382,8 @@ pub trait MemberModerationStore: Send + Sync {
         created_at: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Flip this request's `staged` row to `pending`, superseding any older
-    /// pending/running job for the member (legacy `activateStagedUnban`:
-    /// re-ban or extension moves the one job instead of forking a second).
-    /// Errors when the staged row is lost.
+    /// Activate only a confirmed accepted expiry which is still the newest
+    /// non-rejected ban intent. Errors when that ownership or staging is lost.
     fn activate_staged_unban(
         &self,
         guild_id: &str,
@@ -373,24 +392,24 @@ pub trait MemberModerationStore: Send + Sync {
         completed_at: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Cancel this request's `staged` row after a provably mutation-free ban
-    /// failure (legacy `cancelStagedUnban`).
-    fn cancel_staged_unban(
+    /// Atomically reject a prepared intent and cancel its staged expiry.
+    /// If cleanup fails, the prepared fence survives: no guessed recovery.
+    fn reject_ban(
         &self,
+        guild_id: &str,
+        user_id: &str,
         request_id: &str,
         completed_at: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Atomically move due `pending` jobs to `running`, returning exactly
-    /// the rows this caller won (legacy `claimDueUnbans`: the
-    /// `UPDATE … RETURNING` is the claim, so two overlapping sweeps cannot
-    /// process one job). Staged rows left by a crash after the ban are
-    /// activated first — the durable schedule existed before the mutation,
-    /// so activation is safe. `running` rows are never reclaimed by age: an
-    /// unban that timed out may have succeeded and a later ban may now be
-    /// in force.
+    /// Claim due accepted expiries in THIS guild only. Recover only staged
+    /// rows with durable acceptance and current generation ownership.
+    /// Dispatchers request one job at a time so a cancelled first request
+    /// cannot strand a batch of never-dispatched expiries. Running rows are
+    /// never reclaimed by age; prepared bans require reconciliation.
     fn claim_due_unbans(
         &self,
+        guild_id: &str,
         now: &str,
         limit: i64,
     ) -> impl Future<Output = Result<Vec<UnbanJob>, StoreError>> + Send;
@@ -619,67 +638,72 @@ where
     /// The durable row is the owner and the recovery record: once a request
     /// has reached Discord the row is never deleted or taken over on a
     /// timer, so a retry either replays a stored result or gets
-    /// [`MemberError::InFlight`]. Tempbans serialize per member.
-    pub async fn execute(&self, exec: &MemberExecution) -> Result<MemberResult, MemberError> {
-        let validated = self.validate(exec)?;
-        let hash = request_hash(
-            validated.action,
-            &exec.guild_id,
-            exec.target.as_ref().map(|t| t.user_id.as_str()),
-            &validated.reason,
-            validated.duration_seconds,
-        );
-        if validated.action == ModerationAction::TempBan {
-            let target_id = exec
-                .target
-                .as_ref()
-                .map(|t| t.user_id.as_str())
-                .unwrap_or("");
-            self.store
-                .serialize_member(&exec.guild_id, target_id, || {
-                    self.execute_claimed(exec, &validated, &hash)
-                })
-                .await
-        } else {
-            self.execute_claimed(exec, &validated, &hash).await
+    /// [`MemberError::InFlight`]. Both ban kinds serialize per member.
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "explicit Send avoids opaque callback lifetime inference at spawn sites (rust-lang/rust#100013)"
+    )]
+    pub fn execute<'a>(
+        &'a self,
+        exec: &'a MemberExecution,
+    ) -> impl Future<Output = Result<MemberResult, MemberError>> + Send + 'a {
+        async move {
+            let validated = self.validate(exec)?;
+            let hash = request_hash(
+                validated.action,
+                &exec.guild_id,
+                exec.target.as_ref().map(|t| t.user_id.as_str()),
+                &validated.reason,
+                validated.duration_seconds,
+            );
+            if matches!(
+                validated.action,
+                ModerationAction::Ban | ModerationAction::TempBan
+            ) {
+                let target_id = exec
+                    .target
+                    .as_ref()
+                    .map(|t| t.user_id.as_str())
+                    .unwrap_or("");
+                self.store
+                    .serialize_member(&exec.guild_id, target_id, || {
+                        self.execute_claimed(exec, &validated, &hash)
+                    })
+                    .await
+            } else {
+                self.execute_claimed(exec, &validated, &hash).await
+            }
         }
     }
 
-    /// Fire every due scheduled unban. Rows are claimed atomically before
-    /// any Discord call; a safely-failed unban is requeued for the next
-    /// sweep, anything else keeps its `running` claim for an operator to
-    /// reconcile. Returns completed jobs; rethrows the first error after
-    /// attempting the rest (legacy `runDueUnbans`).
-    pub async fn run_due_unbans(&self) -> Result<usize, MemberError> {
-        let now = format_iso_millis((self.now)());
-        let jobs = self
-            .store
-            .claim_due_unbans(&now, UNBAN_SWEEP_CLAIM_LIMIT)
-            .await?;
-        let mut completed = 0usize;
-        let mut first_error: Option<MemberError> = None;
-        for job in jobs {
-            match self.run_unban_job(&job).await {
-                Ok(true) => completed += 1,
-                Ok(false) => {}
-                Err(err) => {
-                    if matches!(&err, MemberError::Discord(d) if d.is_safe_pre_mutation()) {
-                        if let Err(store_error) = self
-                            .store
-                            .requeue_unban(&job.request_id, &job.claim_token)
-                            .await
-                        {
-                            first_error.get_or_insert(MemberError::Store(store_error));
-                        }
-                    }
-                    first_error.get_or_insert(err);
+    /// Fire at most 25 due expiries for the owning guild. Claim immediately
+    /// before each dispatch, not a whole batch before the first await. Stop
+    /// on error: a definite rejection is requeued for the NEXT sweep, never
+    /// retried automatically in this one. Uncertain running claims need
+    /// reconciliation; other undispatched jobs stay pending.
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "explicit Send preserves spawnability through the generic queue callback"
+    )]
+    pub fn run_due_unbans<'a>(
+        &'a self,
+        guild_id: &'a str,
+    ) -> impl Future<Output = Result<usize, MemberError>> + Send + 'a {
+        async move {
+            let now = format_iso_millis((self.now)());
+            let mut completed = 0usize;
+            for _ in 0..UNBAN_SWEEP_CLAIM_LIMIT {
+                let Some(job) = self.store.claim_due_unbans(guild_id, &now, 1).await?.pop() else {
+                    break;
+                };
+                match self.run_unban_job(&job).await {
+                    Ok(true) => completed += 1,
+                    Ok(false) => {}
+                    Err(err) => return Err(err),
                 }
             }
+            Ok(completed)
         }
-        if let Some(err) = first_error {
-            return Err(err);
-        }
-        Ok(completed)
     }
 
     // -- internals ----------------------------------------------------------
@@ -784,8 +808,15 @@ where
             .unwrap_or("");
         match validated.action {
             ModerationAction::Ban => {
-                self.discord
-                    .ban(&exec.guild_id, target_id, &validated.reason)
+                self.store
+                    .stage_ban(
+                        &exec.guild_id,
+                        target_id,
+                        &exec.request_id,
+                        &format_iso_millis((self.now)()),
+                    )
+                    .await?;
+                self.dispatch_ban(exec, target_id, &validated.reason)
                     .await?;
                 Ok(MemberOutcome::Banned)
             }
@@ -793,31 +824,23 @@ where
                 let seconds = validated.duration_seconds.unwrap_or(60);
                 let execute_at =
                     format_iso_millis((self.now)().saturating_add(seconds as i64 * 1000));
-                // Stage BEFORE the ban; not active until Discord accepts it.
-                // A crash after that point is recovered by activating staged
-                // rows at the next sweep.
+                // Prepared is not evidence of acceptance. Persist acceptance
+                // separately before activation; only confirmed rows recover.
                 self.store
                     .stage_unban(
                         &exec.guild_id,
                         target_id,
                         &execute_at,
-                        &format!("Temporary ban expired: {}", validated.reason),
+                        &format!("Temporary ban expired: {}", validated.reason)
+                            .chars()
+                            .take(512)
+                            .collect::<String>(),
                         &exec.request_id,
                         &format_iso_millis((self.now)()),
                     )
                     .await?;
-                if let Err(err) = self
-                    .discord
-                    .ban(&exec.guild_id, target_id, &validated.reason)
-                    .await
-                {
-                    if err.is_safe_pre_mutation() {
-                        self.store
-                            .cancel_staged_unban(&exec.request_id, &format_iso_millis((self.now)()))
-                            .await?;
-                    }
-                    return Err(MemberError::Discord(err));
-                }
+                self.dispatch_ban(exec, target_id, &validated.reason)
+                    .await?;
                 self.store
                     .activate_staged_unban(
                         &exec.guild_id,
@@ -863,6 +886,36 @@ where
         }
     }
 
+    async fn dispatch_ban(
+        &self,
+        exec: &MemberExecution,
+        target: &str,
+        reason: &str,
+    ) -> Result<(), MemberError> {
+        if let Err(err) = self.discord.ban(&exec.guild_id, target, reason).await {
+            if err.is_safe_pre_mutation() {
+                self.store
+                    .reject_ban(
+                        &exec.guild_id,
+                        target,
+                        &exec.request_id,
+                        &format_iso_millis((self.now)()),
+                    )
+                    .await?;
+            }
+            return Err(MemberError::Discord(err));
+        }
+        self.store
+            .confirm_ban(
+                &exec.guild_id,
+                target,
+                &exec.request_id,
+                &format_iso_millis((self.now)()),
+            )
+            .await?;
+        Ok(())
+    }
+
     fn audit_row(
         &self,
         exec: &MemberExecution,
@@ -899,10 +952,18 @@ where
                 }
                 // No MAC marker without S5: the plain staged reason is the
                 // audit-log reason (falls back to the pre-MAC behaviour).
-                self.discord
+                if let Err(err) = self
+                    .discord
                     .unban(&job.guild_id, &job.user_id, &job.reason)
                     .await
-                    .map_err(MemberError::Discord)?;
+                {
+                    if err.is_safe_pre_mutation() {
+                        self.store
+                            .requeue_unban(&job.request_id, &job.claim_token)
+                            .await?;
+                    }
+                    return Err(MemberError::Discord(err));
+                }
                 self.store
                     .complete_unban(&job.request_id, &job.claim_token)
                     .await?;
@@ -991,13 +1052,72 @@ enum UnbanState {
     Superseded,
 }
 
+#[derive(Debug, Clone)]
+struct BanRow {
+    guild_id: String,
+    user_id: String,
+    generation: u64,
+    state: BanState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BanState {
+    Prepared,
+    Accepted,
+    Rejected,
+}
+
 #[derive(Debug, Default)]
 struct MemInner {
     idempotency: HashMap<(String, String), IdempotencyRow>,
     audits: Vec<AuditRow>,
     warnings: Vec<(String, String, String, String, String, String)>,
     unbans: HashMap<String, UnbanRow>,
+    bans: HashMap<String, BanRow>,
+    ban_sequence: u64,
     claim_sequence: u64,
+}
+
+impl MemInner {
+    fn stage_ban(&mut self, guild: &str, user: &str, request: &str) -> Result<(), StoreError> {
+        if self.bans.get(request).is_some_and(|row| {
+            row.state != BanState::Rejected || row.guild_id != guild || row.user_id != user
+        }) {
+            return Err(StoreError::new("ban request id is already in use"));
+        }
+        self.ban_sequence += 1;
+        self.bans.insert(
+            request.to_owned(),
+            BanRow {
+                guild_id: guild.to_owned(),
+                user_id: user.to_owned(),
+                generation: self.ban_sequence,
+                state: BanState::Prepared,
+            },
+        );
+        Ok(())
+    }
+
+    fn current_ban(&self, request: &str) -> bool {
+        let Some(row) = self.bans.get(request) else {
+            return false;
+        };
+        row.state != BanState::Rejected
+            && !self.bans.values().any(|other| {
+                other.guild_id == row.guild_id
+                    && other.user_id == row.user_id
+                    && other.state != BanState::Rejected
+                    && other.generation > row.generation
+            })
+    }
+
+    fn accepted_current_ban(&self, request: &str) -> bool {
+        self.current_ban(request)
+            && self
+                .bans
+                .get(request)
+                .is_some_and(|row| row.state == BanState::Accepted)
+    }
 }
 
 /// Local FIFO queues, shared by store clones. Like the legacy service, one
@@ -1184,6 +1304,61 @@ impl MemberModerationStore for MemMemberStore {
         Ok(())
     }
 
+    async fn stage_ban(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        request_id: &str,
+        _created_at: &str,
+    ) -> Result<(), StoreError> {
+        self.lock().stage_ban(guild_id, user_id, request_id)
+    }
+
+    async fn confirm_ban(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        request_id: &str,
+        completed_at: &str,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let intent = inner
+            .bans
+            .get(request_id)
+            .filter(|r| {
+                r.guild_id == guild_id && r.user_id == user_id && r.state == BanState::Prepared
+            })
+            .cloned()
+            .ok_or_else(|| StoreError::new("lost prepared ban"))?;
+        if !inner.current_ban(request_id) {
+            return Err(StoreError::new("ban intent superseded"));
+        }
+        let old_ids: Vec<_> = inner
+            .bans
+            .iter()
+            .filter(|(_, row)| {
+                row.guild_id == guild_id
+                    && row.user_id == user_id
+                    && row.generation < intent.generation
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in old_ids {
+            if let Some(row) = inner.unbans.get_mut(&id) {
+                if matches!(
+                    row.state,
+                    UnbanState::Staged | UnbanState::Pending | UnbanState::Running
+                ) {
+                    row.state = UnbanState::Superseded;
+                    row.completed_at = Some(completed_at.to_owned());
+                    row.claim_token = None;
+                }
+            }
+        }
+        inner.bans.get_mut(request_id).expect("checked ban").state = BanState::Accepted;
+        Ok(())
+    }
+
     async fn stage_unban(
         &self,
         guild_id: &str,
@@ -1199,6 +1374,7 @@ impl MemberModerationStore for MemMemberStore {
         }) {
             return Err(StoreError::new("unban request id is already in use"));
         }
+        inner.stage_ban(guild_id, user_id, request_id)?;
         inner.unbans.insert(
             request_id.to_owned(),
             UnbanRow {
@@ -1223,25 +1399,16 @@ impl MemberModerationStore for MemMemberStore {
         completed_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
-        if !inner.unbans.get(request_id).is_some_and(|row| {
-            row.state == UnbanState::Staged && row.guild_id == guild_id && row.user_id == user_id
-        }) {
-            return Err(StoreError::new("lost staged unban"));
+        if !inner.accepted_current_ban(request_id)
+            || !inner.unbans.get(request_id).is_some_and(|row| {
+                row.state == UnbanState::Staged
+                    && row.guild_id == guild_id
+                    && row.user_id == user_id
+            })
+        {
+            return Err(StoreError::new("lost accepted staged unban"));
         }
-        for (id, row) in inner.unbans.iter_mut() {
-            if row.guild_id == guild_id
-                && row.user_id == user_id
-                && matches!(
-                    row.state,
-                    UnbanState::Staged | UnbanState::Pending | UnbanState::Running
-                )
-                && id != request_id
-            {
-                row.state = UnbanState::Superseded;
-                row.completed_at = Some(completed_at.to_owned());
-                row.claim_token = None;
-            }
-        }
+        let _ = completed_at;
         match inner.unbans.get_mut(request_id) {
             Some(row) if row.state == UnbanState::Staged => {
                 row.state = UnbanState::Pending;
@@ -1251,12 +1418,22 @@ impl MemberModerationStore for MemMemberStore {
         }
     }
 
-    async fn cancel_staged_unban(
+    async fn reject_ban(
         &self,
+        guild_id: &str,
+        user_id: &str,
         request_id: &str,
         completed_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
+        let intent = inner
+            .bans
+            .get_mut(request_id)
+            .filter(|r| {
+                r.state == BanState::Prepared && r.guild_id == guild_id && r.user_id == user_id
+            })
+            .ok_or_else(|| StoreError::new("lost prepared ban"))?;
+        intent.state = BanState::Rejected;
         if let Some(row) = inner.unbans.get_mut(request_id) {
             if row.state == UnbanState::Staged {
                 row.state = UnbanState::Cancelled;
@@ -1266,32 +1443,46 @@ impl MemberModerationStore for MemMemberStore {
         Ok(())
     }
 
-    async fn claim_due_unbans(&self, now: &str, limit: i64) -> Result<Vec<UnbanJob>, StoreError> {
-        // Recheck after acquiring the same queue as tempban: a staged row
-        // may belong to a live ban call, not a crashed process.
-        let mut staged: Vec<_> = self
-            .lock()
-            .unbans
-            .iter()
-            .filter(|(_, r)| r.state == UnbanState::Staged)
-            .map(|(id, r)| {
-                (
-                    r.created_at.clone(),
-                    id.clone(),
-                    r.guild_id.clone(),
-                    r.user_id.clone(),
-                )
-            })
-            .collect();
+    async fn claim_due_unbans(
+        &self,
+        guild_id: &str,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<UnbanJob>, StoreError> {
+        // Only durable acceptance is recoverable. Prepared/live/uncertain
+        // rows never acquire an expiry by guessing whether Discord accepted.
+        let mut staged: Vec<_> = {
+            let inner = self.lock();
+            inner
+                .unbans
+                .iter()
+                .filter(|(id, r)| {
+                    r.guild_id == guild_id
+                        && r.state == UnbanState::Staged
+                        && inner.accepted_current_ban(id)
+                })
+                .map(|(id, r)| {
+                    (
+                        inner.bans[id].generation,
+                        id.clone(),
+                        r.guild_id.clone(),
+                        r.user_id.clone(),
+                    )
+                })
+                .collect()
+        };
         staged.sort_by(|a, b| b.cmp(a));
         for (_, id, guild_id, user_id) in staged {
             self.serialize_member(&guild_id, &user_id, || async {
-                if self
-                    .lock()
-                    .unbans
-                    .get(&id)
-                    .is_some_and(|r| r.state == UnbanState::Staged)
-                {
+                let eligible = {
+                    let inner = self.lock();
+                    inner.accepted_current_ban(&id)
+                        && inner
+                            .unbans
+                            .get(&id)
+                            .is_some_and(|r| r.state == UnbanState::Staged)
+                };
+                if eligible {
                     self.activate_staged_unban(&guild_id, &user_id, &id, now)
                         .await?;
                 }
@@ -1303,7 +1494,12 @@ impl MemberModerationStore for MemMemberStore {
         let mut due: Vec<(String, UnbanRow)> = inner
             .unbans
             .iter()
-            .filter(|(_, r)| r.state == UnbanState::Pending && r.execute_at.as_str() <= now)
+            .filter(|(id, r)| {
+                r.guild_id == guild_id
+                    && r.state == UnbanState::Pending
+                    && r.execute_at.as_str() <= now
+                    && inner.accepted_current_ban(id)
+            })
             .map(|(id, r)| (id.clone(), r.clone()))
             .collect();
         due.sort_by(|a, b| {
@@ -1312,7 +1508,7 @@ impl MemberModerationStore for MemMemberStore {
                 .then_with(|| a.0.cmp(&b.0))
         });
         let mut jobs = Vec::new();
-        for (id, row) in due.into_iter().take(limit.max(0) as usize) {
+        for (id, row) in due.into_iter().take(limit.clamp(0, 25) as usize) {
             inner.claim_sequence += 1;
             let token = format!("mem-{}", inner.claim_sequence);
             if let Some(stored) = inner.unbans.get_mut(&id) {
@@ -1339,13 +1535,17 @@ impl MemberModerationStore for MemMemberStore {
         claim_token: &str,
     ) -> Result<bool, StoreError> {
         let inner = self.lock();
-        Ok(inner.unbans.get(request_id).is_some_and(|r| {
-            r.state == UnbanState::Running && r.claim_token.as_deref() == Some(claim_token)
-        }))
+        Ok(inner.accepted_current_ban(request_id)
+            && inner.unbans.get(request_id).is_some_and(|r| {
+                r.state == UnbanState::Running && r.claim_token.as_deref() == Some(claim_token)
+            }))
     }
 
     async fn complete_unban(&self, request_id: &str, claim_token: &str) -> Result<(), StoreError> {
         let mut inner = self.lock();
+        if !inner.accepted_current_ban(request_id) {
+            return Err(StoreError::new("unban intent superseded"));
+        }
         match inner.unbans.get_mut(request_id) {
             Some(row)
                 if row.state == UnbanState::Running
@@ -2070,7 +2270,7 @@ mod tests {
         assert_eq!(svc.discord.call_count("ban"), 1);
 
         // Not due yet: the sweep claims nothing.
-        assert_eq!(svc.run_due_unbans().await.expect("sweep"), 0);
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("sweep"), 0);
         assert_eq!(svc.discord.call_count("unban"), 0);
 
         // An hour later the sweep unbans exactly once with the staged
@@ -2079,7 +2279,7 @@ mod tests {
         // is now+3600s, hence a sweep at now+3600s is due.
         let jobs = svc
             .store
-            .claim_due_unbans("2023-11-14T23:13:20.000Z", UNBAN_SWEEP_CLAIM_LIMIT)
+            .claim_due_unbans(GUILD, "2023-11-14T23:13:20.000Z", UNBAN_SWEEP_CLAIM_LIMIT)
             .await
             .expect("claim");
         assert_eq!(jobs.len(), 1);
@@ -2090,7 +2290,7 @@ mod tests {
         // Overlapping sweep cannot claim the same job.
         let again = svc
             .store
-            .claim_due_unbans("2023-11-14T23:13:20.000Z", UNBAN_SWEEP_CLAIM_LIMIT)
+            .claim_due_unbans(GUILD, "2023-11-14T23:13:20.000Z", UNBAN_SWEEP_CLAIM_LIMIT)
             .await
             .expect("reclaim");
         assert!(again.is_empty());
@@ -2110,10 +2310,10 @@ mod tests {
             .await
             .expect("tempban");
         clock.store(1_700_003_599_999, Ordering::SeqCst);
-        assert_eq!(svc.run_due_unbans().await.expect("before expiry"), 0);
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("before expiry"), 0);
         clock.store(1_700_003_600_000, Ordering::SeqCst);
-        assert_eq!(svc.run_due_unbans().await.expect("at expiry"), 1);
-        assert_eq!(svc.run_due_unbans().await.expect("second sweep"), 0);
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("at expiry"), 1);
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("second sweep"), 0);
         assert_eq!(svc.discord.call_count("unban"), 1);
         let DiscordCall::Unban { reason, .. } = &svc.discord.calls()[1] else {
             panic!("second call is the unban");
@@ -2152,7 +2352,7 @@ mod tests {
             DiscordError::Rejected("already unbanned".to_owned()),
         );
         let err = svc
-            .run_due_unbans()
+            .run_due_unbans(GUILD)
             .await
             .expect_err("first error rethrown");
         assert!(matches!(
@@ -2165,7 +2365,7 @@ mod tests {
             Some("pending".to_owned())
         );
         svc.discord.clear_failure("unban");
-        assert_eq!(svc.run_due_unbans().await.expect("retry sweep"), 1);
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("retry sweep"), 1);
         assert_eq!(
             svc.store.unban_state("req-tempban-3"),
             Some("done".to_owned())

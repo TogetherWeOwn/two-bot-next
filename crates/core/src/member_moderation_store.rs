@@ -1,12 +1,13 @@
 //! Postgres member-moderation ledger. Enabled only by the core `db` feature.
 //!
-//! Construct once per guild consumer and clone it into command/sweep paths:
-//! clones share the legacy per-member queues. SQL claims are atomic across
-//! connections, but ordering Discord effects requires a single guild consumer.
+//! Construct exactly one consumer per guild and clone it into command/sweep
+//! paths: clones share the per-member queues. SQL claims are atomic across
+//! connections, but ordering Discord effects requires that single consumer.
+//! Every database operation is fenced to the guild bound at construction.
 
 use std::future::Future;
 
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::member_moderation::{
     AuditRow, ClaimState, MemberModerationStore, MemberQueues, StoreError, UnbanJob,
@@ -15,66 +16,100 @@ use crate::member_moderation::{
 #[derive(Clone)]
 pub struct PgMemberModerationStore {
     pool: PgPool,
+    guild_id: String,
     queues: MemberQueues,
 }
 
 impl PgMemberModerationStore {
     #[must_use]
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool, guild_id: impl Into<String>) -> Self {
         Self {
             pool,
+            guild_id: guild_id.into(),
             queues: MemberQueues::default(),
         }
     }
 
-    // Recovery rechecks the staged state under the same transaction as
-    // supersession. A stale sweep snapshot cannot supersede a newer tempban.
+    fn ensure_guild(&self, guild: &str) -> Result<(), StoreError> {
+        if guild != self.guild_id {
+            return Err(StoreError::new("moderation store guild mismatch"));
+        }
+        Ok(())
+    }
+
+    // Both temporary and permanent bans create their fence before dispatch.
+    // Only an explicitly rejected exact identity can reuse a request id, and
+    // it receives a fresh sequence generation even if its clock moved back.
+    async fn prepare(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        guild: &str,
+        user: &str,
+        request: &str,
+        now: &str,
+    ) -> Result<(), StoreError> {
+        self.ensure_guild(guild)?;
+        let changed = sqlx::query(
+            "INSERT INTO moderation_member_bans
+             (request_id, guild_id, user_id, state, created_at)
+             VALUES ($1, $2, $3, 'prepared', $4::text::timestamptz)
+             ON CONFLICT (request_id) DO UPDATE SET state = 'prepared',
+               generation = EXCLUDED.generation, created_at = EXCLUDED.created_at,
+               completed_at = NULL
+             WHERE moderation_member_bans.state = 'rejected'
+               AND moderation_member_bans.guild_id = EXCLUDED.guild_id
+               AND moderation_member_bans.user_id = EXCLUDED.user_id",
+        )
+        .bind(request)
+        .bind(&self.guild_id)
+        .bind(user)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StoreError::new("ban request id is already in use"));
+        }
+        Ok(())
+    }
+
+    // Acceptance, current generation and the exact staged schedule are checked
+    // by the same UPDATE. Recovery never guesses whether dispatch succeeded.
+    // Supersession belongs to confirm_ban, not activation: a delayed older
+    // activation cannot supersede a newer permanent or temporary ban.
     async fn activate(
         &self,
         guild: &str,
         user: &str,
         request: &str,
-        now: &str,
         recovery: bool,
     ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await.map_err(db_error)?;
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT state FROM moderation_scheduled_unbans
-             WHERE request_id = $1 AND guild_id = $2 AND user_id = $3 FOR UPDATE",
+        self.ensure_guild(guild)?;
+        let changed = sqlx::query(
+            "UPDATE moderation_scheduled_unbans AS job SET state = 'pending'
+             FROM moderation_member_bans AS intent
+             WHERE job.request_id = $1 AND job.guild_id = $2 AND job.user_id = $3
+               AND job.state = 'staged' AND intent.request_id = job.request_id
+               AND intent.guild_id = job.guild_id AND intent.user_id = job.user_id
+               AND intent.state = 'accepted'
+               AND NOT EXISTS (
+                 SELECT 1 FROM moderation_member_bans AS newer
+                 WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
+                   AND newer.generation > intent.generation AND newer.state <> 'rejected'
+               )",
         )
         .bind(request)
-        .bind(guild)
+        .bind(&self.guild_id)
         .bind(user)
-        .fetch_optional(&mut *tx)
+        .execute(&self.pool)
         .await
-        .map_err(db_error)?;
-        if state.as_deref() != Some("staged") {
-            if recovery {
-                return Ok(());
-            }
-            return Err(StoreError::new("lost staged unban"));
+        .map_err(db_error)?
+        .rows_affected();
+        if changed != 1 && !recovery {
+            return Err(StoreError::new("lost or fenced staged unban"));
         }
-        sqlx::query(
-            "UPDATE moderation_scheduled_unbans SET state = 'superseded',
-             completed_at = $1::text::timestamptz, claim_token = NULL
-             WHERE guild_id = $2 AND user_id = $3 AND request_id <> $4
-               AND state IN ('staged', 'pending', 'running')",
-        )
-        .bind(now)
-        .bind(guild)
-        .bind(user)
-        .bind(request)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        sqlx::query(
-            "UPDATE moderation_scheduled_unbans SET state = 'pending' WHERE request_id = $1",
-        )
-        .bind(request)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        tx.commit().await.map_err(db_error)
+        Ok(())
     }
 }
 
@@ -100,6 +135,8 @@ impl MemberModerationStore for PgMemberModerationStore {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = T> + Send,
     {
+        // The generic result cannot report a guild error here. Each operation
+        // inside the closure independently fences its guild before any write.
         self.queues.run(guild_id, user_id, run).await
     }
 
@@ -111,13 +148,14 @@ impl MemberModerationStore for PgMemberModerationStore {
         hash: &str,
         now: &str,
     ) -> Result<ClaimState, StoreError> {
+        self.ensure_guild(guild_id)?;
         let won = sqlx::query(
             "INSERT INTO moderation_idempotency
              (guild_id, idempotency_key, action, request_hash, state, claimed_at)
              VALUES ($1, $2, $3, $4, 'in_flight', $5::text::timestamptz)
              ON CONFLICT (guild_id, idempotency_key) DO NOTHING",
         )
-        .bind(guild_id)
+        .bind(&self.guild_id)
         .bind(key)
         .bind(action)
         .bind(hash)
@@ -133,7 +171,7 @@ impl MemberModerationStore for PgMemberModerationStore {
             "SELECT request_hash, state, outcome FROM moderation_idempotency
              WHERE guild_id = $1 AND idempotency_key = $2",
         )
-        .bind(guild_id)
+        .bind(&self.guild_id)
         .bind(key)
         .fetch_optional(&self.pool)
         .await
@@ -163,12 +201,13 @@ impl MemberModerationStore for PgMemberModerationStore {
         result_json: &str,
         now: &str,
     ) -> Result<(), StoreError> {
+        self.ensure_guild(guild_id)?;
         let changed = sqlx::query(
             "UPDATE moderation_idempotency SET state = 'done', outcome = $3,
              result_json = $4, completed_at = $5::text::timestamptz
              WHERE guild_id = $1 AND idempotency_key = $2 AND state = 'in_flight'",
         )
-        .bind(guild_id)
+        .bind(&self.guild_id)
         .bind(key)
         .bind(outcome)
         .bind(result_json)
@@ -184,11 +223,12 @@ impl MemberModerationStore for PgMemberModerationStore {
     }
 
     async fn release(&self, guild_id: &str, key: &str) -> Result<(), StoreError> {
+        self.ensure_guild(guild_id)?;
         sqlx::query(
             "DELETE FROM moderation_idempotency WHERE guild_id = $1
                      AND idempotency_key = $2 AND state = 'in_flight'",
         )
-        .bind(guild_id)
+        .bind(&self.guild_id)
         .bind(key)
         .execute(&self.pool)
         .await
@@ -197,6 +237,7 @@ impl MemberModerationStore for PgMemberModerationStore {
     }
 
     async fn record_audit(&self, row: &AuditRow) -> Result<(), StoreError> {
+        self.ensure_guild(&row.guild_id)?;
         sqlx::query(
             "INSERT INTO moderation_audit
              (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
@@ -205,7 +246,7 @@ impl MemberModerationStore for PgMemberModerationStore {
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(&row.request_id)
-        .bind(&row.guild_id)
+        .bind(&self.guild_id)
         .bind(&row.actor_id)
         .bind(row.action)
         .bind(&row.target_id)
@@ -229,13 +270,79 @@ impl MemberModerationStore for PgMemberModerationStore {
         request: &str,
         now: &str,
     ) -> Result<(), StoreError> {
+        self.ensure_guild(guild)?;
         sqlx::query(
             "INSERT INTO moderation_warnings (id, guild_id, user_id, actor_id, reason, request_id, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7::text::timestamptz)
              ON CONFLICT (request_id) DO NOTHING"
-        ).bind(id).bind(guild).bind(user).bind(actor).bind(reason).bind(request).bind(now)
+        ).bind(id).bind(&self.guild_id).bind(user).bind(actor).bind(reason).bind(request).bind(now)
             .execute(&self.pool).await.map_err(db_error)?;
         Ok(())
+    }
+
+    async fn stage_ban(
+        &self,
+        guild: &str,
+        user: &str,
+        request: &str,
+        now: &str,
+    ) -> Result<(), StoreError> {
+        self.ensure_guild(guild)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        self.prepare(&mut tx, guild, user, request, now).await?;
+        tx.commit().await.map_err(db_error)
+    }
+
+    async fn confirm_ban(
+        &self,
+        guild: &str,
+        user: &str,
+        request: &str,
+        now: &str,
+    ) -> Result<(), StoreError> {
+        self.ensure_guild(guild)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let generation: Option<i64> = sqlx::query_scalar(
+            "UPDATE moderation_member_bans AS intent SET state = 'accepted',
+               completed_at = $4::text::timestamptz
+             WHERE intent.request_id = $1 AND intent.guild_id = $2 AND intent.user_id = $3
+               AND intent.state = 'prepared'
+               AND NOT EXISTS (
+                 SELECT 1 FROM moderation_member_bans AS newer
+                 WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
+                   AND newer.generation > intent.generation AND newer.state <> 'rejected'
+               )
+             RETURNING intent.generation",
+        )
+        .bind(request)
+        .bind(&self.guild_id)
+        .bind(user)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let generation = generation.ok_or_else(|| StoreError::new("lost prepared ban intent"))?;
+        // A permanent ban has no schedule, but supersedes old expiries too.
+        // Strict generation comparison prevents a late older confirmation
+        // from superseding any newer schedule. Failure rolls acceptance back
+        // to prepared, retaining its conservative fence against older jobs.
+        sqlx::query(
+            "UPDATE moderation_scheduled_unbans AS job SET state = 'superseded',
+               completed_at = $1::text::timestamptz, claim_token = NULL
+             FROM moderation_member_bans AS older
+             WHERE job.guild_id = $2 AND job.user_id = $3
+               AND job.request_id = older.request_id
+               AND older.guild_id = job.guild_id AND older.user_id = job.user_id
+               AND older.generation < $4 AND job.state IN ('staged', 'pending', 'running')",
+        )
+        .bind(now)
+        .bind(&self.guild_id)
+        .bind(user)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)
     }
 
     async fn stage_unban(
@@ -247,24 +354,34 @@ impl MemberModerationStore for PgMemberModerationStore {
         request: &str,
         now: &str,
     ) -> Result<(), StoreError> {
-        // A definite ban rejection cancelled this exact row and released its
-        // idempotency key; that same request may legitimately be retried.
+        self.ensure_guild(guild)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        self.prepare(&mut tx, guild, user, request, now).await?;
         let changed = sqlx::query(
             "INSERT INTO moderation_scheduled_unbans
              (request_id, guild_id, user_id, execute_at, reason, state, created_at)
              VALUES ($1, $2, $3, $4::text::timestamptz, $5, 'staged', $6::text::timestamptz)
              ON CONFLICT (request_id) DO UPDATE SET state = 'staged',
-             execute_at = EXCLUDED.execute_at, reason = EXCLUDED.reason,
-             created_at = EXCLUDED.created_at, completed_at = NULL, claimed_at = NULL, claim_token = NULL
+               execute_at = EXCLUDED.execute_at, reason = EXCLUDED.reason,
+               created_at = EXCLUDED.created_at, completed_at = NULL, claimed_at = NULL, claim_token = NULL
              WHERE moderation_scheduled_unbans.state = 'cancelled'
                AND moderation_scheduled_unbans.guild_id = EXCLUDED.guild_id
-               AND moderation_scheduled_unbans.user_id = EXCLUDED.user_id"
-        ).bind(request).bind(guild).bind(user).bind(execute_at).bind(reason).bind(now)
-            .execute(&self.pool).await.map_err(db_error)?.rows_affected();
+               AND moderation_scheduled_unbans.user_id = EXCLUDED.user_id",
+        )
+        .bind(request)
+        .bind(&self.guild_id)
+        .bind(user)
+        .bind(execute_at)
+        .bind(reason)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?
+        .rows_affected();
         if changed != 1 {
             return Err(StoreError::new("unban request id is already in use"));
         }
-        Ok(())
+        tx.commit().await.map_err(db_error)
     }
 
     async fn activate_staged_unban(
@@ -272,48 +389,107 @@ impl MemberModerationStore for PgMemberModerationStore {
         guild: &str,
         user: &str,
         request: &str,
+        _now: &str,
+    ) -> Result<(), StoreError> {
+        self.activate(guild, user, request, false).await
+    }
+
+    async fn reject_ban(
+        &self,
+        guild: &str,
+        user: &str,
+        request: &str,
         now: &str,
     ) -> Result<(), StoreError> {
-        self.activate(guild, user, request, now, false).await
-    }
-
-    async fn cancel_staged_unban(&self, request: &str, now: &str) -> Result<(), StoreError> {
-        sqlx::query("UPDATE moderation_scheduled_unbans SET state = 'cancelled',
-                     completed_at = $2::text::timestamptz WHERE request_id = $1 AND state = 'staged'")
-            .bind(request).bind(now).execute(&self.pool).await.map_err(db_error)?;
-        Ok(())
-    }
-
-    async fn claim_due_unbans(&self, now: &str, limit: i64) -> Result<Vec<UnbanJob>, StoreError> {
-        let staged = sqlx::query(
-            "SELECT request_id, guild_id, user_id FROM moderation_scheduled_unbans
-             WHERE state = 'staged' ORDER BY created_at DESC, request_id DESC",
+        self.ensure_guild(guild)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let changed = sqlx::query(
+            "UPDATE moderation_member_bans SET state = 'rejected', completed_at = $4::text::timestamptz
+             WHERE request_id = $1 AND guild_id = $2 AND user_id = $3 AND state = 'prepared'",
         )
+        .bind(request)
+        .bind(&self.guild_id)
+        .bind(user)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StoreError::new("lost prepared ban intent"));
+        }
+        // If this write fails, prepared -> rejected also rolls back. Otherwise
+        // a rejected tempban could leave an automatically recoverable expiry
+        // capable of removing an existing permanent ban.
+        sqlx::query(
+            "UPDATE moderation_scheduled_unbans SET state = 'cancelled',
+               completed_at = $4::text::timestamptz
+             WHERE request_id = $1 AND guild_id = $2 AND user_id = $3 AND state = 'staged'",
+        )
+        .bind(request)
+        .bind(&self.guild_id)
+        .bind(user)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)
+    }
+
+    async fn claim_due_unbans(
+        &self,
+        guild: &str,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<UnbanJob>, StoreError> {
+        self.ensure_guild(guild)?;
+        let staged = sqlx::query(
+            "SELECT job.request_id, job.user_id FROM moderation_scheduled_unbans AS job
+             JOIN moderation_member_bans AS intent ON intent.request_id = job.request_id
+               AND intent.guild_id = job.guild_id AND intent.user_id = job.user_id
+             WHERE job.guild_id = $1 AND job.state = 'staged' AND intent.state = 'accepted'
+               AND NOT EXISTS (
+                 SELECT 1 FROM moderation_member_bans AS newer
+                 WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
+                   AND newer.generation > intent.generation AND newer.state <> 'rejected'
+               )
+             ORDER BY intent.generation DESC",
+        )
+        .bind(&self.guild_id)
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;
         for row in staged {
             let request: String = row.try_get("request_id").map_err(db_error)?;
-            let guild: String = row.try_get("guild_id").map_err(db_error)?;
             let user: String = row.try_get("user_id").map_err(db_error)?;
-            self.serialize_member(&guild, &user, || {
-                self.activate(&guild, &user, &request, now, true)
+            self.serialize_member(&self.guild_id, &user, || {
+                self.activate(&self.guild_id, &user, &request, true)
             })
             .await?;
         }
         let token = format!("{:032x}", rand::random::<u128>());
-        // A single UPDATE owns the rows. SKIP LOCKED lets overlapping sweeps
-        // claim other jobs without ever reclaiming an uncertain running row.
+        // A single UPDATE owns the rows. SKIP LOCKED permits overlapping
+        // sweeps without ever reclaiming an uncertain running row by age.
+        // Both recovery and claiming are scoped to this consumer's guild.
         let rows = sqlx::query(
             "WITH due AS (
-               SELECT request_id FROM moderation_scheduled_unbans
-               WHERE state = 'pending' AND execute_at <= $1::text::timestamptz
-               ORDER BY execute_at, request_id LIMIT $2 FOR UPDATE SKIP LOCKED
+               SELECT job.request_id FROM moderation_scheduled_unbans AS job
+               JOIN moderation_member_bans AS intent ON intent.request_id = job.request_id
+                 AND intent.guild_id = job.guild_id AND intent.user_id = job.user_id
+               WHERE job.guild_id = $1 AND job.state = 'pending' AND intent.state = 'accepted'
+                 AND job.execute_at <= $2::text::timestamptz
+                 AND NOT EXISTS (
+                   SELECT 1 FROM moderation_member_bans AS newer
+                   WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
+                     AND newer.generation > intent.generation AND newer.state <> 'rejected'
+                 )
+               ORDER BY job.execute_at, intent.generation LIMIT $3 FOR UPDATE OF job SKIP LOCKED
              ) UPDATE moderation_scheduled_unbans AS job SET state = 'running',
-               claimed_at = $1::text::timestamptz, claim_token = $3
-             FROM due WHERE job.request_id = due.request_id AND job.state = 'pending'
+               claimed_at = $2::text::timestamptz, claim_token = $4
+             FROM due WHERE job.request_id = due.request_id AND job.guild_id = $1 AND job.state = 'pending'
              RETURNING job.request_id, job.guild_id, job.user_id, job.reason, job.claim_token",
         )
+        .bind(&self.guild_id)
         .bind(now)
         .bind(limit.clamp(0, 25))
         .bind(token)
@@ -335,11 +511,22 @@ impl MemberModerationStore for PgMemberModerationStore {
 
     async fn owns_unban_claim(&self, request: &str, token: &str) -> Result<bool, StoreError> {
         sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM moderation_scheduled_unbans
-                           WHERE request_id = $1 AND state = 'running' AND claim_token = $2)",
+            "SELECT EXISTS (
+               SELECT 1 FROM moderation_scheduled_unbans AS job
+               JOIN moderation_member_bans AS intent ON intent.request_id = job.request_id
+                 AND intent.guild_id = job.guild_id AND intent.user_id = job.user_id
+               WHERE job.request_id = $1 AND job.claim_token = $2 AND job.guild_id = $3
+                 AND job.state = 'running' AND intent.state = 'accepted'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM moderation_member_bans AS newer
+                   WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
+                     AND newer.generation > intent.generation AND newer.state <> 'rejected'
+                 )
+             )",
         )
         .bind(request)
         .bind(token)
+        .bind(&self.guild_id)
         .fetch_one(&self.pool)
         .await
         .map_err(db_error)
@@ -348,11 +535,12 @@ impl MemberModerationStore for PgMemberModerationStore {
     async fn complete_unban(&self, request: &str, token: &str) -> Result<(), StoreError> {
         let changed = sqlx::query(
             "UPDATE moderation_scheduled_unbans SET state = 'done',
-                                  completed_at = NOW(), claim_token = NULL
-                                  WHERE request_id = $1 AND state = 'running' AND claim_token = $2",
+               completed_at = NOW(), claim_token = NULL
+             WHERE request_id = $1 AND state = 'running' AND claim_token = $2 AND guild_id = $3",
         )
         .bind(request)
         .bind(token)
+        .bind(&self.guild_id)
         .execute(&self.pool)
         .await
         .map_err(db_error)?
@@ -366,11 +554,12 @@ impl MemberModerationStore for PgMemberModerationStore {
     async fn requeue_unban(&self, request: &str, token: &str) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE moderation_scheduled_unbans SET state = 'pending',
-                     claimed_at = NULL, claim_token = NULL
-                     WHERE request_id = $1 AND state = 'running' AND claim_token = $2",
+               claimed_at = NULL, claim_token = NULL
+             WHERE request_id = $1 AND state = 'running' AND claim_token = $2 AND guild_id = $3",
         )
         .bind(request)
         .bind(token)
+        .bind(&self.guild_id)
         .execute(&self.pool)
         .await
         .map_err(db_error)?;
