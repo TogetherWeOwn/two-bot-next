@@ -1,51 +1,103 @@
 //! One ordered blocking worker; reception must never wait for dispatch I/O.
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
+
 use futures_util::{Stream, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 pub const DISPATCH_BACKLOG: usize = 64;
+// One REST read (10s) + checkpoint (<=5s), with scheduling headroom.
+pub const DISPATCH_IO_MAX: Duration = Duration::from_secs(20);
+pub const DISPATCH_DRAIN_MAX: Duration = Duration::from_secs(30);
 
-/// A full backlog stops reception, retains the overflow dispatch, and drains
-/// received work before returning a fatal error for supervisor restart.
-/// A dead worker is fatal too; restart alone cannot replay uncommitted work.
+#[cfg(test)]
 pub async fn dispatch_ordered<T, S, F>(
     stream: S,
     capacity: usize,
-    mut handle: F,
+    handle: F,
 ) -> Result<(), &'static str>
 where
     T: Send + 'static,
     S: Stream<Item = T>,
     F: FnMut(T) + Send + 'static,
 {
+    dispatch_bounded(
+        stream,
+        capacity,
+        handle,
+        || async {},
+        DISPATCH_IO_MAX,
+        DISPATCH_DRAIN_MAX,
+    )
+    .await
+}
+
+/// Stop reception/readiness before draining a retained overflow tail. Both an
+/// individual handler and the entire drain (including tail enqueue) are bounded.
+/// Timeout is fatal: spawn_blocking cannot cancel running code. The essential
+/// task supervisor MUST exit the process, not await runtime shutdown or reconnect
+/// alongside an old writer. A durable checkpoint replays uncommitted dispatches.
+pub async fn dispatch_bounded<T, S, F, Stop, Stopped>(
+    stream: S,
+    capacity: usize,
+    mut handle: F,
+    on_stop: Stop,
+    io_max: Duration,
+    drain_max: Duration,
+) -> Result<(), &'static str>
+where
+    T: Send + 'static,
+    S: Stream<Item = T>,
+    F: FnMut(T) + Send + 'static,
+    Stop: FnOnce() -> Stopped,
+    Stopped: std::future::Future<Output = ()>,
+{
     let (tx, mut rx) = mpsc::channel(capacity);
+    let (progress, mut deadline) = watch::channel(None);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
     let mut worker = tokio::task::spawn_blocking(move || {
         while let Some(event) = rx.blocking_recv() {
+            if worker_cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            progress.send_replace(Some(tokio::time::Instant::now() + io_max));
             handle(event);
+            progress.send_replace(None);
         }
     });
     futures_util::pin_mut!(stream);
+    let mut tail = None;
     let result = loop {
+        let active_deadline = *deadline.borrow_and_update();
+        let stalled = async {
+            match active_deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
+            biased;
             result = &mut worker => {
+                on_stop().await;
                 return match result {
                     Ok(()) => Err("dispatch worker ended unexpectedly"),
                     Err(_) => Err("dispatch worker failed"),
                 };
             }
+            _ = stalled => { break Err("dispatch I/O deadline exceeded"); }
+            _ = deadline.changed() => {}
             item = stream.next() => {
                 let Some(event) = item else { break Ok(()) };
                 match tx.try_send(event) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(event)) => {
-                        // Stop reading, but retain this already-received tail.
-                        // Memory stays bounded to the queue + one overflow item.
-                        let sent = tx.send(event).await;
-                        break Err(if sent.is_ok() {
-                            "dispatch backlog full"
-                        } else {
-                            "dispatch worker unavailable"
-                        });
+                        tail = Some(event);
+                        break Err("dispatch backlog full");
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         break Err("dispatch worker unavailable");
@@ -54,9 +106,28 @@ where
             }
         }
     };
-    drop(tx);
-    worker.await.map_err(|_| "dispatch worker failed")?;
-    result
+    on_stop().await;
+    if result == Err("dispatch I/O deadline exceeded") {
+        cancelled.store(true, Ordering::Release);
+        return result;
+    }
+    let drain = async {
+        if let Some(event) = tail {
+            tx.send(event)
+                .await
+                .map_err(|_| "dispatch worker unavailable")?;
+        }
+        drop(tx);
+        worker.await.map_err(|_| "dispatch worker failed")?;
+        result
+    };
+    match tokio::time::timeout(drain_max, drain).await {
+        Ok(result) => result,
+        Err(_) => {
+            cancelled.store(true, Ordering::Release);
+            Err("dispatch drain deadline exceeded")
+        }
+    }
 }
 
 #[cfg(test)]

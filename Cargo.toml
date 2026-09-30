@@ -18,6 +18,7 @@ axum = { version = "0.8", default-features = false, features = [
     "tokio",
     "tracing",
 ] }
+base64 = "0.22"
 hex = "0.4"
 hmac = "0.13"
 rand = "0.10"

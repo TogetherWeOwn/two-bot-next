@@ -16,7 +16,9 @@ path = "src/main.rs"
 two-bot-core = { version = "0.1.0", path = "../core" }
 two-bot-discord = { version = "0.1.0", path = "../discord" }
 two-bot-store = { version = "0.1.0", path = "../store" }
+two-bot-cutover = { version = "0.1.0", path = "../cutover" }
 sqlx = { workspace = true }
+serde = { workspace = true }
 axum = { workspace = true }
 futures-util = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
@@ -33,3 +35,6 @@ twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
+
+[dev-dependencies]
+tokio-websockets = { workspace = true }
