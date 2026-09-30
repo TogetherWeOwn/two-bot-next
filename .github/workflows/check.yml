@@ -29,10 +29,13 @@ jobs:
           POSTGRES_USER: agent_test
           POSTGRES_DB: postgres
           POSTGRES_HOST_AUTH_METHOD: trust
-        ports: [5432:5432]
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U agent_test -d postgres"
-          --health-interval 5s --health-timeout 5s --health-retries 10
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,11 +61,16 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      # Compile optional stores and run their non-network safety tests too.
+      # Live store tests remain explicitly ignored (agent-testdb only).
       - name: cargo clippy -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features two-bot-core/db -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --features two-bot-core/db --locked
+
+      - name: settings database regressions (CI service only)
+        run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
       - name: Docker dependency-layer manifests (offline)
         run: python3 scripts/check-docker-manifests.py

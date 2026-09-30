@@ -80,9 +80,16 @@ async fn main() {
         info!("persistent store ready; gateway shard connecting");
         let task = tokio::spawn(run_shard(shard, pipeline, Arc::clone(&gateway)));
         tokio::spawn(async move {
-            let _ = task.await;
+            let reason = match task.await {
+                Ok(Err(reason)) => reason,
+                Ok(Ok(())) => "gateway stream ended",
+                Err(_) => "gateway task failed",
+            };
             *gateway.write().await = GatewayState::Armed;
-            tracing::error!("gateway task stopped; exiting for supervisor restart");
+            tracing::error!(
+                reason,
+                "gateway task stopped; exiting for supervisor restart"
+            );
             std::process::exit(1);
         });
     } else {
