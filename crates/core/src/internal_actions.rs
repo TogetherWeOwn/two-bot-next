@@ -64,9 +64,9 @@ pub const SKEW_SECONDS: u64 = 120;
 /// delivery must still be live then. 241 s is the smallest TTL that covers
 /// every accepted instant for the default skew.
 pub const NONCE_TTL_SECONDS: u64 = 241;
-/// Crash-recovery valve for `in_flight` idempotency claims (legacy
-/// `CLAIM_STALE_SECONDS`). The claim state machine itself lives with the db
-/// slice; the constant lives here so both sides agree.
+/// Diagnostic cutoff for `in_flight` idempotency claims (legacy
+/// `CLAIM_STALE_SECONDS`). Durable stale claims require reconciliation, never
+/// automatic reexecution; this is not an execution lease expiry.
 pub const CLAIM_STALE_SECONDS: u64 = 60;
 /// Anything larger is a caller bug, not a request (legacy `MAX_BODY_BYTES`).
 /// A full MEE6 export may hold hundreds of 2,000-character templates.

@@ -95,7 +95,12 @@ impl TestDb {
     async fn connect(options: &PgConnectOptions, schema: &str) -> PgPool {
         PgPoolOptions::new()
             .max_connections(6)
-            .connect_with(options.clone().options([("search_path", schema)]))
+            .connect_with(
+                options
+                    .clone()
+                    .application_name(schema)
+                    .options([("search_path", schema)]),
+            )
             .await
             .unwrap()
     }
@@ -117,6 +122,103 @@ impl TestDb {
             .unwrap();
         self.admin.close().await;
     }
+}
+
+async fn wait_for_uniqueness_lock(db: &TestDb, table: &str) {
+    // Observe only this owned test schema's sessions. Bounded synchronization
+    // proves the VALUES clock was sampled before rollback; no timing-only sleep.
+    for _ in 0..100 {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = $1 \
+             AND wait_event_type = 'Lock' AND query LIKE '%' || $2 || '%')",
+        )
+        .bind(&db.schema)
+        .bind(table)
+        .fetch_one(&db.admin)
+        .await
+        .unwrap();
+        if blocked {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("test writer did not reach the expected unique-index lock");
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
+async fn rollback_wait_starts_retention_and_staleness_after_winning_insert() {
+    let db = TestDb::new().await;
+    let second = db.independent_pool().await;
+    let store = InternalActionStore::new(second.clone());
+    let nonce = body_hash(schema_name().as_bytes())[..32].to_owned();
+    let nonce_hash = body_hash(nonce.as_bytes());
+    let mut blocker = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "WITH instant AS MATERIALIZED (SELECT clock_timestamp() AS now) \
+         INSERT INTO internal_nonces SELECT $1, now, now + INTERVAL '241 seconds' FROM instant",
+    )
+    .bind(&nonce_hash)
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+    let writer = store.clone();
+    let offered_nonce = nonce.clone();
+    let burn = tokio::spawn(async move { writer.burn_nonce(&offered_nonce).await });
+    wait_for_uniqueness_lock(&db, "internal_nonces").await;
+    let release: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    blocker.rollback().await.unwrap();
+    assert!(burn.await.unwrap().unwrap());
+    let row =
+        sqlx::query("SELECT burned_at, expires_at FROM internal_nonces WHERE nonce_hash = $1")
+            .bind(&nonce_hash)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let burned_at: time::OffsetDateTime = row.get("burned_at");
+    let expires_at: time::OffsetDateTime = row.get("expires_at");
+    assert!(burned_at >= release);
+    assert_eq!(expires_at - burned_at, time::Duration::seconds(241));
+    assert!(!store.burn_nonce(&nonce).await.unwrap());
+
+    let id = identity("blocked-key:123", "event.upsert", b"payload");
+    let mut blocker = db.pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) \
+         VALUES ($1, $2, 'event.upsert', $3, 'in_flight')",
+    )
+    .bind(body_hash(b"website"))
+    .bind(body_hash(b"blocked-key:123"))
+    .bind(body_hash(b"payload"))
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+    let writer = store.clone();
+    let offered_id = id.clone();
+    let claim = tokio::spawn(async move { writer.claim(&offered_id, &subject()).await });
+    wait_for_uniqueness_lock(&db, "internal_idempotency").await;
+    let release: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    blocker.rollback().await.unwrap();
+    let owner = claimed(claim.await.unwrap().unwrap());
+    let created_at: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT created_at FROM internal_idempotency WHERE intent_id = $1")
+            .bind(owner.intent_id())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(created_at >= release);
+    assert!(matches!(
+        store.claim(&id, &subject()).await.unwrap(),
+        InternalClaim::InFlight
+    ));
+    second.close().await;
+    db.cleanup().await;
 }
 
 fn identity(key: &str, action: &str, payload: &[u8]) -> RequestIdentity {
@@ -493,5 +595,47 @@ async fn discord_event_dedup_is_atomic_global_and_durable() {
         Err(InternalStoreError::InvalidInput)
     );
     restarted.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
+async fn completion_and_reconciliation_race_cannot_overwrite_terminal() {
+    let db = TestDb::new().await;
+    let second = db.independent_pool().await;
+    let executor = db.store();
+    let reconciler = InternalActionStore::new(second.clone());
+    for n in 0..16 {
+        let id = identity(
+            &format!("finish-race:{n}"),
+            "event.upsert",
+            b"validated payload",
+        );
+        let owner = claimed(executor.claim(&id, &subject()).await.unwrap());
+        executor.mark_unknown(&owner).await.unwrap();
+        let success = success();
+        let failure = TerminalResponse::Failure(TerminalFailure::NoEffect);
+        let (finished, reconciled) = tokio::join!(
+            executor.finish(&owner, &success),
+            reconciler.reconcile(&id, &failure, ReconciliationEvidence::ProvenNotSent)
+        );
+        let expected = match (finished, reconciled) {
+            (Ok(()), Err(InternalStoreError::TransitionRefused)) => success,
+            (Err(InternalStoreError::TransitionRefused), Ok(())) => failure,
+            other => panic!("exactly one terminal writer must win: {other:?}"),
+        };
+        assert!(
+            matches!(executor.claim(&id, &subject()).await.unwrap(), InternalClaim::Replay(r) if r == expected)
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM internal_action_log WHERE intent_id = $1 AND phase = 'terminal'",
+        )
+        .bind(owner.intent_id())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+    second.close().await;
     db.cleanup().await;
 }

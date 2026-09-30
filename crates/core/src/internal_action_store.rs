@@ -246,6 +246,8 @@ impl InternalActionStore {
         }
         let ttl = i64::try_from(NONCE_TTL_SECONDS.max(2 * SKEW_SECONDS + 1))
             .map_err(|_| InternalStoreError::InvalidInput)?;
+        let mut tx = self.pool.begin().await?;
+        let nonce_hash = body_hash(nonce.as_bytes());
         let burned = sqlx::query(
             "WITH instant AS MATERIALIZED (SELECT clock_timestamp() AS now) \
              INSERT INTO internal_nonces (nonce_hash, burned_at, expires_at) \
@@ -257,11 +259,27 @@ impl InternalActionStore {
              ) WHERE internal_nonces.expires_at <= clock_timestamp() \
              RETURNING nonce_hash",
         )
-        .bind(body_hash(nonce.as_bytes()))
+        .bind(&nonce_hash)
         .bind(ttl)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .is_some();
+        if burned {
+            // A speculative INSERT may wait on another transaction which then
+            // rolls back. Its VALUES clock was sampled BEFORE that wait. Refresh
+            // only the winning, still-locked row so retention starts after it.
+            sqlx::query(
+                "WITH fresh AS MATERIALIZED (SELECT clock_timestamp() AS now) \
+                 UPDATE internal_nonces SET burned_at = now, \
+                 expires_at = now + $2::bigint * INTERVAL '1 second' \
+                 FROM fresh WHERE nonce_hash = $1",
+            )
+            .bind(&nonce_hash)
+            .bind(ttl)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(burned)
     }
 
@@ -288,6 +306,16 @@ impl InternalActionStore {
         .fetch_optional(&mut *tx)
         .await?;
         let result = if let Some(intent_id) = inserted {
+            // As with nonce insertion, start diagnostics after any speculative
+            // uniqueness wait, not before a competing transaction rolled back.
+            sqlx::query(
+                "WITH fresh AS MATERIALIZED (SELECT clock_timestamp() AS now) \
+                 UPDATE internal_idempotency SET created_at = now, updated_at = now \
+                 FROM fresh WHERE intent_id = $1",
+            )
+            .bind(intent_id)
+            .execute(&mut *tx)
+            .await?;
             Self::audit(&mut tx, intent_id, "intent", None).await?;
             InternalClaim::Claimed(ExecutionClaim {
                 intent_id,
