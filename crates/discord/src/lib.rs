@@ -7,6 +7,7 @@
 
 pub mod adapter;
 pub mod audit_mirror;
+pub mod channel_access;
 pub mod command_registry;
 pub mod executor;
 pub mod intents;

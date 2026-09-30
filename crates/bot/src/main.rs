@@ -12,6 +12,7 @@ mod gateway;
 mod gateway_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+mod preflight;
 mod server;
 mod sticky_runtime;
 #[cfg(test)]
@@ -31,6 +32,10 @@ use server::serve;
 #[tokio::main]
 async fn main() {
     ensure_crypto_provider();
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_args.first().is_some_and(|arg| arg == "preflight") {
+        std::process::exit(preflight::dispatch(&cli_args[1..]).await);
+    }
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot
     // rot behind an HTTP-client upgrade.
@@ -41,7 +46,6 @@ async fn main() {
     // Operator CLI (TOG-9881): backup/restore + sealed guild-config snapshot.
     // No subcommand falls through to the gateway path below. sqlx is linked
     // (core `db` feature) so these paths can open Postgres directly.
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli_args.first().is_some_and(|arg| arg == "commands") {
         std::process::exit(commands_cli::dispatch(&cli_args[1..]).await);
     }
@@ -173,6 +177,7 @@ async fn main() {
 /// `--help` covers the gateway server and both operator CLI surfaces.
 async fn print_backup_help_and_exit() -> ! {
     print!("{}", commands_cli::USAGE);
+    println!("{}", preflight::USAGE);
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
 }
