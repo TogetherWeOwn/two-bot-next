@@ -16,6 +16,9 @@ pub mod health;
 pub mod invites;
 pub mod leveling;
 pub mod moderation;
+pub mod scheduled;
+#[cfg(feature = "db")]
+pub mod scheduled_store;
 pub mod voice;
 
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
@@ -48,6 +51,22 @@ pub use moderation::{
     require_moderation_reason, ModerationAction, ModerationActor, ModerationGateError,
     ModerationGates, ModerationPolicy, ModerationRequest, ModerationTarget, PolicyError,
     ReasonError, TargetProtection,
+};
+pub use scheduled::{
+    advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
+    next_run_at_ms, no_such_schedule_text, no_unique_match_text, parse_iso_ms,
+    post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text, schedule_confirm_text,
+    schedule_list_line, schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome,
+    ScheduleError, ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX,
+    EVERY_MINUTES_MIN, INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
+    MAX_BODY_CHARS, RETRY_DEFAULT_MS, RETRY_MAX_MS, RETRY_MIN_MS, SCHEDULER_TICK_MS,
+    TICKER_BATCH_LIMIT,
+};
+#[cfg(feature = "db")]
+pub use scheduled_store::{
+    audit_scheduled, claim_due, complete_run, delete_scheduled, get_scheduled, list_scheduled,
+    put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store, retry_scheduled,
+    ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError, ScheduledWrite,
 };
 pub use voice::{
     average_known_voice_duration, count_unknown_starts_per_window, find_blind_windows,
