@@ -7,7 +7,35 @@ use tokio::{
     sync::{oneshot, RwLock},
 };
 
-use crate::{gateway::GatewayState, server, supervise_gateway};
+use two_bot_core::Config;
+
+use crate::{gateway::GatewayState, gateway_prerequisites, server, supervise_gateway};
+
+#[test]
+fn gateway_requires_all_nonempty_bindings_before_starting() {
+    for token in [None, Some(""), Some("INVALID")] {
+        for url in [None, Some(""), Some("synthetic-database-must-not-connect")] {
+            for guild_id in [None, Some(0), Some(123)] {
+                let config = Config {
+                    discord_token: token.map(str::to_owned),
+                    database_url: url.map(str::to_owned),
+                    listen_addr: "127.0.0.1:0".into(),
+                    guild_id,
+                };
+                let expected = if token.is_none_or(str::is_empty) {
+                    Err("DISCORD_TOKEN")
+                } else if url.is_none_or(str::is_empty) {
+                    Err("DATABASE_URL")
+                } else if guild_id.is_none_or(|id| id == 0) {
+                    Err("GUILD_ID")
+                } else {
+                    Ok((token.unwrap(), url.unwrap(), guild_id.unwrap()))
+                };
+                assert_eq!(gateway_prerequisites(&config), expected);
+            }
+        }
+    }
+}
 
 enum Termination {
     Error,
