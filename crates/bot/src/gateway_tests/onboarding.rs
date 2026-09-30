@@ -8,7 +8,10 @@ use std::sync::atomic::AtomicBool;
 
 use crate::mock_rest::{MockRest, RestRequest, ScriptedResponse};
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
+use twilight_gateway::EventTypeFlags;
+use twilight_model::gateway::event::Event;
 use twilight_model::id::Id;
+use twilight_model::util::Timestamp;
 use two_bot_core::onboarding::{
     days_in_guild, goodbye_text, MembershipTrigger, EVENT_CHANNEL_ROUTED,
     EVENT_GAME_ROLES_SELECTED, EVENT_ONBOARDING_PROMPTED, GAME_PICKS, GAME_SELECT_ID,
@@ -233,6 +236,14 @@ async fn spawn_onboarding(db: &TestDb, mock: &MockRest, url: &str, mode: &str) -
     Runner { task, pipeline }
 }
 
+fn joined_at_wire(millis: i64) -> String {
+    // Gateway timestamps use Discord's format, not the legacy event formatter.
+    Timestamp::from_micros(millis * 1000)
+        .expect("fixture joined_at")
+        .iso_8601()
+        .to_string()
+}
+
 fn member_add(seq: u64, pending: bool, joined_at: &str) -> Value {
     json!({"op":0,"s":seq,"t":"GUILD_MEMBER_ADD","d":{
         "guild_id":GUILD,"user":{"id":"77","username":"mock-member","discriminator":"0","bot":false},
@@ -246,6 +257,35 @@ fn gate_clear(seq: u64, joined_at: &str) -> Value {
         "guild_id":GUILD,"user":{"id":"77","username":"mock-member","discriminator":"0","bot":false},
         "roles":[GAME_PICKS[0].role_id],"pending":false,"joined_at":joined_at
     }})
+}
+
+#[test]
+fn onboarding_gateway_member_fixture_timestamp_round_trip() {
+    for joined_ms in [RECEIPT_AT, RECEIPT_AT + 123] {
+        let joined_at = joined_at_wire(joined_ms);
+        for packet in [
+            member_add(2, true, &joined_at),
+            member_add(2, false, &joined_at),
+            gate_clear(3, &joined_at),
+        ] {
+            let pending = packet["d"]["pending"].as_bool().unwrap();
+            let parsed = twilight_gateway::parse(packet.to_string(), EventTypeFlags::all())
+                .expect("gateway fixture parses")
+                .expect("member dispatch selected");
+            let timestamp = match Event::from(parsed) {
+                Event::MemberAdd(member) => {
+                    assert_eq!(member.pending, pending);
+                    member.joined_at
+                }
+                Event::MemberUpdate(member) => {
+                    assert_eq!(member.pending, pending);
+                    member.joined_at
+                }
+                _ => panic!("expected member fixture"),
+            };
+            assert_eq!(timestamp.unwrap().as_micros(), joined_ms * 1000);
+        }
+    }
 }
 
 fn resumed(seq: u64) -> Value {
@@ -368,7 +408,7 @@ async fn welcome_restart(pending: bool) {
     let paused = Arc::new(AtomicBool::new(true));
     let mock = discord(paused.clone(), PauseAt::PermissionRead).await;
     let result = bounded(async {
-        let joined_at = two_bot_core::format_iso_millis(RECEIPT_AT);
+        let joined_at = joined_at_wire(RECEIPT_AT);
         let mut first = gateway(false).await;
         let runner = spawn_onboarding(&db, &mock, &first.mock.url, "legacy").await;
         assert_eq!(first.mock.authentication().await["op"], 2);
@@ -521,7 +561,7 @@ async fn onboarding_gateway_session_goodbye_restart_keeps_captured_joined_at() {
     let mock = discord(paused.clone(), PauseAt::PermissionRead).await;
     let result = bounded(async {
         let joined_ms = two_bot_core::funnel::now_millis_for_test() - 2 * 86_400_000 - 3_600_000;
-        let joined_at = two_bot_core::format_iso_millis(joined_ms);
+        let joined_at = joined_at_wire(joined_ms);
         let mut first = gateway(false).await;
         let runner = spawn_onboarding(&db, &mock, &first.mock.url, "session").await;
         assert_eq!(first.mock.authentication().await["op"], 2);
