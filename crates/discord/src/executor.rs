@@ -20,9 +20,13 @@
 //!   configured, and busy-loops without one — so the executor owns a raw
 //!   hyper transport and observes statuses itself. twilight builders
 //!   (`CreateBan`, `RemoveMember`, `UpdateGuildMember`, `UpdateChannel`,
-//!   `UpdateChannelPermission`, `CreateMessage`, `Request::builder(&Route)`,
+//!   `UpdateChannelPermission`, `Request::builder(&Route)`,
 //!   `TryIntoRequest`) remain the request factory: method, path, body and
 //!   audit-header encoding come from twilight, the executor only sends them.
+//!   Message POST is the exception: the pinned `CreateMessage` builder only
+//!   models a `u64` nonce and never serializes `enforce_nonce`, so that one
+//!   body is built explicitly (method/path stay twilight-owned via
+//!   `Route::CreateMessage`) to carry string audit nonces with enforcement.
 //! - `ClientBuilder::proxy(host, use_http)` is the analogue of legacy
 //!   `DISCORD_API_BASE` (host only — the `http(s)://` scheme prefix is
 //!   stripped, mirroring `cutover/src/rest.rs`).
@@ -48,8 +52,8 @@ use twilight_model::id::marker::{
 use twilight_model::id::Id;
 use two_bot_core::{
     backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, retry_after_ms,
-    ActionOutcome, KickOutcome, KickResult, KickStatus, ModerationExecution, MAX_HTTP_TRIES,
-    MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
+    utf16_len, ActionOutcome, KickOutcome, KickResult, KickStatus, ModerationExecution,
+    MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
 };
 
 /// Minimum gap between paced requests, ms (legacy `rest.ts` default).
@@ -469,12 +473,17 @@ impl ActionExecutor {
     }
 
     /// Build a twilight [`Request`] from a builder without sending (keeps
-    /// every method/path/body/audit encoding twilight-owned).
-    fn request_of<T>(build: T) -> Result<Request, String>
+    /// every method/path/body/audit encoding twilight-owned). Build failures
+    /// (bad ids, out-of-range fields, failed validation) happen before any
+    /// I/O, so they map to [`DiscordError::Rejected`] — provably no mutation
+    /// happened and the claim fence is safe to release.
+    fn request_of<T>(build: T) -> Result<Request, DiscordError>
     where
         T: TryIntoRequest,
     {
-        build.try_into_request().map_err(|e| format!("build: {e}"))
+        build
+            .try_into_request()
+            .map_err(|e| DiscordError::Rejected(format!("build: {e}")))
     }
 
     /// One moderation verb: a single attempt with the 5 s abort, no
@@ -486,12 +495,24 @@ impl ActionExecutor {
         request: Request,
         accepted: &[u16],
     ) -> Result<Option<serde_json::Value>, DiscordError> {
+        let res = self.call_once_raw(request, accepted).await?;
+        Ok(serde_json::from_slice(&res.body).ok())
+    }
+
+    /// Same single-attempt send as [`Self::call_once`], but returns the raw
+    /// exchange so callers that must distinguish "proven absent" from
+    /// "unreadable" can validate the body themselves.
+    async fn call_once_raw(
+        &self,
+        request: Request,
+        accepted: &[u16],
+    ) -> Result<RawResponse, DiscordError> {
         let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&request))
             .await
             .map_err(|_| DiscordError::Timeout)?
             .map_err(DiscordError::Unavailable)?;
         if accepted.contains(&res.status) {
-            return Ok(serde_json::from_slice(&res.body).ok());
+            return Ok(res);
         }
         Err(throw_for_status(&res))
     }
@@ -506,8 +527,7 @@ impl ActionExecutor {
         let guild = snowflake(guild_id)?;
         let user = snowflake(user_id)?;
         let reason = audit_reason(reason)?;
-        let req = Self::request_of(self.inner.factory.create_ban(guild, user).reason(&reason))
-            .map_err(DiscordError::Unavailable)?;
+        let req = Self::request_of(self.inner.factory.create_ban(guild, user).reason(&reason))?;
         self.call_once(req, &[200, 204]).await.map(|_| ())
     }
 
@@ -522,8 +542,7 @@ impl ActionExecutor {
         let guild = snowflake(guild_id)?;
         let user = snowflake(user_id)?;
         let reason = audit_reason(reason)?;
-        let req = Self::request_of(self.inner.factory.delete_ban(guild, user).reason(&reason))
-            .map_err(DiscordError::Unavailable)?;
+        let req = Self::request_of(self.inner.factory.delete_ban(guild, user).reason(&reason))?;
         self.call_once(req, &[200, 204, 404]).await.map(|_| ())
     }
 
@@ -543,8 +562,7 @@ impl ActionExecutor {
                 .factory
                 .remove_guild_member(guild, user)
                 .reason(&reason),
-        )
-        .map_err(DiscordError::Unavailable)?;
+        )?;
         self.call_once(req, &[200, 204, 404]).await.map(|_| ())
     }
 
@@ -573,8 +591,9 @@ impl ActionExecutor {
                 .update_guild_member(guild, user)
                 .communication_disabled_until(until)
                 .reason(&reason),
-        )
-        .map_err(DiscordError::Unavailable)?;
+        )?;
+        // NB: a 29-day-expiry rejection happens here, before any I/O — it is
+        // Rejected (safe pre-mutation) by request_of, never Unavailable.
         self.call_once(req, &[200]).await.map(|_| ())
     }
 
@@ -728,22 +747,31 @@ impl ActionExecutor {
     fn kick_request(&self, guild_id: &str, user_id: &str, reason: &str) -> Result<Request, String> {
         let guild: Id<GuildMarker> = snowflake(guild_id).map_err(|e| e.to_string())?;
         let user: Id<UserMarker> = snowflake(user_id).map_err(|e| e.to_string())?;
+        // Kick failures report as values, never throw, so the pre-send error
+        // is rendered to its detail string here (finding 7 still holds: it is
+        // Rejected at the DiscordError level before rendering).
         Self::request_of(
             self.inner
                 .factory
                 .remove_guild_member(guild, user)
                 .reason(reason),
         )
+        .map_err(|e| e.to_string())
     }
 
     /// Paced GET: 110 ms lane, 403/404 → `None`, 429 parks (same attempt),
     /// 5xx/transport backs off ≤4, other statuses → `None` (legacy
-    /// `DiscordRest::get`).
+    /// `DiscordRest::get`). Supported paths cover the parity §6 reads —
+    /// guild, guild members (+`after`/`limit`), guild scheduled-events
+    /// (+`with_user_count`), single channel and the channel-messages list
+    /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
+    /// is refused without I/O, never silently rewritten (finding 2).
     pub async fn get_json(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
+        let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
         loop {
             self.pace(false).await;
-            let request = Request::from_route(&raw_get_route(path));
+            let request = Request::from_route(&route);
             let res = match self.send(&request).await {
                 Ok(r) => r,
                 Err(detail) => {
@@ -781,30 +809,49 @@ impl ActionExecutor {
         guild_id: &str,
     ) -> Result<Option<EveryoneOverwrite>, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
-        let req = Self::request_of(self.inner.factory.channel(channel))
-            .map_err(DiscordError::Unavailable)?;
+        let req = Self::request_of(self.inner.factory.channel(channel))?;
         // Reads use the paced lane with a single attempt (channel verbs run
-        // under the router's own pacing; the 5 s abort still applies).
-        let body = self.call_once(req, &[200]).await?;
-        let Some(doc) = body else { return Ok(None) };
-        let overwrites = doc
-            .get("permission_overwrites")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        // under the router's own pacing; the 5 s abort still applies). The
+        // raw body is validated strictly here: an unreadable channel document
+        // must refuse — reading it as "absent" would PUT a fabricated
+        // zero-mask overwrite and erase live allow/deny bits (finding 3).
+        // Only a proven-absent entry (valid document, array present, no
+        // @everyone row) returns `Ok(None)`. Read-only, so refusal is
+        // Rejected (safe pre-mutation).
+        let res = self.call_once_raw(req, &[200]).await?;
+        let doc: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
+            DiscordError::Rejected(format!("unreadable channel {channel_id}: body is not JSON"))
+        })?;
+        let overwrites = doc.get("permission_overwrites").ok_or_else(|| {
+            DiscordError::Rejected(format!(
+                "unreadable channel {channel_id}: missing permission_overwrites"
+            ))
+        })?;
+        let overwrites = overwrites.as_array().ok_or_else(|| {
+            DiscordError::Rejected(format!(
+                "unreadable channel {channel_id}: permission_overwrites is not an array"
+            ))
+        })?;
         for entry in overwrites {
             let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let kind = entry.get("type").and_then(|v| v.as_u64()).unwrap_or(99);
             if id == guild_id && kind == 0 {
-                let allow = entry
-                    .get("allow")
-                    .map(|v| v.as_str().unwrap_or("0").to_owned())
-                    .unwrap_or_else(|| "0".to_owned());
-                let deny = entry
-                    .get("deny")
-                    .map(|v| v.as_str().unwrap_or("0").to_owned())
-                    .unwrap_or_else(|| "0".to_owned());
-                return Ok(Some(EveryoneOverwrite { allow, deny }));
+                let mask = |field: &str| {
+                    entry
+                        .get(field)
+                        .and_then(|v| v.as_str())
+                        .filter(|s| s.parse::<u64>().is_ok())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            DiscordError::Rejected(format!(
+                                "unreadable channel {channel_id}: @everyone overwrite has a non-numeric {field} mask"
+                            ))
+                        })
+                };
+                return Ok(Some(EveryoneOverwrite {
+                    allow: mask("allow")?,
+                    deny: mask("deny")?,
+                }));
             }
         }
         Ok(None)
@@ -830,9 +877,14 @@ impl ActionExecutor {
         let deny_bits = deny
             .parse::<u64>()
             .map_err(|_| DiscordError::Rejected(format!("bad deny mask: {deny}")))?;
+        // `from_bits_retain`, not `truncate`: unmodeled bits (e.g. 1 << 48,
+        // absent from the pinned model) must round-trip on the wire, or the
+        // preservation/restoration contract silently drops them (finding 4).
+        // `Permissions` serializes as its decimal bits string, so retained
+        // bits are sent losslessly.
         let overwrite = PermissionOverwrite {
-            allow: Some(Permissions::from_bits_truncate(allow_bits)),
-            deny: Some(Permissions::from_bits_truncate(deny_bits)),
+            allow: Some(Permissions::from_bits_retain(allow_bits)),
+            deny: Some(Permissions::from_bits_retain(deny_bits)),
             id: target,
             kind: PermissionOverwriteType::Role,
         };
@@ -841,8 +893,8 @@ impl ActionExecutor {
                 .factory
                 .update_channel_permission(channel, &overwrite)
                 .reason(&reason),
-        )
-        .map_err(DiscordError::Unavailable)?;
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
         self.call_once(req, &[200, 204]).await.map(|_| ())
     }
 
@@ -863,8 +915,8 @@ impl ActionExecutor {
                 .delete_channel_permission(channel)
                 .role(target.cast())
                 .reason(&reason),
-        )
-        .map_err(DiscordError::Unavailable)?;
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
         self.call_once(req, &[200, 204, 404]).await.map(|_| ())
     }
 
@@ -888,8 +940,8 @@ impl ActionExecutor {
                 .update_channel(channel)
                 .rate_limit_per_user(seconds)
                 .reason(&reason),
-        )
-        .map_err(DiscordError::Unavailable)?;
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
         self.call_once(req, &[200]).await.map(|_| ())
     }
 
@@ -907,8 +959,7 @@ impl ActionExecutor {
             .clamp(1, 100)
             .try_into()
             .map_err(|_| DiscordError::Rejected(format!("purge out of range: {count}")))?;
-        let list_req = Self::request_of(self.inner.factory.channel_messages(channel).limit(limit))
-            .map_err(DiscordError::Unavailable)?;
+        let list_req = Self::request_of(self.inner.factory.channel_messages(channel).limit(limit))?;
         let listed = self.call_once(list_req, &[200]).await?.unwrap_or_default();
         let ids: Vec<Id<MessageMarker>> = listed
             .as_array()
@@ -927,8 +978,8 @@ impl ActionExecutor {
                     .factory
                     .delete_message(channel, ids[0])
                     .reason(&reason),
-            )
-            .map_err(DiscordError::Unavailable)?;
+            )?;
+            // request_of maps pre-send build failures to Rejected (finding 7).
             self.call_once(req, &[200, 204]).await?;
             return Ok(1);
         }
@@ -937,46 +988,76 @@ impl ActionExecutor {
                 .factory
                 .delete_messages(channel, &ids)
                 .reason(&reason),
-        )
-        .map_err(DiscordError::Unavailable)?;
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
         self.call_once(req, &[200, 204]).await?;
         Ok(ids.len() as u64)
     }
 
     /// Post a message with mention suppression (legacy
-    /// `allowed_mentions: { parse: [] }`). Asserts the 2000-char ceiling
-    /// before sending; returns the message id (`""` when Discord omits it).
+    /// `allowed_mentions: { parse: [] }`). Asserts the legacy 2000 UTF-16-unit
+    /// ceiling before sending; returns the message id (`""` when Discord
+    /// omits it). A numeric nonce is sent with `enforce_nonce: true` for
+    /// duplicate suppression.
     pub async fn post_message(
         &self,
         channel_id: &str,
         content: &str,
         nonce: Option<u64>,
     ) -> Result<String, DiscordError> {
-        if content.chars().count() > MAX_MESSAGE_CHARS {
+        self.send_message(channel_id, content, nonce.map(serde_json::Value::from))
+            .await
+    }
+
+    /// Raw message send shared by [`Self::post_message`] and the audit
+    /// string-nonce path: the pinned Twilight `CreateMessage` builder only
+    /// models a `u64` nonce and never serializes `enforce_nonce`, so the body
+    /// is built explicitly — method and path stay twilight-owned via
+    /// `Route::CreateMessage` (finding 5). `nonce` is either a JSON number or
+    /// a ≤25-char string (Discord's string-nonce ceiling, which is exactly
+    /// what `audit::delivery_nonce` mints).
+    async fn send_message(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: Option<serde_json::Value>,
+    ) -> Result<String, DiscordError> {
+        // Legacy ceiling is UTF-16 units (two-bot counts JS string length),
+        // not scalar values: 1001 astral chars are 2002 units and must be
+        // rejected with zero wire calls (finding 8).
+        let units = utf16_len(content);
+        if units > MAX_MESSAGE_CHARS {
             return Err(DiscordError::Rejected(format!(
-                "message is {} characters; Discord's ceiling is {MAX_MESSAGE_CHARS}",
-                content.chars().count()
+                "message is {units} UTF-16 units; Discord's ceiling is {MAX_MESSAGE_CHARS}"
             )));
         }
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
-        let mentions = AllowedMentions {
-            parse: vec![],
-            replied_user: false,
-            roles: vec![],
-            users: vec![],
-        };
-        let mut create = self
-            .inner
-            .factory
-            .create_message(channel)
-            .content(content)
-            .allowed_mentions(Some(&mentions));
-        if let Some(n) = nonce {
-            create = create.nonce(n);
+        if let Some(serde_json::Value::String(s)) = &nonce {
+            if s.is_empty() || s.len() > 25 {
+                return Err(DiscordError::Rejected(format!(
+                    "bad nonce: string nonces must be 1-25 chars, got {}",
+                    s.len()
+                )));
+            }
         }
-        let req = Self::request_of(create).map_err(DiscordError::Unavailable)?;
-        let body = self.call_once(req, &[200, 201]).await?.unwrap_or_default();
-        Ok(body
+        let mut body = serde_json::json!({
+            "content": content,
+            "allowed_mentions": {"parse": []},
+        });
+        if let Some(n) = nonce {
+            body["nonce"] = n;
+            body["enforce_nonce"] = serde_json::Value::Bool(true);
+        }
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|e| DiscordError::Rejected(format!("build message body: {e}")))?;
+        let req = Request::builder(&Route::CreateMessage {
+            channel_id: channel.get(),
+        })
+        .body(body_bytes)
+        .build()
+        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
+        let answered = self.call_once(req, &[200, 201]).await?.unwrap_or_default();
+        Ok(answered
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -1029,13 +1110,16 @@ impl ActionExecutor {
                 content,
                 nonce,
             } => {
-                let parsed = nonce
-                    .as_deref()
-                    .map(str::parse::<u64>)
-                    .transpose()
-                    .map_err(|_| DiscordError::Rejected("bad nonce".to_owned()))?;
+                // `audit::delivery_nonce` mints `oa_...` strings that can never
+                // parse as u64 — carry them as string nonces with enforcement
+                // instead of rejecting them (finding 5). Numeric strings keep
+                // the numeric wire shape.
+                let value = nonce.as_deref().map(|s| match s.parse::<u64>() {
+                    Ok(n) => serde_json::Value::from(n),
+                    Err(_) => serde_json::Value::from(s),
+                });
                 Ok(ChannelCallOutcome::Posted {
-                    message_id: self.post_message(channel_id, content, parsed).await?,
+                    message_id: self.send_message(channel_id, content, value).await?,
                 })
             }
         }
@@ -1060,8 +1144,8 @@ impl ActionExecutor {
                 .factory
                 .interaction(application)
                 .set_guild_commands(guild, commands),
-        )
-        .map_err(DiscordError::Unavailable)?;
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
         // Publish is idempotent registry sync: paced lane, 429 parks and 5xx
         // back off within the same budget as kicks.
         let mut attempts: u32 = 0;
@@ -1108,8 +1192,8 @@ impl ActionExecutor {
                 .factory
                 .interaction(Id::<ApplicationMarker>::new(1))
                 .create_response(interaction_id, interaction_token, response),
-        )
-        .map_err(DiscordError::Unavailable)?;
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
         let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
             .await
             .map_err(|_| DiscordError::Timeout)?
@@ -1156,7 +1240,12 @@ impl ActionExecutor {
             }
             ActionOutcome::Purged { channel_id, .. } => {
                 let count = exec.count.unwrap_or(0);
-                self.purge(channel_id, count, &exec.reason).await?;
+                let affected = self.purge(channel_id, count, &exec.reason).await?;
+                return Ok(ActionOutcome::Purged {
+                    channel_id: channel_id.clone(),
+                    // `purge` counts listed ids (≤100 by clamp); always fits.
+                    affected: affected as usize,
+                });
             }
             ActionOutcome::SlowmodeUpdated {
                 channel_id,
@@ -1310,6 +1399,10 @@ fn audit_reason(reason: &str) -> Result<String, DiscordError> {
 
 /// `timeout` until timestamp: now + duration, RFC 3339 (legacy
 /// `new Date(now + seconds * 1000).toISOString()`).
+///
+/// The offset is rendered `+00:00`, not `Z`: pinned Twilight 0.17.1
+/// `Timestamp::parse` rejects inputs shorter than `...+00:00` (25 chars), so
+/// the `Z` form never survived `timeout_member` (finding 1).
 #[must_use]
 pub fn timeout_until_iso(duration_seconds: u64) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1322,7 +1415,7 @@ pub fn timeout_until_iso(duration_seconds: u64) -> String {
 }
 
 fn format_iso_secs(epoch_secs: u64) -> String {
-    // Days-based civil conversion (Howard Hinnant's algorithm) + HH:MM:SSZ.
+    // Days-based civil conversion (Howard Hinnant's algorithm) + HH:MM:SS.
     let days = (epoch_secs / 86_400) as i64;
     let secs = epoch_secs % 86_400;
     let z = days + 719_468;
@@ -1336,7 +1429,7 @@ fn format_iso_secs(epoch_secs: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     y += i64::from(m <= 2);
     format!(
-        "{y:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        "{y:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
         m,
         d,
         secs / 3600,
@@ -1346,43 +1439,79 @@ fn format_iso_secs(epoch_secs: u64) -> String {
 }
 
 /// Raw GET route for an absolute `/api/v10`-relative path the executor builds
-/// for paced reads (uncharted query shapes stay string-built; the typed
-/// builders cover every mutation).
-fn raw_get_route(path: &str) -> Route<'static> {
-    // Only the channel-messages list needs a query; everything else is a
-    // bare resource GET. Route Display renders the query string twilight's
-    // way so the mock sees byte-identical paths.
-    if let Some((base, query)) = path.split_once('?') {
-        if base.starts_with("/channels/") && base.ends_with("/messages") {
-            let channel_id = base
-                .trim_start_matches("/channels/")
-                .trim_end_matches("/messages")
-                .parse::<u64>()
-                .unwrap_or(0);
-            let mut limit = None;
-            for pair in query.split('&') {
-                if let Some(v) = pair.strip_prefix("limit=") {
-                    limit = v.parse::<u16>().ok();
+/// for paced reads (uncharted query shapes are refused; the typed builders
+/// cover every mutation). All query parameters the parity §6 reads use are
+/// preserved — dropping `before` would page the newest history forever
+/// (finding 2). Route Display renders the query string twilight's way so the
+/// mock sees byte-identical paths.
+fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
+    let err = || format!("unsupported GET path: {path}");
+    let (base, query) = match path.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => (path, ""),
+    };
+    // Route borrows nothing here (u64/bool fields); the 'static bound is
+    // satisfied because no borrowed variant is constructed.
+    if let Some(id) = base.strip_prefix("/guilds/") {
+        let (guild_part, rest) = match id.split_once('/') {
+            Some((g, r)) => (g, Some(r)),
+            None => (id, None),
+        };
+        let guild_id: u64 = guild_part.parse().map_err(|_| err())?;
+        if guild_id == 0 {
+            return Err(err());
+        }
+        return match rest {
+            None => Ok(Route::GetGuild {
+                guild_id,
+                with_counts: query_param(query, "with_counts").is_some_and(|v| v == "true"),
+            }),
+            Some("members") => Ok(Route::GetGuildMembers {
+                after: query_param(query, "after").and_then(|v| v.parse().ok()),
+                guild_id,
+                limit: query_param(query, "limit").and_then(|v| v.parse().ok()),
+            }),
+            Some("scheduled-events") => Ok(Route::GetGuildScheduledEvents {
+                guild_id,
+                with_user_count: query_param(query, "with_user_count").is_some_and(|v| v == "true"),
+            }),
+            _ => Err(err()),
+        };
+    }
+    if let Some(id) = base.strip_prefix("/channels/") {
+        let (channel_part, rest) = match id.split_once('/') {
+            Some((c, r)) => (c, Some(r)),
+            None => (id, None),
+        };
+        let channel_id: u64 = channel_part.parse().map_err(|_| err())?;
+        if channel_id == 0 {
+            return Err(err());
+        }
+        return match rest {
+            None => {
+                if query.is_empty() {
+                    Ok(Route::GetChannel { channel_id })
+                } else {
+                    Err(err())
                 }
             }
-            // Route borrows nothing here (u64 fields); the 'static bound is
-            // satisfied because no borrowed variant is constructed.
-            return Route::GetMessages {
-                after: None,
-                around: None,
-                before: None,
+            Some("messages") => Ok(Route::GetMessages {
+                after: query_param(query, "after").and_then(|v| v.parse().ok()),
+                around: query_param(query, "around").and_then(|v| v.parse().ok()),
+                before: query_param(query, "before").and_then(|v| v.parse().ok()),
                 channel_id,
-                limit,
-            };
-        }
-        let _ = query;
+                limit: query_param(query, "limit").and_then(|v| v.parse().ok()),
+            }),
+            _ => Err(err()),
+        };
     }
-    if let Some(rest) = path.strip_prefix("/channels/") {
-        if let Ok(channel_id) = rest.parse::<u64>() {
-            return Route::GetChannel { channel_id };
-        }
-    }
-    Route::GetChannel { channel_id: 0 }
+    Err(err())
+}
+
+/// First `key=value` pair value in a raw query string.
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    query.split('&').find_map(|pair| pair.strip_prefix(&prefix))
 }
 
 /// One paced-lane retry decision (legacy `rest.ts` / `kick.ts` policy made
@@ -1568,9 +1697,13 @@ mod tests {
 
     #[test]
     fn timeout_until_is_iso_and_additive() {
+        use twilight_model::util::datetime::Timestamp;
         let a = timeout_until_iso(60);
         let b = timeout_until_iso(3600);
-        assert!(a.ends_with('Z') && b.ends_with('Z'));
+        // The pinned Twilight parser only accepts the +00:00 offset form
+        // (25+ chars); a trailing Z never survived timeout_member (finding 1).
+        assert!(a.ends_with("+00:00") && b.ends_with("+00:00"));
+        assert!(Timestamp::parse(&a).is_ok(), "executor output parses: {a}");
         assert!(b > a, "longer duration must sort later: {a} vs {b}");
     }
 
