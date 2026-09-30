@@ -38,8 +38,9 @@
 //! Burst coalescing is the atomic claim, not the pure check: concurrent
 //! activity passes through the store's `claim_sticky_post` (one `UPDATE …
 //! RETURNING`), so exactly one attempt wins the re-post window while the
-//! losers report [`ActivityOutcome::Held`]. The pure
-//! [`decide_activity`] mirrors the predicate for tests and pre-checks.
+//! losers report [`ActivityOutcome::Held`]. The pure [`decide_activity`] is
+//! only a debounce/gateway precheck: it does not read claim state and never
+//! authorizes a post. Callers must acquire the atomic claim even after `Repost`.
 
 use std::collections::HashMap;
 
@@ -53,11 +54,9 @@ pub const DEFAULT_DEBOUNCE_SECONDS: u64 = 5;
 pub const MIN_DEBOUNCE_SECONDS: u64 = 1;
 /// Debounce ceiling (legacy `debounce > 300` rejected + `setMaxValue(300)`).
 pub const MAX_DEBOUNCE_SECONDS: u64 = 300;
-/// Sticky body ceiling in characters (legacy `MAX_BODY = 2000`; the DB
-/// `CHECK (length(body) BETWEEN 1 AND 2000)` agrees. Postgres `length()`
-/// counts characters while JS `.length` counts UTF-16 units — identical for
-/// BMP text, one-per-emoji apart for astral-plane text; the Rust side counts
-/// `char`s, matching Postgres).
+/// Sticky body ceiling in UTF-16 units (legacy `MAX_BODY = 2000` and JS
+/// `.length`). The PostgreSQL character-count check is a looser backstop:
+/// astral characters occupy two UTF-16 units but one database character.
 pub const MAX_BODY_CHARS: usize = 2000;
 /// Stale-claim horizon (legacy `expiredClaimCutoff = now - 60_000`): a claim
 /// older than this no longer blocks a new attempt (crashed re-poster).
@@ -77,10 +76,10 @@ pub enum StickyError {
     BadDebounce,
 }
 
-/// Validate a sticky body: 1–2000 characters (legacy `requireBody`, no trim —
-/// whitespace-only bodies pass, matching legacy).
+/// Validate a sticky body: 1–2000 UTF-16 units (legacy `requireBody`, no trim
+/// — whitespace-only bodies pass, matching legacy).
 pub fn validate_body(body: &str) -> Result<(), StickyError> {
-    let len = body.chars().count();
+    let len = body.encode_utf16().count();
     if !(1..=MAX_BODY_CHARS).contains(&len) {
         return Err(StickyError::BodyLength);
     }
@@ -178,17 +177,18 @@ pub fn activity_eligible(author_is_bot: bool, guild_matches: bool, channel_prese
     !author_is_bot && guild_matches && channel_present
 }
 
-/// Pure decision for one accepted message, mirroring the store claim
-/// predicate for tests and pre-checks. The atomic claim stays authoritative
-/// under concurrency: two racing activities can both read `Repost` here while
-/// only one wins the `UPDATE … RETURNING`.
+/// Pure gateway/debounce precheck for one accepted message. Claim state is
+/// deliberately omitted from [`StickyState`], so even an already-held claim
+/// can return `Repost` here. Only the atomic store claim authorizes a post:
+/// two racing activities can both pass this check while only one wins the
+/// `UPDATE … RETURNING`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityDecision {
     /// Never reaches the check (bot author, foreign guild, no channel).
     Ignore,
     /// No enabled sticky in this channel.
     NoSticky,
-    /// Inside the debounce window (or claim held): coalesced, no re-post.
+    /// Inside the debounce window: coalesced, no re-post.
     Hold,
     /// Outside the window: post `body`, then delete `previous_message_id`
     /// (best-effort) once the replacement is recorded.
@@ -198,7 +198,8 @@ pub enum ActivityDecision {
     },
 }
 
-/// Decide one activity against an optional sticky row.
+/// Precheck one activity against an optional sticky row. A `Repost` result
+/// still requires [`store::claim_sticky_post`] before any Discord side effect.
 #[must_use]
 pub fn decide_activity(
     state: Option<&StickyState>,
@@ -636,8 +637,22 @@ mod tests {
             validate_body(&"x".repeat(2001)),
             Err(StickyError::BodyLength)
         );
-        // Multibyte counts as characters (matches Postgres length()).
+        // BMP characters occupy one UTF-16 unit regardless of UTF-8 width.
         assert!(validate_body(&"é".repeat(2000)).is_ok());
+    }
+
+    #[test]
+    fn body_length_counts_legacy_utf16_units() {
+        assert!(validate_body(&"😀".repeat(1000)).is_ok());
+        assert_eq!(
+            validate_body(&"😀".repeat(1001)),
+            Err(StickyError::BodyLength)
+        );
+        assert!(validate_body(&format!("{}😀", "é".repeat(1998))).is_ok());
+        assert_eq!(
+            validate_body(&format!("{}😀", "é".repeat(1999))),
+            Err(StickyError::BodyLength)
+        );
     }
 
     #[test]

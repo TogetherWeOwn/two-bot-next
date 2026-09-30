@@ -52,5 +52,22 @@ CREATE TABLE IF NOT EXISTS automation_audit_log (
   created_at timestamptz NOT NULL
 );
 
+-- CREATE IF NOT EXISTS cannot upgrade an existing legacy 0015/0016 table.
+-- Repair the pre-lease shape too, then convert all timestamp columns. Legacy
+-- ISO-8601 strings carry UTC/offsets; the cast preserves the instant and NULLs
+-- and fails on invalid data rather than silently discarding it. Casting an
+-- already-timestamptz column is also safe (fresh install / DDL reapplication).
+ALTER TABLE sticky_messages ADD COLUMN IF NOT EXISTS claim_token TEXT;
+ALTER TABLE sticky_messages ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
+
+ALTER TABLE sticky_messages
+  ALTER COLUMN last_posted_at TYPE timestamptz USING last_posted_at::timestamptz,
+  ALTER COLUMN created_at TYPE timestamptz USING created_at::timestamptz,
+  ALTER COLUMN updated_at TYPE timestamptz USING updated_at::timestamptz,
+  ALTER COLUMN claimed_at TYPE timestamptz USING claimed_at::timestamptz;
+
+ALTER TABLE automation_audit_log
+  ALTER COLUMN created_at TYPE timestamptz USING created_at::timestamptz;
+
 CREATE INDEX IF NOT EXISTS idx_automation_audit_guild_time
   ON automation_audit_log (guild_id, created_at);
