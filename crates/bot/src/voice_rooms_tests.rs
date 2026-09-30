@@ -71,10 +71,11 @@ fn room(channel_id: u64) -> VoiceRoom {
 
 struct Store {
     trace: Trace,
-    creators: Vec<CreatorChannel>,
+    creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     persist_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
+    add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
 }
 
@@ -82,10 +83,11 @@ impl Store {
     fn new(trace: Trace) -> Self {
         Self {
             trace,
-            creators: vec![CreatorChannel::new(GUILD, CREATOR)],
+            creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
             persist_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
+            add_creator_error: Mutex::new(None),
             after_persist: None,
         }
     }
@@ -93,10 +95,21 @@ impl Store {
 
 impl RoomPersistence for Store {
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
-        Ok(self.creators.clone())
+        Ok(self.creators.lock().unwrap().clone())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
         Ok(self.rooms.lock().unwrap().values().cloned().collect())
+    }
+    async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
+        if let Some(error) = *self.add_creator_error.lock().unwrap() {
+            return Err(error);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("add_creator:{}", creator.channel_id));
+        self.creators.lock().unwrap().push(creator.clone());
+        Ok(())
     }
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
         self.trace
@@ -882,4 +895,381 @@ async fn runtime_actor_creates_persists_and_moves_room() {
         *trace.lock().unwrap(),
         ["create", "persist:500", "move:300:500"]
     );
+}
+
+// --- S4 `/create` + `/setup` handler tests ----------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use twilight_model::{
+    application::{
+        command::CommandType,
+        interaction::application_command::{CommandData, CommandDataOption},
+    },
+    guild::{MemberFlags, PartialMember},
+    oauth::ApplicationIntegrationMap,
+};
+
+fn member_with(permissions: Option<Permissions>) -> PartialMember {
+    PartialMember {
+        avatar: None,
+        avatar_decoration_data: None,
+        banner: None,
+        communication_disabled_until: None,
+        deaf: false,
+        flags: MemberFlags::empty(),
+        joined_at: None,
+        mute: false,
+        nick: None,
+        permissions,
+        premium_since: None,
+        roles: Vec::new(),
+        user: None,
+    }
+}
+
+fn command_option(name: &str, value: &str) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::String(value.to_owned()),
+    }
+}
+
+fn command_data(name: &str, options: Vec<CommandDataOption>) -> CommandData {
+    CommandData {
+        guild_id: None,
+        id: Id::new(3),
+        name: name.to_owned(),
+        kind: CommandType::ChatInput,
+        options,
+        resolved: None,
+        target_id: None,
+    }
+}
+
+#[allow(deprecated)]
+fn voice_interaction(
+    command: Option<CommandData>,
+    permissions: Option<Permissions>,
+    with_guild: bool,
+) -> Interaction {
+    Interaction {
+        app_permissions: None,
+        application_id: Id::new(1),
+        authorizing_integration_owners: ApplicationIntegrationMap {
+            guild: None,
+            user: None,
+        },
+        channel: None,
+        channel_id: None,
+        context: None,
+        data: command.map(|data| InteractionData::ApplicationCommand(Box::new(data))),
+        entitlements: Vec::new(),
+        guild: None,
+        guild_id: if with_guild {
+            Some(Id::new(GUILD))
+        } else {
+            None
+        },
+        guild_locale: None,
+        id: Id::new(2),
+        kind: InteractionType::ApplicationCommand,
+        locale: None,
+        member: if with_guild {
+            Some(member_with(permissions))
+        } else {
+            None
+        },
+        message: None,
+        token: "token".to_owned(),
+        user: None,
+    }
+}
+
+fn response_text(response: &InteractionResponse) -> String {
+    response
+        .data
+        .as_ref()
+        .and_then(|data| data.content.clone())
+        .unwrap_or_default()
+}
+
+async fn handle_capture(
+    runtime: &VoiceRuntime<Store, Http>,
+    interaction: &Interaction,
+) -> (bool, Option<InteractionResponse>) {
+    let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
+    let writer = seen.clone();
+    let owned = handle_voice_interaction(runtime, interaction, |response| {
+        *writer.lock().unwrap() = Some(response);
+        async {}
+    })
+    .await;
+    let response = seen.lock().unwrap().clone();
+    (owned, response)
+}
+
+#[test]
+fn parse_create_extracts_name_option() {
+    let interaction = voice_interaction(
+        Some(command_data(
+            "create",
+            vec![command_option("name", "lobby")],
+        )),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Create {
+            name: "lobby".to_owned()
+        })
+    );
+    assert_eq!(interaction_guild(&interaction), Some(GUILD));
+}
+
+#[test]
+fn parse_create_without_name_defaults_blank_for_refusal() {
+    let interaction = voice_interaction(
+        Some(command_data("create", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Create {
+            name: String::new()
+        })
+    );
+}
+
+#[test]
+fn parse_setup_command() {
+    let interaction = voice_interaction(Some(command_data("setup", Vec::new())), None, true);
+    assert_eq!(parse_voice_command(&interaction), Some(VoiceCommand::Setup));
+}
+
+#[test]
+fn parse_ignores_unowned_commands() {
+    let other = voice_interaction(Some(command_data("other", Vec::new())), None, true);
+    assert_eq!(parse_voice_command(&other), None);
+    let guildless = voice_interaction(Some(command_data("setup", Vec::new())), None, false);
+    assert_eq!(parse_voice_command(&guildless), None);
+    assert_eq!(interaction_guild(&guildless), None);
+    let mut ping = voice_interaction(
+        Some(command_data(
+            "create",
+            vec![command_option("name", "lobby")],
+        )),
+        None,
+        true,
+    );
+    ping.kind = InteractionType::Ping;
+    ping.data = None;
+    assert_eq!(parse_voice_command(&ping), None);
+}
+
+#[test]
+fn ephemeral_response_is_ephemeral_channel_message() {
+    let response = ephemeral_response("hello");
+    assert_eq!(
+        response.kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let data = response.data.expect("ephemeral content");
+    assert_eq!(data.content.as_deref(), Some("hello"));
+    assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+}
+
+#[test]
+fn may_create_accepts_admin_or_manage_channels() {
+    assert!(may_create(Some(Permissions::MANAGE_CHANNELS)));
+    assert!(may_create(Some(Permissions::ADMINISTRATOR)));
+    assert!(may_create(Some(
+        Permissions::ADMINISTRATOR | Permissions::MANAGE_CHANNELS
+    )));
+    assert!(!may_create(None));
+    assert!(!may_create(Some(Permissions::VIEW_CHANNEL)));
+}
+
+#[test]
+fn failure_line_formats_each_category() {
+    assert_eq!(
+        failure_line(&LifecycleFailure::CategoryFull {
+            creator_id: CREATOR,
+            message: "category is full".to_owned(),
+        }),
+        "create <#200>: category is full"
+    );
+    assert!(failure_line(&LifecycleFailure::Discord {
+        channel_id: 500,
+        error: RoomHttpError::AccessDenied,
+    })
+    .contains("channel <#500>"));
+    assert!(failure_line(&LifecycleFailure::Persistence {
+        channel_id: Some(500),
+        error: StoreError::Unavailable,
+    })
+    .contains("store <#500>"));
+    assert!(failure_line(&LifecycleFailure::Persistence {
+        channel_id: None,
+        error: StoreError::Unavailable,
+    })
+    .starts_with("store:"));
+}
+
+#[tokio::test]
+async fn handle_create_refuses_without_manage_channels() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = voice_interaction(
+        Some(command_data(
+            "create",
+            vec![command_option("name", "lobby")],
+        )),
+        None,
+        true,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(response_text(response.as_ref().expect("reply")).contains("Manage Channels"));
+    assert!(!trace.lock().unwrap().iter().any(|entry| entry == "create"));
+}
+
+#[tokio::test]
+async fn handle_create_success_persists_creator() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = voice_interaction(
+        Some(command_data(
+            "create",
+            vec![command_option("name", "lobby")],
+        )),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let response = response.expect("reply");
+    assert_eq!(
+        response.kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    assert!(response_text(&response).contains("Created <#500>"));
+    assert!(trace.lock().unwrap().contains(&"create".to_owned()));
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&"add_creator:500".to_owned()));
+}
+
+#[tokio::test]
+async fn handle_create_blank_name_refuses_before_rest() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = voice_interaction(
+        Some(command_data("create", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert!(response_text(response.as_ref().expect("reply")).contains("a name"));
+    assert!(!trace.lock().unwrap().iter().any(|entry| entry == "create"));
+}
+
+#[tokio::test]
+async fn handle_setup_lists_seeded_creator() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    let interaction = voice_interaction(Some(command_data("setup", Vec::new())), None, true);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("Voice rooms"));
+    assert!(text.contains(&format!("<#{CREATOR}>")));
+}
+
+#[tokio::test]
+async fn handle_ignores_non_voice_interactions() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    let interaction = voice_interaction(Some(command_data("other", Vec::new())), None, true);
+    let called = Arc::new(AtomicBool::new(false));
+    let flag = called.clone();
+    let owned = handle_voice_interaction(&runtime, &interaction, |_| {
+        flag.store(true, Ordering::SeqCst);
+        async {}
+    })
+    .await;
+    assert!(!owned);
+    assert!(!called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn execute_create_rest_failure_never_touches_store() {
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    let http = Http::new(trace.clone());
+    http.create_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    assert!(text.contains("Manage Channels"));
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("add_creator")));
+}
+
+#[tokio::test]
+async fn execute_create_rate_limit_reports_retry_seconds() {
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    let http = Http::new(trace.clone());
+    http.create_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 1500,
+            global: false,
+        });
+    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    assert!(text.contains("2s"));
+}
+
+#[tokio::test]
+async fn execute_create_store_failure_deletes_channel_as_compensation() {
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    *store.add_creator_error.lock().unwrap() = Some(StoreError::Unavailable);
+    let http = Http::new(trace.clone());
+    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    assert!(text.contains("removed"));
+    assert_eq!(*trace.lock().unwrap(), ["create", "delete:500"]);
+}
+
+#[tokio::test]
+async fn execute_create_store_credential_pause() {
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    *store.add_creator_error.lock().unwrap() = Some(StoreError::CredentialRefused);
+    let http = Http::new(trace.clone());
+    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    assert!(text.contains("paused"));
+    assert_eq!(*trace.lock().unwrap(), ["create", "delete:500"]);
+}
+
+#[tokio::test]
+async fn runtime_worker_status_reports_live_actor() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    let status = tokio::time::timeout(Duration::from_secs(5), runtime.worker_status(GUILD))
+        .await
+        .expect("status reply")
+        .expect("live actor");
+    assert_eq!(status.tracked_rooms, 0);
+    assert!(!status.halted);
 }

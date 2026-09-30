@@ -19,12 +19,16 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
-    channel::{permission_overwrite::PermissionOverwrite, Channel},
+    application::interaction::{
+        application_command::CommandOptionValue, Interaction, InteractionData, InteractionType,
+    },
+    channel::{message::MessageFlags, permission_overwrite::PermissionOverwrite, Channel},
     guild::{Permissions, Role},
+    http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     id::{marker::RoleMarker, Id},
 };
 use two_bot_core::{
@@ -61,6 +65,10 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
     ) -> impl Future<Output = Result<Vec<VoiceRoom>, StoreError>> + Send;
+    fn add_creator(
+        &self,
+        creator: &CreatorChannel,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn persist(&self, room: &VoiceRoom) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
@@ -76,6 +84,11 @@ impl RoomPersistence for PgRoomStore {
 
     async fn rooms(&self, guild: Snowflake) -> Result<Vec<VoiceRoom>, StoreError> {
         self.rooms_in_guild(guild).await.map_err(store_error)
+    }
+
+    async fn add_creator(&self, creator: &CreatorChannel) -> Result<(), StoreError> {
+        self.add_creator(creator).await.map_err(store_error)?;
+        Ok(())
     }
 
     async fn persist(&self, room: &VoiceRoom) -> Result<(), StoreError> {
@@ -1083,6 +1096,8 @@ enum ActorCommand {
     ChannelUpsert(Box<Channel>),
     ChannelRemove(Snowflake),
     RefreshBot(BotAccess),
+    /// One-shot worker snapshot for `/setup` (room count, failures, halt).
+    Status(oneshot::Sender<WorkerStatus>),
 }
 
 /// Per-guild actor registry. Actors spawn lazily on the first complete
@@ -1195,6 +1210,21 @@ where
                 .ok()
             })
             .is_some()
+    }
+
+    /// Fresh store/http pair from the actor factory (used by the S4 command
+    /// handlers for creator rows and channel writes outside the queue).
+    fn make_pair(&self) -> (S, H) {
+        (self.make)()
+    }
+
+    /// Snapshot the live worker for `/setup`. `None` when the guild has no
+    /// actor yet (before the first GuildCreate) or its inbox already drained.
+    pub async fn worker_status(&self, guild: Snowflake) -> Option<WorkerStatus> {
+        let tx = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        tx.send(ActorCommand::Status(reply)).ok()?;
+        inbox.await.ok()
     }
 
     /// Drop the guild actor (GuildDelete). The task exits once its inbox drains.
@@ -1371,6 +1401,13 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::RefreshBot(access) => {
             worker.live.refresh_bot(access);
             worker.reconcile();
+        }
+        ActorCommand::Status(reply) => {
+            let _ = reply.send(WorkerStatus {
+                tracked_rooms: worker.tracked().len(),
+                failures: worker.failures().iter().map(failure_line).collect(),
+                halted: worker.halted(),
+            });
         }
     }
 }
@@ -1586,6 +1623,223 @@ pub fn voice_command_set(gates: &VoiceGates) -> Vec<CommandDefinition> {
         voice_commands()
     } else {
         Vec::new()
+    }
+}
+
+// --- `/create` + `/setup` interaction handlers (S4) ---------------------------
+//
+// Pure parse and auth stay testable without Discord; execution runs one
+// guarded REST/SQL round-trip per command and answers with a single
+// ephemeral response. Reply transport errors are the caller's to log: the
+// handler attempts the response exactly once.
+
+/// A voice slash command carried by an interaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceCommand {
+    Create { name: String },
+    Setup,
+}
+
+/// Guild the interaction was invoked in. `PartialMember` carries no guild, so
+/// the top-level `guild_id` is authoritative.
+#[must_use]
+pub fn interaction_guild(interaction: &Interaction) -> Option<Snowflake> {
+    interaction.guild_id.map(|id| id.get())
+}
+
+/// Parse a voice command, or `None` for anything this slice does not own
+/// (non-command interactions, other commands, guild-less invocations).
+#[must_use]
+pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
+    if interaction.kind != InteractionType::ApplicationCommand {
+        return None;
+    }
+    let InteractionData::ApplicationCommand(command) = interaction.data.as_ref()? else {
+        return None;
+    };
+    interaction_guild(interaction)?;
+    match command.name.as_str() {
+        "create" => {
+            let name = command
+                .options
+                .iter()
+                .find(|option| option.name == "name")
+                .and_then(|option| match &option.value {
+                    CommandOptionValue::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Some(VoiceCommand::Create { name })
+        }
+        "setup" => Some(VoiceCommand::Setup),
+        _ => None,
+    }
+}
+
+/// `/create` needs Manage Channels; admins pass everywhere. `/setup` is
+/// view-open, so this gate applies to `/create` only. Fail closed on
+/// missing permissions.
+fn may_create(permissions: Option<Permissions>) -> bool {
+    permissions.is_some_and(|permissions| {
+        permissions.intersects(Permissions::ADMINISTRATOR | Permissions::MANAGE_CHANNELS)
+    })
+}
+
+/// Ephemeral `ChannelMessageWithSource` reply shell.
+#[must_use]
+pub fn ephemeral_response(content: &str) -> InteractionResponse {
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            content: Some(content.to_owned()),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
+/// Live worker snapshot for `/setup`: room count, recent failure lines and
+/// the credential-halt flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerStatus {
+    pub tracked_rooms: usize,
+    pub failures: Vec<String>,
+    pub halted: bool,
+}
+
+fn failure_line(failure: &LifecycleFailure) -> String {
+    match failure {
+        LifecycleFailure::CategoryFull {
+            creator_id,
+            message,
+        } => format!("create <#{creator_id}>: {message}"),
+        LifecycleFailure::Discord { channel_id, error } => {
+            format!("channel <#{channel_id}>: {error}")
+        }
+        LifecycleFailure::Persistence { channel_id, error } => match channel_id {
+            Some(channel) => format!("store <#{channel}>: {error:?}"),
+            None => format!("store: {error:?}"),
+        },
+    }
+}
+
+/// Execute one `/create`: validate the name, single-attempt the voice channel
+/// POST, then store the creator row. A REST failure refuses without touching
+/// the store; a store failure deletes the new channel as compensation.
+async fn execute_create<S: RoomPersistence, H: RoomWrites>(
+    store: &S,
+    http: &H,
+    guild_id: Snowflake,
+    name: &str,
+) -> String {
+    let attributes = RoomChannelAttributes {
+        parent_id: None,
+        bitrate: None,
+        rtc_region: None,
+        video_quality_mode: None,
+        nsfw: false,
+        user_limit: 0,
+        overwrites: Vec::new(),
+    };
+    let always: WriteGuard = Arc::new(|| true);
+    let channel = match http
+        .create(guild_id, name, &attributes, always.clone())
+        .await
+    {
+        Ok(channel) => channel,
+        Err(error) => return create_error_text(error),
+    };
+    let channel_id = channel.id.get();
+    match store
+        .add_creator(&CreatorChannel::new(guild_id, channel_id))
+        .await
+    {
+        Ok(()) => format!("Created <#{channel_id}>: join it to spin up temporary voice rooms."),
+        Err(error) => {
+            let _ = http.delete(channel_id, always).await;
+            match error {
+                StoreError::CredentialRefused => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
+                _ => "Could not save the new creator channel, so it was removed. Try again.".to_owned(),
+            }
+        }
+    }
+}
+
+fn create_error_text(error: RoomHttpError) -> String {
+    match error {
+        RoomHttpError::Unauthorized => "Voice rooms are paused: Discord refused the bot credential. Tell an admin to fix the token, then restart the bot.".to_owned(),
+        RoomHttpError::AccessDenied => {
+            "I cannot create channels here: I need Manage Channels. Tell an admin to fix my permissions.".to_owned()
+        }
+        RoomHttpError::RateLimited { retry_after_ms, .. } => {
+            format!("Discord is rate-limiting channel creates; try again in {}s.", retry_after_ms.div_ceil(1000))
+        }
+        _ => "Discord refused the channel create. Check my permissions and try again.".to_owned(),
+    }
+}
+
+/// Handle one interaction, replying exactly once. Returns true when the
+/// interaction was a voice command (even when refused); false means another
+/// slice owns it. `reply` performs the single response attempt.
+pub async fn handle_voice_interaction<S, H, F>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    reply: impl FnOnce(InteractionResponse) -> F + Send,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
+    let Some(command) = parse_voice_command(interaction) else {
+        return false;
+    };
+    let Some(guild_id) = interaction_guild(interaction) else {
+        return false;
+    };
+    match command {
+        VoiceCommand::Setup => {
+            let (store, _) = runtime.make_pair();
+            let creators = store.creators(guild_id).await.unwrap_or_default();
+            let status = runtime.worker_status(guild_id).await;
+            let panel = setup_panel(&SetupSummary {
+                guild_id,
+                creators,
+                tracked_rooms: status.as_ref().map_or(0, |status| status.tracked_rooms),
+                failures: status
+                    .as_ref()
+                    .map_or_else(Vec::new, |status| status.failures.clone()),
+                halted: status.as_ref().is_some_and(|status| status.halted),
+            });
+            reply(ephemeral_response(&format!(
+                "**{}**\n{}",
+                panel.title, panel.description
+            )))
+            .await;
+            true
+        }
+        VoiceCommand::Create { name } => {
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_create(permissions) {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /create.",
+                ))
+                .await;
+                return true;
+            }
+            let text = match decide_create_channel(CreateChannelRequest { guild_id, name }) {
+                CreateChannelPlan::Refuse { message } => message,
+                CreateChannelPlan::Create { guild_id, name } => {
+                    let (store, http) = runtime.make_pair();
+                    execute_create(&store, &http, guild_id, &name).await
+                }
+            };
+            reply(ephemeral_response(&text)).await;
+            true
+        }
     }
 }
 
