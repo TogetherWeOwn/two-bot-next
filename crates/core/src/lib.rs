@@ -5,6 +5,7 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod automod;
 pub mod commands;
 pub mod config;
 pub mod events;
@@ -19,8 +20,18 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod moderation;
+pub mod rsvp;
+#[cfg(feature = "db")]
+pub mod rsvp_store;
+pub mod sticky;
 pub mod voice;
 
+pub use automod::{
+    match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
+    AutomodExportError, AutomodExportRule, AutomodFilter, AutomodGateError, AutomodMessage,
+    AutomodPolicy, AutomodSanction, RepeatTracker, SanctionAction, DEFAULT_BLOCKED_ATTACHMENTS,
+    DEFAULT_SANCTIONS,
+};
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
 pub use events::{CoreEvent, VoiceSessionDelta};
@@ -60,6 +71,25 @@ pub use moderation::{
     require_moderation_reason, ModerationAction, ModerationActor, ModerationGateError,
     ModerationGates, ModerationPolicy, ModerationRequest, ModerationTarget, PolicyError,
     ReasonError, TargetProtection,
+};
+pub use rsvp::{
+    attendance_totals_text, checkin_classification, checkin_duplicate_text,
+    checkin_idempotency_key, checkin_metadata_json, checkin_recorded_text, checkin_source,
+    checkin_source_event_id, is_snowflake, partition_rsvps, require_manage_events, rsvp_saved_text,
+    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceProof,
+    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
+    ATTENDANCE_EVENT_TYPE, RSVP_AUDIT_ACTION,
+};
+#[cfg(feature = "db")]
+pub use rsvp_store::{
+    list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+};
+pub use sticky::{
+    activity_eligible, automations_enabled, claim_blocks, decide_activity, normalize_debounce,
+    repost_due, sticky_removed_reply, sticky_set_reply, validate_body, ActivityDecision,
+    ActivityOutcome, ClaimGrant, PutSticky, RemoveOutcome, StickyAudit, StickyAuditAction,
+    StickyAuditOutcome, StickyError, StickyState, CLAIM_EXPIRY_SECONDS, DEFAULT_DEBOUNCE_SECONDS,
+    MAX_BODY_CHARS, MAX_DEBOUNCE_SECONDS, MIN_DEBOUNCE_SECONDS,
 };
 pub use voice::{
     average_known_voice_duration, count_unknown_starts_per_window, find_blind_windows,
