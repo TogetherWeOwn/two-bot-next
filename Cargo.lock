@@ -2188,6 +2188,7 @@ dependencies = [
 name = "two-bot-core"
 version = "0.1.0"
 dependencies = [
+ "rand",
  "regex",
  "serde",
  "serde_json",
