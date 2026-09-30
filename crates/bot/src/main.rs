@@ -1,9 +1,9 @@
 //! two-bot-next container entrypoint.
 //!
-//! S1 skeleton: serves liveness (`/health`) and readiness (`/readyz`) and
-//! owns the gateway shard supervisor seam. Without `DISCORD_TOKEN` the shard
-//! stays parked and `/readyz` reports `gateway: down` (HTTP 503) — the
-//! Container boots healthy on staging config either way.
+//! Serves liveness (`/health`) and readiness (`/readyz`) and runs the gateway
+//! shard supervisor (S3). Without `DISCORD_TOKEN` the shard stays parked and
+//! `/readyz` reports `gateway: down` (HTTP 503) — the Container boots healthy
+//! on staging config either way.
 
 mod gateway;
 mod server;
@@ -14,11 +14,14 @@ use tokio::sync::RwLock;
 use tracing::info;
 use two_bot_core::{ComponentStatus, Config};
 
-use gateway::GatewayState;
+use gateway::{
+    build_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard, GatewayState,
+};
 use server::serve;
 
 #[tokio::main]
 async fn main() {
+    ensure_crypto_provider();
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot
     // rot behind an HTTP-client upgrade.
@@ -45,8 +48,13 @@ async fn main() {
 
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
 
-    if config.gateway_configured() {
-        info!("discord token present; gateway supervisor armed (S3 connects)");
+    if let Some(token) = config.discord_token.clone().filter(|t| !t.is_empty()) {
+        // S5 offers the persisted session here for RESUME; fresh IDENTIFY
+        // until then.
+        let shard = build_shard(token, intents_from_env(), None);
+        let pipeline = Arc::new(build_pipeline());
+        info!("discord token present; gateway shard connecting");
+        tokio::spawn(run_shard(shard, pipeline, Arc::clone(&state)));
     } else {
         info!(
             status = ?ComponentStatus::Down,
