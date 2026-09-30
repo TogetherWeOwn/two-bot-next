@@ -162,10 +162,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn guild_command_publish_classifies_to_guild_template() {
+    #[tokio::test]
+    async fn guild_command_publish_classifies_to_guild_template() {
         use twilight_http::request::TryIntoRequest;
         // Real twilight builder: the exact request publish_guild_commands sends.
+        // Needs a Tokio context: Client::builder spawns the ratelimit actor.
         let client = twilight_http::Client::builder().build();
         let request = client
             .interaction(Id::<ApplicationMarker>::new(1))
