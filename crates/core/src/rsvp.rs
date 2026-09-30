@@ -1,0 +1,613 @@
+//! RSVP + host check-in attendance domain: transitions, totals, reply text.
+//!
+//! Slice TOG-10083 (S4 RSVP). Ports the DB-free, framework-free heart of
+//! legacy two-bot RSVP (`src/announcements/service.ts`: `rsvp`, `attendance`;
+//! `src/announcements/discord.ts`: the `/rsvp` and `/attendance` replies) and
+//! host check-in (`src/analytics/communityAttendance.ts`:
+//! `recordCommunityAttendance`; `src/analytics/communityFacts.ts`:
+//! `recordAttendance`) as pure functions over plain data. Storage lands in
+//! the `rsvp_store` module (sqlx, behind the `db` feature); the interaction
+//! router (TOG-10075) and REST executor (TOG-10076) consume the outcome enums
+//! and reply-text helpers here, so every transition and refusal is
+//! unit-testable without Discord or Postgres.
+//!
+//! Source files (legacy `two-bot`, frozen `main`):
+//! - transitions + totals: `src/announcements/service.ts` (`rsvp`,
+//!   `attendance`) + `src/announcements/store.ts` (`putRsvp`, `listRsvps`).
+//! - replies: `src/announcements/discord.ts` (`handleCommand` `rsvp` /
+//!   `attendance` cases) and `src/analytics/communityAttendance.ts` (check-in
+//!   replies).
+//! - check-in fact: `src/analytics/communityFacts.ts` (`recordAttendance`:
+//!   the `rsvp` proof writes nothing, every other proof appends one
+//!   `event_attended` fact keyed `event-attended:{occurrence}:{actor}`).
+//!
+//! Naming: the scorecard `/attendance` keeps the `attendance` name; the RSVP
+//! totals command is namespaced to `rsvp-attendance` (parity §1 #24–#25, see
+//! `feature_commands.rs`). The merge in `commands.rs` is first-wins, so a
+//! repeated name can never silently drop a command again — the registry test
+//! below pins the published set.
+//!
+//! Deliberately out of scope: LFG + feeds (TOG-10084/TOG-10085), the full
+//! community classifier (S5; check-in carries the minimal bot/human rule
+//! until it lands), and Discord delivery (router/executor slices).
+
+use super::commands::PERM_MANAGE_EVENTS;
+
+/// An RSVP response (legacy `RsvpStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RsvpStatus {
+    Going,
+    Interested,
+    Declined,
+}
+
+impl RsvpStatus {
+    /// All three responses in legacy choice order.
+    pub const ALL: [Self; 3] = [Self::Going, Self::Interested, Self::Declined];
+
+    /// Wire value (`going`, … — legacy `status` column + `/rsvp` choices).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Going => "going",
+            Self::Interested => "interested",
+            Self::Declined => "declined",
+        }
+    }
+
+    /// Parse a wire value. Discord enforces the choices, so anything else is
+    /// a caller bug, surfaced as [`RsvpError::UnknownStatus`].
+    pub fn parse(value: &str) -> Result<Self, RsvpError> {
+        match value {
+            "going" => Ok(Self::Going),
+            "interested" => Ok(Self::Interested),
+            "declined" => Ok(Self::Declined),
+            other => Err(RsvpError::UnknownStatus(other.to_owned())),
+        }
+    }
+}
+
+impl std::fmt::Display for RsvpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Invalid RSVP input. Messages mirror the legacy throws so router surfacing
+/// stays byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RsvpError {
+    #[error("event id must be a Discord id.")]
+    InvalidEventId,
+    #[error("unknown RSVP status {0:?}: expected going, interested or declined.")]
+    UnknownStatus(String),
+}
+
+/// True when `s` is a Discord snowflake (legacy `/^\d{17,20}$/`).
+#[must_use]
+pub fn is_snowflake(s: &str) -> bool {
+    (17..=20).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Validate an `/rsvp` or `/rsvp-attendance` event id (legacy
+/// `assertSnowflake(eventId, 'event id')`).
+pub fn validate_event_id(value: &str) -> Result<String, RsvpError> {
+    if is_snowflake(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(RsvpError::InvalidEventId)
+    }
+}
+
+/// One RSVP row (legacy `EventRsvpRow`): the durable per-member response.
+/// `responded_at` is ISO-8601 UTC; the store binds it as `timestamptz`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsvpRecord {
+    pub guild_id: String,
+    pub event_id: String,
+    pub user_id: String,
+    pub status: RsvpStatus,
+    pub responded_at: String,
+}
+
+/// What one write changed (legacy `putRsvp` is a blind upsert; the read-back
+/// of the previous row is what makes going/interested/declined transitions
+/// observable to the router).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsvpTransition {
+    pub previous: Option<RsvpStatus>,
+    pub current: RsvpStatus,
+}
+
+impl RsvpTransition {
+    /// First response from this member for this event.
+    #[must_use]
+    pub fn is_new(self) -> bool {
+        self.previous.is_none()
+    }
+
+    /// The member moved between responses (including re-selecting the same
+    /// one — legacy still rewrites `responded_at` and audits every response).
+    #[must_use]
+    pub fn changed(self) -> bool {
+        self.previous.is_some_and(|p| p != self.current)
+    }
+}
+
+/// Partitioned totals (legacy `service.attendance` return): member ids per
+/// response, in store order (`responded_at, user_id`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RsvpTotals {
+    pub going: Vec<String>,
+    pub interested: Vec<String>,
+    pub declined: Vec<String>,
+}
+
+impl RsvpTotals {
+    /// `(going, interested, declined)` counts for the totals reply.
+    #[must_use]
+    pub fn counts(&self) -> (usize, usize, usize) {
+        (self.going.len(), self.interested.len(), self.declined.len())
+    }
+
+    /// Total responses across all three buckets.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.going.len() + self.interested.len() + self.declined.len()
+    }
+}
+
+/// Partition rows into totals, preserving input order (legacy filters
+/// `going` / `interested` / `declined` over `listRsvps` order).
+#[must_use]
+pub fn partition_rsvps(records: &[RsvpRecord]) -> RsvpTotals {
+    let mut totals = RsvpTotals::default();
+    for record in records {
+        match record.status {
+            RsvpStatus::Going => totals.going.push(record.user_id.clone()),
+            RsvpStatus::Interested => totals.interested.push(record.user_id.clone()),
+            RsvpStatus::Declined => totals.declined.push(record.user_id.clone()),
+        }
+    }
+    totals
+}
+
+/// `/rsvp` reply (legacy `` `RSVP saved: ${status}.` ``, ephemeral).
+#[must_use]
+pub fn rsvp_saved_text(status: RsvpStatus) -> String {
+    format!("RSVP saved: {}.", status.as_str())
+}
+
+/// `/rsvp-attendance` totals reply (legacy `` `Going: ${g}\nInterested:
+/// ${i}\nDeclined: ${d}` ``, ephemeral).
+#[must_use]
+pub fn attendance_totals_text(totals: &RsvpTotals) -> String {
+    let (going, interested, declined) = totals.counts();
+    format!("Going: {going}\nInterested: {interested}\nDeclined: {declined}")
+}
+
+/// Host check-in refusal or malformed input.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CheckinError {
+    /// Legacy LFG wording, reused: the scorecard `/attendance` command gates
+    /// `ManageEvents` in Discord, and the router enforces it server-side too.
+    #[error("Manage Events permission is required.")]
+    MissingManageEvents,
+    #[error("event occurrence must not be empty.")]
+    EmptyOccurrence,
+}
+
+/// Server-side `ManageEvents` gate for host check-in (parity §1 #12: the
+/// scorecard `/attendance` handler). Discord enforces the command's
+/// `default_member_permissions`; this is the defense-in-depth check the
+/// router runs before recording.
+pub fn require_manage_events(permissions: u64) -> Result<(), CheckinError> {
+    if permissions & PERM_MANAGE_EVENTS == PERM_MANAGE_EVENTS {
+        Ok(())
+    } else {
+        Err(CheckinError::MissingManageEvents)
+    }
+}
+
+/// Validate a host check-in occurrence id (legacy trims the
+/// `event-occurrence` option; an empty id records nothing addressable, so it
+/// is refused instead).
+pub fn validate_occurrence_id(value: &str) -> Result<String, CheckinError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(CheckinError::EmptyOccurrence)
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
+/// Attendance proof (legacy `AttendanceProof`). Only `host_checkin` is
+/// produced by this slice; the other variants are carried so the
+/// `rsvp`-writes-nothing rule ports exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttendanceProof {
+    HostCheckin,
+    DurableCheckin,
+    Voice600s,
+    Rsvp,
+}
+
+impl AttendanceProof {
+    /// Metadata value (legacy `proof` field).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostCheckin => "host_checkin",
+            Self::DurableCheckin => "durable_checkin",
+            Self::Voice600s => "voice_600s",
+            Self::Rsvp => "rsvp",
+        }
+    }
+
+    /// Whether this proof appends a fact (legacy `recordAttendance` returns
+    /// `false` without writing for the `rsvp` proof).
+    #[must_use]
+    pub fn writes_fact(self) -> bool {
+        !matches!(self, Self::Rsvp)
+    }
+}
+
+impl std::fmt::Display for AttendanceProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Verified-attendance fact identity (legacy `recordAttendance`):
+/// `event_type = 'event_attended'`, `source_event_id =
+/// '{occurrence}:{actor}'`, `source = 'event:{occurrence}'`, idempotency key
+/// `event-attended:{occurrence}:{actor}`.
+pub const ATTENDANCE_EVENT_TYPE: &str = "event_attended";
+
+/// `source_event_id` for a check-in fact.
+#[must_use]
+pub fn checkin_source_event_id(event_occurrence_id: &str, member_id: &str) -> String {
+    format!("{event_occurrence_id}:{member_id}")
+}
+
+/// `source` for a check-in fact.
+#[must_use]
+pub fn checkin_source(event_occurrence_id: &str) -> String {
+    format!("event:{event_occurrence_id}")
+}
+
+/// Idempotency key for a check-in fact: retries dedupe, distinct members and
+/// occurrences never collide.
+#[must_use]
+pub fn checkin_idempotency_key(event_occurrence_id: &str, member_id: &str) -> String {
+    format!("event-attended:{event_occurrence_id}:{member_id}")
+}
+
+/// `metadata` JSON for a check-in fact (legacy `{ eventOccurrenceId, proof }`).
+#[must_use]
+pub fn checkin_metadata_json(event_occurrence_id: &str, proof: AttendanceProof) -> String {
+    serde_json::json!({
+        "eventOccurrenceId": event_occurrence_id,
+        "proof": proof.as_str(),
+    })
+    .to_string()
+}
+
+/// Minimal check-in classification (legacy `CommunityClassifier` precedence
+/// reduced to the bot flag: bots classify `bot`, everyone else
+/// `eligible_human`). The full classifier — staff/raid/staging/test actor
+/// lists — is S5-owned; the store takes explicit classification inputs so it
+/// picks the S5 classifier up without a signature change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttendanceClassification {
+    pub classification: &'static str,
+    pub matched_rule: &'static str,
+}
+
+/// Classify a host check-in subject (legacy rules `discord_bot` /
+/// `no_exclusion_matched`). Bots are recorded — never refused — so the fact
+/// retains the `bot` classification and can never enter human attendance.
+#[must_use]
+pub fn checkin_classification(member_is_bot: bool) -> AttendanceClassification {
+    if member_is_bot {
+        AttendanceClassification {
+            classification: "bot",
+            matched_rule: "discord_bot",
+        }
+    } else {
+        AttendanceClassification {
+            classification: "eligible_human",
+            matched_rule: "no_exclusion_matched",
+        }
+    }
+}
+
+/// Host check-in recorded reply (legacy `` `Recorded <@${id}> for event
+/// occurrence \`${occ}\`.` ``).
+#[must_use]
+pub fn checkin_recorded_text(member_id: &str, event_occurrence_id: &str) -> String {
+    format!("Recorded <@{member_id}> for event occurrence `{event_occurrence_id}`.")
+}
+
+/// Host check-in duplicate reply (legacy `` `Attendance for <@${id}> and
+/// event occurrence \`${occ}\` was already recorded.` ``).
+#[must_use]
+pub fn checkin_duplicate_text(member_id: &str, event_occurrence_id: &str) -> String {
+    format!(
+        "Attendance for <@{member_id}> and event occurrence \
+         `{event_occurrence_id}` was already recorded."
+    )
+}
+
+/// Audit action for RSVP writes (legacy `event.rsvp`; every response is
+/// audited, including repeats).
+pub const RSVP_AUDIT_ACTION: &str = "event.rsvp";
+
+/// One `announcements_audit_log` row (legacy `AnnouncementsAuditInput` plus
+/// the caller-supplied id and timestamp). The id is an input — not generated
+/// here — so this module stays free of randomness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsvpAudit {
+    pub id: String,
+    pub guild_id: String,
+    pub actor_id: Option<String>,
+    pub action: String,
+    pub target_key: Option<String>,
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
+impl RsvpAudit {
+    /// Audit row for one RSVP response: action `event.rsvp`, target the
+    /// event, outcome the new status (legacy `service.rsvp` audit call).
+    #[must_use]
+    pub fn for_rsvp(id: &str, record: &RsvpRecord) -> Self {
+        Self {
+            id: id.to_owned(),
+            guild_id: record.guild_id.clone(),
+            actor_id: Some(record.user_id.clone()),
+            action: RSVP_AUDIT_ACTION.to_owned(),
+            target_key: Some(record.event_id.clone()),
+            outcome: record.status.as_str().to_owned(),
+            reason: None,
+            created_at: record.responded_at.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::merge_commands;
+    use crate::feature_commands::feature_commands;
+    use crate::moderation::moderation_commands;
+
+    const GUILD: &str = "1545644954272137297";
+    const EVENT: &str = "1546451670500642999";
+    const USER: &str = "1546451670500642888";
+
+    fn record(status: RsvpStatus, user: &str, at: &str) -> RsvpRecord {
+        RsvpRecord {
+            guild_id: GUILD.to_owned(),
+            event_id: EVENT.to_owned(),
+            user_id: user.to_owned(),
+            status,
+            responded_at: at.to_owned(),
+        }
+    }
+
+    #[test]
+    fn status_round_trips_wire_values_in_legacy_order() {
+        let values: Vec<_> = RsvpStatus::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(values, ["going", "interested", "declined"]);
+        for status in RsvpStatus::ALL {
+            assert_eq!(RsvpStatus::parse(status.as_str()), Ok(status));
+            assert_eq!(status.to_string(), status.as_str());
+        }
+        assert!(matches!(
+            RsvpStatus::parse("Going"),
+            Err(RsvpError::UnknownStatus(_))
+        ));
+        assert!(matches!(
+            RsvpStatus::parse(""),
+            Err(RsvpError::UnknownStatus(_))
+        ));
+    }
+
+    #[test]
+    fn event_id_must_be_a_snowflake() {
+        assert_eq!(validate_event_id(EVENT), Ok(EVENT.to_owned()));
+        assert_eq!(validate_event_id("1"), Err(RsvpError::InvalidEventId));
+        assert_eq!(
+            validate_event_id("not-an-id"),
+            Err(RsvpError::InvalidEventId)
+        );
+        assert_eq!(
+            validate_event_id(&"9".repeat(21)),
+            Err(RsvpError::InvalidEventId)
+        );
+        // 17-digit lower bound and 20-digit upper bound both pass.
+        assert!(validate_event_id(&"1".repeat(17)).is_ok());
+        assert!(validate_event_id(&"9".repeat(20)).is_ok());
+        assert!(!is_snowflake("1234567890123456x"));
+    }
+
+    #[test]
+    fn transitions_distinguish_new_change_and_repeat() {
+        let fresh = RsvpTransition {
+            previous: None,
+            current: RsvpStatus::Going,
+        };
+        assert!(fresh.is_new());
+        assert!(!fresh.changed());
+        let moved = RsvpTransition {
+            previous: Some(RsvpStatus::Going),
+            current: RsvpStatus::Interested,
+        };
+        assert!(!moved.is_new());
+        assert!(moved.changed());
+        // Re-selecting the same status still rewrites responded_at + audits.
+        let repeat = RsvpTransition {
+            previous: Some(RsvpStatus::Going),
+            current: RsvpStatus::Going,
+        };
+        assert!(!repeat.changed());
+    }
+
+    #[test]
+    fn totals_partition_preserves_store_order() {
+        let rows = vec![
+            record(RsvpStatus::Going, USER, "2026-09-10T10:00:00.000Z"),
+            record(
+                RsvpStatus::Declined,
+                "1546451670500642777",
+                "2026-09-10T10:01:00.000Z",
+            ),
+            record(
+                RsvpStatus::Going,
+                "1546451670500642778",
+                "2026-09-10T10:02:00.000Z",
+            ),
+            record(
+                RsvpStatus::Interested,
+                "1546451670500642779",
+                "2026-09-10T10:03:00.000Z",
+            ),
+        ];
+        let totals = partition_rsvps(&rows);
+        assert_eq!(totals.going, [USER, "1546451670500642778"]);
+        assert_eq!(totals.interested, ["1546451670500642779"]);
+        assert_eq!(totals.declined, ["1546451670500642777"]);
+        assert_eq!(totals.counts(), (2, 1, 1));
+        assert_eq!(totals.total(), 4);
+        assert_eq!(partition_rsvps(&[]), RsvpTotals::default());
+    }
+
+    #[test]
+    fn reply_texts_match_legacy_byte_for_byte() {
+        assert_eq!(
+            rsvp_saved_text(RsvpStatus::Interested),
+            "RSVP saved: interested."
+        );
+        assert_eq!(
+            attendance_totals_text(&RsvpTotals {
+                going: vec!["a".to_owned(), "b".to_owned()],
+                interested: vec!["c".to_owned()],
+                declined: vec![],
+            }),
+            "Going: 2\nInterested: 1\nDeclined: 0"
+        );
+        assert_eq!(
+            checkin_recorded_text("human-1", "event-1"),
+            "Recorded <@human-1> for event occurrence `event-1`."
+        );
+        assert_eq!(
+            checkin_duplicate_text("human-1", "event-1"),
+            "Attendance for <@human-1> and event occurrence `event-1` was already recorded."
+        );
+    }
+
+    #[test]
+    fn checkin_gate_requires_manage_events() {
+        assert!(require_manage_events(PERM_MANAGE_EVENTS).is_ok());
+        // Combined with unrelated bits the gate still passes.
+        assert!(require_manage_events(PERM_MANAGE_EVENTS | 0x20).is_ok());
+        assert_eq!(
+            require_manage_events(0),
+            Err(CheckinError::MissingManageEvents)
+        );
+        // Moderation bits alone do not open check-in.
+        assert_eq!(
+            require_manage_events(4),
+            Err(CheckinError::MissingManageEvents)
+        );
+    }
+
+    #[test]
+    fn occurrence_id_trims_and_rejects_empty() {
+        assert_eq!(
+            validate_occurrence_id("  event-1  "),
+            Ok("event-1".to_owned())
+        );
+        assert_eq!(
+            validate_occurrence_id("   "),
+            Err(CheckinError::EmptyOccurrence)
+        );
+        assert_eq!(
+            validate_occurrence_id(""),
+            Err(CheckinError::EmptyOccurrence)
+        );
+    }
+
+    #[test]
+    fn rsvp_proof_writes_no_fact() {
+        assert!(AttendanceProof::HostCheckin.writes_fact());
+        assert!(AttendanceProof::DurableCheckin.writes_fact());
+        assert!(AttendanceProof::Voice600s.writes_fact());
+        assert!(!AttendanceProof::Rsvp.writes_fact());
+        assert_eq!(AttendanceProof::HostCheckin.as_str(), "host_checkin");
+        assert_eq!(AttendanceProof::Rsvp.to_string(), "rsvp");
+    }
+
+    #[test]
+    fn checkin_fact_identity_matches_legacy() {
+        assert_eq!(ATTENDANCE_EVENT_TYPE, "event_attended");
+        assert_eq!(
+            checkin_source_event_id("event-1", "human-1"),
+            "event-1:human-1"
+        );
+        assert_eq!(checkin_source("event-1"), "event:event-1");
+        assert_eq!(
+            checkin_idempotency_key("event-1", "human-1"),
+            "event-attended:event-1:human-1"
+        );
+        assert_eq!(
+            checkin_metadata_json("event-1", AttendanceProof::HostCheckin),
+            r#"{"eventOccurrenceId":"event-1","proof":"host_checkin"}"#
+        );
+    }
+
+    #[test]
+    fn checkin_classification_keeps_bots_out_of_human_attendance() {
+        let human = checkin_classification(false);
+        assert_eq!(human.classification, "eligible_human");
+        assert_eq!(human.matched_rule, "no_exclusion_matched");
+        // Bots are recorded, never refused, with the bot classification.
+        let bot = checkin_classification(true);
+        assert_eq!(bot.classification, "bot");
+        assert_eq!(bot.matched_rule, "discord_bot");
+    }
+
+    #[test]
+    fn audit_row_carries_event_and_outcome() {
+        let audit = RsvpAudit::for_rsvp(
+            "audit-id",
+            &record(RsvpStatus::Declined, USER, "2026-09-10T10:00:00.000Z"),
+        );
+        assert_eq!(audit.action, "event.rsvp");
+        assert_eq!(audit.actor_id.as_deref(), Some(USER));
+        assert_eq!(audit.target_key.as_deref(), Some(EVENT));
+        assert_eq!(audit.outcome, "declined");
+        assert_eq!(audit.reason, None);
+        assert_eq!(audit.created_at, "2026-09-10T10:00:00.000Z");
+    }
+
+    #[test]
+    fn published_set_has_no_attendance_collision() {
+        // Scorecard keeps `attendance`; RSVP totals ship namespaced as
+        // `rsvp-attendance`. First-wins merge must publish each exactly once.
+        let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
+            .expect("slices merge cleanly");
+        // 2 core + 16 feature + 9 moderation: nothing deduped away.
+        assert_eq!(merged.len(), 27);
+        let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
+        for name in ["attendance", "rsvp", "rsvp-attendance"] {
+            assert_eq!(
+                names.iter().filter(|n| **n == name).count(),
+                1,
+                "{name} published exactly once"
+            );
+        }
+    }
+}
