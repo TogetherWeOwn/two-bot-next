@@ -50,7 +50,10 @@ pub use handlers::{
     NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow, VoiceEndedFact,
     VoiceInput, VoiceStartedFact,
 };
-pub use health::{ComponentStatus, HealthReport};
+pub use health::{
+    classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
+    VoiceFailureKind, VoiceHealthReport, VoicePermission, VoicePermissionScope, VoiceReadiness,
+};
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
     summarize_attribution_split, AttributionCategory, AttributionSplit, DowntimeWindow,
