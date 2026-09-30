@@ -86,8 +86,9 @@ On an actual level-up, the runtime reads the current ladder and member roles,
 plans grants with `staging_revoke_allowed = false`, and sends idempotent role PUTs
 through the shared executor. It sends no channel announcement. Ordinary runtime
 never constructs a revoke fence. Separately authorized callers must supply
-`StagingRevokeFence` with distinct staging/production identities; production and
-nonstaging guilds are rejected before any I/O. For a nonempty revoke set, current
+`StagingRevokeFence` whose staging/production identities match the existing
+pinned TWO identities in `backup::guild_config`; callers cannot relabel production
+as staging. Production and nonstaging guilds are rejected before any I/O. For a nonempty revoke set, current
 bot identity/roles and the guild role catalog must prove Manage Roles (or
 Administrator), a complete catalog, nonmanaged targets and strict hierarchy for
 **every** target before any grant/removal is sent. Discord permission changes

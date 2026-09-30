@@ -370,8 +370,8 @@ impl HyperTransport {
 }
 
 /// A separately authorized staging revoke operation. It is never constructed
-/// by the level-up path. Deployment supplies both guild identities; ambiguous
-/// identities are refused, and the production identity is always denied.
+/// by the level-up path. Both deployment identities must match the existing
+/// pinned TWO identities, so configuration cannot relabel production as staging.
 #[derive(Debug, Clone, Copy)]
 pub struct StagingRevokeFence {
     staging_guild: u64,
@@ -380,7 +380,10 @@ pub struct StagingRevokeFence {
 
 impl StagingRevokeFence {
     pub fn new(staging_guild: u64, production_guild: u64) -> Result<Self, DiscordError> {
-        if staging_guild == 0 || production_guild == 0 || staging_guild == production_guild {
+        use two_bot_core::backup::guild_config::{LIVE_GUILD_ID, TWO_STAGING_GUILD_ID};
+        if staging_guild.to_string() != TWO_STAGING_GUILD_ID
+            || production_guild.to_string() != LIVE_GUILD_ID
+        {
             return Err(DiscordError::Rejected(
                 "invalid staging revoke fence".into(),
             ));

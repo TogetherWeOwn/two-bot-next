@@ -7,8 +7,9 @@ use serde_json::json;
 use two_bot_core::leveling::{plan_reward_roles, LevelRoleReward, RewardRolePlan};
 use two_bot_discord::{executor::StagingRevokeFence, ActionExecutor, DiscordError};
 
-const GUILD: u64 = 2222;
-const PRODUCTION: u64 = 9999;
+// Public pinned identities, used only to prove refusal and on the mock wire.
+const GUILD: u64 = 1545644954272137297;
+const PRODUCTION: u64 = 326474832151838730;
 const USER: u64 = 3333;
 
 fn executor(mock: &MockRest) -> ActionExecutor {
@@ -31,7 +32,7 @@ fn preflight(
     missing: bool,
 ) -> Vec<ScriptedResponse> {
     let mut roles = vec![
-        json!({"id":"2222","permissions":"0","position":0,"managed":false}),
+        json!({"id":GUILD.to_string(),"permissions":"0","position":0,"managed":false}),
         json!({"id":"8888","permissions": if manage_roles {"268435456"} else {"0"},"position":10,"managed":false}),
         json!({"id":"6666","permissions":"0","position":1,"managed":false}),
     ];
@@ -68,7 +69,7 @@ async fn ordinary_grants_are_idempotent_and_never_remove_roles() {
     assert_eq!(requests[0].method, "PUT");
     assert_eq!(
         requests[0].path,
-        "/api/v10/guilds/2222/members/3333/roles/5555"
+        format!("/api/v10/guilds/{GUILD}/members/3333/roles/5555")
     );
     assert!(requests[0]
         .header("x-audit-log-reason")
@@ -95,6 +96,17 @@ async fn revoke_requires_explicit_staging_fence_before_any_io() {
         ));
     }
     assert!(StagingRevokeFence::new(PRODUCTION, PRODUCTION).is_err());
+    assert!(StagingRevokeFence::new(PRODUCTION, GUILD).is_err());
+    assert!(StagingRevokeFence::new(1234, PRODUCTION).is_err());
+    assert!(StagingRevokeFence::new(GUILD, 9999).is_err());
+    assert_eq!(
+        GUILD.to_string(),
+        two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID
+    );
+    assert_eq!(
+        PRODUCTION.to_string(),
+        two_bot_core::backup::guild_config::LIVE_GUILD_ID
+    );
     assert!(mock.requests().is_empty());
     mock.shutdown().await;
 }
