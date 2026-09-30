@@ -224,7 +224,7 @@ pub struct HyperTransport {
     >,
     scheme_http: bool,
     host: String,
-    token: String,
+    token: two_bot_core::Secret<String>,
 }
 
 impl HyperTransport {
@@ -283,7 +283,7 @@ impl HyperTransport {
             inner,
             scheme_http,
             host,
-            token,
+            token: two_bot_core::Secret::new(token),
         })
     }
 
@@ -308,7 +308,7 @@ impl HyperTransport {
         if let Some(headers) = builder.headers_mut() {
             headers.insert(
                 hyper::header::AUTHORIZATION,
-                hyper::header::HeaderValue::from_str(&self.token)
+                hyper::header::HeaderValue::from_str(self.token.expose())
                     .map_err(|e| format!("bad token header: {e}"))?,
             );
             if let Some(bytes) = request.body() {

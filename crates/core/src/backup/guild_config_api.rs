@@ -15,6 +15,8 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+use crate::Secret;
+
 use super::guild_config_restore::RestorePlan;
 use super::http::{self, HttpError, HttpMethod};
 
@@ -70,7 +72,7 @@ pub fn checked_base(
 pub struct GuildConfigDiscordApi {
     pub api_base: String,
     pub cdn_base: String,
-    pub token: String,
+    pub token: Secret<String>,
     pub application_id: String,
     pub guild_id: String,
     pub writes: u64,
@@ -96,7 +98,7 @@ impl GuildConfigDiscordApi {
                 "GUILD_CONFIG_CDN_BASE",
                 "https://cdn.discordapp.com",
             )?,
-            token,
+            token: Secret::new(token),
             application_id,
             guild_id,
             writes: 0,
@@ -105,7 +107,7 @@ impl GuildConfigDiscordApi {
     }
 
     fn auth_header(&self) -> (String, String) {
-        ("authorization".to_owned(), format!("Bot {}", self.token))
+        ("authorization".to_owned(), format!("Bot {}", self.token.expose()))
     }
 
     /// GET with Discord 429 handling: honour `retry_after` (capped at 30 s),

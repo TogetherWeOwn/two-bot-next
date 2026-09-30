@@ -597,7 +597,7 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
     let timeout_ms: u64 = env_var("TWO_BACKUP_S3_TIMEOUT_MS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(300_000);
-    match http::put(&signed.url, signed.headers, body, timeout_ms.div_ceil(1000)).await {
+    match http::put(signed.url.expose(), signed.headers.expose().clone(), body, timeout_ms.div_ceil(1000)).await {
         Ok(res) => {
             if !(200..300).contains(&res.status.as_u16()) {
                 eprintln!(

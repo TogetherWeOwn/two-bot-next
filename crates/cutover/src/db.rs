@@ -38,14 +38,15 @@ pub async fn connect(
         ));
     }
     let mut options = PgConnectOptions::from_str(url)
-        .map_err(|e| sqlx::Error::InvalidArgument(format!("invalid database URL: {e}")))?;
+        .map_err(|_| sqlx::Error::InvalidArgument("invalid database URL".to_owned()))?;
     // Statement timeout rides the connection options (server-side setting
     // per connection), so no per-connection SET is needed.
     options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);
     let pool = PgPoolOptions::new()
         .max_connections(pool_max)
         .connect_with(options)
-        .await?;
+        .await
+        .map_err(|_| sqlx::Error::InvalidArgument("database connection failed".to_owned()))?;
     let db = CutoverDb { pool };
     if !skip_migrations {
         if let Err(e) = db.migrate().await {
@@ -73,7 +74,7 @@ impl CutoverDb {
         sqlx::migrate!("./migrations")
             .run(&self.pool)
             .await
-            .map_err(|e| sqlx::Error::InvalidArgument(format!("migration failed: {e}")))
+            .map_err(|_| sqlx::Error::InvalidArgument("database migration failed".to_owned()))
     }
 
     /// Close idle connections (drains the pool).

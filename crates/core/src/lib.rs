@@ -57,6 +57,8 @@ pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
 pub mod scheduled_events;
+pub mod secret;
+pub use secret::Secret;
 pub mod settings;
 pub mod sticky;
 pub mod voice;

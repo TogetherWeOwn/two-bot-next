@@ -17,8 +17,8 @@ fn gateway_requires_all_nonempty_bindings_before_starting() {
         for url in [None, Some(""), Some("synthetic-database-must-not-connect")] {
             for guild_id in [None, Some(0), Some(123)] {
                 let config = Config {
-                    discord_token: token.map(str::to_owned),
-                    database_url: url.map(str::to_owned),
+                    discord_token: token.map(|value| two_bot_core::Secret::new(value.to_owned())),
+                    database_url: url.map(|value| two_bot_core::Secret::new(value.to_owned())),
                     listen_addr: "127.0.0.1:0".into(),
                     guild_id,
                 };
