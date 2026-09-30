@@ -10,7 +10,9 @@ TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_tes
 
 The shared gateway test-database guard runs before connecting. It accepts only
 `agent-testdb` or the CI loopback service (`localhost` / `127.0.0.1`), with user
-and database both `agent_test`. It never falls back to runtime `DATABASE_URL`.
+and database both `agent_test`. Explicit Unix sockets (including SQLx's
+`?host=/path` override on an allowed TCP host) are rejected before connection.
+It never falls back to runtime `DATABASE_URL`.
 Each run creates its own schema; the child URL carries `options[search_path]`
 so even the binary's startup migrations stay isolated. Normal failure paths
 kill/reap children and delete only that schema. CI explicitly runs this ignored

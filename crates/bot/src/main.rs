@@ -74,7 +74,14 @@ async fn main() {
             tracing::error!(error = %err, "container listener failed");
             std::process::exit(1);
         });
-    let gateway_url = std::env::var("DISCORD_GATEWAY_URL").ok();
+    let gateway_url = match std::env::var("DISCORD_GATEWAY_URL") {
+        Ok(url) => Some(url),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::error!("DISCORD_GATEWAY_URL must be valid UTF-8");
+            std::process::exit(1);
+        }
+    };
     if gateway_url
         .as_deref()
         .is_some_and(|url| !gateway::is_loopback_gateway(url))

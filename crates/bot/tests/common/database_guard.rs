@@ -13,6 +13,7 @@ pub fn test_options() -> PgConnectOptions {
 
 fn guarded_options(url: &str) -> PgConnectOptions {
     let options = PgConnectOptions::from_str(url).expect("test URL");
+    assert!(options.get_socket().is_none(), "test URL must use TCP");
     assert!(matches!(
         options.get_host(),
         "agent-testdb" | "localhost" | "127.0.0.1"
@@ -32,6 +33,8 @@ fn accepts_only_disposable_gateway_databases() {
         "postgres://agent_test@prod.example/agent_test",
         "postgres://postgres@agent-testdb/agent_test",
         "postgres://agent_test@agent-testdb/two_bot",
+        "postgres://agent_test@agent-testdb/agent_test?host=%2Fsome%2Fsocket",
+        "postgres://agent_test@127.0.0.1/agent_test?host=/var/run/postgresql",
     ] {
         assert!(std::panic::catch_unwind(|| guarded_options(url)).is_err());
     }
