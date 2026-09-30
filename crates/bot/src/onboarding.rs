@@ -649,7 +649,6 @@ impl OnboardingRuntime {
                 interaction.application_id.get(),
                 &interaction.token,
                 content,
-                &[],
             ),
         )
         .await

@@ -1230,42 +1230,6 @@ impl ActionExecutor {
         Ok(())
     }
 
-    /// Complete a deferred interaction without publishing a second channel
-    /// message. The original callback decides ephemerality; edits retain it.
-    /// Source: https://docs.rs/twilight-http/0.17.1/twilight_http/client/struct.InteractionClient.html#method.update_response
-    pub async fn edit_interaction_response(
-        &self,
-        application_id: u64,
-        interaction_token: &str,
-        content: &str,
-        components: &[twilight_model::channel::message::Component],
-    ) -> Result<(), DiscordError> {
-        if utf16_len(content) > MAX_MESSAGE_CHARS {
-            return Err(DiscordError::Rejected(
-                "message exceeds UTF-16 ceiling".into(),
-            ));
-        }
-        let application = Id::<ApplicationMarker>::new_checked(application_id)
-            .ok_or_else(|| DiscordError::Rejected("invalid application id".into()))?;
-        let mentions = AllowedMentions {
-            parse: vec![],
-            replied_user: false,
-            roles: vec![],
-            users: vec![],
-        };
-        let interaction = self.inner.factory.interaction(application);
-        let req = Self::request_of(
-            interaction
-                .update_response(interaction_token)
-                .content(Some(content))
-                .components(Some(components))
-                .allowed_mentions(Some(&mentions)),
-        )?;
-        let req = Self::explicit_mentions(req, &mentions)?;
-        self.call_once(req, &[200, 204]).await?;
-        Ok(())
-    }
-
     /// Carry out one [`ChannelCall`].
     pub async fn execute_channel(
         &self,
@@ -1416,12 +1380,18 @@ impl ActionExecutor {
 
     /// Complete an acknowledged interaction by editing its original response.
     /// Like the initial callback, this bypasses the paced moderation lane.
+    /// The original callback decides ephemerality; edits retain it.
     pub async fn edit_interaction_response(
         &self,
         application_id: u64,
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
+        if utf16_len(content) > MAX_MESSAGE_CHARS {
+            return Err(DiscordError::Rejected(
+                "message exceeds UTF-16 ceiling".into(),
+            ));
+        }
         let application =
             Id::<ApplicationMarker>::new_checked(application_id).ok_or_else(|| {
                 DiscordError::Rejected(format!("bad application id: {application_id}"))
@@ -1435,7 +1405,8 @@ impl ActionExecutor {
                 .content(Some(content))
                 .allowed_mentions(Some(&mentions)),
         )?;
-        self.call_once_raw(req, &[200]).await.map(|_| ())
+        let req = Self::explicit_mentions(req, &mentions)?;
+        self.call_once(req, &[200, 204]).await.map(|_| ())
     }
 
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect

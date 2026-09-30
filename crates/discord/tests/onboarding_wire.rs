@@ -119,7 +119,7 @@ async fn shared_executor_defer_role_delta_and_edit_are_not_broadcasts() {
     exec.set_member_role("22", "44", "66", false, "member deselected games")
         .await
         .unwrap();
-    exec.edit_interaction_response(11, "mock-callback", "Done", &[])
+    exec.edit_interaction_response(11, "mock-callback", "Done")
         .await
         .unwrap();
     let reqs = mock.requests();
@@ -146,6 +146,15 @@ async fn shared_executor_defer_role_delta_and_edit_are_not_broadcasts() {
     );
     let body: serde_json::Value = serde_json::from_slice(&reqs[3].body).unwrap();
     assert_eq!(body["allowed_mentions"]["users"], serde_json::json!([]));
+    assert_eq!(body["allowed_mentions"]["roles"], serde_json::json!([]));
+    assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
+    let before = exec.requests();
+    assert!(matches!(
+        exec.edit_interaction_response(11, "mock-callback", &"😀".repeat(1001))
+            .await,
+        Err(DiscordError::Rejected(_))
+    ));
+    assert_eq!(before, exec.requests(), "reject oversized edit before wire");
     assert!(
         reqs[2]
             .received_at
