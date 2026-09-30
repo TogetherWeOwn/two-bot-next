@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn json_is_canonical_without_losing_large_numbers() {
-        let normalize = |s| canonical_json(s).unwrap();
+        let normalize = |s: &str| canonical_json(s).unwrap();
         assert_eq!(
             normalize(r#"{"z":[1.00,{"b":true,"a":null}],"a":-0.0}"#),
             normalize(r#"{"a":0,"z":[1,{"a":null,"b":true}]}"#)
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn json_marker_properties_remain_literal_objects() {
-        let normalize = |s| canonical_json(s).unwrap();
+        let normalize = |s: &str| canonical_json(s).unwrap();
         for key in [
             "$serde_json::private::Number",
             "$serde_json::private::RawValue",
