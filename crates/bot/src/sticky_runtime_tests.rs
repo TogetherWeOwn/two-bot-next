@@ -56,11 +56,28 @@ const CHANNEL_S: &str = "3333";
 // imported here, so the scripted-queue TCP double is reproduced).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RestRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+    received_at: std::time::Instant,
+}
+
+struct RestResponse {
+    status: u16,
+    body: Option<String>,
+    delay: Duration,
+}
+
+impl RestResponse {
+    fn status(status: u16) -> Self {
+        Self {
+            status,
+            body: None,
+            delay: Duration::ZERO,
+        }
+    }
 }
 
 struct MockRest {
@@ -73,6 +90,10 @@ impl MockRest {
     /// request gets 200 with `{"id": "<counter>"}` for message posts (a real
     /// snowflake the store can record) or `{}` otherwise.
     async fn start(script: Vec<u16>) -> (Self, String) {
+        Self::start_script(script.into_iter().map(RestResponse::status).collect()).await
+    }
+
+    async fn start_script(script: Vec<RestResponse>) -> (Self, String) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock listen");
         let origin = format!("http://{}", listener.local_addr().expect("addr"));
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -90,16 +111,24 @@ impl MockRest {
                         method: request.0.clone(),
                         path: request.1.clone(),
                         body: request.2,
+                        received_at: std::time::Instant::now(),
                     });
-                    let status = scr.lock().expect("script").pop_front().unwrap_or(200);
-                    let body =
+                    let response = scr
+                        .lock()
+                        .expect("script")
+                        .pop_front()
+                        .unwrap_or_else(|| RestResponse::status(200));
+                    tokio::time::sleep(response.delay).await;
+                    let status = response.status;
+                    let body = response.body.unwrap_or_else(|| {
                         if status == 200 && request.0 == "POST" && request.1.ends_with("/messages")
                         {
                             let n = ctr.fetch_add(1, Ordering::Relaxed);
                             format!("{{\"id\":\"{}\"}}", 9_000_000_000_000_000_000u64 + n)
                         } else {
                             "{}".to_owned()
-                        };
+                        }
+                    });
                     let reason = match status {
                         200 => "OK",
                         201 => "Created",
@@ -122,16 +151,7 @@ impl MockRest {
     }
 
     fn requests(&self) -> Vec<RestRequest> {
-        self.recorded
-            .lock()
-            .expect("recorded")
-            .iter()
-            .map(|r| RestRequest {
-                method: r.method.clone(),
-                path: r.path.clone(),
-                body: r.body.clone(),
-            })
-            .collect()
+        self.recorded.lock().expect("recorded").clone()
     }
 
     async fn posts_to(&self, suffix: &str) -> Vec<RestRequest> {
@@ -146,6 +166,28 @@ impl MockRest {
             .into_iter()
             .filter(|r| r.method == "DELETE")
             .collect()
+    }
+
+    fn deferred_reply(&self) -> serde_json::Value {
+        let requests = self.requests();
+        let callbacks: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+            .collect();
+        assert_eq!(callbacks.len(), 1, "exactly one initial acknowledgement");
+        assert_eq!(requests[0].path, callbacks[0].path, "defer before effects");
+        let json: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+        assert_eq!(json["type"], 5);
+        assert_eq!(json["data"]["flags"], 64, "ephemeral defer");
+        let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+        assert_eq!(edits.len(), 1, "one completion, not a second callback");
+        assert_eq!(
+            edits[0].path,
+            "/api/v10/webhooks/1111/sticky-test-token/messages/@original"
+        );
+        let reply: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
+        assert_eq!(reply["allowed_mentions"]["parse"], serde_json::json!([]));
+        reply
     }
 
     async fn shutdown(self) {
@@ -460,12 +502,17 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 #[tokio::test]
 async fn non_sticky_automation_admin_names_are_ignored() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
-    let runtime = runtime_without_db(true, true, origin);
-    // `command`/`command-remove` belong to the sibling custom-commands slice.
-    for name in ["command", "command-remove"] {
-        runtime
-            .on_interaction(&slash(name, Some(CHANNEL), Vec::new()))
-            .await;
+    // Other slices own both their accepted commands and their refusals.
+    for enabled in [true, false] {
+        let runtime = runtime_without_db(enabled, enabled, origin.clone());
+        for name in ["command", "command-remove", "schedule", "ban", "attendance"] {
+            let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+            runtime.on_interaction(&interaction).await;
+            interaction.member.as_mut().unwrap().permissions = Some(Permissions::empty());
+            runtime.on_interaction(&interaction).await;
+            interaction.guild_id = Some(Id::new(9999));
+            runtime.on_interaction(&interaction).await;
+        }
     }
     assert!(
         mock.requests().is_empty(),
@@ -617,7 +664,14 @@ impl TestDb {
 }
 
 async fn db_runtime(db: &TestDb, script: Vec<u16>) -> (Arc<StickyRuntime>, MockRest) {
-    let (mock, origin) = MockRest::start(script).await;
+    db_runtime_script(db, script.into_iter().map(RestResponse::status).collect()).await
+}
+
+async fn db_runtime_script(
+    db: &TestDb,
+    script: Vec<RestResponse>,
+) -> (Arc<StickyRuntime>, MockRest) {
+    let (mock, origin) = MockRest::start_script(script).await;
     let runtime = StickyRuntime::new(
         db.pool.clone(),
         executor_at(origin),
@@ -626,6 +680,135 @@ async fn db_runtime(db: &TestDb, script: Vec<u16>) -> (Arc<StickyRuntime>, MockR
         true,
     );
     (runtime, mock)
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn slow_cleanup_is_acknowledged_before_deadline_and_completed_by_edit() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000005"), 120_000, 5).await;
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![
+            RestResponse::status(200),
+            RestResponse {
+                status: 200,
+                body: None,
+                delay: Duration::from_millis(3500),
+            },
+        ],
+    )
+    .await;
+    let start = std::time::Instant::now();
+    runtime
+        .on_interaction(&slash("sticky-remove", Some(CHANNEL), vec![]))
+        .await;
+    assert_eq!(mock.deferred_reply()["content"], "Sticky removed.");
+    let requests = mock.requests();
+    assert!(requests[0].received_at.duration_since(start) < Duration::from_secs(3));
+    assert_eq!(requests[1].method, "DELETE");
+    assert_eq!(requests[2].method, "PATCH");
+    assert!(
+        requests[2]
+            .received_at
+            .duration_since(requests[1].received_at)
+            >= Duration::from_millis(3500)
+    );
+    assert!(db.row().await.is_none());
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.delete".into(), "ok".into())]
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn failed_defer_leaves_set_and_remove_state_untouched() {
+    let db = TestDb::new().await;
+    db.seed(Some("8888"), 120_000, 5).await;
+    let (runtime, mock) = db_runtime(&db, vec![404, 404]).await;
+    for name in ["sticky", "sticky-remove"] {
+        runtime
+            .on_interaction(&slash(
+                name,
+                Some(CHANNEL),
+                vec![option("body", CommandOptionValue::String("changed".into()))],
+            ))
+            .await;
+    }
+    assert_eq!(
+        db.row().await,
+        Some(("remember this".into(), Some("8888".into()), None))
+    );
+    assert!(db.audits().await.is_empty());
+    assert_eq!(mock.requests().len(), 2);
+    assert_eq!(mock.posts_to("/callback").await.len(), 2);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn unconfirmed_replacement_preserves_previous_and_releases_claim() {
+    let db = TestDb::new().await;
+    db.seed(Some("8888"), 120_000, 5).await;
+    for body in [
+        "{}",
+        "not JSON",
+        r#"{"id":null}"#,
+        r#"{"id":0}"#,
+        r#"{"id":""}"#,
+        r#"{"id":"0"}"#,
+        r#"{"id":"abc"}"#,
+        r#"{"id":"+123"}"#,
+        r#"{"id":"18446744073709551616"}"#,
+    ] {
+        let (runtime, mock) = db_runtime_script(
+            &db,
+            vec![RestResponse {
+                status: 200,
+                body: Some(body.into()),
+                delay: Duration::ZERO,
+            }],
+        )
+        .await;
+        assert_eq!(
+            runtime
+                .on_message(&message(24, CHANNEL, false, Some(GUILD)))
+                .await,
+            ActivityOutcome::Held,
+            "{body}"
+        );
+        assert_eq!(
+            db.row().await,
+            Some(("remember this".into(), Some("8888".into()), None)),
+            "{body}"
+        );
+        assert_eq!(mock.posts_to("/messages").await.len(), 1);
+        assert!(mock.deletes().is_empty(), "no retirement for {body}");
+        mock.shutdown().await;
+    }
+    let audits = db.audits().await;
+    assert_eq!(audits.len(), 9);
+    assert!(audits
+        .iter()
+        .all(|(action, outcome)| action == "sticky.run" && outcome == "post_failed"));
+    let (runtime, mock) = db_runtime(&db, vec![]).await;
+    assert_eq!(
+        runtime
+            .on_message(&message(25, CHANNEL, false, Some(GUILD)))
+            .await,
+        ActivityOutcome::Reposted
+    );
+    assert_eq!(
+        mock.deletes().len(),
+        1,
+        "subsequent confirmed replacement retires previous"
+    );
+    mock.shutdown().await;
+    db.close().await;
 }
 
 #[tokio::test]
@@ -785,11 +968,8 @@ async fn sticky_remove_clears_state_and_deletes_the_message() {
         deletes[0].path,
         "/api/v10/channels/3333/messages/8000000000000000005"
     );
-    let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 1);
-    let json: serde_json::Value = serde_json::from_slice(&callbacks[0].body).expect("reply");
-    assert_eq!(json["data"]["content"], "Sticky removed.");
-    assert_eq!(json["data"]["flags"], 64);
+    let json = mock.deferred_reply();
+    assert_eq!(json["content"], "Sticky removed.");
     assert_eq!(
         db.audits().await,
         vec![("sticky.delete".to_owned(), "ok".to_owned())]
@@ -809,9 +989,8 @@ async fn sticky_remove_absent_reports_absent_without_delete() {
         .await;
 
     assert!(mock.deletes().is_empty());
-    let callbacks = mock.posts_to("/callback").await;
-    let json: serde_json::Value = serde_json::from_slice(&callbacks[0].body).expect("reply");
-    assert_eq!(json["data"]["content"], "No sticky in this channel.");
+    let json = mock.deferred_reply();
+    assert_eq!(json["content"], "No sticky in this channel.");
     assert_eq!(
         db.audits().await,
         vec![("sticky.delete".to_owned(), "absent".to_owned())]
@@ -849,12 +1028,8 @@ async fn sticky_set_writes_row_audits_and_confirms() {
     .await
     .expect("debounce");
     assert_eq!(debounce, 7);
-    let callbacks = mock.posts_to("/callback").await;
-    let json: serde_json::Value = serde_json::from_slice(&callbacks[0].body).expect("reply");
-    assert_eq!(
-        json["data"]["content"],
-        "Sticky set for <#3333>, 7s debounce."
-    );
+    let json = mock.deferred_reply();
+    assert_eq!(json["content"], "Sticky set for <#3333>, 7s debounce.");
     assert_eq!(
         db.audits().await,
         vec![("sticky.create".to_owned(), "ok".to_owned())]
@@ -879,8 +1054,7 @@ async fn sticky_set_rejection_audits_rejected_and_still_replies() {
         .await;
 
     assert!(db.row().await.is_none(), "no row on rejection");
-    let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(callbacks.len(), 1);
+    assert!(mock.deferred_reply()["content"].as_str().is_some());
     assert_eq!(
         db.audits().await,
         vec![("sticky.create".to_owned(), "rejected".to_owned())]

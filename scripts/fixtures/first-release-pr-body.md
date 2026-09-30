@@ -1,10 +1,18 @@
-# Changelog
+:robot: I have created a release *beep* *boop*
 
-## Unreleased
+## Summary
 
-### Added
+Publish the next synchronized Rust workspace release through release-please.
 
-- Wire `/sticky` and `/sticky-remove` through the shared interaction router and drive accepted-message re-posts through the shared REST executor. The runtime claims one re-post window atomically per burst, validates and records the replacement id before retiring the previous sticky (best-effort), releases the claim and audits `post_failed` on REST failure, and deletes an orphaned replacement when the claim moved on. Commands defer ephemerally before I/O and edit the original reply; refusals are limited to owned sticky commands. `TWO_AUTOMATIONS` gates both surfaces; ManageGuild is required, and `/sticky` validates a 1–2000 UTF-16 body with a 1–300 s debounce (default 5 s). Covered by isolated Postgres and mock REST acceptance tests.
+## Changes
+
+Update the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.
+
+## Testing
+
+Worker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.
+---
+
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 
@@ -94,3 +102,6 @@
 ### Notes
 
 - Command/component wiring and the Discord REST reads stay on the S4 interaction router and REST executor slices; the outcome enums are the integration surface until they land. Scorecard and probe collection are not enabled by this change.
+
+---
+Refs: TOG-9865

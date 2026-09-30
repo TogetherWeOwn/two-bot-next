@@ -1276,6 +1276,30 @@ impl ActionExecutor {
         }
     }
 
+    /// Complete an acknowledged interaction by editing its original response.
+    /// Like the initial callback, this bypasses the paced moderation lane.
+    pub async fn edit_interaction_response(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        let application =
+            Id::<ApplicationMarker>::new_checked(application_id).ok_or_else(|| {
+                DiscordError::Rejected(format!("bad application id: {application_id}"))
+            })?;
+        let mentions = AllowedMentions::default();
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .interaction(application)
+                .update_response(interaction_token)
+                .content(Some(content))
+                .allowed_mentions(Some(&mentions)),
+        )?;
+        self.call_once_raw(req, &[200]).await.map(|_| ())
+    }
+
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
     /// (legacy `ModerationService::carryOut` verb mapping; warn is
     /// store-only and never reaches the wire).

@@ -49,6 +49,9 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: offline build-cache safety regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -209,3 +212,4 @@ jobs:
         run: |
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
+          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs

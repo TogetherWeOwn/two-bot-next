@@ -186,6 +186,9 @@ impl StickyRuntime {
         else {
             return;
         };
+        if !matches!(name.as_str(), "sticky" | "sticky-remove") {
+            return;
+        }
         if let Some(response) = response_for_slash(&outcome) {
             self.answer(interaction, response).await;
             return;
@@ -195,6 +198,26 @@ impl StickyRuntime {
                 handler: HandlerId::AutomationAdmin,
             })
         {
+            return;
+        }
+        // Acknowledge before any database wait or Discord cleanup. If the
+        // acknowledgement fails, do not mutate state without a reply path.
+        if let Err(err) = self
+            .executor
+            .answer_interaction(
+                interaction.id.get(),
+                &interaction.token,
+                &InteractionResponse {
+                    kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                    data: Some(InteractionResponseData {
+                        flags: Some(MessageFlags::EPHEMERAL),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+        {
+            warn!(interaction_id = %interaction.id.get(), error = %err, "sticky defer failed");
             return;
         }
         match name.as_str() {
@@ -252,7 +275,10 @@ impl StickyRuntime {
             .post_message(&channel_id, &grant.body, Some(attempt))
             .await
         {
-            Ok(message_id) => {
+            Ok(message_id)
+                if message_id.parse::<u64>().is_ok_and(|id| id != 0)
+                    && message_id.bytes().all(|b| b.is_ascii_digit()) =>
+            {
                 match store::record_sticky_post(
                     &self.pool,
                     &guild_id,
@@ -308,9 +334,25 @@ impl StickyRuntime {
                     }
                 }
             }
+            Ok(_) => {
+                // A 2xx without a usable id is not a confirmed replacement.
+                // Keep the previous message; the unknown post cannot safely
+                // be recorded or cleaned up by id.
+                self.release(&guild_id, &channel_id, &claim_token).await;
+                self.audit(
+                    &guild_id,
+                    None,
+                    StickyAuditAction::Run,
+                    Some(&channel_id),
+                    StickyAuditOutcome::PostFailed,
+                    Some("replacement message id missing or invalid"),
+                )
+                .await;
+                ActivityOutcome::Held
+            }
             Err(err) => {
                 // Post did not land (or its id was lost): release the claim so
-                // the next message can retry; enforce_nonce dedupes a retry.
+                // the next message can retry.
                 self.release(&guild_id, &channel_id, &claim_token).await;
                 self.audit(
                     &guild_id,
@@ -332,7 +374,7 @@ impl StickyRuntime {
     async fn sticky_set(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
-            self.answer(interaction, ephemeral(NO_CHANNEL_REPLY)).await;
+            self.finish(interaction, NO_CHANNEL_REPLY).await;
             return;
         };
         let actor_id = actor_id(interaction);
@@ -361,7 +403,7 @@ impl StickyRuntime {
                     Some(&err.to_string()),
                 )
                 .await;
-                self.answer(interaction, ephemeral(err.to_string())).await;
+                self.finish(interaction, err.to_string()).await;
                 return;
             }
         };
@@ -395,12 +437,11 @@ impl StickyRuntime {
                 )
                 .await;
                 let reply = sticky_set_reply(&channel_id, debounce_option.map(|_| debounce));
-                self.answer(interaction, ephemeral(reply)).await;
+                self.finish(interaction, reply).await;
             }
             Err(err) => {
                 warn!(error = %err, "sticky put failed");
-                self.answer(interaction, ephemeral(STORE_FAILURE_REPLY))
-                    .await;
+                self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
     }
@@ -410,7 +451,7 @@ impl StickyRuntime {
     async fn sticky_remove(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
-            self.answer(interaction, ephemeral(NO_CHANNEL_REPLY)).await;
+            self.finish(interaction, NO_CHANNEL_REPLY).await;
             return;
         };
         let actor_id = actor_id(interaction);
@@ -432,8 +473,7 @@ impl StickyRuntime {
                     None,
                 )
                 .await;
-                self.answer(interaction, ephemeral(sticky_removed_reply(true)))
-                    .await;
+                self.finish(interaction, sticky_removed_reply(true)).await;
             }
             Ok(RemoveOutcome::Absent) => {
                 self.audit(
@@ -445,13 +485,11 @@ impl StickyRuntime {
                     None,
                 )
                 .await;
-                self.answer(interaction, ephemeral(sticky_removed_reply(false)))
-                    .await;
+                self.finish(interaction, sticky_removed_reply(false)).await;
             }
             Err(err) => {
                 warn!(error = %err, "sticky delete failed");
-                self.answer(interaction, ephemeral(STORE_FAILURE_REPLY))
-                    .await;
+                self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
     }
@@ -465,6 +503,21 @@ impl StickyRuntime {
             .await
         {
             warn!(interaction_id = %interaction.id.get(), error = %err, "sticky reply failed");
+        }
+    }
+
+    /// Complete the original ephemeral defer, never issue a second callback.
+    async fn finish(&self, interaction: &Interaction, content: impl AsRef<str>) {
+        if let Err(err) = self
+            .executor
+            .edit_interaction_response(
+                interaction.application_id.get(),
+                &interaction.token,
+                content.as_ref(),
+            )
+            .await
+        {
+            warn!(interaction_id = %interaction.id.get(), error = %err, "sticky reply edit failed");
         }
     }
 
@@ -538,6 +591,7 @@ pub(crate) fn router_with_sticky(gates: RouterGates) -> InteractionRouter {
 
 /// Ephemeral channel-message reply (same shape the router's refusal builder
 /// produces).
+#[cfg(test)]
 pub(crate) fn ephemeral(text: impl Into<String>) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
