@@ -2,7 +2,6 @@
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/compare/v0.1.0...v0.2.0) (2026-09-30)
 
-
 ### Added
 
 * **audit:** add durable fenced delivery storage ([#58](https://github.com/TogetherWeOwn/two-bot-next/issues/58)) ([4f8c460](https://github.com/TogetherWeOwn/two-bot-next/commit/4f8c4606fbdc9256a88888c740168057eecbad3c))
@@ -39,22 +38,6 @@
 * **voice:** add pure vote-kick decision core ([#50](https://github.com/TogetherWeOwn/two-bot-next/issues/50)) ([e6694ee](https://github.com/TogetherWeOwn/two-bot-next/commit/e6694ee1c18012d686cd8cb4b377159302a3538b))
 * **voice:** add standalone versioned configuration codec ([#51](https://github.com/TogetherWeOwn/two-bot-next/issues/51)) ([dcbe432](https://github.com/TogetherWeOwn/two-bot-next/commit/dcbe432e447df9965411d7835d28c9aa5aa8d62f))
 
-
-### Fixed
-
-* **build:** refresh stale Cargo.lock so --locked Docker build passes ([#19](https://github.com/TogetherWeOwn/two-bot-next/issues/19)) ([1aa9ce8](https://github.com/TogetherWeOwn/two-bot-next/commit/1aa9ce819d802fe8b9f387eb4cae329d8af5f9d2))
-* **config:** isolate environment parser tests ([#52](https://github.com/TogetherWeOwn/two-bot-next/issues/52)) ([32ef2b6](https://github.com/TogetherWeOwn/two-bot-next/commit/32ef2b62226e9778ec879bc0d019b88bcfe1b4f7))
-* **deploy:** wire explicit Container/DO bindings for staging and production ([#8](https://github.com/TogetherWeOwn/two-bot-next/issues/8)) ([66884ff](https://github.com/TogetherWeOwn/two-bot-next/commit/66884ff523bef839df94abb020e340c1fef7b751))
-* **gateway:** park until checkpoint prerequisites are configured ([#59](https://github.com/TogetherWeOwn/two-bot-next/issues/59)) ([bd8d415](https://github.com/TogetherWeOwn/two-bot-next/commit/bd8d4155139c655e0edfec20520ce4ef85d850d2))
-* **release:** preserve bootstrap Notes tail in first release ([#62](https://github.com/TogetherWeOwn/two-bot-next/issues/62)) ([9d1cc1d](https://github.com/TogetherWeOwn/two-bot-next/commit/9d1cc1d58f238bfb49698a5e51cfe0f6bac100bc))
-* **worker:** forward environment on automatic container starts ([#21](https://github.com/TogetherWeOwn/two-bot-next/issues/21)) ([5436321](https://github.com/TogetherWeOwn/two-bot-next/commit/543632175675a642974ded84e18983da4c41d5e6))
-
-## Changelog
-
-## Unreleased
-
-### Added
-
 - Add durable operational audit rows, fenced delivery claims, accepted-message recovery, quarantine and a persistent delivery halt to the sqlx core store. Reserve audit migrations 0340–0349 and run isolated Postgres regressions in CI; Discord service/runtime activation remains a follow-up. Every owner mutation takes the audit row lock before evaluating token, generation and the current lease, and preflight-only failures park rows out of queue discovery for a 60 s backoff without counting a POST attempt. Deferral and failure releases stamp a fairness yield fixing queue position at release time, so expired backoffs rotate past repeatedly failing rows while aged retries keep position ahead of later arrivals instead of being starved by continued fresh rows, and a lock-free eligibility precheck keeps ineligible claims from waiting on a row lock while holding the shared halt guard.
 - Port the website-to-bot internal-actions auth core (HMAC-SHA256 rotation-aware signing, skew + nonce replay guard, post-verify token buckets, 19-verb allowlist with env flags, settings catalog guard, bind guard, `authorize` pipeline) as framework-free domain logic. HTTP route, durable stores, and Discord execution remain follow-up slices.
 - Framework-free LFG role parsing, future start-time validation, signup capacity decisions, select-menu data, permission checks, and message rendering.
@@ -80,6 +63,13 @@
   generation alongside the original seed (migration 0122).
 
 ### Fixed
+
+* **build:** refresh stale Cargo.lock so --locked Docker build passes ([#19](https://github.com/TogetherWeOwn/two-bot-next/issues/19)) ([1aa9ce8](https://github.com/TogetherWeOwn/two-bot-next/commit/1aa9ce819d802fe8b9f387eb4cae329d8af5f9d2))
+* **config:** isolate environment parser tests ([#52](https://github.com/TogetherWeOwn/two-bot-next/issues/52)) ([32ef2b6](https://github.com/TogetherWeOwn/two-bot-next/commit/32ef2b62226e9778ec879bc0d019b88bcfe1b4f7))
+* **deploy:** wire explicit Container/DO bindings for staging and production ([#8](https://github.com/TogetherWeOwn/two-bot-next/issues/8)) ([66884ff](https://github.com/TogetherWeOwn/two-bot-next/commit/66884ff523bef839df94abb020e340c1fef7b751))
+* **gateway:** park until checkpoint prerequisites are configured ([#59](https://github.com/TogetherWeOwn/two-bot-next/issues/59)) ([bd8d415](https://github.com/TogetherWeOwn/two-bot-next/commit/bd8d4155139c655e0edfec20520ce4ef85d850d2))
+* **release:** preserve bootstrap Notes tail in first release ([#62](https://github.com/TogetherWeOwn/two-bot-next/issues/62)) ([9d1cc1d](https://github.com/TogetherWeOwn/two-bot-next/commit/9d1cc1d58f238bfb49698a5e51cfe0f6bac100bc))
+* **worker:** forward environment on automatic container starts ([#21](https://github.com/TogetherWeOwn/two-bot-next/issues/21)) ([5436321](https://github.com/TogetherWeOwn/two-bot-next/commit/543632175675a642974ded84e18983da4c41d5e6))
 
 - Match legacy ECMAScript whitespace trimming for LFG roles, slot numbers, and titles, including BOM and NEL edge cases.
 - Detect settings changes with a commit-ordered transactional revision instead of a sequence maximum, including deletes and late commits with lower row versions.
