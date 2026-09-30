@@ -169,8 +169,9 @@ pub async fn run_shard(
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
+    onboarding: Option<Arc<crate::onboarding::OnboardingRuntime>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store).await;
+    let result = run_loop(&mut shard, &pipeline, &state, &store, onboarding.as_ref()).await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -180,11 +181,25 @@ async fn run_loop(
     pipeline: &GatewayPipeline,
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
+    onboarding: Option<&Arc<crate::onboarding::OnboardingRuntime>>,
 ) -> Result<(), sqlx::Error> {
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
-    while let Some(item) = shard.next().await {
+    let mut feature_jobs = tokio::task::JoinSet::new();
+    loop {
+        let item = tokio::select! {
+            item = shard.next() => item,
+            result = feature_jobs.join_next(), if !feature_jobs.is_empty() => {
+                if !matches!(result, Some(Ok(Ok(())))) {
+                    warn!("onboarding worker failed; no successful delivery inferred");
+                }
+                continue;
+            }
+        };
+        let Some(item) = item else {
+            break;
+        };
         let message = match item {
             Ok(message) => message,
             Err(error)
@@ -286,9 +301,16 @@ async fn run_loop(
             )
         })?;
         let mut connected = false;
+        let mut onboarding_job = None;
         if let Some(parsed) = parsed {
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
+            onboarding_job = onboarding.and_then(|runtime| runtime.capture(&event, pipeline));
+            if onboarding_job.is_some() && feature_jobs.len() >= 32 {
+                return Err(sqlx::Error::InvalidArgument(
+                    "onboarding worker capacity exceeded; checkpoint unchanged".into(),
+                ));
+            }
             pipeline.handle(&event);
         }
         checkpoint_io(
@@ -298,6 +320,18 @@ async fn run_loop(
         )
         .await?;
         committed = Some(checkpoint);
+        if let (Some(runtime), Some(job)) = (onboarding, onboarding_job) {
+            let runtime = Arc::clone(runtime);
+            let now_ms = two_bot_core::funnel::now_millis_for_test();
+            feature_jobs.spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(90),
+                    runtime.handle(job, now_ms),
+                )
+                .await
+                .map_err(|_| crate::onboarding::RuntimeError::Discord)?
+            });
+        }
         if connected {
             *state.write().await = GatewayState::Connected;
         }

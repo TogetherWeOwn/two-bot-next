@@ -11,6 +11,7 @@ pub mod intents;
 pub mod interactions;
 pub mod onboarding_config;
 pub mod onboarding_messages;
+pub mod onboarding_permissions;
 pub mod pipeline;
 
 pub use adapter::event_to_core;

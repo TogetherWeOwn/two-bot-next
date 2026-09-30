@@ -114,6 +114,9 @@ jobs:
           TWO_LEVELING_TEST_CI: '1'
         run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
 
+      - name: onboarding prompt store regressions (CI service only)
+        run: cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
+
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 

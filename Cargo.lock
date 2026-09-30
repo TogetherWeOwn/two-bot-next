@@ -2185,6 +2185,7 @@ dependencies = [
  "tracing-subscriber",
  "twilight-cache-inmemory",
  "twilight-gateway",
+ "twilight-model",
  "two-bot-core",
  "two-bot-cutover",
  "two-bot-discord",

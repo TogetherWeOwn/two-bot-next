@@ -472,25 +472,29 @@ pub struct MockRest {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+type RestResponder = Arc<dyn Fn(&RestRequest) -> ScriptedResponse + Send + Sync>;
+
 impl MockRest {
     /// Bind on 127.0.0.1 and start serving `script` in order; once the queue
     /// is spent, every further request gets `default`.
     pub async fn start(script: Vec<ScriptedResponse>, default: ScriptedResponse) -> Self {
+        let queue = Mutex::new(VecDeque::from(script));
+        Self::with_responder(move |_| {
+            queue.lock().expect("queue").pop_front().unwrap_or_else(|| default.clone())
+        }).await
+    }
+
+    /// Route-aware stateful fixture for concurrent feature orchestration.
+    pub async fn with_responder(responder: impl Fn(&RestRequest) -> ScriptedResponse + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let queue = Arc::new(Mutex::new(VecDeque::from(script)));
+        let responder: RestResponder = Arc::new(responder);
         let handle = {
             let recorded = Arc::clone(&recorded);
-            tokio::spawn(async move {
-                rest_task(listener, recorded, queue, default).await;
-            })
+            tokio::spawn(async move { rest_task(listener, recorded, responder).await })
         };
-        Self {
-            addr,
-            recorded,
-            handle: Some(handle),
-        }
+        Self { addr, recorded, handle: Some(handle) }
     }
 
     /// `http://127.0.0.1:PORT` for `ActionExecutor::with_proxy`.
@@ -514,41 +518,25 @@ impl MockRest {
 async fn rest_task(
     listener: TcpListener,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
-    queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
-    default: ScriptedResponse,
+    responder: RestResponder,
 ) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            break;
-        };
+        let Ok((stream, _)) = listener.accept().await else { break; };
         let recorded = Arc::clone(&recorded);
-        let queue = Arc::clone(&queue);
-        let default = default.clone();
-        tokio::spawn(async move { handle_rest(stream, recorded, queue, default).await });
+        let responder = Arc::clone(&responder);
+        tokio::spawn(async move { handle_rest(stream, recorded, responder).await });
     }
 }
 
 async fn handle_rest(
     mut stream: TcpStream,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
-    queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
-    default: ScriptedResponse,
+    responder: RestResponder,
 ) {
-    let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
-        return;
-    };
-    recorded.lock().expect("recorded").push(RestRequest {
-        method,
-        path,
-        headers,
-        body,
-        received_at: std::time::Instant::now(),
-    });
-    let next = queue
-        .lock()
-        .expect("queue")
-        .pop_front()
-        .unwrap_or_else(|| default.clone());
+    let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else { return; };
+    let request = RestRequest { method, path, headers, body, received_at: std::time::Instant::now() };
+    let next = responder(&request);
+    recorded.lock().expect("recorded").push(request);
     if !next.delay.is_zero() {
         tokio::time::sleep(next.delay).await;
     }
