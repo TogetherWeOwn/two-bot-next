@@ -1,0 +1,56 @@
+[package]
+name = "two-bot-cutover"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Cutover data path (TOG-9882): one-shot MEE6 XP / reward / history
+# import-backfill operator tools. Library modules port the pure legacy logic
+# (parse, plan, reconcile); `src/db.rs` + `src/rest.rs` hold the sqlx and
+# twilight seams; `src/bin/` holds the seven operator CLIs.
+#
+# Intra-workspace path deps carry an explicit version (still resolved via
+# path): cargo-deny `wildcards = "deny"` rejects version-less deps.
+
+[dependencies]
+two-bot-core = { version = "0.1.0", path = "../core" }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+twilight-http = { workspace = true }
+twilight-model = { workspace = true }
+
+[[bin]]
+name = "levels-import-mee6"
+path = "src/bin/levels_import_mee6.rs"
+
+[[bin]]
+name = "levels-role-rewards"
+path = "src/bin/levels_role_rewards.rs"
+
+[[bin]]
+name = "levels-import-rewards-probe"
+path = "src/bin/levels_import_rewards_probe.rs"
+
+[[bin]]
+name = "backfill"
+path = "src/bin/backfill.rs"
+
+[[bin]]
+name = "backfill-messages"
+path = "src/bin/backfill_messages.rs"
+
+[[bin]]
+name = "capture"
+path = "src/bin/capture.rs"
+
+[[bin]]
+name = "dedupe-events"
+path = "src/bin/dedupe_events.rs"

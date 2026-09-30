@@ -1,0 +1,14 @@
+[
+  {
+    "secret": "test-secret-at-least-32-chars-long!!",
+    "reason": "[two-audit:v1:7f5125dc1665d379a4037cbaa10a94cb:moderation.ban:987654321098765432:239149ae7165b1c1] spam"
+  },
+  {
+    "secret": "  test-secret-at-least-32-chars-long!!  ",
+    "reason": "[two-audit:v1:7f5125dc1665d379a4037cbaa10a94cb:moderation.ban:987654321098765432:767575204c4582b2] spam"
+  },
+  {
+    "secret": " \t\n",
+    "reason": "[two-audit:v1:7f5125dc1665d379a4037cbaa10a94cb:moderation.ban:987654321098765432:f7f88afbc0937d68] spam"
+  }
+]

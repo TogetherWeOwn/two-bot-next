@@ -1,11 +1,15 @@
 //! two-bot-next container entrypoint.
 //!
-//! S1 skeleton: serves liveness (`/health`) and readiness (`/readyz`) and
-//! owns the gateway shard supervisor seam. Without `DISCORD_TOKEN` the shard
-//! stays parked and `/readyz` reports `gateway: down` (HTTP 503) — the
-//! Container boots healthy on staging config either way.
+//! Serves liveness (`/health`) and readiness (`/readyz`) and runs the gateway
+//! shard supervisor (S3). Without `DISCORD_TOKEN` the shard stays parked and
+//! `/readyz` reports `gateway: down` (HTTP 503) — the Container boots healthy
+//! on staging config either way.
 
 mod gateway;
+#[cfg(test)]
+mod gateway_tests;
+#[cfg(test)]
+mod lifecycle_tests;
 mod server;
 
 use std::sync::Arc;
@@ -14,11 +18,14 @@ use tokio::sync::RwLock;
 use tracing::info;
 use two_bot_core::{ComponentStatus, Config};
 
-use gateway::GatewayState;
+use gateway::{
+    build_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard, GatewayState,
+};
 use server::serve;
 
 #[tokio::main]
 async fn main() {
+    ensure_crypto_provider();
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot
     // rot behind an HTTP-client upgrade.
@@ -38,25 +45,95 @@ async fn main() {
         Config {
             discord_token: None,
             database_url: None,
-            listen_addr: "0.0.0.0:8080".to_owned(),
+            // Gateway config errors must not move the listener away from
+            // the Worker probes and Docker healthcheck's configured address.
+            listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
             guild_id: None,
         }
     });
 
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
 
-    if config.gateway_configured() {
-        info!("discord token present; gateway supervisor armed (S3 connects)");
+    let gateway_task = if let Some(token) = config.discord_token.clone().filter(|t| !t.is_empty()) {
+        let database_url = config.database_url.clone();
+        let guild_id = config.guild_id;
+        let state = Arc::clone(&state);
+        Some(tokio::spawn(async move {
+            let result: Result<(), sqlx::Error> = async {
+                let url = database_url
+                    .as_deref()
+                    .filter(|url| !url.is_empty())
+                    .ok_or_else(|| {
+                        sqlx::Error::InvalidArgument(
+                            "DATABASE_URL required for gateway checkpoint".into(),
+                        )
+                    })?;
+                let guild_id = guild_id.filter(|id| *id != 0).ok_or_else(|| {
+                    sqlx::Error::InvalidArgument("GUILD_ID required for gateway checkpoint".into())
+                })?;
+                let db = two_bot_cutover::connect(url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
+                    .await?;
+                let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
+                    db.pool().clone(),
+                    guild_id.to_string(),
+                    0,
+                );
+                let saved = gateway::load_boot_session(&store).await?;
+                let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                let shard = build_shard(token, intents_from_env(), saved.as_ref());
+                info!(
+                    resume = saved.is_some(),
+                    "durable gateway initialized; shard connecting"
+                );
+                run_shard(shard, pipeline, Arc::clone(&state), store).await
+            }
+            .await;
+            if result.is_err() {
+                // Do not print sqlx errors: configuration errors may contain a URL.
+                tracing::error!(
+                    "durable gateway failed; checkpoint unchanged, readiness unavailable"
+                );
+                *state.write().await = GatewayState::Armed;
+            }
+            result
+        }))
     } else {
         info!(
             status = ?ComponentStatus::Down,
             "no discord token; gateway parked, /readyz reports down"
         );
-    }
+        None
+    };
 
-    if let Err(err) = serve(&config.listen_addr, state).await {
-        tracing::error!(error = %err, "http server failed");
+    let http = serve(&config.listen_addr, state);
+    let result = match gateway_task {
+        Some(task) => supervise_gateway(task, http).await,
+        None => http.await,
+    };
+    if let Err(err) = result {
+        tracing::error!(error = %err, "container service failed");
         std::process::exit(1);
+    }
+}
+
+/// A configured gateway is essential: never leave a health-only zombie after
+/// initialization/dispatch failure, stream termination, or a task panic. Exit
+/// nonzero so the Container supervisor can restart from the committed checkpoint.
+/// Source: https://docs.rs/tokio/1/tokio/macro.select.html#cancellation-safety
+async fn supervise_gateway(
+    mut task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
+    http: impl std::future::Future<Output = std::io::Result<()>>,
+) -> std::io::Result<()> {
+    tokio::select! {
+        biased;
+        // Never expose task/SQL errors: they may contain connection secrets.
+        _ = &mut task => Err(std::io::Error::other(
+            "gateway task stopped; container restart required",
+        )),
+        result = http => {
+            task.abort();
+            result
+        }
     }
 }
 

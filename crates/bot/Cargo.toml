@@ -15,7 +15,15 @@ path = "src/main.rs"
 [dependencies]
 two-bot-core = { version = "0.1.0", path = "../core" }
 two-bot-discord = { version = "0.1.0", path = "../discord" }
+two-bot-cutover = { version = "0.1.0", path = "../cutover" }
+futures-util = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
 axum = { workspace = true }
+# Sole rustls crypto provider (ring): twilight's Shard build panics without
+# exactly one provider feature enabled. Declared here (not on a lib) so the
+# release binary and `cargo test` share the same provider.
+rustls = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
@@ -24,3 +32,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
+
+[dev-dependencies]
+tokio-websockets = { workspace = true }
