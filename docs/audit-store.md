@@ -45,10 +45,11 @@ instants round-trip as UTC ISO strings with millisecond precision, matching lega
   including attempts, boundary, accepted message ID/time, and completion time.
 - `pending_ids() -> Vec<String>`: discovery only, maximum 25; excludes terminal,
   store-only, unsupported kinds and preflight-deferred rows whose backoff has
-  not expired. Rows that yielded queue position (preflight deferral or failure
-  release) sort after never-yielded rows, least-recently-yielded first, so a
-  bounded batch rotates past repeatedly failing rows. Each candidate still
-  requires a claim.
+  not expired. Queue position ages: rows order by yield time, or by creation
+  when they never yielded, so a bounded batch rotates past repeatedly failing
+  rows while an aged retry keeps its position ahead of later arrivals instead
+  of being starved by continued fresh rows. Each candidate still requires a
+  claim.
 - `claim(entry_id) -> Option<AuditClaim>`: five-minute lease with opaque random
   owner token and monotonic generation. Only the winning UPDATE returns a claim.
   A lock-free eligibility precheck rejects missing/terminal/store-only,
@@ -69,14 +70,16 @@ instants round-trip as UTC ISO strings with millisecond precision, matching lega
   terminal: no API reclaims, releases, quarantines or rewrites a delivered row.
 - `release_unattempted(claim) -> bool`: releases preflight/held claims only when
   no boundary or acceptance exists. Does not count a send attempt. Stamps the
-  fairness yield so the released row rotates behind never-yielded rows; use
-  `defer_preflight` for destination-tied preflight failures that must also
-  hide from discovery during the backoff.
+  fairness yield, fixing the row's queue position at release time so it ages
+  behind older rows but ahead of later arrivals; use `defer_preflight` for
+  destination-tied preflight failures that must also hide from discovery
+  during the backoff.
 - `defer_preflight(claim) -> bool`: parks a preflight-failed claim out of queue
   discovery for `PREFLIGHT_DEFER_SECONDS` (60 s) without counting a POST
   attempt, so a repeatedly failing destination cannot starve healthy rows in
-  the bounded batch. Also stamps the fairness yield, so after the backoff
-  expires the row still sorts behind never-yielded rows. The next successful
+  the bounded batch. Also stamps the fairness yield, fixing the row's queue
+  position at deferral time; once the backoff expires the row ages alongside
+  older rows instead of being excluded by later arrivals. The next successful
   claim clears the deferral.
 - `fail_attempt(claim, DeliveryFailure) -> bool`: authoritative
   `DefinitelyRejected` (including a guaranteed not-sent request) clears the
@@ -85,7 +88,8 @@ instants round-trip as UTC ISO strings with millisecond precision, matching lega
   read rejection to clear an earlier POST's ambiguity. Accepted IDs cannot be
   cleared by either path. Attempt count was already persisted at preparation;
   release/completion/recovery do not count it again. Both paths stamp the
-  fairness yield so the released row rotates behind never-yielded rows.
+  fairness yield, fixing the row's queue position at release time so aged
+  retries sort ahead of later arrivals.
 - `renew(claim) -> bool`: only a still-active owner can renew. An expired worker
   cannot revive a lease or affect a replacement owner.
 - `quarantine(claim, QuarantineReason) -> bool`: terminal hold with bounded

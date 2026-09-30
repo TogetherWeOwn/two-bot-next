@@ -210,11 +210,13 @@ impl AuditStore {
     /// Bounded queue discovery, not ownership or send authorization. A switch
     /// engaged after discovery is observed again by each claim/prepare.
     /// Preflight-deferred rows stay hidden until their backoff expires; the
-    /// backoff is retry scheduling, never a POST attempt count. Rows that
-    /// yielded their queue position (preflight deferral or failure release)
-    /// sort after never-yielded rows, least-recently-yielded first, so a
-    /// bounded batch rotates past repeatedly failing rows instead of
-    /// starving healthy ones once a backoff expires.
+    /// backoff is retry scheduling, never a POST attempt count. Queue position
+    /// ages: a row sorts by its yield time, or by creation when it never
+    /// yielded, so a recovered retry keeps a fixed position ahead of every
+    /// later arrival instead of being excluded while fresh rows are delivered
+    /// around it. Yielding still deprioritizes a repeatedly failing row behind
+    /// rows that arrived before the yield; attempts, boundaries and accepted
+    /// evidence are never touched by position.
     pub async fn pending_ids(&self) -> Result<Vec<String>, AuditStoreError> {
         Ok(sqlx::query_scalar(
             "SELECT entry_id FROM operational_audit_log
@@ -224,8 +226,8 @@ impl AuditStore {
                AND (delivery_deferred_until IS NULL
                  OR delivery_deferred_until <= clock_timestamp())
                AND NOT EXISTS (SELECT 1 FROM audit_kill_switch WHERE id = 1)
-             ORDER BY delivery_yielded_at NULLS FIRST, delivery_attempted_at NULLS FIRST,
-               created_at, entry_id LIMIT 25",
+             ORDER BY COALESCE(delivery_yielded_at, created_at),
+               delivery_attempted_at NULLS FIRST, created_at, entry_id LIMIT 25",
         )
         .bind(KINDS)
         .fetch_all(&self.pool)
@@ -409,8 +411,9 @@ impl AuditStore {
     /// that arrived before preparation; never clears earlier ambiguous
     /// acceptance evidence. A preflight failure that should rotate the queue
     /// uses `defer_preflight` instead so the row does not keep its priority.
-    /// A halt-driven release marks the same fairness yield so a held batch
-    /// does not keep its position indefinitely.
+    /// A halt-driven release marks the same fairness yield, fixing the row's
+    /// queue position at release time so it ages behind older rows but ahead
+    /// of later arrivals instead of keeping its position indefinitely.
     pub async fn release_unattempted(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_row(&mut tx, &claim.row.event.entry_id).await?;
@@ -439,8 +442,9 @@ impl AuditStore {
     /// history read, halt observed before preparation) fails for a reason tied
     /// to the destination rather than the row: the bounded queue then rotates
     /// to healthy rows instead of returning the same failing batch every tick.
-    /// Yielding also stamps the fairness cursor, so once the backoff expires
-    /// the row sorts behind never-yielded rows instead of reclaiming the head.
+    /// Yielding also stamps the fairness cursor, fixing the row's queue
+    /// position at deferral time; once the backoff expires the row ages
+    /// alongside older rows instead of being excluded by later arrivals.
     pub async fn defer_preflight(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_row(&mut tx, &claim.row.event.entry_id).await?;
@@ -469,9 +473,9 @@ impl AuditStore {
     /// Only an authoritative non-acceptance permits another send. Uncertainty
     /// preserves the boundary so the next claim is reconciliation-only.
     /// Neither classification can clear an already accepted message ID. Both
-    /// stamp the fairness yield so the released row rotates behind
-    /// never-yielded rows instead of reclaiming the head of the bounded batch;
-    /// attempts, boundary and accepted evidence are preserved untouched.
+    /// stamp the fairness yield, fixing the row's queue position at release
+    /// time so aged retries sort ahead of later arrivals; attempts, boundary
+    /// and accepted evidence are preserved untouched.
     pub async fn fail_attempt(
         &self,
         claim: &AuditClaim,

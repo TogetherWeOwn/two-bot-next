@@ -815,6 +815,94 @@ async fn reconciliation_failure_release_rotates_behind_healthy_send() -> TestRes
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI Postgres service"]
+async fn continued_arrivals_do_not_starve_aged_retries() -> TestResult {
+    let db = TestDb::new(true).await?;
+    let store = AuditStore::new(&db.pool);
+    // One reconciliation-only retry (ambiguous boundary kept) and one
+    // sendable retry (definite rejection clears the boundary). Both yield
+    // queue position at release time, before any fresh arrival exists.
+    for id in ["aged-reconcile", "aged-resend"] {
+        store.record(&event(id), Some("123")).await?;
+        let sending = store.claim(id).await?.unwrap();
+        assert_eq!(
+            store.prepare_send(&sending, "200").await?,
+            PrepareSend::Prepared
+        );
+        if id == "aged-resend" {
+            // Definite rejection is authoritative only from the sending
+            // owner; it clears the boundary and permits another send.
+            assert!(
+                store
+                    .fail_attempt(&sending, DeliveryFailure::DefinitelyRejected)
+                    .await?
+            );
+        }
+    }
+    db.expire("aged-reconcile").await?;
+    let recovery = store.claim("aged-reconcile").await?.unwrap();
+    assert_eq!(recovery.intent(), DeliveryIntent::Reconcile);
+    assert!(
+        store
+            .fail_attempt(&recovery, DeliveryFailure::UncertainAcceptance)
+            .await?
+    );
+    let reconcile_before = store.get("aged-reconcile").await?.unwrap();
+    let resend_before = store.get("aged-resend").await?.unwrap();
+    assert_eq!(reconcile_before.attempts, 1);
+    assert_eq!(reconcile_before.search_before.as_deref(), Some("200"));
+    assert_eq!(resend_before.attempts, 1);
+    assert_eq!(resend_before.search_before, None);
+    // Four sweeps of 25 fresh arrivals each. Under never-yielded-first
+    // ordering the two aged retries never enter the bounded batch while
+    // fresh rows are delivered around them; with aging position they stay
+    // at the head because their yield predates every fresh creation.
+    for sweep in 0..4 {
+        for i in 0..25 {
+            store
+                .record(&event(&format!("fresh-{sweep}-{i:02}")), Some("123"))
+                .await?;
+        }
+        let batch = store.pending_ids().await?;
+        assert_eq!(batch.len(), 25);
+        assert!(
+            batch.contains(&"aged-reconcile".to_owned()),
+            "sweep {sweep}: aged reconcile retry starved by fresh arrivals"
+        );
+        assert!(
+            batch.contains(&"aged-resend".to_owned()),
+            "sweep {sweep}: aged resend retry starved by fresh arrivals"
+        );
+        // Deliver only the fresh rows in this batch, leaving the aged
+        // retries pending for the next sweep.
+        for id in batch {
+            if id.starts_with("fresh-") {
+                let claim = store.claim(&id).await?.unwrap();
+                assert_eq!(
+                    store.prepare_send(&claim, "0").await?,
+                    PrepareSend::Prepared
+                );
+                assert!(store.note_accepted(&claim, "234").await?);
+                assert!(store.complete(&claim).await?);
+            }
+        }
+    }
+    // Queue position never touched attempts, boundaries or accepted evidence.
+    assert_eq!(
+        store.get("aged-reconcile").await?.unwrap(),
+        reconcile_before
+    );
+    assert_eq!(store.get("aged-resend").await?.unwrap(), resend_before);
+    let reconcile = store.claim("aged-reconcile").await?.unwrap();
+    assert_eq!(reconcile.intent(), DeliveryIntent::Reconcile);
+    assert!(store.note_accepted(&reconcile, "345").await?);
+    assert!(store.complete(&reconcile).await?);
+    let resend = store.claim("aged-resend").await?.unwrap();
+    assert_eq!(resend.intent(), DeliveryIntent::Send);
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
 async fn ineligible_claim_never_waits_on_row_or_halt_guard() -> TestResult {
     let db = TestDb::new(true).await?;
     let store = AuditStore::new(&db.pool);
