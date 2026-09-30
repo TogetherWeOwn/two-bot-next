@@ -411,6 +411,154 @@ fn prefixed_extension_fields_do_not_shadow_core_guid() {
 }
 
 #[test]
+fn legacy_parser_emulation_matches_identity_corpus() {
+    // Full reviewer corpus ([TOG-10352](/TOG/issues/TOG-10352) verdict on `c44577e`):
+    // legacy `parseXml` normalizes CRLF/CR to LF before anything else, trims
+    // each plain-text run on flush (CDATA appends raw, comments glue without
+    // flushing), rejects repeated fields as arrays, resolves structured link
+    // records through their `href` child, and lets entry attributes shadow
+    // same-named children. Every case pins the exact legacy hash/nonce so a
+    // restored delivery row is found instead of reposted.
+    for (xml, key, url, hash, nonce) in [
+        (
+            "<rss><channel><item><guid>first\r\nsecond</guid><link>https://example.org/post</link></item></channel></rss>",
+            "first\nsecond",
+            "https://example.org/post",
+            "4252f8d56b4bb236d0b1bc95a1202e392ca84ce0644bf628398fbb9517287da8",
+            "b704a73caebca38623bb5d22",
+        ),
+        (
+            "<rss><channel><item><guid>first\rsecond</guid><link>https://example.org/post</link></item></channel></rss>",
+            "first\nsecond",
+            "https://example.org/post",
+            "4252f8d56b4bb236d0b1bc95a1202e392ca84ce0644bf628398fbb9517287da8",
+            "b704a73caebca38623bb5d22",
+        ),
+        (
+            "<rss><channel><item><guid><![CDATA[first\r\nsecond]]></guid><link>https://example.org/post</link></item></channel></rss>",
+            "first\nsecond",
+            "https://example.org/post",
+            "4252f8d56b4bb236d0b1bc95a1202e392ca84ce0644bf628398fbb9517287da8",
+            "b704a73caebca38623bb5d22",
+        ),
+        (
+            "<feed><entry><link href=\"https://example.org/first\r\nsecond\"/></entry></feed>",
+            "https://example.org/first\nsecond",
+            "https://example.org/first\nsecond",
+            "1e60ac49b1f98d495a3d373dd7416efcdc5aaca81b0d387d1b1b8909587a7caa",
+            "e66f07ccd2089fba4f00759a",
+        ),
+        (
+            "<rss><channel><item><guid>post <![CDATA[1]]></guid><link>https://example.org/post</link></item></channel></rss>",
+            "post1",
+            "https://example.org/post",
+            "0c99c0ff97ab9d918039af1f390708ea1e0a32feed5c43469328fe2b559c9260",
+            "d3de15aef4a7f86bb7aa4c56",
+        ),
+        (
+            "<rss><channel><item><guid>pre <value>ignored</value> post</guid><link>https://example.org/post</link></item></channel></rss>",
+            "prepost",
+            "https://example.org/post",
+            "1accc940716d0d1956412ac8c9ed6049a94e1141e572b908429b7aa3b06212e3",
+            "39cbc9f03c64af50ffb28d4d",
+        ),
+        (
+            "<rss><channel><item><guid>pre <!--ignored--> post</guid><link>https://example.org/post</link></item></channel></rss>",
+            "pre  post",
+            "https://example.org/post",
+            "14705c6dd789eb8a78275ba3030fd97943ff9e87e442cd8ab9b4baf001888d6c",
+            "fc03158660584246956da9ef",
+        ),
+        (
+            "<rss><channel><item><guid>first</guid><guid>second</guid><id>stable-id</id><link>https://example.org/post</link></item></channel></rss>",
+            "stable-id",
+            "https://example.org/post",
+            "b1def59c1c5d69343801d03c4713526730d1e3bfcc4433c6833ec47a05d94601",
+            "3ff7db0ef03790598da90d81",
+        ),
+        (
+            "<rss><channel><item guid=\"attribute-key\"><guid>element-key</guid><link>https://example.org/post</link></item></channel></rss>",
+            "attribute-key",
+            "https://example.org/post",
+            "cb50fad2885cdd9620e8b5d775d90d2538b970087d348d38000670cb673d7287",
+            "6532279af5fbf20ae968129a",
+        ),
+        (
+            "<rss><channel><item><link><href>https://example.org/post</href></link></item></channel></rss>",
+            "https://example.org/post",
+            "https://example.org/post",
+            "53db375c90f95b28ded98a853f86ff3611560d726a857caf6b5c71b14789596f",
+            "ff28c1b9c4c672e5889547ed",
+        ),
+    ] {
+        let items = parse_xml_feed(xml).unwrap();
+        assert_eq!(items.len(), 1, "xml: {xml}");
+        assert_eq!(items[0].key, key, "xml: {xml}");
+        assert_eq!(items[0].url, url, "xml: {xml}");
+        assert_eq!(item_key(&items[0]).unwrap(), hash, "xml: {xml}");
+        assert_eq!(
+            delivery_nonce("feed-1", &item_key(&items[0]).unwrap()),
+            nonce,
+            "xml: {xml}"
+        );
+    }
+    // Adversarial shapes beyond the corpus, same legacy contract: padded
+    // CDATA trims, PIs split runs, empty CDATA joins, entry `link`
+    // attributes shadow child links, and any valued link attribute (even
+    // `xmlns`) blocks the bare-text fallback.
+    for (xml, key, url) in [
+        (
+            "<rss><channel><item><guid>  <![CDATA[  padded  ]]>  </guid><link>https://example.org/p</link></item></channel></rss>",
+            "padded",
+            "https://example.org/p",
+        ),
+        (
+            "<rss><channel><item><guid>pre <?pi data?> post</guid><link>https://example.org/p</link></item></channel></rss>",
+            "prepost",
+            "https://example.org/p",
+        ),
+        (
+            "<rss><channel><item><guid>a<![CDATA[]]>b</guid><link>https://example.org/p</link></item></channel></rss>",
+            "ab",
+            "https://example.org/p",
+        ),
+        (
+            "<rss><channel><item><link href=\"https://example.org/attr\"><href>https://example.org/child</href></link></item></channel></rss>",
+            "https://example.org/attr",
+            "https://example.org/attr",
+        ),
+        (
+            "<rss><channel><item link=\"https://example.org/attr\"><link>https://example.org/elem</link><guid>k</guid></item></channel></rss>",
+            "k",
+            "https://example.org/attr",
+        ),
+        (
+            "<rss><channel><item><link xmlns=\"http://www.w3.org/2005/Atom\">https://example.org/t</link><guid>k</guid></item></channel></rss>",
+            "k",
+            "https://example.org/t",
+        ),
+    ] {
+        // The xmlns case drops its link (record has no href), so the item
+        // falls back to guid-as-key with no valid URL and is filtered out.
+        let items = parse_xml_feed(xml).unwrap();
+        if url == "https://example.org/t" && key == "k" {
+            assert!(items.is_empty(), "xml: {xml}");
+        } else {
+            assert_eq!(items.len(), 1, "xml: {xml}");
+            assert_eq!(items[0].key, key, "xml: {xml}");
+            assert_eq!(items[0].url, url, "xml: {xml}");
+        }
+    }
+    // Multi-href children are an array legacy rejects, so the item is lost
+    // deterministically on both sides (no URL, no key fallback).
+    assert!(
+        parse_xml_feed("<rss><channel><item><link><href>https://example.org/1</href><href>https://example.org/2</href></link></item></channel></rss>")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn rejects_xml_entities_malformed_size_and_item_explosion() {
     for xml in ["<rss>", "<html/>",
         "<!DOCTYPE rss [<!ENTITY secret SYSTEM 'file:///etc/passwd'>]><rss><channel><item><title>&secret;</title></item></channel></rss>",

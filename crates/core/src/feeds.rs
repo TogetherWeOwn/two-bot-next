@@ -243,47 +243,62 @@ pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
     Ok(entries
         .into_iter()
         .filter_map(|entry| {
-            let links: Vec<_> = entry
-                .children()
-                .filter(|node| named(xml, *node, "link"))
-                .collect();
-            // Legacy `resolveLink` tests the RAW href: only an alternate whose
-            // href is itself HTTP(S) is promoted. A mailto alternate must not
-            // shadow the valid HTTPS alternate that follows it.
-            let link = links
-                .iter()
-                .find(|node| is_alternate(xml, **node) && is_http_href(&link_href_raw(xml, **node)))
-                .or_else(|| {
+            // An entry-level `link` attribute overwrites child `<link>`
+            // elements on the legacy record, so it shadows them entirely
+            // (even when empty, which then resolves to no URL).
+            let raw_url = match raw_attribute(xml, entry, "link") {
+                Some(attr) => normalize_line_endings(&attr),
+                None => {
+                    let links: Vec<_> = entry
+                        .children()
+                        .filter(|node| named(xml, *node, "link"))
+                        .collect();
+                    // Legacy `resolveLink` tests the RAW href: only an alternate whose
+                    // href is itself HTTP(S) is promoted. A mailto alternate must not
+                    // shadow the valid HTTPS alternate that follows it.
                     links
                         .iter()
-                        .find(|node| is_http_href(&link_href_raw(xml, **node)))
-                })
-                // Legacy falls back to the first non-empty href, not the
-                // first link element: `hrefs[0]` is drawn from the filtered list.
-                .or_else(|| {
-                    links
-                        .iter()
-                        .find(|node| !link_href_raw(xml, **node).is_empty())
-                });
-            let raw_url = link
-                .map(|node| link_href_raw(xml, *node))
-                .unwrap_or_default();
+                        .find(|node| {
+                            is_alternate(xml, **node) && is_http_href(&link_href_raw(xml, **node))
+                        })
+                        .or_else(|| {
+                            links
+                                .iter()
+                                .find(|node| is_http_href(&link_href_raw(xml, **node)))
+                        })
+                        // Legacy falls back to the first non-empty href, not the
+                        // first link element: `hrefs[0]` is drawn from the filtered list.
+                        .or_else(|| {
+                            links
+                                .iter()
+                                .find(|node| !link_href_raw(xml, **node).is_empty())
+                        })
+                        .map(|node| link_href_raw(xml, *node))
+                        .unwrap_or_default()
+                }
+            };
             // Legacy `textValue` short-circuits on the raw text: guid, then
-            // id, then the raw link. Identity decoding runs after selection
-            // so delivery keys hash the exact legacy form.
-            let raw_key = [raw_text(xml, entry, "guid"), raw_text(xml, entry, "id")]
-                .into_iter()
-                .find(|key| !key.is_empty())
-                .unwrap_or(raw_url.clone());
+            // id, then the raw link. Entry-level attributes override
+            // same-named children and repeated children become an array that
+            // textValue rejects, so selection mirrors the legacy record
+            // shape, not just the first matching child. Identity decoding
+            // runs after selection so delivery keys hash the exact legacy form.
+            let raw_key = [
+                raw_scalar_field(xml, entry, "guid"),
+                raw_scalar_field(xml, entry, "id"),
+            ]
+            .into_iter()
+            .find(|key| !key.is_empty())
+            .unwrap_or(raw_url.clone());
             let key = decode_xml_entities(&raw_key);
             let url = decode_xml_entities(&raw_url);
             if key.is_empty() || !is_item_url(&url) {
                 return None;
             }
-            let raw_title = raw_text(xml, entry, "title");
+            let raw_title = raw_scalar_field(xml, entry, "title");
             let published_at = ["pubDate", "published", "updated"]
                 .into_iter()
-                .map(|name| raw_text(xml, entry, name))
+                .map(|name| raw_scalar_field(xml, entry, name))
                 .find(|value| !value.is_empty())
                 .map(|value| decode_xml_entities(&value));
             Some(FeedItem {
@@ -358,42 +373,73 @@ fn open_tag_end(tag_and_rest: &str) -> usize {
     bytes.len()
 }
 
-/// Keep only the element's own character data the way legacy `textValue`
-/// keeps only `#text`: nested elements contribute nothing (not even their
-/// content), like legacy's `#text` read for `<b>Bold</b> tail` yielding
-/// just `tail`. CDATA contributes its raw body, markers excluded.
-/// Numeric references pass through untouched; NOT decoded here.
-fn raw_text(xml: &str, entry: Node<'_, '_>, name: &str) -> String {
-    let text = entry
-        .children()
-        .find(|child| named(xml, *child, name))
-        .map(|node| strip_markup(inner_source(xml, node)))
-        .unwrap_or_default();
-    js_trim(&text).to_owned()
+/// Scalar field the way the legacy record shape resolves it: an
+/// entry-level attribute wins over a same-named child, a repeated child
+/// name is an array that `textValue` rejects, and otherwise the value is
+/// the child's own `#text`. Returns the raw source form (line endings
+/// normalized, numeric references untouched).
+fn raw_scalar_field(xml: &str, entry: Node<'_, '_>, name: &str) -> String {
+    // Entry-level attributes land on the parsed item record first, so
+    // `<item guid="attribute-key">` shadows `<guid>element-key</guid>`.
+    // A missing `=` contributes nothing (legacy `allowBooleanAttributes`
+    // is false), which `raw_attribute` already models as `None`.
+    if let Some(attr) = raw_attribute(xml, entry, name) {
+        return attr;
+    }
+    let mut matching = entry.children().filter(|child| named(xml, *child, name));
+    let Some(first) = matching.next() else {
+        return String::new();
+    };
+    if matching.next().is_some() {
+        // Repeated children compress to an array; `textValue` only reads
+        // strings, numbers and single records, so the field is rejected and
+        // identity falls through exactly like legacy.
+        return String::new();
+    }
+    raw_own_text(xml, first)
 }
 
-/// Keep only the element's own character data the way legacy `textValue`
-/// keeps only `#text`: PIs, comments and nested elements (including their
-/// content) contribute nothing, and a CDATA section contributes its raw
-/// body (markers excluded). Numeric references pass through untouched;
-/// they are NOT decoded here.
-fn strip_markup(source: &str) -> String {
+/// Keep only the element's own character data the way legacy `#text` keeps
+/// it: nested elements split flush boundaries (their content contributes
+/// nothing), comments glue neighbours without flushing, and each plain-text
+/// run is JS-trimmed on flush. CDATA appends its raw body untrimmed, PIs
+/// flush-split through their tagged node, and a final JS trim mirrors
+/// `textValue`. Numeric references pass through untouched; NOT decoded here.
+fn raw_own_text(xml: &str, node: Node<'_, '_>) -> String {
+    raw_own_text_inner(normalize_line_endings(inner_source(xml, node)).as_ref())
+}
+
+fn raw_own_text_inner(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
+    let mut segment = String::new();
+    let flush_segment = |segment: &mut String, out: &mut String| {
+        let trimmed = js_trim(segment);
+        if !trimmed.is_empty() {
+            out.push_str(trimmed);
+        }
+        segment.clear();
+    };
     let mut i = 0;
     while i < bytes.len() {
         if source[i..].starts_with("<![CDATA[") {
             let rest = &source[i + 9..];
             let end = rest.find("]]>").map(|j| i + 9 + j).unwrap_or(source.len());
+            // CDATA is stored raw (`dontTrim`), so it appends even when it
+            // is empty or padding-only: `<![CDATA[]]>` still joins neighbours.
             out.push_str(&source[i + 9..end]);
             i = (end + 3).min(source.len());
         } else if source[i..].starts_with("<!--") {
+            // Comments produce no node and flush nothing: neighbours join.
             let end = source[i..]
                 .find("-->")
                 .map(|j| i + j + 3)
                 .unwrap_or(source.len());
             i = end;
         } else if source[i..].starts_with("<?") {
+            // PIs are tagged nodes: plain text flushes around them and their
+            // content contributes nothing.
+            flush_segment(&mut segment, &mut out);
             let end = source[i..]
                 .find("?>")
                 .map(|j| i + j + 2)
@@ -402,12 +448,48 @@ fn strip_markup(source: &str) -> String {
         } else if source[i..].starts_with("</") {
             i = tag_end(source, i);
         } else if bytes[i] == b'<' {
-            // Nested element: drop the whole subtree, not just its tags.
+            // Nested element: its content contributes nothing, but the plain
+            // text around it flushes as separate runs.
+            flush_segment(&mut segment, &mut out);
             i = skip_element(source, i);
         } else {
             let end = source[i..].find('<').map(|j| i + j).unwrap_or(source.len());
-            out.push_str(&source[i..end]);
+            segment.push_str(&source[i..end]);
+            // Each plain-text run flushes when it meets markup: `pre <v>x</v>
+            // post` yields `pre` + `post`, not a trimmed `pre  post`.
+            // Comments are the exception: legacy skips them without flushing,
+            // so neighbours join into one run (`pre <!--c--> post` stays
+            // `pre  post`).
+            if end < source.len() && !source[end..].starts_with("<!--") {
+                flush_segment(&mut segment, &mut out);
+            }
             i = end;
+        }
+    }
+    flush_segment(&mut segment, &mut out);
+    js_trim(&out).to_owned()
+}
+
+/// Legacy `parseXml` normalizes line endings before any other parsing:
+/// `xmlData.replace(/\r\n?/g, "\n")`. Every downstream text, CDATA body
+/// and attribute value therefore sees LF only. Apply the same
+/// normalization to source-derived identity paths (text, CDATA, raw
+/// attribute values) so hashes match the historic rows.
+fn normalize_line_endings(value: &str) -> String {
+    if !value.as_bytes().contains(&b'\r') {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            out.push('\n');
+            // A CRLF pair is one line break: skip the LF that follows CR.
+            if chars.clone().next() == Some('\n') {
+                chars.next();
+            }
+        } else {
+            out.push(ch);
         }
     }
     out
@@ -529,31 +611,103 @@ fn is_http_href(raw_href: &str) -> bool {
 
 /// Resolve one `<link>` element the way legacy `resolveLink` resolves a
 /// single record, but in RAW source form: the `href` attribute wins when
-/// present, and an attribute-bearing element without `href` contributes
-/// nothing (legacy only consults `record.href`, never the text body).
-/// A bare text link resolves to its stripped raw text.
+/// present (a nested `<href>` child only matters when NO `href` attribute
+/// is present, since attributes overwrite same-named children on the
+/// record). A repeated `<href>` child is an array that `textValue`
+/// rejects, yielding nothing. Any other attribute means the record has
+/// fields but no `href`, so it contributes nothing (legacy only consults
+/// `record.href`, never the text body). A bare text link resolves to its
+/// own `#text` only when the element is attribute-free; `xmlns`/`xml:*`
+/// bookkeeping attributes count as attributes but resolve to the bare text
+/// in the legacy reader, which drops them at this level.
 fn link_href_raw(xml: &str, node: Node<'_, '_>) -> String {
     if let Some(href) = raw_attribute(xml, node, "href") {
-        return href;
+        // NORMALIZE, not trim: legacy parses attribute values through
+        // `trimValues`, which trims JS-whitespace including newlines.
+        return normalize_line_endings(&href);
     }
-    if node.attributes().next().is_none() {
-        return js_trim(&strip_markup(inner_source(xml, node))).to_owned();
+    let href_children: Vec<_> = node
+        .children()
+        .filter(|child| named(xml, *child, "href"))
+        .collect();
+    if !href_children.is_empty() {
+        if href_children.len() > 1 {
+            return String::new();
+        }
+        return raw_own_text(xml, href_children[0]);
     }
-    String::new()
+    if has_meaningful_attributes(xml, node) {
+        return String::new();
+    }
+    raw_own_text(xml, node)
+}
+
+/// Any valued attribute on the record blocks the bare-text fallback the way
+/// legacy single-record `resolveLink` does: it only reads `record.href`,
+/// so `<link rel="x">text</link>` — and equally `<link
+/// xmlns="…">text</link>` — resolve to nothing. Valueless attributes never
+/// reach the legacy record (`allowBooleanAttributes` is false), so they do
+/// not block the fallback.
+fn has_meaningful_attributes(xml: &str, node: Node<'_, '_>) -> bool {
+    !raw_attribute_names(xml, node).is_empty()
+}
+
+/// Names on the open tag in source order (duplicates kept, the LAST wins
+/// in the legacy record). A missing `=` is a valueless attribute: legacy
+/// `allowBooleanAttributes` is false, so the legacy reader drops it and it
+/// never appears on the record.
+fn raw_attribute_names(xml: &str, node: Node<'_, '_>) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some(tag) = open_tag_attributes(xml, node) else {
+        return names;
+    };
+    scan_attributes(&tag, &mut |attr_name, has_value| {
+        if has_value.is_some() {
+            names.push(attr_name.to_owned());
+        }
+        true
+    });
+    names
 }
 
 /// Read one attribute value from the source slice so entity references
-/// survive (`href="...?a=1&amp;b=2"` keeps the raw `&amp;`). Matches
-/// legacy's attribute-name rule: case-sensitive, first match wins, and a
-/// missing `=` contributes nothing.
+/// survive (`href="...?a=1&amp;b=2"` keeps the raw `&amp;`), line endings
+/// stay raw here (callers normalize), and a duplicate name resolves to the
+/// LAST value like the legacy record. Matches legacy's attribute-name
+/// rule: case-sensitive; a missing `=` contributes nothing (`None`,
+/// whether or not the name matches).
 fn raw_attribute(xml: &str, node: Node<'_, '_>, name: &str) -> Option<String> {
+    let tag = open_tag_attributes(xml, node)?;
+    let mut found: Option<String> = None;
+    scan_attributes(&tag, &mut |attr_name, has_value| {
+        if attr_name == name {
+            // Valueless: legacy drops it, so it clears any earlier valued
+            // duplicate and never resolves.
+            found = has_value.map(|value| js_trim(value).to_owned());
+        }
+        true
+    });
+    found
+}
+
+/// The open tag's attribute span: everything after the element name up to
+/// the closing `>` (quote-aware so `>` inside a value does not end the
+/// scan, e.g. `href="a>b"`).
+fn open_tag_attributes(xml: &str, node: Node<'_, '_>) -> Option<String> {
     let range = node.range();
-    // Quote-aware: a `>` inside an attribute value must not end the scan.
     let open = open_tag_end(&xml[range.clone()]);
     let mut tag = &xml[range.start..range.start + open];
     // Drop the element name.
     let first = tag.find(|c: char| c.is_whitespace() || c == '/')?;
     tag = &tag[first..];
+    Some(tag.to_owned())
+}
+
+/// Walk one open tag's attribute span, calling `visit` with each name and
+/// its raw value (`None` when the attribute has no `=`). Quoted values may
+/// contain anything except their own quote; unquoted values run to the next
+/// ASCII whitespace. Returns `false` when the visitor stops early.
+fn scan_attributes(tag: &str, visit: &mut dyn FnMut(&str, Option<&str>) -> bool) -> bool {
     let bytes = tag.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -589,7 +743,7 @@ fn raw_attribute(xml: &str, node: Node<'_, '_>, name: &str) -> Option<String> {
                 while i < bytes.len() && bytes[i] != quote {
                     i += 1;
                 }
-                let value = tag[start..i].to_owned();
+                let value = &tag[start..i];
                 i = (i + 1).min(bytes.len());
                 value
             } else {
@@ -597,17 +751,16 @@ fn raw_attribute(xml: &str, node: Node<'_, '_>, name: &str) -> Option<String> {
                 while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                     i += 1;
                 }
-                tag[start..i].to_owned()
+                &tag[start..i]
             };
-            if attr_name == name {
-                return Some(js_trim(&value).to_owned());
+            if !visit(attr_name, Some(value)) {
+                return false;
             }
-        } else if attr_name == name {
-            // Valueless attribute: present but contributes nothing.
-            return None;
+        } else if !visit(attr_name, None) {
+            return false;
         }
     }
-    None
+    true
 }
 
 fn is_item_url(value: &str) -> bool {
