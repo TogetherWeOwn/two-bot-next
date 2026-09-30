@@ -412,13 +412,18 @@ fn prefixed_extension_fields_do_not_shadow_core_guid() {
 
 #[test]
 fn legacy_parser_emulation_matches_identity_corpus() {
-    // Full reviewer corpus ([TOG-10352](/TOG/issues/TOG-10352) verdict on `c44577e`):
-    // legacy `parseXml` normalizes CRLF/CR to LF before anything else, trims
-    // each plain-text run on flush (CDATA appends raw, comments glue without
-    // flushing), rejects repeated fields as arrays, resolves structured link
-    // records through their `href` child, and lets entry attributes shadow
-    // same-named children. Every case pins the exact legacy hash/nonce so a
-    // restored delivery row is found instead of reposted.
+    // Full reviewer corpus ([TOG-10352](/TOG/issues/TOG-10352) verdicts on
+    // `c44577e` and `3a45987`): legacy `parseXml` normalizes CRLF/CR to LF
+    // before anything else — including inside attribute values — trims each
+    // plain-text run on flush (CDATA flushes the pending run first, then
+    // appends raw; comments glue without flushing), rejects repeated fields
+    // as arrays, resolves structured link records through their `href` child
+    // (a nested element/PI child with no `href` field discards the link
+    // rather than falling back to its text), reads child `<rel>` through the
+    // same attribute-over-child projection for alternate selection, and lets
+    // entry attributes shadow same-named children. Every case pins the exact
+    // legacy hash/nonce so a restored delivery row is found instead of
+    // reposted.
     for (xml, key, url, hash, nonce) in [
         (
             "<rss><channel><item><guid>first\r\nsecond</guid><link>https://example.org/post</link></item></channel></rss>",
@@ -490,6 +495,32 @@ fn legacy_parser_emulation_matches_identity_corpus() {
             "53db375c90f95b28ded98a853f86ff3611560d726a857caf6b5c71b14789596f",
             "ff28c1b9c4c672e5889547ed",
         ),
+        // Scalar ATTRIBUTE identities also see the pre-parse line-ending
+        // normalization: a CRLF inside `guid="…"` is LF on both sides.
+        (
+            "<rss><channel><item guid=\"first\r\nsecond\"><link>https://example.org/post</link></item></channel></rss>",
+            "first\nsecond",
+            "https://example.org/post",
+            "4252f8d56b4bb236d0b1bc95a1202e392ca84ce0644bf628398fbb9517287da8",
+            "b704a73caebca38623bb5d22",
+        ),
+        // Same for a bare CR inside an Atom entry `id="…"` attribute.
+        (
+            "<feed><entry id=\"first\rsecond\"><link href=\"https://example.org/post\"/></entry></feed>",
+            "first\nsecond",
+            "https://example.org/post",
+            "4252f8d56b4bb236d0b1bc95a1202e392ca84ce0644bf628398fbb9517287da8",
+            "b704a73caebca38623bb5d22",
+        ),
+        // A text run buffered before CDATA keeps its position: the pending
+        // segment flushes first, so the key preserves source order.
+        (
+            "<rss><channel><item><guid>pre<!--x--><![CDATA[ mid ]]><!--y-->post</guid><link>https://example.org/post</link></item></channel></rss>",
+            "pre mid post",
+            "https://example.org/post",
+            "f97474f81145c0d03baecfa3b28863b56b996c265ef868a8eedea533d525a6dc",
+            "db2a7886835f457fb9b14f6e",
+        ),
     ] {
         let items = parse_xml_feed(xml).unwrap();
         assert_eq!(items.len(), 1, "xml: {xml}");
@@ -556,6 +587,105 @@ fn legacy_parser_emulation_matches_identity_corpus() {
             .unwrap()
             .is_empty()
     );
+    // A nested element child projects the link to a record with no `href`
+    // field, so legacy discards the item instead of URL-keying it.
+    assert!(
+        parse_xml_feed("<rss><channel><item><link>https://example.org/post<other>value</other></link></item></channel></rss>")
+            .unwrap()
+            .is_empty()
+    );
+    // Alternate selection reads child `<rel>` through the same
+    // attribute-over-child projection: the alternate post URL wins over the
+    // self feed URL even with a stable id in play.
+    let items = parse_xml_feed("<feed><entry><id>stable-id</id><link><rel>self</rel><href>https://example.org/feed</href></link><link><rel>alternate</rel><href>https://example.org/post</href></link></entry></feed>").unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "stable-id");
+    assert_eq!(items[0].url, "https://example.org/post");
+    assert_eq!(
+        item_key(&items[0]).unwrap(),
+        "b1def59c1c5d69343801d03c4713526730d1e3bfcc4433c6833ec47a05d94601"
+    );
+    assert_eq!(
+        delivery_nonce("feed-1", &item_key(&items[0]).unwrap()),
+        "3ff7db0ef03790598da90d81"
+    );
+    // A same-named attribute shadows a `<rel>` child the way attributes
+    // overwrite same-named children on the legacy record: `rel="self"` on the
+    // link wins over `<rel>alternate</rel>`, so the suitable alternate is the
+    // OTHER link, not this one.
+    let items = parse_xml_feed("<feed><entry><id>k</id><link rel=\"self\"><rel>alternate</rel><href>https://example.org/u1</href></link><link rel=\"alternate\"><rel>self</rel><href>https://example.org/u2</href></link></entry></feed>").unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].url, "https://example.org/u2");
+    // A PI child is a tagged record field (`?pi`), so a text link with a PI
+    // is a record without `href` and the item is discarded — while a comment
+    // tail or a CDATA body is `#text` and the bare-text fallback survives.
+    assert!(parse_xml_feed(
+        "<rss><channel><item><link>https://example.org/p<?pi data?></link></item></channel></rss>"
+    )
+    .unwrap()
+    .is_empty());
+    assert!(
+        parse_xml_feed("<rss><channel><item><link rel=\"alternate\">https://example.org/p</link></item></channel></rss>")
+            .unwrap()
+            .is_empty()
+    );
+    for (xml, key, url, hash, nonce) in [
+        (
+            "<rss><channel><item><link>https://example.org/p<!--c--></link></item></channel></rss>",
+            "https://example.org/p",
+            "https://example.org/p",
+            "a88aada49b36ba941d5df671fa8d3a3f244d9606589ce8e0ed6a1fc1bdf4509c",
+            "b191ee155dacf0e38c4b002a",
+        ),
+        (
+            "<rss><channel><item><link><![CDATA[https://example.org/p]]></link></item></channel></rss>",
+            "https://example.org/p",
+            "https://example.org/p",
+            "a88aada49b36ba941d5df671fa8d3a3f244d9606589ce8e0ed6a1fc1bdf4509c",
+            "b191ee155dacf0e38c4b002a",
+        ),
+        // CDATA flushes the text run buffered before it; empty CDATA still
+        // joins neighbours; CDATA chains across an element keep order.
+        (
+            "<rss><channel><item><guid>pre <!--c--><![CDATA[1]]></guid><link>https://example.org/p</link></item></channel></rss>",
+            "pre1",
+            "https://example.org/p",
+            "d884b328056ffc0a71e6e6cc0d30a336c252732d7c6a9381330a4ba462418c75",
+            "0d8c240da97f3e6c4391a281",
+        ),
+        (
+            "<rss><channel><item><guid>a <![CDATA[]]> b</guid><link>https://example.org/p</link></item></channel></rss>",
+            "ab",
+            "https://example.org/p",
+            "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+            "04335f7f7bfcc511c74fc79c",
+        ),
+        (
+            "<rss><channel><item><guid>a<![CDATA[x]]><v>q</v><![CDATA[y]]>b</guid><link>https://example.org/p</link></item></channel></rss>",
+            "axyb",
+            "https://example.org/p",
+            "8ff031f9e83eb5c3635706b88d9529b7269bd2038a361c870ec95ea12f42d3b5",
+            "45798480c1c9154060b5505f",
+        ),
+        (
+            "<rss><channel><item><guid><![CDATA[1]]> post</guid><link>https://example.org/p</link></item></channel></rss>",
+            "1post",
+            "https://example.org/p",
+            "e0e05d90c9af2475b7190e3464809b5e2ed43d2f1f2bb3aa800083c2e1849f73",
+            "e52c9770ae9a031d4753abf3",
+        ),
+    ] {
+        let items = parse_xml_feed(xml).unwrap();
+        assert_eq!(items.len(), 1, "xml: {xml}");
+        assert_eq!(items[0].key, key, "xml: {xml}");
+        assert_eq!(items[0].url, url, "xml: {xml}");
+        assert_eq!(item_key(&items[0]).unwrap(), hash, "xml: {xml}");
+        assert_eq!(
+            delivery_nonce("feed-1", &item_key(&items[0]).unwrap()),
+            nonce,
+            "xml: {xml}"
+        );
+    }
 }
 
 #[test]

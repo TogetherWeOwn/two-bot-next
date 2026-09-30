@@ -247,7 +247,9 @@ pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
             // elements on the legacy record, so it shadows them entirely
             // (even when empty, which then resolves to no URL).
             let raw_url = match raw_attribute(xml, entry, "link") {
-                Some(attr) => normalize_line_endings(&attr),
+                // Already line-ending-normalized and JS-trimmed by
+                // `raw_attribute`, mirroring legacy's normalize-then-trim.
+                Some(attr) => attr,
                 None => {
                     let links: Vec<_> = entry
                         .children()
@@ -425,8 +427,12 @@ fn raw_own_text_inner(source: &str) -> String {
         if source[i..].starts_with("<![CDATA[") {
             let rest = &source[i + 9..];
             let end = rest.find("]]>").map(|j| i + 9 + j).unwrap_or(source.len());
-            // CDATA is stored raw (`dontTrim`), so it appends even when it
-            // is empty or padding-only: `<![CDATA[]]>` still joins neighbours.
+            // A text run buffered before CDATA keeps its position: flush it
+            // first so `pre<!--x--><![CDATA[ mid ]]>` stays `pre mid` instead
+            // of reordering to `mid pre`. CDATA is stored raw (`dontTrim`),
+            // so it appends even when empty or padding-only: `<![CDATA[]]>`
+            // still joins neighbours.
+            flush_segment(&mut segment, &mut out);
             out.push_str(&source[i + 9..end]);
             i = (end + 3).min(source.len());
         } else if source[i..].starts_with("<!--") {
@@ -589,12 +595,32 @@ fn decode_xml_entities(value: &str) -> String {
 
 /// Whether a `<link>` element is an alternate in the legacy sense: a
 /// missing or empty `rel` defaults to alternate, matching `entry.rel ||
-/// 'alternate'`.
+/// 'alternate'`. The `rel` attribute wins over a `<rel>` child (attributes
+/// overwrite same-named children on the legacy record); a repeated `<rel>`
+/// child is an array that `textValue` rejects, so the field is missing and
+/// the link defaults to alternate. Standalone text or tagged (`?pi`) nodes
+/// under `<link>` are not `rel` fields, so they never block the default.
 fn is_alternate(xml: &str, node: Node<'_, '_>) -> bool {
     match raw_attribute(xml, node, "rel") {
-        None => true,
         Some(rel) => rel.is_empty() || rel.eq_ignore_ascii_case("alternate"),
+        None => match raw_rel_child(xml, node) {
+            None => true,
+            Some(rel) => rel.is_empty() || rel.eq_ignore_ascii_case("alternate"),
+        },
     }
+}
+
+/// The `<rel>` child of a `<link>` record the way legacy `resolveLink` reads
+/// it: `textValue(record.rel)` over the single named child, where a repeated
+/// child is an array that rejects to missing. Returns `None` when there is
+/// no `<rel>` element child at all.
+fn raw_rel_child(xml: &str, node: Node<'_, '_>) -> Option<String> {
+    let mut matching = node.children().filter(|child| named(xml, *child, "rel"));
+    let first = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    Some(raw_own_text(xml, first))
 }
 
 /// Legacy tests the raw href with `/^https?:\/\//i` — before any entity
@@ -616,15 +642,21 @@ fn is_http_href(raw_href: &str) -> bool {
 /// record). A repeated `<href>` child is an array that `textValue`
 /// rejects, yielding nothing. Any other attribute means the record has
 /// fields but no `href`, so it contributes nothing (legacy only consults
-/// `record.href`, never the text body). A bare text link resolves to its
-/// own `#text` only when the element is attribute-free; `xmlns`/`xml:*`
-/// bookkeeping attributes count as attributes but resolve to the bare text
-/// in the legacy reader, which drops them at this level.
+/// `record.href`, never the text body). Likewise a nested element or PI
+/// child projects the link to a record: `<link>url<other>v</other></link>`
+/// is `{other, #text}`, so without an `href` attribute or `<href>` child
+/// there is no `href` field and the link is discarded rather than falling
+/// back to its own text. Comments and CDATA are not fields (comments
+/// produce no node, CDATA is `#text`), so they never block the fallback.
+/// A bare text link resolves to its own `#text` only when the element is
+/// attribute- and field-free; `xmlns`/`xml:*` bookkeeping attributes count
+/// as attributes but resolve to the bare text in the legacy reader, which
+/// drops them at this level.
 fn link_href_raw(xml: &str, node: Node<'_, '_>) -> String {
     if let Some(href) = raw_attribute(xml, node, "href") {
-        // NORMALIZE, not trim: legacy parses attribute values through
-        // `trimValues`, which trims JS-whitespace including newlines.
-        return normalize_line_endings(&href);
+        // Already line-ending-normalized and JS-trimmed by `raw_attribute`,
+        // mirroring legacy's normalize-then-`trimValues` order.
+        return href;
     }
     let href_children: Vec<_> = node
         .children()
@@ -635,6 +667,12 @@ fn link_href_raw(xml: &str, node: Node<'_, '_>) -> String {
             return String::new();
         }
         return raw_own_text(xml, href_children[0]);
+    }
+    if node
+        .children()
+        .any(|child| child.is_element() || child.is_pi())
+    {
+        return String::new();
     }
     if has_meaningful_attributes(xml, node) {
         return String::new();
@@ -671,11 +709,13 @@ fn raw_attribute_names(xml: &str, node: Node<'_, '_>) -> Vec<String> {
 }
 
 /// Read one attribute value from the source slice so entity references
-/// survive (`href="...?a=1&amp;b=2"` keeps the raw `&amp;`), line endings
-/// stay raw here (callers normalize), and a duplicate name resolves to the
-/// LAST value like the legacy record. Matches legacy's attribute-name
-/// rule: case-sensitive; a missing `=` contributes nothing (`None`,
-/// whether or not the name matches).
+/// survive (`href="...?a=1&amp;b=2"` keeps the raw `&amp;`), and a duplicate
+/// name resolves to the LAST value like the legacy record. Matches legacy's
+/// attribute-name rule: case-sensitive; a missing `=` contributes nothing
+/// (`None`, whether or not the name matches). Line endings are normalized
+/// here because legacy normalizes CRLF/CR to LF before parsing, so every
+/// downstream attribute value sees LF only; normalization runs before the
+/// JS trim exactly like legacy's parse-then-`trimValues` order.
 fn raw_attribute(xml: &str, node: Node<'_, '_>, name: &str) -> Option<String> {
     let tag = open_tag_attributes(xml, node)?;
     let mut found: Option<String> = None;
@@ -683,7 +723,7 @@ fn raw_attribute(xml: &str, node: Node<'_, '_>, name: &str) -> Option<String> {
         if attr_name == name {
             // Valueless: legacy drops it, so it clears any earlier valued
             // duplicate and never resolves.
-            found = has_value.map(|value| js_trim(value).to_owned());
+            found = has_value.map(|value| js_trim(&normalize_line_endings(value)).to_owned());
         }
         true
     });
