@@ -2,9 +2,8 @@
 //!
 //! Ports `src/internal/*` from legacy two-bot (frozen `main`, card acceptance
 //! criteria) as framework-free data plus pure functions. The axum route, the
-//! sqlx `InternalActionStore` tables (`internal_nonces`, `internal_idempotency`,
-//! `internal_action_log`, `internal_discord_events`), and the twilight Discord
-//! calls land in later slices behind the `db` feature and the bot crate; this
+//! twilight Discord calls land in later slices in the bot crate. The durable
+//! guards live in `internal_action_store` behind the `db` feature; this
 //! module owns the order of the checks and every refusal the caller can see, so
 //! the whole pipeline below is unit-testable without Discord, Postgres, or a
 //! socket.
