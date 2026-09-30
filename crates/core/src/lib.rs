@@ -10,9 +10,9 @@ pub mod automod;
 pub mod classify;
 pub mod commands;
 pub mod community;
+pub mod community_snapshots;
 #[cfg(feature = "db")]
 pub mod community_store;
-pub mod community_snapshots;
 pub mod config;
 pub mod containment;
 pub mod events;
