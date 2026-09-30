@@ -180,20 +180,69 @@ struct MockDiscord {
     auth: mpsc::Receiver<Value>,
     release: mpsc::Sender<()>,
     task: JoinHandle<()>,
+    rest: JoinHandle<()>,
 }
 
 impl MockDiscord {
     async fn new() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("ws://{addr}");
-        let api = format!("http://{addr}/api/v10");
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let url = format!("ws://{ws_addr}");
+        // REST origin without the `/api/v10` suffix: `HyperTransport::url()`
+        // appends `/api/v10/{path}` itself, so passing the suffixed form
+        // would double-prefix to `/api/v10/api/v10/...`.
+        let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest_addr = rest_listener.local_addr().unwrap();
+        let api = format!("http://{rest_addr}");
         let (auth_tx, auth) = mpsc::channel(2);
         let (release, mut gates) = mpsc::channel(4);
         let resume_url = url.clone();
+        // Boot-time onboarding identity probe (`GET /api/v10/users/@me`)
+        // must stay on loopback: serve the bot identity on the same REST
+        // origin the child receives via `DISCORD_API_BASE`.
+        let rest = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = rest_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.is_err() {
+                            return;
+                        }
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_owned();
+                    let (status, body) =
+                        if request_line.starts_with("GET") && path == "/api/v10/users/@me" {
+                            ("200 OK", r#"{"id":"999","bot":true}"#.to_owned())
+                        } else {
+                            ("404 Not Found", r#"{"message":"not found"}"#.to_owned())
+                        };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let mut stream = reader.into_inner();
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
         let task = tokio::spawn(async move {
             for boot in 0..2 {
-                let (stream, _) = listener.accept().await.unwrap();
+                let (stream, _) = ws_listener.accept().await.unwrap();
                 let (_, mut ws) = ServerBuilder::new()
                     .accept(stream)
                     .await
@@ -252,6 +301,7 @@ impl MockDiscord {
             auth,
             release,
             task,
+            rest,
         }
     }
 
@@ -422,6 +472,8 @@ async fn real_binary_is_alive_and_resumes_after_sigterm() {
     }
     discord.task.abort();
     let _ = discord.task.await;
+    discord.rest.abort();
+    let _ = discord.rest.await;
     db.close().await;
     match result {
         Ok(Ok(())) => eprintln!("real-binary lifecycle PASS in {:?}", started.elapsed()),

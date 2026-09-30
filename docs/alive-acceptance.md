@@ -47,9 +47,11 @@ is actually selected. HELLO and READY/RESUMED are separately gated by the test.
   addresses, DNS names, credentials, paths and queries are rejected before a
   shard is built. Unset keeps the normal Discord endpoint; saved resume URLs
   retain precedence.
-- `DISCORD_API_BASE` is set to the local mock in the child environment as a
-  containment seam for REST-capable startup. The current lifecycle entrypoint
-  does not issue REST requests, so this test does not claim REST acceptance.
+- `DISCORD_API_BASE` is set to the local mock REST origin in the child
+  environment as a containment seam. Startup issues exactly one proxied REST
+  read (`GET /api/v10/users/@me`) for the onboarding identity probe; the mock
+  serves `{"id":"999","bot":true}` on loopback and 404 otherwise. No real
+  Discord service is contacted.
 - The connected log is emitted only after READY/RESUMED and its checkpoint
   commit. `LOG_FORMAT=json` is not implemented in the current binary; the
   acceptance reports the skip rather than pretending plain text is JSON.

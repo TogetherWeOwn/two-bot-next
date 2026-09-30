@@ -117,12 +117,20 @@ async fn main() {
                     );
                     let saved = gateway::load_boot_session(&store).await?;
                     let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                    // Onboarding identity probe must honor the mock REST seam
+                    // (`DISCORD_API_BASE`), mirroring the sticky runtime: the
+                    // alive acceptance serves `/users/@me` on loopback.
+                    let proxy = std::env::var("DISCORD_API_BASE")
+                        .ok()
+                        .filter(|value| !value.is_empty());
                     let executor =
-                        two_bot_discord::ActionExecutor::new(token.clone()).map_err(|_| {
-                            sqlx::Error::InvalidArgument(
-                                "Discord executor initialization failed".into(),
-                            )
-                        })?;
+                        two_bot_discord::ActionExecutor::with_proxy(token.clone(), proxy).map_err(
+                            |_| {
+                                sqlx::Error::InvalidArgument(
+                                    "Discord executor initialization failed".into(),
+                                )
+                            },
+                        )?;
                     let onboarding = Arc::new(
                         onboarding::OnboardingRuntime::from_env(
                             db.pool().clone(),
