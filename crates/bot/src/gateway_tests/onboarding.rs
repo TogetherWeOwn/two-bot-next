@@ -1,16 +1,12 @@
 //! Durable onboarding recovery through a real local shard and mock REST.
 //! Only the parent's explicitly opted-in, isolated TestDb is used.
 
-#[allow(dead_code)]
-#[path = "../../../discord/tests/common/mod.rs"]
-mod common;
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::AtomicBool;
 
-use common::{MockRest, RestRequest, ScriptedResponse};
+use crate::mock_rest::{MockRest, RestRequest, ScriptedResponse};
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
 use twilight_model::id::Id;
 use two_bot_core::onboarding::{

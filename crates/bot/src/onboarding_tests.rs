@@ -1,13 +1,10 @@
 //! Combined shared-router/REST and isolated agent-testdb acceptance. No live inputs.
 #![allow(dead_code)]
-#[path = "../../discord/tests/common/mod.rs"]
-mod common;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::{MockRest, RestRequest, ScriptedResponse};
+use crate::mock_rest::{MockRest, RestRequest, ScriptedResponse};
 use futures_util::FutureExt as _;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;

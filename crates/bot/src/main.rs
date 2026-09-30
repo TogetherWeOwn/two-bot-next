@@ -11,6 +11,10 @@ mod gateway;
 mod gateway_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../discord/tests/common/mod.rs"]
+mod mock_rest;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
