@@ -22,6 +22,21 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
+    services:
+      agent-testdb:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: two_bot_test_tog10090_ci
+          # Ephemeral CI service only; tests explicitly use an empty password.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d two_bot_test_tog10090_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,13 +62,34 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      # Compile optional stores and run their non-network safety tests too.
-      # Live store tests remain explicitly ignored (agent-testdb only).
+      # Compile optional stores and run their safety and scratch-DB tests too.
+      # Onboarding/sticky live tests remain explicitly ignored by default.
       - name: cargo clippy -D warnings
         run: cargo clippy --workspace --all-targets --features two-bot-core/db -- -D warnings
 
-      - name: cargo test
-        run: cargo test --workspace --features two-bot-core/db --locked
+      - name: Prepare isolated test databases
+        env:
+          TEST_DB_CONTAINER: ${{ job.services.agent-testdb.id }}
+        run: |
+          # Host-runner steps reach only this job's published service port.
+          # Keep the test guards' required hostname instead of weakening them.
+          printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
+          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_tog10090_rsvp_ci
+
+      # Preserve cargo test's default unit/binary, integration and doc targets.
+      # RSVP's unique schemas live in a different database from website resets.
+      - name: cargo test (unit and binary, including RSVP store)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_rsvp_ci
+        run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
+
+      - name: cargo test (integration, including website acceptance)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_ci
+        run: cargo test --workspace --test '*' --features two-bot-core/db --locked
+
+      - name: cargo test (docs)
+        run: cargo test --workspace --doc --features two-bot-core/db --locked
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
