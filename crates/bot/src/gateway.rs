@@ -41,7 +41,7 @@ pub fn ensure_crypto_provider() {
 /// Supervisor-visible gateway state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayState {
-    /// No token configured; the shard will not start.
+    /// Missing gateway prerequisites; the shard will not start.
     Unconfigured,
     /// Token present; the supervisor task is (re)connecting.
     Armed,
