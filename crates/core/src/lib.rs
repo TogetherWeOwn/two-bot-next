@@ -22,6 +22,8 @@ pub mod community_snapshots;
 pub mod community_store;
 pub mod config;
 pub mod containment;
+#[cfg(feature = "db")]
+pub mod database_roles;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
