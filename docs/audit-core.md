@@ -26,7 +26,15 @@ Correlation requires **both** a valid guild-bound MAC and an executor matching
 this bot's user ID. Without a configured secret, reasons remain unchanged and
 entries use `discord-audit:` identities. A valid token by itself proves nothing.
 The MAC is the legacy truncated 64-bit HMAC; this port does not redesign that
-wire contract. The independent Node crypto vector is asserted in a Rust test.
+wire contract. Independent Node crypto vectors are asserted in Rust tests,
+including padded and whitespace-only environment keys. The public, non-production
+vectors live in `crates/core/tests/fixtures/moderation-mac.json` and are loaded
+only by test code; no operational key is embedded in Rust source. The original
+known-answer vector remains unchanged. No CodeQL checks or queries are disabled.
+
+Credential-file contents are trimmed; nonempty environment values retain their
+exact bytes, like legacy `readSecret`. An empty resolved mirror channel means
+store-only regardless of the event guild.
 
 ## Source contract
 

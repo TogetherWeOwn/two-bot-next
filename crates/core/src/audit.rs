@@ -318,7 +318,10 @@ pub fn route_for_sink(
     {
         return SinkRoute::TamperLoop { stored };
     }
-    let Some(requested) = channels.channel_for(event.channel) else {
+    let Some(requested) = channels
+        .channel_for(event.channel)
+        .filter(|id| !id.is_empty())
+    else {
         return SinkRoute::StoreOnly;
     };
     // Legacy: `requestedChannelId && options.guildId &&
@@ -582,6 +585,38 @@ mod tests {
             ),
             SinkRoute::StoreOnly
         );
+    }
+
+    #[test]
+    fn empty_resolved_destination_stores_only_in_every_guild() {
+        let channels = AuditChannelIds {
+            audit: Some(String::new()),
+            voice: Some(String::new()),
+            moderation: Some(String::new()),
+        };
+        for kind in [
+            AuditKind::MemberUpdate,
+            AuditKind::VoiceJoin,
+            AuditKind::ModerationAction,
+        ] {
+            let event =
+                AuditEvent::new("empty-channel".into(), kind, "guild-1".into(), "AT".into());
+            for guild in [Some("guild-1"), Some("other"), Some(""), None] {
+                assert_eq!(
+                    route_for_sink(&event, &channels, &[], guild, true),
+                    SinkRoute::StoreOnly,
+                );
+                // Absent voice/moderation channels also resolve to the empty audit fallback.
+                let fallback = AuditChannelIds {
+                    audit: Some(String::new()),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    route_for_sink(&event, &fallback, &[], guild, true),
+                    SinkRoute::StoreOnly
+                );
+            }
+        }
     }
 
     #[test]

@@ -610,9 +610,7 @@ pub fn classify_moderation_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mac::moderation_audit_reason;
-
-    const SECRET: &str = "test-secret-at-least-32-chars-long!!";
+    use crate::mac::{moderation_audit_reason, moderation_test_vectors};
     const GUILD: &str = "123456789012345678";
     const ACTOR: &str = "987654321098765432";
 
@@ -867,8 +865,9 @@ mod tests {
 
     #[test]
     fn correlated_moderation_row_matches_legacy() {
+        let secret = moderation_test_vectors().remove(0).secret;
         let reason = moderation_audit_reason(
-            Some(SECRET),
+            Some(&secret),
             GUILD,
             "idem-1",
             "moderation.ban",
@@ -887,7 +886,7 @@ mod tests {
             extra_removed: None,
         };
         let event =
-            classify_moderation_audit(&entry, GUILD, Some(ACTOR), Some(SECRET)).expect("row");
+            classify_moderation_audit(&entry, GUILD, Some(ACTOR), Some(&secret)).expect("row");
         assert_eq!(event.kind, AuditKind::ModerationAction);
         assert!(event
             .entry_id
@@ -904,6 +903,7 @@ mod tests {
 
     #[test]
     fn uncorrelated_moderation_row_matches_legacy() {
+        let secret = moderation_test_vectors().remove(0).secret;
         // No secret: marker cannot verify, row stays a plain discord-audit row.
         let entry = RawAuditLogEntry {
             action_id: 20,
@@ -926,8 +926,14 @@ mod tests {
         assert!(!event.metadata_json.contains("moderation_service"));
 
         // Marker names another bot: uncorrelated even with the secret.
-        let reason =
-            moderation_audit_reason(Some(SECRET), GUILD, "idem-9", "moderation.kick", ACTOR, "x");
+        let reason = moderation_audit_reason(
+            Some(&secret),
+            GUILD,
+            "idem-9",
+            "moderation.kick",
+            ACTOR,
+            "x",
+        );
         let other_bot = RawAuditLogEntry {
             action_id: 20,
             log_entry_id: "223".to_owned(),
@@ -940,12 +946,12 @@ mod tests {
             extra_removed: None,
         };
         let event =
-            classify_moderation_audit(&other_bot, GUILD, Some(ACTOR), Some(SECRET)).expect("row");
+            classify_moderation_audit(&other_bot, GUILD, Some(ACTOR), Some(&secret)).expect("row");
         assert_eq!(event.entry_id, format!("discord-audit:{GUILD}:223"));
 
         // Channel-targeted correlated action: target moves to the channel row.
         let reason = moderation_audit_reason(
-            Some(SECRET),
+            Some(&secret),
             GUILD,
             "idem-p",
             "moderation.purge",
@@ -964,7 +970,7 @@ mod tests {
             extra_removed: None,
         };
         let event =
-            classify_moderation_audit(&purge, GUILD, Some(ACTOR), Some(SECRET)).expect("row");
+            classify_moderation_audit(&purge, GUILD, Some(ACTOR), Some(&secret)).expect("row");
         assert_eq!(event.action.as_deref(), Some("moderation.purge"));
         assert_eq!(event.target_id, None);
         assert_eq!(
@@ -980,7 +986,7 @@ mod tests {
             ..purge
         };
         assert_eq!(
-            classify_moderation_audit(&unknown, GUILD, Some(ACTOR), Some(SECRET)),
+            classify_moderation_audit(&unknown, GUILD, Some(ACTOR), Some(&secret)),
             None
         );
     }
