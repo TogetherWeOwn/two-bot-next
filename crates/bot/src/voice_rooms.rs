@@ -1,26 +1,41 @@
 //! Ordered V1 lifecycle executor. Gateway publication must continue independently
 //! while a worker awaits HTTP/SQL: every write rechecks the latest snapshot.
-//! This service is not enabled until the bot wires it to complete guild snapshots.
+//!
+//! [`VoiceRuntime`] (below) is the V1 wiring: a per-guild actor registry fed
+//! by a gateway sink. Each guild gets one actor task owning its
+//! [`GuildRoomWorker`]; the sink translates twilight events into actor
+//! commands, and a timer drains the worker's ordered queue. Single-attempt
+//! REST plus deferred rename backoff are preserved so a rename backlog can
+//! never monopolize a guild lane. The runtime is inert unless constructed
+//! (gated on `TWO_VOICE=1` by the binary).
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    sync::{Arc, RwLock},
-    time::Instant,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use tokio::sync::mpsc;
+use twilight_cache_inmemory::DefaultInMemoryCache;
+use twilight_gateway::Event;
 use twilight_model::{
     channel::{permission_overwrite::PermissionOverwrite, Channel},
     guild::{Permissions, Role},
     id::{marker::RoleMarker, Id},
 };
 use two_bot_core::{
+    now_iso,
     voice_rooms::{
-        category_full_message, ActionQueue, CreatorChannel, NewRoomSpec, PermissionSource,
-        ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, VoiceRoom,
-        MAX_CHANNELS_PER_CATEGORY, RENAME_MIN_INTERVAL_MS,
+        category_full_message, voice_commands, ActionQueue, CreatorChannel, NewRoomSpec,
+        PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
+        VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN,
+        RENAME_MIN_INTERVAL_MS,
     },
-    Snowflake,
+    CommandDefinition, Snowflake,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{
@@ -294,6 +309,13 @@ impl LiveGuild {
         let mut live = self.inner.write().expect("live voice lock");
         live.ready = false;
         live.generation += 1;
+    }
+
+    /// Refresh the bot access snapshot after role changes. Generation is
+    /// unchanged: role edits do not invalidate in-flight tickets, they only
+    /// affect the next guard evaluation.
+    pub fn refresh_bot(&self, access: BotAccess) {
+        self.inner.write().expect("live voice lock").bot = Some(access);
     }
 
     /// Publish before enqueueing the ticket. Same-channel mute/deaf updates do
@@ -1032,6 +1054,539 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
 
 fn elapsed_ms(now_ms: u64, started: Instant) -> u64 {
     now_ms.saturating_add(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+// --- V1 runtime: per-guild actors + gateway sink ------------------------------
+
+/// Gateway-loop sink for voice events. The shard runner calls [`VoiceEventSink::handle`]
+/// after the pipeline's cache update, so every snapshot the runtime builds is
+/// complete. Handling never blocks: events become actor commands on unbounded
+/// channels, and each guild actor drains its worker on its own timer.
+pub trait VoiceEventSink: Send + Sync {
+    fn handle(&self, event: &Event, cache: &DefaultInMemoryCache);
+}
+
+/// Commands for one guild actor. The actor owns its [`GuildRoomWorker`]
+/// mutably; the gateway loop never touches the worker directly.
+enum ActorCommand {
+    /// Complete snapshot (GuildCreate, reconnect refresh): publish + reconcile.
+    Publish(GuildSnapshot),
+    /// One voice transition: update live state, maybe accept the join, reconcile.
+    VoiceFrame {
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+        name: String,
+        seed: u64,
+        created_at: String,
+    },
+    ChannelUpsert(Box<Channel>),
+    ChannelRemove(Snowflake),
+    RefreshBot(BotAccess),
+}
+
+/// Per-guild actor registry. Actors spawn lazily on the first complete
+/// snapshot and exit when their guild leaves (sender dropped) or their store
+/// load fails (respawned on the next event via [`UnboundedSender::is_closed`]).
+pub struct VoiceRuntime<S, H> {
+    make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
+    tick: Duration,
+    enabled: bool,
+    seeds: AtomicU64,
+    actors: Mutex<HashMap<Snowflake, mpsc::UnboundedSender<ActorCommand>>>,
+}
+
+impl<S, H> VoiceRuntime<S, H>
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+{
+    /// Build the runtime. `make` produces a fresh store/http pair per guild
+    /// actor; `tick` drives the ordered-queue drain (250 ms production);
+    /// `enabled` gates on `TWO_VOICE=1` so construction without the gate is inert.
+    pub fn new(
+        make: impl Fn() -> (S, H) + Send + Sync + 'static,
+        tick: Duration,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            make: Arc::new(make),
+            tick,
+            enabled,
+            seeds: AtomicU64::new(initial_seed()),
+            actors: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn live_actor(&self, guild: Snowflake) -> Option<mpsc::UnboundedSender<ActorCommand>> {
+        self.actors
+            .lock()
+            .expect("voice runtime lock")
+            .get(&guild)
+            .cloned()
+    }
+
+    fn ensure_actor(&self, guild: Snowflake) -> Option<mpsc::UnboundedSender<ActorCommand>> {
+        if !self.enabled {
+            return None;
+        }
+        let mut actors = self.actors.lock().expect("voice runtime lock");
+        if let Some(tx) = actors.get(&guild) {
+            if !tx.is_closed() {
+                return Some(tx.clone());
+            }
+            actors.remove(&guild);
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        let make = Arc::clone(&self.make);
+        let tick = self.tick;
+        tokio::spawn(async move {
+            let live = LiveGuild::new(guild);
+            let (store, http) = make();
+            let Ok(mut worker) = GuildRoomWorker::load(live, store, http).await else {
+                return;
+            };
+            run_actor(&mut worker, rx, tick).await;
+        });
+        actors.insert(guild, tx.clone());
+        Some(tx)
+    }
+
+    /// Guilds with a live actor (reconnect refresh iterates these).
+    fn known_guilds(&self) -> Vec<Snowflake> {
+        self.actors
+            .lock()
+            .expect("voice runtime lock")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Publish a complete snapshot, spawning the guild actor on first use.
+    pub fn publish_snapshot(&self, guild: Snowflake, snapshot: GuildSnapshot) -> bool {
+        self.ensure_actor(guild)
+            .and_then(|tx| tx.send(ActorCommand::Publish(snapshot)).ok())
+            .is_some()
+    }
+
+    /// Feed one voice transition to an existing actor. Returns false when the
+    /// guild has no actor yet (frames before the first GuildCreate are
+    /// dropped; the snapshot that follows replays complete state).
+    pub fn voice_frame(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+        name: String,
+    ) -> bool {
+        let seed = self.seeds.fetch_add(1, Ordering::Relaxed);
+        let created_at = now_iso();
+        self.live_actor(guild)
+            .and_then(|tx| {
+                tx.send(ActorCommand::VoiceFrame {
+                    member,
+                    channel,
+                    bot,
+                    name,
+                    seed,
+                    created_at,
+                })
+                .ok()
+            })
+            .is_some()
+    }
+
+    /// Drop the guild actor (GuildDelete). The task exits once its inbox drains.
+    pub fn remove_guild(&self, guild: Snowflake) {
+        self.actors
+            .lock()
+            .expect("voice runtime lock")
+            .remove(&guild);
+    }
+
+    fn send_to_live(&self, guild: Snowflake, command: ActorCommand) {
+        if let Some(tx) = self.live_actor(guild) {
+            let _ = tx.send(command);
+        }
+    }
+}
+
+impl<S, H> VoiceEventSink for VoiceRuntime<S, H>
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+{
+    fn handle(&self, event: &Event, cache: &DefaultInMemoryCache) {
+        if !self.enabled {
+            return;
+        }
+        match event {
+            Event::GuildCreate(gc) => {
+                if let twilight_model::gateway::payload::incoming::GuildCreate::Available(_) =
+                    gc.as_ref()
+                {
+                    let guild_id = gc.id().get();
+                    if let Some(snapshot) = snapshot_from_cache(cache, guild_id) {
+                        self.publish_snapshot(guild_id, snapshot);
+                    }
+                }
+            }
+            Event::VoiceStateUpdate(update) => {
+                let Some(guild_id) = update.guild_id.map(|id| id.get()) else {
+                    return;
+                };
+                let member_id = update.user_id.get();
+                let bot = update.member.as_ref().map(|member| member.user.bot);
+                let name = room_name(&display_name(cache, guild_id, member_id));
+                self.voice_frame(
+                    guild_id,
+                    member_id,
+                    update.channel_id.map(|id| id.get()),
+                    bot,
+                    name,
+                );
+            }
+            Event::ChannelCreate(created) => {
+                if let Some(guild_id) = created.guild_id.map(|id| id.get()) {
+                    self.send_to_live(
+                        guild_id,
+                        ActorCommand::ChannelUpsert(Box::new(created.0.clone())),
+                    );
+                }
+            }
+            Event::ChannelUpdate(updated) => {
+                if let Some(guild_id) = updated.guild_id.map(|id| id.get()) {
+                    self.send_to_live(
+                        guild_id,
+                        ActorCommand::ChannelUpsert(Box::new(updated.0.clone())),
+                    );
+                }
+            }
+            Event::ChannelDelete(deleted) => {
+                if let Some(guild_id) = deleted.guild_id.map(|id| id.get()) {
+                    self.send_to_live(guild_id, ActorCommand::ChannelRemove(deleted.id.get()));
+                }
+            }
+            Event::RoleCreate(created) => {
+                let guild_id = created.guild_id.get();
+                if let Some(access) = bot_access_from_cache(cache, guild_id) {
+                    self.send_to_live(guild_id, ActorCommand::RefreshBot(access));
+                }
+            }
+            Event::RoleUpdate(updated) => {
+                let guild_id = updated.guild_id.get();
+                if let Some(access) = bot_access_from_cache(cache, guild_id) {
+                    self.send_to_live(guild_id, ActorCommand::RefreshBot(access));
+                }
+            }
+            Event::RoleDelete(deleted) => {
+                let guild_id = deleted.guild_id.get();
+                if let Some(access) = bot_access_from_cache(cache, guild_id) {
+                    self.send_to_live(guild_id, ActorCommand::RefreshBot(access));
+                }
+            }
+            // RESUMED keeps the cache but proves nothing about the outage
+            // window: re-publish every known guild from the cache so tracked
+            // rooms reconcile against actual channels (spec "Discord API notes").
+            // READY alone is not sufficient (GuildCreate follows with state).
+            // MemberUpdate carries no voice data; voice frames feed bot flags.
+            Event::Resumed => {
+                for guild_id in self.known_guilds() {
+                    if let Some(snapshot) = snapshot_from_cache(cache, guild_id) {
+                        self.publish_snapshot(guild_id, snapshot);
+                    }
+                }
+            }
+            Event::GuildDelete(deleted) => {
+                self.remove_guild(deleted.id.get());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn run_actor<S: RoomPersistence, H: RoomWrites>(
+    worker: &mut GuildRoomWorker<S, H>,
+    mut inbox: mpsc::UnboundedReceiver<ActorCommand>,
+    tick: Duration,
+) {
+    let start = Instant::now();
+    let mut timer = tokio::time::interval(tick);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            command = inbox.recv() => {
+                let Some(command) = command else { break };
+                apply_command(worker, command);
+            }
+            _ = timer.tick() => {
+                worker.reconcile();
+                let now_ms = start
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                for _ in 0..64 {
+                    if !worker.dispatch_one(now_ms).await {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn apply_command<S: RoomPersistence, H: RoomWrites>(
+    worker: &mut GuildRoomWorker<S, H>,
+    command: ActorCommand,
+) {
+    match command {
+        ActorCommand::Publish(snapshot) => {
+            if worker.live.publish(snapshot) {
+                worker.reconcile();
+            }
+        }
+        ActorCommand::VoiceFrame {
+            member,
+            channel,
+            bot,
+            name,
+            seed,
+            created_at,
+        } => {
+            if let Some(ticket) = worker.live.voice_update(member, channel, bot) {
+                worker.accept_join(ticket, name, seed, created_at);
+            }
+            worker.reconcile();
+        }
+        ActorCommand::ChannelUpsert(channel) => {
+            worker.live.upsert_channel(*channel);
+            worker.reconcile();
+        }
+        ActorCommand::ChannelRemove(channel) => {
+            worker.live.remove_channel(channel);
+            worker.reconcile();
+        }
+        ActorCommand::RefreshBot(access) => {
+            worker.live.refresh_bot(access);
+            worker.reconcile();
+        }
+    }
+}
+
+/// Build the production runtime: sqlx store over `pool`, single-attempt HTTP
+/// over `token`. The caller clones the pair per guild actor.
+pub fn build_production_runtime(
+    token: &str,
+    pool: sqlx::PgPool,
+) -> Result<VoiceRuntime<PgRoomStore, RoomHttp>, RoomHttpError> {
+    let http = RoomHttp::new(token.to_owned())?;
+    let store = PgRoomStore::new(pool);
+    Ok(VoiceRuntime::new(
+        move || (store.clone(), http.clone()),
+        Duration::from_millis(250),
+        true,
+    ))
+}
+
+/// Complete guild snapshot from the post-update cache. Returns None until the
+/// cache holds the guild, the bot user and the voice states — never publish a
+/// partial listing as complete.
+fn snapshot_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<GuildSnapshot> {
+    let guild_key = Id::new(guild_id);
+    cache.guild(guild_key)?;
+    let channels: Vec<Channel> = cache
+        .guild_channels(guild_key)?
+        .iter()
+        .filter_map(|id| cache.channel(*id).map(|channel| channel.value().clone()))
+        .collect();
+    let members: Vec<VoiceMember> = cache
+        .guild_voice_states(guild_key)?
+        .iter()
+        .filter_map(|user_id| {
+            let state = cache.voice_state(*user_id, guild_key)?;
+            Some(VoiceMember {
+                member_id: user_id.get(),
+                channel_id: state.channel_id().get(),
+                bot: cache.user(*user_id).map(|user| user.bot),
+            })
+        })
+        .collect();
+    Some(GuildSnapshot {
+        channels,
+        members,
+        bot: bot_access_from_cache(cache, guild_id)?,
+    })
+}
+
+fn bot_access_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<BotAccess> {
+    let guild_key = Id::new(guild_id);
+    let guild = cache.guild(guild_key)?;
+    let bot_id = cache.current_user()?.id;
+    let member_roles = cache
+        .member(guild_key, bot_id)
+        .map(|member| member.roles().to_vec())
+        .unwrap_or_default();
+    let roles = cache
+        .guild_roles(guild_key)?
+        .iter()
+        .filter_map(|role_id| cache.role(*role_id).map(|role| role.resource().clone()))
+        .collect();
+    Some(BotAccess {
+        member_id: bot_id.get(),
+        guild_owner_id: guild.owner_id().get(),
+        member_roles,
+        roles,
+    })
+}
+
+fn display_name(cache: &DefaultInMemoryCache, guild_id: Snowflake, member_id: Snowflake) -> String {
+    let guild_key = Id::new(guild_id);
+    let user_key = Id::new(member_id);
+    if let Some(member) = cache.member(guild_key, user_key) {
+        if let Some(nick) = member.nick() {
+            if !nick.is_empty() {
+                return nick.to_owned();
+            }
+        }
+    }
+    if let Some(user) = cache.user(user_key) {
+        if let Some(global) = user.global_name.clone() {
+            if !global.is_empty() {
+                return global;
+            }
+        }
+        return user.name.clone();
+    }
+    "member".to_owned()
+}
+
+fn initial_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+}
+
+/// V1 room name until the V5 template engine owns naming: the joiner's
+/// display name, truncated to the Discord 100-character ceiling.
+fn room_name(display: &str) -> String {
+    const SUFFIX: &str = "'s room";
+    let base = format!("{display}{SUFFIX}");
+    if base.chars().count() <= MAX_CHANNEL_NAME_LEN as usize {
+        return base;
+    }
+    let keep = (MAX_CHANNEL_NAME_LEN as usize).saturating_sub(SUFFIX.chars().count());
+    let head: String = display.chars().take(keep).collect();
+    format!("{head}{SUFFIX}")
+}
+
+// --- `/create` + `/setup` decisions (pure, no Discord) -------------------------
+
+/// `/create` input: the admin-supplied name for a new creator channel.
+pub struct CreateChannelRequest {
+    pub guild_id: Snowflake,
+    pub name: String,
+}
+
+/// What `/create` means. Refusals are ephemeral-safe strings; the S4 handler
+/// executes `Create` via the guarded adapter and stores the creator row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateChannelPlan {
+    Create { guild_id: Snowflake, name: String },
+    Refuse { message: String },
+}
+
+/// Validate a `/create` name: non-blank and within the Discord name ceiling.
+#[must_use]
+pub fn decide_create_channel(request: CreateChannelRequest) -> CreateChannelPlan {
+    let name = request.name.trim().to_owned();
+    if name.is_empty() {
+        return CreateChannelPlan::Refuse {
+            message: "Give the new creator channel a name, then try again.".to_owned(),
+        };
+    }
+    if name.chars().count() > MAX_CHANNEL_NAME_LEN as usize {
+        return CreateChannelPlan::Refuse {
+            message: format!(
+                "That name is too long: Discord channel names top out at {} characters.",
+                MAX_CHANNEL_NAME_LEN
+            ),
+        };
+    }
+    CreateChannelPlan::Create {
+        guild_id: request.guild_id,
+        name,
+    }
+}
+
+/// `/setup` input: creator rows plus live worker state for the guild.
+pub struct SetupSummary {
+    pub guild_id: Snowflake,
+    pub creators: Vec<CreatorChannel>,
+    pub tracked_rooms: usize,
+    pub failures: Vec<String>,
+    pub halted: bool,
+}
+
+/// `/setup` panel text. Anyone may view it; the S4 handler gates the quick
+/// action and settings buttons on admin (spec V1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupPanel {
+    pub title: String,
+    pub description: String,
+}
+
+#[must_use]
+pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
+    let mut lines = Vec::new();
+    if summary.halted {
+        lines.push(
+            "Voice rooms are paused: Discord refused the bot credential. \
+             Fix the token, then restart the bot."
+                .to_owned(),
+        );
+    } else {
+        lines.push("Voice rooms are running.".to_owned());
+    }
+    if summary.creators.is_empty() {
+        lines.push("No creator channels yet. Use /create to add the first one.".to_owned());
+    } else {
+        lines.push(format!("Creator channels ({})", summary.creators.len()));
+        for creator in &summary.creators {
+            let position = match creator.position {
+                RoomPosition::Above => "above",
+                RoomPosition::Below => "below",
+            };
+            lines.push(format!("- <#{}>: new rooms {position}", creator.channel_id));
+        }
+    }
+    lines.push(format!("Tracked rooms: {}.", summary.tracked_rooms));
+    if summary.failures.is_empty() {
+        lines.push("No recent failures.".to_owned());
+    } else {
+        lines.push(format!("Recent failures ({})", summary.failures.len()));
+        for failure in summary.failures.iter().take(5) {
+            lines.push(format!("- {failure}"));
+        }
+    }
+    SetupPanel {
+        title: "Voice rooms".to_owned(),
+        description: lines.join("\n"),
+    }
+}
+
+/// Voice definitions for the guild command merge, gated on `TWO_VOICE=1`.
+/// Registration merges these first-wins via [`merge_commands`](two_bot_core::merge_commands);
+/// the S4 slice owns the REST call.
+#[must_use]
+pub fn voice_command_set(gates: &VoiceGates) -> Vec<CommandDefinition> {
+    if gates.enabled {
+        voice_commands()
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

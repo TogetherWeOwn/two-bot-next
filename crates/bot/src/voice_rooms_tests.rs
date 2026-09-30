@@ -720,3 +720,166 @@ async fn lacking_manage_roles_uses_category_overwrites_not_creator_overwrites() 
         [overwrite]
     );
 }
+
+#[test]
+fn create_channel_plan_trims_and_validates_names() {
+    assert_eq!(
+        decide_create_channel(CreateChannelRequest {
+            guild_id: GUILD,
+            name: "  lobby  ".to_owned()
+        }),
+        CreateChannelPlan::Create {
+            guild_id: GUILD,
+            name: "lobby".to_owned()
+        }
+    );
+    assert!(matches!(
+        decide_create_channel(CreateChannelRequest {
+            guild_id: GUILD,
+            name: "   ".to_owned()
+        }),
+        CreateChannelPlan::Refuse { .. }
+    ));
+    assert!(matches!(
+        decide_create_channel(CreateChannelRequest {
+            guild_id: GUILD,
+            name: "x".repeat(101)
+        }),
+        CreateChannelPlan::Refuse { .. }
+    ));
+    let hundred = "y".repeat(100);
+    assert_eq!(
+        decide_create_channel(CreateChannelRequest {
+            guild_id: GUILD,
+            name: hundred.clone()
+        }),
+        CreateChannelPlan::Create {
+            guild_id: GUILD,
+            name: hundred
+        }
+    );
+}
+
+#[test]
+fn room_name_uses_display_plus_suffix_and_truncates() {
+    assert_eq!(room_name("ava"), "ava's room");
+    let named = room_name(&"x".repeat(200));
+    assert_eq!(named.chars().count(), 100);
+    assert!(named.ends_with("'s room"));
+}
+
+#[test]
+fn setup_panel_describes_empty_running_healthy_guild() {
+    let panel = setup_panel(&SetupSummary {
+        guild_id: GUILD,
+        creators: vec![],
+        tracked_rooms: 0,
+        failures: vec![],
+        halted: false,
+    });
+    assert_eq!(panel.title, "Voice rooms");
+    assert!(panel.description.contains("running"));
+    assert!(panel.description.contains("/create"));
+    assert!(panel.description.contains("No recent failures"));
+}
+
+#[test]
+fn setup_panel_lists_creators_failures_and_halt() {
+    let mut creator = CreatorChannel::new(GUILD, CREATOR);
+    creator.position = RoomPosition::Below;
+    let panel = setup_panel(&SetupSummary {
+        guild_id: GUILD,
+        creators: vec![creator],
+        tracked_rooms: 2,
+        failures: vec!["create <#200>: rate limited".to_owned()],
+        halted: true,
+    });
+    assert!(panel.description.contains("paused"));
+    assert!(panel.description.contains(&format!("<#{CREATOR}>")));
+    assert!(panel.description.contains("below"));
+    assert!(panel.description.contains("Tracked rooms: 2"));
+    assert!(panel.description.contains("rate limited"));
+}
+
+#[test]
+fn voice_command_set_is_gated_on_two_voice() {
+    let on = VoiceGates { enabled: true };
+    let names: Vec<_> = voice_command_set(&on)
+        .iter()
+        .map(|definition| definition.name.clone())
+        .collect();
+    assert_eq!(names, ["create", "setup"]);
+    let off = VoiceGates::from_map(&Default::default());
+    assert!(voice_command_set(&off).is_empty());
+}
+
+fn test_runtime(trace: Trace) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || (Store::new(trace.clone()), Http::new(trace.clone())),
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[test]
+fn disabled_runtime_ignores_snapshots_and_frames() {
+    let trace = Trace::default();
+    let runtime = VoiceRuntime::new(
+        move || (Store::new(trace.clone()), Http::new(trace.clone())),
+        Duration::from_millis(10),
+        false,
+    );
+    assert!(!runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    assert!(!runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "x".to_owned()));
+}
+
+#[test]
+fn runtime_drops_voice_frames_before_first_snapshot() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    assert!(!runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "x".to_owned()));
+}
+
+#[tokio::test]
+async fn runtime_remove_guild_drops_actor() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    runtime.remove_guild(GUILD);
+    assert!(!runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "x".to_owned()));
+}
+
+#[tokio::test]
+async fn runtime_actor_creates_persists_and_moves_room() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    assert!(runtime.voice_frame(
+        GUILD,
+        MEMBER,
+        Some(CREATOR),
+        Some(false),
+        "ava's room".to_owned()
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.starts_with("move:"))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "actor did not drive the lifecycle: {:?}",
+            trace.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "move:300:500"]
+    );
+}
