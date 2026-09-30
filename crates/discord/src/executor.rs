@@ -650,44 +650,70 @@ impl ActionExecutor {
     /// retried. Never throws — every ending is a [`KickResult`] (legacy
     /// `DiscordKicker::kick`).
     pub async fn kick_paced(&self, guild_id: &str, user_id: &str, reason: &str) -> KickResult {
+        match self
+            .kick_paced_guarded(guild_id, user_id, reason, |_| async {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Reauthorize after pacing and before every DELETE, including retries.
+    /// The callback receives the number of DELETE attempts already made. A
+    /// refusal returns to the caller for auditing without another mutation.
+    pub async fn kick_paced_guarded<F, Fut, E>(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        reason: &str,
+        mut authorize: F,
+    ) -> Result<KickResult, E>
+    where
+        F: FnMut(u32) -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
         let path_guild = guild_id.to_owned();
         let path_user = user_id.to_owned();
         let reason = match audit_reason(reason) {
             Ok(r) => r,
             Err(e) => {
-                return KickResult {
+                return Ok(KickResult {
                     outcome: KickOutcome::Failed,
                     status: None,
                     detail: e.to_string(),
                     attempts: 0,
-                }
+                })
             }
         };
         let mut attempts: u32 = 0;
         loop {
             self.pace(true).await;
-            attempts += 1;
             let request = match self.kick_request(&path_guild, &path_user, &reason) {
                 Ok(r) => r,
                 Err(detail) => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Failed,
                         status: None,
                         detail,
                         attempts,
-                    }
+                    })
                 }
             };
+            authorize(attempts).await?;
+            attempts += 1;
             let res = match self.send(&request).await {
                 Ok(r) => r,
                 Err(detail) => {
                     if attempts > MAX_HTTP_TRIES - 1 {
-                        return KickResult {
+                        return Ok(KickResult {
                             outcome: KickOutcome::Failed,
                             status: None,
                             detail: format!("network: {detail}"),
                             attempts,
-                        };
+                        });
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms(attempts - 1))).await;
                     continue;
@@ -695,67 +721,67 @@ impl ActionExecutor {
             };
             match classify_kick_status(res.status) {
                 KickStatus::Removed => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Kicked,
                         status: Some(res.status),
                         detail: "removed".to_owned(),
                         attempts,
-                    }
+                    })
                 }
                 KickStatus::AlreadyGone => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::AlreadyGone,
                         status: Some(res.status),
                         detail: "not a member".to_owned(),
                         attempts,
-                    }
+                    })
                 }
                 KickStatus::Forbidden => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Forbidden,
                         status: Some(res.status),
                         detail: "missing Kick Members, or the target outranks the bot".to_owned(),
                         attempts,
-                    }
+                    })
                 }
                 KickStatus::Unauthorized => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Failed,
                         status: Some(res.status),
                         detail: "token rejected".to_owned(),
                         attempts,
-                    }
+                    })
                 }
                 KickStatus::RateLimited => {
                     let wait = res.retry_after_wait_ms();
                     if attempts > MAX_HTTP_TRIES - 1 {
-                        return KickResult {
+                        return Ok(KickResult {
                             outcome: KickOutcome::RateLimited,
                             status: Some(res.status),
                             detail: format!("still rate limited after {attempts} attempts"),
                             attempts,
-                        };
+                        });
                     }
                     tokio::time::sleep(Duration::from_millis(wait)).await;
                 }
                 KickStatus::ServerError => {
                     if attempts > MAX_HTTP_TRIES - 1 {
-                        return KickResult {
+                        return Ok(KickResult {
                             outcome: KickOutcome::Failed,
                             status: Some(res.status),
                             detail: "server error".to_owned(),
                             attempts,
-                        };
+                        });
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms(attempts - 1))).await;
                 }
                 KickStatus::Other => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Failed,
                         status: Some(res.status),
                         detail: "unexpected status".to_owned(),
                         attempts,
-                    }
+                    })
                 }
             }
         }
@@ -827,10 +853,13 @@ impl ActionExecutor {
     ) -> Result<Option<serde_json::Value>, DiscordError> {
         let route = raw_get_route(path).map_err(DiscordError::Rejected)?;
         self.pace(false).await;
-        let res = self
-            .send(&Request::from_route(&route))
-            .await
-            .map_err(DiscordError::Unavailable)?;
+        let res = tokio::time::timeout(
+            self.inner.moderation_timeout,
+            self.send(&Request::from_route(&route)),
+        )
+        .await
+        .map_err(|_| DiscordError::Unavailable("Discord safety read timed out".into()))?
+        .map_err(DiscordError::Unavailable)?;
         match res.status {
             200..=299 => serde_json::from_slice(&res.body)
                 .map(Some)

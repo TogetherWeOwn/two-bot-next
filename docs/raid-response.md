@@ -46,9 +46,9 @@ Keep one audit file per approved cohort. Every reached target has an outcome, in
 
 Execute outcomes `kicked` and `already_gone` are terminal for that guild/member in that audit file. A later dry-run line cannot re-arm an earlier kick. Resume with the same input and audit file: settled targets are skipped without Discord requests; failures remain retryable. If an approved target genuinely rejoins, review it as a new cohort with a new audit file. A crash between kick and audit converges through a fresh membership 404 on resume.
 
-The shared executor preserves legacy kick pacing (350 ms), rate-limit handling, and four retries. Three consecutive member failures abort the cohort rather than repeating a systemic error down the whole list. Authentication/permission refusal stops immediately: do not try a different token or hunt for a credential. Fix access through its authorized provisioner before resuming.
+The shared executor preserves legacy kick pacing (350 ms), rate-limit handling, and four retries. Every actual DELETE attempt, including retries, requires a fresh protection snapshot after pacing/backoff; a newly protected target is kept. Each strict safety-read exchange (headers and body) has a five-second deadline; a timeout is audited as failure and aborts the run. Three consecutive member failures abort the cohort rather than repeating a systemic error down the whole list. Authentication/permission refusal stops immediately: do not try a different token or hunt for a credential. Fix access through its authorized provisioner before resuming.
 
-Do not run simultaneous removals using the same audit file. The tool holds an exclusive process lock for the audit lifetime and refuses concurrent use; inspect a stale lock after a crash before deliberately clearing it.
+Do not run simultaneous removals using the same audit file, including symlink or hard-link aliases. The tool holds a nonblocking exclusive OS lock on the opened file for the audit lifetime. The lock releases when the file closes, including on process exit; no pathname sidecar lock needs clearing. Unknown outcome names or unsupported mode/outcome combinations refuse resume rather than re-arming a target.
 
 ## Verification boundary
 

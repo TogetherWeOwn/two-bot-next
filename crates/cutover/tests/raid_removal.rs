@@ -9,7 +9,9 @@ use tokio::{
     net::TcpListener,
 };
 use two_bot_core::raid_removal::RemovalMode;
-use two_bot_cutover::raid_tools::{remove_accounts, FileAudit, RemovalRecord, RemovalRun};
+use two_bot_cutover::raid_tools::{
+    remove_accounts, FileAudit, RemovalOutcome, RemovalRecord, RemovalRun,
+};
 use two_bot_discord::executor::{ActionExecutor, KICK_INTERVAL_MS};
 const G: &str = "100000000000000010";
 const BOT: &str = "100000000000000099";
@@ -109,6 +111,7 @@ async fn execute_revalidates_protection_paces_retries_and_audits_each_reached_ta
         500,
         json!({}),
     ));
+    steps.extend(safety(A, json!([])));
     steps.push(step(
         format!("DELETE /api/v10/guilds/{G}/members/{A}"),
         204,
@@ -163,6 +166,133 @@ async fn execute_revalidates_protection_paces_retries_and_audits_each_reached_ta
     assert_eq!(KICK_INTERVAL_MS, 350);
 }
 
+async fn run_single(
+    ex: &ActionExecutor,
+    protected: &HashSet<String>,
+) -> (
+    two_bot_cutover::raid_tools::RemovalSummary,
+    Vec<RemovalRecord>,
+) {
+    let ids = vec![A.into()];
+    let empty = HashSet::new();
+    let mut records = vec![];
+    let summary = remove_accounts(
+        RemovalRun {
+            guild: G,
+            ids: &ids,
+            mode: RemovalMode::Execute,
+            reason: "reviewed",
+            run_id: "test",
+            done: &empty,
+            protected,
+        },
+        Some(ex),
+        |r| {
+            records.push(r.clone());
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    (summary, records)
+}
+
+#[tokio::test]
+async fn webhook_only_staff_is_protected_without_a_delete() {
+    let mut steps = safety(A, json!(["100000000000000060"]));
+    steps[3].2[2]["permissions"] = json!((1_u64 << 27).to_string());
+    let (ex, requests, task) = mock(steps).await;
+    let (summary, records) = run_single(&ex, &HashSet::new()).await;
+    task.await.unwrap();
+    assert_eq!(summary.failed, 0);
+    assert_eq!(records[0].outcome, RemovalOutcome::Protected);
+    assert_eq!(records[0].attempts, 0);
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(p, _)| !p.starts_with("DELETE")));
+}
+
+#[tokio::test]
+async fn retries_reread_configured_protection_and_never_delete_a_newly_protected_target() {
+    for status in [500, 429] {
+        let mut steps = safety(A, json!([]));
+        steps[3].2[2]["permissions"] = json!("0");
+        steps.push(step(
+            format!("DELETE /api/v10/guilds/{G}/members/{A}"),
+            status,
+            json!({"retry_after":0.001}),
+        ));
+        let mut fresh = safety(A, json!(["100000000000000060"]));
+        fresh[3].2[2]["permissions"] = json!("0");
+        steps.extend(fresh);
+        let (ex, requests, task) = mock(steps).await;
+        let protected = HashSet::from(["100000000000000060".into()]);
+        let (summary, records) = run_single(&ex, &protected).await;
+        task.await.unwrap();
+        assert!(!summary.aborted);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(records[0].outcome, RemovalOutcome::Protected);
+        assert_eq!(records[0].attempts, 1);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| p.starts_with("DELETE"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn stalled_safety_headers_and_body_time_out_audit_and_abort_without_delete() {
+    use std::time::Duration;
+    use two_bot_discord::executor::MODERATION_TIMEOUT_MS;
+    for partial_body in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![];
+            loop {
+                let mut chunk = [0; 4096];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(String::from_utf8(bytes).unwrap().starts_with("GET "));
+            if partial_body {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        });
+        let ex = ActionExecutor::with_proxy("offline-fixture-token".into(), Some(base)).unwrap();
+        let start = Instant::now();
+        let (summary, records) =
+            tokio::time::timeout(Duration::from_secs(8), run_single(&ex, &HashSet::new()))
+                .await
+                .expect("strict read must be bounded");
+        assert!(start.elapsed() >= Duration::from_millis(MODERATION_TIMEOUT_MS));
+        assert!(summary.aborted);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, RemovalOutcome::Failed);
+        assert_eq!(records[0].attempts, 0);
+        assert_eq!(ex.requests(), 1);
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 #[tokio::test]
 async fn forbidden_read_is_not_missing_and_aborts_without_credential_retry_or_delete() {
     let (ex, requests, task) = mock(vec![step(
@@ -195,7 +325,7 @@ async fn forbidden_read_is_not_missing_and_aborts_without_credential_retry_or_de
     task.await.unwrap();
     assert!(summary.aborted);
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].outcome, "failed");
+    assert_eq!(records[0].outcome, RemovalOutcome::Failed);
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
@@ -236,7 +366,7 @@ async fn settled_replay_and_dry_run_make_no_requests_even_with_executor_present(
         },
         Some(&ex),
         |r| {
-            assert_eq!(r.outcome, "would_kick");
+            assert_eq!(r.outcome, RemovalOutcome::WouldKick);
             Ok(())
         },
     )
@@ -292,6 +422,17 @@ fn file_audit_is_durable_locked_and_terminal_ever_scoped_by_guild() {
     ));
     let mut audit = FileAudit::open(&path, G).unwrap();
     assert!(FileAudit::open(&path, G).is_err());
+    let hard_alias = path.with_extension("hard-link");
+    std::fs::hard_link(&path, &hard_alias).unwrap();
+    assert!(FileAudit::open(&hard_alias, G).is_err());
+    std::fs::remove_file(&hard_alias).unwrap();
+    #[cfg(unix)]
+    {
+        let sym_alias = path.with_extension("symbolic-link");
+        std::os::unix::fs::symlink(&path, &sym_alias).unwrap();
+        assert!(FileAudit::open(&sym_alias, G).is_err());
+        std::fs::remove_file(&sym_alias).unwrap();
+    }
     let mut r = RemovalRecord {
         v: 1,
         ts: "2026-09-01T00:00:00Z".into(),
@@ -300,13 +441,15 @@ fn file_audit_is_durable_locked_and_terminal_ever_scoped_by_guild() {
         member_id: A.into(),
         mode: RemovalMode::Execute,
         action: "kick".into(),
-        outcome: "kicked".into(),
+        outcome: RemovalOutcome::Kicked,
         status: Some(204),
         attempts: 1,
     };
     audit.append(&r).unwrap();
     r.mode = RemovalMode::DryRun;
-    r.outcome = "would_kick".into();
+    r.outcome = RemovalOutcome::WouldKick;
+    r.status = None;
+    r.attempts = 0;
     audit.append(&r).unwrap();
     drop(audit);
     let audit = FileAudit::open(&path, G).unwrap();
@@ -333,6 +476,84 @@ fn file_audit_is_durable_locked_and_terminal_ever_scoped_by_guild() {
 }
 
 #[test]
+fn malformed_audit_outcomes_and_padded_protected_roles_refuse_before_token_access() {
+    let root = std::env::var_os("PAPERCLIP_SCRATCH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = root.join(format!(
+        "raid-refusal-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let ids = path.with_extension("ids");
+    std::fs::write(&ids, A).unwrap();
+    let baseline = json!({"v":1,"ts":"2026-09-01T00:00:00Z","run_id":"test","guild_id":G,"member_id":A,"mode":"execute","action":"kick","outcome":"kicked","status":204,"attempts":1});
+    for (mode, outcome) in [
+        ("execute", "kickd"),
+        ("execute", "would_kick"),
+        ("dry_run", "kicked"),
+    ] {
+        let mut damaged = baseline.clone();
+        damaged["mode"] = json!(mode);
+        damaged["outcome"] = json!(outcome);
+        std::fs::write(&path, format!("{damaged}\n")).unwrap();
+        assert!(FileAudit::open(&path, G).is_err());
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_raid-remove"))
+            .args([
+                "--guild",
+                G,
+                "--ids-from",
+                ids.to_str().unwrap(),
+                "--audit",
+                path.to_str().unwrap(),
+                "--execute",
+                "--expect",
+                "1",
+                "--reason",
+                "reviewed",
+            ])
+            .env_remove("DISCORD_TOKEN")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains("audit"), "{err}");
+        assert!(
+            !err.contains("DISCORD_TOKEN"),
+            "must refuse before executor construction"
+        );
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_raid-remove"))
+        .args([
+            "--guild",
+            G,
+            "--ids-from",
+            ids.to_str().unwrap(),
+            "--audit",
+            path.to_str().unwrap(),
+            "--execute",
+            "--expect",
+            "1",
+            "--reason",
+            "reviewed",
+            "--protected-roles",
+            "0100000000000000050",
+        ])
+        .env_remove("DISCORD_TOKEN")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8(out.stderr)
+        .unwrap()
+        .contains("invalid Discord snowflake"));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(&ids).unwrap();
+}
+
+#[test]
 fn both_clis_refuse_live_before_file_or_database_access_and_help_is_offline() {
     for bin in [
         env!("CARGO_BIN_EXE_raid-list"),
@@ -348,6 +569,17 @@ fn both_clis_refuse_live_before_file_or_database_access_and_help_is_offline() {
         assert!(String::from_utf8(out.stderr)
             .unwrap()
             .contains("Refusing live guild"));
+        let padded = format!("0{}", two_bot_cutover::LIVE_GUILD_ID);
+        let out = std::process::Command::new(bin)
+            .args(["--guild", &padded])
+            .env_remove("TWO_DATABASE_URL")
+            .env_remove("DISCORD_TOKEN")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("must be a Discord snowflake"));
         assert!(std::process::Command::new(bin)
             .arg("--help")
             .output()

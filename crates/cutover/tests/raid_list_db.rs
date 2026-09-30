@@ -155,6 +155,14 @@ async fn flags_are_guild_scoped_half_open_deduplicated_and_activity_protected() 
             false,
         ),
         (
+            "voice-funnel-only",
+            "100000000000000008",
+            "100000000000000010",
+            "2026-09-01T00:00:00Z",
+            true,
+            false,
+        ),
+        (
             "funnel",
             "100000000000000007",
             "100000000000000010",
@@ -178,6 +186,8 @@ async fn flags_are_guild_scoped_half_open_deduplicated_and_activity_protected() 
     }
     sqlx::query("INSERT INTO members (guild_id,member_id,first_voice_at) VALUES ('100000000000000010','100000000000000006',now())").execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO events (guild_id,member_id,event_type,occurred_at,source,idempotency_key) VALUES ('100000000000000010','100000000000000007','first_message',now(),'test','test-key')").execute(&pool).await.unwrap();
+    // Historical funnel evidence without a members projection must also protect.
+    sqlx::query("INSERT INTO events (guild_id,member_id,event_type,occurred_at,source,idempotency_key) VALUES ('100000000000000010','100000000000000008','first_voice_session',now(),'test','voice-test-key')").execute(&pool).await.unwrap();
     let rows = list_flagged(
         &pool,
         "100000000000000010",

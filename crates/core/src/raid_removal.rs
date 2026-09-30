@@ -58,6 +58,7 @@ pub fn validate_targets(ids: Vec<String>) -> Result<Vec<String>, &'static str> {
     let mut targets = Vec::new();
     for id in ids {
         if !(17..=20).contains(&id.len())
+            || id.starts_with('0')
             || !id.bytes().all(|b| b.is_ascii_digit())
             || id.parse::<u64>().map_or(true, |n| n == 0)
         {
@@ -104,6 +105,7 @@ mod tests {
         );
         assert!(validate_targets(vec![]).is_err());
         assert!(validate_targets(vec!["bad".into()]).is_err());
+        assert!(validate_targets(vec!["0100000000000000050".into()]).is_err());
         assert!(validate_targets(vec!["99999999999999999999".into()]).is_err());
         assert!(validate_execute_count(RemovalMode::Execute, None, 2).is_err());
         assert!(validate_execute_count(RemovalMode::Execute, Some(3), 2).is_err());

@@ -7,11 +7,12 @@ use std::{
     collections::HashSet,
     fs::{File, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 use two_bot_core::{
+    containment::DANGEROUS_PERMISSIONS,
     moderation::{moderation_target_protection, ModerationPolicy, ModerationTarget},
-    raid_removal::{decide_removal, validate_targets, RemovalDecision, RemovalMode, TargetState},
+    raid_removal::{validate_targets, RemovalMode, TargetState},
     KickOutcome,
 };
 use two_bot_discord::executor::ActionExecutor;
@@ -53,7 +54,7 @@ pub async fn list_flagged(
            AND NOT EXISTS (SELECT 1 FROM members m WHERE m.guild_id = r.guild_id AND m.member_id = r.member_id
              AND (m.is_bot OR m.left_at IS NOT NULL OR m.first_message_at IS NOT NULL OR m.first_voice_at IS NOT NULL))
            AND NOT EXISTS (SELECT 1 FROM events e WHERE e.guild_id = r.guild_id AND e.member_id = r.member_id
-             AND e.event_type IN ('first_message', 'third_message', 'first_voice', 'voice_session_start'))
+             AND e.event_type IN ('first_message', 'third_message', 'first_voice_session', 'first_voice', 'voice_session_start'))
          ORDER BY r.member_id, r.joined_at::timestamptz, r.event_id"
     ).bind(guild).bind(from).bind(to).fetch_all(pool).await?;
     rows.iter()
@@ -137,6 +138,31 @@ pub fn parse_targets(text: &str, guild: &str) -> Result<Vec<String>, String> {
     validate_targets(ids).map_err(str::to_owned)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovalOutcome {
+    WouldKick,
+    Kicked,
+    AlreadyGone,
+    Protected,
+    Forbidden,
+    RateLimited,
+    Failed,
+}
+impl RemovalOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WouldKick => "would_kick",
+            Self::Kicked => "kicked",
+            Self::AlreadyGone => "already_gone",
+            Self::Protected => "protected",
+            Self::Forbidden => "forbidden",
+            Self::RateLimited => "rate_limited",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemovalRecord {
     pub v: u8,
@@ -146,84 +172,83 @@ pub struct RemovalRecord {
     pub member_id: String,
     pub mode: RemovalMode,
     pub action: String,
-    pub outcome: String,
+    pub outcome: RemovalOutcome,
     pub status: Option<u16>,
     pub attempts: u32,
 }
 
-/// Lifetime lock and fsync-per-record. Never truncate a prior run's evidence.
+impl RemovalRecord {
+    fn validate(&self) -> Result<(), String> {
+        if self.v != 1 || self.action != "kick" {
+            return Err("unsupported audit schema".into());
+        }
+        validate_targets(vec![self.guild_id.clone(), self.member_id.clone()])?;
+        time::OffsetDateTime::parse(&self.ts, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| "invalid audit timestamp")?;
+        let valid_mode = match self.mode {
+            RemovalMode::DryRun => {
+                self.outcome == RemovalOutcome::WouldKick
+                    && self.attempts == 0
+                    && self.status.is_none()
+            }
+            RemovalMode::Execute => self.outcome != RemovalOutcome::WouldKick,
+        };
+        if !valid_mode {
+            return Err("unsupported audit mode/outcome combination".into());
+        }
+        Ok(())
+    }
+}
+
+/// Lifetime inode lock and fsync-per-record. Never truncate prior evidence.
 pub struct FileAudit {
     file: File,
-    lock: PathBuf,
     pub done: HashSet<String>,
 }
 impl FileAudit {
     pub fn open(path: &Path, guild: &str) -> Result<Self, String> {
-        let lock = PathBuf::from(format!("{}.lock", path.display()));
         let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
+        opts.read(true).append(true).create(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let lock_file = opts
-            .open(&lock)
-            .map_err(|_| "audit lock unavailable; inspect concurrent run or stale lock")?;
-        let opened = (|| {
-            let mut opts = OpenOptions::new();
-            opts.read(true).append(true).create(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let mut file = opts.open(path).map_err(|_| "cannot open audit file")?;
-            let mut text = String::new();
-            file.read_to_string(&mut text)
-                .map_err(|_| "cannot read audit file")?;
-            if !text.is_empty() && !text.ends_with('\n') {
-                return Err("unterminated audit record; repair evidence before resuming".into());
-            }
-            let mut done = HashSet::new();
-            for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                // Fail closed on damaged evidence; never hide a successful kick.
-                let r: RemovalRecord = serde_json::from_str(line)
-                    .map_err(|_| "invalid audit record; repair evidence before resuming")?;
-                if r.v != 1 || r.action != "kick" {
-                    return Err("unsupported audit schema".into());
-                }
-                if r.guild_id == guild
-                    && r.mode == RemovalMode::Execute
-                    && matches!(r.outcome.as_str(), "kicked" | "already_gone")
-                {
-                    done.insert(r.member_id);
-                }
-            }
-            Ok(Self {
-                file,
-                lock: lock.clone(),
-                done,
-            })
-        })();
-        drop(lock_file);
-        if opened.is_err() {
-            let _ = std::fs::remove_file(lock);
+        let mut file = opts.open(path).map_err(|_| "cannot open audit file")?;
+        file.try_lock()
+            .map_err(|_| "audit lock unavailable; inspect concurrent run")?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|_| "cannot read audit file")?;
+        if !text.is_empty() && !text.ends_with('\n') {
+            return Err("unterminated audit record; repair evidence before resuming".into());
         }
-        opened
+        let mut done = HashSet::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            // Fail closed on damaged evidence; never hide a successful kick.
+            let r: RemovalRecord = serde_json::from_str(line)
+                .map_err(|_| "invalid audit record; repair evidence before resuming")?;
+            r.validate()?;
+            if r.guild_id == guild
+                && r.mode == RemovalMode::Execute
+                && matches!(
+                    r.outcome,
+                    RemovalOutcome::Kicked | RemovalOutcome::AlreadyGone
+                )
+            {
+                done.insert(r.member_id);
+            }
+        }
+        Ok(Self { file, done })
     }
     pub fn append(&mut self, record: &RemovalRecord) -> Result<(), String> {
+        record.validate()?;
         let mut bytes = serde_json::to_vec(record).map_err(|_| "cannot encode audit record")?;
         bytes.push(b'\n');
         self.file
             .write_all(&bytes)
             .and_then(|()| self.file.sync_all())
             .map_err(|_| "audit write/fsync failed; stopped before next target".into())
-    }
-}
-impl Drop for FileAudit {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock);
     }
 }
 
@@ -292,8 +317,8 @@ async fn target_state(
     let mut protected_roles = protected.clone();
     let mut known = HashSet::new();
     let (mut target_top, mut bot_top, mut bot_perms) = (0, 0, 0_u64);
-    // Administrator, Kick/Ban Members, Manage Channels/Guild/Messages/Roles/Webhooks, Moderate Members.
-    let dangerous = 8 | 2 | 4 | 16 | 32 | 8192 | (1 << 28) | (1 << 29) | (1 << 40);
+    // Shared staff permissions, plus Manage Messages and Manage Guild Expressions.
+    let dangerous = DANGEROUS_PERMISSIONS | (1 << 13) | (1 << 29);
     for role in roles {
         let rid = required(role, "id")?;
         let pos = role
@@ -373,43 +398,45 @@ pub async fn remove_accounts(
             continue;
         }
         let mut stop = false;
-        let state = if run.mode == RemovalMode::Execute {
-            match target_state(executor.unwrap(), run.guild, id, run.protected).await {
-                Ok(s) => Some(s),
-                Err(_) => {
-                    stop = true;
-                    None
-                }
-            }
+        let (outcome, status, attempts) = if run.mode == RemovalMode::DryRun {
+            (RemovalOutcome::WouldKick, None, 0)
         } else {
-            None
-        };
-        let decision = decide_removal(run.mode, false, state);
-        let (outcome, status, attempts) = if stop {
-            ("failed".to_owned(), None, 0)
-        } else {
-            match decision {
-                RemovalDecision::Kick => {
-                    let result = executor
-                        .unwrap()
-                        .kick_paced(run.guild, id, run.reason)
-                        .await;
+            let ex = executor.unwrap();
+            let result = ex
+                .kick_paced_guarded(run.guild, id, run.reason, |attempts| async move {
+                    match target_state(ex, run.guild, id, run.protected).await {
+                        Ok(TargetState::Eligible) => Ok(()),
+                        Ok(state) => Err((Some(state), attempts)),
+                        Err(_) => Err((None, attempts)),
+                    }
+                })
+                .await;
+            match result {
+                Ok(result) => {
                     stop = matches!(result.status, Some(401 | 403));
                     let outcome = match result.outcome {
-                        KickOutcome::Kicked => "kicked",
-                        KickOutcome::AlreadyGone => "already_gone",
-                        KickOutcome::Forbidden => "forbidden",
-                        KickOutcome::RateLimited => "rate_limited",
-                        KickOutcome::Failed => "failed",
+                        KickOutcome::Kicked => RemovalOutcome::Kicked,
+                        KickOutcome::AlreadyGone => RemovalOutcome::AlreadyGone,
+                        KickOutcome::Forbidden => RemovalOutcome::Forbidden,
+                        KickOutcome::RateLimited => RemovalOutcome::RateLimited,
+                        KickOutcome::Failed => RemovalOutcome::Failed,
                     };
-                    (outcome.to_owned(), result.status, result.attempts)
+                    (outcome, result.status, result.attempts)
                 }
-                RemovalDecision::WouldKick => ("would_kick".into(), None, 0),
-                RemovalDecision::AlreadyGone => ("already_gone".into(), Some(404), 0),
-                _ => ("protected".into(), None, 0),
+                Err((Some(TargetState::Missing), attempts)) => {
+                    (RemovalOutcome::AlreadyGone, Some(404), attempts)
+                }
+                Err((Some(_), attempts)) => (RemovalOutcome::Protected, None, attempts),
+                Err((None, attempts)) => {
+                    stop = true;
+                    (RemovalOutcome::Failed, None, attempts)
+                }
             }
         };
-        let failed = matches!(outcome.as_str(), "failed" | "forbidden" | "rate_limited");
+        let failed = matches!(
+            outcome,
+            RemovalOutcome::Failed | RemovalOutcome::Forbidden | RemovalOutcome::RateLimited
+        );
         let record = RemovalRecord {
             v: 1,
             ts: crate::cli::now_iso(),
@@ -486,7 +513,7 @@ mod tests {
         assert_eq!(summary.reached, 2);
         assert!(records
             .iter()
-            .all(|r| r.outcome == "would_kick" && r.attempts == 0));
+            .all(|r| r.outcome == RemovalOutcome::WouldKick && r.attempts == 0));
         let run = RemovalRun {
             guild: "100000000000000003",
             ids: &ids,
