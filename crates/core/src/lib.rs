@@ -12,6 +12,7 @@ pub mod feature_commands;
 pub mod health;
 pub mod leveling;
 pub mod moderation;
+pub mod settings;
 
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
@@ -26,4 +27,10 @@ pub use moderation::{
     require_moderation_reason, ModerationAction, ModerationActor, ModerationGateError,
     ModerationGates, ModerationPolicy, ModerationRequest, ModerationTarget, PolicyError,
     ReasonError, TargetProtection,
+};
+pub use settings::{
+    assert_storable_key, classify_key, is_declared_env_only, is_env_only_key, is_storable_key,
+    to_env_string, validate_write, EnvOnlyKeyError, IgnoreReason, IgnoredChange, KeyChange,
+    RefreshReport, SettingClass, SettingRow, SettingsCache, ValidatedWrite, WriteAction,
+    WriteRefusal, ENV_ONLY_KEY_PREFIXES, HOT_WIRED, POLL_SECONDS, SETTING_CLASSES,
 };
