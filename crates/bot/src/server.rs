@@ -22,6 +22,7 @@ pub type SharedState = Arc<RwLock<GatewayState>>;
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/healthz", get(health))
         .route("/readyz", get(readyz))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
@@ -47,10 +48,15 @@ async fn readyz(
     (code, Json(report))
 }
 
-/// Serve until SIGTERM/SIGINT (Container stop) or a bind failure.
-pub async fn serve(addr: &str, state: SharedState) -> std::io::Result<()> {
+/// Bind before starting the gateway so liveness never waits for Discord.
+pub async fn bind(addr: &str) -> std::io::Result<TcpListener> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(addr, "listening");
+    Ok(listener)
+}
+
+/// Serve until SIGTERM/SIGINT (Container stop).
+pub async fn serve(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
     axum::serve(listener, router(state).into_make_service())
         .with_graceful_shutdown(shutdown_signal())
         .await

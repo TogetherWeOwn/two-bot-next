@@ -58,6 +58,43 @@ hierarchy checks in `assert_moderation_allowed`. Dynamic/prefix feature gates an
 the dropped rota disposition are unchanged. Tests compare every row with this
 section and all published permission bitfields, including Twilight wire JSON.
 
+## Registry golden exceptions
+
+`crates/core/tests/fixtures/legacy_registry.json` captures the frozen source above,
+with every builtin enabled (including staging-only rota), no DB custom rows, and
+both colliding `attendance` definitions intact. The core router publish set and
+the actual Twilight guild bulk-set JSON are checked against that snapshot.
+
+| Intentional difference | Matrix reference | Exact allowance |
+|---|---|---|
+| `rsvp-attendance` | docs/parity.md §1 #12 / #25 | Rename only the RSVP-totals `attendance` (its option is `event-id`); scorecard keeps `attendance`. No option, choice, description or permission waiver. |
+| `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
+
+These are the complete behavioural exceptions, mirrored by the test allowlist.
+Only equivalent guild-API representation defaults are canonicalized: omitted
+command type = ChatInput (`1`), omitted command options = `[]`, optional
+`required` omitted = `false`, permission gate `null` = omitted, guild-only
+`dm_permission: false` = omitted (the guild endpoint cannot publish global/DM
+commands), and Twilight's server-assigned `version: "1"` placeholder = omitted.
+Non-default values and unknown fields are **not** discarded. Array order,
+option names/types/bounds, choices, descriptions and permission bitfields remain
+strict. Real unlisted drift fails with field paths and legacy/next values; file a
+follow-up instead of changing the fixture or expanding the exceptions to hide it.
+
+Regenerate only from a scratch clone (Node 24, no Discord/DB access):
+
+```sh
+git clone https://github.com/TogetherWeOwn/two-bot.git "$PAPERCLIP_RUN_SCRATCH_DIR/legacy"
+git -C "$PAPERCLIP_RUN_SCRATCH_DIR/legacy" checkout --detach d5d1179348feb9157bcac8c875de9399d4f5c76a
+npm ci --prefix "$PAPERCLIP_RUN_SCRATCH_DIR/legacy" --ignore-scripts --no-audit --no-fund
+node scripts/export-legacy-registry.mjs "$PAPERCLIP_RUN_SCRATCH_DIR/legacy" crates/core/tests/fixtures/legacy_registry.json
+cargo test -p two-bot-core -p two-bot-discord --test registry_golden --locked
+```
+
+The export script calls legacy `mergedCommandData` in `src/index.ts:660–666`
+feature order, then discord.js `ApplicationCommandManager.transformCommand`, the
+same transform used by `guild.commands.set`. It refuses any other legacy SHA.
+
 ## 2. Non-command interactions (buttons / selects / reactions)
 
 | Interaction | Behaviour | Map |
