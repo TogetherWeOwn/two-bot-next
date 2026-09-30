@@ -13,8 +13,12 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 
 - `env_only`: never dashboard-stored. Unknown names and `TWO_INTERNAL_*` fail closed.
 - `cold`: storable, applied after restart.
-- `hot`: eligible for reload, not a guarantee of live application. Only `HOT_WIRED`
-keys are live-wired; other hot keys still require a consumer restart.
+- `hot`: reload classification from the legacy catalog, not a claim of runtime
+wiring. Keys in legacy `HOT_WIRED` are classified “reload-report hot” (the
+`RefreshReport::hot` partition in `settings.rs`); the Container startup
+(`crates/bot/src/main.rs`) currently constructs no settings cache/store,
+poller or reload consumer, so no key is live-applied. Treat every hot key
+as restart-applied until store/poller/consumer integration lands.
 
 ## Container bootstrap
 
@@ -35,65 +39,65 @@ Catalog entries: 117.
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
 | `CREDENTIALS_DIRECTORY` | env_only | Not specified in Next | environment only | Legacy credential-file directory; environment-only boot input. |
-| `DISCORD_ANCHOR_WELCOME_CHANNEL_ID` | hot | Not specified in Next | restart (not live-wired) | Destination for anchor-mode welcomes. |
+| `DISCORD_ANCHOR_WELCOME_CHANNEL_ID` | hot | Not specified in Next | restart | Destination for anchor-mode welcomes. |
 | `DISCORD_API_BASE` | env_only | Not specified in Next | environment only | Discord REST API origin; not dashboard-selectable. |
-| `DISCORD_AUDIT_LOG_CHANNEL_ID` | hot | Not specified in Next | restart (not live-wired) | Discord audit mirror destination. |
+| `DISCORD_AUDIT_LOG_CHANNEL_ID` | hot | Not specified in Next | restart | Discord audit mirror destination. |
 | `DISCORD_BOT_TOKEN` | env_only | Not rendered (secret) | environment only | Legacy Discord authentication token; never stored in guild settings. |
-| `DISCORD_GOODBYE_CHANNEL_IDS` | hot | Not specified in Next | live-wired | Channels used for session-mode goodbye routing. |
+| `DISCORD_GOODBYE_CHANNEL_IDS` | hot | Not specified in Next | restart (reload-report hot) | Channels used for session-mode goodbye routing. |
 | `DISCORD_GUILD_ID` | env_only | Not specified in Next | environment only | Legacy managed guild identifier; distinct from Container GUILD_ID. |
-| `DISCORD_LANDING_CHANNEL_IDS` | hot | Not specified in Next | live-wired | Onboarding landing destinations for game-picker routing. |
-| `DISCORD_MODERATION_LOG_CHANNEL_ID` | hot | Not specified in Next | restart (not live-wired) | Destination for moderation logs. |
-| `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot | Not specified in Next | restart (not live-wired) | Voice lobby offered by session onboarding. |
-| `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID` | hot | Not specified in Next | restart (not live-wired) | Looking-to-play destination offered by session onboarding. |
-| `DISCORD_STAFF_ALERT_CHANNEL_ID` | hot | Not specified in Next | restart (not live-wired) | Destination for staff alerts. |
+| `DISCORD_LANDING_CHANNEL_IDS` | hot | Not specified in Next | restart (reload-report hot) | Onboarding landing destinations for game-picker routing. |
+| `DISCORD_MODERATION_LOG_CHANNEL_ID` | hot | Not specified in Next | restart | Destination for moderation logs. |
+| `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot | Not specified in Next | restart | Voice lobby offered by session onboarding. |
+| `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID` | hot | Not specified in Next | restart | Looking-to-play destination offered by session onboarding. |
+| `DISCORD_STAFF_ALERT_CHANNEL_ID` | hot | Not specified in Next | restart | Destination for staff alerts. |
 | `DISCORD_STAGING_BOT_TOKEN` | env_only | Not rendered (secret) | environment only | Staging Discord authentication token; never rendered. |
 | `DISCORD_STAGING_GUILD_ID` | env_only | Not specified in Next | environment only | Staging guild boundary; no ID is embedded in the reference. |
-| `DISCORD_TICKET_CATEGORY_ID` | hot | Not specified in Next | restart (not live-wired) | Category for newly opened ticket channels. |
-| `DISCORD_TICKET_PANEL_CHANNEL_ID` | hot | Not specified in Next | restart (not live-wired) | Destination for the ticket-opening panel. |
-| `DISCORD_TICKET_STAFF_ROLE_ID` | hot | Not specified in Next | restart (not live-wired) | Staff role used by ticket authorization. |
+| `DISCORD_TICKET_CATEGORY_ID` | hot | Not specified in Next | restart | Category for newly opened ticket channels. |
+| `DISCORD_TICKET_PANEL_CHANNEL_ID` | hot | Not specified in Next | restart | Destination for the ticket-opening panel. |
+| `DISCORD_TICKET_STAFF_ROLE_ID` | hot | Not specified in Next | restart | Staff role used by ticket authorization. |
 | `DISCORD_TOKEN` | env_only | Not rendered (secret) | environment only | Container Discord authentication token; never stored in guild settings. |
-| `DISCORD_VOICE_LOG_CHANNEL_ID` | hot | Not specified in Next | restart (not live-wired) | Destination for voice-session logs. |
+| `DISCORD_VOICE_LOG_CHANNEL_ID` | hot | Not specified in Next | restart | Destination for voice-session logs. |
 | `LOG_LEVEL` | cold | Not specified in Next | restart | Legacy logging filter read at boot; Container tracing configuration is separate. |
 | `TEMP_VOICE_ENABLED` | cold | Not specified in Next | restart | Legacy temporary-voice enable flag; classification does not imply runtime wiring. |
 | `TWO_ANNOUNCEMENTS` | cold | `false` | restart | Enable announcement command publication and routing. |
 | `TWO_ANTI_NUKE` | cold | Not specified in Next | restart | Enable anti-nuke protection. |
 | `TWO_ANTI_NUKE_DRY_RUN` | cold | Not specified in Next | restart | Observe anti-nuke decisions without executing protective writes. |
-| `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` | hot | Not specified in Next | restart (not live-wired) | Maximum age of anti-nuke events considered for action. |
-| `TWO_ANTI_NUKE_HEAT_THRESHOLD` | hot | Not specified in Next | restart (not live-wired) | Heat threshold for anti-nuke decisions. |
+| `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` | hot | Not specified in Next | restart | Maximum age of anti-nuke events considered for action. |
+| `TWO_ANTI_NUKE_HEAT_THRESHOLD` | hot | Not specified in Next | restart | Heat threshold for anti-nuke decisions. |
 | `TWO_ANTI_NUKE_PROTECTED_USER_IDS` | env_only | Not specified in Next | environment only | Accounts anti-nuke may not target; environment-only reach boundary. |
 | `TWO_ANTI_NUKE_SNAPSHOT_PATH` | env_only | Not specified in Next | environment only | Filesystem snapshot destination; never dashboard-selectable. |
 | `TWO_ANTI_NUKE_TRUSTED_USER_IDS` | env_only | Not specified in Next | environment only | Trusted accounts ignored by anti-nuke; environment-only reach boundary. |
-| `TWO_ANTI_NUKE_WINDOW_SECONDS` | hot | Not specified in Next | restart (not live-wired) | Aggregation window for anti-nuke heat. |
+| `TWO_ANTI_NUKE_WINDOW_SECONDS` | hot | Not specified in Next | restart | Aggregation window for anti-nuke heat. |
 | `TWO_AUTOMATIONS` | cold | `false` | restart | Enable automation administration and custom command publication/routing. |
 | `TWO_AUTOMOD` | cold | `false` | restart | Enable automod message inspection. |
-| `TWO_AUTOMOD_ALLOWED_DOMAINS` | hot | `[]` | restart (not live-wired) | Domains permitted by the external-link matcher. |
-| `TWO_AUTOMOD_BAD_WORDS` | hot | `[]` | restart (not live-wired) | Bad-word list normalized with NFKC and lowercase. |
-| `TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS` | hot | `["bat","cmd","com","exe","js","jse","msi","ps1","scr","vbs","wsf"]` | restart (not live-wired) | Blocked attachment extensions, lowercase without a leading dot. |
-| `TWO_AUTOMOD_BYPASS_ROLE_IDS` | hot | `[]` | restart (not live-wired) | Roles exempt from automod inspection. |
-| `TWO_AUTOMOD_ENFORCE` | hot | `false` | restart (not live-wired) | Enable automod enforcement; absent/disabled remains dry-run. |
-| `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` | hot | `[]` | restart (not live-wired) | Channels exempt from automod inspection. |
-| `TWO_AUTOMOD_MENTION_LIMIT` | hot | `5` | restart (not live-wired) | Mention threshold for automod (validated from 1 to 50). |
-| `TWO_AUTOMOD_REPEAT_COUNT` | hot | `3` | live-wired | Repeated-message threshold (validated from 2 to 20). |
-| `TWO_AUTOMOD_REPEAT_WINDOW_SECONDS` | hot | `30` | restart (not live-wired) | Repeated-message window (validated from 1 to 3600 seconds). |
-| `TWO_AUTOMOD_SANCTIONS` | hot | `[{"violations":1,"action":"delete","timeout_seconds":null},{"violations":2,"action":"warn","timeout_seconds":null},{"violations":3,"action":"timeout","timeout_seconds":600}]` | restart (not live-wired) | Ordered violation ladder, starting at one; delete, warn or timeout actions. |
+| `TWO_AUTOMOD_ALLOWED_DOMAINS` | hot | `[]` | restart | Domains permitted by the external-link matcher. |
+| `TWO_AUTOMOD_BAD_WORDS` | hot | `[]` | restart | Bad-word list normalized with NFKC and lowercase. |
+| `TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS` | hot | `["bat","cmd","com","exe","js","jse","msi","ps1","scr","vbs","wsf"]` | restart | Blocked attachment extensions, lowercase without a leading dot. |
+| `TWO_AUTOMOD_BYPASS_ROLE_IDS` | hot | `[]` | restart | Roles exempt from automod inspection. |
+| `TWO_AUTOMOD_ENFORCE` | hot | `false` | restart | Enable automod enforcement; absent/disabled remains dry-run. |
+| `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` | hot | `[]` | restart | Channels exempt from automod inspection. |
+| `TWO_AUTOMOD_MENTION_LIMIT` | hot | `5` | restart | Mention threshold for automod (validated from 1 to 50). |
+| `TWO_AUTOMOD_REPEAT_COUNT` | hot | `3` | restart (reload-report hot) | Repeated-message threshold (validated from 2 to 20). |
+| `TWO_AUTOMOD_REPEAT_WINDOW_SECONDS` | hot | `30` | restart | Repeated-message window (validated from 1 to 3600 seconds). |
+| `TWO_AUTOMOD_SANCTIONS` | hot | `[{"violations":1,"action":"delete","timeout_seconds":null},{"violations":2,"action":"warn","timeout_seconds":null},{"violations":3,"action":"timeout","timeout_seconds":600}]` | restart | Ordered violation ladder, starting at one; delete, warn or timeout actions. |
 | `TWO_BACKUP_S3_ACCESS_KEY_ID` | env_only | Not rendered (secret) | environment only | Backup object-store access credential; never rendered. |
 | `TWO_BACKUP_S3_BUCKET` | env_only | Not specified in Next | environment only | Backup destination bucket; environment-only to prevent web-selected exfiltration. |
 | `TWO_BACKUP_S3_ENDPOINT` | env_only | Not specified in Next | environment only | Backup object-store endpoint; environment-only destination boundary. |
 | `TWO_BACKUP_S3_PREFIX` | env_only | Not specified in Next | environment only | Backup object-key prefix; environment-only destination boundary. |
 | `TWO_BACKUP_S3_REGION` | env_only | Not specified in Next | environment only | Backup object-store region; environment-only destination boundary. |
 | `TWO_BACKUP_S3_SECRET_ACCESS_KEY` | env_only | Not rendered (secret) | environment only | Backup object-store secret credential; never rendered. |
-| `TWO_BULK_JOIN_WINDOW_UNTIL` | hot | Not specified in Next | restart (not live-wired) | End of the temporary bulk-join window. |
-| `TWO_COMMUNITY_AUTOMATION_ACTOR_IDS` | hot | `[]` | restart (not live-wired) | Automation actors excluded from human community activity. |
-| `TWO_COMMUNITY_CLASSIFIER_VERSION` | hot | `"community-v1"` | restart (not live-wired) | Version label for community classification. |
+| `TWO_BULK_JOIN_WINDOW_UNTIL` | hot | Not specified in Next | restart | End of the temporary bulk-join window. |
+| `TWO_COMMUNITY_AUTOMATION_ACTOR_IDS` | hot | `[]` | restart | Automation actors excluded from human community activity. |
+| `TWO_COMMUNITY_CLASSIFIER_VERSION` | hot | `"community-v1"` | restart | Version label for community classification. |
 | `TWO_COMMUNITY_CORRECTION_CYCLES` | cold | `0` | restart | Non-negative count of operator scorecard corrections. |
-| `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` | hot | Not specified in Next | restart (not live-wired) | Channels considered for human community activity. |
-| `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | restart (not live-wired) | Known raid actors excluded from human activity classification. |
+| `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` | hot | Not specified in Next | restart | Channels considered for human community activity. |
+| `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | restart | Known raid actors excluded from human activity classification. |
 | `TWO_COMMUNITY_RECOMMENDATIONS` | cold | `true` | restart | Permit scorecard recommendations unless explicitly disabled with 0. |
 | `TWO_COMMUNITY_SCORECARD` | cold | `false` | restart | Enable community fact capture and the weekly scorecard job. |
-| `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | restart (not live-wired) | Staging actors excluded from human community activity. |
-| `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | restart (not live-wired) | Staging guilds excluded from human community activity. |
-| `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | restart (not live-wired) | Test actors excluded from human community activity. |
-| `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | restart (not live-wired) | Welcome-channel classification for community analytics. |
+| `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | restart | Staging actors excluded from human community activity. |
+| `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | restart | Staging guilds excluded from human community activity. |
+| `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | restart | Test actors excluded from human community activity. |
+| `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | restart | Welcome-channel classification for community analytics. |
 | `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Legacy database connection secret; distinct from Container DATABASE_URL. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
 | `TWO_FEED_POLL_SECONDS` | cold | `300` | restart | Feed polling interval (validated from 60 to 86400 seconds). |
@@ -112,12 +116,12 @@ Catalog entries: 117.
 | `TWO_INTERNAL_CHANNEL_KEYS` | env_only | Not specified in Next | environment only | Logical channel-key allowlist for internal actions. |
 | `TWO_INTERNAL_PORT` | env_only | Not specified in Next | environment only | Internal-action listener port; environment-only network bind. |
 | `TWO_INTERNAL_ROLE_KEYS` | env_only | Not specified in Next | environment only | Logical role-key allowlist for internal actions. |
-| `TWO_JOIN_RISK_THRESHOLD` | hot | Not specified in Next | restart (not live-wired) | Join-risk threshold for protection decisions. |
-| `TWO_JOIN_RISK_WINDOW_SECONDS` | hot | Not specified in Next | restart (not live-wired) | Aggregation window for join-risk decisions. |
+| `TWO_JOIN_RISK_THRESHOLD` | hot | Not specified in Next | restart | Join-risk threshold for protection decisions. |
+| `TWO_JOIN_RISK_WINDOW_SECONDS` | hot | Not specified in Next | restart | Aggregation window for join-risk decisions. |
 | `TWO_MODERATION` | env_only | `false` | environment only | Enable moderation command publication/routing; enabled mode requires Owen ID. |
 | `TWO_MODERATION_AUDIT_SECRET` | env_only | Not rendered (secret) | environment only | Authentication secret for moderation audit handoff; never rendered. |
 | `TWO_MODERATION_PROTECTED_ROLE_IDS` | env_only | `[]` | environment only | Roles moderation may not target; environment-only reach boundary. |
-| `TWO_ONBOARDING_DRY_RUN` | hot | `false` | restart (not live-wired) | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. |
+| `TWO_ONBOARDING_DRY_RUN` | hot | `false` | restart | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. |
 | `TWO_ONBOARDING_MODE` | env_only | `"legacy"` | environment only | Onboarding selector: legacy, session or anchor; session suppresses role writes. |
 | `TWO_ONBOARDING_ROTA_MEASUREMENT` | env_only | Not specified in Next | environment only | Dropped staging rota measurement gate; env-only refusal is retained. |
 | `TWO_ONBOARDING_ROTA_NOTICE` | env_only | Not specified in Next | environment only | Dropped staging rota notice gate; env-only refusal is retained. |
@@ -126,13 +130,13 @@ Catalog entries: 117.
 | `TWO_ONBOARDING_ROTA_READER_IDS` | env_only | Not specified in Next | environment only | Dropped staging rota reader boundary; env-only refusal is retained. |
 | `TWO_OWEN_USER_ID` | env_only | `""` | environment only | Owen bot identity, required and snowflake-validated when moderation is enabled. |
 | `TWO_PRESENCE_PROBE` | cold | Not specified in Next | restart | Enable the presence-probe surface. |
-| `TWO_RAID_JOIN_THRESHOLD` | hot | Not specified in Next | live-wired | Join count threshold for the raid watch. |
-| `TWO_RAID_WINDOW_SECONDS` | hot | Not specified in Next | live-wired | Join aggregation window for the raid watch. |
+| `TWO_RAID_JOIN_THRESHOLD` | hot | Not specified in Next | restart (reload-report hot) | Join count threshold for the raid watch. |
+| `TWO_RAID_WINDOW_SECONDS` | hot | Not specified in Next | restart (reload-report hot) | Join aggregation window for the raid watch. |
 | `TWO_REDIRECT_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy redirect listener interface; environment-only network bind. |
-| `TWO_REDIRECT_FALLBACK_CODE` | hot | Not specified in Next | restart (not live-wired) | Fallback code for redirect routing. |
+| `TWO_REDIRECT_FALLBACK_CODE` | hot | Not specified in Next | restart | Fallback code for redirect routing. |
 | `TWO_REDIRECT_PORT` | env_only | Not specified in Next | environment only | Legacy redirect listener port; environment-only network bind. |
 | `TWO_REDIRECT_TRUSTED_PROXIES` | env_only | Not specified in Next | environment only | Trusted proxy boundaries for redirect request attribution. |
-| `TWO_SELF_ROLE_DRY_RUN` | hot | Not specified in Next | restart (not live-wired) | Observe self-role plans without writing roles. |
+| `TWO_SELF_ROLE_DRY_RUN` | hot | Not specified in Next | restart | Observe self-role plans without writing roles. |
 | `TWO_SELF_ROLE_PANELS` | cold | Not specified in Next | restart | Self-role panel catalog read when constructing consumers. |
 | `TWO_STAGING_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Staging database connection secret; never rendered. |
 | `TWO_STAGING_RESTART_CONTAINMENT` | env_only | Not specified in Next | environment only | Staging restart containment gate read at boot. |
