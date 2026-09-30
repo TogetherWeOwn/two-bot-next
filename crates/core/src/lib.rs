@@ -26,6 +26,7 @@ pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod feeds;
+pub mod feeds_connector;
 pub mod feeds_http;
 #[cfg(feature = "db")]
 pub mod feeds_store;
