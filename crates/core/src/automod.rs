@@ -27,8 +27,11 @@
 //! containment/anti-nuke heat scoring (slice 5).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
+use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
+use url::Url;
 
 /// Automod match reason, in legacy evaluation order (legacy `AutomodFilter`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -444,102 +447,79 @@ fn has_invite(content: &str) -> bool {
     false
 }
 
-/// Split an authority into host: strip userinfo, port, leading `www.`;
-/// empty host means unparseable (legacy treats URL-constructor throws as
-/// external — fail closed).
-fn authority_host(authority: &str) -> Option<String> {
-    let after_userinfo = authority.rsplit('@').next().unwrap_or(authority);
-    let host_port = after_userinfo;
-    let host = if let Some(colon) = host_port.rfind(':') {
-        if host_port[colon + 1..].bytes().all(|b| b.is_ascii_digit())
-            && !host_port[..colon].contains(']')
-        {
-            &host_port[..colon]
-        } else {
-            host_port
-        }
-    } else {
-        host_port
-    };
-    let host = host.to_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host);
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_owned())
-    }
-}
-
 fn host_allowed(host: &str, allowed: &[String]) -> bool {
     allowed
         .iter()
         .any(|domain| host == domain || host.ends_with(&format!(".{domain}")))
 }
 
-/// External-link verdict over link content: explicit URLs (`http(s)://`,
-/// `www.`) plus bare `label.tld` domains from the legacy TLD list, each
-/// checked against `allowed_domains` (exact or subdomain). Bare candidates
-/// whose labels are all filename stems are skipped.
+/// Unanchored explicit and bare-domain scans (legacy `hasExternalLink`).
+/// Preserve the legacy TLD alternation order and lack of a right boundary;
+/// URL parsing supplies host canonicalization, ignoring query/path/userinfo.
 fn has_external_link(content: &str, allowed: &[String]) -> bool {
-    for token in content.split(|c: char| c.is_whitespace() || c == '<') {
-        if token.is_empty() {
-            continue;
-        }
-        let candidate = token.trim_matches(TRAILING_URL_PUNCTUATION);
-        if candidate.is_empty() {
-            continue;
-        }
-        let lower = candidate.to_lowercase();
-        if lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || lower.starts_with("www.")
-        {
-            let without_scheme = lower
-                .strip_prefix("https://")
-                .or_else(|| lower.strip_prefix("http://"))
-                .unwrap_or(&lower);
-            let authority = without_scheme.split('/').next().unwrap_or("");
-            match authority_host(authority) {
-                Some(host) if !host_allowed(&host, allowed) => return true,
-                None => return true,
-                _ => {}
+    static EXPLICIT: OnceLock<Regex> = OnceLock::new();
+    static BARE: OnceLock<Regex> = OnceLock::new();
+    static BARE_LEFT_EXCLUSION: OnceLock<Regex> = OnceLock::new();
+    let explicit = EXPLICIT.get_or_init(|| {
+        Regex::new(r"(?iu)(?:https?://|www\.)[^\s<]+").expect("static explicit URL pattern")
+    });
+    let bare = BARE.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?iu)(?:[\p{{L}}\p{{N}}](?:[\p{{L}}\p{{N}}-]{{0,61}}[\p{{L}}\p{{N}}])?\.)+(?:{})(?:/[^\s<]*)?",
+            BARE_TLDS.join("|")
+        ))
+        .expect("static bare-domain pattern")
+    });
+    let excluded = BARE_LEFT_EXCLUSION.get_or_init(|| {
+        Regex::new(r"[\p{L}\p{N}@._/\\-]").expect("static bare-domain left exclusion")
+    });
+    for (pattern, is_bare) in [(explicit, false), (bare, true)] {
+        let mut offset = 0;
+        while let Some(found) = pattern.find_at(content, offset) {
+            // Rust regex has no lookbehind. On a rejected left boundary,
+            // advance one character, not the entire match: its optional path
+            // can contain a later candidate with a valid boundary.
+            if is_bare
+                && content[..found.start()]
+                    .char_indices()
+                    .next_back()
+                    .is_some_and(|(at, _)| excluded.is_match(&content[at..found.start()]))
+            {
+                offset = found.start()
+                    + content[found.start()..]
+                        .chars()
+                        .next()
+                        .expect("nonempty match")
+                        .len_utf8();
+                continue;
             }
-        } else if let Some(host) = bare_domain_host(candidate) {
-            if !host_allowed(&host, allowed) {
+            offset = found.end();
+            let candidate = found.as_str().trim_end_matches(TRAILING_URL_PUNCTUATION);
+            let parsed = if candidate.starts_with("http://") || candidate.starts_with("https://") {
+                Url::parse(candidate)
+            } else {
+                Url::parse(&format!("https://{candidate}"))
+            };
+            let Ok(parsed) = parsed else { return true };
+            let Some(host) = parsed.host_str() else {
+                return true;
+            };
+            let host = host.strip_prefix("www.").unwrap_or(host);
+            if is_bare
+                && host.rsplit_once('.').is_some_and(|(labels, _)| {
+                    labels
+                        .split('.')
+                        .all(|label| COMMON_FILENAME_STEMS.contains(&label))
+                })
+            {
+                continue;
+            }
+            if !host_allowed(host, allowed) {
                 return true;
             }
         }
     }
     false
-}
-
-/// Bare `label.tld[/path]` host, or `None` when the token is not a bare
-/// domain (wrong TLD, bad labels, or only filename stems).
-fn bare_domain_host(token: &str) -> Option<String> {
-    let token = token.to_lowercase();
-    let host_part = token.split('/').next().unwrap_or("");
-    let mut labels: Vec<&str> = host_part.split('.').collect();
-    if labels.len() < 2 {
-        return None;
-    }
-    let tld = labels.pop().expect("len >= 2");
-    if !BARE_TLDS.contains(&tld) {
-        return None;
-    }
-    if labels.iter().any(|label| {
-        label.is_empty()
-            || label.len() > 63
-            || !label.chars().all(|c| c.is_alphanumeric() || c == '-')
-    }) {
-        return None;
-    }
-    if labels
-        .iter()
-        .all(|label| COMMON_FILENAME_STEMS.contains(label))
-    {
-        return None;
-    }
-    Some(format!("{}.{}", labels.join("."), tld))
 }
 
 fn has_blocked_attachment(names: &[String], blocked: &[String]) -> bool {
@@ -996,6 +976,104 @@ mod tests {
             check("bad site badexample.io!", &policy),
             Some(AutomodFilter::ExternalLink)
         );
+    }
+
+    #[test]
+    fn external_links_scan_inside_text_and_punctuation() {
+        for content in [
+            "xhttps://evil.com",
+            "go(https://evil.com)",
+            "(evil.com)",
+            "see,evil.com",
+            "xwww.evil.com",
+            "🦀https://evil.com",
+            "see,évil.gg",
+            "(evil.com).",
+            "evil.gg/path",
+            "foo@ignored.gg/path(other.gg)",
+        ] {
+            assert_eq!(
+                check(content, &AutomodPolicy::default()),
+                Some(AutomodFilter::ExternalLink),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_links_preserve_allowlisted_hosts_and_boundaries() {
+        let policy = AutomodPolicy {
+            allowed_domains: vec!["two.gg".to_owned()],
+            ..AutomodPolicy::default()
+        };
+        for content in [
+            "xhttps://two.gg/news",
+            "go(https://sub.two.gg/news)",
+            "xwww.two.gg",
+            "(two.gg)",
+            "see,two.gg",
+            "https://two.gg?q=hello",
+            "https://two.gg#hello",
+            "https://two.gg:443/news",
+            "email@evil.gg",
+            "foo/evil.gg",
+            r"foo\evil.gg",
+            "foo_evil.gg",
+            "-evil.gg",
+            ".evil.gg",
+            "package.json",
+            "readme.md",
+            "config.app",
+            "config.package.app",
+        ] {
+            assert_eq!(check(content, &policy), None, "{content}");
+        }
+        for content in [
+            "https://two.gg.evil.gg/news",
+            "https://two.gg@evil.gg/news",
+            "two.gg https://evil.gg",
+            "https://two.gg/news see,evil.gg",
+            "config.evil.app",
+            "évil.gg",
+        ] {
+            assert_eq!(
+                check(content, &policy),
+                Some(AutomodFilter::ExternalLink),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_links_use_url_hostname_canonicalization() {
+        let policy = AutomodPolicy {
+            allowed_domains: vec!["xn--vil-9la.gg".to_owned()],
+            ..AutomodPolicy::default()
+        };
+        assert_eq!(check("(évil.gg)", &policy), None);
+        assert_eq!(check("https://évil.gg/news", &policy), None);
+        assert_eq!(
+            check("https://[invalid]", &policy),
+            Some(AutomodFilter::ExternalLink)
+        );
+    }
+
+    #[test]
+    fn external_links_preserve_legacy_tld_matching() {
+        let policy = AutomodPolicy::default();
+        for content in ["evil.appsuffix", "evil.gg.", "evil.app.appsuffix"] {
+            assert_eq!(
+                check(content, &policy),
+                Some(AutomodFilter::ExternalLink),
+                "{content}"
+            );
+        }
+        let allowed = AutomodPolicy {
+            allowed_domains: vec!["evil.co".to_owned()],
+            ..policy
+        };
+        // The legacy alternation tries `co` before `com`, without a right boundary.
+        assert_eq!(check("evil.com", &allowed), None);
     }
 
     #[test]
