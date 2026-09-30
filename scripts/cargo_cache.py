@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""TWO-only Cargo admission, read-only retention audit, and filesystem alarm.
+
+No deletion, mounting, credential access, or service control. Linux + stdlib only.
+A filesystem quota is the hard byte bound; the sampled guard is defense in depth.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+GIB = 1024 ** 3
+DEFAULT_POOL = Path('/paperclip/.cache/two-bot-next-bounded')
+TERMINAL = {'done', 'cancelled'}
+
+
+class Refusal(Exception):
+    pass
+
+
+def real_directory(path):
+    path = Path(os.path.abspath(path))
+    # Reject symlinks anywhere in the path, not just at the leaf.
+    if path.resolve() != path or not path.is_dir():
+        raise Refusal(f'not a real directory: {path}')
+    return path
+
+
+def usage(path):
+    """Allocated blocks, not logical lengths (sparse files do not fake usage)."""
+    total = 0
+    seen = set()
+    def unreadable(error):
+        raise Refusal(f'incomplete cache scan: {error.filename}')
+
+    for base, dirs, files in os.walk(path, followlinks=False, onerror=unreadable):
+        for item in [Path(base)] + [Path(base) / name for name in files + dirs]:
+            info = item.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise Refusal(f'symlink in cache: {item}')
+            key = (info.st_dev, info.st_ino)
+            if key not in seen:
+                seen.add(key)
+                total += info.st_blocks * 512
+    return total
+
+
+def available(path):
+    fs = os.statvfs(path)
+    return fs.f_bavail * fs.f_frsize
+
+
+def load_policy(pool):
+    policy = json.loads((pool / 'policy.json').read_text())
+    if policy.get('version') != 1:
+        raise Refusal('unsupported pool policy')
+    for field in ('slots', 'slot_budget_bytes', 'min_available_bytes'):
+        if type(policy.get(field)) is not int or policy[field] <= 0:
+            raise Refusal(f'invalid policy {field}')
+    if policy['slots'] > 8:
+        raise Refusal('more than 8 slots is not a bounded TWO pool')
+    expected = {'policy.json'} | {f'slot-{n}' for n in range(policy['slots'])}
+    if {p.name for p in pool.iterdir()} != expected:
+        raise Refusal('pool contents do not match immutable policy')
+    return policy
+
+
+def acquire(pool, policy):
+    for number in range(policy['slots']):
+        slot = real_directory(pool / f'slot-{number}')
+        if {p.name for p in slot.iterdir()} - {'lock', 'target', 'lease.json'}:
+            raise Refusal(f'unexpected slot contents: {slot}')
+        target = real_directory(slot / 'target')
+        fd = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
+        if (slot / 'lease.json').exists():
+            os.close(fd)
+            continue  # Interrupted run: Operator must inspect it, never steal it.
+        if usage(target) >= policy['slot_budget_bytes']:
+            os.close(fd)
+            continue
+        return slot, target, fd
+    raise Refusal('no idle, below-budget slot; no per-worktree fallback')
+
+
+def validate_cargo_args(args, workspace):
+    if not args or args[0] not in {'build', 'check', 'test', 'clippy', 'fmt'}:
+        raise Refusal('supported Cargo commands: build, check, test, clippy, fmt')
+    for number, arg in enumerate(args):
+        if any(arg == flag or arg.startswith(flag + '=') for flag in (
+                '--target-dir', '--build-dir', '--config', '--artifact-dir', '--out-dir', '-Z')) or arg.startswith('-Z'):
+            raise Refusal('Cargo output/config overrides are not allowed')
+        if arg == '--manifest-path' or arg.startswith('--manifest-path='):
+            value = arg.split('=', 1)[1] if '=' in arg else args[number + 1]
+            if not (workspace / value).resolve().is_relative_to(workspace):
+                raise Refusal('manifest must stay in this workspace')
+
+
+def group_alive(pid):
+    try:
+        os.killpg(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def stop_group(child):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            break
+        if sig == signal.SIGTERM:
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    child.wait()
+
+
+def run_cargo(pool, args, cargo='cargo', interval=1):
+    pool = real_directory(pool)
+    workspace = real_directory(Path.cwd())
+    validate_cargo_args(args, workspace)
+    policy = load_policy(pool)
+    if available(pool) < policy['min_available_bytes']:
+        raise Refusal('backing filesystem has insufficient user-available bytes')
+    slot, target, fd = acquire(pool, policy)
+    child = None
+    previous = {}
+    clean_exit = False
+    try:
+        # Exclusive create + persistent sentinel protect against wrapper death.
+        with (slot / 'lease.json').open('x') as output:
+            json.dump({'workspace': str(workspace), 'wrapper_pid': os.getpid(),
+                       'started_at': time.time()}, output)
+        env = os.environ.copy()
+        env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_TARGET_DIR=str(target),
+                   CARGO_BUILD_BUILD_DIR=str(target),
+                   CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0',
+                   CARGO_PROFILE_TEST_DEBUG='0')
+        # Pass the lease FD to Cargo as well: wrapper SIGKILL must not free it.
+        child = subprocess.Popen([cargo] + args, env=env, start_new_session=True,
+                                 pass_fds=(fd,))
+
+        def interrupted(signum, frame):
+            raise Refusal(f'build interrupted by signal {signum}; lease retained')
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, interrupted)
+        while True:
+            if usage(target) >= policy['slot_budget_bytes']:
+                raise Refusal('slot reached sampled byte budget; lease retained')
+            if available(pool) < policy['min_available_bytes']:
+                raise Refusal('filesystem available-byte floor reached; lease retained')
+            result = child.poll()
+            if result is not None:
+                if group_alive(child.pid):
+                    raise Refusal('descendant process outlived Cargo; lease retained')
+                clean_exit = True
+                return result
+            time.sleep(interval)
+    finally:
+        if child is not None and not clean_exit:
+            stop_group(child)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        if clean_exit:
+            (slot / 'lease.json').unlink()
+        os.close(fd)
+
+
+def process_references(proc_root):
+    """Host PID namespace, including container processes. Denied reads fail closed."""
+    references = []
+    for entry in Path(proc_root).iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+            # Kernel threads have no userspace cwd/exe; zombies have no live FDs.
+            if fields[0] == 'Z' or int(fields[6]) & 0x00200000:
+                continue
+            for link in [entry / 'cwd', entry / 'exe'] + list((entry / 'fd').iterdir()):
+                try:
+                    name = os.readlink(link)
+                    info = link.stat()
+                except FileNotFoundError:
+                    # Exit/closed-FD race is okay only if the process or FD is gone.
+                    if not entry.exists() or (link.parent.name == 'fd' and not link.exists()):
+                        continue
+                    raise
+                if name.startswith('/'):
+                    references.append((name.removesuffix(' (deleted)'), info.st_dev, info.st_ino))
+            for line in (entry / 'maps').read_text().splitlines():
+                fields = line.split(None, 5)
+                if len(fields) == 6 and fields[5].startswith('/'):
+                    major, minor = fields[3].split(':')
+                    references.append((fields[5].removesuffix(' (deleted)'),
+                                       os.makedev(int(major, 16), int(minor, 16)),
+                                       int(fields[4])))
+        except FileNotFoundError:
+            if entry.exists():
+                raise Refusal(f'incomplete process visibility: pid {entry.name}')
+        except PermissionError:
+            raise Refusal(f'incomplete process visibility: pid {entry.name}')
+    return references
+
+
+def within(path, root):
+    return Path(path).is_relative_to(root)
+
+
+def workspace_inodes(workspace):
+    # Includes source/evidence, so a process working anywhere in the workspace
+    # vetoes retention, even when container path spellings differ from the host.
+    result = set()
+
+    def unreadable(error):
+        raise Refusal(f'incomplete workspace scan: {error.filename}')
+
+    for base, dirs, files in os.walk(workspace, followlinks=False, onerror=unreadable):
+        for path in [Path(base)] + [Path(base) / name for name in dirs + files]:
+            info = path.lstat()
+            result.add((info.st_dev, info.st_ino))
+    return result
+
+
+def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=60):
+    """Only direct worktree/target candidates. Never cleans shared caches or sources."""
+    worktrees = real_directory(worktrees)
+    started = time.monotonic()
+    now = time.time() if now is None else now
+    if (inventory.get('version') != 1 or inventory.get('complete') is not True
+            or inventory.get('process_scope') != 'host'):
+        raise Refusal('need complete host-scope control-plane inventory')
+    captured = inventory.get('captured_at_unix')
+    if type(captured) not in (int, float) or not 0 <= now - captured <= max_age:
+        raise Refusal('control-plane inventory is stale or from the future')
+    rows = inventory.get('workspaces')
+    if not isinstance(rows, list):
+        raise Refusal('inventory workspaces must be a list')
+    indexed = {}
+    for row in rows:
+        path = row['path']
+        if path in indexed or type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
+            raise Refusal('ambiguous workspace attribution')
+        if not row.get('issue_id') or row.get('status') not in TERMINAL | {
+                'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
+            raise Refusal('missing issue attribution/status')
+        indexed[path] = row
+    refs = process_references(proc_root)
+    results = []
+    for workspace in sorted(worktrees.iterdir()):
+        target = workspace / 'target'
+        if not target.exists() and not target.is_symlink():
+            continue
+        result = {'target': str(target), 'eligible': False}
+        results.append(result)
+        if workspace.is_symlink() or target.is_symlink():
+            result['reason'] = 'symlink'
+            continue
+        workspace = real_directory(workspace)
+        target = real_directory(target)
+        row = indexed.get(str(workspace))
+        if not row:
+            result['reason'] = 'unattributed'
+            continue
+        if row['status'] not in TERMINAL or row['live_run'] or row['referenced']:
+            result['reason'] = 'live run, workspace reference, or nonterminal issue'
+            continue
+        tracked = subprocess.run(['git', '-C', str(workspace), 'ls-files', '-z', '--', 'target'],
+                                 capture_output=True, check=True)
+        ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'])
+        if tracked.stdout or ignored.returncode != 0:
+            result['reason'] = 'tracked or not ignored'
+            continue
+        nodes = workspace_inodes(workspace)
+        if any(within(path, workspace) or (device, inode) in nodes for path, device, inode in refs):
+            result['reason'] = 'actual process cwd/exe/fd/map reference'
+            continue
+        result.update(eligible=True, allocated_bytes=usage(target), reason='audit only; not deletion authority')
+    if now - captured + time.monotonic() - started > max_age:
+        raise Refusal('audit took too long; capture a new inventory')
+    return {'version': 1, 'audit_only': True, 'captured_at_unix': now, 'candidates': results}
+
+
+def filesystem_finding(path, backing_path, floor):
+    path = real_directory(path)
+    backing_path = real_directory(backing_path)
+    if path.stat().st_dev != backing_path.stat().st_dev:
+        return {'finding': 'wrong_filesystem', 'monitored_path': str(path),
+                'backing_path': str(backing_path)}
+    free = available(path)
+    if free < floor:
+        return {'finding': 'low_available_bytes', 'path': str(path),
+                'available_bytes': free, 'floor_bytes': floor}
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    run = commands.add_parser('run')
+    run.add_argument('--pool', type=Path, default=DEFAULT_POOL)
+    run.add_argument('cargo_args', nargs=argparse.REMAINDER)
+    audit = commands.add_parser('audit')
+    audit.add_argument('--worktrees', type=Path, required=True)
+    audit.add_argument('--inventory', type=Path, required=True)
+    watch = commands.add_parser('filesystem')
+    watch.add_argument('--path', type=Path, default=Path('/home'))
+    watch.add_argument('--backing-path', type=Path, required=True)
+    watch.add_argument('--min-available-bytes', type=int, default=10 * GIB)
+    args = parser.parse_args()
+    try:
+        if args.command == 'run':
+            cargo_args = args.cargo_args
+            if cargo_args[:1] == ['--']:
+                cargo_args = cargo_args[1:]
+            return run_cargo(args.pool, cargo_args)
+        if args.command == 'audit':
+            result = retention_audit(args.worktrees, json.loads(args.inventory.read_text()))
+        else:
+            if args.min_available_bytes <= 0:
+                raise Refusal('available-byte floor must be positive')
+            result = filesystem_finding(args.path, args.backing_path, args.min_available_bytes)
+            if result is None:
+                return 0  # Healthy monitoring is silent.
+        print(json.dumps(result, sort_keys=True))
+        return 1 if args.command == 'filesystem' else 0
+    except (Refusal, OSError, ValueError, KeyError, IndexError, subprocess.CalledProcessError) as error:
+        print(json.dumps({'finding': 'refused', 'reason': str(error)}), file=sys.stderr)
+        return 75
+
+
+if __name__ == '__main__':
+    sys.exit(main())
