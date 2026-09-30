@@ -22,6 +22,20 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,6 +68,11 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --features two-bot-core/db --locked
+
+      - name: leveling Postgres parity tests
+        env:
+          TWO_LEVELING_TEST_CI: '1'
+        run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.

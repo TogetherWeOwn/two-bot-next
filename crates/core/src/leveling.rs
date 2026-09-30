@@ -12,13 +12,10 @@
 //! REST executor consume the outcome types here; until they land, nothing in
 //! this module publishes commands or touches Discord.
 //!
-//! Parity notes: legacy posts no channel message on level-up — `onLevelUp`
-//! only grants reward roles (`applyLevelRoles`). The port matches that: a
-//! level-up produces a [`RewardRolePlan`] (role grant/revoke plan + audit
-//! reasons) for the executor, not a message. Legacy revokes nothing, but the
-//! staging-only TOG-4444 apply path proved grant/readback/revoke, and this
-//! card explicitly scopes grant/revoke — so the plan revokes held ladder
-//! roles the member no longer qualifies for, and never touches other roles.
+//! Legacy posts no channel message on level-up; `applyLevelRoles` grants
+//! rewards and `removeLevelRoles` is a separate staging-only operation.
+//! [`RewardRolePlan`] preserves that separation. The executor must enforce
+//! the staging fence, Manage Roles and role hierarchy before any revocation.
 
 /// XP per qualifying message (legacy `MESSAGE_XP`).
 pub const MESSAGE_XP: u64 = 15;
@@ -133,15 +130,14 @@ pub fn voice_xp_for_duration(duration_seconds: u64) -> u64 {
 }
 
 /// Format a count the way legacy `Number.toLocaleString()` (en-US) does:
-/// thousands grouped with `,`, no decimals. Legacy applies it to every number
-/// in the rank/leaderboard replies, so the port must too (acceptance: replies
-/// match legacy text).
+/// thousands grouped with `,`, no decimals. Legacy groups XP/progress counts,
+/// but leaves level, rank and member count ungrouped.
 #[must_use]
 pub fn grouped_number(n: u64) -> String {
     let digits = n.to_string().into_bytes();
     let mut out = Vec::with_capacity(digits.len() + digits.len() / 3);
     for (i, b) in digits.iter().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(b',');
         }
         out.push(*b);
@@ -160,8 +156,6 @@ pub fn rank_text(display_name: &str, level: u64, rank: u64, member_count: u64, x
     format!(
         "**{display_name}**\nLevel **{level}** · Rank **#{rank}** of **{member_count}**\nXP **{xp}** · {progress}/{span} this level · **{to_next}** to level {}",
         level + 1,
-        rank = grouped_number(rank),
-        member_count = grouped_number(member_count),
         xp = grouped_number(xp),
         progress = grouped_number(progress),
         span = grouped_number(span),
@@ -171,7 +165,12 @@ pub fn rank_text(display_name: &str, level: u64, rank: u64, member_count: u64, x
 
 /// One `/leaderboard` row (legacy mapping, top 10, mentions without parsing).
 #[must_use]
-pub fn leaderboard_line(rank: u64, member_id: u64, level: u64, xp: u64) -> String {
+pub fn leaderboard_line(
+    rank: u64,
+    member_id: impl std::fmt::Display,
+    level: u64,
+    xp: u64,
+) -> String {
     format!(
         "**{rank}.** <@{member_id}> · level **{level}** · {xp} XP",
         xp = grouped_number(xp)
@@ -269,10 +268,7 @@ pub struct LeaderboardReply {
 pub fn leaderboard_reply(entries: &[LeaderboardEntry]) -> LeaderboardReply {
     let rows: Vec<String> = entries
         .iter()
-        .map(|e| {
-            let member_id: u64 = e.member_id.parse().unwrap_or(0);
-            leaderboard_line(e.rank, member_id, e.level, e.xp)
-        })
+        .map(|e| leaderboard_line(e.rank, &e.member_id, e.level, e.xp))
         .collect();
     LeaderboardReply {
         content: leaderboard_text(&rows),
@@ -339,12 +335,10 @@ pub fn grant_audit_reason(level: u64) -> String {
     format!("TWO leveling: reached level {level}")
 }
 
-/// Audit reason for revoking ladder roles the member no longer qualifies for.
-/// New string — legacy never revokes — namespaced the same way so the audit
-/// trail reads as one leveling actor.
+/// Audit reason for staging revocations (legacy `removeLevelRoles`).
 #[must_use]
 pub fn revoke_audit_reason(level: u64) -> String {
-    format!("TWO leveling: removed unqualified reward roles at level {level}")
+    format!("TWO leveling: below level thresholds at level {level}")
 }
 
 /// Idempotent level-up reward plan: role ids to grant and to revoke, for the
@@ -353,7 +347,10 @@ pub fn revoke_audit_reason(level: u64) -> String {
 /// above their level (e.g. after the reward configuration moved). Roles
 /// outside the ladder are never touched, and re-planning after applying
 /// yields an empty plan (acceptance: reward grants idempotent). With role
-/// writes suppressed (session onboarding mode) the plan is empty.
+/// writes suppressed (session onboarding mode) the plan is empty. Revocation
+/// additionally requires `staging_revoke_allowed`; ordinary level-ups only
+/// grant. This is a plan, not authorization: executor permission/hierarchy
+/// checks still apply to the whole revoke set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewardRolePlan {
     pub grant: Vec<String>,
@@ -368,6 +365,7 @@ pub fn plan_reward_roles(
     rewards: &[LevelRoleReward],
     member_role_ids: &[String],
     role_writes: bool,
+    staging_revoke_allowed: bool,
 ) -> RewardRolePlan {
     let empty = RewardRolePlan {
         grant: Vec::new(),
@@ -392,7 +390,9 @@ pub fn plan_reward_roles(
         .iter()
         .filter(|id| {
             let id = id.as_str();
-            ladder.contains(id) && !rewards.iter().any(|r| r.role_id == id && r.level <= level)
+            staging_revoke_allowed
+                && ladder.contains(id)
+                && !rewards.iter().any(|r| r.role_id == id && r.level <= level)
         })
         .cloned()
         .collect();
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn leaderboard_line_groups_large_xp_like_legacy() {
         assert_eq!(
-            leaderboard_line(3, 100000000000000003, 42, 9_876_543),
+            leaderboard_line(3, 100000000000000003u64, 42, 9_876_543),
             "**3.** <@100000000000000003> · level **42** · 9,876,543 XP"
         );
     }
@@ -653,7 +653,7 @@ mod tests {
             },
         ];
         // Level 10 holding nothing: grants both rungs.
-        let plan = plan_reward_roles(10, &rewards, &[], true);
+        let plan = plan_reward_roles(10, &rewards, &[], true, false);
         assert_eq!(
             plan.grant,
             vec![
@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(plan.grant_reason, "TWO leveling: reached level 10");
         assert!(plan.revoke_reason.is_none());
         // Re-planning after applying is empty (idempotent grants).
-        let replan = plan_reward_roles(10, &rewards, &plan.grant, true);
+        let replan = plan_reward_roles(10, &rewards, &plan.grant, true, false);
         assert!(replan.grant.is_empty() && replan.revoke.is_empty());
         // Level 5 holding the level-10 role: keeps 5, revokes 10, grants
         // nothing; non-ladder roles are never touched.
@@ -678,15 +678,16 @@ mod tests {
                 "999999999999999999".to_owned(),
             ],
             true,
+            true,
         );
         assert!(plan.grant.is_empty());
         assert_eq!(plan.revoke, vec!["400000000000000010".to_owned()]);
         assert_eq!(
             plan.revoke_reason.as_deref(),
-            Some("TWO leveling: removed unqualified reward roles at level 5")
+            Some("TWO leveling: below level thresholds at level 5")
         );
         // Session mode: no writes at all.
-        let plan = plan_reward_roles(10, &rewards, &[], false);
+        let plan = plan_reward_roles(10, &rewards, &[], false, true);
         assert!(plan.grant.is_empty() && plan.revoke.is_empty());
     }
 
@@ -695,6 +696,42 @@ mod tests {
         assert_eq!(leaderboard_text(&[]), "No XP has been earned yet.");
         let text = leaderboard_text(&[leaderboard_line(1, 20, 5, 1200)]);
         assert!(text.starts_with("**TWO XP Leaderboard**\n**1.** <@20>"));
+    }
+
+    #[test]
+    fn ordinary_level_ups_never_plan_staging_revocations() {
+        let rewards = [LevelRoleReward {
+            level: 10,
+            role_id: "400000000000000010".to_owned(),
+        }];
+        let held = ["400000000000000010".to_owned()];
+        let plan = plan_reward_roles(5, &rewards, &held, true, false);
+        assert!(plan.grant.is_empty() && plan.revoke.is_empty());
+        assert!(plan.revoke_reason.is_none());
+    }
+
+    #[test]
+    fn leaderboard_preserves_stored_member_ids() {
+        let entries = [LeaderboardEntry {
+            member_id: "99999999999999999999".to_owned(),
+            xp: 15,
+            level: 0,
+            rank: 1,
+        }];
+        assert!(leaderboard_reply(&entries)
+            .content
+            .contains("<@99999999999999999999>"));
+    }
+
+    #[test]
+    fn reward_levels_fit_legacy_integer_column() {
+        assert_eq!(
+            normalize_role_rewards(&[LevelRoleReward {
+                level: u64::MAX,
+                role_id: "400000000000000010".to_owned(),
+            }]),
+            Err(RewardConfigError::InvalidLevel)
+        );
     }
 
     #[test]

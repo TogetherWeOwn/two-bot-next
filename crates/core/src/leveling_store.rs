@@ -12,7 +12,7 @@
 //! Enabled only by the crate `db` feature so unit tests for pure domain logic
 //! never need a Postgres driver or a live database.
 //!
-//! Transaction shape (legacy `award`, verbatim): one transaction holding the
+//! Transaction shape (legacy `award`): one transaction holding the
 //! atomic cooldown claim (`INSERT … ON CONFLICT DO UPDATE … WHERE
 //! last_awarded_at <= cutoff RETURNING`), then the XP upsert guarded by the
 //! ceiling (`… WHERE member_levels.xp <= MAX - amount RETURNING xp`), then the
@@ -61,7 +61,7 @@ fn validate_at(at_iso: &str) -> Result<i64, LevelingStoreError> {
 
 /// Core award path (legacy private `award`): cooldown-claim → XP upsert →
 /// `xp_awards` row, all in one transaction. `amount == 0` short-circuits to
-/// the current award before touching the database (legacy early return), and
+/// the current award before any write (legacy early return), and
 /// amounts above the ceiling are rejected without consuming cooldown.
 pub async fn award(
     pool: &PgPool,
@@ -231,23 +231,9 @@ pub async fn current_award(
     })
 }
 
-/// Offline award preview against supplied state (no database): cooldown age
-/// in seconds (`None` = never awarded) plus remaining ceiling headroom.
-/// Thin wrapper over [`adjudicate_award`] for callers that already hold the
-/// row; the transaction in [`award`] is the authoritative runtime path.
-#[must_use]
-pub fn preview_award(
-    previous_xp: u64,
-    amount: u64,
-    seconds_since_last_award: Option<u64>,
-    headroom: u64,
-) -> XpAward {
-    adjudicate_award(previous_xp, amount, seconds_since_last_award, headroom)
-}
-
 /// Full read model for `/rank` (legacy `profile`): XP split, 1-based rank
 /// with ties broken by member id ascending, member count, next-level floor.
-/// A member with no row still reads rank 1 with zero XP.
+/// A member with no row reads zero XP, ranked below higher-XP members.
 pub async fn profile(
     pool: &PgPool,
     guild_id: &str,
