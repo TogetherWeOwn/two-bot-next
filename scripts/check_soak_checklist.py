@@ -19,10 +19,10 @@ def parity_rows(markdown):
     seen_sections = set()
     for line in markdown.splitlines():
         heading = re.match(r"^## (\d+)\. ", line)
-        if heading:
-            section = int(heading[1])
+        if re.match(r"^##\s", line):
+            section = int(heading[1]) if heading else None
             headers = None
-            if 1 <= section <= 8:
+            if section in range(1, 9):
                 seen_sections.add(section)
             continue
         if section not in range(1, 9):

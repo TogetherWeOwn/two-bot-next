@@ -22,6 +22,18 @@ class SoakChecklistTests(unittest.TestCase):
         self.assertEqual(set(counts), set(range(1, 9)))
         self.assertEqual((ROOT / "docs/soak-checklist.md").read_text(), render(self.checklist))
 
+    def test_unnumbered_section_ends_parity_table_scope(self):
+        heading = "## 2. Non-command interactions"
+        changed = self.parity.replace(heading,
+            "## Registry golden exceptions\n\n"
+            "| Intentional difference | Matrix reference | Exact allowance |\n"
+            "|---|---|---|\n"
+            "| rsvp-attendance | §1 #12 / #25 | Rename only |\n\n" + heading)
+        self.assertNotEqual(changed, self.parity)
+        self.assertEqual(validate(changed, self.checklist), validate(self.parity, self.checklist))
+        with self.assertRaisesRegex(ValueError, "must end in Map"):
+            parity_rows(changed.replace("## Registry golden exceptions", "### Registry golden exceptions"))
+
     def test_missing_row_fails(self):
         data = copy.deepcopy(self.checklist)
         data["entries"].pop()
