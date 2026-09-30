@@ -102,17 +102,24 @@ credentials. It also runs on `main` and workflow dispatch (including release
 check dispatches). The existing required `check` job is unchanged.
 
 `scripts/container-smoke.py` prints both sizes in bytes and MiB to the log and
-job summary and fails above these initial ceilings:
+job summary and fails above these calibrated ceilings:
 
-| Artifact | Definition | Maximum |
-|---|---|---|
-| Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 160 MiB / 167,772,160 bytes |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 32 MiB / 33,554,432 bytes |
+| Artifact | Definition | Measured | Maximum | Headroom |
+|---|---|---|---|---|
+| Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 10 MiB / 10,485,760 bytes | 2.99 MiB / 42.7% |
 
-These ceilings will be calibrated from this PR's first hosted image measurement
-plus explicit headroom before review. Docker is not available in the controller
-workspace; offline fixture sizes are not measurements. Base-image/toolchain
-changes must remeasure and justify any future budget increase.
+Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
+at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
+25% image growth rounded up to the next 8 MiB, and roughly 40% binary growth
+rounded up to the next MiB. Base-image/toolchain changes must remeasure and
+justify any future budget increase. Docker is not available in the controller
+workspace; offline fixture sizes are not measurements.
+
+The hosted parked-mode contract passed, including SIGTERM exit 0 in 0.095 s.
+Manual log verification confirmed both deliberate one-byte-budget invocations
+failed with the corresponding `exceeds size budget` error and that the CI
+negative-test step passed. This exercises real measured artifacts, not mocks.
 
 The smoke test starts the image with **no token, guild or database bindings**, a
 256 MiB memory cap, and only a random loopback host port. It checks `/health` 200

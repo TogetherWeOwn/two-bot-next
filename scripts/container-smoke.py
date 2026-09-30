@@ -11,8 +11,8 @@ import urllib.request
 import uuid
 
 MIB = 1024 * 1024
-IMAGE_MAX_BYTES = 160 * MIB
-BINARY_MAX_BYTES = 32 * MIB
+IMAGE_MAX_BYTES = 112 * MIB
+BINARY_MAX_BYTES = 10 * MIB
 BINARY = "/home/two-bot/two-bot"
 
 

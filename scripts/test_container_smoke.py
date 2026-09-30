@@ -20,7 +20,7 @@ class DockerFixture:
     def __init__(self):
         self.calls = []
         self.image_size = 110 * smoke.MIB
-        self.binary_size = 20 * smoke.MIB
+        self.binary_size = 7 * smoke.MIB
         self.user = "two-bot"
         self.health_command = ["CMD", smoke.BINARY, "--healthcheck"]
         self.uid = "1000"
@@ -90,7 +90,7 @@ class ContainerSmokeTests(unittest.TestCase):
     def test_valid_image_contract_and_cleanup(self):
         output = self.run_smoke()
         self.assertIn("115343360 bytes", output)
-        self.assertIn("20971520 bytes", output)
+        self.assertIn("7340032 bytes", output)
         self.assertIn("SIGTERM exits 0", output)
         args, _ = self.fixture.calls[-1]
         self.assertEqual(args[:2], ("rm", "--force"))
@@ -108,6 +108,14 @@ class ContainerSmokeTests(unittest.TestCase):
 
     def test_binary_budget_is_enforced(self):
         self.assert_rejected("release binary exceeds size budget", binary_max_bytes=1)
+
+    def test_default_image_budget_is_enforced(self):
+        self.fixture.image_size = smoke.IMAGE_MAX_BYTES + 1
+        self.assert_rejected("image exceeds size budget")
+
+    def test_default_binary_budget_is_enforced(self):
+        self.fixture.binary_size = smoke.BINARY_MAX_BYTES + 1
+        self.assert_rejected("release binary exceeds size budget")
 
     def test_exact_budget_is_allowed(self):
         self.run_smoke(image_max_bytes=self.fixture.image_size, binary_max_bytes=self.fixture.binary_size)
