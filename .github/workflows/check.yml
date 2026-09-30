@@ -136,6 +136,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked --test internal_action_store -- --ignored
 
+      - name: Internal event executor mirror acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-discord --features db --locked --test internal_events -- --ignored
+
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
