@@ -4,6 +4,11 @@
 #[path = "common/database_guard.rs"]
 mod database_guard;
 
+#[allow(dead_code)]
+#[path = "../../discord/tests/common/mod.rs"]
+mod common;
+use common::{MockRest, ScriptedResponse};
+
 use std::{net::SocketAddr, panic::AssertUnwindSafe, process::Stdio, sync::Arc, time::Duration};
 
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
@@ -106,6 +111,8 @@ impl Bot {
             .env("DATABASE_URL", &db.child_url)
             .env("DISCORD_GATEWAY_URL", gateway)
             .env("DISCORD_API_BASE", api)
+            .env("TWO_ANNOUNCEMENTS", "1")
+            .env("TWO_COMMUNITY_SCORECARD", "1")
             .env("RUST_LOG", "two_bot=info")
             .env("LOG_FORMAT", "json")
             .env("NO_COLOR", "1")
@@ -176,7 +183,7 @@ async fn capture(stream: impl AsyncRead + Unpin, logs: Logs) {
 
 struct MockDiscord {
     url: String,
-    api: String,
+    rest: MockRest,
     auth: mpsc::Receiver<Value>,
     release: mpsc::Sender<()>,
     task: JoinHandle<()>,
@@ -187,7 +194,18 @@ impl MockDiscord {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("ws://{addr}");
-        let api = format!("http://{addr}/api/v10");
+        // Registry publication is HTTP before gateway connect on BOTH boots.
+        // Keep REST on its own listener so it cannot be mistaken for an upgrade.
+        let rest = MockRest::start(
+            vec![
+                ScriptedResponse::json(200, json!({"id":"1111"})),
+                ScriptedResponse::status(200),
+                ScriptedResponse::json(200, json!({"id":"1111"})),
+                ScriptedResponse::status(200),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
         let (auth_tx, auth) = mpsc::channel(2);
         let (release, mut gates) = mpsc::channel(4);
         let resume_url = url.clone();
@@ -248,7 +266,7 @@ impl MockDiscord {
         });
         Self {
             url,
-            api,
+            rest,
             auth,
             release,
             task,
@@ -328,7 +346,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         } else {
             "ws://127.0.0.1:1"
         };
-        bots.push(Bot::spawn(db, addr, gateway, &discord.api, logs));
+        bots.push(Bot::spawn(db, addr, gateway, &discord.rest.origin(), logs));
         let bot = bots.last_mut().unwrap();
         let health = wait_http(bot, addr, "/healthz", 200).await;
         assert!(health.contains("\"status\":\"ok\""));
@@ -337,6 +355,41 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         assert!(before.contains("\"gateway\",\"starting\""));
         discord.release.send(()).await.unwrap(); // Health precedes HELLO.
         let auth = discord.authentication().await;
+        let requests = discord.rest.requests();
+        assert_eq!(requests.len(), (boot + 1) * 2, "registry sync on each boot");
+        let identity = &requests[boot * 2];
+        assert_eq!(identity.method, "GET");
+        assert_eq!(identity.path, "/api/v10/oauth2/applications/@me");
+        let publish = &requests[boot * 2 + 1];
+        assert_eq!(publish.method, "PUT");
+        assert_eq!(
+            publish.path,
+            "/api/v10/applications/1111/guilds/2222/commands"
+        );
+        let commands: Vec<Value> = serde_json::from_slice(&publish.body).unwrap();
+        let names: Vec<_> = commands
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        for name in [
+            "rank",
+            "leaderboard",
+            "attendance",
+            "rsvp",
+            "rsvp-attendance",
+        ] {
+            assert_eq!(
+                names.iter().filter(|&&published| published == name).count(),
+                1,
+                "publish the full shared registry, without duplicate {name}"
+            );
+        }
+        if boot == 1 {
+            assert_eq!(
+                publish.body, requests[1].body,
+                "same registry on RESUMED boot"
+            );
+        }
         // The binary itself has now finished migration and checkpoint loading.
         assert_eq!(
             db.store()
@@ -422,6 +475,7 @@ async fn real_binary_is_alive_and_resumes_after_sigterm() {
     }
     discord.task.abort();
     let _ = discord.task.await;
+    discord.rest.shutdown().await;
     db.close().await;
     match result {
         Ok(Ok(())) => eprintln!("real-binary lifecycle PASS in {:?}", started.elapsed()),
