@@ -191,7 +191,7 @@ impl TestDatabase {
     /// Set a bound search_path within this fixture, never a connection redirect.
     pub async fn pool_with_search_path(&self, path: &str) -> Result<PgPool> {
         let path = path.to_owned();
-        Ok(PgPoolOptions::new()
+        PgPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(10))
             .after_connect(move |conn, _| {
@@ -206,7 +206,7 @@ impl TestDatabase {
             })
             .connect_with(self.pool().connect_options().as_ref().clone())
             .await
-            .context("connect independent fixture pool")?)
+            .context("connect independent fixture pool")
     }
 
     pub fn name(&self) -> &str {
