@@ -73,6 +73,12 @@ pub async fn award(
     channel_id: Option<&str>,
 ) -> Result<XpAward, LevelingStoreError> {
     let at_ms = validate_at(at_iso)?;
+    // Legacy `service.ts` normalizes both timestamps through
+    // `new Date(ms).toISOString()` before comparing or persisting. Bind that
+    // same millisecond-normalized form everywhere: persisting the raw input
+    // would store sub-millisecond instants the cutoff arithmetic (which
+    // truncates to millis) cannot see, rejecting awards exactly 60 s apart.
+    let at_norm = format_iso_millis(at_ms);
     if amount == 0 || amount > MAX_STORED_XP {
         return current_award(pool, guild_id, member_id).await;
     }
@@ -94,7 +100,7 @@ pub async fn award(
     .bind(guild_id)
     .bind(member_id)
     .bind(source.as_str())
-    .bind(at_iso)
+    .bind(&at_norm)
     .bind(cutoff_iso)
     .fetch_optional(&mut *tx)
     .await?;
@@ -126,7 +132,7 @@ pub async fn award(
     .bind(amount as i64)
     .bind(message_xp as i64)
     .bind(voice_xp as i64)
-    .bind(at_iso)
+    .bind(&at_norm)
     .bind((MAX_STORED_XP - amount) as i64)
     .fetch_optional(&mut *tx)
     .await?;
@@ -143,7 +149,7 @@ pub async fn award(
     .bind(member_id)
     .bind(source.as_str())
     .bind(amount as i64)
-    .bind(at_iso)
+    .bind(&at_norm)
     .bind(channel_id)
     .execute(&mut *tx)
     .await?;
@@ -234,36 +240,49 @@ pub async fn current_award(
 /// Full read model for `/rank` (legacy `profile`): XP split, 1-based rank
 /// with ties broken by member id ascending, member count, next-level floor.
 /// A member with no row reads zero XP, ranked below higher-XP members.
+///
+/// One statement, so XP, rank and member count share a single snapshot: an
+/// award committing between separate SELECTs would otherwise compare the new
+/// rows against a stale XP bound and rank a sole member 2 of 1 (TOG-10359).
+/// Wrapping the three reads in a default READ COMMITTED transaction would
+/// not fix that — each statement would still see a fresh snapshot.
 pub async fn profile(
     pool: &PgPool,
     guild_id: &str,
     member_id: &str,
 ) -> Result<LevelProfile, LevelingStoreError> {
-    let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
-        "SELECT xp, message_xp, voice_xp, imported_xp
-         FROM member_levels WHERE guild_id = $1 AND member_id = $2",
+    let (xp, message_xp, voice_xp, imported_xp, rank, member_count): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT
+           COALESCE(m.xp, 0),
+           COALESCE(m.message_xp, 0),
+           COALESCE(m.voice_xp, 0),
+           COALESCE(m.imported_xp, 0),
+           (SELECT COUNT(*) FROM member_levels
+            WHERE guild_id = $1
+              AND (xp > COALESCE(m.xp, 0)
+                   OR (xp = COALESCE(m.xp, 0) AND member_id < $2))),
+           (SELECT COUNT(*) FROM member_levels WHERE guild_id = $1)
+         FROM (SELECT 1) AS one
+         LEFT JOIN member_levels m
+           ON m.guild_id = $1 AND m.member_id = $2",
     )
     .bind(guild_id)
-    .bind(member_id)
-    .fetch_optional(pool)
-    .await?;
-    let (xp, message_xp, voice_xp, imported_xp) = row
-        .map(|(a, b, c, d)| (a as u64, b as u64, c as u64, d as u64))
-        .unwrap_or((0, 0, 0, 0));
-    let rank: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM member_levels
-         WHERE guild_id = $1 AND (xp > $2 OR (xp = $2 AND member_id < $3))",
-    )
-    .bind(guild_id)
-    .bind(xp as i64)
     .bind(member_id)
     .fetch_one(pool)
     .await?;
-    let member_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM member_levels WHERE guild_id = $1")
-            .bind(guild_id)
-            .fetch_one(pool)
-            .await?;
+    let (xp, message_xp, voice_xp, imported_xp) = (
+        xp as u64,
+        message_xp as u64,
+        voice_xp as u64,
+        imported_xp as u64,
+    );
     let level = level_for_xp(xp);
     Ok(LevelProfile {
         guild_id: guild_id.to_owned(),
@@ -335,6 +354,14 @@ pub async fn role_rewards(
 /// `replaceRoleRewards`): normalize (last row per level wins, ascending),
 /// then delete-all + insert in one transaction. Invalid rows fail before any
 /// write.
+///
+/// A transaction alone does not serialize two replacements: with an empty
+/// ladder both writers finish `DELETE` before either `INSERT`s, and the
+/// commits union two independent configurations (TOG-10359). Row locks
+/// cannot cover absent rows, so take a stable per-guild advisory lock first.
+/// The cutover import writer (`two-bot-cutover::replace_role_rewards`) takes
+/// the same lock with the same key — both crates must keep the strings in
+/// sync.
 pub async fn replace_role_rewards(
     pool: &PgPool,
     guild_id: &str,
@@ -342,6 +369,13 @@ pub async fn replace_role_rewards(
 ) -> Result<(), LevelingStoreError> {
     let normalized = normalize_role_rewards(rewards)?;
     let mut tx = pool.begin().await?;
+    // Same namespaced-key convention as `onboarding_store`: a hash collision
+    // only serializes unrelated guilds, never merges ladders.
+    let lock_key = format!("{guild_id}:level_role_rewards");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM level_role_rewards WHERE guild_id = $1")
         .bind(guild_id)
         .execute(&mut *tx)

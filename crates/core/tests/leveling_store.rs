@@ -351,6 +351,119 @@ async fn level_up_crosses_threshold_and_plans_grants(
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn submillisecond_awards_keep_exact_sixty_second_boundary(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let (admin, pool, schema) = pool().await;
+    // TOG-10359: the parser truncates sub-millisecond input, but the store
+    // bound the raw string — the stored first instant sat 500µs after the
+    // second cutoff, so an award exactly 60 s later was rejected. All binds
+    // now carry the millisecond-normalized form, matching legacy
+    // `new Date(ms).toISOString()`.
+    let first = store::award_message(&pool, GUILD, A, "2026-09-30T12:00:00.000500Z", None).await?;
+    let second = store::award_message(&pool, GUILD, A, "2026-09-30T12:01:00.000500Z", None).await?;
+    assert_eq!((first.awarded, second.awarded), (15, 15));
+    assert_eq!(second.total_xp, 30);
+    // Equivalent offset forms normalize to the same instants: 59 s after the
+    // second award stays inside cooldown, 60 s fires again.
+    let blocked =
+        store::award_message(&pool, GUILD, A, "2026-09-30T14:01:59.000500+02:00", None).await?;
+    assert_eq!(blocked.awarded, 0);
+    let third =
+        store::award_message(&pool, GUILD, A, "2026-09-30T14:02:00.000500+02:00", None).await?;
+    assert_eq!(third.awarded, 15);
+    // Stored instants carry no sub-millisecond residue.
+    let stored: String = sqlx::query_scalar(
+        "SELECT last_awarded_at::text FROM xp_cooldowns
+         WHERE guild_id = $1 AND member_id = $2 AND source = 'message'",
+    )
+    .bind(GUILD)
+    .bind(A)
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        stored.starts_with("2026-09-30 12:02:00"),
+        "cooldown instant normalized to millis, got {stored}"
+    );
+    teardown(admin, &schema).await;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn profile_stays_consistent_under_concurrent_awards(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let (admin, pool, schema) = pool().await;
+    sqlx::query(
+        "INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
+                 VALUES ($1, $2, 100, 100, $3::text::timestamptz)",
+    )
+    .bind(GUILD)
+    .bind(A)
+    .bind(at(0))
+    .execute(&pool)
+    .await?;
+    // TOG-10359: profile read XP, rank and count in three statements, so an
+    // award committing between the first two ranked a sole member 2 of 1.
+    // The single-statement read shares one snapshot: a sole member always
+    // reads rank 1 of 1, whatever commits alongside.
+    for round in 1..=30 {
+        let timestamp = at(i64::from(round) * 61);
+        let (awarded, profile) = tokio::join!(
+            store::award_message(&pool, GUILD, A, &timestamp, None),
+            store::profile(&pool, GUILD, A),
+        );
+        awarded?;
+        let profile = profile?;
+        assert_eq!(profile.member_count, 1, "round {round}");
+        assert_eq!(profile.rank, 1, "round {round}");
+        assert!(profile.rank <= profile.member_count, "round {round}");
+    }
+    teardown(admin, &schema).await;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn concurrent_empty_ladder_replacements_keep_one_ladder(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let (admin, pool, schema) = pool().await;
+    let five = [LevelRoleReward {
+        level: 5,
+        role_id: "400000000000000005".to_owned(),
+    }];
+    let ten = [LevelRoleReward {
+        level: 10,
+        role_id: "400000000000000010".to_owned(),
+    }];
+    // TOG-10359: with an empty ladder both writers finished DELETE before
+    // either INSERTed, committing the union of two independent
+    // configurations. The per-guild advisory lock serializes replacements,
+    // so every round stores exactly one requested ladder, never the union.
+    for round in 0..10 {
+        sqlx::query("TRUNCATE level_role_rewards")
+            .execute(&pool)
+            .await?;
+        let (left, right) = tokio::join!(
+            store::replace_role_rewards(&pool, GUILD, &five),
+            store::replace_role_rewards(&pool, GUILD, &ten),
+        );
+        left?;
+        right?;
+        let ladder = store::role_rewards(&pool, GUILD).await?;
+        assert!(
+            ladder == five || ladder == ten,
+            "round {round}: union of independent ladders: {ladder:?}"
+        );
+    }
+    teardown(admin, &schema).await;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn concurrent_first_message_awards_have_one_winner(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
     let (admin, pool, schema) = pool().await;
