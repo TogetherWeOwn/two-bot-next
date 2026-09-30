@@ -9,6 +9,9 @@
 //!
 //! Dev-only: never ships in the release binary.
 
+// The shared double also serves the REST half (S4's tests); this target
+// only drives its gateway side, so the REST members read as unused here.
+#[allow(dead_code)]
 mod common;
 
 use std::time::{Duration, Instant};

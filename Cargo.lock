@@ -738,6 +738,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2193,9 +2194,19 @@ dependencies = [
 name = "two-bot-core"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64",
+ "bytes",
+ "flate2",
+ "futures-util",
  "hex",
  "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rand",
  "regex",
  "serde",
  "serde_json",
@@ -2232,10 +2243,17 @@ dependencies = [
 name = "two-bot-discord"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "rustls",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-websockets",
  "tracing",
@@ -2245,6 +2263,10 @@ dependencies = [
  "twilight-model",
  "two-bot-core",
 ]
+
+[[package]]
+name = "two-bot-next"
+version = "0.1.0"
 
 [[package]]
 name = "typenum"
