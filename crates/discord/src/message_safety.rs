@@ -113,8 +113,17 @@ pub(crate) fn interaction_response(
                 value["data"] = json!({});
             }
             sanitize_message(&mut value["data"]);
-            serde_json::from_value(value)
-                .map_err(|e| DiscordError::Rejected(format!("decode safe response: {e}")))
+            let mut safe: InteractionResponse = serde_json::from_value(value)
+                .map_err(|e| DiscordError::Rejected(format!("decode safe response: {e}")))?;
+            // Attachment.file is #[serde(skip)]: keep the actual upload bytes,
+            // not just their JSON metadata, across the sanitized round trip.
+            if let Some(data) = safe.data.as_mut() {
+                data.attachments = response
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.attachments.clone());
+            }
+            Ok(safe)
         }
         _ => Ok(response.clone()),
     }
@@ -123,6 +132,47 @@ pub(crate) fn interaction_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_sanitization_preserves_upload_bytes_and_nonmessage_responses() {
+        use twilight_model::http::{attachment::Attachment, interaction::InteractionResponseData};
+        let response = InteractionResponse {
+            kind: InteractionResponseType::ChannelMessageWithSource,
+            data: Some(InteractionResponseData {
+                content: Some("@everyone".to_owned()),
+                attachments: Some(vec![Attachment::from_bytes(
+                    "fixture.txt".to_owned(),
+                    b"preserved upload".to_vec(),
+                    0,
+                )]),
+                ..Default::default()
+            }),
+        };
+        let safe = interaction_response(&response).unwrap();
+        assert_eq!(
+            safe.data.as_ref().unwrap().attachments,
+            response.data.as_ref().unwrap().attachments
+        );
+        for kind in [
+            InteractionResponseType::Pong,
+            InteractionResponseType::DeferredUpdateMessage,
+            InteractionResponseType::ApplicationCommandAutocompleteResult,
+            InteractionResponseType::Modal,
+        ] {
+            let response = InteractionResponse { kind, data: None };
+            assert_eq!(interaction_response(&response).unwrap(), response);
+        }
+        let response = InteractionResponse {
+            kind: InteractionResponseType::DeferredChannelMessageWithSource,
+            data: None,
+        };
+        assert!(interaction_response(&response)
+            .unwrap()
+            .data
+            .unwrap()
+            .allowed_mentions
+            .is_some());
+    }
 
     #[test]
     fn caller_cannot_opt_into_mass_role_user_or_reply_mentions() {

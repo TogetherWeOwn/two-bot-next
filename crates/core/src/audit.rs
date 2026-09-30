@@ -197,9 +197,11 @@ fn format_metadata_value(value: &serde_json::Value) -> String {
             }
             let items: Vec<String> = items
                 .iter()
-                .map(|item| match item {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
+                .map(|item| {
+                    crate::message_safety::neutralize_mentions(&match item {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
                 })
                 .collect();
             let mut included: Vec<&str> = Vec::new();
@@ -232,8 +234,13 @@ fn format_metadata_value(value: &serde_json::Value) -> String {
                 format!("{} ({indicator})", included.join(","))
             }
         }
-        serde_json::Value::String(s) => utf16_prefix(s, 300),
-        other => utf16_prefix(&other.to_string(), 300),
+        serde_json::Value::String(s) => {
+            utf16_prefix(&crate::message_safety::neutralize_mentions(s), 300)
+        }
+        other => utf16_prefix(
+            &crate::message_safety::neutralize_mentions(&other.to_string()),
+            300,
+        ),
     }
 }
 
