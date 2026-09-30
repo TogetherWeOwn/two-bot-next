@@ -117,7 +117,7 @@ pub fn registry_snapshot(commands: &[Command]) -> Result<RegistrySnapshot, serde
         normalized.insert(key, value);
     }
     let bytes = serde_json::to_vec(&normalized)?;
-    let hash = format!("{:x}", Sha256::digest(bytes));
+    let hash = hex::encode(Sha256::digest(bytes));
     Ok(RegistrySnapshot {
         hash,
         commands: normalized,
