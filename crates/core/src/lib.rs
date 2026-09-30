@@ -19,6 +19,13 @@ pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
 pub mod moderation;
+pub mod onboarding;
+#[cfg(feature = "db")]
+pub mod onboarding_store;
+pub mod rsvp;
+#[cfg(feature = "db")]
+pub mod rsvp_store;
+pub mod sticky;
 pub mod voice;
 
 pub use automod::{
@@ -65,6 +72,47 @@ pub use moderation::{
     require_moderation_reason, ModerationAction, ModerationActor, ModerationGateError,
     ModerationGates, ModerationPolicy, ModerationRequest, ModerationTarget, PolicyError,
     ReasonError, TargetProtection,
+};
+pub use onboarding::{
+    adjudicate_game_select, adjudicate_goodbye, adjudicate_session_select, adjudicate_welcome,
+    anchor_welcome_text, build_session_picks, channel_link, channel_routed_row, current_game_keys,
+    days_in_guild, decide_prompt, funnel_idempotency_key, game_picker_allowed, game_selected_row,
+    goodbye_text, level_role_writes_allowed, next_anchor_occurrence, occurrence_context,
+    pick_by_key, plan_game_selection, plan_session, preselected_game_keys, prompted_row,
+    resolve_destination, session_ack_text, session_pick_by_key, session_routed_row,
+    session_welcome_text, staging_session_picks, welcome_trigger, zoned_epoch_secs, AnchorSpec,
+    Destination, FunnelRow, GamePick, GamePickerOutcome, GameSelection, GoodbyeEffect,
+    MembershipTrigger, MentionPolicy, OccurrenceContext, OnboardingGateError, OnboardingGates,
+    OnboardingMode, PickerKind, PromptDecision, PromptSkip, SessionPick, SessionPickerOutcome,
+    SessionPlan, WelcomeEffect, ANCHOR_CHANNEL_ID, EVENT_CHANNEL_ROUTED, EVENT_GAME_ROLES_SELECTED,
+    EVENT_ONBOARDING_PROMPTED, GAME_HUB_CHANNEL_ID, GAME_PICKS, GAME_SELECT_ID, INTRO_CHANNEL_ID,
+    NEAR_EVENT_SECS, PICKER_CLEARED_REPLY, PICKER_DRY_RUN_REPLY, PICKER_ROLE_FAILURE_REPLY,
+    PLATFORM_PICKS, SESSION_SELECT_ID, SOURCE_PICKER, SOURCE_SESSION_PICKER,
+    STAGING_LOBBY_VOICE_CHANNEL_ID, STAGING_LOOKING_TO_PLAY_CHANNEL_ID, SUNDAY_SQUAD, TWO_GUILD_ID,
+};
+#[cfg(feature = "db")]
+pub use onboarding_store::{
+    begin_prompt, has_onboarding_prompt, record_channel_routed, record_game_selected,
+    record_prompted, record_session_routed, OnboardingStoreError, PromptGuard,
+};
+pub use rsvp::{
+    attendance_totals_text, checkin_classification, checkin_duplicate_text,
+    checkin_idempotency_key, checkin_metadata_json, checkin_recorded_text, checkin_source,
+    checkin_source_event_id, is_snowflake, partition_rsvps, require_manage_events, rsvp_saved_text,
+    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceProof,
+    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
+    ATTENDANCE_EVENT_TYPE, RSVP_AUDIT_ACTION,
+};
+#[cfg(feature = "db")]
+pub use rsvp_store::{
+    list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+};
+pub use sticky::{
+    activity_eligible, automations_enabled, claim_blocks, decide_activity, normalize_debounce,
+    repost_due, sticky_removed_reply, sticky_set_reply, validate_body, ActivityDecision,
+    ActivityOutcome, ClaimGrant, PutSticky, RemoveOutcome, StickyAudit, StickyAuditAction,
+    StickyAuditOutcome, StickyError, StickyState, CLAIM_EXPIRY_SECONDS, DEFAULT_DEBOUNCE_SECONDS,
+    MAX_BODY_CHARS, MAX_DEBOUNCE_SECONDS, MIN_DEBOUNCE_SECONDS,
 };
 pub use voice::{
     average_known_voice_duration, count_unknown_starts_per_window, find_blind_windows,
