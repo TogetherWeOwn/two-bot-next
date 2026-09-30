@@ -69,6 +69,30 @@ elif args[1].startswith(repo + "/commits/"):
     print(json.dumps({"parents": [{"sha": parent} for parent in parents.split()]}))
 elif args == ["api", repo + "/pulls/42", "--jq", ".body"]:
     print(state["body"])
+elif args[1] == repo + "/git/ref/heads/main" and args[3] == ".object.sha":
+    print(state["main_sha"])
+elif args[1] == repo + "/git/ref/heads/" + NOTES_BRANCH and args[3] == ".object.sha":
+    if NOTES_BRANCH not in state["branches"]:
+        sys.exit(1)
+    print(state["branches"][NOTES_BRANCH])
+elif args[:4] == ["api", "--method", "POST", repo + "/git/refs"]:
+    # Native forkBranch (createFileOnNewBranch): the notes branch is created
+    # from the default branch, and reused when a retried run finds it already
+    # present. Both directions are enforced, not just scripted.
+    state["branch_create_attempts"] += 1
+    if state.get("fail_branch_create"):
+        state["fail_branch_create"] = False
+        state_path.write_text(json.dumps(state))
+        sys.exit(1)
+    pairs = [args[i + 1] for i, arg in enumerate(args) if arg == "-f" and i + 1 < len(args)]
+    fields = dict(pair.split("=", 1) for pair in pairs)
+    assert fields.get("ref") == "refs/heads/" + NOTES_BRANCH, fields
+    assert fields.get("sha") == state["main_sha"], "Notes branch must be created from main"
+    if NOTES_BRANCH in state["branches"]:
+        sys.exit(1)
+    state["branches"][NOTES_BRANCH] = fields["sha"]
+    state["branch_creates"] += 1
+    state_path.write_text(json.dumps(state))
 elif "/contents/release-notes.md?ref=" in args[1]:
     if state.get("notes") is None:
         sys.exit(1)
@@ -94,6 +118,9 @@ elif args[1:4] == ["--method", "PUT", repo + "/contents/release-notes.md"]:
         state["fail_notes_put"] = False
         state_path.write_text(json.dumps(state))
         sys.exit(1)
+    # The Contents API cannot carry a file onto a missing branch: a PUT that
+    # skipped branch creation fails here, before any mock state changes.
+    assert NOTES_BRANCH in state["branches"], "Notes PUT without notes branch"
     payload = json.loads(pathlib.Path(args[args.index("--input") + 1]).read_text())
     # The Contents API reads the branch from the JSON payload: with --input,
     # gh puts -f field flags into the URL query instead (gh api --help), so a
@@ -160,7 +187,7 @@ class ReleaseRetryTests(unittest.TestCase):
         self.git("remote", "add", "origin", str(self.remote))
         self.git("push", "origin", "HEAD")
         self.state_path = self.base / "state.json"
-        self.state_path.write_text(json.dumps({"open": True, "body": BODY, "patches": 0, "patch_attempts": 0, "pushes": 0, "push_attempts": 0, "notes": None, "notes_sha": "notes-sha-0", "notes_puts": 0, "notes_put_attempts": 0}))
+        self.state_path.write_text(json.dumps({"open": True, "body": BODY, "patches": 0, "patch_attempts": 0, "pushes": 0, "push_attempts": 0, "notes": None, "notes_sha": "notes-sha-0", "notes_puts": 0, "notes_put_attempts": 0, "main_sha": self.main, "branches": {}, "branch_creates": 0, "branch_create_attempts": 0}))
         bin_path = self.base / "bin"
         bin_path.mkdir()
         mocks = [("gh", GH_MOCK.replace("__BRANCH__", BRANCH)), ("git", GIT_MOCK)]
@@ -186,6 +213,12 @@ class ReleaseRetryTests(unittest.TestCase):
         state = json.loads(self.state_path.read_text())
         if updates:
             state.update(updates)
+            # Native overflow bodies arrive with the notes branch already
+            # created by native. Mirror that here: setting a stored-notes body
+            # seeds the branch, so the native-overflow tests exercise reuse
+            # while the grown-body tests exercise creation.
+            if "body" in updates and updates["body"] == OVERFLOW_BODY and "branches" not in updates:
+                state["branches"] = {NOTES_BRANCH: state["main_sha"]}
             self.state_path.write_text(json.dumps(state))
         return state
 
@@ -364,6 +397,11 @@ class ReleaseRetryTests(unittest.TestCase):
         self.reconcile()
         self.assertEqual(self.state()["pushes"], 1)
         self.assertEqual(self.state()["notes_puts"], 1)
+        # The migration-created notes branch did not exist: the workflow must
+        # have created it from main before the PUT, and the mock enforces both
+        # directions (PUT without the branch fails closed).
+        self.assertEqual(self.state()["branch_creates"], 1)
+        self.assertEqual(self.state()["branches"], {NOTES_BRANCH: self.main})
         # The visible body really changes (normal body -> overflow link), so
         # exactly one small-link PATCH is published; the oversized text never
         # goes through PATCH.
@@ -382,7 +420,65 @@ class ReleaseRetryTests(unittest.TestCase):
         overflow_state = self.state()
         self.assertEqual(overflow_state["pushes"], before["pushes"])
         self.assertEqual(overflow_state["notes_puts"], before["notes_puts"])
+        self.assertEqual(overflow_state["branch_creates"], before["branch_creates"])
         self.assertEqual(overflow_state["patches"], before["patches"])
+
+    def test_notes_put_without_branch_fails_before_dispatch(self):
+        # The reviewer's exact P2 against the strict mock: the old workflow PUT
+        # the migration-created notes onto a branch it never created. Invoke
+        # the mock's PUT exactly as the workflow would, with the notes branch
+        # absent: it must fail closed, changing no mock state and dispatching
+        # nothing. This is the enforcement behind the workflow's create/reuse
+        # step: skip that step and the run fails here instead.
+        import base64 as b64lib
+        self.state(body=OVERFLOW_BODY, notes=BODY, branches={})
+        payload = self.base / "notes-payload.json"
+        payload.write_text(json.dumps({
+            "message": "chore(release): preserve bootstrap release notes",
+            "content": b64lib.b64encode(b"updated notes").decode(),
+            "branch": NOTES_BRANCH, "sha": self.state()["notes_sha"],
+        }))
+        before = self.state()
+        result = subprocess.run(
+            [str(self.base / "bin" / "gh"), "api", "--method", "PUT",
+             "repos/fixture/repo/contents/release-notes.md",
+             "--input", str(payload), "--silent"],
+            env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, "PUT onto a missing notes branch must fail")
+        self.assertEqual(self.state(), before, "Failed PUT changes no mock state")
+        self.assertEqual(self.state()["notes_puts"], 0)
+        self.assertEqual(self.state()["patches"], 0)
+
+    def test_failed_branch_create_recovers_without_repeating_work(self):
+        filler = "\n".join(f"* generated item {i:04d} {'x' * 60}" for i in range(900))
+        big_changelog = f"# Changelog\n\n{NOTES}\n\n{filler}\n\n## Changelog\n\n## Unreleased\n\n### Fixed\n\n- historical RSVP repair\n"
+        big_body = f":robot: release\n---\n\n{NOTES}\n\n{filler}\n\n---\nRefs: TOG-9865\n"
+        (self.repo / "CHANGELOG.md").write_text(big_changelog)
+        self.state(body=big_body, fail_branch_create=True)
+        self.reconcile(False)
+        self.assertEqual(self.state()["pushes"], 1)
+        self.assertEqual(self.state()["branch_creates"], 0)
+        self.assertEqual(self.state()["notes_puts"], 0)
+        self.assertEqual(self.state()["patches"], 0)
+        self.fresh_checkout()
+        self.reconcile()
+        self.assertEqual(self.state()["branch_create_attempts"], 2)
+        self.assertEqual(self.state()["branch_creates"], 1)
+        self.assertEqual(self.state()["pushes"], 1)
+        self.assertEqual(self.state()["notes_puts"], 1)
+        self.assertEqual(self.state()["patches"], 1)
+
+    def test_native_overflow_reuses_existing_notes_branch(self):
+        # Native-created overflows arrive with the notes branch already in
+        # place: no create call, just the notes update; a retry changes nothing.
+        self.state(body=OVERFLOW_BODY, notes=BODY)
+        self.reconcile()
+        self.assertEqual(self.state()["branch_creates"], 0)
+        self.assertEqual(self.state()["notes_puts"], 1)
+        before = self.state()
+        self.fresh_checkout()
+        self.reconcile()
+        self.assertEqual(self.state(), before, "No push, PUT, create or PATCH on unchanged overflow rerun")
 
     def test_normal_body_stays_on_patch_path(self):
         self.assertLess(len(BODY), 65536)

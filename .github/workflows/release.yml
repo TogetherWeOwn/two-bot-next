@@ -116,9 +116,21 @@ jobs:
             # the same overflow representation native uses: full notes in
             # release-notes.md on the derived notes branch, visible body as the
             # single-line link (which the next run resolves like a native
-            # overflow). The file may not exist yet, so the sha lookup tolerates
-            # a missing file and the payload carries a sha only on update.
+            # overflow).
             if [ "$(node -e "process.stdout.write(require('./scripts/migrate-release-notes.cjs').selectBodyWrite(require('node:fs').readFileSync(process.argv[1], 'utf8')))" "$BODY_FILE")" = "overflow" ]; then
+              # Migration-created overflow: native emitted a normal body, so the
+              # derived notes branch does not exist yet and the Contents API
+              # cannot create a file on a missing ref. Mirror native forkBranch
+              # (createFileOnNewBranch): create the notes branch from the
+              # default branch, reusing it when a retried run already created
+              # it. Either step failing fails the run here, before any PUT or
+              # check dispatch.
+              BASE_SHA=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+              if ! gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/heads/$NOTES_BRANCH" -f sha="$BASE_SHA" --silent 2>/dev/null; then
+                gh api "repos/$GH_REPO/git/ref/heads/$NOTES_BRANCH" --jq .object.sha > /dev/null
+              fi
+              # The file may not exist yet, so the sha lookup tolerates
+              # a missing file and the payload carries a sha only on update.
               NOTES_SHA=$(gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" --jq .sha 2>/dev/null || true)
               NOTES_BRANCH="$NOTES_BRANCH" NOTES_SHA="$NOTES_SHA" python3 -c 'import base64, json, os, pathlib, sys; payload = {"message": "chore(release): preserve bootstrap release notes", "content": base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode(), "branch": os.environ["NOTES_BRANCH"]}; sha = os.environ["NOTES_SHA"]; print(json.dumps({**payload, **({"sha": sha} if sha else {})}))' "$BODY_FILE" > "$NOTES_FILE.json"
               gh api --method PUT "repos/$GH_REPO/contents/release-notes.md" --input "$NOTES_FILE.json" --silent

@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -65,6 +66,8 @@ class PRLintTests(unittest.TestCase):
             "GITHUB_SHA": PR["headRefOid"], "GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next",
             "GITHUB_REF": f"refs/heads/{PR['headRefName']}",
             "EVENT_TITLE": TITLE, "EVENT_BODY": BODY, "EVENT_AUTHOR": "contributor",
+            "EVENT_HEAD_REF": PR["headRefName"], "EVENT_HEAD_REPO": "TogetherWeOwn/two-bot-next",
+            "EVENT_BASE_REF": "main",
             **overrides,
         }
         def fake_check_output(args, **kwargs):
@@ -78,6 +81,7 @@ class PRLintTests(unittest.TestCase):
             output = Path(tmp) / "output"
             output.touch()
             env["GITHUB_OUTPUT"] = str(output)
+            env["RUNNER_TEMP"] = tmp
             with patch.dict(os.environ, env, clear=True), patch("subprocess.check_output", side_effect=fake_check_output) as gh:
                 exec(RESOLVE, {})
             if env["EVENT_NAME"] == "workflow_dispatch":
@@ -85,19 +89,66 @@ class PRLintTests(unittest.TestCase):
                 self.assertEqual(first[:6], ["gh", "pr", "view", env["PR_NUMBER"], "--repo", env["GITHUB_REPOSITORY"]])
                 self.assertEqual(gh.call_count, 2 if stored_notes is not None else 1)
             else:
-                gh.assert_not_called()
-            return outputs(output.read_text())
+                body_in = env.get("EVENT_BODY", BODY)
+                expect_fetch = len(body_in.strip().splitlines()) == 1 and body_in.strip().startswith(OVERFLOW_SENTENCE)
+                self.assertEqual(gh.call_count, 1 if expect_fetch else 0)
+            metadata = outputs(output.read_text())
+            # The body travels through a file, never outputs: read it back for
+            # assertions, and prove no emitted value carries the full text.
+            body_path = metadata["body_file"]
+            self.assertTrue(Path(body_path).is_file())
+            metadata["body"] = Path(body_path).read_text(encoding="utf-8")
+            for key, value in metadata.items():
+                if key != "body":
+                    self.assertLess(len(value), 4096, f"Step output {key} must stay small")
+            self.assertLess(output.stat().st_size, 4096, "Step outputs must stay small even for oversized notes")
+            return metadata
 
     def validate(self, metadata, success=True):
-        env = {key.upper(): value for key, value in metadata.items()}
-        env["REQUIRE_CARD_REF"] = "true"
-        with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()):
-            if success:
-                exec(CHECK, {})
-            else:
-                with self.assertRaises(SystemExit) as result:
+        metadata = dict(metadata)
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            if "body" in metadata:
+                # CHECK reads the body from a file, never env: stage overrides
+                # through a file so the validation path stays identical to CI.
+                path = Path(tmp) / "body.md"
+                path.write_text(metadata.pop("body"), encoding="utf-8")
+                metadata["body_file"] = str(path)
+            env = {key.upper(): value for key, value in metadata.items()}
+            env["REQUIRE_CARD_REF"] = "true"
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+                if success:
                     exec(CHECK, {})
-                self.assertEqual(result.exception.code, 1)
+                else:
+                    with self.assertRaises(SystemExit) as result:
+                        exec(CHECK, {})
+                    self.assertEqual(result.exception.code, 1)
+
+    def validate_subprocess(self, metadata, success=True):
+        # The reviewer's E2BIG regression: run the real validation step as a
+        # child process with the file-based env, proving a valid 182,061-char
+        # body starts the process and validates instead of failing execve.
+        metadata = dict(metadata)
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            body_text = metadata.pop("body", "")
+            path = Path(tmp) / "body.md"
+            path.write_text(body_text, encoding="utf-8")
+            metadata["body_file"] = str(path)
+            env = {key.upper(): str(value) for key, value in metadata.items()}
+            env["REQUIRE_CARD_REF"] = "true"
+            for key, value in env.items():
+                if key != "BODY_FILE":
+                    self.assertLess(len(value), 4096, f"Child env {key} must stay small")
+            script = Path(tmp) / "check_step.py"
+            script.write_text(CHECK, encoding="utf-8")
+            child_env = {k: v for k, v in os.environ.items() if k not in
+                         ("TITLE", "BODY", "BODY_FILE", "EVENT", "AUTHOR", "COMMITS", "REQUIRE_CARD_REF")}
+            child_env.update(env)
+            result = subprocess.run(["python3", str(script)], env=child_env, capture_output=True, text=True)
+            if success:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("PR conventions OK", result.stdout)
+            else:
+                self.assertEqual(result.returncode, 1)
 
     def test_dispatch_preserves_delimiter_and_output_like_body(self):
         metadata = self.resolve()
@@ -145,6 +196,46 @@ class PRLintTests(unittest.TestCase):
         bad = {**PR, "body": f"{OVERFLOW_SENTENCE} https://github.com/TogetherWeOwn/two-bot-next/blob/other--release-notes/release-notes.md"}
         with self.assertRaises(SystemExit):
             self.resolve(bad, stored_notes=STORED_NOTES)
+
+    def test_oversized_notes_validate_in_subprocess(self):
+        # The reviewer's E2BIG P2: a valid 182,061-char body must validate in
+        # a real child process, proving the file-based transport survives
+        # execve where a BODY env var would keep Python from starting.
+        filler = "x" * (182061 - len(STORED_NOTES))
+        big_notes = STORED_NOTES + filler
+        self.assertEqual(len(big_notes), 182061)
+        # Prove the finding, not just the fix: the old BODY-env transport
+        # cannot even start a process at this size on this kernel.
+        with self.assertRaises(OSError):
+            subprocess.run(["python3", "-c", "pass"],
+                           env={"PATH": "/usr/bin:/bin", "BODY": big_notes},
+                           capture_output=True)
+        metadata = self.resolve({**PR, "body": OVERFLOW_LINK}, stored_notes=big_notes)
+        self.assertEqual(metadata["body"], big_notes)
+        self.validate_subprocess(metadata)
+
+    def test_pr_event_overflow_resolves_stored_notes(self):
+        # The reviewer's pull_request-event P2: an edited/reopened release PR
+        # carries the same overflow link; lint must resolve it (not fail the
+        # card-reference gate on the link) through the same branch gates.
+        metadata = self.resolve(EVENT_NAME="pull_request", EVENT_BODY=OVERFLOW_LINK,
+                                EVENT_AUTHOR="github-actions[bot]", stored_notes=STORED_NOTES)
+        self.assertEqual(metadata["body"], STORED_NOTES)
+        self.assertEqual(metadata["event"], "pull_request")
+        self.validate(metadata)
+
+    def test_pr_event_overflow_wrong_branch_or_fork_fails(self):
+        bad_branch = f"{OVERFLOW_SENTENCE} https://github.com/TogetherWeOwn/two-bot-next/blob/other--release-notes/release-notes.md"
+        with self.assertRaises(SystemExit):
+            self.resolve(EVENT_NAME="pull_request", EVENT_BODY=bad_branch, stored_notes=STORED_NOTES)
+        with self.assertRaises(SystemExit):
+            self.resolve(EVENT_NAME="pull_request", EVENT_BODY=OVERFLOW_LINK,
+                         EVENT_HEAD_REPO="someone-else/two-bot-next", stored_notes=STORED_NOTES)
+
+    def test_pr_event_normal_body_needs_no_fetch(self):
+        metadata = self.resolve(EVENT_NAME="pull_request")
+        self.assertEqual(metadata["body"], BODY)
+        self.validate(metadata)
 
     def test_dispatch_overflow_non_link_body_ignores_stored_notes(self):
         metadata = self.resolve()

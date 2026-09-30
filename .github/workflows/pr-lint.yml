@@ -53,6 +53,9 @@ jobs:
           EVENT_TITLE: ${{ github.event.pull_request.title }}
           EVENT_BODY: ${{ github.event.pull_request.body }}
           EVENT_AUTHOR: ${{ github.event.pull_request.user.login }}
+          EVENT_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EVENT_NAME: ${{ github.event_name }}
         shell: python3 {0}
@@ -60,11 +63,49 @@ jobs:
           import json, os, subprocess, uuid
 
           event = os.environ["EVENT_NAME"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          overflow_prefix = ("This release is too large to preview in the pull "
+                             "request body. View the full release notes here: ")
+
+          def resolve_overflow(body, head_ref, head_repo_name, base_ref):
+              # Native overflow PRs carry only a single-line link in the
+              # visible body; the full notes (including the card footer) live
+              # in release-notes.md on the derived notes branch. Resolve that
+              # file before the card-reference gate, without weakening it: the
+              # link must be the exact native sentence and its branch must be
+              # exactly this PR's own notes branch in this same repository,
+              # targeting main. A non-link body passes through untouched, so
+              # ordinary (including fork) PRs never reach the gates below.
+              lines = (body or "").strip().splitlines()
+              if len(lines) != 1 or not lines[0].startswith(overflow_prefix):
+                  return body
+              from urllib.parse import urlparse
+              parts, overflow_branch = None, ""
+              try:
+                  parts = urlparse(lines[0][len(overflow_prefix):].strip())
+                  chunks = parts.path.split("/blob/", 1)
+                  overflow_branch = (chunks[1].rsplit("/release-notes.md", 1)[0]
+                                     if len(chunks) == 2 and chunks[1].endswith("/release-notes.md")
+                                     else "")
+              except Exception:
+                  parts, overflow_branch = None, ""
+              if (base_ref != "main"
+                      or (head_repo_name or "").lower() != repo.lower()
+                      or not head_ref
+                      or parts is None or not parts.netloc
+                      or overflow_branch != f"{head_ref}--release-notes"):
+                  raise SystemExit("Overflow link must resolve to this PR's notes branch")
+              encoded = subprocess.check_output([
+                  "gh", "api", f"repos/{repo}/contents/release-notes.md?ref={overflow_branch}",
+                  "--jq", ".content",
+              ], text=True)
+              import base64
+              return base64.b64decode("".join(encoded.split())).decode("utf-8")
+
           if event == "workflow_dispatch":
               number = os.environ["PR_NUMBER"]
               if not number.isascii() or not number.isdecimal() or int(number) < 1:
                   raise SystemExit("Expected a positive PR number")
-              repo = os.environ["GITHUB_REPOSITORY"]
               pr = json.loads(subprocess.check_output([
                   "gh", "pr", "view", number, "--repo", repo, "--json",
                   "title,body,author,state,headRefOid,headRefName,baseRefName,headRepository,headRepositoryOwner",
@@ -80,53 +121,42 @@ jobs:
                       or head_name.lower() != repo.lower()):
                   raise SystemExit("Dispatch ref/SHA must match an open same-repository PR targeting main")
               title, body, author = pr["title"], pr["body"], pr["author"]["login"]
-              # Native overflow PRs carry only a single-line link in the
-              # visible body; the full notes (including the card footer) live
-              # in release-notes.md on the derived notes branch. Resolve that
-              # file before the card-reference gate, without weakening it: the
-              # link must be the exact native sentence and its branch must be
-              # exactly this release's notes branch from the already-validated
-              # same-repo head. Anything else fails closed.
-              overflow_prefix = ("This release is too large to preview in the pull "
-                                 "request body. View the full release notes here: ")
-              lines = (body or "").strip().splitlines()
-              if len(lines) == 1 and lines[0].startswith(overflow_prefix):
-                  from urllib.parse import urlparse
-                  parts, overflow_branch = None, ""
-                  try:
-                      parts = urlparse(lines[0][len(overflow_prefix):].strip())
-                      chunks = parts.path.split("/blob/", 1)
-                      overflow_branch = (chunks[1].rsplit("/release-notes.md", 1)[0]
-                                         if len(chunks) == 2 and chunks[1].endswith("/release-notes.md")
-                                         else "")
-                  except Exception:
-                      parts, overflow_branch = None, ""
-                  if parts is None or not parts.netloc or overflow_branch != f"{pr['headRefName']}--release-notes":
-                      raise SystemExit("Overflow link must resolve to this release's notes branch")
-                  encoded = subprocess.check_output([
-                      "gh", "api", f"repos/{repo}/contents/release-notes.md?ref={overflow_branch}",
-                      "--jq", ".content",
-                  ], text=True)
-                  import base64
-                  body = base64.b64decode("".join(encoded.split())).decode("utf-8")
+              body = resolve_overflow(body, pr["headRefName"], head_name, pr["baseRefName"])
               event = "pull_request"
           else:
               title = os.environ.get("EVENT_TITLE", "")
               body = os.environ.get("EVENT_BODY", "")
               author = os.environ.get("EVENT_AUTHOR", "")
+              # Ordinary edited/reopened PRs can carry the same native overflow
+              # link; resolve it through the same gates so card-reference lint
+              # sees the full notes instead of failing on the link.
+              body = resolve_overflow(body, os.environ.get("EVENT_HEAD_REF", ""),
+                                      os.environ.get("EVENT_HEAD_REPO", ""),
+                                      os.environ.get("EVENT_BASE_REF", ""))
+
+          # The resolved body travels through a file, never env or step
+          # outputs: stored release notes can exceed the per-string execve
+          # limit, which would keep the next step's process from starting
+          # (E2BIG) before any lint runs. Only the short path crosses outputs.
+          import tempfile
+          body_path = os.path.join(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()), "pr-body.md")
+          with open(body_path, "w", encoding="utf-8") as handle:
+              handle.write(body or "")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              for key, value in {"title": title, "body": body, "author": author, "event": event}.items():
+              for key, value in {"title": title, "author": author, "event": event}.items():
                   delimiter = uuid.uuid4().hex
-                  while delimiter in value.splitlines():
+                  while delimiter in (value or "").splitlines():
                       delimiter = uuid.uuid4().hex
                   output.write(f"{key}<<{delimiter}\n{value}\n{delimiter}\n")
+              delimiter = uuid.uuid4().hex
+              output.write(f"body_file<<{delimiter}\n{body_path}\n{delimiter}\n")
 
       - name: Check title, body and commits
         env:
           EVENT: ${{ steps.pr.outputs.event }}
           TITLE: ${{ steps.pr.outputs.title }}
-          BODY: ${{ steps.pr.outputs.body }}
+          BODY_FILE: ${{ steps.pr.outputs.body_file }}
           AUTHOR: ${{ steps.pr.outputs.author }}
           COMMITS: ${{ toJSON(github.event.commits) }}
         shell: python3 {0}
@@ -138,6 +168,14 @@ jobs:
           HELP = ("Expected a Conventional Commits header, e.g. 'fix(auth): refuse expired sudo "
                   "sessions' or 'feat(events): shareable event page'. Allowed types: "
                   + TYPES.replace("|", ", ") + ". Put the card ID in the body as 'Refs: TOG-1234'.")
+
+          def read_body():
+              # The body arrives as a file path, never env: stored release
+              # notes can exceed the per-string execve limit (E2BIG) that
+              # would otherwise keep this process from starting at all.
+              path = os.environ.get("BODY_FILE", "")
+              with open(path, encoding="utf-8") as handle:
+                  return handle.read()
 
           def header_errors(text):
               errs = []
@@ -152,7 +190,7 @@ jobs:
           failed = False
           if os.environ["EVENT"] == "pull_request":
               title = os.environ.get("TITLE", "").strip()
-              body = os.environ.get("BODY", "") or ""
+              body = read_body() or ""
               author = os.environ.get("AUTHOR", "")
               if author.endswith("[bot]") and author.startswith(("dependabot", "renovate")):
                   if header_errors(title):
