@@ -77,10 +77,9 @@ pub(crate) fn route(request: &Request) -> &'static str {
         (Put, [Some("applications"), Some(_), Some("commands"), None, None, None]) => {
             "PUT /applications/:application/commands"
         }
-        (
-            Put,
-            [Some("applications"), Some(_), Some("guilds"), Some(_), Some("commands"), None],
-        ) => "PUT /applications/:application/guilds/:guild/commands",
+        (Put, [Some("applications"), Some(_), Some("guilds"), Some(_), Some("commands"), None]) => {
+            "PUT /applications/:application/guilds/:guild/commands"
+        }
         (Post, [Some("interactions"), Some(_), Some(_), Some("callback"), None, None]) => {
             "POST /interactions/:interaction/:token/callback"
         }
@@ -126,8 +125,8 @@ mod tests {
     use super::*;
     use twilight_http::request::RequestBuilder;
     use twilight_model::id::{
-        Id,
         marker::{ApplicationMarker, GuildMarker},
+        Id,
     };
 
     #[tokio::test]
