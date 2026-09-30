@@ -1189,6 +1189,20 @@ impl ActionExecutor {
         }
     }
 
+    /// Resolve the bot application for registry sync even when a saved gateway
+    /// session resumes without READY. One read through the shared transport.
+    pub async fn current_application_id(&self) -> Result<u64, DiscordError> {
+        let request = Self::request_of(self.inner.factory.current_user_application())?;
+        let response = self.call_once_raw(request, &[200]).await?;
+        let body: serde_json::Value = serde_json::from_slice(&response.body)
+            .map_err(|_| DiscordError::Rejected("invalid application response".to_owned()))?;
+        body["id"]
+            .as_str()
+            .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .ok_or_else(|| DiscordError::Rejected("missing application id".to_owned()))
+    }
+
     /// Publish the router's full guild command set in one send
     /// (`PUT /applications/{app}/guilds/{guild}/commands`).
     pub async fn publish_guild_commands(

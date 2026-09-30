@@ -28,6 +28,7 @@ use crate::gateway::{
 
 mod deadline;
 mod recovery;
+mod rsvp;
 
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";

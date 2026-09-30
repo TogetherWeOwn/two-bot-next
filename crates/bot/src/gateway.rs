@@ -165,17 +165,59 @@ struct BufferedPacket {
     message: Result<Message, twilight_gateway::error::ReceiveMessageError>,
     session: Option<Session>,
     resume_url: Option<String>,
+    acknowledgement: Option<
+        tokio::task::JoinHandle<
+            Result<two_bot_discord::rsvp::PreparedRsvp, two_bot_discord::DiscordError>,
+        >,
+    >,
 }
 
 impl BufferedPacket {
     fn capture(
         shard: &Shard,
         message: Result<Message, twilight_gateway::error::ReceiveMessageError>,
+        runtime: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
+        committed: Option<&GatewaySession>,
     ) -> Self {
-        Self {
+        let mut packet = Self {
             message,
             session: session_snapshot(shard),
             resume_url: shard.resume_url().map(str::to_owned),
+            acknowledgement: None,
+        };
+        packet.prepare(runtime, committed);
+        packet
+    }
+
+    fn prepare(
+        &mut self,
+        runtime: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
+        committed: Option<&GatewaySession>,
+    ) {
+        let (Some(runtime), Ok(Message::Text(text)), Some(session)) =
+            (runtime, &self.message, &self.session)
+        else {
+            return;
+        };
+        let Ok(header) = serde_json::from_str::<Header>(text) else {
+            return;
+        };
+        let Some(sequence) = header.s.filter(|_| header.op == 0) else {
+            return;
+        };
+        if dispatch_action(committed, session.id(), sequence) == DispatchAction::Duplicate {
+            return;
+        }
+        if let Ok(Some(parsed)) =
+            twilight_gateway::parse(text.clone(), EventTypeFlags::INTERACTION_CREATE)
+        {
+            if let Event::InteractionCreate(interaction) = Event::from(parsed) {
+                let runtime = Arc::clone(runtime);
+                self.acknowledgement =
+                    Some(tokio::spawn(
+                        async move { runtime.prepare(interaction.0).await },
+                    ));
+            }
         }
     }
 }
@@ -212,16 +254,22 @@ where
     let timeout = tokio::time::sleep(FEATURE_IO_MAX);
     tokio::pin!(timeout);
     let mut paused = pending.iter().any(&is_boundary);
+    let mut slow = false;
     loop {
         tokio::select! {
             biased;
-            result = &mut operation => return result.map_err(|_| sqlx::Error::InvalidArgument("interaction registry publish failed".into())),
-            _ = &mut timeout => return Err(sqlx::Error::InvalidArgument("gateway feature I/O deadline exceeded".into())),
-            item = stream.next(), if !paused => {
-                let item = item.ok_or_else(|| sqlx::Error::InvalidArgument("gateway ended during feature I/O".into()))?;
-                if pending.len() >= MAX_PENDING_PACKETS {
-                    return Err(sqlx::Error::InvalidArgument("gateway feature backlog exceeded".into()));
-                }
+            result = &mut operation => return result.map_err(|_| sqlx::Error::InvalidArgument("interaction execution failed".into())),
+            _ = &mut timeout, if !slow => {
+                // Cancellation after defer loses accepted work: a replay cannot
+                // acknowledge it again. Drain to a final reply and checkpoint.
+                slow = true;
+                warn!("gateway feature I/O slow; draining accepted command");
+            }
+            item = stream.next(), if !paused && pending.len() < MAX_PENDING_PACKETS => {
+                let Some(item) = item else {
+                    paused = true;
+                    continue;
+                };
                 let packet = capture(stream, item);
                 paused = is_boundary(&packet);
                 pending.push_back(packet);
@@ -240,14 +288,7 @@ pub async fn run_shard(
     store: GatewaySessionStore,
     interactions: Option<Arc<two_bot_discord::interactions::InteractionRuntime>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(
-        &mut shard,
-        &pipeline,
-        &state,
-        &store,
-        interactions.as_deref(),
-    )
-    .await;
+    let result = run_loop(&mut shard, &pipeline, &state, &store, interactions.as_ref()).await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -257,8 +298,13 @@ async fn run_loop(
     pipeline: &GatewayPipeline,
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
-    interactions: Option<&two_bot_discord::interactions::InteractionRuntime>,
+    interactions: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
 ) -> Result<(), sqlx::Error> {
+    if let Some(runtime) = interactions {
+        runtime.publish_current().await.map_err(|_| {
+            sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
+        })?;
+    }
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
     let mut pending = std::collections::VecDeque::new();
@@ -267,7 +313,9 @@ async fn run_loop(
         let packet = match pending.pop_front() {
             Some(packet) => packet,
             None => match shard.next().await {
-                Some(item) => BufferedPacket::capture(shard, item),
+                Some(item) => {
+                    BufferedPacket::capture(shard, item, interactions, committed.as_ref())
+                }
                 None => break,
             },
         };
@@ -379,28 +427,33 @@ async fn run_loop(
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
             if let Some(runtime) = interactions {
-                let operation = async {
-                    match &event {
-                        Event::Ready(ready) => runtime.publish(ready.application.id.get()).await,
-                        Event::InteractionCreate(interaction) => {
-                            if runtime.handle(&interaction.0).await.is_err() {
-                                // Never repeat committed effects after an uncertain reply,
-                                // or log Discord errors that may include interaction tokens.
-                                warn!("interaction response failed; not replaying command");
-                            }
-                            Ok(())
+                if let Some(acknowledgement) = packet.acknowledgement {
+                    let operation = async {
+                        let result = match acknowledgement.await {
+                            Ok(Ok(prepared)) => runtime.complete(prepared).await,
+                            Ok(Err(error)) => Err(error),
+                            Err(_) => Err(two_bot_discord::DiscordError::Rejected(
+                                "interaction acknowledgement task failed".into(),
+                            )),
+                        };
+                        if result.is_err() {
+                            // Do not retry committed effects after an uncertain
+                            // reply, or log errors containing interaction tokens.
+                            warn!("interaction response failed; not replaying command");
                         }
-                        _ => Ok(()),
-                    }
-                };
-                poll_while(
-                    shard,
-                    &mut pending,
-                    BufferedPacket::capture,
-                    BufferedPacket::is_boundary,
-                    operation,
-                )
-                .await?;
+                        Ok(())
+                    };
+                    poll_while(
+                        shard,
+                        &mut pending,
+                        |shard, item| {
+                            BufferedPacket::capture(shard, item, interactions, committed.as_ref())
+                        },
+                        BufferedPacket::is_boundary,
+                        operation,
+                    )
+                    .await?;
+                }
             }
         }
         checkpoint_io(
@@ -521,19 +574,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn feature_backlog_is_bounded_and_fails_closed() {
+    async fn feature_backlog_is_bounded_without_cancelling_accepted_work() {
         let mut stream = futures_util::stream::iter(0..MAX_PENDING_PACKETS + 1);
         let mut pending = std::collections::VecDeque::new();
-        let result = poll_while(
+        let completed = std::cell::Cell::new(false);
+        poll_while(
             &mut stream,
             &mut pending,
             |_, packet| packet,
             |_| false,
-            std::future::pending(),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                completed.set(true);
+                Ok(())
+            },
         )
-        .await;
-        assert!(result.is_err());
+        .await
+        .unwrap();
+        assert!(completed.get());
         assert_eq!(pending.len(), MAX_PENDING_PACKETS);
+        assert_eq!(stream.next().await, Some(MAX_PENDING_PACKETS));
+    }
+
+    #[tokio::test]
+    async fn feature_deadline_and_stream_end_do_not_cancel_accepted_work() {
+        let mut stream = futures_util::stream::empty::<usize>();
+        let mut pending = std::collections::VecDeque::new();
+        let completed = std::cell::Cell::new(false);
+        poll_while(
+            &mut stream,
+            &mut pending,
+            |_, packet| packet,
+            |_| false,
+            async {
+                tokio::time::sleep(FEATURE_IO_MAX + std::time::Duration::from_millis(10)).await;
+                completed.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(completed.get());
     }
 
     #[test]
@@ -543,6 +624,7 @@ mod tests {
                 message: Ok(Message::Text(text.into())),
                 session: None,
                 resume_url: None,
+                acknowledgement: None,
             }
             .is_boundary());
         }
@@ -550,12 +632,14 @@ mod tests {
             message: Ok(Message::Close(None)),
             session: None,
             resume_url: None,
+            acknowledgement: None,
         }
         .is_boundary());
         assert!(!BufferedPacket {
             message: Ok(Message::Text(r#"{"op":0,"s":2,"t":"RESUMED"}"#.into())),
             session: None,
             resume_url: None,
+            acknowledgement: None,
         }
         .is_boundary());
     }

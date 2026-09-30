@@ -21,38 +21,48 @@ use crate::{
     interactions::{response_for_slash, route_interaction, RoutedInteraction},
 };
 
-/// Returns false for interactions owned by another feature. All gates come
-/// from the shared router; no database or Discord read precedes authorization.
-/// Accepted commands defer before paced reads so retries cannot exhaust the
-/// Discord three-second acknowledgement window.
-pub async fn handle_rsvp_interaction(
+/// Acknowledgement is separate from ordered effects: the gateway prepares
+/// queued commands immediately, then completes them in dispatch order. The
+/// private deferred fields can only be constructed after a successful callback.
+#[derive(Debug)]
+pub struct PreparedRsvp {
+    handled: bool,
+    deferred: Option<(HandlerId, Interaction)>,
+}
+
+pub async fn prepare_rsvp_interaction(
     router: &InteractionRouter,
-    pool: &Pool<Postgres>,
     executor: &ActionExecutor,
-    classifier: &ClassifierConfig,
-    interaction: &Interaction,
-) -> Result<bool, DiscordError> {
-    let RoutedInteraction::Slash { name, outcome } = route_interaction(router, interaction, None)
+    interaction: Interaction,
+) -> Result<PreparedRsvp, DiscordError> {
+    let ignored = || PreparedRsvp {
+        handled: false,
+        deferred: None,
+    };
+    let RoutedInteraction::Slash { name, outcome } = route_interaction(router, &interaction, None)
     else {
-        return Ok(false);
+        return Ok(ignored());
     };
     if !matches!(name.as_str(), "rsvp" | "rsvp-attendance" | "attendance") {
-        return Ok(false);
+        return Ok(ignored());
     }
     if let Some(response) = response_for_slash(&outcome) {
         executor
             .answer_interaction(interaction.id.get(), &interaction.token, &response)
             .await?;
-        return Ok(true);
+        return Ok(PreparedRsvp {
+            handled: true,
+            deferred: None,
+        });
     }
     let SlashOutcome::Handled { handler } = outcome else {
-        return Ok(false);
+        return Ok(ignored());
     };
     if !matches!(
         handler,
         HandlerId::Rsvp | HandlerId::RsvpAttendance | HandlerId::ScorecardAttendance
     ) {
-        return Ok(false);
+        return Ok(ignored());
     }
     executor
         .answer_interaction(
@@ -67,7 +77,22 @@ pub async fn handle_rsvp_interaction(
             },
         )
         .await?;
-    let content = execute(handler, pool, executor, classifier, interaction)
+    Ok(PreparedRsvp {
+        handled: true,
+        deferred: Some((handler, interaction)),
+    })
+}
+
+pub async fn complete_rsvp_interaction(
+    prepared: PreparedRsvp,
+    pool: &Pool<Postgres>,
+    executor: &ActionExecutor,
+    classifier: &ClassifierConfig,
+) -> Result<bool, DiscordError> {
+    let Some((handler, interaction)) = prepared.deferred else {
+        return Ok(prepared.handled);
+    };
+    let content = execute(handler, pool, executor, classifier, &interaction)
         .await
         .unwrap_or_else(|message| message);
     executor
@@ -78,6 +103,19 @@ pub async fn handle_rsvp_interaction(
         )
         .await?;
     Ok(true)
+}
+
+/// Returns false for another feature; authorization and acknowledgement must
+/// succeed before any store or paced Discord read.
+pub async fn handle_rsvp_interaction(
+    router: &InteractionRouter,
+    pool: &Pool<Postgres>,
+    executor: &ActionExecutor,
+    classifier: &ClassifierConfig,
+    interaction: &Interaction,
+) -> Result<bool, DiscordError> {
+    let prepared = prepare_rsvp_interaction(router, executor, interaction.clone()).await?;
+    complete_rsvp_interaction(prepared, pool, executor, classifier).await
 }
 
 async fn execute(

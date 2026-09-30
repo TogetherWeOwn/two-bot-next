@@ -147,6 +147,33 @@ impl InteractionRuntime {
         .await
     }
 
+    pub async fn prepare(
+        &self,
+        interaction: Interaction,
+    ) -> Result<crate::rsvp::PreparedRsvp, crate::DiscordError> {
+        crate::rsvp::prepare_rsvp_interaction(&self.router, &self.executor, interaction).await
+    }
+
+    pub async fn complete(
+        &self,
+        prepared: crate::rsvp::PreparedRsvp,
+    ) -> Result<bool, crate::DiscordError> {
+        crate::rsvp::complete_rsvp_interaction(
+            prepared,
+            &self.pool,
+            &self.executor,
+            &self.classifier,
+        )
+        .await
+    }
+
+    /// Boot sync also covers persisted-session RESUMED, which has no application
+    /// payload. Resolve the identity with the shared executor before connecting.
+    pub async fn publish_current(&self) -> Result<(), crate::DiscordError> {
+        self.publish(self.executor.current_application_id().await?)
+            .await
+    }
+
     /// One full registry sync, never an RSVP-only partial replacement.
     pub async fn publish(&self, application_id: u64) -> Result<(), crate::DiscordError> {
         let guild_id =

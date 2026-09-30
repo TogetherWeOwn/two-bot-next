@@ -4,7 +4,7 @@
 
 ### Added
 
-- Wire RSVP, namespaced RSVP totals and ManageEvents-gated host attendance through the shared interaction router, sqlx stores and REST executor, with ephemeral deferred replies and test-container/mock-Discord acceptance. Publish the shared command registry on READY and keep polling gateway heartbeats during feature I/O without checkpointing ahead of command effects.
+- Wire RSVP, namespaced RSVP totals and ManageEvents-gated host attendance through the shared interaction router, sqlx stores and REST executor, with ephemeral deferred replies and test-container/mock-Discord acceptance. Publish the full shared command registry before gateway startup, including persisted-session RESUMED boots. Defer queued commands at receipt, keep effects/checkpoints in dispatch order, and drain accepted work rather than cancel it at the feature deadline or backlog limit.
 
 ### Notes
 
