@@ -5,6 +5,7 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod automod;
 pub mod commands;
 pub mod config;
 pub mod events;
@@ -18,6 +19,12 @@ pub mod leveling;
 pub mod moderation;
 pub mod voice;
 
+pub use automod::{
+    match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
+    AutomodExportError, AutomodExportRule, AutomodFilter, AutomodGateError, AutomodMessage,
+    AutomodPolicy, AutomodSanction, RepeatTracker, SanctionAction, DEFAULT_BLOCKED_ATTACHMENTS,
+    DEFAULT_SANCTIONS,
+};
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
 pub use events::{CoreEvent, VoiceSessionDelta};
