@@ -2850,9 +2850,11 @@ mod tests {
 
     #[test]
     fn bind_guard_checks_mapped_ipv6_and_private_range_edges() {
+        // Expanded mapped forms exercise the IPv6 parser's mapped-v4 path,
+        // rather than the normalizer's dotted-v4 prefix stripping.
         for host in [
-            "::ffff:ac10:1",
-            "[::ffff:c0a8:1]",
+            "0:0:0:0:0:ffff:ac10:1",
+            "[0:0:0:0:0:ffff:c0a8:1]",
             "172.16.0.1",
             "172.31.255.254",
             "100.64.0.1",
@@ -2864,6 +2866,8 @@ mod tests {
         for host in [
             "::ffff:808:808",
             "[::ffff:0:0]",
+            "0:0:0:0:0:ffff:808:808",
+            "[0:0:0:0:0:ffff:0:0]",
             "172.15.255.254",
             "172.32.0.1",
             "100.63.255.254",
