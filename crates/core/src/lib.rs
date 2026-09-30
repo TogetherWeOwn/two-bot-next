@@ -21,6 +21,7 @@ pub mod moderation;
 pub mod onboarding;
 #[cfg(feature = "db")]
 pub mod onboarding_store;
+pub mod raid;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
@@ -92,6 +93,12 @@ pub use onboarding::{
 pub use onboarding_store::{
     begin_prompt, has_onboarding_prompt, record_channel_routed, record_game_selected,
     record_prompted, record_session_routed, OnboardingStoreError, PromptGuard,
+};
+pub use raid::{
+    count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,
+    RaidAlert, RaidConfigError, RaidTuning, RaidWatch, RecordedJoinRisk, StaffAlertMessage,
+    DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS, DEFAULT_RAID_COOLDOWN_SECONDS,
+    DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
 };
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
