@@ -11,3 +11,10 @@ condition = "AND"
 regexTarget = "secret"
 paths = ['''^crates/core/src/internal_actions\.rs$''', '''^crates/core/tests/fixtures/internal-action-signing\.json$''']
 regexes = ['''^123456789012345678$''']
+
+# docs/lfg-port.md documents this public boolean test-container switch.
+# Match only the literal identifier/value, never a path, commit, or rule.
+[[allowlists]]
+description = "Public LFG CI boolean switch, not an API credential"
+regexTarget = "secret"
+regexes = ['^TWO_LFG_TESTDB_CI=1$']

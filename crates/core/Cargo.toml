@@ -31,4 +31,5 @@ default = []
 db = ["dep:sqlx"]
 
 [dev-dependencies]
+rand = { workspace = true }
 tokio = { workspace = true }
