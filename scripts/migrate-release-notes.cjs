@@ -93,7 +93,11 @@ function migrateReleaseNotes(changelog, body) {
       if (manualNotes) assert.equal(preamble, '', 'Unsectioned bootstrap notes');
       for (let index = 0; index < chunks.length; index += 2) {
         const heading = chunks[index].trim();
-        if (manualNotes) assert(['Added', 'Fixed', 'Changed'].includes(heading), 'Unsupported bootstrap section');
+        // The live bootstrap changelog carries a hand-written `### Notes`
+        // tail after Fixed (live failure 2026-09-30: first release run died
+        // on `Unsupported bootstrap section`). Notes is legitimate preserved
+        // content, not a generated section; anything else still fails closed.
+        if (manualNotes) assert(['Added', 'Fixed', 'Changed', 'Notes'].includes(heading), 'Unsupported bootstrap section');
         const notes = chunks[index + 1].trim();
         sections.set(heading, [sections.get(heading), notes].filter(Boolean).join('\n\n'));
       }
