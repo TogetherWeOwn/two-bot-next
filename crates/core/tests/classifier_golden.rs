@@ -16,7 +16,8 @@ use two_bot_core::rsvp::{
 };
 
 fn fixture() -> Value {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/classifier_legacy.json")).unwrap();
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/classifier_legacy.json")).unwrap();
     assert_eq!(fixture["version"], 1);
     assert_eq!(
         fixture["source"]["revision"],
@@ -144,14 +145,24 @@ fn window_and_live_invite_attribution_match_legacy() {
     }
     assert_eq!(
         buckets,
-        HashSet::from(["ambiguous", "unknown", "vanity", "invite-exact", "invite-placed"])
+        HashSet::from([
+            "ambiguous",
+            "unknown",
+            "vanity",
+            "invite-exact",
+            "invite-placed"
+        ])
     );
 }
 
 #[test]
 fn attribution_quality_does_not_merge_ambiguous_and_unknown() {
     let f = fixture();
-    for case in f["categories"].as_array().unwrap() {
+    let categories = f["categories"].as_array().unwrap();
+    let splits = f["splits"].as_array().unwrap();
+    assert_eq!(categories.len(), 11, "retain the source taxonomy cases");
+    assert_eq!(splits.len(), 4, "retain whole-population quality cases");
+    for case in categories {
         let source = text(&case["source"]);
         let category = match attribution_category(source) {
             AttributionCategory::Ambiguous => "ambiguous",
@@ -160,7 +171,7 @@ fn attribution_quality_does_not_merge_ambiguous_and_unknown() {
         };
         assert_eq!(category, text(&case["expect"]), "source {source}");
     }
-    for case in f["splits"].as_array().unwrap() {
+    for case in splits {
         let rows: Vec<_> = case["input"]
             .as_array()
             .unwrap()
@@ -201,7 +212,10 @@ fn attendance_identity_classification_and_metadata_bytes_match_legacy() {
     let raw = checkin_metadata_json(occurrence, AttendanceProof::HostCheckin);
     assert_eq!(raw.as_bytes(), text(&expected["metadata"]).as_bytes());
     // Value equality alone would miss a sorted-key serialization regression.
-    assert_eq!(serde_json::from_str::<Value>(&raw).unwrap().to_string(), raw);
+    assert_eq!(
+        serde_json::from_str::<Value>(&raw).unwrap().to_string(),
+        raw
+    );
     for case in f["community"]
         .as_array()
         .unwrap()
@@ -213,7 +227,10 @@ fn attendance_identity_classification_and_metadata_bytes_match_legacy() {
             classification.classification,
             text(&case["expect"]["classification"])
         );
-        assert_eq!(classification.matched_rule, text(&case["expect"]["matchedRule"]));
+        assert_eq!(
+            classification.matched_rule,
+            text(&case["expect"]["matchedRule"])
+        );
     }
 }
 
@@ -230,6 +247,9 @@ fn persisted_voice_metadata_preserves_legacy_byte_order() {
             input["durationSeconds"].as_i64(),
         );
         // Parsed Value equality ignores object key order. Compare persisted bytes.
-        assert_eq!(actual.to_string().as_bytes(), text(&case["expect"]).as_bytes());
+        assert_eq!(
+            actual.to_string().as_bytes(),
+            text(&case["expect"]).as_bytes()
+        );
     }
 }
