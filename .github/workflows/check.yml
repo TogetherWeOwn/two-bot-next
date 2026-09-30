@@ -48,6 +48,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Verify Docker dependency layer
+        run: python3 scripts/test-docker-deps.py --cargo
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -87,6 +90,8 @@ jobs:
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
       - name: check env bindings are explicit
         run: python3 scripts/check-env-bindings.py wrangler.toml
+      - name: Verify PR lint event and dispatch paths
+        run: python3 ../scripts/test-pr-lint.py
       - name: Verify offline release lifecycle
         run: |
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0

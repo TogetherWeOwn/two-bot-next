@@ -86,7 +86,7 @@ async function simulate(message, file, tagged) {
   assert(content['CHANGELOG.md'].includes(version));
   assert(pr.body.toString().includes('Refs: TOG-9865'));
   if (message.startsWith('feat')) assert(content['CHANGELOG.md'].includes('### Added'));
-  if (message.startsWith('fix')) assert(content['CHANGELOG.md'].includes('### Fixed'));
+  if (/^(fix|security)/.test(message)) assert(content['CHANGELOG.md'].includes('### Fixed'));
   state.merged = [{
     number: 999, title: pr.title.toString(), body: pr.body.toString(),
     headBranchName: pr.headRefName, baseBranchName: 'main',
@@ -112,5 +112,6 @@ async function simulate(message, file, tagged) {
     for (const scope of scopes) await simulate('feat: scoped feature', scope, tagged);
     await simulate('feat!: breaking workspace change', 'crates/core/src/lib.rs', tagged);
     await simulate('fix: repair workspace behavior', 'crates/core/src/lib.rs', tagged);
+    await simulate('security: repair permission handling', 'crates/core/src/lib.rs', tagged);
   }
 })().catch(error => { console.error(error.stack); process.exitCode = 1; });

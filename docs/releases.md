@@ -49,9 +49,18 @@ NODE_PATH="$RELEASE_TEST_DEPS/node_modules" node scripts/test-release.cjs
 Set `RELEASE_TEST_DEPS` to a disposable dependency directory (in agent runs,
 use a directory under `PAPERCLIP_RUN_SCRATCH_DIR`). The fixture covers tagged
 and untagged seeds, features in the root/four crates/Worker, breaking changes,
-fixes, Common Changelog headings, the card footer, synchronized manifest and
-lock updates, and exactly one componentless release candidate. Cargo CI still
-validates compilation and the real release flow still validates GitHub writes.
+fixes (including security-only commits), Common Changelog headings, the card
+footer, synchronized manifest and lock updates, and exactly one componentless
+release candidate. `security` entries appear under Fixed and advance the patch.
+Cargo CI still validates compilation and the real release flow still validates
+GitHub writes.
+
+`python3 scripts/test-pr-lint.py` executes the workflow's actual inline scripts
+with mocked PR metadata, including delimiter collisions and stale/foreign PR
+rejection. `python3 scripts/test-docker-deps.py` recreates the manifest/stub
+layer from the actual Dockerfile and verifies all five package targets. Add
+`--cargo` to run that layer's `cargo fetch --locked` (as Rust CI does). These
+fixtures do not contact a database; full Docker builds remain a deployment gate.
 
 ## Required-check dispatch
 
@@ -59,7 +68,10 @@ validates compilation and the real release flow still validates GitHub writes.
 workflow dispatches `check.yml`, `secret-scan.yml`, and `pr-lint.yml` on the
 release PR branch. `GH_REPO` explicitly names the repository because that job
 has no checkout. PR lint reads the open release PR's title and body via the
-API, then applies the same rules as an ordinary PR event.
+API, verifies that its open same-repository head SHA and branch match the
+dispatched run and that its base is main, then applies the same rules as an
+ordinary PR event. Metadata uses collision-checked random multiline delimiters
+so arbitrary descriptions cannot break or replace workflow outputs.
 
 No App key or PAT is added to Actions. A reviewer must approve the exact head
 SHA and all required checks must be green before squash merge. The first

@@ -54,33 +54,44 @@ jobs:
           EVENT_BODY: ${{ github.event.pull_request.body }}
           EVENT_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: python3 {0}
         run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Validating release PR #$PR_NUMBER via the API."
-            TITLE=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title --jq .title)
-            BODY=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
-            AUTHOR=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json author --jq .author.login)
-            # workflow_dispatch runs land on the dispatch ref (the release
-            # branch head = the PR head), which is what required checks match
-            # on, so validate as a PR event.
-            EVENT=pull_request
-          else
-            TITLE="$EVENT_TITLE"
-            BODY="$EVENT_BODY"
-            AUTHOR="$EVENT_AUTHOR"
-            EVENT='${{ github.event_name }}'
-          fi
-          {
-            echo "title<<PR_EOF"
-            echo "$TITLE"
-            echo "PR_EOF"
-            echo "body<<PR_EOF"
-            echo "$BODY"
-            echo "PR_EOF"
-            echo "author=$AUTHOR"
-            echo "event=$EVENT"
-          } >> "$GITHUB_OUTPUT"
+          import json, os, subprocess, uuid
+
+          event = os.environ["EVENT_NAME"]
+          if event == "workflow_dispatch":
+              number = os.environ["PR_NUMBER"]
+              if not number.isascii() or not number.isdecimal() or int(number) < 1:
+                  raise SystemExit("Expected a positive PR number")
+              repo = os.environ["GITHUB_REPOSITORY"]
+              pr = json.loads(subprocess.check_output([
+                  "gh", "pr", "view", number, "--repo", repo, "--json",
+                  "title,body,author,state,headRefOid,headRefName,baseRefName,headRepository,headRepositoryOwner",
+              ], text=True))
+              # A green dispatch check must describe this exact open PR head,
+              # not an unrelated, forked, closed, or stale PR's metadata.
+              head_repo = pr.get("headRepository") or {}
+              head_owner = pr.get("headRepositoryOwner") or {}
+              head_name = f"{head_owner.get('login', '')}/{head_repo.get('name', '')}"
+              if (pr["state"] != "OPEN" or pr["baseRefName"] != "main"
+                      or pr["headRefOid"] != os.environ["GITHUB_SHA"]
+                      or f"refs/heads/{pr['headRefName']}" != os.environ["GITHUB_REF"]
+                      or head_name.lower() != repo.lower()):
+                  raise SystemExit("Dispatch ref/SHA must match an open same-repository PR targeting main")
+              title, body, author = pr["title"], pr["body"], pr["author"]["login"]
+              event = "pull_request"
+          else:
+              title = os.environ.get("EVENT_TITLE", "")
+              body = os.environ.get("EVENT_BODY", "")
+              author = os.environ.get("EVENT_AUTHOR", "")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for key, value in {"title": title, "body": body, "author": author, "event": event}.items():
+                  delimiter = uuid.uuid4().hex
+                  while delimiter in value.splitlines():
+                      delimiter = uuid.uuid4().hex
+                  output.write(f"{key}<<{delimiter}\n{value}\n{delimiter}\n")
 
       - name: Check title, body and commits
         env:
