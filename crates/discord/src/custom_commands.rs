@@ -39,6 +39,8 @@ pub enum CustomCommandError {
     Storage,
     #[error("Custom-command Discord delivery failed.")]
     Delivery,
+    #[error("Custom-command Discord delivery outcome is unknown.")]
+    DeliveryUnknown,
     #[error("Custom-command registry publication failed; the saved definition is unchanged.")]
     Publication,
     #[error("Custom-command context is unavailable.")]
@@ -321,7 +323,7 @@ impl CustomCommandRuntime {
             });
         let (result, reason) = match rendered {
             Ok(content) => {
-                let result = self
+                let result = match self
                     .executor
                     .post_message(
                         &message.channel_id.to_string(),
@@ -329,8 +331,14 @@ impl CustomCommandRuntime {
                         Some(message.id.get()),
                     )
                     .await
-                    .map(|_| ())
-                    .map_err(|_| CustomCommandError::Delivery);
+                {
+                    Ok(_) => Ok(()),
+                    Err(error) if error.is_safe_pre_mutation() => Err(CustomCommandError::Delivery),
+                    // Timeout/transport/5xx/429 cannot prove that no POST took
+                    // effect. Keep the attempt unresolved; never append a
+                    // definitive failed result or automatically resend it.
+                    Err(_) => return Err(CustomCommandError::DeliveryUnknown),
+                };
                 let reason = result.as_ref().err().map(|_| "delivery_failed");
                 (result, reason)
             }

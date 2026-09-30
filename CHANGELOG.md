@@ -16,7 +16,9 @@
   gateway activation and accepted-prefix integration remain in progress.
 - Explicit moderation-acceptance contract and prefix execution through the shared
   REST executor, with immutable pre-send audit reservations preventing replay of
-  unknown deliveries. Add prefix failure/restart fixtures, dual-gated Message
+  unknown deliveries. Preserve uncertain transport/timeout/5xx/429 outcomes as
+  unresolved rather than auditing a definite failure. Add prefix failure/restart
+  fixtures, dual-gated Message
   Content intent, and unchanged Worker forwarding of custom-command feature flags.
   Gateway dispatch and the actual moderation-result producer remain pending.
 

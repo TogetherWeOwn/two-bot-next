@@ -359,6 +359,62 @@ async fn prefix_delivery_and_render_failures_are_audited_without_retry() {
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn prefix_uncertain_delivery_remains_unresolved_and_never_reposts() {
+    use two_bot_discord::custom_commands::CustomCommandError;
+    use AutomationMessageAcceptance::Unmatched;
+    let pool = test_pool().await;
+    seed_text_command(&pool, "hello").await;
+    for (id, response) in [
+        (67, ScriptedResponse::status(500)),
+        (68, ScriptedResponse::rate_limited(0.01, "0.01")),
+        // The server receives the POST, but its response arrives after the
+        // shared executor's five-second deadline. Acceptance is unknown.
+        (
+            69,
+            ScriptedResponse::json(200, json!({"id": "9000"}))
+                .delayed(std::time::Duration::from_secs(6)),
+        ),
+    ] {
+        let mock = MockRest::start(vec![], response).await;
+        let runtime = runtime(pool.clone(), &mock, true);
+        assert!(matches!(
+            runtime
+                .handle_message(&message(id, "!faq"), Unmatched, true, Some("Test guild"))
+                .await,
+            Err(CustomCommandError::DeliveryUnknown)
+        ));
+        assert_eq!(
+            runtime
+                .handle_message(&message(id, "!faq"), Unmatched, true, Some("Test guild"))
+                .await
+                .unwrap(),
+            TextCommandOutcome::AlreadyAttempted
+        );
+        let result: Option<String> =
+            sqlx::query_scalar("SELECT outcome FROM automation_audit_log WHERE id = $1")
+                .bind(format!("custom:text:result:{id}"))
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(
+            result.is_none(),
+            "uncertain delivery must not be resolved as failed"
+        );
+        let attempt: String =
+            sqlx::query_scalar("SELECT outcome FROM automation_audit_log WHERE id = $1")
+                .bind(format!("custom:text:attempt:{id}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempt, "unknown");
+        assert_eq!(mock.requests().len(), 1);
+        mock.shutdown().await;
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn prefix_storage_failure_never_permits_an_untracked_or_repeated_post() {
     use AutomationMessageAcceptance::Unmatched;
     let pool = test_pool().await;

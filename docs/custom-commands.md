@@ -107,8 +107,10 @@ A committed, immutable `command.text_attempt` audit row reserves the source mess
 ID before any POST. `ON CONFLICT (id) DO NOTHING` excludes concurrent/replayed
 invocations across runtime instances. Its `unknown` outcome and `delivery_pending`
 reason mean only that an attempt was reserved, not that Discord accepted it.
-The separate `command.run` result records success or failure, with fixed reason
-codes and no incoming content. IDs are deterministic `custom:text:attempt:<id>` and
+The separate `command.run` result records success or definite failure, with fixed
+reason codes and no incoming content. Timeout, transport, 5xx and 429 outcomes use
+the shared executor's uncertainty classification: they leave the attempt unresolved
+and never append a misleading definitive-failure result. IDs are deterministic `custom:text:attempt:<id>` and
 `custom:text:result:<id>` text values in the existing audit schema.
 
 **At-most-once attempt, not guaranteed delivery:** cancellation, an ambiguous
