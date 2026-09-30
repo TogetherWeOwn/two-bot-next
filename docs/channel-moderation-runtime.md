@@ -89,3 +89,20 @@ loading is not yet integrated; never replace enabled custom commands with an emp
 partial publish set. Exercise both actual stores once the member slice merges.
 Then ship one PR, exact-head CI and independent Code Reviewer squash merge.
 No startup activation, PR review or merge is claimed yet.
+
+## Build admission checkpoint — 2026-09-30
+
+Lifecycle commit `25a032b5d91f3139e913bdb908100c79e7d0f30d` passed 15 runtime
+acceptance tests, 19 executor regressions and Discord all-target DB-feature Clippy.
+These results precede this branch's integration of `origin/main` at `44338b2`,
+including release 0.2.0 and mandatory bounded Cargo admission (PR #56).
+Released changelog notes are preserved; this slice remains Unreleased.
+
+Verification through the required wrapper was refused with exit 75:
+`not a real directory: /paperclip/.cache/two-bot-next-bounded`.
+Do not substitute the old shared target, create the host pool, or fabricate quota
+receipts. The existing [Operator rollout](https://github.com/TogetherWeOwn/two-bot-next/pull/56)
+tracked by TOG-10906 owns provisioning and evidence. Current integrated-head Rust
+verification is blocked until that rollout completes; no post-integration green
+result is claimed. Resume with bounded-wrapper verification, then the remaining
+startup/READY/dispatch work and exact-head independent review.

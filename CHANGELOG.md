@@ -80,6 +80,7 @@
   unlock (or a retried cleanup whose earlier result was lost) reports stale instead of
   deleting a later lockdown cycle's seed. Repeated lockdowns preserve the original
   generation alongside the original seed (migration 0122).
+
 ### Fixed
 
 * **build:** refresh stale Cargo.lock so --locked Docker build passes ([#19](https://github.com/TogetherWeOwn/two-bot-next/issues/19)) ([1aa9ce8](https://github.com/TogetherWeOwn/two-bot-next/commit/1aa9ce819d802fe8b9f387eb4cae329d8af5f9d2))
