@@ -23,16 +23,16 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     services:
-      automod-testdb:
+      postgres:
         image: postgres:17
         env:
           POSTGRES_USER: agent_test
-          POSTGRES_DB: agent_test
+          POSTGRES_DB: postgres
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-cmd "pg_isready -U agent_test -d postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -73,6 +73,9 @@ jobs:
         env:
           AUTOMOD_CI_TESTDB: '1'
         run: cargo test -p two-bot-core --features db --locked --test automod_store -- --ignored
+
+      - name: settings database regressions (CI service only)
+        run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.

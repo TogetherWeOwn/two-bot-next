@@ -6,10 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 hex = { workspace = true }
-sha2 = { workspace = true }
+hmac = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+time = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

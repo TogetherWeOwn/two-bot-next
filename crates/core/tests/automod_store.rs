@@ -12,14 +12,16 @@ use two_bot_core::AutomodFilter;
 
 // No DATABASE_URL fallback. Tests can reach only the named disposable container,
 // or the explicitly opted-in CI service container (same user/empty password).
+// The CI service container only provisions the default `postgres` database, so
+// CI mode connects there; per-process schemas keep the suites isolated.
 fn test_options() -> PgConnectOptions {
-    let host = if std::env::var("AUTOMOD_CI_TESTDB").as_deref() == Ok("1") {
+    let (host, database) = if std::env::var("AUTOMOD_CI_TESTDB").as_deref() == Ok("1") {
         assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
-        "127.0.0.1"
+        ("127.0.0.1", "postgres")
     } else {
-        "agent-testdb"
+        ("agent-testdb", "agent_test")
     };
-    PgConnectOptions::from_str(&format!("postgres://agent_test@{host}:5432/agent_test")).unwrap()
+    PgConnectOptions::from_str(&format!("postgres://agent_test@{host}:5432/{database}")).unwrap()
 }
 
 fn key(id: &str, revision: &str, dry_run: bool) -> DeliveryKey {
