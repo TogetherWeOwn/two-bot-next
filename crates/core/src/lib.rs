@@ -20,6 +20,7 @@ pub mod moderation;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
+pub mod sticky;
 pub mod voice;
 
 pub use automod::{
@@ -70,6 +71,13 @@ pub use rsvp::{
 #[cfg(feature = "db")]
 pub use rsvp_store::{
     list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+};
+pub use sticky::{
+    activity_eligible, automations_enabled, claim_blocks, decide_activity, normalize_debounce,
+    repost_due, sticky_removed_reply, sticky_set_reply, validate_body, ActivityDecision,
+    ActivityOutcome, ClaimGrant, PutSticky, RemoveOutcome, StickyAudit, StickyAuditAction,
+    StickyAuditOutcome, StickyError, StickyState, CLAIM_EXPIRY_SECONDS, DEFAULT_DEBOUNCE_SECONDS,
+    MAX_BODY_CHARS, MAX_DEBOUNCE_SECONDS, MIN_DEBOUNCE_SECONDS,
 };
 pub use voice::{
     average_known_voice_duration, count_unknown_starts_per_window, find_blind_windows,
