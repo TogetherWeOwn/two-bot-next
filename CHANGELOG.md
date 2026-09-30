@@ -14,6 +14,11 @@
   deferred mention-safe replies, dynamic slash execution auditing, and serialized
   full-registry publication. Add mock REST + isolated testdb runtime fixtures;
   gateway activation and accepted-prefix integration remain in progress.
+- Explicit moderation-acceptance contract and prefix execution through the shared
+  REST executor, with immutable pre-send audit reservations preventing replay of
+  unknown deliveries. Add prefix failure/restart fixtures, dual-gated Message
+  Content intent, and unchanged Worker forwarding of custom-command feature flags.
+  Gateway dispatch and the actual moderation-result producer remain pending.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 

@@ -39,11 +39,13 @@ It defers responses before transactional work, edits through the shared executor
 suppresses mentions, audits writes/runs, and serializes mutation plus full-set
 publication. A publication failure reports a saved-but-not-synchronized result.
 
-**Not activated in the gateway yet.** READY injection, safe asynchronous gateway
-execution and an explicitly automod-accepted prefix hook are still pending.
-Do not use unconditional `MessageCreate` or `capture_only: false` as acceptance.
-Cold RESUME can lack a cached guild name; this adapter refuses rendering without
-context rather than inventing a `{server}` value.
+**Not activated in the gateway yet.** READY injection, heartbeat-safe gateway
+execution and a caller supplying the ordinary message path's actual moderation
+decision are still pending. `handle_message` now executes explicitly accepted
+prefixes, but is not an unconditional gateway listener. Do not use `MessageCreate`
+or `capture_only: false` as acceptance. Cold RESUME can lack a cached guild name;
+this adapter refuses rendering without context rather than inventing a `{server}`
+value.
 
 The following checklist includes both implemented adapter contracts and the
 remaining gateway/accepted-prefix work:
@@ -77,6 +79,53 @@ remaining gateway/accepted-prefix work:
    in-flight refusal gate active during deregistration and surface incomplete
    REST deletes instead of declaring disable complete.
 
+## Explicit prefix acceptance and replay safety
+
+`AutomationMessageAcceptance` distinguishes deliberately disabled automod,
+completed unmatched inspection, policy exemption, matched inspection, unavailable
+inspection, and capture-only operation. Only the first three permit automations.
+A match rejects prefix execution even in dry-run mode or when sanctions/deletion
+were refused. Missing services and unknown errors fail closed. The caller must
+reuse the existing inspection result; this slice does not run a second matcher or
+claim to implement the missing automod service. The ordinary message path must
+complete before invoking the callback.
+
+This is based on legacy `two-bot` revision
+[`9677746`](https://github.com/TogetherWeOwn/two-bot/blob/96777468472f23a02a1e97a43ffab3912fe5df2a/src/discord/client.ts#L426-L535)
+and its [consumer](https://github.com/TogetherWeOwn/two-bot/blob/96777468472f23a02a1e97a43ffab3912fe5df2a/src/automations/gateway.ts).
+Two deliberate tightenings: legacy unknown inspection errors can emit acceptance
+because its `null` result is falsy; the port refuses them. The port also explicitly
+excludes webhooks, rather than relying on their bot-author flag.
+
+Before DB lookup, the adapter checks the configured guild, human/non-webhook
+author, both feature gates, acceptance, and a non-builtin first token. Leading
+whitespace does not trigger; arguments are ignored. Enabled guild-scoped rows
+render real user, username, server and channel context through the shared executor
+with mention suppression.
+
+A committed, immutable `command.text_attempt` audit row reserves the source message
+ID before any POST. `ON CONFLICT (id) DO NOTHING` excludes concurrent/replayed
+invocations across runtime instances. Its `unknown` outcome and `delivery_pending`
+reason mean only that an attempt was reserved, not that Discord accepted it.
+The separate `command.run` result records success or failure, with fixed reason
+codes and no incoming content. IDs are deterministic `custom:text:attempt:<id>` and
+`custom:text:result:<id>` text values in the existing audit schema.
+
+**At-most-once attempt, not guaranteed delivery:** cancellation, an ambiguous
+commit/network response, or a failed result audit must never clear the reservation
+or resend automatically. A crash after reservation may lose the reply; an attempt
+without a result stays unknown for operator reconciliation. The source message ID
+is also an enforced Discord nonce, but the durable reservation—not Discord's short
+nonce window—is the replay guard. Do not purge attempt rows independently of the
+corresponding gateway replay horizon.
+
+The gateway intent now requests Message Content when both `TWO_AUTOMATIONS=1` and
+`TWO_TEXT_COMMANDS=1`; existing automod/ticket intent reasons are preserved. The
+Worker forwards those two values unchanged on both container startup paths.
+Neither flag is enabled by default, and no deployment settings are changed. The
+privileged intent must also be authorized for the Discord application before
+operators opt into text commands.
+
 SQLx 0.9's documented `Executor` contract supports both pools and transaction
 connections; dereference transactions as `&mut *tx`:
 https://docs.rs/sqlx/0.9.0/sqlx/trait.Executor.html
@@ -88,8 +137,13 @@ use the loopback mock REST double and a single testdb connection with session-lo
 `pg_temp` tables. Unlike the store-only fixture, those tables survive service
 commits and disappear when the pool closes. No application credentials are read.
 They cover routing refusals, full-set publication, dynamic rendering, safe reply
-edits, audit rollback and honest publication/delivery failures. These fixtures
-are **added, not locally executed**, while the controller cache pool is absent.
+edits, audit rollback and honest publication/delivery failures. Prefix fixtures
+add zero-I/O rejection gates, explicit acceptance, first-token rendering, disabled
+and unknown rows, concurrent/restarted/unknown attempts, render and delivery
+failures, and audit failure before/after POST. These Rust fixtures are **added,
+not locally executed**, while the controller cache pool is absent. Worker gate
+passthrough fixtures are added too; executing them requires the pinned local
+`@cloudflare/containers` SDK.
 
 Deferred completion follows Twilight 0.17's documented `update_response` builder:
 https://docs.rs/twilight-http/0.17.0/twilight_http/request/application/interaction/struct.UpdateResponse.html

@@ -11,9 +11,15 @@ use std::sync::Arc;
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use twilight_model::application::interaction::Interaction;
-use two_bot_core::{custom_command_store as store, InteractionRouter, RouterGates};
-use two_bot_discord::{custom_commands::CustomCommandRuntime, ActionExecutor};
+use twilight_model::{application::interaction::Interaction, channel::Message, id::Id};
+use two_bot_core::{
+    custom_command_store as store, custom_commands::AutomationMessageAcceptance, InteractionRouter,
+    RouterGates,
+};
+use two_bot_discord::{
+    custom_commands::{CustomCommandRuntime, TextCommandOutcome},
+    ActionExecutor,
+};
 
 const MIGRATION: &str = include_str!("../../cutover/migrations/0130_custom_commands.sql");
 
@@ -58,6 +64,36 @@ fn slash(id: u64, name: &str, permissions: u64, options: &[(&str, &str)]) -> Int
     })).expect("valid Twilight interaction fixture")
 }
 
+fn message(id: u64, content: &str) -> Message {
+    serde_json::from_value(json!({
+        "id": id.to_string(), "guild_id": "2222", "channel_id": "4444", "type": 0,
+        "author": {"id": "3333", "username": "tester", "discriminator": "0000", "avatar": null},
+        "content": content, "timestamp": "2026-09-30T12:00:00Z", "edited_timestamp": null,
+        "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+        "attachments": [], "embeds": [], "pinned": false
+    }))
+    .expect("valid Twilight message fixture")
+}
+
+async fn seed_text_command(pool: &sqlx::PgPool, template: &str) {
+    two_bot_core::custom_command_service::put(
+        pool,
+        true,
+        "2222",
+        "3333",
+        &two_bot_core::custom_commands::PutCommandInput {
+            name: "faq".to_owned(),
+            description: "FAQ".to_owned(),
+            template: template.to_owned(),
+            text_trigger: Some("!faq".to_owned()),
+        },
+        "seed",
+        &two_bot_core::now_iso(),
+    )
+    .await
+    .unwrap();
+}
+
 fn test_options() -> PgConnectOptions {
     let ci_service = std::env::var("CI").as_deref() == Ok("true")
         && std::env::var("TWO_CUSTOM_COMMAND_TEST_CI").as_deref() == Ok("1");
@@ -100,6 +136,265 @@ fn bodies(mock: &MockRest) -> Vec<Value> {
         .iter()
         .map(|request| serde_json::from_slice(&request.body).unwrap())
         .collect()
+}
+
+#[tokio::test]
+async fn rejected_prefix_inputs_never_access_database_or_discord() {
+    use AutomationMessageAcceptance::*;
+    let pool = PgPoolOptions::new().connect_lazy_with(test_options());
+    // A missed early gate fails immediately instead of trying a live connection.
+    pool.close().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    for acceptance in [Matched, Unavailable, CaptureOnly] {
+        assert_eq!(
+            runtime
+                .handle_message(&message(50, "!faq"), acceptance, true, None)
+                .await
+                .unwrap(),
+            TextCommandOutcome::Ignored
+        );
+    }
+    for content in ["hello !faq", " !faq", "!", "! faq", "!RaNk ignored"] {
+        assert_eq!(
+            runtime
+                .handle_message(&message(50, content), Unmatched, true, None)
+                .await
+                .unwrap(),
+            TextCommandOutcome::Ignored
+        );
+    }
+    for scope in ["bot", "webhook", "foreign", "dm"] {
+        let mut input = message(50, "!faq");
+        match scope {
+            "bot" => input.author.bot = true,
+            "webhook" => input.webhook_id = Some(Id::new(6666)),
+            "foreign" => input.guild_id = Some(Id::new(7777)),
+            "dm" => input.guild_id = None,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            runtime
+                .handle_message(&input, Unmatched, true, None)
+                .await
+                .unwrap(),
+            TextCommandOutcome::Ignored,
+            "{scope}"
+        );
+    }
+    assert_eq!(
+        runtime
+            .handle_message(&message(50, "!faq"), Unmatched, false, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Ignored
+    );
+    let disabled = self::runtime(pool, &mock, false);
+    assert_eq!(
+        disabled
+            .handle_message(&message(50, "!faq"), AutomodDisabled, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Ignored
+    );
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn explicitly_accepted_prefixes_render_audit_and_suppress_mentions() {
+    use AutomationMessageAcceptance::*;
+    let pool = test_pool().await;
+    seed_text_command(&pool, "Hi {user} {username} in {server} {channel}").await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "9000"}))).await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    for (id, acceptance) in [(51, AutomodDisabled), (52, Unmatched), (53, Exempt)] {
+        assert_eq!(
+            runtime
+                .handle_message(
+                    &message(id, "!FaQ ignored arguments"),
+                    acceptance,
+                    true,
+                    Some("Test guild")
+                )
+                .await
+                .unwrap(),
+            TextCommandOutcome::Delivered
+        );
+    }
+    assert_eq!(
+        runtime
+            .handle_message(
+                &message(54, "!unknown"),
+                Unmatched,
+                true,
+                Some("Test guild")
+            )
+            .await
+            .unwrap(),
+        TextCommandOutcome::Ignored
+    );
+    sqlx::query("UPDATE automation_commands SET enabled = FALSE WHERE name = 'faq'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .handle_message(&message(55, "!faq"), Unmatched, true, Some("Test guild"))
+            .await
+            .unwrap(),
+        TextCommandOutcome::Ignored
+    );
+    let calls = bodies(&mock);
+    assert_eq!(calls.len(), 3);
+    for (index, body) in calls.iter().enumerate() {
+        assert_eq!(body["content"], "Hi <@3333> tester in Test guild <#4444>");
+        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+        assert_eq!(body["enforce_nonce"], true);
+        assert_eq!(body["nonce"], 51 + index as u64);
+    }
+    let facts: Vec<(String, String)> = sqlx::query_as(
+        "SELECT action, outcome FROM automation_audit_log WHERE id LIKE 'custom:text:%' ORDER BY id",
+    ).fetch_all(&pool).await.unwrap();
+    assert_eq!(facts.len(), 6);
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|(action, outcome)| action == "command.run" && outcome == "ok")
+            .count(),
+        3
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|(action, outcome)| action == "command.text_attempt" && outcome == "unknown")
+            .count(),
+        3
+    );
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn prefix_attempt_survives_concurrency_restart_and_unknown_outcomes() {
+    use AutomationMessageAcceptance::Unmatched;
+    let pool = test_pool().await;
+    seed_text_command(&pool, "hello").await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "9000"}))).await;
+    let first = runtime(pool.clone(), &mock, true);
+    let second = runtime(pool.clone(), &mock, true);
+    let input = message(60, "!faq");
+    let (a, b) = tokio::join!(
+        first.handle_message(&input, Unmatched, true, Some("Test guild")),
+        second.handle_message(&input, Unmatched, true, Some("Test guild")),
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert!(outcomes.contains(&TextCommandOutcome::Delivered));
+    assert!(outcomes.contains(&TextCommandOutcome::AlreadyAttempted));
+    let restarted = runtime(pool.clone(), &mock, true);
+    assert_eq!(
+        restarted
+            .handle_message(&input, Unmatched, true, Some("Test guild"))
+            .await
+            .unwrap(),
+        TextCommandOutcome::AlreadyAttempted
+    );
+    // Crash/cancellation after committing the attempt, before recording a result.
+    assert!(
+        store::claim_text_attempt(&pool, "2222", "3333", "faq", 61, &two_bot_core::now_iso())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        restarted
+            .handle_message(&message(61, "!faq"), Unmatched, true, Some("Test guild"))
+            .await
+            .unwrap(),
+        TextCommandOutcome::AlreadyAttempted
+    );
+    assert_eq!(mock.requests().len(), 1);
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn prefix_delivery_and_render_failures_are_audited_without_retry() {
+    use AutomationMessageAcceptance::Unmatched;
+    let pool = test_pool().await;
+    seed_text_command(&pool, "{server}").await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(403)).await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    let oversized = "x".repeat(2001);
+    for (id, server, reason) in [
+        (62, Some("Test guild"), "delivery_failed"),
+        (63, None, "context_unavailable"),
+        (64, Some(oversized.as_str()), "render_failed"),
+    ] {
+        assert!(runtime
+            .handle_message(&message(id, "!faq"), Unmatched, true, server)
+            .await
+            .is_err());
+        assert_eq!(
+            runtime
+                .handle_message(&message(id, "!faq"), Unmatched, true, Some("Test guild"))
+                .await
+                .unwrap(),
+            TextCommandOutcome::AlreadyAttempted
+        );
+        let fact: (String, String) =
+            sqlx::query_as("SELECT outcome, reason FROM automation_audit_log WHERE id = $1")
+                .bind(format!("custom:text:result:{id}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fact, ("failed".to_owned(), reason.to_owned()));
+    }
+    assert_eq!(mock.requests().len(), 1);
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn prefix_storage_failure_never_permits_an_untracked_or_repeated_post() {
+    use AutomationMessageAcceptance::Unmatched;
+    let pool = test_pool().await;
+    seed_text_command(&pool, "hello").await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "9000"}))).await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    sqlx::query("ALTER TABLE automation_audit_log ADD CONSTRAINT refuse_attempt CHECK (action <> 'command.text_attempt')")
+        .execute(&pool).await.unwrap();
+    assert!(runtime
+        .handle_message(&message(65, "!faq"), Unmatched, true, Some("Test guild"))
+        .await
+        .is_err());
+    assert!(mock.requests().is_empty());
+    sqlx::query("ALTER TABLE automation_audit_log DROP CONSTRAINT refuse_attempt")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE automation_audit_log ADD CONSTRAINT refuse_result CHECK (action <> 'command.run')")
+        .execute(&pool).await.unwrap();
+    assert!(runtime
+        .handle_message(&message(66, "!faq"), Unmatched, true, Some("Test guild"))
+        .await
+        .is_err());
+    // Discord accepted, but result persistence failed. The committed attempt
+    // still prevents another send, even with an entirely new runtime instance.
+    let restarted = self::runtime(pool.clone(), &mock, true);
+    assert_eq!(
+        restarted
+            .handle_message(&message(66, "!faq"), Unmatched, true, Some("Test guild"))
+            .await
+            .unwrap(),
+        TextCommandOutcome::AlreadyAttempted
+    );
+    assert_eq!(mock.requests().len(), 1);
+    mock.shutdown().await;
+    pool.close().await;
 }
 
 #[tokio::test]

@@ -36,6 +36,37 @@ pub async fn audit<'c>(
     Ok(())
 }
 
+/// Permanently reserve one text invocation before any Discord POST. The audit
+/// primary key excludes concurrent/replayed attempts even after Discord's nonce
+/// window expires. Call with the pool (autocommit), NOT a transaction that could
+/// roll back after sending. An error/unknown commit result never permits a send.
+///
+/// This append-only attempt is intentionally not a lease: crashes may lose a
+/// reply, but must never replay an unknown external mutation. The caller appends
+/// a separate command.run result when known; an attempt alone means unknown.
+pub async fn claim_text_attempt(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    actor_id: &str,
+    name: &str,
+    message_id: u64,
+    at_iso: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
+         VALUES ($1, $2, $3, 'command.text_attempt', $4, 'unknown', 'delivery_pending', $5::text::timestamptz)
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(format!("custom:text:attempt:{message_id}"))
+    .bind(guild_id)
+    .bind(actor_id)
+    .bind(name)
+    .bind(at_iso)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 fn map_command(row: &sqlx::postgres::PgRow) -> StoredCommand {
     StoredCommand {
         guild_id: row.get("guild_id"),

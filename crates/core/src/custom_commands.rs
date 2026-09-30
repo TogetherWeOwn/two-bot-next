@@ -489,6 +489,32 @@ pub fn is_builtin_trigger(word: &str, builtins: &HashSet<String>) -> bool {
         .is_some_and(|name| builtins.contains(name))
 }
 
+/// The ordinary message path's explicit moderation decision. A MessageCreate
+/// event, successful funnel capture, or a message surviving deletion is NOT an
+/// acceptance decision. Reuse the inspection result; do not inspect twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomationMessageAcceptance {
+    /// The configured moderation service is deliberately disabled (not missing).
+    AutomodDisabled,
+    /// Inspection completed without a match.
+    Unmatched,
+    /// The moderation policy explicitly exempts this channel/member.
+    Exempt,
+    /// Includes dry-run matches, protected-author refusals and matched errors.
+    Matched,
+    /// Missing service/result or unknown inspection error: fail closed.
+    Unavailable,
+    /// Containment/capture-only operation never runs automations.
+    CaptureOnly,
+}
+
+impl AutomationMessageAcceptance {
+    #[must_use]
+    pub fn permits_automations(self) -> bool {
+        matches!(self, Self::AutomodDisabled | Self::Unmatched | Self::Exempt)
+    }
+}
+
 /// A lookup key from an automod-accepted guild message. The adapter must call
 /// this only after guild/channel scoping and moderation acceptance. Both flags
 /// gate content processing, not just the MessageContent intent.
@@ -588,6 +614,21 @@ mod tests {
             description: "FAQ answer".to_owned(),
             template: "See {channel}, {username}!".to_owned(),
             text_trigger: Some("!faq".to_owned()),
+        }
+    }
+
+    #[test]
+    fn automation_acceptance_requires_a_known_nonmatching_decision() {
+        use AutomationMessageAcceptance::*;
+        for (decision, allowed) in [
+            (AutomodDisabled, true),
+            (Unmatched, true),
+            (Exempt, true),
+            (Matched, false),
+            (Unavailable, false),
+            (CaptureOnly, false),
+        ] {
+            assert_eq!(decision.permits_automations(), allowed, "{decision:?}");
         }
     }
 

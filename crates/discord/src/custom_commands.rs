@@ -11,14 +11,17 @@ use twilight_model::{
         application_command::{CommandData, CommandOptionValue},
         Interaction, InteractionData,
     },
-    channel::message::{AllowedMentions, MessageFlags},
+    channel::{
+        message::{AllowedMentions, MessageFlags},
+        Message,
+    },
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        builtin_command_names, format_command_list, render_template, AuditRecord, PutCommandInput,
-        StoredCommand, TemplateContext,
+        accepted_text_trigger, builtin_command_names, format_command_list, render_template,
+        AuditRecord, AutomationMessageAcceptance, PutCommandInput, StoredCommand, TemplateContext,
     },
     router::InteractionHandler,
     HandlerId, InteractionRouter, SlashOutcome,
@@ -40,6 +43,16 @@ pub enum CustomCommandError {
     Publication,
     #[error("Custom-command context is unavailable.")]
     Context,
+    #[error("Custom-command template could not be rendered.")]
+    Render,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextCommandOutcome {
+    Ignored,
+    /// A prior invocation may have sent a reply. Never resend automatically.
+    AlreadyAttempted,
+    Delivered,
 }
 
 #[derive(Debug)]
@@ -235,6 +248,105 @@ impl CustomCommandRuntime {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Called only after the ordinary message path has completed, with its
+    /// explicit moderation result. Never derive acceptance from MessageCreate,
+    /// funnel capture, or whether deletion succeeded. Unknown errors fail closed
+    /// (unlike the legacy emitter's fail-open null result).
+    pub async fn handle_message(
+        &self,
+        message: &Message,
+        acceptance: AutomationMessageAcceptance,
+        text_commands_enabled: bool,
+        guild_name: Option<&str>,
+    ) -> Result<TextCommandOutcome, CustomCommandError> {
+        if !acceptance.permits_automations()
+            || message.guild_id.is_none()
+            || message.guild_id.map(|id| id.get()) != self.router.gates().configured_guild
+            || message.webhook_id.is_some()
+        {
+            return Ok(TextCommandOutcome::Ignored);
+        }
+        let Some(trigger) = accepted_text_trigger(
+            self.router.gates().automations,
+            text_commands_enabled,
+            message.author.bot,
+            &message.content,
+            &builtin_command_names(),
+        ) else {
+            return Ok(TextCommandOutcome::Ignored);
+        };
+        let guild = message.guild_id.expect("fenced guild").to_string();
+        let Some(row) = store::find_text_trigger(&self.pool, &guild, &trigger)
+            .await
+            .map_err(|_| CustomCommandError::Storage)?
+        else {
+            return Ok(TextCommandOutcome::Ignored);
+        };
+        // Imported/custom rows must not execute a reserved slash name either.
+        if builtin_command_names().contains(&row.name) {
+            return Ok(TextCommandOutcome::Ignored);
+        }
+        let actor = message.author.id.to_string();
+        if !store::claim_text_attempt(
+            &self.pool,
+            &guild,
+            &actor,
+            &row.name,
+            message.id.get(),
+            &two_bot_core::now_iso(),
+        )
+        .await
+        .map_err(|_| CustomCommandError::Storage)?
+        {
+            return Ok(TextCommandOutcome::AlreadyAttempted);
+        }
+        // The committed attempt is never cleared, including on cancellation,
+        // rendering/audit failure, or an ambiguous network response. Nonce
+        // enforcement is additional protection, not our durable replay guard.
+        let rendered = guild_name
+            .ok_or(CustomCommandError::Context)
+            .and_then(|server| {
+                render_template(
+                    &row.template,
+                    &TemplateContext {
+                        user: format!("<@{}>", message.author.id),
+                        username: message.author.name.clone(),
+                        server: server.to_owned(),
+                        channel: format!("<#{}>", message.channel_id),
+                    },
+                )
+                .map_err(|_| CustomCommandError::Render)
+            });
+        let (result, reason) = match rendered {
+            Ok(content) => {
+                let result = self
+                    .executor
+                    .post_message(
+                        &message.channel_id.to_string(),
+                        &content,
+                        Some(message.id.get()),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| CustomCommandError::Delivery);
+                let reason = result.as_ref().err().map(|_| "delivery_failed");
+                (result, reason)
+            }
+            Err(CustomCommandError::Context) => (
+                Err(CustomCommandError::Context),
+                Some("context_unavailable"),
+            ),
+            Err(error) => (Err(error), Some("render_failed")),
+        };
+        self.audit(
+            &AuditRecord::run(&guild, &actor, &row.name, result.is_ok(), reason),
+            &format!("custom:text:result:{}", message.id),
+        )
+        .await?;
+        result?;
+        Ok(TextCommandOutcome::Delivered)
     }
 
     async fn defer(

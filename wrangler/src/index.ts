@@ -34,6 +34,8 @@ export interface Env {
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
   GUILD_ID?: string;
+  TWO_AUTOMATIONS?: string;
+  TWO_TEXT_COMMANDS?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
   /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
@@ -85,6 +87,13 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;
+  // Pass gates unchanged; only the bot decides whether an exact "1" enables them.
+  if (env.TWO_AUTOMATIONS !== undefined) {
+    vars["TWO_AUTOMATIONS"] = env.TWO_AUTOMATIONS;
+  }
+  if (env.TWO_TEXT_COMMANDS !== undefined) {
+    vars["TWO_TEXT_COMMANDS"] = env.TWO_TEXT_COMMANDS;
+  }
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   return vars;
 }
