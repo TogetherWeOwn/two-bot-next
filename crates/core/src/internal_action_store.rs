@@ -6,8 +6,8 @@
 use sqlx::{PgPool, Row};
 
 use crate::internal_actions::{
-    body_hash, is_implemented, valid_idempotency_key, valid_nonce_format, CLAIM_STALE_SECONDS,
-    MAX_BODY_BYTES, NONCE_TTL_SECONDS, SKEW_SECONDS,
+    body_hash, is_implemented, valid_idempotency_key, valid_nonce_format, within_skew,
+    CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS, SKEW_SECONDS,
 };
 
 /// Public errors deliberately omit SQLx sources and all request/provider details.
@@ -240,7 +240,21 @@ impl InternalActionStore {
 
     /// Signature/freshness first, then durable burn, BEFORE body parsing/buckets.
     /// Scope is global, matching NonceCache. Only expiry allows replacement.
-    pub async fn burn_nonce(&self, nonce: &str) -> Result<bool, InternalStoreError> {
+    ///
+    /// `timestamp` is the exact authenticated timestamp header (unix seconds).
+    /// A pool, row-lock or uniqueness wait can outlast the skew window, so the
+    /// expiry predicate alone cannot decide replays: after the burn statement
+    /// the store re-checks `within_skew` against database time in the SAME
+    /// transaction and rolls back with `InvalidInput` when the wait crossed
+    /// out of the window. A delayed replay can therefore never win a second
+    /// burn, even if the row it waited on expired mid-wait. Callers must treat
+    /// every error (including this one) as refusal: only `Ok(true)` with a
+    /// fresh timestamp is a successful burn.
+    pub async fn burn_nonce(
+        &self,
+        nonce: &str,
+        timestamp: &str,
+    ) -> Result<bool, InternalStoreError> {
         if !valid_nonce_format(nonce) {
             return Err(InternalStoreError::InvalidInput);
         }
@@ -278,6 +292,23 @@ impl InternalActionStore {
             .bind(ttl)
             .execute(&mut *tx)
             .await?;
+        }
+        // Commit-time freshness: the wait above may have crossed the skew
+        // window (or expiry) after the receiver's pre-burn check passed. Decide
+        // against database time — never the caller's clock — with the same
+        // whole-second `within_skew` semantics as the domain check, and roll
+        // the whole burn back when the attempt is no longer fresh. An invalid
+        // (non-numeric) timestamp fails `within_skew` and is refused the same
+        // way; format-validated nonces are unaffected.
+        let commit_secs: i64 =
+            sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::bigint")
+                .fetch_one(&mut *tx)
+                .await?;
+        let commit_secs =
+            u64::try_from(commit_secs).map_err(|_| InternalStoreError::InvalidInput)?;
+        if !within_skew(timestamp, SKEW_SECONDS, commit_secs) {
+            tx.rollback().await?;
+            return Err(InternalStoreError::InvalidInput);
         }
         tx.commit().await?;
         Ok(burned)

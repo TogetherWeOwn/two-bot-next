@@ -3,7 +3,7 @@
 #![cfg(feature = "db")]
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{PgPool, Row};
+use sqlx::{ConnectOptions, PgPool, Row};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use two_bot_core::internal_action_store::{
@@ -20,6 +20,8 @@ fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
     {
         return Err("explicit agent_test empty password required");
     }
+    // sqlx parses query-string overrides (host/hostaddr/user/dbname/port)
+    // while parsing, so validate the effective options, not URL substrings.
     let options = PgConnectOptions::from_str(url).map_err(|_| "invalid test URL")?;
     if options.get_host() != "agent-testdb"
         || options.get_port() != 5432
@@ -27,10 +29,18 @@ fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
         || options.get_username() != "agent_test"
         || options.get_options().is_some()
         || options.get_database() != Some("agent_test")
+        // The URL parser drops an empty password, and sqlx 0.9 falls back to
+        // an inherited PGPASSWORD or .pgpass credential. Reject any effective
+        // nonempty password and pin the empty one, mirroring sticky_store_live.
+        || options
+            .to_url_lossy()
+            .password()
+            .is_some_and(|password| !password.is_empty())
     {
         return Err("test-container target only");
     }
-    Ok(options)
+    // Never fall back to an inherited PGPASSWORD or .pgpass credential.
+    Ok(options.password(""))
 }
 
 fn schema_name() -> String {
@@ -124,6 +134,16 @@ impl TestDb {
     }
 }
 
+/// Database clock in whole seconds. Timestamps handed to `burn_nonce` must be
+/// fresh against this same clock at commit time, so read them here rather than
+/// assuming the runner and database clocks agree.
+async fn db_now_secs(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()))::bigint")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn wait_for_uniqueness_lock(db: &TestDb, table: &str) {
     // Observe only this owned test schema's sessions. Bounded synchronization
     // proves the VALUES clock was sampled before rollback; no timing-only sleep.
@@ -164,7 +184,8 @@ async fn rollback_wait_starts_retention_and_staleness_after_winning_insert() {
     .unwrap();
     let writer = store.clone();
     let offered_nonce = nonce.clone();
-    let burn = tokio::spawn(async move { writer.burn_nonce(&offered_nonce).await });
+    let attempt = db_now_secs(&db.pool).await.to_string();
+    let burn = tokio::spawn(async move { writer.burn_nonce(&offered_nonce, &attempt).await });
     wait_for_uniqueness_lock(&db, "internal_nonces").await;
     let release: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&db.pool)
@@ -182,7 +203,8 @@ async fn rollback_wait_starts_retention_and_staleness_after_winning_insert() {
     let expires_at: time::OffsetDateTime = row.get("expires_at");
     assert!(burned_at >= release);
     assert_eq!(expires_at - burned_at, time::Duration::seconds(241));
-    assert!(!store.burn_nonce(&nonce).await.unwrap());
+    let now = db_now_secs(&db.pool).await.to_string();
+    assert!(!store.burn_nonce(&nonce, &now).await.unwrap());
 
     let id = identity("blocked-key:123", "event.upsert", b"payload");
     let mut blocker = db.pool.begin().await.unwrap();
@@ -264,6 +286,116 @@ fn test_guard_rejects_redirects_credentials_and_non_test_targets() {
     }
 }
 
+/// Child-process probe: with an inherited `PGPASSWORD` the guard must reject
+/// the approved URL. Runs only when `IA10606_GUARD_PROBE` is set (see the
+/// parent test below); a no-op in the normal suite. Opens no connection and
+/// prints no credential value.
+#[test]
+fn guard_probe_rejects_inherited_password_child() {
+    if std::env::var("IA10606_GUARD_PROBE").is_err() {
+        return;
+    }
+    // The parent supplies a synthetic sentinel, never a real credential.
+    assert!(
+        test_options("postgres://agent_test:@agent-testdb:5432/agent_test").is_err(),
+        "guard accepted an inherited nonempty password"
+    );
+}
+
+/// Parent: re-run only the probe above in a child test-binary process with a
+/// synthetic `PGPASSWORD` sentinel. A separate process avoids process-global
+/// environment races with the parallel suite. Credential-free: no connection
+/// is opened in either process.
+#[test]
+fn test_guard_rejects_inherited_nonempty_password() {
+    if std::env::var("IA10606_GUARD_PROBE").is_ok() {
+        return; // child run: covered by the probe test above
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "guard_probe_rejects_inherited_password_child",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("IA10606_GUARD_PROBE", "1")
+        .env("PGPASSWORD", "synthetic-sentinel-never-a-credential")
+        .env("PGPASSFILE", "/dev/null")
+        .output()
+        .expect("run isolated guard probe");
+    assert!(
+        output.status.success(),
+        "guard probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // And this process (no PG* env) still accepts the approved URL.
+    assert!(test_options("postgres://agent_test:@agent-testdb:5432/agent_test").is_ok());
+}
+
+/// A replay that is fresh before an async wait but stale after it must be
+/// refused, never granted a second burn. Seeds a live row expiring ~2s out,
+/// holds the writer behind a controlled row lock for 3s (crossing both the
+/// row expiry and the attempt's skew window), then asserts `InvalidInput`
+/// and that the original burn stands untouched. A fresh attempt against the
+/// same expired row still wins a genuine replacement afterwards.
+#[tokio::test]
+#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
+async fn stale_wait_cannot_win_second_nonce_burn() {
+    let db = TestDb::new().await;
+    let second = db.independent_pool().await;
+    let store = InternalActionStore::new(second.clone());
+    let nonce = body_hash(schema_name().as_bytes())[..32].to_owned();
+    let nonce_hash = body_hash(nonce.as_bytes());
+    let start = db_now_secs(&db.pool).await;
+    sqlx::query(
+        "WITH instant AS MATERIALIZED (SELECT clock_timestamp() AS now) \
+         INSERT INTO internal_nonces SELECT $1, now - INTERVAL '239 seconds', now + INTERVAL '2 seconds' FROM instant",
+    )
+    .bind(&nonce_hash)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // Fresh now (1s of margin), stale after the 3s hold plus lock overhead.
+    let attempt = (start - SKEW_SECONDS as i64 + 1).to_string();
+    let mut blocker = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT nonce_hash FROM internal_nonces WHERE nonce_hash = $1 FOR UPDATE")
+        .bind(&nonce_hash)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let writer = store.clone();
+    let offered = nonce.clone();
+    let burn = tokio::spawn(async move { writer.burn_nonce(&offered, &attempt).await });
+    wait_for_uniqueness_lock(&db, "internal_nonces").await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    blocker.rollback().await.unwrap();
+    assert_eq!(
+        burn.await.unwrap(),
+        Err(InternalStoreError::InvalidInput),
+        "a replay that lapsed mid-wait must be refused"
+    );
+    let row =
+        sqlx::query("SELECT burned_at, expires_at FROM internal_nonces WHERE nonce_hash = $1")
+            .bind(&nonce_hash)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let burned_at: time::OffsetDateTime = row.get("burned_at");
+    let now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    // The refused replay replaced nothing: the row still dates from the seed.
+    assert!(
+        (now - burned_at) >= time::Duration::seconds(238),
+        "refused replay must not refresh the burn"
+    );
+    // A genuinely fresh attempt against the expired row replaces it.
+    let fresh = db_now_secs(&db.pool).await.to_string();
+    assert!(store.burn_nonce(&nonce, &fresh).await.unwrap());
+    second.close().await;
+    db.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn nonce_race_restart_and_expiry_window() {
@@ -272,12 +404,14 @@ async fn nonce_race_restart_and_expiry_window() {
     let a = db.store();
     let b = InternalActionStore::new(second.clone());
     let nonce = body_hash(schema_name().as_bytes())[..32].to_owned();
+    let attempt = db_now_secs(&db.pool).await.to_string();
     let mut tasks = Vec::new();
     for i in 0..24 {
         let store = if i % 2 == 0 { a.clone() } else { b.clone() };
         let nonce = nonce.clone();
+        let attempt = attempt.clone();
         tasks.push(tokio::spawn(async move {
-            store.burn_nonce(&nonce).await.unwrap()
+            store.burn_nonce(&nonce, &attempt).await.unwrap()
         }));
     }
     let mut wins = 0;
@@ -295,22 +429,27 @@ async fn nonce_race_restart_and_expiry_window() {
     assert_eq!(retained, NONCE_TTL_SECONDS as f64);
     // A future expiry is refused. A known-past expiry is replaceable, with a
     // full fresh interval. Alter BOTH timestamps to preserve the retention check.
+    let now = db_now_secs(&db.pool).await.to_string();
     sqlx::query("UPDATE internal_nonces SET burned_at = clock_timestamp() - INTERVAL '240 seconds', expires_at = clock_timestamp() + INTERVAL '1 second'")
         .execute(&db.pool).await.unwrap();
-    assert!(!b.burn_nonce(&nonce).await.unwrap());
+    assert!(!b.burn_nonce(&nonce, &now).await.unwrap());
+    let now = db_now_secs(&db.pool).await.to_string();
     sqlx::query("UPDATE internal_nonces SET burned_at = clock_timestamp() - INTERVAL '242 seconds', expires_at = clock_timestamp() - INTERVAL '1 second'")
         .execute(&db.pool).await.unwrap();
-    assert!(b.burn_nonce(&nonce).await.unwrap());
+    assert!(b.burn_nonce(&nonce, &now).await.unwrap());
     second.close().await;
     let restarted = db.independent_pool().await;
+    let now = db_now_secs(&db.pool).await.to_string();
     assert!(!InternalActionStore::new(restarted.clone())
-        .burn_nonce(&nonce)
+        .burn_nonce(&nonce, &now)
         .await
         .unwrap());
     // Built dynamically so static analysis does not read a hard-coded nonce.
+    // A malformed (non-numeric) timestamp fails the commit-time freshness
+    // check even though the nonce format check runs first.
     let invalid_nonce = ["not", "a", "valid", "nonce"].join("-");
     assert_eq!(
-        a.burn_nonce(&invalid_nonce).await,
+        a.burn_nonce(&invalid_nonce, "not-a-timestamp").await,
         Err(InternalStoreError::InvalidInput)
     );
     restarted.close().await;
@@ -551,6 +690,9 @@ async fn audit_failures_roll_back_claim_and_terminal_without_leaking_details() {
     assert_eq!(terminal.get::<&str, _>("response_code"), "success");
     assert_eq!(terminal.get::<i32, _>("http_status"), 200);
     assert_eq!(terminal.get::<&str, _>("evidence_code"), "executor");
+    // Capture while the pool is still open: after `close` the burn fails at
+    // transaction begin (Unavailable) before any freshness logic runs.
+    let attempt = db_now_secs(&db.pool).await.to_string();
     db.pool.close().await;
     assert!(matches!(
         store.claim(&id, &subject()).await,
@@ -558,7 +700,7 @@ async fn audit_failures_roll_back_claim_and_terminal_without_leaking_details() {
     ));
     let nonce = body_hash(schema_name().as_bytes())[..32].to_owned();
     assert_eq!(
-        store.burn_nonce(&nonce).await,
+        store.burn_nonce(&nonce, &attempt).await,
         Err(InternalStoreError::Unavailable)
     );
     assert_eq!(

@@ -9,10 +9,15 @@ readiness HOLD.
 1. Authenticate the exact bytes and enforce timestamp skew using the domain
    layer. Never log the body or headers.
 2. Burn the authenticated nonce in the durable store **before** JSON parsing,
-   allowlist checks or rate buckets. A live duplicate or any storage error refuses
-   the request. The nonce digest is globally scoped, not scoped to the caller.
-   Its exclusive expiry covers the complete inclusive timestamp-skew window,
-   `(2 * SKEW_SECONDS + 1)` seconds (241 seconds with the current core constants).
+   allowlist checks or rate buckets, passing the exact authenticated timestamp
+   header through to the burn. A live duplicate, a stale attempt or any storage
+   error refuses the request. The nonce digest is globally scoped, not scoped
+   to the caller. Its exclusive expiry covers the complete inclusive
+   timestamp-skew window, `(2 * SKEW_SECONDS + 1)` seconds (241 seconds with
+   the current core constants). The burn re-checks freshness against database
+   time after any pool/row-lock wait and rolls back when the wait crossed out
+   of the skew window — a replay that lapsed mid-wait can never win a second
+   burn, so the receiver must not continue on any burn error.
 3. Apply key/action buckets, parse and validate caller/action/payload/permissions.
    Derive the request identity from the validated caller, idempotency key, action
    and **exact authenticated payload bytes**. The unique slot is `(caller digest,
@@ -34,8 +39,13 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
 
 - `InternalActionStore::new(PgPool)` reuses the application's pool; it does not
   connect, migrate or contact Discord.
-- `burn_nonce(&str) -> Result<bool, InternalStoreError>` validates the same
-  32-hex-character format as the core and stores only a globally unique digest.
+- `burn_nonce(nonce, timestamp) -> Result<bool, InternalStoreError>` validates
+  the same 32-hex-character format as the core and stores only a globally
+  unique digest. `timestamp` is the exact authenticated timestamp header: the
+  burn rolls back with `InvalidInput` when the attempt is no longer within
+  skew at commit time (database clock, whole-second `within_skew` semantics).
+  Only `Ok(true)` with a fresh timestamp authorizes the receiver to continue;
+  every error is a refusal.
 - `RequestIdentity::new(caller, key, action, authenticated_payload)` validates the
   caller/key bounds and core action allowlist, and hashes the exact signed bytes.
   Caller must be an authenticated **stable logical principal**; a rotating HMAC
