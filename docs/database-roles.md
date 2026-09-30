@@ -73,9 +73,14 @@ and revoking grants; do not copy a credential from another service if it fails.
 The plan is transactional and refuses unsafe existing groups instead of changing
 their login status or silently removing memberships. It contains no passwords.
 
-1. Apply `crates/cutover/migrations` with the dedicated migrator identity using the
-   established SQLx migration process (ledger in `public`). Apply `sql/web_v1.sql`
-   with `public` as the bot-table search path.
+1. For the first bootstrap, the authorized provisioning identity applies
+   `crates/cutover/migrations` through the established SQLx migration process
+   (ledger in `public`) and applies `sql/web_v1.sql` with `public` as the bot-table
+   search path. The full role plan requires those objects to exist. For later
+   migrations, the dedicated migrator login must `SET ROLE two_bot_migrator`
+   before creating objects: creator-specific default ACLs belong to the group,
+   not automatically to a member login. Reapply the reviewed plan after migrations
+   and view updates, then verify.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
