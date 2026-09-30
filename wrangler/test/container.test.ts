@@ -138,6 +138,52 @@ for (const path of ["/health", "/readyz"]) {
   });
 }
 
+for (const failure of ["lookup", "insert"] as const) {
+  for (const warm of [false, true]) {
+    for (const path of ["/health", "/readyz"]) {
+      for (const status of path === "/health" ? [200] : [200, 503]) {
+        test(`real SDK ${warm ? "warm" : "cold"} ${path} (${status}) still forwards on keepalive ${failure} failure`, async (t) => {
+          const h = await harness(t);
+          h.setProbeStatus(status);
+          if (warm) {
+            const response = await h.bot.fetch(new Request("https://worker.invalid/health"));
+            await response.arrayBuffer();
+            h.bot.deleteSchedules("keepalive");
+          }
+          const exec = h.ctx.storage.sql.exec;
+          let failing = true;
+          t.mock.method(h.ctx.storage.sql, "exec", (query: string, ...bindings: (string | number | null)[]) => {
+            const matches = failure === "lookup"
+              ? /SELECT \* FROM container_schedules WHERE callback =/.test(query)
+              : /INSERT OR REPLACE INTO container_schedules/.test(query);
+            if (failing && matches) {
+              throw new Error(`synthetic scheduling failure ${WORKER_ENV.DISCORD_TOKEN} ${WORKER_ENV.OPS_ALERT_WEBHOOK_URL}`);
+            }
+            return exec(query, ...bindings);
+          });
+          const forwardedBefore = h.requests.filter((r) => r.pathname === path).length;
+          const response = await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+          assert.equal(response.status, status, "monitoring must not replace the Container response");
+          assert.deepEqual(await response.json(), { ready: status === 200, gateway_connected: status === 200 });
+          assert.ok(h.requests.filter((r) => r.pathname === path).length > forwardedBefore);
+          assert.equal(h.starts.length, 1, "monitoring must not cause an extra startup");
+          assert.equal(h.pending().length, 0);
+          assert.ok(h.logs.includes(JSON.stringify({ event: "container_keepalive_arm_failed" })));
+          assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.OPS_ALERT_WEBHOOK_URL)));
+
+          failing = false;
+          const retry = await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+          assert.equal(retry.status, status);
+          await retry.arrayBuffer();
+          await h.bot.onStart();
+          assert.equal(h.pending().length, 1, "later requests/startup retry arming without duplicating the chain");
+          assert.equal(h.starts.length, 1);
+        });
+      }
+    }
+  }
+}
+
 test("cold keepalive passes env through the SDK's string-URL fetch path", async (t) => {
   const h = await harness(t);
   await tickKeepalive(h.bot);

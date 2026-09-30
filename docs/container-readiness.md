@@ -1,4 +1,6 @@
-# two-bot-next operations runbook
+# Container readiness monitoring
+
+Part of the [operations runbook](runbook.md#sustained-unready-alerts).
 
 ## Container stays unready
 
@@ -14,6 +16,13 @@ pending task without postponing it. Each firing replaces its task (and any old
 duplicate chains) with one successor; stale callbacks from the SDK's due-task
 snapshot do not probe or record another sample. Nonempty readiness JSON is
 drained, not cancelled, so the SDK's response proxy can settle cleanly.
+
+A schedule lookup or insertion failure emits the sanitized structured event
+`container_keepalive_arm_failed` without error details. It does not reject
+inbound health/readiness forwarding or the SDK's `onStart` startup hook; these
+still return the Container's own status/body. The coalesced arming attempt is
+released so later requests or startup can retry. This log is a monitoring outage
+signal, not a readiness sample or proof that a successor has been scheduled.
 
 ### Threshold and notifications
 

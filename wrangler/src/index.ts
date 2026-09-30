@@ -143,7 +143,12 @@ export class TwoBotContainer extends Container<Env> {
           startedAt: Date.now(),
         } satisfies KeepalivePayload);
       }
-    })().finally(() => { this.keepaliveArming = undefined; });
+    })().catch(() => {
+      // Monitoring setup must not replace health/readiness responses or fail
+      // SDK startup via onStart. Later callers retry; never log error details.
+      // https://developers.cloudflare.com/containers/api/container-class/#onstart
+      console.warn(JSON.stringify({ event: "container_keepalive_arm_failed" }));
+    }).finally(() => { this.keepaliveArming = undefined; });
     return this.keepaliveArming;
   }
 
