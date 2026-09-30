@@ -237,9 +237,7 @@ fn render_configuration() -> String {
         let (class, application) = match class {
             SettingClass::EnvOnly => ("env_only", "environment only"),
             SettingClass::Cold => ("cold", "restart"),
-            SettingClass::Hot if HOT_WIRED.contains(&key) => {
-                ("hot", "restart (reload-report hot)")
-            }
+            SettingClass::Hot if HOT_WIRED.contains(&key) => ("hot", "restart (reload-report hot)"),
             SettingClass::Hot => ("hot", "restart"),
         };
         let default = if is_secret_key(key) {
