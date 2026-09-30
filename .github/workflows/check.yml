@@ -47,7 +47,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          # The migration guard reads PR base/push-before blobs, including the lock.
+          fetch-depth: 0
+
+      - name: Check migration numbering and immutability
+        env:
+          MIGRATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
+          python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
       - name: offline build-cache safety regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
