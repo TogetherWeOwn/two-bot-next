@@ -334,6 +334,17 @@ fn digest_content(normalized: &str) -> u64 {
 }
 
 impl RepeatTracker {
+    /// Expire inactive authors as well as rows for the next observed author.
+    /// The runtime calls this with receipt time; an adapter can also call it
+    /// on its regular sweep so an idle guild retains no stale repeat history.
+    pub fn expire(&mut self, now_ms: u64, window_seconds: u64) {
+        let cutoff = now_ms.saturating_sub(window_seconds.saturating_mul(1000));
+        self.rows.retain(|_, rows| {
+            rows.retain(|row| row.at_ms >= cutoff);
+            !rows.is_empty()
+        });
+    }
+
     /// Record one message; `true` when `repeated_message_count` identical
     /// messages from this author fall inside the window (legacy
     /// `MemoryRepeatTracker.observe`). Position matters: the caller must

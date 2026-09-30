@@ -6,6 +6,7 @@
 //! or by future transports. Slices S3+ build on these seams.
 
 pub mod automod;
+pub mod automod_runtime;
 pub mod commands;
 pub mod config;
 pub mod events;
