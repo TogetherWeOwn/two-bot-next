@@ -447,7 +447,8 @@ impl ActionExecutor {
     }
 
     async fn pace(&self, kick_lane: bool) {
-        *self.paced_lane(kick_lane).await = std::time::Instant::now();
+        let mut last = self.paced_lane(kick_lane).await;
+        *last = std::time::Instant::now();
     }
 
     /// Keep the reservation through late authorization and the bounded send
