@@ -20,9 +20,16 @@ are the source evidence here.
   other paths enter the invite redirect handler (`wrangler/src/index.ts:164`).
   Redirects accept GET/HEAD only, so current `POST /internal/actions` returns
   405 rather than reaching an action receiver (`wrangler/src/redirect.ts:165`).
-- The Container router has only GET `/health` and GET `/readyz`
-  (`crates/bot/src/server.rs:21`). Readiness means process and gateway readiness,
+- The Container router serves GET `/health`, its alias GET `/healthz`, and GET
+  `/readyz` (`crates/bot/src/server.rs:24-26`). Axum `get()` routes also accept
+  HEAD with the body stripped, so HEAD on these paths is live on the direct
+  Container listener. Readiness means process and gateway readiness,
   not action-service, settings-store or general database readiness.
+  `/healthz` reaches the Container only there: the Worker forwards only exact
+  `/health` and `/readyz` to the DO (`wrangler/src/index.ts:172`), the DO
+  forwards only those two (`:106`), and at the Worker level `/healthz` is
+  answered statically by the redirect handler (`wrangler/src/redirect.ts:181`),
+  never proxied.
 - The Container DO independently refuses forwarding paths other than the two
   probes (`wrangler/src/index.ts:104`). Neither that forwarding policy nor the
   Worker secret whitelist currently admits internal actions.
@@ -251,11 +258,20 @@ change the legacy canonical format.
   requires bounded caller state and safe eviction/overflow behavior. Neither
   this bucket nor `max_instances=1` proves global rate enforcement. Source shows
   no application gate on public health/readiness.
-- Executor clones share 110 ms general / 350 ms kick pacing. Internal moderation
-  mutations are one attempt with a five-second timeout and no automatic retry;
-  generic paced GET/kick helpers have different retry semantics and 429 waits
-  can extend their lifetime (`crates/discord/src/executor.rs:449`, `:635`).
-  Pacing protects upstream quota; it is not action authorization or exactly-once.
+- The moderation `ActionExecutor` (`crates/discord/src/executor.rs`) paces its
+  own clones at 110 ms general / 350 ms kick, with one-attempt five-second-timeout
+  moderation mutations, retrying paced GET/kick helpers whose 429 waits can extend
+  their lifetime (`:449`, `:635`). The separate `AnnouncementExecutor`
+  (`crates/discord/src/internal_actions.rs:107`) is unpaced: one ten-second
+  attempt, no retries, and its `RateLimited(RateLimitCooldown)` outcome only
+  *reports* scope/timing — it installs no governor. Per-key HMAC buckets and
+  the terminal original intent do not stop *fresh* intents from firing into an
+  active global/channel cooldown, so before admitting independent intents the
+  receiver must feed every `RateLimitCooldown` into one shared per-bot-token
+  cooldown governor covering all callers, guild workers and Discord transports
+  ([executor contract](internal-action-executor.md:42-62); outcome dispositions
+  `:71-79`). Pacing protects upstream quota; it is not action authorization or
+  exactly-once. F7 requires the governor plus a multi-intent 429 acceptance case.
 - `assert_private_bind` accepts specific loopback/RFC1918/CGNAT/link-local IPv4,
   IPv6 loopback/ULA/link-local and mapped private IPv4; it refuses wildcard,
   public, hostname, malformed and host:port inputs with **no override**
@@ -375,7 +391,7 @@ Remaining proposals are intentionally **not implemented** here:
 | F4 / P2 rejection telemetry | Receiver implementer: scalar structured logger with bounded labels/suppression | Capture every rejection class with token/body/SQL marker fixtures; no marker or full input escapes and rejection flood stays bounded. |
 | F5 / P2 action-specific safety | Action owners: mapped event ownership, automation import schema/cardinality/overwrite transaction, key-specific setting validation, tempban recovery and lockdown/unlock overwrite serialization | Unmapped events, excessive imports, protected roles, invalid setting types, conflicting channel intents and unknown outcomes fail closed; legitimate operation/reconciliation has scalar evidence. |
 | F6 / P1 deployment gate | Deployment owner with CISO: verify secret custody, per-environment guild/DB/key bindings, least-privilege DB role and mandatory authenticated TLS for Neon | Record non-secret binding/TLS/role receipts on the deployment card; test only fixtures/CI or explicitly authorized staging. Source URL-prefix validation is not TLS or isolation proof. |
-| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: edge probe limits, global guild/caller quotas, bounded redirect caller-map/nonce/intent growth and total REST deadlines; preserve gateway resources | Local many-caller fixtures, including invalid-slug/unknown-campaign 404s and long simulated idle intervals, prove a fixed caller-state ceiling and idle reclamation. Define eviction/overflow behavior so churn cannot reset a depleted caller's quota or create unbounded work. Also prove bounded collection/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. No destructive live load tests. |
+| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: edge probe limits, global guild/caller quotas, bounded redirect caller-map/nonce/intent growth, a shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429, and total REST deadlines; preserve gateway resources | Local many-caller fixtures, including invalid-slug/unknown-campaign 404s and long simulated idle intervals, prove a fixed caller-state ceiling and idle reclamation. Define eviction/overflow behavior so churn cannot reset a depleted caller's quota or create unbounded work. Also prove bounded collection/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. Prove the 429 governor: first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent admitted before that cooldown elapses is held without a Discord send, then proceeds only after the cooldown closes; the original key stays terminal throughout. No destructive live load tests. |
 | F8 / P1 receiver clock-policy gate | Receiver/store owners with Security review: define fail-closed behavior for backwards freshness/expiry clocks (including DB time), bounded retention and safe recovery across restart/failover; TTL coverage is conditional | Accept a capture, expire/sweep/replace its nonce, then roll time back into its signed window: memory and durable paths must refuse, including across instance restart/failover and lock waits. Record the trusted clock/high-water or equivalent policy and recovery criteria; cleanup must not erase replay protection. Legitimate traffic resumes only under that verified policy. |
 
 F1/F2/F8 are requirements for the existing receiver slice, not new route work in
