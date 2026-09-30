@@ -36,7 +36,8 @@ pub enum RsvpStoreError {
 /// Upsert one RSVP row and report the transition (legacy `putRsvp` blind
 /// upsert, plus a locked read-back so going/interested/declined transitions
 /// are observable). Last writer wins on the row; concurrent same-key writers
-/// serialize on the row lock, so the reported `previous` is never torn.
+/// serialize on a transaction-scoped key lock even before the row exists,
+/// so the reported `previous` is never torn.
 /// Every call site also writes an audit row via [`write_audit`] — legacy
 /// audits every response, including repeats.
 pub async fn put_rsvp(
@@ -44,6 +45,18 @@ pub async fn put_rsvp(
     record: &RsvpRecord,
 ) -> Result<RsvpTransition, RsvpStoreError> {
     let mut tx = pool.begin().await?;
+    // FOR UPDATE cannot lock an absent row. Serialize the complete identity
+    // first; tuple encoding avoids delimiter ambiguity, and a hash collision
+    // only causes extra contention, never an incorrect transition.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            jsonb_build_array($1::text, $2::text, $3::text)::text, 0))",
+    )
+    .bind(&record.guild_id)
+    .bind(&record.event_id)
+    .bind(&record.user_id)
+    .execute(&mut *tx)
+    .await?;
     let previous: Option<String> = sqlx::query_scalar(
         "SELECT status FROM event_rsvps
          WHERE guild_id = $1 AND event_id = $2 AND user_id = $3 FOR UPDATE",
@@ -218,98 +231,82 @@ mod tests {
     use super::super::rsvp::{checkin_classification, AttendanceProof, RsvpStatus};
     use super::*;
 
-    /// Open an isolated test schema and apply the slice DDL. Returns `None`
-    /// (skip) unless `TWO_TEST_DATABASE_URL` points at Postgres — CI runs
-    /// without a database, so store tests must degrade to a skip, never fail.
-    async fn test_pool(schema: &str) -> Option<Pool<Postgres>> {
-        let url = std::env::var("TWO_TEST_DATABASE_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())?;
-        if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
-            return None;
-        }
-        // Schema names are fixed per-test identifiers; the guard below keeps
-        // them interpolation-safe (values always bind — only DDL names
-        // interpolate, and only after this check).
-        if !is_test_schema_name(schema) {
-            return None;
-        }
-        let admin = match PgPoolOptions::new().max_connections(1).connect(&url).await {
-            Ok(pool) => pool,
-            Err(e) => {
-                eprintln!("rsvp_store test setup: admin connect failed: {e}");
-                return None;
-            }
+    /// Only an absent URL skips the test. Configured setup failures are errors.
+    async fn test_pool(prefix: &str) -> Result<Option<(Pool<Postgres>, String)>, sqlx::Error> {
+        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(_) => panic!("TWO_TEST_DATABASE_URL must be Unicode"),
         };
-        // Idempotent setup: a crashed earlier run may have left this schema
-        // behind, and stale rows would pollute exact-count assertions.
-        // SAFETY: `schema` passed `is_test_schema_name`, so interpolation
-        // cannot break out of the identifier position.
-        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE"
-        )))
-        .execute(&admin)
-        .await
-        {
-            eprintln!("rsvp_store test setup: drop schema failed: {e}");
-            return None;
-        }
-        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await
-        {
-            eprintln!("rsvp_store test setup: create schema failed: {e}");
-            return None;
-        }
-        admin.close().await;
-        let mut options: PgConnectOptions = match url.parse() {
-            Ok(options) => options,
-            Err(e) => {
-                eprintln!("rsvp_store test setup: parse url failed: {e}");
-                return None;
-            }
-        };
-        options = options.options([("search_path", schema)]);
-        let pool = match PgPoolOptions::new()
+        test_pool_with_url(prefix, &url).await.map(Some)
+    }
+
+    async fn test_pool_with_url(
+        prefix: &str,
+        url: &str,
+    ) -> Result<(Pool<Postgres>, String), sqlx::Error> {
+        let options: PgConnectOptions = url.parse()?;
+        assert_eq!(
+            options.get_host(),
+            "agent-testdb",
+            "test-container-only URL"
+        );
+        assert_eq!(
+            options.get_username(),
+            "agent_test",
+            "test-container-only user"
+        );
+        // No shared fixed-name fixtures: each invocation owns its schema,
+        // including concurrent invocations of the same test in other processes.
+        static NEXT_SCHEMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let schema = format!(
+            "{prefix}_{}_{nonce}_{}",
+            std::process::id(),
+            NEXT_SCHEMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(is_test_schema_name(&schema), "safe unique test schema");
+        let admin = PgPoolOptions::new()
             .max_connections(1)
-            .connect_with(options)
-            .await
-        {
-            Ok(pool) => pool,
-            Err(e) => {
-                eprintln!("rsvp_store test setup: schema connect failed: {e}");
-                return None;
-            }
-        };
-        // `raw_sql` runs the whole multi-statement script at once (the same
-        // way `sqlx::migrate!` applies it in production); splitting on `;`
-        // would break on semicolons inside header comments.
-        let ddl = include_str!("../../cutover/migrations/0160_rsvp.sql");
-        if let Err(e) = sqlx::raw_sql(ddl).execute(&pool).await {
-            eprintln!("rsvp_store test setup: DDL failed: {e}");
-            return None;
-        }
-        Some(pool)
+            .connect_with(options.clone())
+            .await?;
+        // SAFETY: only the guarded identifier interpolates; values bind.
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(3)
+            .connect_with(options.options([("search_path", schema.as_str())]))
+            .await?;
+        // Execute the entire migration, including multi-statement DDL.
+        sqlx::raw_sql(include_str!("../../cutover/migrations/0160_rsvp.sql"))
+            .execute(&pool)
+            .await?;
+        Ok((pool, schema))
     }
 
     /// Test-only schema names: lowercase identifier characters, so DDL
     /// interpolation cannot break out of the identifier position.
     fn is_test_schema_name(schema: &str) -> bool {
         !schema.is_empty()
-            && schema.len() <= 40
+            && schema.len() <= 63
             && schema
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     }
 
     async fn drop_schema(pool: &Pool<Postgres>, schema: &str) {
-        if !is_test_schema_name(schema) {
-            return;
-        }
+        assert!(is_test_schema_name(schema));
         // SAFETY: guarded by `is_test_schema_name` (see `test_pool`).
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(pool)
-            .await;
+            .await
+            .expect("clean up owned test schema");
+        pool.close().await;
     }
 
     fn rsvp(status: RsvpStatus, user: &str, at: &str) -> RsvpRecord {
@@ -325,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn put_reports_new_then_change() {
         let schema = "tog_10083_rsvp_put";
-        let Some(pool) = test_pool(schema).await else {
+        let Some((pool, schema)) = test_pool(schema).await.expect("test database setup") else {
             eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
@@ -350,13 +347,139 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, RsvpStatus::Interested);
         assert_eq!(rows[0].responded_at, "2026-09-10T10:01:00.000Z");
-        drop_schema(&pool, schema).await;
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_responses_report_one_new_transition() {
+        let Some((pool, schema)) = test_pool("rsvp_concurrent")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let going = rsvp(RsvpStatus::Going, &schema, "2026-09-10T10:00:00.000Z");
+        let interested = RsvpRecord {
+            status: RsvpStatus::Interested,
+            ..going.clone()
+        };
+        // Hold the empty key before either writer starts. Both must wait here,
+        // not read an absent row then race their upserts with previous=None.
+        let mut guard = pool.begin().await.expect("guard transaction");
+        let guard_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *guard)
+            .await
+            .expect("guard pid");
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended(
+                jsonb_build_array($1::text, $2::text, $3::text)::text, 0))",
+        )
+        .bind(&going.guild_id)
+        .bind(&going.event_id)
+        .bind(&going.user_id)
+        .execute(&mut *guard)
+        .await
+        .expect("hold empty RSVP key");
+        let first_pool = pool.clone();
+        let first = tokio::spawn(async move { put_rsvp(&first_pool, &going).await });
+        let second_pool = pool.clone();
+        let second = tokio::spawn(async move { put_rsvp(&second_pool, &interested).await });
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM pg_locks waiter
+                     WHERE waiter.locktype = 'advisory' AND NOT waiter.granted
+                       AND (waiter.classid, waiter.objid, waiter.objsubid) IN
+                         (SELECT classid, objid, objsubid FROM pg_locks
+                          WHERE locktype = 'advisory' AND granted AND pid = $1)",
+                )
+                .bind(guard_pid)
+                .fetch_one(&mut *guard)
+                .await
+                .expect("key waiters");
+                if count == 2 {
+                    break;
+                }
+                if first.is_finished() || second.is_finished() {
+                    panic!("RSVP writer bypassed the empty-key lock");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        guard.commit().await.expect("release key");
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            (
+                first.await.expect("first task").expect("first write"),
+                second.await.expect("second task").expect("second write"),
+            )
+        })
+        .await
+        .expect("writers finish");
+        waiting.expect("both concurrent writers queued on empty key");
+        let (new, changed) = if first.is_new() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        assert!(new.is_new());
+        assert_eq!(changed.previous, Some(new.current));
+        assert!(changed.changed());
+        let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
+            .await
+            .expect("final RSVP");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, changed.current);
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn same_fixture_prefix_allocates_independent_schemas() {
+        let Some((first, first_schema)) = test_pool("rsvp_isolation").await.expect("first setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let record = rsvp(RsvpStatus::Going, "u1", "2026-09-10T10:00:00.000Z");
+        put_rsvp(&first, &record)
+            .await
+            .expect("first fixture write");
+        let (second, second_schema) = test_pool("rsvp_isolation")
+            .await
+            .expect("second setup")
+            .expect("configured");
+        assert_ne!(first_schema, second_schema);
+        assert_eq!(
+            list_rsvps(&first, &record.guild_id, &record.event_id)
+                .await
+                .expect("first fixture")
+                .len(),
+            1
+        );
+        assert!(list_rsvps(&second, &record.guild_id, &record.event_id)
+            .await
+            .expect("second fixture")
+            .is_empty());
+        drop_schema(&first, &first_schema).await;
+        assert!(put_rsvp(&second, &record)
+            .await
+            .expect("surviving fixture write")
+            .is_new());
+        drop_schema(&second, &second_schema).await;
+    }
+
+    #[tokio::test]
+    async fn configured_invalid_url_is_an_error_not_a_skip() {
+        for url in ["", "not a database URL"] {
+            assert!(test_pool_with_url("rsvp_invalid", url).await.is_err());
+        }
     }
 
     #[tokio::test]
     async fn list_orders_by_response_time_then_user() {
         let schema = "tog_10083_rsvp_list";
-        let Some(pool) = test_pool(schema).await else {
+        let Some((pool, schema)) = test_pool(schema).await.expect("test database setup") else {
             eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
@@ -380,13 +503,13 @@ mod tests {
         assert_eq!(totals.counts(), (1, 0, 1));
         assert_eq!(totals.going, ["u2"]);
         assert_eq!(totals.declined, ["u1"]);
-        drop_schema(&pool, schema).await;
+        drop_schema(&pool, &schema).await;
     }
 
     #[tokio::test]
     async fn audit_appends_every_response() {
         let schema = "tog_10083_rsvp_audit";
-        let Some(pool) = test_pool(schema).await else {
+        let Some((pool, schema)) = test_pool(schema).await.expect("test database setup") else {
             eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
@@ -405,13 +528,13 @@ mod tests {
         .await
         .expect("count");
         assert_eq!(count.0, 2);
-        drop_schema(&pool, schema).await;
+        drop_schema(&pool, &schema).await;
     }
 
     #[tokio::test]
     async fn checkin_dedupes_and_ignores_rsvp_proof() {
         let schema = "tog_10083_rsvp_checkin";
-        let Some(pool) = test_pool(schema).await else {
+        let Some((pool, schema)) = test_pool(schema).await.expect("test database setup") else {
             eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
@@ -447,6 +570,6 @@ mod tests {
             rows[0].3,
             r#"{"eventOccurrenceId":"event-1","proof":"host_checkin"}"#
         );
-        drop_schema(&pool, schema).await;
+        drop_schema(&pool, &schema).await;
     }
 }

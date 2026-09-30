@@ -7,6 +7,11 @@
 
 pub mod adapter;
 pub mod intents;
+pub mod pipeline;
 
 pub use adapter::event_to_core;
-pub use intents::{cache_resource_types, gateway_intents};
+pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
+pub use pipeline::{
+    build_cache, ChannelClassifier, InviteSource, MemPipeline, NoClassification, NoInvites,
+    Pipeline, PipelineSnapshots, ScriptedInvites,
+};
