@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/redirect.test.ts",
+    "test": "node --import ./test/cloudflare-loader.mjs --test test/*.test.ts",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev"
   },

@@ -1,9 +1,9 @@
 //! two-bot-next container entrypoint.
 //!
 //! Serves liveness (`/health`) and readiness (`/readyz`) and runs the gateway
-//! shard supervisor (S3). Without `DISCORD_TOKEN` the shard stays parked and
-//! `/readyz` reports `gateway: down` (HTTP 503) — the Container boots healthy
-//! on staging config either way.
+//! shard supervisor (S3). Without `DISCORD_TOKEN`, `DATABASE_URL`, or a nonzero
+//! `GUILD_ID` the shard stays parked and `/readyz` reports `gateway: down`
+//! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod gateway;
 #[cfg(test)]
@@ -45,62 +45,59 @@ async fn main() {
         Config {
             discord_token: None,
             database_url: None,
-            listen_addr: "0.0.0.0:8080".to_owned(),
+            // Gateway config errors must not move the listener away from
+            // the Worker probes and Docker healthcheck's configured address.
+            listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
             guild_id: None,
         }
     });
 
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
 
-    let gateway_task = if let Some(token) = config.discord_token.clone().filter(|t| !t.is_empty()) {
-        let database_url = config.database_url.clone();
-        let guild_id = config.guild_id;
-        let state = Arc::clone(&state);
-        Some(tokio::spawn(async move {
-            let result: Result<(), sqlx::Error> = async {
-                let url = database_url
-                    .as_deref()
-                    .filter(|url| !url.is_empty())
-                    .ok_or_else(|| {
-                        sqlx::Error::InvalidArgument(
-                            "DATABASE_URL required for gateway checkpoint".into(),
-                        )
-                    })?;
-                let guild_id = guild_id.filter(|id| *id != 0).ok_or_else(|| {
-                    sqlx::Error::InvalidArgument("GUILD_ID required for gateway checkpoint".into())
-                })?;
-                let db = two_bot_cutover::connect(url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
-                    .await?;
-                let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
-                    db.pool().clone(),
-                    guild_id.to_string(),
-                    0,
-                );
-                let saved = gateway::load_boot_session(&store).await?;
-                let pipeline = Arc::new(build_pipeline(store.milestones().await?));
-                let shard = build_shard(token, intents_from_env(), saved.as_ref());
-                info!(
-                    resume = saved.is_some(),
-                    "durable gateway initialized; shard connecting"
-                );
-                run_shard(shard, pipeline, Arc::clone(&state), store).await
-            }
-            .await;
-            if result.is_err() {
-                // Do not print sqlx errors: configuration errors may contain a URL.
-                tracing::error!(
-                    "durable gateway failed; checkpoint unchanged, readiness unavailable"
-                );
-                *state.write().await = GatewayState::Armed;
-            }
-            result
-        }))
-    } else {
-        info!(
-            status = ?ComponentStatus::Down,
-            "no discord token; gateway parked, /readyz reports down"
-        );
-        None
+    let gateway_task = match gateway_prerequisites(&config) {
+        Ok((token, url, guild_id)) => {
+            let token = token.to_owned();
+            let url = url.to_owned();
+            let state = Arc::clone(&state);
+            Some(tokio::spawn(async move {
+                let result: Result<(), sqlx::Error> = async {
+                    let db =
+                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
+                            .await?;
+                    let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
+                        db.pool().clone(),
+                        guild_id.to_string(),
+                        0,
+                    );
+                    let saved = gateway::load_boot_session(&store).await?;
+                    let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                    let shard = build_shard(token, intents_from_env(), saved.as_ref());
+                    info!(
+                        resume = saved.is_some(),
+                        "durable gateway initialized; shard connecting"
+                    );
+                    run_shard(shard, pipeline, Arc::clone(&state), store).await
+                }
+                .await;
+                if result.is_err() {
+                    // Do not print sqlx errors: configuration errors may contain a URL.
+                    tracing::error!(
+                        "durable gateway failed; checkpoint unchanged, readiness unavailable"
+                    );
+                    *state.write().await = GatewayState::Armed;
+                }
+                result
+            }))
+        }
+        Err(missing) => {
+            *state.write().await = GatewayState::Unconfigured;
+            info!(
+                missing,
+                status = ?ComponentStatus::Down,
+                "gateway prerequisites missing; gateway parked, /readyz reports down"
+            );
+            None
+        }
     };
 
     let http = serve(&config.listen_addr, state);
@@ -112,6 +109,23 @@ async fn main() {
         tracing::error!(error = %err, "container service failed");
         std::process::exit(1);
     }
+}
+
+/// Validate before spawning: missing bindings park the gateway, whereas a
+/// configured task's failures remain fatal. Errors contain binding names only.
+fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static str> {
+    let token = config
+        .discord_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .ok_or("DISCORD_TOKEN")?;
+    let url = config
+        .database_url
+        .as_deref()
+        .filter(|url| !url.is_empty())
+        .ok_or("DATABASE_URL")?;
+    let guild_id = config.guild_id.filter(|id| *id != 0).ok_or("GUILD_ID")?;
+    Ok((token, url, guild_id))
 }
 
 /// A configured gateway is essential: never leave a health-only zombie after
