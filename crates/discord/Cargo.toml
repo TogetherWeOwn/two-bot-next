@@ -10,6 +10,13 @@ license.workspace = true
 [dependencies]
 two-bot-core = { version = "0.1.0", path = "../core" }
 serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true }
+twilight-http = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 twilight-cache-inmemory = { workspace = true }
@@ -23,6 +30,6 @@ futures-util = { workspace = true, features = ["sink"] }
 rustls = { workspace = true }
 serde_json = { workspace = true }
 tokio-websockets = { workspace = true }
+tracing-subscriber = { workspace = true }
 twilight-gateway = { workspace = true }
-twilight-http = { workspace = true }
 twilight-model = { workspace = true }
