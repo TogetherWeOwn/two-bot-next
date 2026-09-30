@@ -50,7 +50,75 @@ explicitly from the legacy producer/projection instead:
 | `members.is_bot`, `inactive_flagged_at` | Human fixture (`0`); no inactivity job, so NULL. [e2e.funnel-accuracy.test.ts:147–156](https://github.com/TogetherWeOwn/two-bot/blob/96777468472f23a02a1e97a43ffab3912fe5df2a/test/e2e.funnel-accuracy.test.ts#L147-L156). |
 | Invite snapshot fields | Code/use count/channel come from the REST snapshot; timestamp is capture time. The same code in another guild is a separate row. [e2e.attribution-guild-scope.test.ts:124–129](https://github.com/TogetherWeOwn/two-bot/blob/96777468472f23a02a1e97a43ffab3912fe5df2a/test/e2e.attribution-guild-scope.test.ts#L124-L129). |
 
-Serial event IDs are database-owned and deliberately excluded; insertion order
-is checked by reading the rows in ID order. No other semantic row field should
-be normalized away. Timestamp rendering uses explicit UTC millisecond strings,
-and JSON metadata is compared structurally, preserving SQL NULL vs JSON objects.
+Serial event IDs and `recorded_at` are database-owned and deliberately excluded;
+insertion order is checked by reading the rows in ID order. No other semantic
+row field is normalized away. Timestamp rendering uses explicit UTC millisecond
+strings, and JSON metadata is compared structurally, preserving SQL NULL vs JSON
+objects. The Rust schema represents legacy's human flag as BOOLEAN (`false`),
+not the report fixture's numeric `0`.
+
+## Script and hand-computed totals
+
+The expectation lives in
+`crates/bot/src/gateway_tests/member_journey.golden.json`; the executable script
+is its sibling `member_journey.rs`. All stamps below are on 2026-09-30 UTC.
+
+| Time | Dispatch / expected consequence |
+| --- | --- |
+| 11:59:00–30 | Foreign guild `3333` creates `journey`, then member `77` joins pending. Counter becomes 8, inviter is 88. This is the same member/code as the main guild, not a manually seeded control. |
+| 11:59:40–50 | Main guild `2222` creates `side` and `journey`. Both snapshots must survive; inviter 99 and channel 4444 are retained. No funnel event is emitted for creation. |
+| 12:00:00 | Member 77 joins pending; REST counter `journey` increases 0→1 while `side` stays 0. One attributed join, no gate clear. Observation is at 12:00:05, so snapshot time differs from join time. |
+| 12:01:00 | Pending true→false: one gate event and member gate timestamp. A second cleared update at 12:01:30 adds nothing. |
+| 12:02, 03, 04, 05 | Four messages: first/second/third events only. The fourth updates activity; the observation clock is intentionally 12:06 while message payload times remain authoritative. |
+| 12:10 | Voice join A (5555): start then lifetime first-voice event. A same-channel mute update at 12:11 adds nothing. |
+| 12:20 | Move A→B (6666): end A (600 seconds), then start B at the same instant. A conflicting duplicate dispatch sequence is rejected before touching the cache. |
+| 12:25:30 | Leave B: known end, 330 seconds. |
+| 12:30 | Join A again: a start, not a second lifetime first-voice milestone. |
+| 12:40 | RESUMED: open count 1→0; no synthetic end event. The cached channel remains available. |
+| 12:41 | Leave A after resume: unknown-start end with both duration and start timestamp NULL. Never claim 660 seconds spanning an unproven outage. |
+| 13:00 | Leave guild: one gateway leave, member left timestamp; last activity stays 12:41. |
+
+Total: **14 events** (13 main + 1 foreign), **2 member projections**, **3 invite
+snapshots**. Main has 1 join + 1 gate + 3 message milestones + 3 voice starts +
+1 first-voice + 3 voice ends + 1 leave. The snapshot assertions run both after
+invite creation and at the end, catching accidental full-replacement deletion.
+The entire table is compared, not just selected rows or positive existence.
+
+The separate transactional regression distinguishes an unavailable snapshot
+(`None`, preserve rows) from a successful empty snapshot (`Some([])`, remove
+missing codes). A bad capture timestamp fails after funnel writes and proves
+snapshot/event/projection/checkpoint rollback. A foreign-guild snapshot is
+rejected by the same writer.
+
+## Minimal implementation seam and limits
+
+`Pipeline::handle_at` injects observation time without replacing gateway payload
+timestamps. Normal `handle` still observes the real clock. The store's optional
+snapshot hook stages successful REST replacements and invite-create upserts in
+`FunnelBatch`; `GatewaySessionStore::commit_dispatch` writes them with events,
+activity and the dispatch checkpoint in one transaction. Failed commits retain
+the existing fail-stop runner contract; do not continue a mutated pipeline after
+an SQL failure.
+
+This test uses `ScriptedInvites`, not live Discord REST. It proves the real
+pipeline-to-Postgres persistence path, **not** deployment, live invite fetching,
+or invite-baseline hydration on a cold process restart. Resume here means a
+RESUMED dispatch on the existing cache; the separate gateway recovery suite owns
+cold restart. Onboarding/leveling runtime effects remain out of scope.
+
+## Run and database containment
+
+```sh
+TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
+  cargo test -p two-bot --locked gateway_tests::member_journey \
+  -- --ignored --test-threads=1
+```
+
+`gateway_tests::TestDb::new` checks the dedicated URL before opening a connection,
+accepts only the test host/CI loopback and `agent_test` user/database, and creates
+an isolated schema. It never falls back to runtime `DATABASE_URL`. Both journey
+tests drop their own schema even when their assertions panic, then propagate the
+failure. The existing `Gateway restart and transaction tests`
+CI step includes this module, so these are executed tests, not silently skipped
+coverage on `check`. Build output belongs in a run-owned `CARGO_TARGET_DIR` and
+is removed at handoff; no shared cache should be deleted.
