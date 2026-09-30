@@ -7,6 +7,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[cfg(feature = "db-tests")]
+mod admission;
+
 const CHANNEL: &str = "333333333333333333";
 const MESSAGE: &str = "444444444444444444";
 
@@ -82,7 +85,7 @@ impl MockDiscord {
                                 name.eq_ignore_ascii_case("content-length")
                                     .then(|| value.trim().parse::<usize>().unwrap())
                             })
-                            .unwrap();
+                            .unwrap_or(0);
                         break (end + 4, length);
                     }
                 };
@@ -103,8 +106,11 @@ impl MockDiscord {
                         name.eq_ignore_ascii_case("user-agent")
                             .then(|| value.trim().to_owned())
                     }),
-                    body: serde_json::from_slice(&bytes[head_end..head_end + content_length])
-                        .unwrap(),
+                    body: if content_length == 0 {
+                        Value::Null
+                    } else {
+                        serde_json::from_slice(&bytes[head_end..head_end + content_length]).unwrap()
+                    },
                 });
                 if reply.disconnect {
                     continue;

@@ -656,6 +656,29 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+async fn governed_guild_config_api(
+    token: String,
+    guild_id: String,
+) -> Result<GuildConfigDiscordApi, String> {
+    let url = env_var("TWO_DATABASE_URL").ok_or("TWO_DATABASE_URL admission authority required")?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .map_err(|_| "Discord admission authority unavailable")?;
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(pool, &token)
+        .map_err(|error| error.to_string())?;
+    GuildConfigDiscordApi::with_admission(
+        env_var("GUILD_CONFIG_API_BASE").as_deref(),
+        env_var("GUILD_CONFIG_CDN_BASE").as_deref(),
+        token,
+        guild_config::STAGING_BOT_APPLICATION_ID.to_owned(),
+        guild_id,
+        std::sync::Arc::new(admission),
+    )
+    .map_err(|error| error.to_string())
+}
+
 async fn cmd_guild_config_snapshot() -> i32 {
     let token = match staging_token() {
         Ok(token) => token,
@@ -677,13 +700,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         }
     };
 
-    let api = match GuildConfigDiscordApi::new(
-        env_var("GUILD_CONFIG_API_BASE").as_deref(),
-        env_var("GUILD_CONFIG_CDN_BASE").as_deref(),
-        token,
-        guild_config::STAGING_BOT_APPLICATION_ID.to_owned(),
-        guild_id.clone(),
-    ) {
+    let api = match governed_guild_config_api(token, guild_id.clone()).await {
         Ok(api) => api,
         Err(err) => {
             eprintln!("guild-config-snapshot: {err}");
@@ -924,13 +941,7 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 2;
     }
 
-    let mut api = match GuildConfigDiscordApi::new(
-        env_var("GUILD_CONFIG_API_BASE").as_deref(),
-        env_var("GUILD_CONFIG_CDN_BASE").as_deref(),
-        token,
-        guild_config::STAGING_BOT_APPLICATION_ID.to_owned(),
-        guild_id.clone(),
-    ) {
+    let mut api = match governed_guild_config_api(token, guild_id.clone()).await {
         Ok(api) => api,
         Err(err) => {
             eprintln!("guild-config-restore: {err}");

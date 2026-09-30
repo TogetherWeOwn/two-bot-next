@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use twilight_http::error::{Error as TwilightError, ErrorType};
+use twilight_http::error::Error as TwilightError;
+use twilight_http::request::{Request, TryIntoRequest};
 use twilight_http::Client;
 use twilight_model::channel::message::Message;
 use twilight_model::channel::Channel;
@@ -23,6 +24,8 @@ use twilight_model::guild::invite::Invite;
 use twilight_model::guild::{Guild, Member};
 use twilight_model::id::marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker};
 use twilight_model::id::Id;
+use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
+use two_bot_discord::executor::HyperTransport;
 
 /// REST failure: transport/validation vs Discord API error vs body decode.
 #[derive(Debug, Error)]
@@ -30,7 +33,9 @@ pub enum RestError {
     #[error("discord request failed: {0}")]
     Twilight(#[from] TwilightError),
     #[error("discord response body unreadable: {0}")]
-    Body(#[from] twilight_http::response::DeserializeBodyError),
+    Body(#[from] serde_json::Error),
+    #[error("discord send refused: {0}")]
+    Wire(String),
 }
 
 /// Paced twilight client with legacy retry semantics.
@@ -42,13 +47,15 @@ pub struct RestClient {
 #[derive(Debug)]
 struct RestInner {
     client: Client,
+    transport: Result<HyperTransport, String>,
     min_interval: Duration,
     last_at: tokio::sync::Mutex<std::time::Instant>,
     requests: AtomicU64,
 }
 
 impl RestClient {
-    /// Build against real Discord.
+    /// Ungoverned compatibility constructor; live sends are refused. Runtime
+    /// CLI callers use `from_env` to bind the durable authority.
     #[must_use]
     pub fn new(token: String) -> Self {
         Self::with_proxy(token, None)
@@ -60,7 +67,43 @@ impl RestClient {
     /// so any scheme prefix is stripped here.
     #[must_use]
     pub fn with_proxy(token: String, proxy_url: Option<String>) -> Self {
-        let mut builder = Client::builder().token(token);
+        Self::build(token, proxy_url, None)
+    }
+
+    pub fn with_admission(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Arc<dyn SendAdmission>,
+    ) -> Self {
+        Self::build(token, proxy_url, Some(admission))
+    }
+
+    /// Administrative data targets may differ; admission must use the runtime's
+    /// TWO_DATABASE_URL authority, never the backfill/capture target database.
+    pub async fn from_env(token: String, proxy_url: Option<String>) -> Result<Self, RestError> {
+        let url = std::env::var("TWO_DATABASE_URL").map_err(|_| {
+            RestError::Wire("TWO_DATABASE_URL admission authority required".to_owned())
+        })?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .map_err(|_| RestError::Wire("admission authority unavailable".to_owned()))?;
+        let gate =
+            PgSendAdmission::new(pool, &token).map_err(|e| RestError::Wire(e.to_string()))?;
+        Ok(Self::with_admission(token, proxy_url, Arc::new(gate)))
+    }
+
+    fn build(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Option<Arc<dyn SendAdmission>>,
+    ) -> Self {
+        let transport = match admission {
+            Some(gate) => HyperTransport::with_admission(token.clone(), proxy_url.clone(), gate),
+            None => HyperTransport::with_proxy(token.clone(), proxy_url.clone()),
+        };
+        let mut builder = Client::builder().token(token).ratelimiter(None);
         if let Some(url) = proxy_url {
             let host = url
                 .trim_start_matches("http://")
@@ -71,6 +114,7 @@ impl RestClient {
         Self {
             inner: Arc::new(RestInner {
                 client: builder.build(),
+                transport,
                 min_interval: Duration::from_millis(110),
                 last_at: tokio::sync::Mutex::new(
                     std::time::Instant::now() - Duration::from_secs(60),
@@ -96,97 +140,47 @@ impl RestClient {
         *last = std::time::Instant::now();
     }
 
-    // twilight surfaces the Discord `retry-after` via the ratelimiter, which
-    // the tools bypass for one-shot pacing; 429s wait 1s + 250ms.
-
-    /// Classify a request error: `RetryKind::GiveUpNone` for 403/404 and
-    /// 5xx past the attempt budget, `RetryKind::Sleep` to retry after the
-    /// delay, `RetryKind::Fail` for anything else.
-    fn classify(&self, kind: &ErrorType, attempt: u32) -> RetryKind {
-        match kind {
-            ErrorType::Response { status, .. } => {
-                let code = status.get();
-                if code == 403 || code == 404 {
-                    RetryKind::GiveUpNone
-                } else if code == 429 {
-                    RetryKind::Sleep(Duration::from_millis(1250))
-                } else if code >= 500 {
-                    if attempt >= 4 {
-                        RetryKind::GiveUpNone
-                    } else {
-                        RetryKind::Sleep(backoff_duration(attempt))
-                    }
-                } else {
-                    RetryKind::Fail
+    /// Twilight is only a request factory: ResponseFuture hides 429 resends.
+    /// Every actual attempt instead passes through the governed raw transport.
+    async fn exec_one<T, F>(&self, make: F) -> Result<Option<T>, RestError>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn() -> Result<Request, TwilightError>,
+    {
+        let transport = self
+            .inner
+            .transport
+            .as_ref()
+            .map_err(|e| RestError::Wire(e.clone()))?;
+        for attempt in 0..=4 {
+            self.pace().await;
+            let request = make()?;
+            self.inner.requests.fetch_add(1, Ordering::Relaxed);
+            let res =
+                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
+                    .await
+                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
+                    .map_err(RestError::Wire)?;
+            match res.status {
+                200..=299 => return Ok(Some(serde_json::from_slice(&res.body)?)),
+                403 | 404 => return Ok(None),
+                429 if attempt < 4 => {
+                    tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await
                 }
-            }
-            _ => {
-                if attempt >= 4 {
-                    RetryKind::Fail
-                } else {
-                    RetryKind::Sleep(backoff_duration(attempt))
-                }
+                500..=599 if attempt < 4 => tokio::time::sleep(backoff_duration(attempt)).await,
+                500..=599 => return Ok(None),
+                _ => return Err(RestError::Wire(format!("HTTP {}", res.status))),
             }
         }
+        unreachable!("last attempt always returns")
     }
 
-    /// Run one list request with legacy retry semantics. `make` builds the
-    /// twilight request builder each attempt (builders are consumed by
-    /// `IntoFuture`, so they cannot be reused across retries).
-    async fn exec_list<T, F, Fut>(&self, make: F) -> Result<Option<Vec<T>>, RestError>
+    async fn exec_list<T, F>(&self, make: F) -> Result<Option<Vec<T>>, RestError>
     where
-        // `Unpin` is satisfied by every concrete twilight model; the bound
-        // exists because `ModelFuture` awaits the deserialized value by value.
-        T: serde::de::DeserializeOwned + Unpin,
-        F: Fn() -> Fut,
-        Fut: std::future::Future<
-            Output = Result<
-                twilight_http::Response<twilight_http::response::marker::ListBody<T>>,
-                TwilightError,
-            >,
-        >,
+        T: serde::de::DeserializeOwned,
+        F: Fn() -> Result<Request, TwilightError>,
     {
-        let mut attempt: u32 = 0;
-        loop {
-            self.pace().await;
-            self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            match make().await {
-                Ok(resp) => return Ok(Some(resp.models().await?)),
-                Err(e) => match self.classify(e.kind(), attempt) {
-                    RetryKind::Sleep(delay) => {
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                    }
-                    RetryKind::GiveUpNone => return Ok(None),
-                    RetryKind::Fail => return Err(RestError::Twilight(e)),
-                },
-            }
-        }
-    }
-
-    /// Run one single-model request with the same retry semantics.
-    async fn exec_one<T, F, Fut>(&self, make: F) -> Result<Option<T>, RestError>
-    where
-        T: serde::de::DeserializeOwned + Unpin,
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<twilight_http::Response<T>, TwilightError>>,
-    {
-        let mut attempt: u32 = 0;
-        loop {
-            self.pace().await;
-            self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            match make().await {
-                Ok(resp) => return Ok(Some(resp.model().await?)),
-                Err(e) => match self.classify(e.kind(), attempt) {
-                    RetryKind::Sleep(delay) => {
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                    }
-                    RetryKind::GiveUpNone => return Ok(None),
-                    RetryKind::Fail => return Err(RestError::Twilight(e)),
-                },
-            }
-        }
+        self.exec_one(make).await
     }
 
     /// Page a guild's full member list (`joined_at` is Discord's own record).
@@ -206,7 +200,7 @@ impl RestClient {
                     if let Some(a) = after {
                         req = req.after(a);
                     }
-                    async move { req.await }
+                    req.try_into_request()
                 })
                 .await?;
             let Some(batch) = page else {
@@ -233,7 +227,7 @@ impl RestClient {
     ) -> Result<Option<Vec<Invite>>, RestError> {
         self.exec_list(|| {
             let client = &self.inner.client;
-            async move { client.guild_invites(guild_id).await }
+            client.guild_invites(guild_id).try_into_request()
         })
         .await
     }
@@ -245,7 +239,7 @@ impl RestClient {
     ) -> Result<Option<Vec<Channel>>, RestError> {
         self.exec_list(|| {
             let client = &self.inner.client;
-            async move { client.guild_channels(guild_id).await }
+            client.guild_channels(guild_id).try_into_request()
         })
         .await
     }
@@ -254,7 +248,7 @@ impl RestClient {
     pub async fn guild(&self, guild_id: Id<GuildMarker>) -> Result<Option<Guild>, RestError> {
         self.exec_one(|| {
             let client = &self.inner.client;
-            async move { client.guild(guild_id).await }
+            client.guild(guild_id).try_into_request()
         })
         .await
     }
@@ -266,7 +260,7 @@ impl RestClient {
     ) -> Result<Option<twilight_model::channel::thread::ThreadsListing>, RestError> {
         self.exec_one(|| {
             let client = &self.inner.client;
-            async move { client.active_threads(guild_id).await }
+            client.active_threads(guild_id).try_into_request()
         })
         .await
     }
@@ -278,7 +272,10 @@ impl RestClient {
     ) -> Result<Option<twilight_model::channel::thread::ThreadsListing>, RestError> {
         self.exec_one(|| {
             let client = &self.inner.client;
-            async move { client.public_archived_threads(channel_id).limit(100).await }
+            client
+                .public_archived_threads(channel_id)
+                .limit(100)
+                .try_into_request()
         })
         .await
     }
@@ -307,20 +304,21 @@ impl RestClient {
                 Some(b) => {
                     self.exec_list(|| {
                         let client = &self.inner.client;
-                        async move {
-                            client
-                                .channel_messages(channel_id)
-                                .limit(100)
-                                .before(b)
-                                .await
-                        }
+                        client
+                            .channel_messages(channel_id)
+                            .limit(100)
+                            .before(b)
+                            .try_into_request()
                     })
                     .await?
                 }
                 None => {
                     self.exec_list(|| {
                         let client = &self.inner.client;
-                        async move { client.channel_messages(channel_id).limit(100).await }
+                        client
+                            .channel_messages(channel_id)
+                            .limit(100)
+                            .try_into_request()
                     })
                     .await?
                 }
@@ -352,13 +350,6 @@ impl RestClient {
             truncated,
         })
     }
-}
-
-/// Retry outcome for one failed attempt.
-enum RetryKind {
-    Sleep(Duration),
-    GiveUpNone,
-    Fail,
 }
 
 fn backoff_duration(attempt: u32) -> Duration {

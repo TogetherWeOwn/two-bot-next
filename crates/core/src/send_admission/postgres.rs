@@ -11,7 +11,10 @@ pub struct PgSendAdmission {
 
 impl PgSendAdmission {
     pub fn new(pool: PgPool, token: &str) -> Result<Self, AdmissionError> {
-        Ok(Self { pool, key: TokenKey::for_bot_token(token)? })
+        Ok(Self {
+            pool,
+            key: TokenKey::for_bot_token(token)?,
+        })
     }
 
     /// Monotonic external extension; never clears an occupied/indefinite lane.
@@ -45,7 +48,9 @@ fn finite_delay(cooldown: Option<SendCooldown>) -> Option<i64> {
 }
 
 impl SendAdmission for PgSendAdmission {
-    fn token_key(&self) -> &TokenKey { &self.key }
+    fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
 
     fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
         Box::pin(async move {
@@ -67,8 +72,13 @@ impl SendAdmission for PgSendAdmission {
             .await
             .map_err(|_| AdmissionError::Storage)?
             .ok_or(AdmissionError::Blocked)?;
-            let generation: i64 = row.try_get("generation").map_err(|_| AdmissionError::Storage)?;
-            Ok(AdmissionPermit::new(Box::new(PgCompletion { gate: self.clone(), generation })))
+            let generation: i64 = row
+                .try_get("generation")
+                .map_err(|_| AdmissionError::Storage)?;
+            Ok(AdmissionPermit::new(Box::new(PgCompletion {
+                gate: self.clone(),
+                generation,
+            })))
         })
     }
 }
@@ -79,7 +89,10 @@ struct PgCompletion {
 }
 
 impl SendCompletion for PgCompletion {
-    fn complete(self: Box<Self>, cooldown: Option<SendCooldown>) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+    fn complete(
+        self: Box<Self>,
+        cooldown: Option<SendCooldown>,
+    ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
         Box::pin(async move {
             let delay = finite_delay(cooldown);
             let indefinite = cooldown.is_some() && delay.is_none();
@@ -98,7 +111,9 @@ impl SendCompletion for PgCompletion {
             .execute(&self.gate.pool)
             .await
             .map_err(|_| AdmissionError::Storage)?;
-            if updated.rows_affected() != 1 { return Err(AdmissionError::StaleClaim); }
+            if updated.rows_affected() != 1 {
+                return Err(AdmissionError::StaleClaim);
+            }
             Ok(())
         })
     }

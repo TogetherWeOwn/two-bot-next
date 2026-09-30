@@ -223,7 +223,7 @@ pub trait RawSender: Send + Sync {
 /// (`twilight-http/src/client/connector.rs` with `rustls-platform-verifier`):
 /// platform-verifier TLS over `https_or_http` so plain-HTTP mock targets
 /// still connect, http1+http2 enabled.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HyperTransport {
     inner: HyperClient<
         hyper_rustls::HttpsConnector<HttpConnector>,
@@ -233,6 +233,14 @@ pub struct HyperTransport {
     host: String,
     token: String,
     admission: Option<Arc<dyn two_bot_core::send_admission::SendAdmission>>,
+}
+
+impl std::fmt::Debug for HyperTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HyperTransport")
+            .field("admission", &self.admission)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HyperTransport {
@@ -264,7 +272,9 @@ impl HyperTransport {
     ) -> Result<Self, String> {
         use two_bot_core::send_admission::{is_loopback_http, TokenKey};
         if let Some(admission) = &admission {
-            if admission.token_key() != &TokenKey::for_bot_token(&token).map_err(|e| e.to_string())? {
+            if admission.token_key()
+                != &TokenKey::for_bot_token(&token).map_err(|e| e.to_string())?
+            {
                 return Err("Discord send admission token mismatch".to_owned());
             }
         } else if !proxy_url.as_deref().is_some_and(is_loopback_http) {
@@ -331,7 +341,8 @@ impl HyperTransport {
         )
     }
 
-    async fn send_request(&self, request: &Request) -> Result<RawResponse, String> {
+    /// One governed wire attempt; no Twilight or pooled-connection resends.
+    pub async fn send_request(&self, request: &Request) -> Result<RawResponse, String> {
         use http_body_util::BodyExt as _;
         let method: http::Method = request
             .method()
@@ -341,11 +352,10 @@ impl HyperTransport {
         let url = self.url(request.path());
         let mut builder = hyper::Request::builder().method(method).uri(url);
         if let Some(headers) = builder.headers_mut() {
-            headers.insert(
-                hyper::header::AUTHORIZATION,
-                hyper::header::HeaderValue::from_str(&self.token)
-                    .map_err(|e| format!("bad token header: {e}"))?,
-            );
+            let mut authorization = hyper::header::HeaderValue::from_str(&self.token)
+                .map_err(|_| "bad token header".to_owned())?;
+            authorization.set_sensitive(true);
+            headers.insert(hyper::header::AUTHORIZATION, authorization);
             if let Some(bytes) = request.body() {
                 headers.insert(
                     hyper::header::CONTENT_LENGTH,
@@ -394,7 +404,7 @@ impl HyperTransport {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let collected = http_body_util::Limited::new(response.into_body(), 64 * 1024)
+        let collected = http_body_util::Limited::new(response.into_body(), 8 * 1024 * 1024)
             .collect()
             .await;
         let body = match collected {
@@ -404,18 +414,24 @@ impl HyperTransport {
             Err(_) if status == 429 => Vec::new(),
             Err(_) => return Err("Discord response body unavailable".to_owned()),
         };
-        let res = RawResponse { status, retry_after_header, body };
+        let res = RawResponse {
+            status,
+            retry_after_header,
+            body,
+        };
         if let Some(permit) = permit {
             let cooldown = (status == 429).then(|| {
                 two_bot_core::send_admission::cooldown_from_delays(
-                    res.retry_after_header.as_deref().and_then(|value| value.parse().ok()),
+                    res.retry_after_header
+                        .as_deref()
+                        .and_then(|value| value.parse().ok()),
                     res.body_retry_after_secs(),
                 )
             });
             if let Err(error) = permit.complete(cooldown).await {
                 tracing::warn!(%error, "Discord send admission completion failed; lane held");
-                // Retain a definitive 429, never turn it into a transport retry.
-                if status != 429 { return Err(error.to_string()); }
+                // Preserve the known exchange, especially definitive 429:
+                // storage failure must not turn it into a transport retry.
             }
         }
         Ok(res)

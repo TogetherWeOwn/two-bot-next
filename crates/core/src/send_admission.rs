@@ -18,7 +18,11 @@ pub struct TokenKey(String);
 impl TokenKey {
     pub fn for_bot_token(token: &str) -> Result<Self, AdmissionError> {
         let token = token.strip_prefix("Bot ").unwrap_or(token);
-        if token.is_empty() || token.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) {
+        if token.is_empty()
+            || token
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        {
             return Err(AdmissionError::Configuration);
         }
         let mut hash = Sha256::new();
@@ -96,7 +100,9 @@ impl AdmissionPermit {
 /// Unguarded fixtures can target only explicit loopback HTTP, never Discord.
 #[must_use]
 pub fn is_loopback_http(origin: &str) -> bool {
-    let Ok(url) = url::Url::parse(origin) else { return false };
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
     url.scheme() == "http"
         && url.username().is_empty()
         && url.password().is_none()
@@ -104,7 +110,10 @@ pub fn is_loopback_http(origin: &str) -> bool {
         && url.query().is_none()
         && url.fragment().is_none()
         && url.host_str().is_some_and(|host| {
-            host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
         })
 }
 
@@ -119,15 +128,36 @@ mod tests {
 
     #[test]
     fn canonical_namespace_and_closed_delay_rules() {
-        assert_eq!(TokenKey::for_bot_token("fixture"), TokenKey::for_bot_token("Bot fixture"));
-        assert_ne!(TokenKey::for_bot_token("fixture"), TokenKey::for_bot_token("other"));
+        assert_eq!(
+            TokenKey::for_bot_token("fixture"),
+            TokenKey::for_bot_token("Bot fixture")
+        );
+        assert_ne!(
+            TokenKey::for_bot_token("fixture"),
+            TokenKey::for_bot_token("other")
+        );
         assert!(TokenKey::for_bot_token("Bot ").is_err());
         assert!(TokenKey::for_bot_token("fixture\n").is_err());
-        assert_eq!(format!("{:?}", TokenKey::for_bot_token("fixture").unwrap()), "TokenKey([redacted])");
-        assert_eq!(cooldown_from_delays(Some(100.0), Some(0.1)), SendCooldown::FiniteMs(100_000));
-        assert_eq!(cooldown_from_delays(None, Some(-1.0)), SendCooldown::Indefinite);
-        assert_eq!(cooldown_from_delays(Some(f64::INFINITY), None), SendCooldown::Indefinite);
-        assert_eq!(cooldown_from_delays(None, Some(0.0001)), SendCooldown::FiniteMs(1));
+        assert_eq!(
+            format!("{:?}", TokenKey::for_bot_token("fixture").unwrap()),
+            "TokenKey([redacted])"
+        );
+        assert_eq!(
+            cooldown_from_delays(Some(100.0), Some(0.1)),
+            SendCooldown::FiniteMs(100_000)
+        );
+        assert_eq!(
+            cooldown_from_delays(None, Some(-1.0)),
+            SendCooldown::Indefinite
+        );
+        assert_eq!(
+            cooldown_from_delays(Some(f64::INFINITY), None),
+            SendCooldown::Indefinite
+        );
+        assert_eq!(
+            cooldown_from_delays(None, Some(0.0001)),
+            SendCooldown::FiniteMs(1)
+        );
         assert!(is_loopback_http("http://127.0.0.1:1234"));
         assert!(!is_loopback_http("https://discord.com"));
         assert!(!is_loopback_http("http://localhost.evil:1234"));

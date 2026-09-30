@@ -126,7 +126,9 @@ pub async fn request(
         .https_or_http()
         .enable_http1()
         .build();
-    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new())
+        .retry_canceled_requests(false)
+        .build(https);
 
     let mut builder = Request::builder().method(method).uri(url);
     for (name, value) in &headers {

@@ -246,7 +246,10 @@ impl AnnouncementExecutor {
             // receiver claim. A definitive 429 stays no-effect even if storage
             // fails: the already-committed occupied row blocks other sends.
             if !matches!(outcome, ExecutionOutcome::Unknown(_)) {
-                if !matches!(tokio::time::timeout_at(deadline, permit.complete(cooldown)).await, Ok(Ok(()))) {
+                if !matches!(
+                    tokio::time::timeout_at(deadline, permit.complete(cooldown)).await,
+                    Ok(Ok(()))
+                ) {
                     tracing::warn!("internal-action admission completion unavailable; lane held");
                 }
             }

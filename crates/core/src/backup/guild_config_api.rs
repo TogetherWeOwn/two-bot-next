@@ -11,8 +11,10 @@
 //! for the same reason legacy honoured it — a staging run against a mock is
 //! how the restore path is rehearsed without touching Discord.
 
+use crate::send_admission::{cooldown_from_delays, AdmissionError, SendAdmission, TokenKey};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use thiserror::Error;
 
 use super::guild_config_restore::RestorePlan;
@@ -29,6 +31,8 @@ pub enum GuildConfigApiError {
     Http(#[from] HttpError),
     #[error("{0}")]
     Discord(String),
+    #[error("{0}")]
+    Admission(#[from] AdmissionError),
 }
 
 /// Checked test-seam base: loopback only. Production default otherwise.
@@ -66,15 +70,23 @@ pub fn checked_base(
 }
 
 /// Discord REST/CDN client for one guild. Counts writes for restore evidence.
-#[derive(Debug)]
 pub struct GuildConfigDiscordApi {
     pub api_base: String,
     pub cdn_base: String,
-    pub token: String,
+    token: String,
+    admission: Option<Arc<dyn SendAdmission>>,
     pub application_id: String,
     pub guild_id: String,
     pub writes: u64,
     pub timeout_secs: u64,
+}
+
+impl std::fmt::Debug for GuildConfigDiscordApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuildConfigDiscordApi")
+            .field("writes", &self.writes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GuildConfigDiscordApi {
@@ -96,12 +108,29 @@ impl GuildConfigDiscordApi {
                 "GUILD_CONFIG_CDN_BASE",
                 "https://cdn.discordapp.com",
             )?,
-            token,
+            token: token.strip_prefix("Bot ").unwrap_or(&token).to_owned(),
+            admission: None,
             application_id,
             guild_id,
             writes: 0,
             timeout_secs: 30,
         })
+    }
+
+    pub fn with_admission(
+        api_base: Option<&str>,
+        cdn_base: Option<&str>,
+        token: String,
+        application_id: String,
+        guild_id: String,
+        admission: Arc<dyn SendAdmission>,
+    ) -> Result<Self, GuildConfigApiError> {
+        if admission.token_key() != &TokenKey::for_bot_token(&token)? {
+            return Err(AdmissionError::Configuration.into());
+        }
+        let mut api = Self::new(api_base, cdn_base, token, application_id, guild_id)?;
+        api.admission = Some(admission);
+        Ok(api)
     }
 
     fn auth_header(&self) -> (String, String) {
@@ -129,9 +158,35 @@ impl GuildConfigDiscordApi {
                 headers.pop();
             }
             let payload = body.clone().map(|b| b.to_string().into_bytes());
+            let permit = match &self.admission {
+                Some(admission) => Some(admission.admit().await?),
+                // `checked_base` enforces loopback on explicit test seams.
+                None if checked_base(Some(&self.api_base), "GUILD_CONFIG_API_BASE", "").is_ok() => {
+                    None
+                }
+                None => return Err(AdmissionError::Configuration.into()),
+            };
             let res =
                 http::request(method.clone(), &url, headers, payload, self.timeout_secs).await?;
             let status = res.status.as_u16();
+            if let Some(permit) = permit {
+                let cooldown = (status == 429).then(|| {
+                    cooldown_from_delays(
+                        res.header("retry-after")
+                            .and_then(|value| value.parse().ok()),
+                        res.json()
+                            .as_ref()
+                            .and_then(|body| body.get("retry_after"))
+                            .and_then(Value::as_f64),
+                    )
+                });
+                if let Err(error) = permit.complete(cooldown).await {
+                    if status == 429 {
+                        return Ok((status, res.json()));
+                    }
+                    return Err(error.into());
+                }
+            }
             if status != 429 {
                 return Ok((status, res.json()));
             }
@@ -578,12 +633,11 @@ impl GuildConfigDiscordApi {
         let roles_path = format!("{guild_path}/roles");
         let channels_path = format!("{guild_path}/channels");
         let emojis_path = format!("{guild_path}/emojis");
-        let (guild, roles, channels, emojis) = tokio::join!(
-            self.request_json("GET", &guild_path, None),
-            self.request_json("GET", &roles_path, None),
-            self.request_json("GET", &channels_path, None),
-            self.request_json("GET", &emojis_path, None),
-        );
+        // One token lane: do not compete with ourselves for admission.
+        let guild = self.request_json("GET", &guild_path, None).await;
+        let roles = self.request_json("GET", &roles_path, None).await;
+        let channels = self.request_json("GET", &channels_path, None).await;
+        let emojis = self.request_json("GET", &emojis_path, None).await;
         let (status, guild) = guild?;
         if status != 200 || guild.is_none() {
             return Err(GuildConfigApiError::Discord(format!(

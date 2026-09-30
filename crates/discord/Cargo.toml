@@ -26,8 +26,14 @@ twilight-gateway = { workspace = true }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
+[features]
+# Explicit service-DB acceptance lane; no credentialed Discord traffic.
+db-tests = ["two-bot-core/db"]
+
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
+sqlx = { workspace = true }
+two-bot-testsupport = { path = "../testsupport", version = "0.2.0" }
 futures-util = { workspace = true, features = ["sink"] }
 rustls = { workspace = true }
 serde_json = { workspace = true }

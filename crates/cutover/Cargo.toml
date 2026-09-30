@@ -14,7 +14,8 @@ license.workspace = true
 # path): cargo-deny `wildcards = "deny"` rejects version-less deps.
 
 [dependencies]
-two-bot-core = { version = "0.2.0", path = "../core" }
+two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
+two-bot-discord = { version = "0.2.0", path = "../discord" }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,6 +27,10 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
+
+[dev-dependencies]
+rustls = { workspace = true }
+two-bot-testsupport = { path = "../testsupport", version = "0.2.0" }
 
 [[bin]]
 name = "levels-import-mee6"
