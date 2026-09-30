@@ -17,6 +17,9 @@ pub mod health;
 pub mod invites;
 pub mod leveling;
 pub mod moderation;
+pub mod rsvp;
+#[cfg(feature = "db")]
+pub mod rsvp_store;
 pub mod self_roles;
 pub mod voice;
 
@@ -57,9 +60,21 @@ pub use moderation::{
     ModerationGates, ModerationPolicy, ModerationRequest, ModerationTarget, PolicyError,
     ReasonError, TargetProtection,
 };
+pub use rsvp::{
+    attendance_totals_text, checkin_classification, checkin_duplicate_text,
+    checkin_idempotency_key, checkin_metadata_json, checkin_recorded_text, checkin_source,
+    checkin_source_event_id, is_snowflake, partition_rsvps, require_manage_events, rsvp_saved_text,
+    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceProof,
+    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
+    ATTENDANCE_EVENT_TYPE, RSVP_AUDIT_ACTION,
+};
+#[cfg(feature = "db")]
+pub use rsvp_store::{
+    list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+};
 pub use self_roles::{
     emoji_identity, event_order_for_event_id, event_order_from_snowflake,
-    find_disallowed_permission, find_unsafe_channel_grant, is_snowflake, parse_self_role_custom_id,
+    find_disallowed_permission, find_unsafe_channel_grant, parse_self_role_custom_id,
     parse_self_role_panels, plan_select_delta, plan_self_role_change, reaction_endpoint_emoji,
     reaction_option_key, self_role_claim_owned, self_role_custom_id, self_role_renew_after_ms,
     self_role_reply, validate_panel_roles, validate_self_role_dispatch, ChannelOverwrite,

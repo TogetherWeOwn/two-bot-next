@@ -76,13 +76,24 @@ isolated `agent-testdb` Postgres service. No database port is published. The
 required `check` job waits for that result and fails on failure, cancellation
 or skip; the normal workspace test run alone still skips this opt-in test.
 
-The merged gateway/funnel pipeline at `main@0129b58` does not provide the S4
+The merged gateway/funnel pipeline at `main@eb88087` does not provide the S4
 interaction router or role-action executor. Those are tracked separately by
-TOG-10075 and TOG-10076. This PR remains domain/store-only as permitted by the
-slice contract; wire handlers, partial fetches and compensation through the
-shared seams after both land, never a feature-private dispatcher/HTTP client.
+[TOG-10075](/TOG/issues/TOG-10075) and
+[TOG-10076](/TOG/issues/TOG-10076).
+This PR remains domain/store-only as permitted by the slice contract.
+[TOG-10292](/TOG/issues/TOG-10292) owns the
+bounded runtime follow-up and is blocked on this slice and both shared seams.
+It wires handlers, partial fetches and compensation after all three merge,
+never a feature-private dispatcher/HTTP client.
 
 A Common Changelog entry and Conventional Commit feature checkpoints provide
-release notes. Release-please setup/closeout and non-author exact-SHA review
-remain delivery steps. No production guild, token, staging database or real
-Discord endpoint was used to verify this seam.
+release notes. Release-please installation and first automated release are
+owned by [TOG-10035](/TOG/issues/TOG-10035)
+and [PR #20](https://github.com/TogetherWeOwn/two-bot-next/pull/20), not a second
+feature-local workflow or version scheme. That implementation is not merged
+at the baseline above; its completed adverse review is not approval. This
+slice waits on that release-standard card before final review/closeout.
+Do not manually bump Cargo versions, publish tags or create a release.
+Non-author exact-SHA review and green required CI still gate squash merge.
+No production guild, token, staging database or real Discord endpoint was
+used to verify this seam.
