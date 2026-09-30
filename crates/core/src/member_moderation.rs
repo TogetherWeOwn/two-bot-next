@@ -1903,7 +1903,6 @@ mod tests {
     }
 
     const NOW: &str = "2023-11-14T22:13:20.000Z";
-    const DUE: &str = "2023-11-14T23:13:20.000Z";
 
     fn service(
         discord: MockMemberDiscord,

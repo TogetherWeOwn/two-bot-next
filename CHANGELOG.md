@@ -51,7 +51,13 @@
   staging. Permanent bans supersede older tempbans; failed refusal cleanup keeps
   a reconciliation fence instead of scheduling an unsafe unban.
 - Claim sweep jobs individually so cancellation cannot strand an undispatched
-  batch, and bound the final generated expiry reason with Unicode-safe truncation.
+  batch, and bound the final generated expiry reason with UTF-16-compatible,
+  Unicode-safe truncation.
+- Refuse new bans while a dispatched unban remains uncertain; confirmation cannot
+  erase running claims, which require exact-token authoritative reconciliation.
+- Upgrade legacy moderation TEXT timestamps in place without reactivating
+  quarantined imports, audit accepted effects before completion writes, and
+  release idempotency keys after definite pre-dispatch transaction rollback.
 
 ### Notes
 
