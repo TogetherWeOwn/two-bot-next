@@ -247,6 +247,28 @@ class MigrationTests(unittest.TestCase):
                 self.git("add", "crates")
                 self.git("commit", "-m", "Fixture regular paths")
 
+    def test_symlinked_lock_fails_in_tree_and_baseline(self):
+        lock = self.root / "migrations.lock"
+        moved = self.root / "real.lock"
+        lock.rename(moved)
+        lock.symlink_to(moved)
+        try:
+            self.assertIn("cannot be a symlink", self.cli(success=False))
+            self.git("init", "--initial-branch=main")
+            self.git("config", "user.name", "Migration fixture")
+            self.git("config", "user.email", "fixture@example.invalid")
+            self.git("config", "commit.gpgsign", "false")
+            self.git("add", "crates", "migrations.lock")
+            self.git("commit", "-m", "Fixture baseline")
+            ref = self.git("rev-parse", "HEAD")
+            lock.unlink()
+            moved.rename(lock)
+            self.assertIn("cannot be symlinks", self.cli("--base-ref", ref, success=False))
+        finally:
+            if lock.is_symlink():
+                lock.unlink()
+                moved.rename(lock)
+
     def test_workflow_compares_event_baseline_and_runs_fixtures(self):
         workflow = (SCRIPT.parent.parent / ".github/workflows/check.yml").read_text()
         step = workflow.split("- name: Check migration numbering and immutability", 1)[1].split("- name:", 1)[0]

@@ -72,8 +72,9 @@ on `main` pushes, and `origin/main` on manual dispatches (including release
 branches). Git history is fetched with `fetch-depth: 0`, as documented by
 [actions/checkout](https://github.com/actions/checkout#fetch-all-history-for-all-tags-and-branches).
 Missing Git baselines fail closed. Symlinked migrations and ancestors (including
-`crates` itself) are rejected in both the working tree and Git baseline, so Git
-and filesystem discovery cannot silently disagree. A baseline without
+`crates` itself), and a symlinked `migrations.lock` itself, are rejected in
+both the working tree and Git baseline, so Git and filesystem discovery cannot
+silently disagree. A baseline without
 `migrations.lock` is supported for the first introduction: baseline SQL bytes
 are still compared.
 

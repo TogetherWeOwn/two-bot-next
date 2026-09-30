@@ -94,8 +94,10 @@ def baseline(root, ref):
             continue
         metadata, path = record.split("\t", 1)
         parts = PurePosixPath(path).parts
-        if metadata.split()[0] == "120000" and parts[0] == "crates" and (len(parts) <= 2 or parts[2] == "migrations"):
-            raise MigrationError(f"{path}: baseline migrations and ancestors cannot be symlinks")
+        if metadata.split()[0] == "120000" and (
+            path == "migrations.lock" or (parts[0] == "crates" and (len(parts) <= 2 or parts[2] == "migrations"))
+        ):
+            raise MigrationError(f"{path}: baseline lock, migrations and ancestors cannot be symlinks")
         paths.append(path)
     migrations = {path: digest(git(root, "show", f"{revision}:{path}")) for path in paths if migration_path(path)}
     lock = read_lock(git(root, "show", f"{revision}:migrations.lock")) if "migrations.lock" in paths else {}
@@ -137,7 +139,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         migrations = read_migrations(args.root)
-        lock = read_lock((args.root / "migrations.lock").read_bytes())
+        lock_path = args.root / "migrations.lock"
+        if lock_path.is_symlink():
+            raise MigrationError(f"{lock_path}: migrations.lock cannot be a symlink")
+        lock = read_lock(lock_path.read_bytes())
         previous, previous_lock = baseline(args.root, args.base_ref) if args.base_ref else (None, None)
         validate(migrations, lock, previous, previous_lock)
     except (MigrationError, OSError) as error:
