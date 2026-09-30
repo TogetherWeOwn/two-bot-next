@@ -35,7 +35,8 @@ Create a B4 evidence manifest before scheduling:
 | Targets | Legacy Coolify UUID, Container/Worker environment and internal URLs, Discord application/guild IDs; verify current inventory, do not reuse historical IDs blindly |
 | Releases | Legacy image digest + commit, Next digest + reviewed head + merged commit, Worker version/config, required checks |
 | Data | Current canonical database, every writer (bot, web, queues, cron), table/key ownership, migration versions, snapshot IDs/hashes, restore receipt |
-| Registry | Global and each affected guild's complete command snapshots, intended diff, restore receipt |
+| Registry | Global/guild command-definition snapshots; separate guild permission snapshots (application defaults and per-command overrides); old→new command-ID map and restore/read-back receipts |
+| Ownership fence | Reviewed Worker/DO maintenance mechanism and version, singleton identity, persisted fence receipt, scheduled/startup-path rehearsal and explicit release owner |
 | Secret bindings | Existing Discord token binding, database binding, internal-action signing binding and intended consumers; never values |
 | Gates | Parity report, soak sign-off, W16 all-warm rollback drill, region/access sign-off, moderator sign-off |
 | Window | Freeze time `T_f`, Next first ready `T_0`, rollback freeze `T_r` if any, watch deadline `T_0 + 48 h`, named on-call coverage |
@@ -57,9 +58,16 @@ Create a B4 evidence manifest before scheduling:
 - [ ] Candidate is merged, independently reviewed on its exact head, and
   `check` (fmt, clippy `-D warnings`, tests, cargo-deny), `worker check`, `pr-lint`
   and `gitleaks` are green on that head. Pin the resulting deployment digest.
-- [ ] Each tool required below is merged into that candidate and its `--help`,
-  safety behavior and rollback have been rehearsed with disposable fixtures.
+- [ ] Each tool required below is merged into that candidate; its argument
+  parsing, safety behavior and rollback have been rehearsed with disposable
+  fixtures. Inspect source before invoking any help flag: in this baseline,
+  **only top-level `two-bot --help` is approved help-only inspection** (see below).
   A planned subcommand is **not executable evidence**.
+- [ ] A reviewed, rehearsed **Worker/DO ownership fence** blocks every Next
+  Container auto-start/reconnect path, persists across restarts/deployments and
+  stays active throughout legacy ownership. A stopped Container, disabled
+  external monitor or blocked public route alone is insufficient. The baseline
+  has no such fence; missing implementation/rehearsal is **NO-GO**.
 - [ ] Restore drill proves both database recovery and replay suppression, not
   just that a dump can be read. Data written by Next **and the web** during the
   watch can be read by legacy or reverse-reconciled without silent loss.
@@ -67,8 +75,11 @@ Create a B4 evidence manifest before scheduling:
   use that application and the agreed endpoint/signing contract. Secret
   provisioning is by an authorized principal, under existing grants; new
   credentials/rotation require the applicable reserved gate.
-- [ ] Command restoration is rehearsed for **both global and guild scopes**;
-  permission overrides and command IDs are accounted for. Full replacement
+- [ ] Command restoration is rehearsed for **both global and guild scopes**,
+  including the separate permissions procedure below. Verify existing authorized
+  OAuth2 Bearer access for permission restoration before any rename/removal;
+  the bot token is insufficient for that write. Missing access/mapping is NO-GO,
+  not permission to obtain/substitute another credential. Full replacement
   deletes omitted slash/user/message commands; no unrelated command is dropped.
 - [ ] A durable journal/watermark covers every affected table, deletes and
   side-effect ledger, or a tested shared-DB compatibility path preserves them.
@@ -96,9 +107,12 @@ that can mutate the copied data can be paused and resumed without duplication.
 application/guild through the authorized REST executor (no gateway startup).
 Capture token-valid/application identity, intent flags, role/channel results and
 session-start budget; FAIL is NO-GO, WARN needs a recorded disposition. Snapshot
-legacy configuration and command registry *before* any overwrite. Confirm the
-legacy restart path does not auto-register a different registry or resume a
-stale session. Reconfirm first Next boot has RESUME disabled (see below).
+legacy configuration, command definitions **and separate guild permissions**
+*before* any overwrite. Confirm the legacy restart path does not auto-register a
+different registry or resume a stale session. Verify the persisted Worker/DO
+fence already prevents Next startup while legacy owns the application, including
+health callers and already scheduled keepalive work. Reconfirm first Next boot
+has RESUME disabled (see below).
 
 ## Freeze and drain (T_f)
 
@@ -125,9 +139,18 @@ stale session. Reconfirm first Next boot has RESUME disabled (see below).
 
 ## Tool availability and command sheet
 
-Baseline checked: `44338b2` on 2026-09-30. Recheck the candidate source and
-`--help` at execution time. `two-bot` with no subcommand starts the server;
-`two-bot --help` describes the backup CLI. `two-bot serve` is **not** supported.
+Baseline checked: `44338b2` on 2026-09-30. Recheck candidate **source parsing**
+before invoking tools. `two-bot` with no subcommand starts the server;
+`two-bot serve` is **not** supported. For baseline help-only inspection, use
+**only `two-bot --help`** (top-level).
+
+Do **not** run `two-bot backup --help` or
+`two-bot guild-config-snapshot --help`: dispatch ignores their trailing arguments
+and executes the backup/prune/upload or Discord snapshot/upload instead. The
+usage comment claiming help after any subcommand is not the dispatch behavior:
+[argument dispatch](../crates/bot/src/backup_cli.rs#L129). Other binaries or future
+subcommand help paths require source/fixture verification before approval; a
+`--help` suffix is not a read-only safety boundary.
 
 ### Existing tools: limited recovery, not the full cutover data path
 
@@ -188,6 +211,48 @@ attach a reviewed, fixture-rehearsed execution/restore command sheet covering
 them before GO. Likewise, the merged generic backup is not a complete snapshot
 of all Next state; a backup upload receipt alone cannot satisfy the data gate.
 
+### Worker/DO ownership fence: required, not implemented in the baseline
+
+The Worker uses `@cloudflare/containers` **0.3.7**. Its health/readyz fetch calls
+`containerFetch`, which can auto-start the Container, and arms durable keepalive.
+The already scheduled `keepalive` calls `containerFetch("http://c/readyz")` and
+re-arms itself; `onStart` arms it too. Merely stopping the process, pausing an
+external monitor or changing public routing does **not** fence that durable work.
+Source: [fetch/auto-start](../wrangler/src/index.ts#L98),
+[keepalive/onStart](../wrangler/src/index.ts#L128),
+[version](../wrangler/package.json#L12).
+
+B4 must supply a reviewed execution sheet for a **persisted, fail-closed** fence
+covering Worker ingress, the singleton DO and every scheduled/SDK startup path.
+It must prevent Container startup/reconnect while fenced, not just reject bot
+commands inside an already connected gateway. Do not invent a maintenance env
+flag or clear DO storage/SDK alarms to approximate this missing capability.
+
+Required ordering and rehearsal receipts:
+
+1. **Before Next configuration/startup while legacy runs**, activate the fence
+   through the authorized deployment/control mechanism. Record the actual
+   Worker/DO version, singleton identity, persisted state and release owner.
+2. **Before stopping Next on rollback**, activate/confirm the fence, pause Next
+   health callers and drain admitted work. Account for already admitted fetches,
+   pending keepalive tasks and `onStart` races; the stop alone is insufficient.
+3. Rehearse on an isolated disposable target that health/readyz calls while
+   fenced return maintenance without `containerFetch`, pending scheduled work
+   cannot start/re-arm the Container, and DO eviction/restart plus a deployment
+   cannot lose the fence. Observe beyond at least two configured keepalive
+   intervals and verify terminal Container state and no new gateway session.
+   Production verification uses the authorized control-plane/log receipts, not
+   an unfenced Next health probe that might restart it.
+4. Keep the fence active **throughout legacy ownership**, including recovered
+   health watch, future deployments and retirement wait. Remove it only for an
+   explicit Next handoff after legacy and all other writers are fenced, data and
+   registry checks pass, and the lead authorizes the single Next startup.
+
+**No rehearsed durable fence = NO-GO** for cutover. If rollback cannot establish
+it, do not start legacy alongside an auto-restarting Next; preserve maintenance
+and escalate to the Director of Engineering. This PR documents the gate, not a
+fence implementation or an authorization to change the Worker.
+
 ### Runtime gates found in the baseline
 
 - Server binds `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID`, and optional
@@ -223,7 +288,9 @@ These are execution blockers to resolve on the implementation/acceptance cards,
 not features delivered by this documentation PR. Do not bypass them with a raw
 REST PUT, a forced dump restore or a manual database edit.
 
-For command snapshots/restoration, the authorized REST tool must cover:
+### Command definitions and separate guild permission recovery
+
+For **command definitions**, the authorized REST tool must cover:
 
 ```text
 GET /applications/{application.id}/commands?with_localizations=true
@@ -232,12 +299,65 @@ PUT /applications/{application.id}/commands
 PUT /applications/{application.id}/guilds/{guild.id}/commands
 ```
 
-Keep raw GET snapshots and separately validated PUT payloads: response-only
-fields and command-permission overrides require explicit handling; a GET JSON
-file is not automatically a tested restore request. Restore every affected
-scope, including user/message commands, not only slash commands. See the
-[official Discord command API](https://docs.discord.com/developers/interactions/application-commands)
-for bulk overwrite, localization and propagation semantics.
+Keep raw GET snapshots and separately validated PUT payloads; response-only
+fields require filtering. Restore every affected scope, including user/message
+commands, not only slash commands. A definition GET/PUT does **not** snapshot or
+restore guild role/user/channel overrides. Discord warns that **deleting or
+renaming a command permanently deletes its permissions**. Recreating a name
+alone cannot recover them.
+
+Before any rename/removal/overwrite, capture **separate permission snapshots**
+for every affected guild, including guild overrides on global commands:
+
+```text
+GET /applications/{application.id}/guilds/{guild.id}/commands/permissions
+GET /applications/{application.id}/guilds/{guild.id}/commands/{command.id}/permissions
+PUT /applications/{application.id}/guilds/{guild.id}/commands/{command.id}/permissions
+```
+
+The first GET captures all returned permission objects, including application
+ID defaults for commands without explicit overrides; the second supports
+per-command read-back. Retain role/user/channel IDs, types and allow/deny values,
+including `guild_id` (`@everyone`) and `guild_id - 1` (All Channels), plus whether
+a command is synced to defaults or has explicit overrides. Capture definitions
+and permissions as one frozen registry baseline; reconcile any concurrent admin
+change before proceeding.
+
+Recovery order through the authorized permission executor:
+
+1. Restore command definitions first; retain each API response's **actual** IDs.
+   Map old→new IDs by application, scope, guild (where applicable), command type
+   and name using the approved snapshot/rename mapping. Do not assume recreated
+   commands reuse old IDs or match only by name. Unmapped/ambiguous IDs are NO-GO.
+2. Reapply each explicit override set to the mapped command's per-command PUT
+   route with `{"permissions": [{"id": "<resource-id>", "type": 1,
+   "permission": false}]}` (illustrative shape only). PUT replaces that command's
+   overrides; use the complete saved array, not a partial patch. Do not convert
+   inherited defaults into explicit per-command overrides. The batch
+   `PUT .../commands/permissions` endpoint is **disabled** and is not a fallback.
+3. Verify application-level defaults and synced/unsynced behavior separately.
+   The docs describe application-ID objects on GET but do not establish an
+   application-ID PUT shortcut here. B4 must provide a separately authorized,
+   rehearsed preservation/restoration path for those defaults; do not invent a
+   command ID or endpoint. An unresolved default mismatch blocks reopening.
+4. Read back guild-wide and mapped per-command permissions and compare all
+   resource/type/allow tuples, default inheritance and command definitions to
+   the approved baseline. Record mapping and zero unexplained mismatches before
+   either cutover GO or reopening legacy commands.
+
+Permission **writes require an existing authorized OAuth2 Bearer token** with
+`applications.commands.permissions.update`, not the bot token used for command
+definitions. The authorizing user must have Manage Guild and Manage Roles,
+permission to run the edited command, and permission to manage the affected
+resources. Verify that authorized route in the rehearsal; never request/export
+credentials in arguments, reuse an unrelated credential or treat an access
+error as permission to substitute tokens. Missing scope/user authority/tooling
+means NO-GO and manager/CISO provisioning review, not an ad hoc bot-token PUT.
+
+Source: [official Discord permissions and API reference](https://docs.discord.com/developers/interactions/application-commands#permissions),
+including permission objects, per-command overwrite, disabled batch update and
+rename/delete warning. These routes describe requirements for the separately
+authorized tool; they are not executable commands or a credential grant.
 
 
 ## Data copy and verification
@@ -276,14 +396,19 @@ from which all subsequent Next/web writes will be reconciled.
 2. Review `commands diff` against the **live snapshot**, including localization,
    options, default permissions, contexts and every scope. Apply only the
    reviewed full desired registry through the authorized command executor.
-   Verify the returned registry and retained permission overrides. Record the
-   receipt; do not use an ordinary bot start as an undocumented sync step.
+   Verify the returned definitions and execute the separate guild permissions
+   mapping/restore/read-back procedure above, including defaults and overrides
+   on global commands. Record the receipts; do not use an ordinary bot start as
+   an undocumented sync step.
 3. Bind the existing application token and approved DB/signing secrets to
    Next through the secret service. Stage configuration while the gateway is
    stopped. First boot is a fresh IDENTIFY with **RESUME disabled**; never
    import legacy gateway session/sequence state. Ensure preflight/diff tooling
-   has not already started a gateway.
-4. Start **one** Next Container. Record first READY, gateway budget remaining,
+   has not already started a gateway; keep the Worker/DO fence active while
+   staging configuration.
+4. Reconfirm legacy is fenced and every data/registry/permission gate passed.
+   The lead then authorizes release of the Next Worker/DO fence and startup of
+   **one** Next Container. Record first READY, gateway budget remaining,
    process/gateway readiness, DB initialization and internal-action readiness.
    Check internal `/health` and `/readyz` and deployment/runtime logs. A 200
    proves only the components listed in its response, not every feature.
@@ -342,11 +467,17 @@ events missed while disconnected are a separate availability gap: record and
 reconcile recoverable events; do not claim IDENTIFY will replay them.
 
 1. Declare rollback and incident start time. Freeze **all** Next/web writers
-   and producers again; do not start legacy yet. Preserve queues, claims,
-   replay IDs, gateway state and logs. Drain admitted work, stop Next and
-   verify no replica/supervisor can reconnect it. Record `T_r` and final durable
-   watermarks; preserve a restricted snapshot of Next data. If the DB is
-   unavailable, leave writers stopped until capture/recovery is possible.
+   and producers again; do not start legacy yet. **Activate and verify the
+   persisted Worker/DO ownership fence before stopping Next**, following the
+   rehearsed procedure above. Pause Next health callers; fence pending keepalive,
+   admitted fetches, `onStart` and every SDK auto-start path. Preserve queues,
+   claims, replay IDs, gateway state and logs. Drain admitted work, stop Next,
+   then use control-plane/log receipts to verify terminal state and no reconnect
+   beyond the rehearsed keepalive horizon. An unfenced `/health` or `/readyz`
+   request can restart Next and is not a stopped-state probe. Record `T_r` and
+   final durable watermarks; preserve a restricted snapshot of Next data. Keep
+   the fence active throughout legacy ownership. If fence verification or DB
+   capture fails, keep maintenance closed; do not start legacy in uncertainty.
 2. Reconcile **every write since baseline**, including config updates and
    deletes, XP/levels, onboarding state, tickets/transcripts, schedules/feeds,
    moderation actions/unbans, voice ownership, audit and internal-action/web
@@ -369,20 +500,28 @@ reconcile recoverable events; do not claim IDENTIFY will replay them.
    messages, sanctions, role changes, unbans or web callbacks. Reconcile uncertain
    effects explicitly with moderators. Release/transfer leases only after old
    owners are fenced; drain overdue unbans once in the restored single consumer.
-4. Restore the complete legacy command registry in each affected global/guild
-   scope from the reviewed restore payload. Verify payload, IDs and permissions;
-   global propagation/read-repair may leave stale clients temporarily, whereas
+4. Restore complete legacy command definitions in each affected global/guild
+   scope from the reviewed payload. Then run the **separate guild permissions
+   recovery** above: map old IDs to restored IDs, restore per-command overrides
+   via the authorized Bearer executor, verify application defaults/inheritance
+   and read back every affected guild. Definition PUT alone is insufficient.
+   Keep commands frozen on missing authority or any unexplained mismatch.
+   Global propagation/read-repair may leave stale clients temporarily, whereas
    guild commands update immediately. Report that gap, not a second gateway.
 5. Restore pinned legacy image/config and the **reconciled** database binding.
    Preserve the existing application token. Read-only legacy preflight must
-   pass; confirm Next is stopped and session-start budget allows recovery.
+   pass; confirm the persisted Next Worker/DO fence remains active, Next is
+   stopped, and session-start budget allows recovery.
    Start one legacy gateway with its tested fresh-session/reconnect procedure,
    never with Next session state. Record first READY and verify health, real
    event continuity, internal actions and pending jobs before reopening writes.
 6. Resume producers/consumers once in the recorded order. Compare post-rollback
    watermarks and command registry, watch the recovered service for at least
    the measured drill recovery window, announce restored ownership and record
-   incident/loss/gap/reconciliation evidence on B4. Keep Next evidence intact.
+   incident/loss/gap/reconciliation evidence on B4. Keep Next evidence intact
+   **and its Worker/DO fence active**; recovered monitors target legacy, not an
+   auto-starting Next health route. Later deployment/retirement must not silently
+   release the fence while legacy still owns the application.
 
 If journal capture is incomplete or reverse reconciliation fails, keep affected
 writes in maintenance, preserve both data sets, and escalate a decision brief to
