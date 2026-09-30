@@ -2243,10 +2243,17 @@ dependencies = [
 name = "two-bot-discord"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "rustls",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-websockets",
  "tracing",
