@@ -1,36 +1,73 @@
 #![cfg(feature = "db")]
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{Pool, Postgres};
+use sqlx::{ConnectOptions, Pool, Postgres};
 use two_bot_core::feeds::*;
 use two_bot_core::feeds_store::*;
 
-fn test_options() -> PgConnectOptions {
-    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test database URL required");
-    let options: PgConnectOptions = url.parse().expect("valid test database URL");
-    assert_eq!(
-        options.get_host(),
-        "agent-testdb",
-        "test-container-only host"
-    );
-    assert_eq!(
-        options.get_username(),
-        "agent_test",
-        "test-container-only user"
-    );
-    assert_eq!(
-        options.get_database(),
-        Some("agent_test"),
-        "test-container-only database"
-    );
-    assert_eq!(options.get_port(), 5432, "test-container-only port");
-    options
+/// Test-container-only connection guard (P1 review fix): validate the
+/// EFFECTIVE parsed options, because sqlx applies query-string overrides
+/// (`?host=`, `?hostaddr=`, `?user=`, `?dbname=`, `?port=`, `?password=`)
+/// while parsing. A Unix-socket override such as
+/// `?host=/var/run/postgresql` would keep `get_host() == "agent-testdb"`
+/// while diverting setup/cleanup outside the disposable container, so
+/// sockets are rejected outright. Also forces the documented empty test
+/// password so an inherited `PGPASSWORD`/`.pgpass` credential can never
+/// leak into test connections.
+fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
+    let options: PgConnectOptions = url.parse().map_err(|_| "invalid test URL")?;
+    if options.get_host() != "agent-testdb" || options.get_socket().is_some() {
+        return Err("refusing non-test host");
+    }
+    if options.get_port() != 5432
+        || options.get_username() != "agent_test"
+        || options.get_database() != Some("agent_test")
+        || options
+            .to_url_lossy()
+            .password()
+            .is_some_and(|password| !password.is_empty())
+    {
+        return Err("refusing non-test database or credential");
+    }
+    // Never fall back to an inherited PGPASSWORD or .pgpass credential.
+    Ok(options.password(""))
+}
+
+#[test]
+fn feed_test_options_require_the_approved_container() {
+    assert!(test_options("postgres://agent_test:@agent-testdb:5432/agent_test").is_ok());
+    for url in [
+        "postgres://agent_test@production.example/testdb",
+        "postgres://agent_test:localhost@production.example/realdb",
+        "postgres://agent_test:@agent-testdb.production.example/agent_test",
+        "postgres://agent_test:@localhost/agent_test",
+        "postgres://agent_test:@127.0.0.1/agent_test",
+        "postgres://agent_test:@agent-testdb/agent_test?host=production.example",
+        "postgres://agent_test:@agent-testdb/agent_test?hostaddr=192.0.2.1",
+        "postgres://agent_test:@agent-testdb/agent_test?host=/var/run/postgresql",
+        "postgres://other_user:@agent-testdb/agent_test",
+        "postgres://agent_test:@agent-testdb/production",
+        "postgres://agent_test:@agent-testdb/agent_test?user=other_user",
+        "postgres://agent_test:@agent-testdb/agent_test?dbname=production",
+        "postgres://agent_test:@agent-testdb/agent_test?port=5433",
+        "postgres://agent_test:fixture-password@agent-testdb/agent_test",
+        "postgres://agent_test:@agent-testdb/agent_test?password=fixture-password",
+    ] {
+        assert!(
+            test_options(url).is_err(),
+            "unsafe test options were accepted"
+        );
+    }
+    // Documents the exact CI-provided URL form (no password segment).
+    assert!(test_options("postgres://agent_test@agent-testdb:5432/agent_test").is_ok());
 }
 
 async fn connect(schema: &str) -> Pool<Postgres> {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test database URL required");
+    let options = test_options(&url).expect("only documented agent-testdb options are allowed");
     PgPoolOptions::new()
         .max_connections(5)
-        .connect_with(test_options().options([("search_path", schema)]))
+        .connect_with(options.options([("search_path", schema)]))
         .await
         .expect("connect to test container")
 }

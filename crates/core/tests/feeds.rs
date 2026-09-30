@@ -276,7 +276,8 @@ fn atom_link_resolution_matches_legacy_resolve_link() {
 #[test]
 fn structured_guid_falls_through_to_id_like_legacy_text_value() {
     // Legacy textValue only reads the record's own #text: nested markup in
-    // <guid> contributes nothing, so the key falls through to the link URL.
+    // <guid> contributes its content but never shadows own text, so a
+    // mixed guid keeps "prepost" and falls through only when fully empty.
     let xml = "<rss><channel><item>\
         <guid><value>nested</value></guid><link>https://example.org/post</link>\
         </item></channel></rss>";
@@ -284,18 +285,63 @@ fn structured_guid_falls_through_to_id_like_legacy_text_value() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].key, "https://example.org/post");
     let xml = "<rss><channel><item>\
-        <guid><value>nested</value></guid><id>real-key</id>\
+        <guid>pre<value>nested</value>post</guid>\
         <link>https://example.org/post</link>\
         </item></channel></rss>";
     let items = parse_xml_feed(xml).unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].key, "real-key");
+    assert_eq!(items[0].key, "prepost");
     // Sanity: a plain-text guid still wins over id and link.
     let xml_plain = "<rss><channel><item>\
         <guid>guid-key</guid><id>id-key</id>\
         <link>https://example.org/post</link>\
         </item></channel></rss>";
     assert_eq!(parse_xml_feed(xml_plain).unwrap()[0].key, "guid-key");
+}
+
+#[test]
+fn numeric_references_keep_legacy_identity_for_delivery_dedupe() {
+    // Legacy parses with processEntities:false and only expands the five
+    // named escapes afterwards, so `<guid>post&#49;</guid>` keeps the raw
+    // `post&#49;` key (sha256 0a1314…). Decoding it to `post1` (0c99c0…)
+    // would bypass restored delivery dedupe and repost. Numeric and hex
+    // references survive everywhere; chained named escapes still decode
+    // exactly like legacy decodeXml (a&amp;lt;b -> a<b).
+    let xml = "<rss><channel><item>\
+        <guid>post&#49;</guid><title>a&amp;lt;b</title>\
+        <link>https://example.org/?a=1&amp;b=2</link>\
+        </item></channel></rss>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "post&#49;");
+    assert_eq!(items[0].title, "a<b");
+    assert_eq!(items[0].url, "https://example.org/?a=1&b=2");
+    assert_eq!(
+        item_key(&items[0]).unwrap(),
+        "0a13142831f76095730df8bee6c6961d78aa5e86b67f41e20dc5b95eb030040e"
+    );
+    // A restored legacy ledger row with this hash must match the fresh
+    // parse, so recovery reconciles instead of reposting.
+    let legacy = FeedItem {
+        key: "post&#49;".into(),
+        title: "a<b".into(),
+        url: "https://example.org/?a=1&b=2".into(),
+        published_at: None,
+    };
+    assert_eq!(item_key(&legacy).unwrap(), item_key(&items[0]).unwrap());
+    assert_eq!(
+        delivery_nonce("feed-1", &item_key(&items[0]).unwrap()),
+        delivery_nonce("feed-1", &item_key(&legacy).unwrap())
+    );
+    // Hex references and CDATA bodies also pass through untouched.
+    let xml = "<rss><channel><item>\
+        <guid>&#x41;&#65;</guid><title><![CDATA[cd&#50;]]></title>\
+        <link>https://example.org/post</link>\
+        </item></channel></rss>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "&#x41;&#65;");
+    assert_eq!(items[0].title, "cd&#50;");
 }
 
 #[test]
