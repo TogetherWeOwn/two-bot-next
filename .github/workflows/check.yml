@@ -120,6 +120,9 @@ jobs:
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
+      - name: legacy copy acceptance (two owned databases on CI service only)
+        run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
+
       - name: channel moderation store clippy
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
 
@@ -136,6 +139,9 @@ jobs:
 
       - name: Sticky runtime acceptance tests (CI service only)
         run: cargo test -p two-bot --locked sticky_runtime_tests -- --ignored --test-threads=1
+
+      - name: Real binary lifecycle acceptance (CI service only, under 60 s)
+        run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
