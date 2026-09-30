@@ -8,6 +8,12 @@ import { pathToFileURL } from 'node:url';
 const [clone, output] = process.argv.slice(2);
 if (!clone || !output) throw new Error('Usage: node scripts/export-legacy-registry.mjs <legacy-clone> <output>');
 const root = resolve(clone);
+// HEAD alone does not pin imported files. Refuse staged, unstaged and untracked
+// inputs; ignored npm dependencies are expected after the frozen-lockfile install.
+const dirty = execFileSync('git', [
+  '-C', root, 'status', '--porcelain=v1', '--untracked-files=all',
+], { encoding: 'utf8' }).trim();
+if (dirty) throw new Error(`Refusing dirty legacy clone; restore frozen source and lockfile:\n${dirty}`);
 const revision = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 if (revision !== 'd5d1179348feb9157bcac8c875de9399d4f5c76a') {
   throw new Error(`Expected docs/parity.md frozen legacy revision, got ${revision}`);
