@@ -55,7 +55,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     creator.name_template = "@@owner@@'s room; SELECT 'not SQL'".to_owned();
     creator.permission_source = PermissionSource::Channel(u64::MAX);
     creator.permission_channel_id = Some(u64::MAX);
-    creator.default_limit = 99;
+    creator.default_limit = Some(99);
     creator.private_default = true;
     creator.text_channels = true;
     creator.position = RoomPosition::Below;
@@ -63,7 +63,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     store.add_creator(&creator).await?;
     assert_eq!(store.creator_for(100, 200).await?, Some(creator.clone()));
     assert_eq!(store.creator_for(101, 200).await?, None);
-    creator.default_limit = 4;
+    creator.default_limit = Some(4);
     store.add_creator(&creator).await?;
     assert_eq!(store.creators(100).await?, vec![creator.clone()]);
     assert!(store.creators(101).await?.is_empty());
@@ -107,10 +107,14 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(restarted.remove_room(100, 500).await?, None);
     assert_eq!(restarted.rooms_in_guild(100).await?, vec![second]);
 
-    creator.default_limit = 100;
+    creator.default_limit = Some(100);
     assert!(store.add_creator(&creator).await.is_err());
-    creator.default_limit = 0;
+    creator.default_limit = Some(0);
     store.add_creator(&creator).await?;
+    assert_eq!(store.creator_for(100, 200).await?, Some(creator.clone()));
+    creator.default_limit = None;
+    store.add_creator(&creator).await?;
+    assert_eq!(store.creator_for(100, 200).await?, Some(creator.clone()));
     assert!(
         sqlx::query("UPDATE voice_creators SET default_limit = 100 WHERE guild_id = $1")
             .bind("100")

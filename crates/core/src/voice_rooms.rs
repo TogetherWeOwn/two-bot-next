@@ -70,8 +70,8 @@ pub struct CreatorChannel {
     pub permission_source: PermissionSource,
     /// Required only when `permission_source` is `Channel`.
     pub permission_channel_id: Option<Snowflake>,
-    /// Starting user limit for new rooms only (0 = unlimited).
-    pub default_limit: i64,
+    /// Starting user limit override (None = inherit creator, Some(0) = unlimited).
+    pub default_limit: Option<i64>,
     pub private_default: bool,
     pub text_channels: bool,
     pub position: RoomPosition,
@@ -81,7 +81,7 @@ pub struct CreatorChannel {
 }
 
 impl CreatorChannel {
-    /// Spec defaults: creator-source permissions, unlimited, public, no text
+    /// Spec defaults: creator-source permissions and limit, public, no text
     /// channel, rooms above, numbering from 1.
     #[must_use]
     pub fn new(guild_id: Snowflake, channel_id: Snowflake) -> Self {
@@ -91,7 +91,7 @@ impl CreatorChannel {
             name_template: String::new(),
             permission_source: PermissionSource::Creator,
             permission_channel_id: None,
-            default_limit: 0,
+            default_limit: None,
             private_default: false,
             text_channels: false,
             position: RoomPosition::Above,
@@ -102,8 +102,10 @@ impl CreatorChannel {
     /// Check the settings before storing (`/create` and the V8/V9 commands
     /// reject through here; the SQL CHECKs mirror these bounds).
     pub fn validate(&self) -> Result<(), CreatorSettingsError> {
-        if !(0..=MAX_USER_LIMIT).contains(&self.default_limit) {
-            return Err(CreatorSettingsError::LimitOutOfRange(self.default_limit));
+        if let Some(limit) = self.default_limit {
+            if !(0..=MAX_USER_LIMIT).contains(&limit) {
+                return Err(CreatorSettingsError::LimitOutOfRange(limit));
+            }
         }
         if self.first_room_number < 1 {
             return Err(CreatorSettingsError::NumberStartOutOfRange(
@@ -1282,7 +1284,7 @@ mod tests {
     fn mem_store_round_trips_creators_and_rooms() {
         let store = MemRoomStore::new();
         let mut c = creator();
-        c.default_limit = 4;
+        c.default_limit = Some(4);
         store.add_creator(c.clone());
         assert_eq!(store.creators(GUILD), vec![c.clone()]);
         assert_eq!(store.creator_for(GUILD, CREATOR), Some(c));
@@ -1305,7 +1307,7 @@ mod tests {
     fn creator_settings_validate() {
         assert!(creator().validate().is_ok());
         let mut bad = creator();
-        bad.default_limit = 100;
+        bad.default_limit = Some(100);
         assert_eq!(
             bad.validate(),
             Err(CreatorSettingsError::LimitOutOfRange(100))

@@ -55,7 +55,7 @@ impl PgRoomStore {
         .bind(&creator.name_template)
         .bind(source)
         .bind(creator.permission_channel_id.map(|id| id.to_string()))
-        .bind(creator.default_limit as i32)
+        .bind(creator.default_limit.map(|limit| limit as i32))
         .bind(creator.private_default)
         .bind(creator.text_channels)
         .bind(position)
@@ -229,7 +229,7 @@ fn decode_creator(row: &PgRow) -> Result<CreatorChannel, sqlx::Error> {
         name_template: row.try_get("name_template")?,
         permission_source,
         permission_channel_id,
-        default_limit: i64::from(row.try_get::<i32, _>("default_limit")?),
+        default_limit: row.try_get::<Option<i32>, _>("default_limit")?.map(i64::from),
         private_default: row.try_get("private_default")?,
         text_channels: row.try_get("text_channels")?,
         position,
