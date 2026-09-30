@@ -134,6 +134,9 @@ jobs:
       - name: Sticky runtime acceptance tests (CI service only)
         run: cargo test -p two-bot --locked sticky_runtime_tests -- --ignored --test-threads=1
 
+      - name: Real binary lifecycle acceptance (CI service only, under 60 s)
+        run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
+
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
       - name: cargo-deny
