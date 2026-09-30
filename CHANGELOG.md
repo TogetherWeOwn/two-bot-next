@@ -21,3 +21,4 @@
 - Serialize concurrent first RSVP responses before reading the previous status, including when no response row exists yet.
 - Fail configured RSVP database-test setup errors instead of silently skipping, and isolate each test invocation in its own schema.
 - Recover gateway sessions rejected with close codes 4007/4009, preserve the committed READY URL after endpoint fallback, and exit for Container restart when the essential gateway task stops instead of serving a healthy zombie.
+- Bound total checkpoint SQL waits to a heartbeat-safe deadline and report readiness unavailable while persistence is pending; fail closed and restore from committed state after a slow-database restart.

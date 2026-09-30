@@ -26,6 +26,7 @@ use crate::gateway::{
     build_pipeline, ensure_crypto_provider, load_boot_session, run_shard, GatewayState,
 };
 
+mod deadline;
 mod recovery;
 
 const GUILD: &str = "2222";

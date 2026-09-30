@@ -119,10 +119,46 @@ pub async fn load_boot_session(
     }
 }
 
+const CHECKPOINT_IO_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(serde::Deserialize)]
 struct Header {
     op: u8,
     s: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct HelloPacket {
+    d: Hello,
+}
+
+#[derive(serde::Deserialize)]
+struct Hello {
+    heartbeat_interval: u64,
+}
+
+/// Bound the entire SQL operation (pool acquire through COMMIT), not each query.
+/// Twilight only drives heartbeats while polled, so use at most a quarter of
+/// HELLO's interval and fail closed instead of waiting through missed heartbeats.
+/// Source: https://docs.rs/tokio/1/tokio/time/fn.timeout.html
+async fn checkpoint_io<T>(
+    state: &RwLock<GatewayState>,
+    deadline: std::time::Duration,
+    operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, sqlx::Error> {
+    let previous = {
+        let mut state = state.write().await;
+        let previous = *state;
+        *state = GatewayState::Armed;
+        previous
+    };
+    let result = tokio::time::timeout(deadline, operation)
+        .await
+        .map_err(|_| sqlx::Error::InvalidArgument("gateway checkpoint deadline exceeded".into()))?;
+    if result.is_ok() {
+        *state.write().await = previous;
+    }
+    result
 }
 
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
@@ -145,7 +181,8 @@ async fn run_loop(
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
 ) -> Result<(), sqlx::Error> {
-    let mut committed = store.load().await?;
+    let mut deadline = CHECKPOINT_IO_MAX;
+    let mut committed = checkpoint_io(state, deadline, store.load()).await?;
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
     while let Some(item) = shard.next().await {
         let message = match item {
@@ -176,7 +213,7 @@ async fn run_loop(
                 Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009)
             );
             if rejected || shard.session().is_none() {
-                store.clear().await?;
+                checkpoint_io(state, deadline, store.clear()).await?;
                 committed = None;
             }
             if rejected {
@@ -188,6 +225,17 @@ async fn run_loop(
         };
         let header: Header = serde_json::from_str(&text)
             .map_err(|_| sqlx::Error::InvalidArgument("invalid gateway header".into()))?;
+        if header.op == 10 {
+            let hello: HelloPacket = serde_json::from_str(&text)
+                .map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
+            if hello.d.heartbeat_interval == 0 {
+                return Err(sqlx::Error::InvalidArgument(
+                    "zero heartbeat interval".into(),
+                ));
+            }
+            deadline = CHECKPOINT_IO_MAX
+                .min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
+        }
         if header.op == 9 {
             let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
                 sqlx::Error::InvalidArgument("invalid gateway session packet".into())
@@ -197,7 +245,7 @@ async fn run_loop(
             })?;
             *state.write().await = GatewayState::Armed;
             if invalidates_session(resumable) {
-                store.clear().await?;
+                checkpoint_io(state, deadline, store.clear()).await?;
                 committed = None;
             }
         }
@@ -243,9 +291,12 @@ async fn run_loop(
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
         }
-        store
-            .commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch())
-            .await?;
+        checkpoint_io(
+            state,
+            deadline,
+            store.commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
+        )
+        .await?;
         committed = Some(checkpoint);
         if connected {
             *state.write().await = GatewayState::Connected;
@@ -322,6 +373,37 @@ mod tests {
             guild_id: None,
         });
         assert_eq!(state.status(), ComponentStatus::Down);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_io_deadline_includes_pending_operation_and_leaves_unready() {
+        let state = RwLock::new(GatewayState::Connected);
+        let result = checkpoint_io(
+            &state,
+            std::time::Duration::from_millis(10),
+            std::future::pending::<Result<(), sqlx::Error>>(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*state.read().await, GatewayState::Armed);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_io_restores_readiness_only_after_success() {
+        let state = RwLock::new(GatewayState::Connected);
+        checkpoint_io(&state, CHECKPOINT_IO_MAX, async {
+            assert_eq!(*state.read().await, GatewayState::Armed);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(*state.read().await, GatewayState::Connected);
+        let result = checkpoint_io(&state, CHECKPOINT_IO_MAX, async {
+            Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*state.read().await, GatewayState::Armed);
     }
 
     #[tokio::test]
