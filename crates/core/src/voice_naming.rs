@@ -125,6 +125,8 @@ pub enum Segment {
         singular: Template,
         plural: Template,
         counter: PluralCounter,
+        /// Preserve explicit separators, including those before an empty body.
+        has_separator: bool,
     },
     /// `[[a/b/c]]` seeded choice, or `[[list:name]]` seeded named-list pick.
     Choice(Choice),
@@ -176,9 +178,10 @@ pub enum Choice {
 /// A V6 conditional or styling node, carried opaquely through V5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Extension {
-    /// `{{...}}`: full source including the braces, plus a syntax-only body
-    /// for reserving random positions even when the conditional is skipped.
-    /// Condition and branch semantics remain the extension policy's job.
+    /// `{{...}}`: full source including the braces, plus the concatenated ASTs
+    /// of independently parsed branches, used only to reserve random positions.
+    /// Malformed syntax in one branch cannot consume the other branch's slots.
+    /// Condition truth remains the extension policy's job.
     Conditional { source: String, body: Template },
     /// `""modes:body""`: full source plus the split modes and body.
     Styled {
@@ -572,6 +575,7 @@ fn parse_plural(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
             singular: Template(singular),
             plural: Template(Vec::new()),
             counter: PluralCounter::Members,
+            has_separator: false,
         });
     }
     let counter = match cursor.bump_char()? {
@@ -592,12 +596,25 @@ fn parse_plural(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
         singular: Template(singular),
         plural: Template(plural),
         counter,
+        has_separator: true,
     })
 }
 
 /// Parse `[[a/b/c]]` or `[[list:name]]`, without rewinding malformed bodies.
 fn parse_choice(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
     cursor.pos += 2;
+    // List identifiers are literal keys, not nested templates. In particular,
+    // token case, plural separators and slashes must survive lookup unchanged.
+    if let Some(payload) = cursor.rest().strip_prefix("list:") {
+        if let Some(end) = payload.find("]]") {
+            let name = payload[..end].trim();
+            if !name.is_empty() {
+                let name = name.to_string();
+                cursor.pos += "list:".len() + end + 2;
+                return Some(Segment::Choice(Choice::NamedList(name)));
+            }
+        }
+    }
     let branch_stops = Stops {
         singles: &['/'],
         choice: true,
@@ -612,15 +629,6 @@ fn parse_choice(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
         }
         if !cursor.eat("/") {
             return None;
-        }
-    }
-    if options.len() == 1 {
-        let body = options[0].to_string();
-        if let Some(name) = body.strip_prefix("list:") {
-            let name = name.trim().to_string();
-            if !name.is_empty() {
-                return Some(Segment::Choice(Choice::NamedList(name)));
-            }
         }
     }
     Some(Segment::Choice(Choice::Options(options)))
@@ -685,19 +693,83 @@ fn parse_conditional(cursor: &mut Cursor, outer_depth: usize) -> Option<Segment>
             cursor.pos += 1;
             depth -= 1;
             if depth == 0 {
-                let mut body_cursor = Cursor::new(&cursor.src[start + 2..cursor.pos - 2]);
-                let body = Template(parse_segments(
-                    &mut body_cursor,
-                    Stops::NONE,
-                    outer_depth + 1,
-                ));
-                cursor.depth_exceeded |= body_cursor.depth_exceeded;
+                let inner = &cursor.src[start + 2..cursor.pos - 2];
+                let branches = conditional_branch_sources(inner);
+                let mut body = Template(Vec::new());
+                for branch in branches {
+                    let mut branch_cursor = Cursor::new(branch);
+                    for segment in parse_segments(&mut branch_cursor, Stops::NONE, outer_depth + 1)
+                    {
+                        if let (Some(Segment::Text(previous)), Segment::Text(next)) =
+                            (body.0.last_mut(), &segment)
+                        {
+                            previous.push_str(next);
+                        } else {
+                            body.0.push(segment);
+                        }
+                    }
+                    cursor.depth_exceeded |= branch_cursor.depth_exceeded;
+                }
                 return Some(Segment::Extension(Extension::Conditional {
                     source: cursor.src[start..cursor.pos].to_string(),
                     body,
                 }));
             }
         }
+    }
+    None
+}
+
+// Split syntax only: no condition truth is evaluated here. An unclosed V5
+// construct must not hide a conditional separator and swallow the next branch.
+fn conditional_branch_sources(inner: &str) -> Vec<&str> {
+    let Some(question) = conditional_separator(inner, "??") else {
+        return vec![inner];
+    };
+    let branches = &inner[question + 2..];
+    if let Some(slash) = conditional_separator(branches, "//") {
+        vec![&branches[..slash], &branches[slash + 2..]]
+    } else {
+        vec![branches]
+    }
+}
+
+fn conditional_separator(input: &str, separator: &str) -> Option<usize> {
+    // Index balanced spans in linear passes, not repeated lookahead from each
+    // malformed opener. This retains the source-length × depth parsing bound.
+    let mut ends = vec![None; input.len()];
+    for (open, close) in [
+        ("{{", "}}"),
+        ("[[", "]]"),
+        ("<<", ">>"),
+        ("__", "__"),
+        ("\"\"", "\"\""),
+    ] {
+        let mut stack = Vec::new();
+        let mut pos = 0;
+        while pos < input.len() {
+            let rest = &input[pos..];
+            if rest.starts_with(close) && !stack.is_empty() {
+                ends[stack.pop().expect("nonempty stack")] = Some(pos + close.len());
+                pos += close.len();
+            } else if rest.starts_with(open) {
+                stack.push(pos);
+                pos += open.len();
+            } else {
+                pos += rest.chars().next().expect("nonempty suffix").len_utf8();
+            }
+        }
+    }
+    let mut pos = 0;
+    while pos < input.len() {
+        let rest = &input[pos..];
+        if rest.starts_with(separator) {
+            return Some(pos);
+        }
+        // Balanced choices may contain empty options (`[[a//b]]`); unclosed
+        // constructs remain literal and cannot hide the next branch boundary.
+        pos = ends[pos]
+            .unwrap_or_else(|| pos + rest.chars().next().expect("nonempty suffix").len_utf8());
     }
     None
 }
@@ -767,6 +839,7 @@ fn display_template(segments: &[Segment]) -> String {
                 singular,
                 plural,
                 counter,
+                has_separator,
             } => {
                 let sep = match counter {
                     PluralCounter::Members => '/',
@@ -775,9 +848,9 @@ fn display_template(segments: &[Segment]) -> String {
                 };
                 out.push_str("<<");
                 out.push_str(&display_template(&singular.0));
-                // Separator-free member plurals parse to the same empty
-                // plural body. Do not grow them past the source-size bound.
-                if *counter != PluralCounter::Members || !plural.0.is_empty() {
+                // Omitting an explicit separator can move trailing `>` text
+                // outside the singular branch. Separator-free sources stay small.
+                if *has_separator {
                     out.push(sep);
                     out.push_str(&display_template(&plural.0));
                 }
@@ -878,6 +951,7 @@ fn render_segments<E: ExtensionPolicy>(
                 singular,
                 plural,
                 counter,
+                ..
             } => {
                 let count = match counter {
                     PluralCounter::Members => ctx.member_count,
@@ -934,7 +1008,9 @@ fn render_segments<E: ExtensionPolicy>(
             Segment::Extension(Extension::Conditional { source, body }) => {
                 let end = evaluation.dice_index + random_choice_count(body);
                 out.push_str(&ext.conditional(source, evaluation));
-                evaluation.dice_index = end;
+                // A policy can evaluate additional syntax; never reuse a slot
+                // it consumed even if it exceeds the syntax-only reservation.
+                evaluation.dice_index = evaluation.dice_index.max(end);
             }
             Segment::Extension(Extension::Styled {
                 source,
@@ -943,7 +1019,9 @@ fn render_segments<E: ExtensionPolicy>(
             }) => {
                 let end = evaluation.dice_index + random_choice_count(body);
                 out.push_str(&ext.styled(modes, body, source, evaluation));
-                evaluation.dice_index = end;
+                // A policy can evaluate additional syntax; never reuse a slot
+                // it consumed even if it exceeds the syntax-only reservation.
+                evaluation.dice_index = evaluation.dice_index.max(end);
             }
         }
     }
@@ -1554,6 +1632,192 @@ mod tests {
             ">>".repeat(MAX_TEMPLATE_DEPTH - 1)
         );
         assert_eq!(parse(&input), Template(vec![Segment::Text(input)]));
+    }
+
+    #[test]
+    fn empty_plural_separators_preserve_delimiter_boundaries() {
+        for input in [
+            "<<x>/>>",
+            "<<x/>>",
+            "<<x\\>>",
+            "<<x|>>",
+            "[[<<x>/>>/other]]",
+        ] {
+            let template = parse(input);
+            assert_eq!(template.to_string(), input);
+            let reparsed = parse(&template.to_string());
+            assert_eq!(template, reparsed, "input {input}");
+            for members in [0, 1, 2] {
+                let c = RoomContext {
+                    member_count: members,
+                    ..ctx()
+                };
+                assert_eq!(
+                    render(&template, &c, &PassthroughExtensions),
+                    render(&reparsed, &c, &PassthroughExtensions),
+                    "input {input}, members {members}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn named_list_keys_are_literal_source_payloads() {
+        for key in [
+            "<<x/>>",
+            "@@OWNER@@",
+            "<<x>/>>",
+            "maps/other",
+            "{{LIVE ?? x // y}}",
+        ] {
+            let mut c = ctx();
+            c.named_lists.insert(key.into(), vec!["chosen".into()]);
+            let input = format!("[[list:{key}]]");
+            let template = parse(&input);
+            assert_eq!(
+                template,
+                Template(vec![Segment::Choice(Choice::NamedList(key.into()))])
+            );
+            assert_eq!(template.to_string(), input);
+            assert_eq!(parse(&template.to_string()), template);
+            assert_eq!(render(&template, &c, &PassthroughExtensions), "chosen");
+        }
+    }
+
+    struct BranchExtensions;
+
+    impl ExtensionPolicy for BranchExtensions {
+        fn conditional(&self, source: &str, evaluation: &mut Evaluation<'_, Self>) -> String {
+            let body = source
+                .strip_prefix("{{LIVE ?? ")
+                .unwrap()
+                .strip_suffix("}}")
+                .unwrap();
+            let (yes, no) = body.rsplit_once(" // ").unwrap();
+            let branches = [parse(yes), parse(no)];
+            let selected = usize::from(evaluation.context().live_count == 0);
+            evaluation.evaluate_selected_branch(&branches, selected)
+        }
+
+        fn styled(
+            &self,
+            _modes: &str,
+            body: &Template,
+            _source: &str,
+            evaluation: &mut Evaluation<'_, Self>,
+        ) -> String {
+            evaluation.evaluate(body)
+        }
+    }
+
+    #[test]
+    fn conditional_reservations_parse_each_branch_independently() {
+        for (yes, no) in [
+            ("[[broken", "[[x/y]]"),
+            ("<<broken", "[[x/y]]"),
+            ("__broken", "[[x/y]]"),
+            ("\"\"identity:broken", "[[x/y]]"),
+            ("[[x/y]]", "[[broken"),
+        ] {
+            let branches = [parse(yes), parse(no)];
+            let input = format!("{{{{LIVE ?? {yes} // {no}}}}} · [[x/y]]");
+            let template = parse(&input);
+            // Inactive outer branches must use the same reservation count.
+            let plural = parse(&format!("<<{input}/many>> · [[x/y]]"));
+            for seed in 0..100 {
+                let mut c = RoomContext { seed, ..ctx() };
+                for selected in [0, 1] {
+                    c.live_count = u32::from(selected == 0);
+                    let mut expected = Evaluation::new(&c, &PassthroughExtensions);
+                    let body = expected.evaluate_selected_branch(&branches, selected);
+                    let trailing = expected.evaluate(&parse("[[x/y]]"));
+                    assert_eq!(
+                        render(&template, &c, &BranchExtensions),
+                        format!("{body} · {trailing}"),
+                        "seed {seed}, selected {selected}, {input}"
+                    );
+                    c.member_count = 1;
+                    let active = render(&plural, &c, &BranchExtensions);
+                    c.member_count = 2;
+                    let skipped = render(&plural, &c, &BranchExtensions);
+                    assert_eq!(active.rsplit(" · ").next(), skipped.rsplit(" · ").next());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_separators_ignore_balanced_nested_syntax() {
+        for (yes, no) in [
+            ("{{LIVE ?? [[a/b]] // [[c/d]]}}", "[[e/f]]"),
+            ("[[a/b]]", "{{LIVE ?? [[c/d]] // [[e/f]]}}"),
+            ("[[a//b]]", "[[c/d]]"),
+            ("<<a//b>>", "[[c/d]]"),
+            ("__a//b__", "[[c/d]]"),
+            ("\"\"identity:a//b\"\"", "[[c/d]]"),
+            ("é🎮 [[broken", "[[c/d]]"),
+        ] {
+            let inner = format!("LIVE ??{yes}//{no}");
+            assert_eq!(conditional_branch_sources(&inner), vec![yes, no]);
+            let template = parse(&format!("{{{{{inner}}}}}"));
+            assert_eq!(
+                random_choice_count(&template),
+                random_choice_count(&parse(yes)) + random_choice_count(&parse(no)),
+                "{inner}"
+            );
+            assert_eq!(parse(&template.to_string()), template);
+        }
+        assert_eq!(
+            conditional_branch_sources("LIVE ??[[a/b]]"),
+            vec!["[[a/b]]"]
+        );
+        for depth in [32, 500] {
+            let malformed = format!("LIVE ??{}//[[x/y]]", "[[".repeat(depth));
+            let branches = conditional_branch_sources(&malformed);
+            assert_eq!(branches[1], "[[x/y]]");
+            let input = format!("{{{{{malformed}}}}}");
+            if depth > MAX_TEMPLATE_DEPTH {
+                // The global nesting bound still makes the whole input literal.
+                assert_eq!(parse(&input), Template(vec![Segment::Text(input)]));
+            } else {
+                assert_eq!(random_choice_count(&parse(&input)), 1);
+            }
+        }
+    }
+
+    struct AdditionalSyntaxExtensions;
+
+    impl ExtensionPolicy for AdditionalSyntaxExtensions {
+        fn conditional(&self, _source: &str, evaluation: &mut Evaluation<'_, Self>) -> String {
+            evaluation.evaluate(&parse("[[x/y]] · [[x/y]]"))
+        }
+
+        fn styled(
+            &self,
+            _modes: &str,
+            _body: &Template,
+            _source: &str,
+            evaluation: &mut Evaluation<'_, Self>,
+        ) -> String {
+            evaluation.evaluate(&parse("[[x/y]] · [[x/y]]"))
+        }
+    }
+
+    #[test]
+    fn extension_callbacks_never_rewind_consumed_random_slots() {
+        for seed in 0..100 {
+            let c = RoomContext { seed, ..ctx() };
+            let expected = render_str("[[x/y]] · [[x/y]] · [[x/y]]", &c);
+            for input in [
+                "{{LIVE ?? plain}} · [[x/y]]",
+                "\"\"identity:plain\"\" · [[x/y]]",
+            ] {
+                assert_eq!(
+                    render(&parse(input), &c, &AdditionalSyntaxExtensions),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
