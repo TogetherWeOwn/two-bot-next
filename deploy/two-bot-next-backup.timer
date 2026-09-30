@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly two-bot-next database backup
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
