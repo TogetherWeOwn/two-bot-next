@@ -1,7 +1,7 @@
 //! Postgres gateway checkpoint + funnel batch transaction. Uses the existing
 //! cutover migrations and members projection rather than a second event store.
 //!
-//! sqlx 0.9 transaction executor: https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html
+//! sqlx 0.9 transaction executor: <https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html>
 
 use sqlx::{PgConnection, PgPool};
 use two_bot_core::gateway_funnel::FunnelBatch;
