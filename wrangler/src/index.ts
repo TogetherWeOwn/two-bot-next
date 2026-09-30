@@ -174,6 +174,11 @@ export default {
       return container.fetch(request);
     }
 
+    // Metrics are container-internal, never a public proxy or invite campaign.
+    if (url.pathname === "/metrics" || url.pathname.startsWith("/metrics/")) {
+      return new Response("not found", { status: 404 });
+    }
+
     // B3: everything else is a go.two.gg tracked link. Clicks record after
     // the 302 via waitUntil — the visitor never waits on the database, and a
     // failed write costs a click, never a member. Record failures are logged
