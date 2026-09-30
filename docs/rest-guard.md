@@ -18,7 +18,10 @@ Discord's IP-level invalid-request limit remains the outer safety boundary.
   10,000-invalid-requests/10-minute IP ban limit to hide a permission loop.
 - While open, non-essential REST attempts return
   `DiscordError::Guard(GuardError::CircuitOpen)` **before network I/O**. This is
-  safe pre-mutation, unlike a network timeout. The legacy paced GET/kick APIs
+  safe pre-mutation, unlike a network timeout. Sleeping admission callers wake
+  immediately when the breaker opens or the bot token becomes fatal, including
+  callers holding a paced lane or waiting for a global response body.
+  The legacy paced GET/kick APIs
   still render their existing string/value failure contracts and do not retry
   a guard refusal. There is no manual reset endpoint.
 - Only interaction callbacks are essential, so the bot can acknowledge/refuse
@@ -37,11 +40,14 @@ Recognize `X-RateLimit-Global: true`, `X-RateLimit-Scope: global`, JSON
 deadline from body `retry_after` seconds (wins over a valid `Retry-After` header)
 plus **250 ms** padding. Global headers install a pause **before reading the
 body**: header timing when usable, otherwise a provisional full-window pause.
-Body timing replaces only that response's provisional pause; it cannot shorten
-another response's restriction. Deadlines are anchored at header receipt, not
-restarted when a delayed body finishes or is cancelled. Concurrent waiters sleep
-to the same maximum deadline; they do not each add another delay. Body-only global
-signals are recognized when the body arrives. Paced callers retain their lane
+Admission stays closed until all global-header bodies resolve (or are cancelled),
+**even if provisional header timing expires first**. Body timing replaces only
+that response's provisional pause; it cannot shorten another response's
+restriction. Deadlines are anchored at header receipt, not restarted when a
+delayed body finishes or is cancelled. Concurrent waiters use the same maximum
+deadline; GET, kick and command-publish retries do not start an additional local
+429 delay after a global response body. Body-only global signals are recognized
+when the body arrives. Paced callers retain their lane
 reservation through global admission and recheck after pacing, so cooldown release
 preserves the 110 ms GET / 350 ms kick dispatch spacing. Local 429s retain the
 executor's existing lane/retry policy.
@@ -86,8 +92,9 @@ Structured tracing events: `discord_breaker_open`, `discord_breaker_close`,
 `discord_global_pause`, and `discord_token_invalid`. No route IDs, response
 bodies, or credentials are included. `RateLimitGuard::snapshot()` exposes the
 rolling invalid count, lifetime invalid/refused/open/close/global-pause counters,
-open/fatal flags and remaining global cooldown for the metrics exporter. No
-metrics endpoint exists in this base slice; no new public endpoint is added.
+open/fatal flags, remaining global cooldown and `pending_global_responses` for
+the metrics exporter. A pending global body still blocks admission when its
+provisional remaining time is zero. No metrics endpoint exists in this base slice; no new public endpoint is added.
 
 Local fixtures only:
 

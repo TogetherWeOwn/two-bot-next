@@ -303,7 +303,7 @@ impl HyperTransport {
         )
     }
 
-    async fn send_request(&self, request: &Request) -> Result<RawResponse, String> {
+    async fn send_request(&self, request: &Request) -> Result<(RawResponse, bool), String> {
         use http_body_util::BodyExt as _;
         let method: http::Method = request
             .method()
@@ -378,8 +378,8 @@ impl HyperTransport {
             retry_after_header,
             body: collected.to_bytes().to_vec(),
         };
-        accounting.finish(&response);
-        Ok(response)
+        let global = accounting.finish(&response);
+        Ok((response, global))
     }
 }
 
@@ -508,7 +508,7 @@ impl ActionExecutor {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    async fn send_admitted(&self, request: &Request) -> Result<RawResponse, DiscordError> {
+    async fn send_admitted(&self, request: &Request) -> Result<(RawResponse, bool), DiscordError> {
         self.count();
         self.inner
             .transport
@@ -521,7 +521,7 @@ impl ActionExecutor {
         &self,
         request: &Request,
         kick_lane: bool,
-    ) -> Result<RawResponse, DiscordError> {
+    ) -> Result<(RawResponse, bool), DiscordError> {
         self.admit(request, Some(kick_lane)).await?;
         self.send_admitted(request).await
     }
@@ -530,7 +530,7 @@ impl ActionExecutor {
         &self,
         request: &Request,
         lane: Option<bool>,
-    ) -> Result<RawResponse, DiscordError> {
+    ) -> Result<(RawResponse, bool), DiscordError> {
         let deadline = tokio::time::Instant::now() + self.inner.moderation_timeout;
         tokio::time::timeout_at(deadline, self.admit(request, lane))
             .await
@@ -575,7 +575,7 @@ impl ActionExecutor {
         request: Request,
         accepted: &[u16],
     ) -> Result<RawResponse, DiscordError> {
-        let res = self.send_with_timeout(&request, None).await?;
+        let (res, _) = self.send_with_timeout(&request, None).await?;
         if accepted.contains(&res.status) {
             return Ok(res);
         }
@@ -725,7 +725,7 @@ impl ActionExecutor {
                     }
                 }
             };
-            let res = match self.send_paced(&request, true).await {
+            let (res, global) = match self.send_paced(&request, true).await {
                 Ok(r) => r,
                 Err(DiscordError::Guard(error)) => {
                     return KickResult {
@@ -782,7 +782,6 @@ impl ActionExecutor {
                     }
                 }
                 KickStatus::RateLimited => {
-                    let wait = res.retry_after_wait_ms();
                     if attempts > MAX_HTTP_TRIES - 1 {
                         return KickResult {
                             outcome: KickOutcome::RateLimited,
@@ -791,7 +790,11 @@ impl ActionExecutor {
                             attempts,
                         };
                     }
-                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                    // Global retries use the header-anchored shared deadline
+                    // at next admission; only route-local 429s start a new wait.
+                    if !global {
+                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    }
                 }
                 KickStatus::ServerError => {
                     if attempts > MAX_HTTP_TRIES - 1 {
@@ -843,7 +846,7 @@ impl ActionExecutor {
         let mut attempt: u32 = 0;
         loop {
             let request = Request::from_route(&route);
-            let res = match self.send_paced(&request, false).await {
+            let (res, global) = match self.send_paced(&request, false).await {
                 Ok(r) => r,
                 Err(DiscordError::Guard(error)) => return Err(error.to_string()),
                 Err(detail) => {
@@ -858,7 +861,9 @@ impl ActionExecutor {
             match res.status {
                 200..=299 => return Ok(serde_json::from_slice(&res.body).ok()),
                 429 => {
-                    tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    if !global {
+                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    }
                 }
                 403 | 404 => return Ok(None),
                 500..=599 => {
@@ -1256,14 +1261,16 @@ impl ActionExecutor {
         // back off within the same budget as kicks.
         let mut attempts: u32 = 0;
         loop {
-            let res = self.send_with_timeout(&req, Some(false)).await?;
+            let (res, global) = self.send_with_timeout(&req, Some(false)).await?;
             match res.status {
                 200..=299 => return Ok(()),
                 429 => {
                     if attempts >= MAX_HTTP_TRIES - 1 {
                         return Err(DiscordError::RateLimited);
                     }
-                    tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    if !global {
+                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    }
                     attempts += 1;
                 }
                 500..=599 => {
@@ -1296,7 +1303,7 @@ impl ActionExecutor {
                 .create_response(interaction_id, interaction_token, response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        let res = self.send_with_timeout(&req, None).await?;
+        let (res, _) = self.send_with_timeout(&req, None).await?;
         match res.status {
             200..=299 => Ok(()),
             _ => Err(throw_for_status(&res)),

@@ -53,6 +53,9 @@ pub struct GuardSnapshot {
     pub breaker_open: bool,
     pub token_invalid: bool,
     pub global_pause_remaining: Duration,
+    /// Admission stays closed while global-header response bodies are unresolved,
+    /// even if the provisional remaining time reaches zero.
+    pub pending_global_responses: usize,
 }
 
 #[derive(Debug, Default)]
@@ -123,7 +126,7 @@ impl RateLimitGuard {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let until = {
+            let (until, pending) = {
                 let mut state = self.state.lock().expect("Discord guard state");
                 self.refresh(&mut state, Instant::now());
                 let error = if state.counters.token_invalid {
@@ -137,11 +140,20 @@ impl RateLimitGuard {
                     state.counters.rejected_requests_total += 1;
                     return Err(error);
                 }
-                Self::global_deadline(&state, Instant::now())
+                (
+                    Self::global_deadline(&state, Instant::now()),
+                    !state.pending_global.is_empty(),
+                )
             };
+            // A short header estimate cannot release admission while the body
+            // may still supply a longer authoritative deadline. Finish/Drop or
+            // a fatal/breaker transition wakes us; timed callers can cancel.
+            if pending {
+                changed.await;
+                continue;
+            }
             match until {
-                // Body timing may replace its own provisional header deadline;
-                // another in-flight response may extend the shared pause.
+                // Another in-flight response may extend the shared pause.
                 Some(until) => tokio::select! {
                     _ = tokio::time::sleep_until(until) => {},
                     _ = &mut changed => {},
@@ -170,6 +182,10 @@ impl RateLimitGuard {
             );
         }
         self.refresh(&mut state, now);
+        drop(state);
+        // Recheck fatal/breaker admission immediately, not at the end of an
+        // unrelated global cooldown or unresolved response body.
+        self.changed.notify_waiters();
     }
 
     /// Extend (never shorten) a global pause. Missing/invalid timing fails
@@ -204,7 +220,7 @@ impl RateLimitGuard {
         let until = self.global_until(timing, observed_at);
         let mut state = self.state.lock().expect("Discord guard state");
         self.refresh(&mut state, observed_at);
-        if Self::global_deadline(&state, observed_at).is_none() {
+        if state.pending_global.is_empty() && Self::global_deadline(&state, observed_at).is_none() {
             state.counters.global_pauses_total += 1;
             tracing::warn!(
                 event = "discord_global_pause",
@@ -238,6 +254,7 @@ impl RateLimitGuard {
         self.refresh(&mut state, now);
         GuardSnapshot {
             invalid_requests_in_window: state.invalid.len(),
+            pending_global_responses: state.pending_global.len(),
             global_pause_remaining: Self::global_deadline(&state, now)
                 .map_or(Duration::ZERO, |until| until.duration_since(now)),
             ..state.counters
@@ -301,13 +318,16 @@ impl<'a> ResponseAccounting<'a> {
         }
     }
 
-    pub(crate) fn finish(&mut self, response: &crate::executor::RawResponse) {
+    /// Return whether this response's retry is governed by shared admission,
+    /// rather than a new local delay starting after body completion.
+    pub(crate) fn finish(&mut self, response: &crate::executor::RawResponse) -> bool {
         let body: Option<serde_json::Value> = serde_json::from_slice(&response.body).ok();
         let global_body = body.as_ref().is_some_and(|value| {
             value.get("global").and_then(|v| v.as_bool()) == Some(true)
                 || value.get("scope").and_then(|v| v.as_str()) == Some("global")
         });
-        if response.status == 429 && (self.global_header.is_some() || global_body) {
+        let global = response.status == 429 && (self.global_header.is_some() || global_body);
+        if global {
             let timing = response
                 .body_retry_after_secs()
                 .filter(|secs| *secs >= 0.0)
@@ -318,6 +338,7 @@ impl<'a> ResponseAccounting<'a> {
                 .unwrap_or_else(|| self.guard.begin_global(timing, self.observed_at));
             self.guard.finish_global(id, timing, self.observed_at);
         }
+        global
     }
 }
 
@@ -435,6 +456,114 @@ mod tests {
             guard.snapshot().global_pause_remaining,
             INVALID_REQUEST_WINDOW
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unresolved_body_holds_admission_past_provisional_expiry() {
+        for (header, elapsed, body_timing) in [
+            (Some("0.1"), Duration::from_millis(500), 1.0),
+            (None, Duration::from_secs(601), 700.0),
+        ] {
+            let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap());
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-ratelimit-global", http::HeaderValue::from_static("true"));
+            if let Some(header) = header {
+                headers.insert("retry-after", http::HeaderValue::from_static(header));
+            }
+            let observed_at = Instant::now();
+            let mut accounting = ResponseAccounting::new(&guard, 429, &headers, true);
+            let waiter = tokio::spawn({
+                let guard = guard.clone();
+                async move { guard.admit(false).await }
+            });
+            tokio::task::yield_now().await;
+            tokio::time::advance(elapsed).await;
+            tokio::task::yield_now().await;
+            assert!(!waiter.is_finished(), "unresolved header pause expired");
+            assert_eq!(guard.snapshot().pending_global_responses, 1);
+            assert!(accounting.finish(&crate::executor::RawResponse {
+                status: 429,
+                retry_after_header: header.map(str::to_owned),
+                body: serde_json::json!({"retry_after": body_timing})
+                    .to_string()
+                    .into_bytes(),
+            }));
+            let until =
+                observed_at + Duration::from_secs_f64(body_timing) + Duration::from_millis(250);
+            assert_eq!(guard.snapshot().pending_global_responses, 0);
+            assert_eq!(
+                guard.snapshot().global_pause_remaining,
+                until - Instant::now()
+            );
+            tokio::task::yield_now().await;
+            assert!(!waiter.is_finished());
+            tokio::time::advance(until - Instant::now()).await;
+            waiter.await.unwrap().unwrap();
+            assert_eq!(guard.snapshot().global_pauses_total, 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guard_rejections_wake_sleepers_without_advancing_cooldown() {
+        for pending in [false, true] {
+            for status in [401, 403] {
+                let guard = Arc::new(
+                    RateLimitGuard::new(GuardConfig {
+                        invalid_request_threshold: 2,
+                        ..GuardConfig::default()
+                    })
+                    .unwrap(),
+                );
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-ratelimit-global", http::HeaderValue::from_static("true"));
+                let mut accounting = ResponseAccounting::new(&guard, 429, &headers, true);
+                if !pending {
+                    accounting.finish(&crate::executor::RawResponse {
+                        status: 429,
+                        retry_after_header: None,
+                        body: Vec::new(),
+                    });
+                }
+                let ordinary = tokio::spawn({
+                    let guard = guard.clone();
+                    async move { guard.admit(false).await }
+                });
+                let essential = tokio::spawn({
+                    let guard = guard.clone();
+                    async move { guard.admit(true).await }
+                });
+                tokio::task::yield_now().await;
+                assert!(!ordinary.is_finished());
+                assert!(!essential.is_finished());
+                let now = Instant::now();
+                guard.observe_status(status, true);
+                tokio::task::yield_now().await;
+                assert!(
+                    ordinary.is_finished(),
+                    "rejection did not wake global waiter"
+                );
+                let expected = if status == 401 {
+                    GuardError::TokenInvalid
+                } else {
+                    GuardError::CircuitOpen
+                };
+                assert_eq!(ordinary.await.unwrap(), Err(expected));
+                if status == 401 {
+                    assert!(
+                        essential.is_finished(),
+                        "fatal token did not wake essential waiter"
+                    );
+                    assert_eq!(essential.await.unwrap(), Err(GuardError::TokenInvalid));
+                } else {
+                    assert!(
+                        !essential.is_finished(),
+                        "budget cannot reject essential callback"
+                    );
+                    essential.abort();
+                }
+                assert_eq!(Instant::now(), now, "must not wait for the cooldown timer");
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

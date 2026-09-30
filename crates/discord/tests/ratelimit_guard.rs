@@ -143,8 +143,13 @@ async fn bot_401_latches_fatal_even_after_window_rollover_and_for_essential_call
 
 #[tokio::test]
 async fn global_headers_block_callers_before_delayed_body_finishes() {
-    for header_timing in [Some("0.8"), None] {
-        let mut response = ScriptedResponse::json(429, serde_json::json!({"retry_after": 0.8}));
+    for (header_timing, retry_after, body_delay) in [
+        (Some("0.8"), 0.8, Duration::from_millis(400)),
+        (None, 0.8, Duration::from_millis(400)),
+        (Some("0.1"), 1.0, Duration::from_millis(600)),
+    ] {
+        let mut response =
+            ScriptedResponse::json(429, serde_json::json!({"retry_after": retry_after}));
         response
             .headers
             .push(("X-RateLimit-Global".into(), "true".into()));
@@ -154,7 +159,7 @@ async fn global_headers_block_callers_before_delayed_body_finishes() {
         let mock = MockRest::start_with_body_delay(
             vec![response],
             ScriptedResponse::status(204),
-            Duration::from_millis(400),
+            body_delay,
         )
         .await;
         let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
@@ -169,7 +174,7 @@ async fn global_headers_block_callers_before_delayed_body_finishes() {
         .await
         .unwrap();
         let callers = tokio::spawn(async move { tokio::join!(ban(&second), ban(&second)) });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(body_delay - Duration::from_millis(100)).await;
         assert!(!initial.is_finished(), "body must still be pending");
         assert_eq!(
             mock.requests().len(),
@@ -184,13 +189,121 @@ async fn global_headers_block_callers_before_delayed_body_finishes() {
         assert_eq!(requests.len(), 3);
         for request in &requests[1..] {
             let elapsed = request.received_at.duration_since(requests[0].received_at);
-            assert!(elapsed >= Duration::from_secs(1));
+            assert!(elapsed >= Duration::from_secs_f64(retry_after + 0.20));
             assert!(
-                elapsed < Duration::from_millis(1350),
+                elapsed < Duration::from_secs_f64(retry_after + 0.55),
                 "cooldown restarted at body"
             );
         }
         assert_eq!(guard.snapshot().global_pauses_total, 1);
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn global_retries_reuse_shared_deadline_across_all_retrying_lanes() {
+    for lane in ["get", "kick", "publish"] {
+        for signal in ["global-header", "scope-header", "body"] {
+            let mut response = ScriptedResponse::json(
+                429,
+                serde_json::json!({"retry_after": 1.0, "global": signal == "body"}),
+            );
+            match signal {
+                "global-header" => response
+                    .headers
+                    .push(("X-RateLimit-Global".into(), "true".into())),
+                "scope-header" => response
+                    .headers
+                    .push(("X-RateLimit-Scope".into(), "global".into())),
+                _ => {}
+            }
+            let mock = MockRest::start_with_body_delay(
+                vec![response],
+                ScriptedResponse::status(204),
+                Duration::from_millis(650),
+            )
+            .await;
+            let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+            let executor = executor(&mock, &guard);
+            tokio::time::timeout(Duration::from_secs(4), async {
+                match lane {
+                    "get" => {
+                        executor.get_json("/guilds/2222").await.unwrap();
+                    }
+                    "kick" => {
+                        let result = executor.kick_paced("2222", "3333", "guard test").await;
+                        assert_eq!(
+                            result.outcome,
+                            two_bot_discord::executor::KickOutcome::Kicked
+                        );
+                        assert_eq!(result.attempts, 2);
+                    }
+                    _ => executor
+                        .publish_guild_commands(1111, 2222, &[])
+                        .await
+                        .unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            let requests = mock.requests();
+            assert_eq!(requests.len(), 2, "{lane}/{signal}");
+            let gap = requests[1]
+                .received_at
+                .duration_since(requests[0].received_at);
+            assert!(
+                gap >= Duration::from_millis(1200),
+                "{lane}/{signal}: skipped shared deadline"
+            );
+            assert!(
+                gap < Duration::from_millis(1700),
+                "{lane}/{signal}: restarted global retry after body: {gap:?}"
+            );
+            assert_eq!(guard.snapshot().global_pauses_total, 1);
+            mock.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn guard_rejection_releases_paced_lanes_during_global_cooldown() {
+    for status in [401, 403] {
+        let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+        let guard = Arc::new(
+            RateLimitGuard::new(GuardConfig {
+                invalid_request_threshold: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let executor = executor(&mock, &guard);
+        guard.observe_global(None);
+        let get = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.get_json("/guilds/2222").await }
+        });
+        let kick = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.kick_paced("2222", "3333", "guard test").await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!get.is_finished());
+        assert!(!kick.is_finished());
+        guard.observe_status(status, true);
+        let (get, kick) = tokio::time::timeout(Duration::from_millis(200), async {
+            tokio::join!(get, kick)
+        })
+        .await
+        .expect("guard transition must interrupt a 600-second admission wait");
+        let error = if status == 401 {
+            GuardError::TokenInvalid
+        } else {
+            GuardError::CircuitOpen
+        };
+        assert_eq!(get.unwrap(), Err(error.to_string()));
+        assert_eq!(kick.unwrap().detail, error.to_string());
+        assert_eq!(executor.requests(), 0);
+        assert!(mock.requests().is_empty());
         mock.shutdown().await;
     }
 }
