@@ -34,7 +34,7 @@ pub struct ChannelAuditRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelClaim {
     /// First attempt won; caller must act, then [`ChannelModerationStore::complete`].
-    Claimed,
+    Claimed { ticket: ChannelClaimTicket },
     /// Key already completed; replay the stored result, make no Discord call.
     Replayed {
         outcome: String,
@@ -44,6 +44,16 @@ pub enum ChannelClaim {
     InFlight,
     /// Key was used for different request content; caller must refuse `malformed`.
     Mismatch,
+}
+
+/// Ownership of one winning claim generation, returned only by [`ChannelModerationStore::claim`].
+/// Keep this ticket for completion or a proven-safe release; never use a new
+/// claimant's ticket to retry an old attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelClaimTicket {
+    guild_id: String,
+    idempotency_key: String,
+    claim_token: String,
 }
 
 /// Durable store for the channel-moderation slice.
@@ -188,7 +198,7 @@ impl ChannelModerationStore {
                (guild_id, idempotency_key, action, request_hash, state, claimed_at)
              VALUES ($1, $2, $3, $4, 'in_flight', $5)
              ON CONFLICT (guild_id, idempotency_key) DO NOTHING
-             RETURNING idempotency_key",
+             RETURNING claim_token",
         )
         .bind(guild_id)
         .bind(idempotency_key)
@@ -197,11 +207,17 @@ impl ChannelModerationStore {
         .bind(claimed_at)
         .fetch_optional(&self.pool)
         .await?;
-        if won.is_some() {
-            return Ok(ChannelClaim::Claimed);
+        if let Some(row) = won {
+            return Ok(ChannelClaim::Claimed {
+                ticket: ChannelClaimTicket {
+                    guild_id: guild_id.to_owned(),
+                    idempotency_key: idempotency_key.to_owned(),
+                    claim_token: row.get("claim_token"),
+                },
+            });
         }
         let row = sqlx::query(
-            "SELECT request_hash, state, outcome, result_json
+            "SELECT action, request_hash, state, outcome, result_json
                FROM moderation_idempotency
               WHERE guild_id = $1 AND idempotency_key = $2",
         )
@@ -214,8 +230,9 @@ impl ChannelModerationStore {
             // attempt releasing its claim. Still running; the caller retries.
             return Ok(ChannelClaim::InFlight);
         };
+        let stored_action: String = row.get("action");
         let stored_hash: String = row.get("request_hash");
-        if stored_hash != request_hash {
+        if stored_action != action || stored_hash != request_hash {
             return Ok(ChannelClaim::Mismatch);
         }
         let state: String = row.get("state");
@@ -231,41 +248,47 @@ impl ChannelModerationStore {
     }
 
     /// Record the result so a retry replays it instead of acting again.
+    /// Returns false if the ticket is stale or already completed; never
+    /// overwrites a newer generation or an immutable completed result.
     pub async fn complete(
         &self,
-        guild_id: &str,
-        idempotency_key: &str,
+        ticket: &ChannelClaimTicket,
         outcome: &str,
         result_json: &str,
         completed_at: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
             "UPDATE moderation_idempotency
                 SET state = 'done', outcome = $1, result_json = $2, completed_at = $3
-              WHERE guild_id = $4 AND idempotency_key = $5",
+              WHERE guild_id = $4 AND idempotency_key = $5
+                AND claim_token = $6 AND state = 'in_flight'",
         )
         .bind(outcome)
         .bind(result_json)
         .bind(completed_at)
-        .bind(guild_id)
-        .bind(idempotency_key)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(&ticket.claim_token)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     /// Release only when the executor can prove no Discord mutation occurred.
     /// A timeout or ambiguous failure must retain the claim to prevent replay.
-    pub async fn release(&self, guild_id: &str, idempotency_key: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    /// Returns false for stale tickets or completed claims.
+    pub async fn release(&self, ticket: &ChannelClaimTicket) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
             "DELETE FROM moderation_idempotency
-              WHERE guild_id = $1 AND idempotency_key = $2 AND state = 'in_flight'",
+              WHERE guild_id = $1 AND idempotency_key = $2
+                AND claim_token = $3 AND state = 'in_flight'",
         )
-        .bind(guild_id)
-        .bind(idempotency_key)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(&ticket.claim_token)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     /// One audit row per executed (or refused) channel action. Insert is
@@ -371,7 +394,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let schema = format!("channel_moderation_test_{}_{}", std::process::id(), nonce);
+        static NEXT_SCHEMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_SCHEMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let schema = format!("cm_test_{}_{}_{}", std::process::id(), nonce, sequence);
         // No external input participates in this generated SQL identifier.
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&admin)
@@ -518,18 +543,17 @@ mod tests {
     async fn claim_complete_replay_refuses_reuse() {
         let store = test_store().await;
         let (guild, key) = ("g-claim", "t-claim-key");
-        assert_eq!(
+        let ticket = winning_ticket(
             store
                 .claim(
                     guild,
                     key,
                     "moderation.lockdown",
                     "hash-a",
-                    "2026-09-30T00:00:00.000Z"
+                    "2026-09-30T00:00:00.000Z",
                 )
                 .await
                 .expect("claims"),
-            ChannelClaim::Claimed
         );
         // Same key, same content, still uncertain: in-flight, not a replay.
         assert_eq!(
@@ -545,16 +569,15 @@ mod tests {
                 .expect("claims"),
             ChannelClaim::InFlight
         );
-        store
+        assert!(store
             .complete(
-                guild,
-                key,
+                &ticket,
                 "locked_down",
                 r#"{"outcome":"locked_down"}"#,
                 "2026-09-30T00:00:02.000Z",
             )
             .await
-            .expect("completes");
+            .expect("completes"));
         // Completed key replays the stored result instead of acting again.
         assert_eq!(
             store
@@ -589,37 +612,118 @@ mod tests {
         store.cleanup().await;
     }
 
+    fn winning_ticket(claim: ChannelClaim) -> ChannelClaimTicket {
+        let ChannelClaim::Claimed { ticket } = claim else {
+            panic!("expected a winning claim, got {claim:?}");
+        };
+        ticket
+    }
+
     #[tokio::test]
     #[ignore = "requires agent-testdb or the CI Postgres service"]
     async fn release_returns_key_for_a_real_retry() {
         let store = test_store().await;
         let (guild, key) = ("g-release", "t-release-key");
-        store
-            .claim(
-                guild,
-                key,
-                "moderation.purge",
-                "hash-a",
-                "2026-09-30T00:00:00.000Z",
-            )
-            .await
-            .expect("claims");
-        // A failed attempt made no lasting change: the key comes back and the
-        // retry is a real second attempt, not a cached error.
-        store.release(guild, key).await.expect("releases");
+        let time = "2026-09-30T00:00:00.000Z";
+        let first = winning_ticket(
+            store
+                .claim(guild, key, "moderation.purge", "hash", time)
+                .await
+                .unwrap(),
+        );
+        // A proven no-op may release; the retry receives a fresh generation.
+        assert!(store.release(&first).await.unwrap());
+        let second = winning_ticket(
+            store
+                .claim(guild, key, "moderation.purge", "hash", time)
+                .await
+                .unwrap(),
+        );
+        assert_ne!(first.claim_token, second.claim_token);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn stale_claim_writes_cannot_affect_a_new_winner() {
+        let store = test_store().await;
+        let (guild, key) = ("g-stale", "key-stale");
+        let time = "2026-09-30T00:00:00.000Z";
+        let first = winning_ticket(
+            store
+                .claim(guild, key, "moderation.purge", "hash", time)
+                .await
+                .unwrap(),
+        );
+        assert!(store.release(&first).await.unwrap());
+        let second = winning_ticket(
+            store
+                .claim(guild, key, "moderation.purge", "hash", time)
+                .await
+                .unwrap(),
+        );
+        assert_ne!(first.claim_token, second.claim_token);
+        // Delayed release AND completion from A must leave B in flight.
+        assert!(!store.release(&first).await.unwrap());
+        assert!(!store.complete(&first, "stale", "{}", time).await.unwrap());
         assert_eq!(
             store
-                .claim(
-                    guild,
-                    key,
-                    "moderation.purge",
-                    "hash-a",
-                    "2026-09-30T00:00:01.000Z"
-                )
+                .claim(guild, key, "moderation.purge", "hash", time)
                 .await
-                .expect("claims"),
-            ChannelClaim::Claimed
+                .unwrap(),
+            ChannelClaim::InFlight
         );
+        assert!(store
+            .complete(&second, "purged", r#"{"affected":3}"#, time)
+            .await
+            .unwrap());
+        // Completed results are immutable, even for the current ticket.
+        assert!(!store
+            .complete(&second, "changed", "{}", time)
+            .await
+            .unwrap());
+        assert!(!store.complete(&first, "stale", "{}", time).await.unwrap());
+        assert!(!store.release(&first).await.unwrap());
+        assert!(!store.release(&second).await.unwrap());
+        assert_eq!(
+            store
+                .claim(guild, key, "moderation.purge", "hash", time)
+                .await
+                .unwrap(),
+            ChannelClaim::Replayed {
+                outcome: "purged".to_owned(),
+                result_json: r#"{"affected":3}"#.to_owned()
+            }
+        );
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn action_only_reuse_is_mismatch_in_flight_and_done() {
+        let store = test_store().await;
+        let (guild, key) = ("g-action", "key-action");
+        let time = "2026-09-30T00:00:00.000Z";
+        let ticket = winning_ticket(
+            store
+                .claim(guild, key, "moderation.purge", "hash", time)
+                .await
+                .unwrap(),
+        );
+        for completed in [false, true] {
+            if completed {
+                assert!(store.complete(&ticket, "purged", "{}", time).await.unwrap());
+            }
+            for (action, hash) in [
+                ("moderation.unlock", "hash"),
+                ("moderation.purge", "different-hash"),
+            ] {
+                assert_eq!(
+                    store.claim(guild, key, action, hash, time).await.unwrap(),
+                    ChannelClaim::Mismatch
+                );
+            }
+        }
         store.cleanup().await;
     }
 

@@ -30,7 +30,7 @@ pub use channel_moderation::{
 };
 #[cfg(feature = "db")]
 pub use channel_moderation_store::{
-    ChannelAuditRow, ChannelClaim, ChannelModerationStore, DB_POOL_MAX_DEFAULT,
+    ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore, DB_POOL_MAX_DEFAULT,
     STATEMENT_TIMEOUT_MS,
 };
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
