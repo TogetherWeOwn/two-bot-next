@@ -67,12 +67,14 @@ impl TicketStore {
             .bind(key)
             .execute(&mut *tx)
             .await?;
+        // ORDER BY instant, not TEXT: legacy rows may carry UTC offsets
+        // (e.g. +02:00) that sort incorrectly as strings.
         let active = sqlx::query(
-            "SELECT id, guild_id, channel_id, opener_id, claimed_by, status, created_at, closing_started_at, closed_at FROM tickets WHERE guild_id = $1 AND opener_id = $2 AND status <> 'closed' ORDER BY created_at DESC LIMIT 1"
+            "SELECT id, guild_id, channel_id, opener_id, claimed_by, status, created_at, closing_started_at, closed_at FROM tickets WHERE guild_id = $1 AND opener_id = $2 AND status <> 'closed' ORDER BY created_at::timestamptz DESC LIMIT 1"
         ).bind(&self.guild_id).bind(opener_id).fetch_optional(&mut *tx).await?
             .map(decode_ticket).transpose()?;
         let last: Option<(String,)> = sqlx::query_as(
-            "SELECT created_at FROM tickets WHERE guild_id = $1 AND opener_id = $2 ORDER BY created_at DESC LIMIT 1"
+            "SELECT created_at FROM tickets WHERE guild_id = $1 AND opener_id = $2 ORDER BY created_at::timestamptz DESC LIMIT 1"
         ).bind(&self.guild_id).bind(opener_id).fetch_optional(&mut *tx).await?;
         let last = last
             .map(|(value,)| timestamp(&value, "created_at"))
@@ -118,7 +120,8 @@ impl TicketStore {
     /// Ready loads open tickets as well as interrupted workflows; no runtime
     /// map is authoritative. The pure recovery_action determines the next call.
     pub async fn recoverable(&self) -> Result<Vec<Ticket>, StoreError> {
-        sqlx::query("SELECT id, guild_id, channel_id, opener_id, claimed_by, status, created_at, closing_started_at, closed_at FROM tickets WHERE guild_id = $1 AND status <> 'closed' ORDER BY created_at, id")
+        // ORDER BY instant, not TEXT: see reserve().
+        sqlx::query("SELECT id, guild_id, channel_id, opener_id, claimed_by, status, created_at, closing_started_at, closed_at FROM tickets WHERE guild_id = $1 AND status <> 'closed' ORDER BY created_at::timestamptz, id")
             .bind(&self.guild_id).fetch_all(&self.pool).await?
             .into_iter().map(decode_ticket).collect()
     }
@@ -218,6 +221,9 @@ impl TicketStore {
     }
 
     /// Legacy transcripts may have been committed without cleanup state.
+    /// A transcript whose body was purged but whose ticket still awaits
+    /// cleanup recovers from the locked ticket's closed timestamp: the
+    /// durable captured-close state survives `purge_expired`.
     pub async fn recover_saved_close(
         &self,
         id: &str,
@@ -225,15 +231,54 @@ impl TicketStore {
     ) -> Result<Ticket, StoreError> {
         let mut tx = self.pool.begin().await?;
         let mut ticket = self.locked(&mut tx, id).await?;
-        let (created_at,): (String,) = sqlx::query_as(
+        let captured = match sqlx::query_as::<_, (String,)>(
             "SELECT created_at FROM ticket_transcripts WHERE guild_id = $1 AND ticket_id = $2",
         )
         .bind(&self.guild_id)
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or(StoreError::NotFound)?;
-        ticket.recover_saved_close(expected_started_at, timestamp(&created_at, "created_at")?)?;
+        {
+            Some((created_at,)) => timestamp(&created_at, "created_at")?,
+            // Purged bodies keep their captured-close rows: fall back to the
+            // persisted cleanup timestamp, which the atomic body-purge sets.
+            None => ticket
+                .closed_at
+                .filter(|_| ticket.status == TicketStatus::CleanupPending)
+                .ok_or(StoreError::NotFound)?,
+        };
+        match ticket.recover_saved_close(expected_started_at, captured) {
+            Ok(()) => {
+                Self::persist(&mut tx, &ticket).await?;
+            }
+            // `purge_expired` already reconciled this close to cleanup in the
+            // same commit that deleted the body: confirm the durable state
+            // instead of failing, so a purged body can never reopen the close.
+            Err(TicketError::StaleClose) => ticket.confirm_reconciled_close(expected_started_at)?,
+            Err(other) => return Err(other.into()),
+        }
+        tx.commit().await?;
+        Ok(ticket)
+    }
+
+    /// Fenced completion for an unsaved close whose channel is confirmed
+    /// absent. Call only after the REST executor proves the channel is gone
+    /// (successful DELETE or Discord code 10003), mirroring legacy
+    /// `recoverClosing`; the expected close token fences a racing capture.
+    pub async fn abandon_unsaved_close(
+        &self,
+        id: &str,
+        expected_started_at: i64,
+        now: i64,
+    ) -> Result<Ticket, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let mut ticket = self.locked(&mut tx, id).await?;
+        let (exists,): (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM ticket_transcripts WHERE guild_id = $1 AND ticket_id = $2)")
+            .bind(&self.guild_id).bind(id).fetch_one(&mut *tx).await?;
+        if exists {
+            return Err(TicketError::InvalidTransition.into());
+        }
+        ticket.abandon_unsaved_close(expected_started_at, now)?;
         Self::persist(&mut tx, &ticket).await?;
         tx.commit().await?;
         Ok(ticket)
@@ -267,8 +312,26 @@ impl TicketStore {
     pub async fn purge_expired(&self, now: i64) -> Result<u64, StoreError> {
         // Native comparisons handle legacy timestamps with different UTC offsets.
         // Retention is a privacy ceiling, even when channel cleanup is pending.
-        Ok(sqlx::query("DELETE FROM ticket_transcripts WHERE guild_id = $1 AND purge_after::timestamptz <= $2::timestamptz")
-            .bind(&self.guild_id).bind(format_iso_millis(now)).execute(&self.pool).await?.rows_affected())
+        // Reconcile first, atomically with the body delete: a closing row whose
+        // only capture evidence is an expiring transcript (legacy crash between
+        // INSERT and state UPDATE) must reach cleanup_pending in the same
+        // commit, or a later reopen_interrupted would resurrect a captured
+        // close. The ticket row itself is then the capture marker.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE tickets AS t SET status = 'cleanup_pending', closed_at = tt.created_at \
+             FROM ticket_transcripts AS tt \
+             WHERE tt.guild_id = $1 AND t.guild_id = tt.guild_id AND t.id = tt.ticket_id \
+             AND t.status = 'closing' AND tt.purge_after::timestamptz <= $2::timestamptz",
+        )
+        .bind(&self.guild_id)
+        .bind(format_iso_millis(now))
+        .execute(&mut *tx)
+        .await?;
+        let deleted = sqlx::query("DELETE FROM ticket_transcripts WHERE guild_id = $1 AND purge_after::timestamptz <= $2::timestamptz")
+            .bind(&self.guild_id).bind(format_iso_millis(now)).execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(deleted)
     }
 
     /// GDPR/member-erasure hook; FK cascades transcript bodies in the same write.

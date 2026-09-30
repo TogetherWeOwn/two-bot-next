@@ -34,9 +34,13 @@ CREATE TABLE IF NOT EXISTS ticket_transcripts (
   purge_after TEXT NOT NULL
 );
 ALTER TABLE ticket_transcripts ADD COLUMN IF NOT EXISTS purge_after TEXT;
+-- Elapsed 90 days in UTC: INTERVAL '90 days' on timestamptz advances
+-- session-local calendar days, which drifts across DST (e.g. +1h under
+-- America/New_York). 2160 hours is the exact retention ceiling, and the
+-- AT TIME ZONE 'UTC' only formats the already-shifted instant.
 UPDATE ticket_transcripts
   SET purge_after = to_char(
-    (created_at::timestamptz + INTERVAL '90 days') AT TIME ZONE 'UTC',
+    (created_at::timestamptz + INTERVAL '2160 hours') AT TIME ZONE 'UTC',
     'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
   )
   WHERE purge_after IS NULL;

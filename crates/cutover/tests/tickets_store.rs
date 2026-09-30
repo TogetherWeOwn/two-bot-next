@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use two_bot_core::tickets::{
     format_transcript, recovery_action, OpenDecision, RecoveryAction, Ticket, TicketError,
     TicketStatus, TranscriptMessage, COOLDOWN_SECONDS, INTERRUPTED_AFTER_MS,
+    TRANSCRIPT_RETENTION_MS,
 };
 use two_bot_cutover::tickets::{OpenResult, StoreError, TicketStore};
 
@@ -308,6 +309,206 @@ async fn interrupted_create_and_legacy_saved_close_remain_recoverable() {
     assert_eq!(recovered.status, TicketStatus::CleanupPending);
     assert_eq!(recovered.closed_at, Some(20));
     db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or a CI service container"]
+async fn unsaved_close_with_confirmed_absent_channel_completes_and_unblocks_opener() {
+    let db = TestDb::new(false).await;
+    let store = db.store("guild");
+    store
+        .reserve("ticket", "member", 0, COOLDOWN_SECONDS)
+        .await
+        .unwrap();
+    store.activate("ticket", "channel").await.unwrap();
+    // begin_close then a crash before capture: channel confirmed deleted
+    // (Discord code 10003), no transcript row exists.
+    store.begin_close("ticket", 10).await.unwrap();
+    let done = store.abandon_unsaved_close("ticket", 10, 20).await.unwrap();
+    assert_eq!(done.status, TicketStatus::Closed);
+    assert_eq!(done.closed_at, Some(20));
+    // The ticket leaves the active set: the opener is no longer blocked.
+    assert!(store.recoverable().await.unwrap().is_empty());
+    assert!(matches!(
+        store
+            .reserve("next", "member", 300_000, COOLDOWN_SECONDS)
+            .await
+            .unwrap(),
+        OpenResult::Created(_)
+    ));
+    // Fencing: a racing capture after the absent-channel completion fails.
+    assert!(store
+        .save_transcript("ticket", 10, 30, format_transcript(vec![]))
+        .await
+        .is_err());
+    // And a captured close can never take the absent-channel path.
+    store
+        .reserve("saved", "other", 0, COOLDOWN_SECONDS)
+        .await
+        .unwrap();
+    store.activate("saved", "other-channel").await.unwrap();
+    store.begin_close("saved", 10).await.unwrap();
+    store
+        .save_transcript("saved", 10, 30, format_transcript(vec![]))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.abandon_unsaved_close("saved", 10, 40).await,
+        Err(two_bot_cutover::tickets::StoreError::Domain(
+            TicketError::InvalidTransition
+        ))
+    ));
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or a CI service container"]
+async fn purge_reconciles_captured_close_before_deleting_body() {
+    let db = TestDb::new(false).await;
+    let store = db.store("guild");
+    store
+        .reserve("legacy", "member", 0, COOLDOWN_SECONDS)
+        .await
+        .unwrap();
+    store.activate("legacy", "channel").await.unwrap();
+    store.begin_close("legacy", 10).await.unwrap();
+    // Legacy crash: transcript committed, state never advanced.
+    sqlx::query("INSERT INTO ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, content, message_count, created_at, purge_after) VALUES ('legacy', 'guild', 'channel', 'member', 'durable', 1, '1970-01-01T00:00:00.020Z', '1970-04-01T00:00:00.020Z')").execute(&db.pool).await.unwrap();
+    // Purge at the inclusive expiry reconciles the row atomically, so the
+    // captured close is never reopenable afterwards.
+    sqlx::query("UPDATE ticket_transcripts SET purge_after = '1970-01-01T00:00:00.020Z' WHERE ticket_id = 'legacy'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(store.purge_expired(20).await.unwrap(), 1);
+    assert!(!store.transcript_exists("legacy").await.unwrap());
+    let persisted = store.get("legacy").await.unwrap().unwrap();
+    assert_eq!(persisted.status, TicketStatus::CleanupPending);
+    assert_eq!(persisted.closed_at, Some(20));
+    assert!(store.reopen_interrupted("legacy", 10).await.is_err());
+    assert_eq!(
+        recovery_action(&persisted, INTERRUPTED_AFTER_MS, false),
+        RecoveryAction::RetryCleanup {
+            channel_id: "channel".into()
+        }
+    );
+    // A reconciled close still recovers idempotently to the same state.
+    let recovered = store.recover_saved_close("legacy", 10).await.unwrap();
+    assert_eq!(recovered.status, TicketStatus::CleanupPending);
+    assert_eq!(recovered.closed_at, Some(20));
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or a CI service container"]
+async fn cooldown_orders_legacy_offsets_by_instant_not_text() {
+    let db = TestDb::new(false).await;
+    let store = db.store("guild");
+    store
+        .reserve("offset", "member", 0, COOLDOWN_SECONDS)
+        .await
+        .unwrap();
+    // Legacy offset-bearing row: 12:00+02:00 is 10:00Z, older than 11:59Z.
+    sqlx::query(
+        "UPDATE tickets SET status = 'closed', created_at = '2026-09-30T12:00:00.000+02:00' WHERE id = 'offset'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO tickets (id, guild_id, opener_id, status, created_at) VALUES ('utc', 'guild', 'member', 'closed', '2026-09-30T11:59:00.000Z')")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // At 12:00Z the newest ticket is 60s old: the cooldown must refuse.
+    // 2026-09-30T12:00:00.000Z; the offset row is 10:00Z, the UTC row 11:59Z.
+    assert_eq!(
+        store
+            .reserve("next", "member", 1_790_769_600_000, COOLDOWN_SECONDS)
+            .await
+            .unwrap(),
+        OpenResult::Refused(OpenDecision::Cooldown)
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or a CI service container"]
+async fn migration_backfill_uses_elapsed_hours_across_dst() {
+    // Reproduces the review repro: TimeZone=America/New_York with a
+    // DST-crossing created_at must still backfill the exact elapsed-90-day
+    // retention ceiling, not a calendar-day shift (+1h). Single session so
+    // the SET applies to the migration statements.
+    let host = match std::env::var("TICKET_TEST_DB_HOST").as_deref() {
+        Ok("127.0.0.1") if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => "127.0.0.1",
+        Ok("agent-testdb") | Err(_) => "agent-testdb",
+        _ => panic!(
+            "ticket DB tests permit only agent-testdb or the GitHub Actions service container"
+        ),
+    };
+    let options = PgConnectOptions::new()
+        .host(host)
+        .port(5432)
+        .username("agent_test")
+        .password("")
+        .database("agent_test");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .expect("connect to test container (do not substitute credentials)");
+    let schema = format!(
+        "tickets_dst_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
+    );
+    sqlx::QueryBuilder::new("CREATE SCHEMA ")
+        .push(&schema) // Trusted identifier: only a fixed prefix and numeric pid/counter.
+        .build()
+        .execute(&admin)
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.options([("search_path", schema.clone())]))
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("SET TIME ZONE 'America/New_York'")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE tickets (id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL UNIQUE, opener_id TEXT NOT NULL, claimed_by TEXT, status TEXT NOT NULL CHECK (status IN ('open', 'closed')), created_at TEXT NOT NULL, closed_at TEXT); CREATE TABLE ticket_transcripts (ticket_id TEXT PRIMARY KEY REFERENCES tickets(id) ON DELETE CASCADE, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, opener_id TEXT NOT NULL, claimed_by TEXT, content TEXT NOT NULL, message_count INTEGER NOT NULL, created_at TEXT NOT NULL);")
+        .execute(&mut *conn).await.unwrap();
+    sqlx::query("INSERT INTO tickets (id, guild_id, channel_id, opener_id, status, created_at) VALUES ('old', 'guild', 'old-channel', 'old-opener', 'closed', '2026-09-08T12:00:00.000Z')")
+        .execute(&mut *conn).await.unwrap();
+    sqlx::query("INSERT INTO ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, content, message_count, created_at) VALUES ('old', 'guild', 'old-channel', 'old-opener', 'existing transcript', 1, '2026-09-08T12:00:00.000Z')")
+        .execute(&mut *conn).await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0210_tickets.sql"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let (purge_after,): (String,) =
+        sqlx::query_as("SELECT purge_after FROM ticket_transcripts WHERE ticket_id = 'old'")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    // Elapsed 90 days from 2026-09-08T12:00Z, to the millisecond.
+    assert_eq!(purge_after, "2026-12-07T12:00:00.000Z");
+    let created_ms = 1_788_868_800_000_i64; // 2026-09-08T12:00:00.000Z
+    assert_eq!(
+        two_bot_core::funnel::parse_iso_millis(&purge_after),
+        Some(created_ms + TRANSCRIPT_RETENTION_MS)
+    );
+    drop(conn);
+    pool.close().await;
+    sqlx::QueryBuilder::new("DROP SCHEMA ")
+        .push(&schema)
+        .push(" CASCADE")
+        .build()
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }
 
 #[tokio::test]

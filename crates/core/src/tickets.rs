@@ -253,6 +253,40 @@ impl Ticket {
         Ok(())
     }
 
+    /// Confirms a capture whose transcript body was retention-purged after
+    /// the store reconciled the row to cleanup. Idempotent: succeeds only
+    /// when the row already carries the reconciled state for this close
+    /// token, so a purged body can never reopen a captured close.
+    pub fn confirm_reconciled_close(
+        &mut self,
+        expected_started_at: i64,
+    ) -> Result<(), TicketError> {
+        if self.status != TicketStatus::CleanupPending
+            || self.closing_started_at != Some(expected_started_at)
+            || self.closed_at.is_none()
+        {
+            return Err(TicketError::StaleClose);
+        }
+        Ok(())
+    }
+
+    /// Fenced completion for an unsaved close whose channel is confirmed
+    /// absent. Call only after the REST executor proves the channel is gone
+    /// (successful DELETE or Discord code 10003) and no transcript row was
+    /// captured. The expected close token fences a racing `capture_close`,
+    /// mirroring `reopen_interrupted`/`recover_saved_close`; legacy
+    /// `recoverClosing` completed this 10003 path without a transcript.
+    pub fn abandon_unsaved_close(
+        &mut self,
+        expected_started_at: i64,
+        now: i64,
+    ) -> Result<(), TicketError> {
+        self.check_close(expected_started_at)?;
+        self.status = TicketStatus::Closed;
+        self.closed_at = Some(now);
+        Ok(())
+    }
+
     /// Failed creation/control posting must remain recoverable until deletion
     /// succeeds. Unlike a normal close, an open rollback has no transcript.
     pub fn queue_open_rollback(&mut self, now: i64) -> Result<(), TicketError> {
@@ -665,6 +699,66 @@ mod tests {
         );
         t.finish_cleanup(40).unwrap();
         assert_eq!(recovery_action(&t, 50, true), RecoveryAction::None);
+    }
+
+    #[test]
+    fn unsaved_close_with_confirmed_absent_channel_completes_without_transcript() {
+        let mut t = ticket();
+        t.activate("channel").unwrap();
+        t.begin_close(10).unwrap();
+        // Wrong close token stays fenced, mirroring reopen/recover fencing.
+        assert_eq!(
+            t.abandon_unsaved_close(11, 20),
+            Err(TicketError::StaleClose)
+        );
+        t.abandon_unsaved_close(10, 20).unwrap();
+        assert_eq!(t.status, TicketStatus::Closed);
+        assert_eq!(t.closed_at, Some(20));
+        // Terminal: the opener may open a fresh ticket afterwards.
+        assert_eq!(
+            decide_open(None, Some(0), 300_000, COOLDOWN_SECONDS),
+            OpenDecision::Reserve
+        );
+        // A captured close can no longer be abandoned.
+        let mut saved = ticket();
+        saved.activate("channel").unwrap();
+        saved.begin_close(10).unwrap();
+        saved
+            .capture_close(10, 30, format_transcript(vec![]))
+            .unwrap();
+        assert_eq!(
+            saved.abandon_unsaved_close(10, 40),
+            Err(TicketError::StaleClose)
+        );
+    }
+
+    #[test]
+    fn reconciled_close_confirms_without_body_and_never_reopens() {
+        // `purge_expired` reconciles a legacy crash row to cleanup in the
+        // same commit that deletes the body; the row is the capture marker.
+        let mut t = ticket();
+        t.activate("channel").unwrap();
+        t.begin_close(10).unwrap();
+        t.recover_saved_close(10, 20).unwrap();
+        t.confirm_reconciled_close(10).unwrap();
+        // The row is CleanupPending, not Closing: check_close fences the
+        // reopen as a stale close, so a purged body can never reopen it.
+        assert_eq!(
+            t.reopen_interrupted(10, false),
+            Err(TicketError::StaleClose)
+        );
+        // Anything else is still a stale close, not a recovered one.
+        let mut other = ticket();
+        other.activate("channel").unwrap();
+        other.begin_close(10).unwrap();
+        assert_eq!(
+            other.confirm_reconciled_close(11),
+            Err(TicketError::StaleClose)
+        );
+        assert_eq!(
+            other.confirm_reconciled_close(10),
+            Err(TicketError::StaleClose)
+        );
     }
 
     #[test]
