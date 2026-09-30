@@ -11,6 +11,7 @@ use std::sync::Arc;
 use axum::{http::StatusCode, routing::get, Json, Router};
 use tokio::{net::TcpListener, sync::RwLock};
 use tower_http::trace::TraceLayer;
+use tracing::{instrument::WithSubscriber, Instrument};
 use two_bot_core::{ComponentStatus, HealthReport};
 
 use crate::gateway::GatewayState;
@@ -57,8 +58,20 @@ pub async fn bind(addr: &str) -> std::io::Result<TcpListener> {
 
 /// Serve until SIGTERM/SIGINT (Container stop).
 pub async fn serve(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
+    serve_with_shutdown(listener, state, shutdown_signal()).await
+}
+
+pub(super) async fn serve_with_shutdown(
+    listener: TcpListener,
+    state: SharedState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    // Axum spawns the signal future: preserve both the run span and dispatcher.
+    // https://docs.rs/axum/0.8.9/src/axum/serve/mod.rs.html
+    // https://docs.rs/tracing/0.1.44/tracing/trait.Instrument.html#method.in_current_span
+    // https://docs.rs/tracing/0.1.44/tracing/instrument/trait.WithSubscriber.html#method.with_current_subscriber
     axum::serve(listener, router(state).into_make_service())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown.in_current_span().with_current_subscriber())
         .await?;
     tracing::info!(msg = "shutdown_completed");
     Ok(())

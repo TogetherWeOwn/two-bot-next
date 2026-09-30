@@ -41,7 +41,9 @@ The server future is instrumented with a run span; the spawned gateway task adds
 a guild span. The synchronous interaction route adapter adds interaction/guild
 spans. Futures use `Instrument`, not an entered guard held over an `.await`.
 New tasks must propagate context explicitly; synchronous span context is not
-implicitly inherited by `tokio::spawn`.
+implicitly inherited by `tokio::spawn`. Axum spawns the graceful-shutdown signal
+future internally, so that future explicitly carries the run span and subscriber
+as well; `shutdown_started` keeps the same `run_id` as boot and drain completion.
 
 Existing snake_case message-only events retain their name as `msg`. Events with
 neither a valid string `msg` nor a snake_case `message` use `msg=tracing_event`,

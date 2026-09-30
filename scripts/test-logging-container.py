@@ -18,6 +18,7 @@ def validate(text):
     if not lines:
         raise AssertionError("container produced no logs")
     names = set()
+    run_id = None
     for number, line in enumerate(lines, 1):
         event = json.loads(line)  # Blank/plain-text lines fail too.
         if not isinstance(event, dict):
@@ -27,6 +28,12 @@ def validate(text):
                 raise AssertionError(f"line {number} missing string {key}")
         if not re.fullmatch(r"[a-z][a-z0-9_]*", event["msg"]):
             raise AssertionError(f"line {number} has an unstable msg")
+        if not isinstance(event.get("run_id"), str) or not event["run_id"]:
+            raise AssertionError(f"line {number} ({event['msg']}) missing string run_id")
+        if run_id is None:
+            run_id = event["run_id"]
+        elif event["run_id"] != run_id:
+            raise AssertionError(f"line {number} ({event['msg']}) changed run_id")
         names.add(event["msg"])
     if not REQUIRED <= names:
         raise AssertionError(f"missing lifecycle names: {sorted(REQUIRED - names)}")
@@ -65,10 +72,6 @@ def smoke(image):
             raise AssertionError(f"container exited {exit_code}, expected graceful exit 0")
         text = docker("logs", name)  # Combined stdout and stderr, every line checked.
         count = validate(text)
-        events = [json.loads(line) for line in text.splitlines()]
-        for event in events:
-            if not isinstance(event.get("run_id"), str):
-                raise AssertionError("lifecycle event missing run correlation")
         print(f"PASS: {count} JSON lines, token-free healthcheck and SIGTERM lifecycle")
     finally:
         if created:
@@ -78,7 +81,7 @@ def smoke(image):
 class ParserTests(unittest.TestCase):
     def fixture(self):
         return "\n".join(
-            json.dumps({"ts": "2026-09-30T12:00:00Z", "level": "info", "msg": name, "target": "two_bot"})
+            json.dumps({"ts": "2026-09-30T12:00:00Z", "level": "info", "msg": name, "target": "two_bot", "run_id": "test-run"})
             for name in sorted(REQUIRED)
         )
 
@@ -95,6 +98,16 @@ class ParserTests(unittest.TestCase):
             line = json.dumps({"ts": "x", "level": "info", "target": "x", "msg": value})
             with self.assertRaises(AssertionError):
                 validate(line + "\n" + self.fixture())
+
+    def test_missing_nonstring_and_changed_run_id_rejected(self):
+        for value in (None, 1, "", "different-run"):
+            events = [json.loads(line) for line in self.fixture().splitlines()]
+            events[-1]["run_id"] = value
+            with self.assertRaisesRegex(AssertionError, "run_id"):
+                validate("\n".join(json.dumps(event) for event in events))
+        events[-1].pop("run_id")
+        with self.assertRaisesRegex(AssertionError, "run_id"):
+            validate("\n".join(json.dumps(event) for event in events))
 
     def test_empty_and_incomplete_output_rejected(self):
         for text in ("", self.fixture().splitlines()[0]):

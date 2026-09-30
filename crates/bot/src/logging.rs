@@ -376,6 +376,52 @@ mod tests {
         assert!(!capture.text().contains("access_token"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_task_preserves_run_correlation() {
+        use tracing::{instrument::WithSubscriber, Instrument};
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(subscriber(
+            LogFormat::Json,
+            filter(None, None),
+            capture.clone(),
+        ));
+        let run = tracing::dispatcher::with_default(&dispatch, run_span);
+        let state = Arc::new(tokio::sync::RwLock::new(
+            crate::gateway::GatewayState::Unconfigured,
+        ));
+        // Bind inside the run span so `http_listening` keeps run correlation,
+        // matching `main.rs` where `bind` runs under the run span.
+        // `WithSubscriber` sets the capture dispatcher for every poll, so no
+        // ambient dispatcher is needed here.
+        let listener = crate::server::bind("127.0.0.1:0")
+            .instrument(run.clone())
+            .with_subscriber(dispatch.clone())
+            .await
+            .unwrap();
+        let serve = crate::server::serve_with_shutdown(listener, state, async {
+            tokio::task::yield_now().await;
+            tracing::info!(msg = "shutdown_started", signal = "test");
+        })
+        .instrument(run)
+        .with_subscriber(dispatch);
+        tokio::time::timeout(std::time::Duration::from_secs(2), serve)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["msg"], "http_listening");
+        assert_eq!(lines[1]["msg"], "shutdown_started");
+        assert_eq!(lines[2]["msg"], "shutdown_completed");
+        let run_id = lines[0]["run_id"].as_str().unwrap();
+        for event in &lines {
+            assert_eq!(event["run_id"], run_id);
+            assert_eq!(event["spans"][0]["name"], "run");
+        }
+    }
+
     #[test]
     fn pretty_is_explicit_opt_in() {
         assert_eq!(LogFormat::from_setting(None), LogFormat::Json);
