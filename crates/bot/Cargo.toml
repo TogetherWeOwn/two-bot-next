@@ -17,7 +17,6 @@ two-bot-core = { version = "0.1.0", path = "../core", features = ["db"] }
 two-bot-discord = { version = "0.1.0", path = "../discord" }
 two-bot-cutover = { version = "0.1.0", path = "../cutover" }
 futures-util = { workspace = true }
-sqlx = { workspace = true }
 serde = { workspace = true }
 axum = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
