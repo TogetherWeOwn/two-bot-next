@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+db = ["two-bot-core/db"]
+
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.
 [dependencies]
@@ -39,6 +42,8 @@ twilight-model = { workspace = true }
 # S2 prototype only: mock Discord double + measurement driver live in
 # tests/s2_prototype.rs. Nothing here ships in the release binary.
 [dev-dependencies]
+sqlx = { workspace = true }
+tracing-subscriber = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 rustls = { workspace = true }
 serde_json = { workspace = true }

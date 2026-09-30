@@ -3,45 +3,16 @@
 #![cfg(feature = "db")]
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{ConnectOptions, PgPool, Row};
-use std::str::FromStr;
+use sqlx::{PgPool, Row};
+#[path = "common/internal_testdb.rs"]
+mod internal_testdb;
+use internal_testdb::test_options;
 use std::sync::atomic::{AtomicU64, Ordering};
 use two_bot_core::internal_action_store::{
     AuditSubject, DiscordId, ExecutionClaim, InternalActionStore, InternalClaim,
     InternalStoreError, ReconciliationEvidence, RequestIdentity, TerminalFailure, TerminalResponse,
 };
 use two_bot_core::{body_hash, CLAIM_STALE_SECONDS, NONCE_TTL_SECONDS, SKEW_SECONDS};
-
-fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
-    if url.contains(['?', '#']) {
-        return Err("no test URL overrides");
-    }
-    if !(url.starts_with("postgres://agent_test:@") || url.starts_with("postgresql://agent_test:@"))
-    {
-        return Err("explicit agent_test empty password required");
-    }
-    // sqlx parses query-string overrides (host/hostaddr/user/dbname/port)
-    // while parsing, so validate the effective options, not URL substrings.
-    let options = PgConnectOptions::from_str(url).map_err(|_| "invalid test URL")?;
-    if options.get_host() != "agent-testdb"
-        || options.get_port() != 5432
-        || options.get_socket().is_some()
-        || options.get_username() != "agent_test"
-        || options.get_options().is_some()
-        || options.get_database() != Some("agent_test")
-        // The URL parser drops an empty password, and sqlx 0.9 falls back to
-        // an inherited PGPASSWORD or .pgpass credential. Reject any effective
-        // nonempty password and pin the empty one, mirroring sticky_store_live.
-        || options
-            .to_url_lossy()
-            .password()
-            .is_some_and(|password| !password.is_empty())
-    {
-        return Err("test-container target only");
-    }
-    // Never fall back to an inherited PGPASSWORD or .pgpass credential.
-    Ok(options.password(""))
-}
 
 fn schema_name() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
