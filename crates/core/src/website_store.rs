@@ -310,9 +310,108 @@ pub async fn replace_events(
 /// every start; a `web_v1` edit that renames, reorders, removes or retypes a
 /// column fails here loudly instead of silently breaking the website.
 pub async fn apply_web_contract(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
+    // Resolve and apply on the same connection: a pool can hand out different
+    // sessions, each with its own search_path.
+    let mut connection = pool.acquire().await?;
+    let bot_schema: Option<String> = sqlx::query_scalar("SELECT current_schema()::text")
+        .fetch_one(&mut *connection)
+        .await?;
+    let bot_schema = bot_schema.ok_or_else(|| {
+        contract_configuration_error("current_schema() is null: no existing schema in search_path")
+    })?;
+    let web_schema = web_schema_for(&bot_schema)?;
+    let sql = rewrite_contract_schema(WEB_CONTRACT_SQL, &web_schema);
     // Multi-statement DDL with plpgsql bodies: `raw_sql`, not `query` (the
     // extended protocol runs one statement; `;`-splitting would shred the
-    // function bodies).
-    sqlx::raw_sql(WEB_CONTRACT_SQL).execute(pool).await?;
+    // function bodies). https://docs.rs/sqlx/0.9.0/sqlx/fn.raw_sql.html
+    // SQLx 0.9 requires an explicit audit of dynamic SQL. The only dynamic
+    // token is web_schema, strictly validated by web_schema_for above.
+    // https://docs.rs/sqlx/0.9.0/sqlx/struct.AssertSqlSafe.html
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(&mut *connection)
+        .await?;
     Ok(())
+}
+
+fn contract_configuration_error(message: &'static str) -> sqlx::Error {
+    sqlx::Error::Configuration(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    )))
+}
+
+fn web_schema_for(bot_schema: &str) -> Result<String, sqlx::Error> {
+    // Legacy assertSafeSchema: [a-z_][a-z0-9_]{0,58}. Validate the
+    // derived identifier too, before interpolation (never allow truncation).
+    fn safe_schema(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 59
+            && (bytes[0].is_ascii_lowercase() || bytes[0] == b'_')
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+    }
+    if !safe_schema(bot_schema) {
+        return Err(contract_configuration_error("unsafe bot schema name"));
+    }
+    let web_schema = if bot_schema == "public" {
+        "web_v1".to_owned()
+    } else {
+        format!("{bot_schema}_web_v1")
+    };
+    if !safe_schema(&web_schema) {
+        return Err(contract_configuration_error("unsafe contract schema name"));
+    }
+    Ok(web_schema)
+}
+
+fn rewrite_contract_schema(source: &str, web_schema: &str) -> String {
+    // Port the legacy whole-word replacement without adding a regex dependency.
+    fn word_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+    let mut sql = String::with_capacity(source.len());
+    let mut copied_until = 0;
+    for (start, token) in source.match_indices("web_v1") {
+        let end = start + token.len();
+        let before = start.checked_sub(1).map(|i| source.as_bytes()[i]);
+        let after = source.as_bytes().get(end).copied();
+        if before.is_some_and(word_byte) || after.is_some_and(word_byte) {
+            continue;
+        }
+        sql.push_str(&source[copied_until..start]);
+        sql.push_str(web_schema);
+        copied_until = end;
+    }
+    sql.push_str(&source[copied_until..]);
+    sql
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_contract_schema_matches_legacy_and_rejects_unsafe_identifiers() {
+        assert_eq!(web_schema_for("public").unwrap(), "web_v1");
+        assert_eq!(web_schema_for("bot_a").unwrap(), "bot_a_web_v1");
+        assert_eq!(web_schema_for("_bot2").unwrap(), "_bot2_web_v1");
+        for name in ["", "Bot", "1bot", "bot-a", "bot; DROP SCHEMA public", "böt"] {
+            assert!(web_schema_for(name).is_err(), "unsafe identifier accepted");
+        }
+        assert!(web_schema_for(&"a".repeat(52)).is_ok());
+        assert!(web_schema_for(&"a".repeat(53)).is_err());
+        assert!(web_schema_for(&"a".repeat(60)).is_err());
+    }
+
+    #[test]
+    fn contract_schema_replacement_matches_whole_words_only() {
+        let source = "web_v1._ts web_v1 aweb_v1 web_v1x _web_v1 web_v1_ (web_v1)";
+        assert_eq!(
+            rewrite_contract_schema(source, "bot_a_web_v1"),
+            "bot_a_web_v1._ts bot_a_web_v1 aweb_v1 web_v1x _web_v1 web_v1_ (bot_a_web_v1)"
+        );
+        assert_eq!(rewrite_contract_schema(source, "web_v1"), source);
+    }
 }

@@ -48,22 +48,95 @@ fn test_db_url() -> String {
 /// this across reset + body.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn test_db_options(url: &str) -> Result<PgConnectOptions, &'static str> {
+    // An explicit empty password prevents sqlx from falling back to PG env or
+    // pgpass credentials. Reject query/fragment overrides rather than letting
+    // hostaddr, socket or options redirect the destructive reset.
+    if url.contains(['?', '#']) {
+        return Err("test URL must not have query parameters or a fragment");
+    }
+    let url = if let Some(rest) = url.strip_prefix("postgres://agent_test@") {
+        format!("postgres://agent_test:@{rest}")
+    } else if let Some(rest) = url.strip_prefix("postgresql://agent_test@") {
+        format!("postgresql://agent_test:@{rest}")
+    } else if url.starts_with("postgres://agent_test:@")
+        || url.starts_with("postgresql://agent_test:@")
+    {
+        url.to_owned()
+    } else {
+        return Err("test URL must explicitly use agent_test with an empty password");
+    };
+    // Inspect parsed fields, never substrings in credentials or URL parameters.
+    // https://docs.rs/sqlx/0.9.0/sqlx/postgres/struct.PgConnectOptions.html
+    let options = PgConnectOptions::from_str(&url).map_err(|_| "invalid test URL")?;
+    if options.get_host() != "agent-testdb"
+        || options.get_port() != 5432
+        || options.get_socket().is_some()
+        || options.get_username() != "agent_test"
+        || options.get_options().is_some()
+    {
+        return Err("test target must be agent-testdb:5432 without socket/startup overrides");
+    }
+    let database = options.get_database().ok_or("scratch database required")?;
+    let prefix = "two_bot_test_tog10090";
+    let allowed_name = database == prefix
+        || database
+            .strip_prefix(prefix)
+            .and_then(|s| s.strip_prefix('_'))
+            .is_some_and(|suffix| !suffix.is_empty());
+    if !allowed_name
+        || database.len() > 63
+        || !database
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err("database must be the isolated two_bot_test_tog10090 scratch target");
+    }
+    Ok(options)
+}
+
 async fn connect() -> Pool<Postgres> {
-    let url = test_db_url();
-    assert!(
-        url.starts_with("postgres://") || url.starts_with("postgresql://"),
-        "test URL must be postgres"
-    );
-    assert!(
-        !url.contains("twobot") || url.contains("test") || url.contains("tog10090"),
-        "refusing a non-scratch database URL"
-    );
-    let options = PgConnectOptions::from_str(&url).expect("valid test URL");
+    let options = test_db_options(&test_db_url()).expect("refusing non-test reset target");
     PgPoolOptions::new()
         .max_connections(5)
         .connect_with(options)
         .await
         .expect("connect to agent-testdb scratch")
+}
+
+#[test]
+fn reset_guard_allows_only_parsed_test_container_and_scratch_database() {
+    for url in [
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090",
+        "postgresql://agent_test@agent-testdb:5432/two_bot_test_tog10090_guard",
+    ] {
+        assert!(test_db_options(url).is_ok());
+    }
+    // Pure guard tests: none of these targets are ever contacted.
+    for url in [
+        "postgres://user@production/two_bot",
+        "postgres://test_runner@production/real_data",
+        "postgres://agent_test:@production/two_bot_test_tog10090",
+        "postgres://agent_test:@agent-testdb/real_data",
+        "postgres://agent_test:@agent-testdb/test",
+        "postgres://agent_test:@agent-testdb/postgres",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090_",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090-unsafe",
+        "postgres://agent_test:@agent-testdb:5433/two_bot_test_tog10090",
+        "postgres://agent_test:@agent-testdb.example/two_bot_test_tog10090",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090?host=production",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090?hostaddr=127.0.0.1",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090?options=-csearch_path=test",
+        "postgres://agent_test:@production/real_data?application_name=test",
+        "postgres://agent_test:@%2Fvar%2Frun%2Fpostgresql/two_bot_test_tog10090",
+        "postgres://agent_test:unexpected@agent-testdb/two_bot_test_tog10090",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090#test",
+        "postgres://agent_test:@agent-testdb/",
+        "postgres://agent-testdb/two_bot_test_tog10090",
+        "not a URL",
+    ] {
+        assert!(test_db_options(url).is_err(), "unsafe target accepted");
+    }
 }
 
 /// Reset the harness schema and apply 0001 + 0300 + web_v1.
@@ -216,6 +289,138 @@ async fn migrations_seed_ladder_version_and_views() {
     assert_eq!(views, expected);
 
     pool.close().await;
+}
+
+#[tokio::test]
+async fn isolated_contracts_keep_their_own_tables_and_leave_public_untouched() {
+    let _serial = SERIAL.lock().await;
+    let public = connect().await;
+    reset(&public).await;
+    sqlx::raw_sql(
+        "DROP SCHEMA IF EXISTS tog10090_a_web_v1 CASCADE;
+         DROP SCHEMA IF EXISTS tog10090_b_web_v1 CASCADE;
+         DROP SCHEMA IF EXISTS tog10090_a CASCADE;
+         DROP SCHEMA IF EXISTS tog10090_b CASCADE;
+         CREATE SCHEMA tog10090_a;
+         CREATE SCHEMA tog10090_b;",
+    )
+    .execute(&public)
+    .await
+    .expect("create isolated scratch schemas");
+    let fresh = two_bot_core::now_iso();
+    write_counter(&public, GUILD, &fresh, 333)
+        .await
+        .expect("public reading");
+
+    let mut isolated = Vec::new();
+    for (schema, count) in [("tog10090_a", 111), ("tog10090_b", 222)] {
+        let options = test_db_options(&test_db_url())
+            .expect("safe test target")
+            .options([("search_path", schema)]);
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .expect("isolated pool");
+        let migrator = sqlx::migrate!("../cutover/migrations");
+        migrator.run(&pool).await.expect("isolated migrations");
+        write_counter(&pool, GUILD, &fresh, count)
+            .await
+            .expect("isolated reading");
+        apply_web_contract(&pool).await.expect("isolated contract");
+        isolated.push(pool);
+    }
+    // Reapplying A must not rebind B or public either (idempotence).
+    apply_web_contract(&isolated[0]).await.expect("reapply A");
+    for (contract, query, expected_count) in [
+        (
+            "web_v1",
+            "SELECT human_member_count FROM web_v1.live_counts",
+            333,
+        ),
+        (
+            "tog10090_a_web_v1",
+            "SELECT human_member_count FROM tog10090_a_web_v1.live_counts",
+            111,
+        ),
+        (
+            "tog10090_b_web_v1",
+            "SELECT human_member_count FROM tog10090_b_web_v1.live_counts",
+            222,
+        ),
+    ] {
+        let count: Option<i32> = sqlx::query_scalar(query)
+            .fetch_one(&public)
+            .await
+            .expect("isolated live count");
+        assert_eq!(count, Some(expected_count), "contract rebound: {contract}");
+        let views: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_views WHERE schemaname = $1")
+            .bind(contract)
+            .fetch_one(&public)
+            .await
+            .expect("contract view count");
+        assert_eq!(views, WEB_CONTRACT_VIEWS.len() as i64);
+    }
+    for pool in isolated {
+        pool.close().await;
+    }
+    sqlx::raw_sql(
+        "DROP SCHEMA tog10090_a_web_v1 CASCADE;
+         DROP SCHEMA tog10090_b_web_v1 CASCADE;
+         DROP SCHEMA tog10090_a CASCADE;
+         DROP SCHEMA tog10090_b CASCADE;",
+    )
+    .execute(&public)
+    .await
+    .expect("remove isolated scratch schemas");
+    public.close().await;
+}
+
+#[tokio::test]
+async fn contract_refuses_a_missing_or_unsafe_current_schema_before_ddl() {
+    let _serial = SERIAL.lock().await;
+    let public = connect().await;
+    reset(&public).await;
+    sqlx::raw_sql(
+        "DROP SCHEMA IF EXISTS tog10090_missing CASCADE;
+         DROP SCHEMA IF EXISTS \"tog10090-unsafe\" CASCADE;
+         CREATE SCHEMA \"tog10090-unsafe\";",
+    )
+    .execute(&public)
+    .await
+    .expect("prepare unsafe and absent scratch schemas");
+    for schema in ["tog10090_missing", "\"tog10090-unsafe\""] {
+        let options = test_db_options(&test_db_url())
+            .expect("safe test target")
+            .options([("search_path", schema)]);
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("scratch pool");
+        let error = apply_web_contract(&pool).await.expect_err("refuse schema");
+        assert!(matches!(error, sqlx::Error::Configuration(_)));
+        pool.close().await;
+    }
+    let namespaced_contracts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_namespace
+         WHERE nspname IN ('tog10090_missing_web_v1', 'tog10090-unsafe_web_v1')",
+    )
+    .fetch_one(&public)
+    .await
+    .expect("no unsafe contracts");
+    assert_eq!(namespaced_contracts, 0);
+    let public_views: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_views WHERE schemaname = 'web_v1'")
+            .fetch_one(&public)
+            .await
+            .expect("public preserved");
+    assert_eq!(public_views, 9);
+    sqlx::raw_sql("DROP SCHEMA \"tog10090-unsafe\" CASCADE;")
+        .execute(&public)
+        .await
+        .expect("cleanup unsafe scratch schema");
+    public.close().await;
 }
 
 #[tokio::test]
