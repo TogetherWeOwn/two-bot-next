@@ -345,6 +345,72 @@ fn numeric_references_keep_legacy_identity_for_delivery_dedupe() {
 }
 
 #[test]
+fn unicode_trim_matches_legacy_string_trim_for_delivery_identity() {
+    // Legacy trims with JavaScript String.trim(); Rust str::trim() differs
+    // in exactly two code points (strips U+0085, keeps U+FEFF -- JS does
+    // the opposite). Either divergence changes the hashed key/nonce and
+    // bypasses restored delivery dedupe, reposting the item.
+    // (\u{feff} / \u{85} escapes keep the invisible code points explicit.)
+    let xml = "<rss><channel><item><guid>\u{feff}post1</guid>\
+        <link>https://example.org/post</link></item></channel></rss>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "post1");
+    assert_eq!(
+        item_key(&items[0]).unwrap(),
+        "0c99c0ff97ab9d918039af1f390708ea1e0a32feed5c43469328fe2b559c9260"
+    );
+    assert_eq!(
+        delivery_nonce("feed-1", &item_key(&items[0]).unwrap()),
+        "d3de15aef4a7f86bb7aa4c56"
+    );
+    // U+0085 is NOT whitespace to legacy: it survives into the key.
+    let xml = "<rss><channel><item><guid>\u{85}post1</guid>\
+        <link>https://example.org/post</link></item></channel></rss>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "\u{85}post1");
+    assert_eq!(
+        item_key(&items[0]).unwrap(),
+        "ec7e0c317ea3b013b32527cbc2ed150be322af67d2f03e70320e9e186a3d9568"
+    );
+    assert_eq!(
+        delivery_nonce("feed-1", &item_key(&items[0]).unwrap()),
+        "02226b2bc943fadb600b482b"
+    );
+    // A guid of only trimmable padding is empty to legacy, so identity
+    // falls through to the link exactly like a missing guid.
+    let xml = "<rss><channel><item><guid>\u{feff} </guid>\
+        <link>https://example.org/post</link></item></channel></rss>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "https://example.org/post");
+}
+
+#[test]
+fn prefixed_extension_fields_do_not_shadow_core_guid() {
+    // Legacy fast-xml-parser keeps the `vendor:` prefix on property names,
+    // so `row.guid` never sees `<vendor:guid>`. Selecting by local name
+    // would hash `extension-key` instead of `real-key` and miss the
+    // restored delivered row.
+    let xml = "<rss xmlns:vendor=\"urn:vendor\"><channel><item>\
+        <vendor:guid>extension-key</vendor:guid><guid>real-key</guid>\
+        <link>https://example.org/post</link>\
+        </item></channel></rss>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "real-key");
+    assert_eq!(
+        item_key(&items[0]).unwrap(),
+        "820b4debdcadc0f01b263929238f1df85926a5e067b332f16ae52eabb1c1b42b"
+    );
+    assert_eq!(
+        delivery_nonce("feed-1", &item_key(&items[0]).unwrap()),
+        "46a5c3c8086f2dbb35b6c65b"
+    );
+}
+
+#[test]
 fn rejects_xml_entities_malformed_size_and_item_explosion() {
     for xml in ["<rss>", "<html/>",
         "<!DOCTYPE rss [<!ENTITY secret SYSTEM 'file:///etc/passwd'>]><rss><channel><item><title>&secret;</title></item></channel></rss>",

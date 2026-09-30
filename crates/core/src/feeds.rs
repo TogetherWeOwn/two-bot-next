@@ -221,17 +221,19 @@ pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
     )
     .map_err(|_| FeedError::InvalidXml)?;
     let root = doc.root_element();
-    let entries: Vec<_> = match root.tag_name().name() {
+    // Qualified root name: legacy looks up `parsed.rss`/`parsed.feed`, so a
+    // prefixed root is not a feed at all rather than a local-name match.
+    let entries: Vec<_> = match raw_tag_name(xml, root) {
         "rss" => root
             .children()
-            .find(|node| named(*node, "channel"))
+            .find(|node| named(xml, *node, "channel"))
             .into_iter()
             .flat_map(|channel| channel.children())
-            .filter(|node| named(*node, "item"))
+            .filter(|node| named(xml, *node, "item"))
             .collect(),
         "feed" => root
             .children()
-            .filter(|node| named(*node, "entry"))
+            .filter(|node| named(xml, *node, "entry"))
             .collect(),
         _ => return Err(FeedError::InvalidXml),
     };
@@ -243,7 +245,7 @@ pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
         .filter_map(|entry| {
             let links: Vec<_> = entry
                 .children()
-                .filter(|node| named(*node, "link"))
+                .filter(|node| named(xml, *node, "link"))
                 .collect();
             // Legacy `resolveLink` tests the RAW href: only an alternate whose
             // href is itself HTTP(S) is promoted. A mailto alternate must not
@@ -298,8 +300,20 @@ pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
         .collect())
 }
 
-fn named(node: Node<'_, '_>, name: &str) -> bool {
-    node.is_element() && node.tag_name().name() == name
+fn named(xml: &str, node: Node<'_, '_>, name: &str) -> bool {
+    node.is_element() && raw_tag_name(xml, node) == name
+}
+
+/// Qualified element name straight from the source slice: legacy
+/// fast-xml-parser keeps namespace prefixes on property names, so `row.guid`
+/// never sees `<vendor:guid>` and only an unprefixed element is a core feed
+/// field. Cuts land on ASCII markup delimiters, so slicing is UTF-8-safe.
+fn raw_tag_name<'a>(xml: &'a str, node: Node<'_, '_>) -> &'a str {
+    let rest = xml[node.range()].strip_prefix('<').unwrap_or("");
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .unwrap_or(rest.len());
+    &rest[..end]
 }
 
 /// Legacy parses with `processEntities: false`, so its key/url/title text is
@@ -350,13 +364,12 @@ fn open_tag_end(tag_and_rest: &str) -> usize {
 /// just `tail`. CDATA contributes its raw body, markers excluded.
 /// Numeric references pass through untouched; NOT decoded here.
 fn raw_text(xml: &str, entry: Node<'_, '_>, name: &str) -> String {
-    entry
+    let text = entry
         .children()
-        .find(|child| named(*child, name))
+        .find(|child| named(xml, *child, name))
         .map(|node| strip_markup(inner_source(xml, node)))
-        .unwrap_or_default()
-        .trim()
-        .to_owned()
+        .unwrap_or_default();
+    js_trim(&text).to_owned()
 }
 
 /// Keep only the element's own character data the way legacy `textValue`
@@ -451,6 +464,35 @@ fn skip_element(source: &str, start: usize) -> usize {
     i
 }
 
+/// Legacy trims with JavaScript `String.trim()`: ECMAScript WhiteSpace plus
+/// LineTerminator. That set differs from Rust `str::trim()` in exactly two
+/// code points: JS strips U+FEFF but keeps U+0085, Rust does the opposite.
+/// Rust trim here would hash `\u{feff}post1` instead of `post1` (or drop a
+/// leading U+0085 legacy keeps), missing restored delivery rows and
+/// reposting. Used on the identity path only: extraction/selection
+/// (`raw_text`, link hrefs, attributes) and final key/fallback hashing
+/// (`item_key`), mirroring legacy `textValue`/`resolveLink`/`String.trim`.
+fn js_trim(value: &str) -> &str {
+    value.trim_matches(js_trim_char)
+}
+
+fn js_trim_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
+}
+
 /// Legacy `decodeXml`: exactly the five named replacements, applied in
 /// order so `&amp;lt;` chains to `<`. General numeric references such as
 /// `&#49;` or `&#x27;` are intentionally NOT decoded.
@@ -477,7 +519,7 @@ fn is_alternate(xml: &str, node: Node<'_, '_>) -> bool {
 /// decoding and without URL parsing. Case-insensitivity matters:
 /// `HTTPS://` counts.
 fn is_http_href(raw_href: &str) -> bool {
-    let href = raw_href.trim().as_bytes();
+    let href = js_trim(raw_href).as_bytes();
     href.get(..7)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http://"))
         || href
@@ -495,7 +537,7 @@ fn link_href_raw(xml: &str, node: Node<'_, '_>) -> String {
         return href;
     }
     if node.attributes().next().is_none() {
-        return strip_markup(inner_source(xml, node)).trim().to_owned();
+        return js_trim(&strip_markup(inner_source(xml, node))).to_owned();
     }
     String::new()
 }
@@ -558,7 +600,7 @@ fn raw_attribute(xml: &str, node: Node<'_, '_>, name: &str) -> Option<String> {
                 tag[start..i].to_owned()
             };
             if attr_name == name {
-                return Some(value.trim().to_owned());
+                return Some(js_trim(&value).to_owned());
             }
         } else if attr_name == name {
             // Valueless attribute: present but contributes nothing.
@@ -578,10 +620,10 @@ fn is_item_url(value: &str) -> bool {
 }
 
 pub fn item_key(item: &FeedItem) -> Result<String, FeedError> {
-    let key = if item.key.trim().is_empty() {
-        item.url.trim()
+    let key = if js_trim(&item.key).is_empty() {
+        js_trim(&item.url)
     } else {
-        item.key.trim()
+        js_trim(&item.key)
     };
     if key.is_empty() {
         return Err(FeedError::MissingKey);
