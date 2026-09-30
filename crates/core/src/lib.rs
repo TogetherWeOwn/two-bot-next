@@ -15,6 +15,7 @@ pub mod handlers;
 pub mod health;
 pub mod invites;
 pub mod leveling;
+pub mod member_moderation;
 pub mod moderation;
 pub mod voice;
 
