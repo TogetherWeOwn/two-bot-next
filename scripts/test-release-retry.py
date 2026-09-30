@@ -351,7 +351,23 @@ class ReleaseRetryTests(unittest.TestCase):
     def test_no_open_pr_keeps_native_creation_and_publication_enabled(self):
         self.state(open=False)
         self.assertEqual(self.outputs("plan"), {"reuse_pr": "false"})
-        self.assertEqual(self.outputs("select"), {"pr_available": "false", "pr": ""})
+        before = self.state()
+        outputs = self.outputs("select")
+        self.assertEqual(outputs, {"pr_available": "false", "pr": "{}"})
+        # The live first-release run published successfully, then failed while
+        # evaluating fromJSON('') in the skipped reconciliation step's env.
+        # Exercise the actual CLI output: it must parse even before if is
+        # applied, and neither selected-PR field may identify a mutation target.
+        selected = json.loads(outputs["pr"])
+        self.assertIsNone(selected.get("number"))
+        self.assertIsNone(selected.get("headBranchName"))
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads("")  # Negative control: original post-publication value.
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertEqual(workflow.count("if: steps.select.outputs.pr_available == 'true'"), 2)
+        self.assertIn("if: needs.release-please.outputs.pr_available == 'true'", workflow)
+        self.assertNotIn("skip-github-release:", workflow)
+        self.assertEqual(self.state(), before, "No push, PATCH, notes PUT or branch creation")
 
     def test_foreign_head_is_not_selected(self):
         self.state(head_repo="foreign/repo")
