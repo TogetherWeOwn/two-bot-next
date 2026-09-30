@@ -7,6 +7,9 @@
 
 pub mod audit;
 pub mod automod;
+pub mod channel_moderation;
+#[cfg(feature = "db")]
+pub mod channel_moderation_store;
 pub mod classify;
 pub mod commands;
 pub mod community;
@@ -39,6 +42,7 @@ pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
 pub mod raid;
+pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
@@ -57,6 +61,18 @@ pub use automod::{
     AutomodExportError, AutomodExportRule, AutomodFilter, AutomodGateError, AutomodMessage,
     AutomodPolicy, AutomodSanction, RepeatTracker, SanctionAction, DEFAULT_BLOCKED_ATTACHMENTS,
     DEFAULT_SANCTIONS,
+};
+pub use channel_moderation::{
+    moderation_result_text, plan_lockdown, plan_unlock, require_channel_reason,
+    validate_purge_count, validate_slowmode_seconds, BoundsError, ChannelModerationVerb,
+    ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord, LockdownSeed, MaskError,
+    UnlockError, UnlockPlan, MAX_PURGE_COUNT, MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT,
+    SEND_MESSAGES_BIT,
+};
+#[cfg(feature = "db")]
+pub use channel_moderation_store::{
+    ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore, DB_POOL_MAX_DEFAULT,
+    STATEMENT_TIMEOUT_MS,
 };
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use community::{
@@ -156,6 +172,13 @@ pub use raid::{
     RaidAlert, RaidConfigError, RaidTuning, RaidWatch, RecordedJoinRisk, StaffAlertMessage,
     DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS, DEFAULT_RAID_COOLDOWN_SECONDS,
     DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
+};
+pub use router::{
+    ComponentHandler, ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter,
+    RouterGates, RouterRefusal, SlashContext, SlashOutcome, SurfaceFlags,
+    ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY, GUILD_RESTRICTED_REPLY, LFG_PREFIX,
+    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
+    SCORECARD_DISABLED_REPLY, SELF_ROLE_PREFIX, TICKET_CLAIM_ID, TICKET_CLOSE_ID, TICKET_OPEN_ID,
 };
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
