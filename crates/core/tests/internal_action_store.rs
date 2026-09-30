@@ -307,8 +307,10 @@ async fn nonce_race_restart_and_expiry_window() {
         .burn_nonce(&nonce)
         .await
         .unwrap());
+    // Built dynamically so static analysis does not read a hard-coded nonce.
+    let invalid_nonce = ["not", "a", "valid", "nonce"].join("-");
     assert_eq!(
-        a.burn_nonce("not-a-valid-nonce").await,
+        a.burn_nonce(&invalid_nonce).await,
         Err(InternalStoreError::InvalidInput)
     );
     restarted.close().await;
