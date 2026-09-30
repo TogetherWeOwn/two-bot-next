@@ -9,6 +9,7 @@ pub mod adapter;
 pub mod executor;
 pub mod intents;
 pub mod interactions;
+mod message_safety;
 pub mod pipeline;
 
 pub use adapter::event_to_core;

@@ -183,7 +183,9 @@ pub fn format_audit_event(event: &AuditEvent) -> String {
             fields.push(rendered.join(" "));
         }
     }
-    truncate_discord_content(&fields.join(" · "))
+    truncate_discord_content(&crate::message_safety::neutralize_mentions(
+        &fields.join(" · "),
+    ))
 }
 
 /// Format one metadata value (two-bot `formatMetadata`).
@@ -247,14 +249,7 @@ fn truncate_discord_content(content: &str) -> String {
 // JS string limits count UTF-16 units. Never slice a Rust string at a byte
 // offset: even the static separator is non-ASCII, and metadata may be Unicode.
 fn utf16_prefix(value: &str, limit: usize) -> String {
-    let mut units = 0;
-    value
-        .chars()
-        .take_while(|c| {
-            units += c.len_utf16();
-            units <= limit
-        })
-        .collect()
+    crate::message_safety::truncate(value, limit)
 }
 
 /// Mirror channel ids the sink routes to (two-bot `AuditChannelIds`).

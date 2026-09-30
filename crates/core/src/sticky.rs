@@ -79,7 +79,7 @@ pub enum StickyError {
 /// Validate a sticky body: 1–2000 UTF-16 units (legacy `requireBody`, no trim
 /// — whitespace-only bodies pass, matching legacy).
 pub fn validate_body(body: &str) -> Result<(), StickyError> {
-    let len = body.encode_utf16().count();
+    let len = crate::message_safety::text_len(body);
     if !(1..=MAX_BODY_CHARS).contains(&len) {
         return Err(StickyError::BodyLength);
     }

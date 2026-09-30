@@ -1082,6 +1082,7 @@ impl ActionExecutor {
             body["nonce"] = n;
             body["enforce_nonce"] = serde_json::Value::Bool(true);
         }
+        crate::message_safety::sanitize_message(&mut body);
         let body_bytes = serde_json::to_vec(&body)
             .map_err(|e| DiscordError::Rejected(format!("build message body: {e}")))?;
         let req = Request::builder(&Route::CreateMessage {
@@ -1221,11 +1222,12 @@ impl ActionExecutor {
             Id::<InteractionMarker>::new_checked(interaction_id).ok_or_else(|| {
                 DiscordError::Rejected(format!("bad interaction id: {interaction_id}"))
             })?;
+        let response = crate::message_safety::interaction_response(response)?;
         let req = Self::request_of(
             self.inner
                 .factory
                 .interaction(Id::<ApplicationMarker>::new(1))
-                .create_response(interaction_id, interaction_token, response),
+                .create_response(interaction_id, interaction_token, &response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
         let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
