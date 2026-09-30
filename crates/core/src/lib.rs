@@ -8,6 +8,7 @@
 pub mod automod;
 pub mod commands;
 pub mod config;
+pub mod containment;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
@@ -35,6 +36,12 @@ pub use automod::{
 };
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
+pub use containment::{
+    plan_quarantine, quarantine_outcome, role_removal_status, ClaimedContainmentEvent,
+    ContainmentDisposition, ContainmentEventState, ContainmentIncident, ContainmentIncidentState,
+    ContainmentPolicy, ContainmentPolicyError, ContainmentReason, ContainmentRole,
+    DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan, QuarantineRefusal,
+};
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
