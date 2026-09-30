@@ -7,7 +7,11 @@ license.workspace = true
 
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.
+[features]
+db = ["two-bot-core/db", "dep:sqlx"]
+
 [dependencies]
+sqlx = { workspace = true, optional = true }
 two-bot-core = { version = "0.1.0", path = "../core" }
 bytes = "1"
 http = "1"

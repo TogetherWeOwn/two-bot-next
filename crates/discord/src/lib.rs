@@ -9,7 +9,12 @@ pub mod adapter;
 pub mod executor;
 pub mod intents;
 pub mod interactions;
+#[cfg(feature = "db")]
+pub mod leveling_runtime;
 pub mod pipeline;
+
+#[cfg(feature = "db")]
+pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};
 
 pub use adapter::event_to_core;
 pub use executor::{

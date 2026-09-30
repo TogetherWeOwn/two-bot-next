@@ -24,7 +24,7 @@ use two_bot_core::gateway_session::{
 use two_bot_core::{ComponentStatus, Config, FunnelEvent};
 use two_bot_cutover::gateway_session::GatewaySessionStore;
 use two_bot_discord::{
-    gateway_intents, needs_message_content, NoClassification, NoInvites, Pipeline,
+    gateway_intents, needs_message_content, LevelingRuntime, OrderedLevelingPipeline,
 };
 
 /// Install the process-wide rustls crypto provider (ring) unless one is set.
@@ -103,7 +103,7 @@ pub fn intents_from_env() -> Intents {
     gateway_intents(message_content)
 }
 
-pub type GatewayPipeline = Pipeline<GatewayFunnelBuffer>;
+pub type GatewayPipeline = OrderedLevelingPipeline<GatewayFunnelBuffer>;
 
 pub async fn load_boot_session(
     store: &GatewaySessionStore,
@@ -289,7 +289,14 @@ async fn run_loop(
         if let Some(parsed) = parsed {
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
-            pipeline.handle(&event);
+            checkpoint_io(state, deadline, async {
+                pipeline.handle(&event).await.map_err(|_| {
+                    sqlx::Error::InvalidArgument(
+                        "leveling gateway dispatch failed; checkpoint unchanged".into(),
+                    )
+                })
+            })
+            .await?;
         }
         checkpoint_io(
             state,
@@ -334,14 +341,11 @@ pub fn build_shard_config(
 }
 
 #[must_use]
-pub fn build_pipeline(milestones: Vec<FunnelEvent>) -> GatewayPipeline {
-    Pipeline::new(
-        GatewayFunnelBuffer::from_milestones(milestones),
-        None,
-        None,
-        NoInvites,
-        NoClassification,
-    )
+pub fn build_pipeline(
+    milestones: Vec<FunnelEvent>,
+    runtime: Option<LevelingRuntime>,
+) -> GatewayPipeline {
+    OrderedLevelingPipeline::new(GatewayFunnelBuffer::from_milestones(milestones), runtime)
 }
 
 #[cfg(test)]

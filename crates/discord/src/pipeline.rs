@@ -191,6 +191,13 @@ impl VoiceChains {
     }
 }
 
+/// Eligibility decisions supplied by the upstream message acceptance path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MessageEligibility {
+    pub is_staff_automation: bool,
+    pub capture_only: bool,
+}
+
 /// The S3 gateway pipeline. `S`/`L`/`F` are the core seams; `I` serves invite
 /// counters; `C` classifies channels. Share via `Arc` between the shard
 /// runner and the HTTP layer (snapshot reads, health).
@@ -324,6 +331,16 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
     /// where the transition matters (member pending, voice channel), updates
     /// the cache, then calls the framework-free handlers.
     pub fn handle(&self, event: &Event) {
+        self.handle_at(
+            event,
+            &two_bot_core::now_iso(),
+            MessageEligibility::default(),
+        );
+    }
+
+    /// The ordered async bridge supplies one processing instant for both halves
+    /// of a voice move and carries the existing automod/staff eligibility gates.
+    pub fn handle_at(&self, event: &Event, at: &str, eligibility: MessageEligibility) {
         match event {
             // Fresh session after (re-)identify: first connect starts empty
             // (no-op); a reconnect's open state is unproven and dropped.
@@ -427,7 +444,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                 let is_bot = remove.user.bot;
                 self.cache.update(event);
                 self.handlers
-                    .on_leave(guild_id, member_id, None, Some(is_bot));
+                    .on_leave(guild_id, member_id, Some(at.to_owned()), Some(is_bot));
             }
             Event::MessageCreate(msg) => {
                 let Some(guild_id) = msg.guild_id.map(|g| g.get()) else {
@@ -440,10 +457,10 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                     is_bot: msg.author.bot,
                     message_id: Some(msg.id.get().to_string()),
                     webhook_id: msg.webhook_id.map(|w| w.get()),
-                    is_staff_automation: false,
+                    is_staff_automation: eligibility.is_staff_automation,
                     channel_id,
                     channel_class: self.classifier.classify(channel_id),
-                    capture_only: false,
+                    capture_only: eligibility.capture_only,
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
                 };
                 self.cache.update(event);
@@ -477,7 +494,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                 // as one instant, not a gap.
                 let chain = self.voice_chains.lock_for(guild_id, member_id);
                 let _guard = chain.lock().expect("voice chain");
-                let at = two_bot_core::now_iso();
+                let at = at.to_owned();
                 if let Some(old) = old_channel {
                     self.handlers.on_voice_leave(VoiceInput {
                         guild_id,

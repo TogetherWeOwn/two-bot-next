@@ -47,7 +47,8 @@ use twilight_http::Client as TwilightClient;
 use twilight_model::channel::message::AllowedMentions;
 use twilight_model::http::permission_overwrite::{PermissionOverwrite, PermissionOverwriteType};
 use twilight_model::id::marker::{
-    ApplicationMarker, ChannelMarker, GuildMarker, InteractionMarker, MessageMarker, UserMarker,
+    ApplicationMarker, ChannelMarker, GuildMarker, InteractionMarker, MessageMarker, RoleMarker,
+    UserMarker,
 };
 use twilight_model::id::Id;
 use two_bot_core::{
@@ -368,6 +369,46 @@ impl HyperTransport {
     }
 }
 
+/// A separately authorized staging revoke operation. It is never constructed
+/// by the level-up path. Deployment supplies both guild identities; ambiguous
+/// identities are refused, and the production identity is always denied.
+#[derive(Debug, Clone, Copy)]
+pub struct StagingRevokeFence {
+    staging_guild: u64,
+    production_guild: u64,
+}
+
+impl StagingRevokeFence {
+    pub fn new(staging_guild: u64, production_guild: u64) -> Result<Self, DiscordError> {
+        if staging_guild == 0 || production_guild == 0 || staging_guild == production_guild {
+            return Err(DiscordError::Rejected(
+                "invalid staging revoke fence".into(),
+            ));
+        }
+        Ok(Self {
+            staging_guild,
+            production_guild,
+        })
+    }
+
+    fn allows(self, guild: u64) -> bool {
+        guild == self.staging_guild && guild != self.production_guild
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MemberRoles {
+    roles: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RewardRole {
+    id: String,
+    managed: bool,
+    position: i64,
+    permissions: String,
+}
+
 /// The S4 REST executor: paced lane + moderation lane over one transport.
 #[derive(Debug, Clone)]
 pub struct ActionExecutor {
@@ -515,6 +556,139 @@ impl ActionExecutor {
             return Ok(res);
         }
         Err(throw_for_status(&res))
+    }
+
+    async fn role_read<T: serde::de::DeserializeOwned>(
+        &self,
+        request: Request,
+    ) -> Result<T, DiscordError> {
+        self.pace(false).await;
+        let response = self.call_once_raw(request, &[200]).await?;
+        serde_json::from_slice(&response.body)
+            .map_err(|_| DiscordError::Unavailable("invalid role readback".into()))
+    }
+
+    /// Fetch current roles, never interpreting unreadable/forbidden as empty.
+    pub async fn member_role_ids(
+        &self,
+        guild_id: u64,
+        member_id: u64,
+    ) -> Result<Vec<String>, DiscordError> {
+        let guild = snowflake(&guild_id.to_string())?;
+        let member = snowflake(&member_id.to_string())?;
+        let request = Self::request_of(self.inner.factory.guild_member(guild, member))?;
+        let roles: MemberRoles = self.role_read(request).await?;
+        for role in &roles.roles {
+            let _: Id<RoleMarker> = snowflake(role)?;
+        }
+        Ok(roles.roles)
+    }
+
+    /// Apply the domain plan through the shared pacing/request factory. All
+    /// local validation and the entire revoke preflight precede any mutation;
+    /// Discord cannot promise atomicity if permissions change after preflight.
+    /// PUT/DELETE role endpoints are idempotent; errors are returned, not hidden.
+    pub async fn execute_reward_roles(
+        &self,
+        guild_id: u64,
+        member_id: u64,
+        plan: &two_bot_core::leveling::RewardRolePlan,
+        revoke_fence: Option<StagingRevokeFence>,
+    ) -> Result<(), DiscordError> {
+        let guild = snowflake(&guild_id.to_string())?;
+        let member = snowflake(&member_id.to_string())?;
+        let grants: Vec<Id<RoleMarker>> = plan
+            .grant
+            .iter()
+            .map(|id| snowflake(id))
+            .collect::<Result<_, _>>()?;
+        let revokes: Vec<Id<RoleMarker>> = plan
+            .revoke
+            .iter()
+            .map(|id| snowflake(id))
+            .collect::<Result<_, _>>()?;
+        let grant_reason = audit_reason(&plan.grant_reason)?;
+        let revoke_reason = if revokes.is_empty() {
+            None
+        } else {
+            if !revoke_fence.is_some_and(|fence| fence.allows(guild_id)) {
+                return Err(DiscordError::Rejected(
+                    "level role revocation is staging-only".into(),
+                ));
+            }
+            Some(audit_reason(plan.revoke_reason.as_deref().ok_or_else(
+                || DiscordError::Rejected("missing level role revoke reason".into()),
+            )?)?)
+        };
+        if !revokes.is_empty() {
+            self.preflight_reward_revokes(guild_id, &plan.revoke)
+                .await?;
+        }
+        for role in grants {
+            self.pace(false).await;
+            let request = Self::request_of(
+                self.inner
+                    .factory
+                    .add_guild_member_role(guild, member, role)
+                    .reason(&grant_reason),
+            )?;
+            self.call_once_raw(request, &[200, 204]).await?;
+        }
+        for role in revokes {
+            self.pace(false).await;
+            let request = Self::request_of(
+                self.inner
+                    .factory
+                    .remove_guild_member_role(guild, member, role)
+                    .reason(revoke_reason.as_deref().expect("validated revoke reason")),
+            )?;
+            self.call_once_raw(request, &[200, 204]).await?;
+        }
+        Ok(())
+    }
+
+    async fn preflight_reward_revokes(
+        &self,
+        guild_id: u64,
+        revoke: &[String],
+    ) -> Result<(), DiscordError> {
+        #[derive(serde::Deserialize)]
+        struct BotIdentity {
+            id: String,
+        }
+        let bot: BotIdentity = self
+            .role_read(Self::request_of(self.inner.factory.current_user())?)
+            .await?;
+        let bot_id: Id<UserMarker> = snowflake(&bot.id)?;
+        let held = self.member_role_ids(guild_id, bot_id.get()).await?;
+        let roles: Vec<RewardRole> = self
+            .role_read(Self::request_of(
+                self.inner.factory.roles(snowflake(&guild_id.to_string())?),
+            )?)
+            .await?;
+        let refuse =
+            || DiscordError::Rejected("level role revoke preflight refused the entire set".into());
+        let everyone = guild_id.to_string();
+        let mut permissions = 0u64;
+        let mut top = 0i64;
+        // Missing held/everyone roles is an incomplete permission snapshot.
+        for id in held.iter().chain(std::iter::once(&everyone)) {
+            let role = roles.iter().find(|r| &r.id == id).ok_or_else(refuse)?;
+            permissions |= role.permissions.parse::<u64>().map_err(|_| refuse())?;
+            top = top.max(role.position);
+        }
+        let manage_roles = twilight_model::guild::Permissions::MANAGE_ROLES.bits();
+        let administrator = twilight_model::guild::Permissions::ADMINISTRATOR.bits();
+        if permissions & (manage_roles | administrator) == 0 {
+            return Err(refuse());
+        }
+        for id in revoke {
+            let role = roles.iter().find(|r| &r.id == id).ok_or_else(refuse)?;
+            if role.managed || role.id == everyone || role.position >= top {
+                return Err(refuse());
+            }
+        }
+        Ok(())
     }
 
     /// Member ban: `PUT /guilds/{g}/bans/{u}` (legacy accepts 200/204).

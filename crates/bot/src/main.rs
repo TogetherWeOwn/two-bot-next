@@ -85,7 +85,34 @@ async fn main() {
                         0,
                     );
                     let saved = gateway::load_boot_session(&store).await?;
-                    let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                    let executor = Arc::new(
+                        two_bot_discord::ActionExecutor::new(token.clone()).map_err(|_| {
+                            sqlx::Error::InvalidArgument(
+                                "Discord executor initialization failed".into(),
+                            )
+                        })?,
+                    );
+                    let session_mode =
+                        std::env::var("TWO_ONBOARDING_MODE").as_deref() == Ok("session");
+                    let router = two_bot_core::InteractionRouter::new(two_bot_core::RouterGates {
+                        configured_guild: Some(guild_id),
+                        scorecard: false,
+                        automations: false,
+                        announcements: false,
+                        moderation: false,
+                        tickets: false,
+                        self_roles: false,
+                        onboarding_picker: false,
+                        session_picker: session_mode,
+                    });
+                    let runtime = two_bot_discord::LevelingRuntime::new(
+                        db.pool().clone(),
+                        executor,
+                        router,
+                        session_mode,
+                    );
+                    let pipeline =
+                        Arc::new(build_pipeline(store.milestones().await?, Some(runtime)));
                     let shard = build_shard(token, intents_from_env(), saved.as_ref());
                     info!(
                         resume = saved.is_some(),
