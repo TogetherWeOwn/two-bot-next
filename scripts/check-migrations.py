@@ -31,7 +31,10 @@ def migration_path(path):
 
 def read_migrations(root):
     migrations = {}
-    for directory in sorted((root / "crates").glob("*/migrations")):
+    crates = root / "crates"
+    if crates.is_symlink() or any(crate.is_symlink() for crate in crates.glob("*")):
+        raise MigrationError(f"{crates}: migration ancestors cannot be symlinks")
+    for directory in sorted(crates.glob("*/migrations")):
         if directory.is_symlink() or directory.parent.is_symlink():
             raise MigrationError(f"{directory}: migration directories cannot be symlinks")
         for file in sorted(directory.rglob("*")):
@@ -85,7 +88,15 @@ def baseline(root, ref):
     # Resolve once, fail closed on a missing/shallow/invalid revision. Blob reads
     # use the resolved object ID, never an unchecked ref in a shell command.
     revision = git(root, "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}").decode().strip()
-    paths = git(root, "ls-tree", "-r", "--name-only", "-z", revision).decode().split("\0")
+    paths = []
+    for record in git(root, "ls-tree", "-r", "-z", revision).decode().split("\0"):
+        if not record:
+            continue
+        metadata, path = record.split("\t", 1)
+        parts = PurePosixPath(path).parts
+        if metadata.split()[0] == "120000" and parts[0] == "crates" and (len(parts) <= 2 or parts[2] == "migrations"):
+            raise MigrationError(f"{path}: baseline migrations and ancestors cannot be symlinks")
+        paths.append(path)
     migrations = {path: digest(git(root, "show", f"{revision}:{path}")) for path in paths if migration_path(path)}
     lock = read_lock(git(root, "show", f"{revision}:migrations.lock")) if "migrations.lock" in paths else {}
     return migrations, lock
@@ -115,7 +126,7 @@ def validate(migrations, lock, previous=None, previous_lock=None):
             raise MigrationError(f"{path}: existing migrations cannot be removed or renamed")
         if migrations[path] != checksum:
             old_reason = (previous_lock or {}).get(path, {}).get("justification", "")
-            if lock[path]["justification"].strip() == old_reason.strip():
+            if lock[path]["justification"].split() == old_reason.split():
                 raise MigrationError(f"{path}: changed migration needs a fresh justification line relative to the Git baseline")
 
 

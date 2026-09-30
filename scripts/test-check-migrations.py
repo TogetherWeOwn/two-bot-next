@@ -125,6 +125,17 @@ class MigrationTests(unittest.TestCase):
         self.lock()
         self.cli("--base-ref", ref)
 
+    def test_internal_whitespace_rewrite_is_not_a_fresh_justification(self):
+        ref = self.commit_baseline()
+        changed = SQL + b"-- reviewed exception\n"
+        self.write(FIRST, changed)
+        self.entries[FIRST]["sha256"] = checker.digest(changed)
+        for reason in ("Initial  fixture baseline.", "Initial\tfixture baseline.", "Initial fixture baseline."):
+            with self.subTest(reason=reason):
+                self.entries[FIRST]["justification"] = reason
+                self.lock()
+                self.assertIn("fresh justification", self.cli("--base-ref", ref, success=False))
+
     def test_removing_file_and_lock_entry_fails_against_baseline(self):
         ref = self.commit_baseline()
         (self.root / FIRST).unlink()
@@ -193,6 +204,48 @@ class MigrationTests(unittest.TestCase):
         (self.root / FIRST).unlink()
         (self.root / FIRST).symlink_to(self.root / "migrations.lock")
         self.fails("cannot be symlinks")
+
+    def test_symlinked_migration_ancestors_fail(self):
+        for path in ("crates", "crates/cutover", "crates/cutover/migrations"):
+            with self.subTest(path=path):
+                directory = self.root / path
+                moved = self.root / "real_directory"
+                directory.rename(moved)
+                directory.symlink_to(moved, target_is_directory=True)
+                try:
+                    self.assertIn("cannot be symlinks", self.cli(success=False))
+                finally:
+                    directory.unlink()
+                    moved.rename(directory)
+
+    def test_committed_symlinked_crates_cannot_hide_an_edit(self):
+        directory = self.root / "crates"
+        moved = self.root / "real_crates"
+        directory.rename(moved)
+        directory.symlink_to(moved, target_is_directory=True)
+        ref = self.commit_baseline()
+        changed = SQL + b"-- hidden from Git baseline\n"
+        self.write(FIRST, changed)
+        self.entries[FIRST]["sha256"] = checker.digest(changed)
+        self.lock()
+        self.assertIn("cannot be symlinks", self.cli("--base-ref", ref, success=False))
+
+    def test_symlinked_baseline_fails_after_restoring_regular_paths(self):
+        self.commit_baseline()
+        for path in ("crates", "crates/cutover", "crates/cutover/migrations", FIRST):
+            with self.subTest(path=path):
+                original = self.root / path
+                moved = self.root / "real_path"
+                original.rename(moved)
+                original.symlink_to(moved, target_is_directory=moved.is_dir())
+                self.git("add", "crates")
+                self.git("commit", "-m", "Fixture symlink")
+                ref = self.git("rev-parse", "HEAD")
+                original.unlink()
+                moved.rename(original)
+                self.assertIn("cannot be symlinks", self.cli("--base-ref", ref, success=False))
+                self.git("add", "crates")
+                self.git("commit", "-m", "Fixture regular paths")
 
     def test_workflow_compares_event_baseline_and_runs_fixtures(self):
         workflow = (SCRIPT.parent.parent / ".github/workflows/check.yml").read_text()

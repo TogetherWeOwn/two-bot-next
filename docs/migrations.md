@@ -34,7 +34,7 @@ by repository-relative filename. Every migration has exactly one entry:
 
 An unlisted new migration fails, as does a stale lock entry, invalid/duplicate
 JSON key, malformed filename, duplicate number or checksum mismatch. Byte changes
-include comments and line endings. All 16 existing migrations are initially
+include comments and line endings. All 18 existing migrations are initially
 locked without changing their contents; this is a source-control baseline, **not
 an attestation that a database has applied them**. CI never queries migration
 history in staging or production.
@@ -71,8 +71,11 @@ Rust compilation. It checks the PR base SHA on pull requests, the push-before SH
 on `main` pushes, and `origin/main` on manual dispatches (including release
 branches). Git history is fetched with `fetch-depth: 0`, as documented by
 [actions/checkout](https://github.com/actions/checkout#fetch-all-history-for-all-tags-and-branches).
-Missing Git baselines fail closed. A baseline without `migrations.lock` is
-supported for the first introduction: baseline SQL bytes are still compared.
+Missing Git baselines fail closed. Symlinked migrations and ancestors (including
+`crates` itself) are rejected in both the working tree and Git baseline, so Git
+and filesystem discovery cannot silently disagree. A baseline without
+`migrations.lock` is supported for the first introduction: baseline SQL bytes
+are still compared.
 
 Without `--base-ref`, the checker verifies current numbering and hashes only;
 it cannot determine whether a justification was changed. CI always supplies the
