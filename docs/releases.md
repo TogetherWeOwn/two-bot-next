@@ -66,6 +66,14 @@ changelog and body are reconciled independently, so retries recover if only one
 side was updated. Once they agree the reconciliation is a no-op; unexpected
 layouts fail closed. The lifecycle fixture asserts each historical note in both
 outputs and the resulting release payload, with one title and no stranded notes.
+The configured PR header keeps Summary/Changes/Testing before the FIRST native
+`---` delimiter. Placing them inside the notes before the version heading makes
+17.6.0 parse zero releases and silently publish an empty notes payload. Worker CI
+runs `scripts/test-release-publication.cjs` against an immutable real first-PR
+body, asserting the full native publication payload and a misplaced-template
+negative control. Reconciliation also repairs the first-release comparison
+against the unpublished 0.1.0 seed in both changelog and body; regeneration must
+not restore a link to a nonexistent tag.
 Cargo CI still validates compilation and the real release flow still validates
 GitHub writes.
 
@@ -94,7 +102,14 @@ regeneration; a closed/merged PR also leaves publication and creation enabled.
 
 Selection after the action queries GitHub, rather than relying on `prs_created`:
 a native no-op or prior migration failure must still reconcile the existing PR
-and dispatch its checks. The workflow pushes a changelog diff only when needed,
+and dispatch its checks. When publication leaves no open PR, selection emits
+`pr_available=false` and valid empty-object `pr={}` JSON. Actions evaluates
+step environment expressions even when the step's `if` is false, so an empty
+string would make the skipped reconciliation step fail at `fromJSON` after
+successful publication. The availability guards skip checkout, reconciliation
+and check dispatch; native publication stays enabled. The retry fixture parses
+the actual no-PR CLI output and checks these guards without making mutations.
+The workflow pushes a changelog diff only when needed,
 then PATCHes a body diff independently via the supported REST API. A successful
 push followed by a failed PATCH therefore repairs only the body on retry.
 Unchanged reconciliation makes no commit, push or body-PATCH calls. Checks may

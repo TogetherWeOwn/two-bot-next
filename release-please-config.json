@@ -6,6 +6,7 @@
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": false,
       "include-component-in-tag": false,
+      "pull-request-header": ":robot: I have created a release *beep* *boop*\n\n## Summary\n\nPublish the next synchronized Rust workspace release through release-please.\n\n## Changes\n\nUpdate the release manifest, Cargo versions and lockfile, and preserve generated and bootstrap changelog notes.\n\n## Testing\n\nWorker CI runs `node scripts/test-release.cjs`, `node scripts/test-release-publication.cjs`, `python3 scripts/test-release-retry.py` and `python3 scripts/test-pr-lint.py`. Required checks are dispatched on this PR head; their green results and independent review are mandatory before merge.",
       "pull-request-footer": "Refs: TOG-9865",
       "changelog-sections": [
         {

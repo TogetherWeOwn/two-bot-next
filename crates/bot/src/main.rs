@@ -15,6 +15,9 @@ mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
 mod server;
+mod sticky_runtime;
+#[cfg(test)]
+mod sticky_runtime_tests;
 
 use std::sync::Arc;
 
@@ -106,12 +109,28 @@ async fn main() {
                             sqlx::Error::InvalidArgument("onboarding initialization failed".into())
                         })?,
                     );
+                    // S4 sticky runtime (TOG-10309): shared router + REST
+                    // executor over the same pool. `None` on bad env gates —
+                    // the shard still boots without the sticky surface.
+                    let sticky = sticky_runtime::StickyRuntime::from_env(
+                        db.pool().clone(),
+                        &token,
+                        guild_id,
+                    );
                     let shard = build_shard(token, intents_from_env(), saved.as_ref());
                     info!(
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store, Some(onboarding)).await
+                    run_shard(
+                        shard,
+                        pipeline,
+                        Arc::clone(&state),
+                        store,
+                        Some(onboarding),
+                        sticky,
+                    )
+                    .await
                 }
                 .await;
                 if result.is_err() {

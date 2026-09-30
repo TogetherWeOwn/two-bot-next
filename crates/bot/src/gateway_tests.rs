@@ -27,6 +27,7 @@ use crate::gateway::{
 };
 
 mod deadline;
+mod onboarding;
 mod recovery;
 
 const GUILD: &str = "2222";
@@ -393,6 +394,7 @@ async fn spawn_runner(
         pipeline,
         state.clone(),
         db.store.clone(),
+        None,
         None,
     ));
     (task, state)

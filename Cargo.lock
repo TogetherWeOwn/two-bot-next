@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "two-bot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "two-bot-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "two-bot-cutover"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -2242,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "two-bot-discord"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2258,6 +2258,7 @@ dependencies = [
  "tokio",
  "tokio-websockets",
  "tracing",
+ "tracing-subscriber",
  "twilight-cache-inmemory",
  "twilight-gateway",
  "twilight-http",
@@ -2267,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "two-bot-next"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "typenum"
