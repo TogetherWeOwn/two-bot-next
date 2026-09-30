@@ -4,11 +4,9 @@
 # platform/webpki roots, no OpenSSL) and tini-style signal handling via
 # the exec form below (PID 1 receives the Container SIGTERM).
 #
-# Build args (set via wrangler [[containers]] image_vars or docker build):
-#   RUST_VERSION  pinned toolchain (default: stable matching rust-toolchain.toml)
-
-ARG RUST_VERSION=1.94-bookworm
-FROM rust:${RUST_VERSION} AS builder
+# Multi-platform manifest digests keep tag names readable for Dependabot while
+# making the builder and runtime immutable (same Bookworm image family).
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
 
 WORKDIR /app
 
@@ -31,7 +29,7 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
 COPY . .
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

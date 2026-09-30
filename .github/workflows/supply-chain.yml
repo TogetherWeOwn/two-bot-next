@@ -1,0 +1,106 @@
+name: supply-chain
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact source SHA or published release tag to inventory
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: image scan and SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      IMAGE: two-bot-next:scan
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Keep the workflow's validation tools while inventorying a historical
+      # release tag that may predate those tools.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          path: source
+          persist-credentials: false
+      - name: Verify supply-chain fixtures
+        run: python3 scripts/test-supply-chain.py
+      - name: Build runtime image (no registry push)
+        run: docker build --tag "$IMAGE" source/
+      - name: Prepare Rust lockfile inventory and image provenance
+        run: |
+          mkdir -p sbom "$RUNNER_TEMP/rust-workspace"
+          cp source/Cargo.lock "$RUNNER_TEMP/rust-workspace/Cargo.lock"
+          git -C source rev-parse HEAD > sbom/source-sha.txt
+          docker image inspect "$IMAGE" --format '{{.Id}}' > sbom/image-id.txt
+      - name: Rust workspace CycloneDX SBOM
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          scan-type: fs
+          scan-ref: ${{ runner.temp }}/rust-workspace
+          scanners: vuln
+          format: cyclonedx
+          output: sbom/rust-workspace.cdx.json
+          exit-code: '0'
+      - name: Runtime image CycloneDX SBOM
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          skip-setup-trivy: true
+          scan-type: image
+          image-ref: two-bot-next:scan
+          format: cyclonedx
+          output: sbom/container-image.cdx.json
+          exit-code: '0'
+      - name: Validate SBOM inventories and record checksums
+        id: inventory
+        run: |
+          python3 scripts/validate-sbom.py source/Cargo.lock sbom
+          (cd sbom && sha256sum *.cdx.json source-sha.txt image-id.txt > SHA256SUMS)
+      # A Rust executable is not necessarily recoverable by an image analyzer.
+      # Scan the lockfile as well; do not mistake an OS-only image BOM for a
+      # complete inventory of the bot's statically linked Rust dependencies.
+      - name: Gate Rust dependencies (HIGH/CRITICAL, including unfixed)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          skip-setup-trivy: true
+          scan-type: fs
+          scan-ref: ${{ runner.temp }}/rust-workspace
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          trivyignores: .trivyignore.yaml
+          format: json
+          output: sbom/rust-vulnerabilities.json
+          exit-code: '1'
+      - name: Gate runtime image (HIGH/CRITICAL, including unfixed)
+        if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.3
+          skip-setup-trivy: true
+          scan-type: image
+          image-ref: two-bot-next:scan
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          trivyignores: .trivyignore.yaml
+          format: json
+          output: sbom/image-vulnerabilities.json
+          exit-code: '1'
+      - name: Retain SBOMs and findings even when the gate fails
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: supply-chain
+          path: sbom/
+          if-no-files-found: error
+          retention-days: 14

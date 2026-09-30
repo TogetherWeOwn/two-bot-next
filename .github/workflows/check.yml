@@ -20,6 +20,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  supply-chain:
+    uses: ./.github/workflows/supply-chain.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
   check:
     name: check
     runs-on: ubuntu-latest
