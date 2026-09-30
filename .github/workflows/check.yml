@@ -22,10 +22,11 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
+      TWO_LFG_TESTDB_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
     services:
       agent-testdb:
-        image: postgres:17
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: agent_test
@@ -67,7 +68,7 @@ jobs:
       # Compile optional stores and run their safety and scratch-DB tests too.
       # Onboarding/sticky live tests remain explicitly ignored by default.
       - name: cargo clippy -D warnings
-        run: cargo clippy --workspace --all-targets --features two-bot-core/db -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Prepare isolated test databases
         env:
@@ -93,6 +94,10 @@ jobs:
 
       - name: cargo test (docs)
         run: cargo test --workspace --doc --features two-bot-core/db --locked
+
+      - name: LFG store regressions (CI service container only)
+        run: >-
+          cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
       - name: leveling Postgres parity tests
         env:
