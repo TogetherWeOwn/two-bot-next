@@ -12,6 +12,7 @@ mod common;
 use std::time::Duration;
 
 use common::{MockRest, ScriptedResponse};
+use two_bot_core::audit::delivery_nonce;
 use two_bot_core::audit_mirror::{AuditMirror, MirrorError};
 use two_bot_discord::ActionExecutor;
 
@@ -22,6 +23,100 @@ const BOT: &str = "9999";
 fn executor_for(mock: &MockRest) -> ActionExecutor {
     ActionExecutor::with_proxy("s5-mirror-token".to_owned(), Some(mock.origin()))
         .expect("executor builds against the mock")
+}
+
+#[tokio::test]
+async fn mirror_posts_share_the_executor_read_pacing_lane() {
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, serde_json::json!([]))).await;
+    let exec = executor_for(&mock);
+    exec.channel_history(CHANNEL, None, 100).await.unwrap();
+    for _ in 0..10 {
+        exec.post_mirror(CHANNEL, "x", &delivery_nonce(&mock.origin()))
+            .await
+            .unwrap();
+    }
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 11);
+    // Allow timer/loopback dispatch jitter, but reject an unpaced burst.
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .received_at
+            .duration_since(requests[0].received_at)
+            >= Duration::from_millis(1050)
+    );
+    for pair in requests.windows(2) {
+        assert!(
+            pair[1].received_at.duration_since(pair[0].received_at) >= Duration::from_millis(100)
+        );
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn checked_post_authorizes_after_pacing_and_refusal_sends_nothing() {
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, serde_json::json!([]))).await;
+    let exec = executor_for(&mock);
+    exec.channel_history(CHANNEL, None, 100).await.unwrap();
+    let start = std::time::Instant::now();
+    let result = exec
+        .post_mirror_checked(CHANNEL, "x", &delivery_nonce(&mock.origin()), async {
+            assert!(
+                start.elapsed() >= Duration::from_millis(100),
+                "authorization must follow pacing"
+            );
+            Err::<(), _>("claim lost while waiting")
+        })
+        .await;
+    assert_eq!(result, Err("claim lost while waiting"));
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "only the earlier history GET reached the wire"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn slow_authorization_cannot_be_overtaken_by_another_mirror_post() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!({"id": "640"})),
+    )
+    .await;
+    let exec = executor_for(&mock);
+    let other = exec.clone();
+    let nonce = delivery_nonce(&mock.origin());
+    let other_nonce = nonce.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let first = tokio::spawn(async move {
+        exec.post_mirror_checked(CHANNEL, "first", &nonce, async {
+            entered_tx.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok::<(), ()>(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    });
+    entered_rx.await.unwrap();
+    other
+        .post_mirror(CHANNEL, "second", &other_nonce)
+        .await
+        .unwrap();
+    first.await.unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let first_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(first_body["content"], "first");
+    assert!(
+        requests[1]
+            .received_at
+            .duration_since(requests[0].received_at)
+            >= Duration::from_millis(100)
+    );
+    mock.shutdown().await;
 }
 
 fn message_row(id: &str, author: &str, content: &str) -> serde_json::Value {
@@ -39,8 +134,9 @@ async fn post_mirror_sends_content_with_enforced_string_nonce() {
     )
     .await;
     let exec = executor_for(&mock);
+    let nonce = delivery_nonce(&mock.origin());
     let outcome = exec
-        .post_mirror(CHANNEL, "audit-event:42; · something happened", "oa_abc123")
+        .post_mirror(CHANNEL, "audit-event:42; · something happened", &nonce)
         .await;
     assert_eq!(outcome, Ok("1234".to_owned()));
     let reqs = mock.requests();
@@ -52,7 +148,7 @@ async fn post_mirror_sends_content_with_enforced_string_nonce() {
     );
     let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("post body is JSON");
     assert_eq!(body["content"], "audit-event:42; · something happened");
-    assert_eq!(body["nonce"], "oa_abc123", "nonce stays a string");
+    assert_eq!(body["nonce"], nonce, "nonce stays a string");
     assert_eq!(body["enforce_nonce"], true);
     assert_eq!(
         body["allowed_mentions"],
@@ -77,7 +173,9 @@ async fn post_mirror_classifies_each_discord_failure() {
         )
         .await;
         let exec = executor_for(&mock);
-        let outcome = exec.post_mirror(CHANNEL, "x", "oa_nonce").await;
+        let outcome = exec
+            .post_mirror(CHANNEL, "x", &delivery_nonce(&mock.origin()))
+            .await;
         match (check, outcome) {
             ("rejected", Err(MirrorError::Rejected(_)))
             | ("rate-limited", Err(MirrorError::RateLimited))
@@ -98,7 +196,9 @@ async fn post_mirror_timeout_is_uncertain_never_rejected() {
     )
     .await;
     let exec = executor_for(&mock);
-    let outcome = exec.post_mirror(CHANNEL, "x", "oa_nonce").await;
+    let outcome = exec
+        .post_mirror(CHANNEL, "x", &delivery_nonce(&mock.origin()))
+        .await;
     assert!(
         matches!(outcome, Err(MirrorError::Uncertain(_))),
         "timeout maps to Uncertain, got {outcome:?}"
@@ -162,10 +262,9 @@ async fn channel_document_missing_guild_and_overwrites_degrades_not_refuses() {
 }
 
 #[tokio::test]
-async fn channel_document_refuses_malformed_rows_and_errors() {
-    // A malformed overwrite row must refuse (never silently "absent"); a
-    // 404 is a refusal, not `Ok(None)` — the audit path needs `Rejected`,
-    // which is exactly why `get_json`'s collapsing is not reused.
+async fn channel_document_distinguishes_unreadable_evidence_from_refusal() {
+    // A malformed success is uncertain, never silently "absent" or proof of
+    // permission loss. A genuine 404 remains a definitive refusal.
     for body in [
         serde_json::json!({"id": CHANNEL, "guild_id": GUILD, "permission_overwrites": "nope"}),
         serde_json::json!({"id": CHANNEL, "guild_id": GUILD, "permission_overwrites": [42]}),
@@ -179,7 +278,7 @@ async fn channel_document_refuses_malformed_rows_and_errors() {
         let exec = executor_for(&mock);
         let outcome = exec.channel_document(CHANNEL).await;
         assert!(
-            matches!(outcome, Err(MirrorError::Rejected(_))),
+            matches!(outcome, Err(MirrorError::Uncertain(_))),
             "malformed document produced {outcome:?}"
         );
         mock.shutdown().await;
@@ -234,45 +333,43 @@ async fn channel_history_pages_with_before_and_limit() {
 }
 
 #[tokio::test]
-async fn channel_history_skips_malformed_rows_and_refuses_non_arrays() {
-    // Reconcile only ever needs one readable marked row: a poisoned element
-    // is skipped, while a non-array body is an unreadable page (Rejected).
-    let mock = MockRest::start(
-        vec![ScriptedResponse::json(
-            200,
-            serde_json::json!([
-                {"id": "300"},
-                message_row("250", BOT, "audit-event:7; · x"),
-                "garbage",
-            ]),
-        )],
-        ScriptedResponse::status(500),
-    )
-    .await;
-    let exec = executor_for(&mock);
-    let rows = exec
-        .channel_history(CHANNEL, None, 100)
-        .await
-        .expect("page parses");
-    assert_eq!(rows.len(), 1, "only the readable row survives");
-    assert_eq!(rows[0].id, "250");
-    let reqs = mock.requests();
-    assert!(!reqs[0].path.contains("before="), "path {}", reqs[0].path);
-    mock.shutdown().await;
-
-    let mock = MockRest::start(
-        vec![ScriptedResponse::json(
-            200,
-            serde_json::json!({"not": "an array"}),
-        )],
-        ScriptedResponse::status(500),
-    )
-    .await;
-    let exec = executor_for(&mock);
-    let outcome = exec.channel_history(CHANNEL, None, 100).await;
-    assert!(
-        matches!(outcome, Err(MirrorError::Rejected(_))),
-        "non-array body produced {outcome:?}"
-    );
-    mock.shutdown().await;
+async fn channel_history_malformed_evidence_is_uncertain() {
+    for bad_index in [0, 49, 99] {
+        let mut page: Vec<_> = (201..=300)
+            .rev()
+            .map(|id| message_row(&id.to_string(), BOT, "unrelated"))
+            .collect();
+        page[bad_index] = serde_json::json!({"id": "250"});
+        let mock = MockRest::start(
+            vec![ScriptedResponse::json(200, serde_json::json!(page))],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let outcome = executor_for(&mock)
+            .channel_history(CHANNEL, None, 100)
+            .await;
+        assert!(
+            matches!(outcome, Err(MirrorError::Uncertain(_))),
+            "malformed row {bad_index} must not shorten a full page: {outcome:?}"
+        );
+        mock.shutdown().await;
+    }
+    for body in [
+        serde_json::json!({"not": "an array"}),
+        serde_json::json!([message_row("not-a-snowflake", BOT, "x")]),
+    ] {
+        let mock = MockRest::start(
+            vec![ScriptedResponse::json(200, body)],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let outcome = executor_for(&mock)
+            .channel_history(CHANNEL, None, 100)
+            .await;
+        assert!(
+            matches!(outcome, Err(MirrorError::Uncertain(_))),
+            "unreadable history produced {outcome:?}"
+        );
+        mock.shutdown().await;
+    }
 }

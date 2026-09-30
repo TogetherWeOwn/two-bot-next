@@ -79,7 +79,34 @@ pub trait AuditMirror: Send + Sync {
         channel_id: &str,
         content: &str,
         nonce: &str,
-    ) -> impl Future<Output = Result<String, MirrorError>> + Send;
+    ) -> impl Future<Output = Result<String, MirrorError>> + Send {
+        async move {
+            match self
+                .post_mirror_checked(channel_id, content, nonce, async {
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .await
+            {
+                Ok(result) => result,
+                Err(never) => match never {},
+            }
+        }
+    }
+
+    /// Reserve the shared pacing lane, then authorize immediately before POST.
+    /// No further pacing/queue wait may occur after authorization. A refused
+    /// authorization makes zero wire calls; the outer error belongs to the
+    /// caller (e.g. lost lease, halt or failed DB read), not to Discord.
+    fn post_mirror_checked<Fut, E>(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: &str,
+        authorize: Fut,
+    ) -> impl Future<Output = Result<Result<String, MirrorError>, E>> + Send
+    where
+        Fut: Future<Output = Result<(), E>> + Send,
+        E: Send;
 
     /// `GET /channels/{c}` reduced to the fields the privacy gate reads.
     fn channel_document(

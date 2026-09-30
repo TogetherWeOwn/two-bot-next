@@ -26,9 +26,9 @@ fn mirror_error(error: DiscordError) -> MirrorError {
     }
 }
 
-/// Rejected-read helper with the channel id in the message.
+/// Unreadable evidence is not proof of a permission refusal or marker absence.
 fn unreadable(channel_id: &str, detail: &str) -> MirrorError {
-    MirrorError::Rejected(format!("unreadable channel {channel_id}: {detail}"))
+    MirrorError::Uncertain(format!("unreadable channel {channel_id}: {detail}"))
 }
 
 impl AuditMirror for ActionExecutor {
@@ -36,30 +36,38 @@ impl AuditMirror for ActionExecutor {
     /// wire shape (deterministic nonce + `enforce_nonce`, empty
     /// `allowed_mentions`, the 2000-utf16 bound) is owned by
     /// `execute_channel` — there is no private HTTP client here.
-    async fn post_mirror(
+    async fn post_mirror_checked<Fut, E>(
         &self,
         channel_id: &str,
         content: &str,
         nonce: &str,
-    ) -> Result<String, MirrorError> {
+        authorize: Fut,
+    ) -> Result<Result<String, MirrorError>, E>
+    where
+        Fut: std::future::Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
         let call = ChannelCall::PostMessage {
             channel_id: channel_id.to_owned(),
             content: content.to_owned(),
             nonce: Some(nonce.to_owned()),
         };
-        match self.execute_channel(&call).await {
+        let mut lane = self.paced_lane(false).await;
+        authorize.await?;
+        *lane = std::time::Instant::now();
+        Ok(match self.execute_channel(&call).await {
             Ok(ChannelCallOutcome::Posted { message_id }) => Ok(message_id),
             // The executor's PostMessage arm only constructs `Posted`; other
             // variants are unreachable but must still map safely.
             Ok(_) => Ok(String::new()),
             Err(error) => Err(mirror_error(error)),
-        }
+        })
     }
 
     /// `GET /channels/{c}` reduced to `guild_id` + the `@everyone` overwrite
     /// (type 0 whose id is the channel's own guild). A missing `guild_id`
     /// becomes `""` so the core fence classifies it `WrongGuild`; malformed
-    /// overwrite rows are `Rejected` — never silently "absent".
+    /// overwrite rows are `Uncertain` — never silently "absent".
     async fn channel_document(&self, channel_id: &str) -> Result<MirrorChannel, MirrorError> {
         let doc = self
             .fetch_channel_document(channel_id)
@@ -123,10 +131,9 @@ impl AuditMirror for ActionExecutor {
         Ok(MirrorChannel { guild_id, everyone })
     }
 
-    /// `GET /channels/{c}/messages` reduced to `{id, author.id, content}`
-    /// rows. A malformed entry is skipped — reconciliation only ever needs
-    /// *one* readable marked row, and a poisoned row must not poison the
-    /// page the boundary was taken from.
+    /// `GET /channels/{c}/messages` reduced to `{id, author.id, content}`.
+    /// Reject an unreadable page as uncertain in its entirety: filtering even
+    /// one row would falsify the page's exhaustion, boundary or cursor evidence.
     async fn channel_history(
         &self,
         channel_id: &str,
@@ -137,15 +144,19 @@ impl AuditMirror for ActionExecutor {
             .fetch_channel_messages(channel_id, before, limit)
             .await
             .map_err(mirror_error)?;
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                Some(MirrorMessage {
-                    id: row.get("id")?.as_str()?.to_owned(),
-                    author_id: row.get("author")?.get("id")?.as_str()?.to_owned(),
-                    content: row.get("content")?.as_str()?.to_owned(),
-                })
+        rows.iter()
+            .map(|row| {
+                let parse = || {
+                    let id = row.get("id")?.as_str()?;
+                    id.parse::<u64>().ok()?;
+                    Some(MirrorMessage {
+                        id: id.to_owned(),
+                        author_id: row.get("author")?.get("id")?.as_str()?.to_owned(),
+                        content: row.get("content")?.as_str()?.to_owned(),
+                    })
+                };
+                parse().ok_or_else(|| unreadable(channel_id, "malformed history entry"))
             })
-            .collect())
+            .collect()
     }
 }

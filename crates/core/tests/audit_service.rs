@@ -182,22 +182,29 @@ fn marked(id: &str, event: &AuditEvent) -> MirrorMessage {
 }
 
 impl AuditMirror for ScriptMirror {
-    async fn post_mirror(
+    async fn post_mirror_checked<Fut, E>(
         &self,
         channel_id: &str,
         content: &str,
         nonce: &str,
-    ) -> Result<String, MirrorError> {
+        authorize: Fut,
+    ) -> Result<Result<String, MirrorError>, E>
+    where
+        Fut: std::future::Future<Output = Result<(), E>> + Send,
+        E: Send,
+    {
+        authorize.await?;
         self.posts.lock().unwrap().push(Post {
             channel_id: channel_id.to_owned(),
             content: content.to_owned(),
             nonce: nonce.to_owned(),
         });
-        self.post_script
+        Ok(self
+            .post_script
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or_else(|| Ok("900000".to_owned()))
+            .unwrap_or_else(|| Ok("900000".to_owned())))
     }
 
     async fn channel_document(&self, channel_id: &str) -> Result<MirrorChannel, MirrorError> {
@@ -263,6 +270,168 @@ fn service_for(pool: &PgPool) -> (AuditStore, AuditMirrorService<ScriptMirror>, 
 }
 
 // ----------------------------------------------------------------- tests --
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
+async fn prepared_owner_losing_lease_or_replaced_by_quarantine_never_posts() -> TestResult {
+    for replace in [false, true] {
+        let db = TestDb::new().await?;
+        let (store, service, mirror) = service_for(&db.pool);
+        let peer = db.peer().await?;
+        let gate_pool = peer.clone();
+        let replacement_mirror = mirror.clone();
+        let service = service.with_pre_send_gate(move || {
+            let pool = gate_pool.clone();
+            let mirror = replacement_mirror.clone();
+            Box::pin(async move {
+                sqlx::query("UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() - interval '1 second' WHERE entry_id = 'expired-prepared'")
+                    .execute(&pool).await.unwrap();
+                if replace {
+                    let recovery = AuditMirrorService::new(AuditStore::new(&pool), mirror, config());
+                    assert_eq!(recovery.deliver_entry("expired-prepared").await.unwrap(),
+                        DeliverOutcome::Quarantined(QuarantineReason::MarkerMissing));
+                }
+            })
+        });
+        service.record(&event("expired-prepared")).await?;
+        assert_eq!(
+            service.deliver_entry("expired-prepared").await?,
+            DeliverOutcome::Unclaimed
+        );
+        assert_eq!(mirror.post_count(), 0, "expired prepared owner cannot POST");
+        let row = store.get("expired-prepared").await?.unwrap();
+        assert_eq!(
+            row.state,
+            if replace {
+                DeliveryState::Quarantined
+            } else {
+                DeliveryState::Delivering
+            }
+        );
+        assert!(row.mirror_message_id.is_none());
+        assert_eq!(row.search_before.as_deref(), Some("0"));
+        peer.close().await;
+        db.finish().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
+async fn interrupted_dedup_adoption_recovers_the_known_mirror() -> TestResult {
+    let db = TestDb::new().await?;
+    let (store, service, mirror) = service_for(&db.pool);
+    let ev = event("adoption-crash");
+    service.record(&ev).await?;
+    mirror
+        .history
+        .lock()
+        .unwrap()
+        .push_back(Ok(vec![marked("640", &ev)]));
+    // Reject only the acceptance write, after prepare_send has committed.
+    sqlx::raw_sql("CREATE FUNCTION fail_acceptance() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.mirror_message_id IS NOT NULL THEN RAISE EXCEPTION 'injected ack loss'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER fail_acceptance BEFORE UPDATE ON operational_audit_log FOR EACH ROW EXECUTE FUNCTION fail_acceptance();")
+        .execute(&db.pool).await?;
+    assert!(service.deliver_entry("adoption-crash").await.is_err());
+    let row = store.get("adoption-crash").await?.unwrap();
+    assert_eq!(row.search_before.as_deref(), Some("640"));
+    assert!(row.mirror_message_id.is_none());
+    sqlx::query("DROP TRIGGER fail_acceptance ON operational_audit_log")
+        .execute(&db.pool)
+        .await?;
+    db.expire("adoption-crash").await?;
+    mirror
+        .history
+        .lock()
+        .unwrap()
+        .push_back(Ok(vec![marked("640", &ev)]));
+    let restarted = AuditMirrorService::new(AuditStore::new(&db.pool), mirror.clone(), config());
+    assert_eq!(
+        restarted.deliver_entry("adoption-crash").await?,
+        DeliverOutcome::Reconciled {
+            message_id: "640".to_owned()
+        }
+    );
+    assert_eq!(mirror.post_count(), 0);
+    assert_eq!(
+        store.get("adoption-crash").await?.unwrap().state,
+        DeliveryState::Delivered
+    );
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
+async fn unreadable_history_defers_then_preserves_recovery_until_healthy() -> TestResult {
+    let db = TestDb::new().await?;
+    let (store, service, mirror) = service_for(&db.pool);
+    let ev = event("unreadable-history");
+    service.record(&ev).await?;
+    mirror
+        .history
+        .lock()
+        .unwrap()
+        .push_back(Err(MirrorError::Uncertain(
+            "malformed successful history page".to_owned(),
+        )));
+    assert_eq!(
+        service.deliver_entry(&ev.entry_id).await?,
+        DeliverOutcome::Deferred
+    );
+    assert_eq!(mirror.post_count(), 0);
+    assert!(store
+        .get(&ev.entry_id)
+        .await?
+        .unwrap()
+        .search_before
+        .is_none());
+    db.expire(&ev.entry_id).await?;
+    mirror
+        .post_script
+        .lock()
+        .unwrap()
+        .push_back(Err(MirrorError::Uncertain(
+            "accepted but timed out".to_owned(),
+        )));
+    assert_eq!(
+        service.deliver_entry(&ev.entry_id).await?,
+        DeliverOutcome::Ambiguous
+    );
+    db.expire(&ev.entry_id).await?;
+    mirror
+        .history
+        .lock()
+        .unwrap()
+        .push_back(Err(MirrorError::Uncertain(
+            "malformed successful history page".to_owned(),
+        )));
+    assert_eq!(
+        service.deliver_entry(&ev.entry_id).await?,
+        DeliverOutcome::Ambiguous
+    );
+    let row = store.get(&ev.entry_id).await?.unwrap();
+    assert_eq!(row.state, DeliveryState::Pending);
+    assert_eq!(row.search_before.as_deref(), Some("0"));
+    db.expire(&ev.entry_id).await?;
+    mirror
+        .history
+        .lock()
+        .unwrap()
+        .push_back(Ok(vec![marked("640", &ev)]));
+    assert_eq!(
+        service.deliver_entry(&ev.entry_id).await?,
+        DeliverOutcome::Reconciled {
+            message_id: "640".to_owned()
+        }
+    );
+    assert_eq!(
+        mirror.post_count(),
+        1,
+        "healthy evidence recovers without a second POST"
+    );
+    db.finish().await
+}
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI Postgres service"]

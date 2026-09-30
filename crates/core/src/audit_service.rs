@@ -103,6 +103,12 @@ pub enum DeliverOutcome {
     Unclaimed,
 }
 
+enum SendStop {
+    Held,
+    LostClaim,
+    Store(AuditStoreError),
+}
+
 /// Per-entry result of one `drain_pending` sweep.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DrainReport {
@@ -355,8 +361,11 @@ impl<M: AuditMirror> AuditMirrorService<M> {
             }
         }
 
+        // Adoption must survive a crash before note_accepted: its recovery
+        // boundary includes the known mirror, not the newest id's successor.
+        let boundary = found.as_deref().unwrap_or(&search_before);
         // Persist the boundary + attempt count *before* the POST decision.
-        match self.store.prepare_send(claim, &search_before).await? {
+        match self.store.prepare_send(claim, boundary).await? {
             PrepareSend::Prepared => {}
             PrepareSend::Halted => {
                 // Halt landed between claim and preparation; no boundary was
@@ -385,25 +394,50 @@ impl<M: AuditMirror> AuditMirrorService<M> {
         if let Some(gate) = &self.pre_send_gate {
             gate().await;
         }
-        // The mandatory last check: a halt here means the POST never began —
-        // definite non-acceptance, row retained for the next owner.
-        if self.check_halt().await {
-            self.store
-                .fail_attempt(claim, DeliveryFailure::DefinitelyRejected)
-                .await?;
-            return Ok(DeliverOutcome::Held);
-        }
-
         let nonce = row
             .nonce
             .clone()
             .unwrap_or_else(|| delivery_nonce(&entry_id));
         let content = format_audit_event(&row.event);
-        match self
+        let posted = match self
             .mirror
-            .post_mirror(&destination, &content, &nonce)
+            .post_mirror_checked(&destination, &content, &nonce, async {
+                // The adapter runs this only AFTER reserving its pacing lane.
+                // A halt is definite non-acceptance; a lost fence must never
+                // POST or clear the replacement owner's recovery evidence.
+                let permission = if self.check_halt().await {
+                    PrepareSend::Halted
+                } else {
+                    self.store
+                        .check_prepared_send(claim)
+                        .await
+                        .map_err(SendStop::Store)?
+                };
+                match permission {
+                    PrepareSend::Prepared => Ok(()),
+                    PrepareSend::LostClaim => Err(SendStop::LostClaim),
+                    PrepareSend::Halted => {
+                        if self
+                            .store
+                            .fail_attempt(claim, DeliveryFailure::DefinitelyRejected)
+                            .await
+                            .map_err(SendStop::Store)?
+                        {
+                            Err(SendStop::Held)
+                        } else {
+                            Err(SendStop::LostClaim)
+                        }
+                    }
+                }
+            })
             .await
         {
+            Ok(posted) => posted,
+            Err(SendStop::Held) => return Ok(DeliverOutcome::Held),
+            Err(SendStop::LostClaim) => return Ok(DeliverOutcome::Unclaimed),
+            Err(SendStop::Store(error)) => return Err(error),
+        };
+        match posted {
             Ok(message_id) if !message_id.is_empty() => {
                 // Accepted with a real id: persist acceptance, then finish.
                 // Either write failing must NOT resend — the boundary holds.
