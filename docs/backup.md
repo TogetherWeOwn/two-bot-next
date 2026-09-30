@@ -11,7 +11,7 @@ restore | backup-upload | guild-config-snapshot | guild-config-restore`
 against scratch Postgres only (tests: agent-testdb `two_next_backup_test` /
 `two_next_restore_drill`). The restore target is a different variable
 (`TWO_RESTORE_URL`, never `TWO_DATABASE_URL`) and real restores additionally
-require `--force`: aiming at production must be said twice, on purpose.
+require `--force`. This confirmation is not authorization to target production.
 
 ## The format
 
@@ -21,9 +21,17 @@ inside one `REPEATABLE READ` transaction, the `events` high-water mark, and
 the source's applied migrations. Values are stored in Postgres text-output
 form with a `$n::type` cast on restore — faithful for every owned type
 without per-type decoding. `column_types` is additive to the legacy envelope.
-Row cells are strings or nulls; a native JSON cell (number, boolean, array,
-object) is refused by `inspect` rather than restored as NULL. Dumps past
-1 GiB (`MAX_DUMP_BYTES`) are refused from file metadata before buffering.
+Port-written row cells are strings/nulls. Frozen legacy v3 dumps have no
+`column_types` and carry native numbers/booleans; these decode to bound
+PostgreSQL input using the target's type, never silently to NULL. JSON-looking
+TEXT stays unchanged, and native JSON cells serialize for JSON/JSONB targets.
+Unsupported composite cells refuse; see `tests/fixtures/README.md` for scope
+and actual frozen-writer fixture provenance.
+
+Input is streamed with separate caps: 1 GiB compressed **and decoded**,
+8 MiB per decoded line/cell envelope, and 256 MiB of conservatively accounted
+retained data (keys plus per-value overhead). Highly compressible input is
+refused before unbounded line-buffer growth, not just by compressed metadata.
 
 All 22 bot-owned tables are dumped (see `DUMP_TABLES` in
 `crates/core/src/backup/dump_file.rs`); the website's tables are not ours.
@@ -52,9 +60,11 @@ journalctl -u two-bot-next-backup -n 30       # what it did
 
 ## Off-box destination
 
-`two-bot backup-upload <file>` PUTs one dump via SigV4 single-PUT (pinned
-against AWS's worked example in `backup::s3` tests; the fake-S3 round trip
-re-derives the signature server-side like `test/helpers/fakeS3.ts` did).
+`two-bot backup-upload <file>` PUTs one dump via SigV4 single-PUT. Canonical
+and signed headers are sorted alphabetically, per
+[AWS's signing specification](https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html#create-canonical-request).
+Tests pin AWS key derivation, an independently calculated complete PUT signature,
+and a loopback verifier that rejects noncanonical order before re-deriving HMAC.
 
 | Variable | Required | Meaning |
 |---|---|---|
@@ -81,6 +91,13 @@ and re-verify hash + seal, then upload **both** via
 `TWO_GUILD_CONFIG_UPLOAD_CMD` (or `TWO_BACKUP_UPLOAD_CMD`). A local-only
 snapshot is an error, not success.
 
+Both guild-config commands first read `CREDENTIALS_DIRECTORY/discord_staging_token`
+(the service's `LoadCredential` contract). Only an absent credential/no configured
+directory permits the deliberate `DISCORD_STAGING_BOT_TOKEN` fallback. Empty,
+invalid or unreadable credentials refuse without substitution or token logging.
+Restore preflight uses the **live capture**, not saved permissions/hierarchy;
+removed authority refuses before writes, and newly granted authority is honored.
+
 Restore: `two-bot guild-config-restore --snapshot FILE` plans (prints
 `WOULD …`); add `--confirm-staging-guild --apply` to write, `--evidence
 FILE` for the hash-proven receipt. Tampered backups are refused (exit 3)
@@ -105,10 +122,10 @@ two-bot restore /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --dry-run
 # 2. Rehearse into scratch. Never restore straight to prod.
 TWO_RESTORE_URL=postgres://.../two_scratch two-bot restore /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --force
 # → RESTORE VERIFIED (every table count matches the manifest)
-
-# 3. Only then, for real: say the target twice.
-TWO_RESTORE_URL="$TWO_DATABASE_URL" two-bot restore /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --force
 ```
+
+Production restore is **not authorized by this slice**. S6 must establish its
+cutover plan and gates separately; these examples are scratch-only.
 
 ### Drill evidence — 2026-09-30 (TOG-9881, scratch only)
 
@@ -126,6 +143,25 @@ TWO_RESTORE_URL="$TWO_DATABASE_URL" two-bot restore /var/backups/two-bot-next/tw
   `refusing tampered backup`, exit 3, zero Discord calls.
 - No production or staging services touched; no tokens used (Discord paths
   exercised against in-process fakes in `backup_transport` tests).
+
+### Review-fix verification — 2026-09-30
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`
+  and `cargo test --workspace --locked` pass. The default database harness skips
+  without its URL; it is not evidence of a database round trip.
+- Separately ran `cargo test -p two-bot-core --features db --locked --test backup_roundtrip -- --nocapture`
+  with `TWO_BOT_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/two_next_backup_9881_1a7ac99c`:
+  one test passed after real dump/wipe/restore, no-ledger dump, malformed-ledger
+  refusal and native frozen-writer fixture restore, including sequence restart.
+- Seven real-CLI loopback tests verify credential-file-only snapshot loading,
+  absent-only fallback, invalid/unreadable credential refusal, and both directions
+  of changed live permissions/hierarchy. Positive preflight reaches a deliberately
+  refused write sentinel; it does not claim real Discord restore convergence.
+- Streaming-budget tests cover a highly compressible oversized line, many small
+  lines over the decoded budget, and retained-value overhead. Four loopback
+  transport tests pass with alphabetic SignedHeaders required by the verifier.
+- Test connections are confined to agent-testdb and loopback HTTP; no production
+  or staging service, usable Discord token or off-box bucket was exercised.
 
 ## S6 hook (Founding Engineer)
 

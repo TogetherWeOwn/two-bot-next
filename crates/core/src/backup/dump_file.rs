@@ -621,6 +621,31 @@ mod tests {
     }
 
     #[test]
+    fn inspects_fixture_emitted_by_the_frozen_legacy_writer() {
+        let mut enc = new_encoder();
+        enc.write_all(include_bytes!(
+            "../../tests/fixtures/legacy-v3-native.ndjson"
+        ))
+        .unwrap();
+        let contents = inspect_bytes(&finish_gzip(enc).unwrap()).unwrap();
+        assert_eq!(contents.rows, 2);
+        assert!(contents
+            .manifest
+            .tables
+            .iter()
+            .all(|t| t.column_types.is_empty()));
+        assert_eq!(contents.buffers["events"][0]["id"], serde_json::json!(1));
+        assert_eq!(
+            contents.buffers["join_risk_flags"][0]["score"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            contents.buffers["join_risk_flags"][0]["flagged"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
     fn refuses_a_native_cell_in_a_text_encoded_dump() {
         // Native cells are valid in legacy dumps, not in this port's
         // explicitly marked PostgreSQL text-output encoding.

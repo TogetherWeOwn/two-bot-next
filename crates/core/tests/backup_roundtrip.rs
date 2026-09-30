@@ -54,13 +54,25 @@ async fn test_url() -> Option<String> {
     if url.is_empty() {
         return None;
     }
-    if url.contains("agent-testdb") || url.contains("127.0.0.1") || url.contains("localhost") {
-        Some(url)
-    } else {
-        panic!(
-            "TWO_BOT_TEST_DATABASE_URL must point at agent-testdb or loopback (test-containers rule); refusing {url:?}"
-        );
-    }
+    let parsed = url::Url::parse(&url).expect("test database URL");
+    assert_eq!(
+        parsed.host_str(),
+        Some("agent-testdb"),
+        "tests only use the agent-testdb container"
+    );
+    assert_eq!(
+        parsed.username(),
+        "agent_test",
+        "tests only use the test principal"
+    );
+    assert!(
+        parsed
+            .path()
+            .trim_start_matches('/')
+            .starts_with("two_next_backup"),
+        "use a dedicated two_next_backup scratch database"
+    );
+    Some(url)
 }
 
 async fn build_schema(pool: &PgPool) {
@@ -228,7 +240,11 @@ async fn dump_inspect_restore_round_trip() {
     seed(&pool).await;
     let before = snapshot_all(&pool).await;
 
-    let dir = std::env::temp_dir().join(format!("two-bot-backup-test-{}", std::process::id()));
+    let scratch = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+        .or_else(|| std::env::var_os("PAPERCLIP_SCRATCH_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = scratch.join(format!("two-bot-backup-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let dump_path: PathBuf = dir.join("two-funnel-test.ndjson.gz");
 
@@ -289,6 +305,83 @@ async fn dump_inspect_restore_round_trip() {
     .await
     .unwrap();
     assert!(next.0 > 3, "sequence resumed past the restored max id");
+
+    // Optional migration ledger must not abort the repeatable-read transaction.
+    sqlx::query("DROP TABLE schema_migrations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let missing_ledger_path = dir.join("no-ledger.ndjson.gz");
+    let no_ledger = two_bot_core::backup::dump::dump(&pool, &missing_ledger_path)
+        .await
+        .unwrap();
+    assert!(no_ledger.schema_migrations.is_empty());
+    let inspected = two_bot_core::backup::dump_file::inspect(&missing_ledger_path).unwrap();
+    assert!(
+        inspected.rows > 0,
+        "table pages still readable without ledger"
+    );
+    sqlx::query("CREATE TABLE schema_migrations (wrong_column TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = two_bot_core::backup::dump::dump(&pool, &dir.join("bad-ledger.gz"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot read schema_migrations"),
+        "{err}"
+    );
+
+    // The actual frozen writer fixture uses the legacy events/risk-flag columns.
+    // Other tables stay present but empty, as declared in this minimal fixture.
+    sqlx::query("DROP TABLE events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE events (id BIGSERIAL PRIMARY KEY, event_type TEXT NOT NULL, member_id TEXT, guild_id TEXT, occurred_at TIMESTAMPTZ NOT NULL, recorded_at TIMESTAMPTZ NOT NULL, source TEXT NOT NULL, metadata TEXT, idempotency_key TEXT)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE join_risk_flags")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE join_risk_flags (event_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, member_id TEXT NOT NULL, account_created_at TIMESTAMPTZ, joined_at TIMESTAMPTZ NOT NULL, source TEXT, score INTEGER NOT NULL, reasons_json TEXT NOT NULL, bulk_join_window BOOLEAN NOT NULL, flagged BOOLEAN NOT NULL, created_at TIMESTAMPTZ NOT NULL)")
+        .execute(&pool).await.unwrap();
+    let legacy_path = dir.join("legacy-v3-native.gz");
+    let mut enc = two_bot_core::backup::dump_file::new_encoder();
+    std::io::Write::write_all(&mut enc, include_bytes!("fixtures/legacy-v3-native.ndjson"))
+        .unwrap();
+    std::fs::write(
+        &legacy_path,
+        two_bot_core::backup::dump_file::finish_gzip(enc).unwrap(),
+    )
+    .unwrap();
+    let legacy = two_bot_core::backup::dump::restore(&pool, &legacy_path)
+        .await
+        .unwrap();
+    assert!(legacy.ok);
+    assert!(legacy.dropped_columns.is_empty());
+    let event: (i64, Option<String>, String, String) = sqlx::query_as("SELECT id, member_id, metadata, to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM events")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        event,
+        (
+            1,
+            None,
+            "{\"channelId\":\"c1\"}".to_owned(),
+            "2026-08-01 12:00:00".to_owned()
+        )
+    );
+    let risk: (i32, bool, bool, String) = sqlx::query_as(
+        "SELECT score, bulk_join_window, flagged, reasons_json FROM join_risk_flags",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(risk, (3, false, true, "[\"new account\"]".to_owned()));
+    let (next_legacy_id,): (i64,) = sqlx::query_as("INSERT INTO events (event_type, occurred_at, recorded_at, source) VALUES ('member_join', now(), now(), 'fixture') RETURNING id")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(next_legacy_id, 2);
 
     std::fs::remove_dir_all(&dir).ok();
 }

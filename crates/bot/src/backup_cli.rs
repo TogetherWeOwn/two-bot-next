@@ -7,8 +7,9 @@
 //! (see `docs/backup.md`); safe while the bot is up — the dump is one
 //! `REPEATABLE READ` snapshot.
 //!
-//! Secret posture (matches `two_bot_core::Config`): values arrive as env
-//! vars, are never logged, never defaulted, never written to the board.
+//! Secret posture: the staging token prefers a systemd credential file,
+//! with an explicit env fallback only when absent. Secrets are never logged,
+//! never defaulted, never written to the board.
 //! Exit codes: 0 success (`RESTORE VERIFIED` / `DRY RUN VERIFIED` on the
 //! last line is the only success for restores), 1 failure, 2 usage/guard
 //! refusal, 3 tampered guild-config snapshot.
@@ -26,6 +27,56 @@ fn env_var(name: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
+}
+
+/// Only an absent credential permits the deliberate environment fallback.
+/// Inject the directory and lazy fallback so tests never mutate process env.
+fn load_staging_token(
+    credentials_dir: Option<&Path>,
+    fallback: &dyn Fn() -> Option<String>,
+) -> Result<String, String> {
+    if let Some(dir) = credentials_dir {
+        match std::fs::read_to_string(dir.join("discord_staging_token")) {
+            Ok(contents) => {
+                let token = contents.trim();
+                if token.is_empty() {
+                    return Err(
+                        "discord_staging_token credential is empty; refusing environment fallback"
+                            .to_owned(),
+                    );
+                }
+                if guild_config::check_staging_token(token).is_err() {
+                    return Err("discord_staging_token credential is invalid for Owen QA Test; refusing environment fallback".to_owned());
+                }
+                return Ok(token.to_owned());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                // Do not include the IO error: invalid UTF-8 and other failures
+                // must never surface credential contents in the journal.
+                return Err(
+                    "cannot read discord_staging_token credential; refusing environment fallback"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    fallback()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            "missing discord_staging_token credential and DISCORD_STAGING_BOT_TOKEN fallback"
+                .to_owned()
+        })
+}
+
+fn staging_token() -> Result<String, String> {
+    let credentials_dir = env::var_os("CREDENTIALS_DIRECTORY")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    load_staging_token(credentials_dir.as_deref(), &|| {
+        env_var("DISCORD_STAGING_BOT_TOKEN")
+    })
 }
 
 /// Bump-friendly usage text. `--help` after any subcommand prints it.
@@ -61,7 +112,8 @@ two-bot backup & restore (TOG-9881)
       emoji via CDN), seal the snapshot (TOG-3513), write it atomically
       plus a drift report against the accepted spec, then upload both.
       A local-only snapshot is an error, not success.
-      Env: DISCORD_STAGING_BOT_TOKEN (required, Owen QA Test app only),
+      Token: CREDENTIALS_DIRECTORY/discord_staging_token (Owen QA Test only).
+      Env: DISCORD_STAGING_BOT_TOKEN (fallback only if credential absent),
            DISCORD_STAGING_GUILD_ID (required, pinned to TWO Staging),
            GUILD_CONFIG_API_BASE / GUILD_CONFIG_CDN_BASE (loopback test
            seams only), TWO_GUILD_CONFIG_BACKUP_DIR,
@@ -568,10 +620,10 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
 }
 
 async fn cmd_guild_config_snapshot() -> i32 {
-    let token = match env_var("DISCORD_STAGING_BOT_TOKEN") {
-        Some(token) => token,
-        None => {
-            eprintln!("guild-config-snapshot: missing DISCORD_STAGING_BOT_TOKEN");
+    let token = match staging_token() {
+        Ok(token) => token,
+        Err(message) => {
+            eprintln!("guild-config-snapshot: {message}");
             return 1;
         }
     };
@@ -754,10 +806,10 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 2;
     }
 
-    let token = match env_var("DISCORD_STAGING_BOT_TOKEN") {
-        Some(token) => token,
-        None => {
-            eprintln!("guild-config-restore: missing DISCORD_STAGING_BOT_TOKEN");
+    let token = match staging_token() {
+        Ok(token) => token,
+        Err(message) => {
+            eprintln!("guild-config-restore: {message}");
             return 2;
         }
     };
@@ -867,7 +919,8 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         }
     };
     if apply && plan.counts.operations > 0 {
-        if let Err(err) = api.assert_restore_permissions(&snapshot, &plan).await {
+        // Authority and hierarchy come from the guild now, not the backup.
+        if let Err(err) = api.assert_restore_permissions(&before, &plan).await {
             eprintln!("guild-config-restore: {err}");
             return 1;
         }
@@ -988,4 +1041,97 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         api.writes
     );
     0
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::load_staging_token;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Public staging application ID encoded as base64; no usable credential.
+    const TOKEN: &str = "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.unit-test.not-a-secret";
+
+    struct Credentials(PathBuf);
+
+    impl Credentials {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+                .or_else(|| std::env::var_os("PAPERCLIP_SCRATCH_DIR"))
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = root.join(format!(
+                "backup-credential-unit-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Credentials {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn staging_credential_takes_precedence_and_trims_newline() {
+        let dir = Credentials::new();
+        std::fs::write(dir.0.join("discord_staging_token"), format!("  {TOKEN}\n")).unwrap();
+        let token = load_staging_token(Some(&dir.0), &|| {
+            panic!("a present credential must not read the fallback")
+        })
+        .unwrap();
+        assert!(token == TOKEN, "credential should be trimmed");
+    }
+
+    #[test]
+    fn staging_credential_falls_back_only_when_absent() {
+        let dir = Credentials::new();
+        for path in [None, Some(dir.0.as_path())] {
+            let token = load_staging_token(path, &|| Some(format!(" {TOKEN}\n"))).unwrap();
+            assert!(token == TOKEN, "explicit fallback should be trimmed");
+        }
+        assert!(load_staging_token(None, &|| None).is_err());
+        assert!(load_staging_token(None, &|| Some(" \n".to_owned())).is_err());
+    }
+
+    #[test]
+    fn staging_credential_rejects_empty_invalid_and_non_utf8_without_fallback() {
+        let dir = Credentials::new();
+        let path = dir.0.join("discord_staging_token");
+        for contents in [
+            &b""[..],
+            &b" \n\t"[..],
+            &b"invalid-credential-secret-marker"[..],
+            // Public LIVE application ID, with dummy suffixes only.
+            &b"MTUzOTcxMTY4Mzg5ODExODE1NA.fake.not-a-secret"[..],
+            &b"\xff\xfeinvalid-credential-secret-marker"[..],
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            let err = load_staging_token(Some(&dir.0), &|| {
+                panic!("invalid credentials must not read the fallback")
+            })
+            .unwrap_err();
+            assert!(err.contains("refusing environment fallback"));
+            assert!(!err.contains("secret-marker"));
+            assert!(!err.contains("not-a-secret"));
+        }
+    }
+
+    #[test]
+    fn staging_credential_read_error_refuses_without_fallback() {
+        let dir = Credentials::new();
+        // A directory is unreadable as token text even when tests run as root.
+        std::fs::create_dir(dir.0.join("discord_staging_token")).unwrap();
+        let err = load_staging_token(Some(&dir.0), &|| {
+            panic!("unreadable credentials must not read the fallback")
+        })
+        .unwrap_err();
+        assert!(err.contains("cannot read discord_staging_token"));
+        assert!(err.contains("refusing environment fallback"));
+    }
 }
