@@ -52,6 +52,14 @@ and untagged seeds, features in the root/four crates/Worker, breaking changes,
 fixes (including security-only commits), Common Changelog headings, the card
 footer, synchronized manifest and lock updates, and exactly one componentless
 release candidate. `security` entries appear under Fixed and advance the patch.
+Before dispatching checks, `scripts/migrate-release-notes.cjs` consumes the
+native updater's first-release bootstrap tail: it merges the existing RSVP
+Added/Fixed notes into the generated version section and the release PR body,
+removing the duplicate title and Unreleased section. The PR body matters because
+release-please uses it, not the changelog file, for GitHub Release notes. Once
+that bootstrap tail is gone the migration is a no-op; unexpected layouts fail
+closed. The lifecycle fixture asserts each historical note in both outputs and
+the resulting release payload, with one title and no stranded Unreleased notes.
 Cargo CI still validates compilation and the real release flow still validates
 GitHub writes.
 

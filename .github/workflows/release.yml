@@ -47,6 +47,33 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # The first native changelog update leaves legacy Unreleased notes behind.
+      # Migrate them into both the versioned file and the PR body (the latter is
+      # the source of GitHub Release notes), before dispatching exact-head CI.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.release.outputs.prs_created == 'true'
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+      - name: Preserve bootstrap release notes
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ fromJSON(steps.release.outputs.pr).number }}
+        run: |
+          set -euo pipefail
+          BODY_FILE="$RUNNER_TEMP/release-pr-body.md"
+          gh pr view "$PR_NUMBER" --json body --jq .body > "$BODY_FILE"
+          node scripts/migrate-release-notes.cjs CHANGELOG.md "$BODY_FILE"
+          if ! git diff --quiet -- CHANGELOG.md; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add CHANGELOG.md
+            gh pr edit "$PR_NUMBER" --body-file "$BODY_FILE"
+            git commit -m 'chore(release): preserve bootstrap release notes' -m 'Co-Authored-By: Paperclip <noreply@paperclip.ing>'
+            git push origin HEAD
+          fi
+
   dispatch-checks:
     name: dispatch-checks
     needs: release-please
