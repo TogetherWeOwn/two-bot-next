@@ -459,7 +459,9 @@ impl TokenBuckets {
         bucket.tokens = spec
             .capacity
             .min(bucket.tokens + elapsed * spec.refill_per_second);
-        bucket.updated_ms = now_ms;
+        // A backwards wall clock must not let its recovery credit the same
+        // elapsed interval twice. Keep the last observed high-water mark.
+        bucket.updated_ms = bucket.updated_ms.max(now_ms);
 
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -1949,6 +1951,22 @@ mod tests {
     }
 
     #[test]
+    fn buckets_clock_rollback_does_not_refill_spent_tokens_twice() {
+        for spec in [DEFAULT_BUCKET, ADD_MEMBER_BUCKET] {
+            let mut buckets = TokenBuckets::new();
+            for _ in 0..spec.capacity as usize {
+                assert!(buckets.take("k", spec, 10_000).allowed);
+            }
+            assert!(!buckets.take("k", spec, 9_000).allowed);
+            assert!(!buckets.take("k", spec, 10_000).allowed);
+            let refill_ms = (1000.0 / spec.refill_per_second) as u64;
+            assert!(!buckets.take("k", spec, 10_000 + refill_ms - 1).allowed);
+            assert!(buckets.take("k", spec, 10_000 + refill_ms).allowed);
+            assert!(!buckets.take("k", spec, 10_000 + refill_ms).allowed);
+        }
+    }
+
+    #[test]
     fn error_code_table() {
         let cases = [
             (ErrorCode::Malformed, 400, false),
@@ -2556,6 +2574,305 @@ mod tests {
             timestamp: ts,
             nonce,
             signature: sig,
+        }
+    }
+
+    fn authorize_for_test(
+        headers: &AuthHeaders<'_>,
+        raw: &[u8],
+        now_ms: u64,
+        nonces: &mut NonceCache,
+        buckets: &mut TokenBuckets,
+    ) -> Result<AuthDecision, ActionError> {
+        authorize(
+            headers,
+            raw,
+            &ring(),
+            &InternalFlags::from_map(&HashMap::new()),
+            true,
+            true,
+            SKEW_SECONDS,
+            now_ms / 1000,
+            now_ms,
+            nonces,
+            buckets,
+        )
+    }
+
+    #[test]
+    fn signing_preserves_header_values_and_raw_body_bytes() {
+        let vector = vec1();
+        let keys = ring();
+        let changed_timestamp = format!("0{}", vector.timestamp);
+        let changed_nonce = vector.nonce.to_uppercase();
+        assert_ne!(changed_nonce, vector.nonce);
+        let changed_signature = format!(" {}", vector.signature);
+        let changed_body = format!("{}\n", vector.body);
+        // HTTP header names are case-insensitive; signed values are not.
+        // Even JSON-equivalent whitespace must not be reserialized away.
+        for (id, timestamp, nonce, signature, raw) in [
+            (
+                "WEB",
+                &vector.timestamp,
+                &vector.nonce,
+                &vector.signature,
+                vector.body.as_bytes(),
+            ),
+            (
+                "web",
+                &changed_timestamp,
+                &vector.nonce,
+                &vector.signature,
+                vector.body.as_bytes(),
+            ),
+            (
+                "web",
+                &vector.timestamp,
+                &changed_nonce,
+                &vector.signature,
+                vector.body.as_bytes(),
+            ),
+            (
+                "web",
+                &vector.timestamp,
+                &vector.nonce,
+                &changed_signature,
+                vector.body.as_bytes(),
+            ),
+            (
+                "web",
+                &vector.timestamp,
+                &vector.nonce,
+                &vector.signature,
+                changed_body.as_bytes(),
+            ),
+        ] {
+            assert!(!keys.verify(id, signature, timestamp, nonce, raw));
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&vector.body).expect("fixture JSON"),
+            serde_json::from_str::<Value>(&changed_body).expect("same JSON")
+        );
+    }
+
+    #[test]
+    fn pipeline_signed_skew_edges_and_malformed_timestamps_do_not_burn() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        for (timestamp, accepted) in [
+            ("1719999880", true),
+            ("1720000120", true),
+            ("1719999879", false),
+            ("1720000121", false),
+            ("+1720000000", false),
+            ("1720000000.0", false),
+            ("1720000000 ", false),
+            ("１７２０００００００", false),
+        ] {
+            let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+            let mut buckets = TokenBuckets::new();
+            let nonce = test_nonce();
+            let sig = sign(
+                vector.secret.as_bytes(),
+                timestamp,
+                &nonce,
+                vector.body.as_bytes(),
+            );
+            let headers = signed_headers("web", timestamp, &nonce, &sig);
+            let result = authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+            );
+            if accepted {
+                assert!(result.is_ok(), "{timestamp}");
+                assert_eq!(nonces.len(), 1);
+            } else {
+                let err = result.expect_err("signed but not fresh");
+                assert_eq!(err.code, ErrorCode::StaleRequest, "{timestamp}");
+                assert!(nonces.is_empty());
+                assert!(buckets.buckets.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_body_cap_is_inclusive_and_oversize_burns_nonce() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut raw = br#"{"action":"role.assign"}"#.to_vec();
+        raw.resize(MAX_BODY_BYTES, b' ');
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let nonce = test_nonce();
+        let sig = sign(vector.secret.as_bytes(), &vector.timestamp, &nonce, &raw);
+        let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+        assert!(authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets).is_ok());
+
+        raw.push(b' ');
+        let nonce = test_nonce();
+        let sig = sign(vector.secret.as_bytes(), &vector.timestamp, &nonce, &raw);
+        let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+        let err = authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets)
+            .expect_err("one byte over cap");
+        assert_eq!(err.code, ErrorCode::Malformed);
+        assert_eq!(err.log_reason, "body_too_large");
+        let err = authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets)
+            .expect_err("oversized request already burned its nonce");
+        assert_eq!(err.code, ErrorCode::Replayed);
+        assert_eq!(nonces.len(), 2);
+    }
+
+    #[test]
+    fn pipeline_bad_signatures_cannot_poison_nonces_or_key_buckets() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let wrong = signed_headers("web", &vector.timestamp, &vector.nonce, &vec2().signature);
+        let unknown = signed_headers(
+            "unknown",
+            &vector.timestamp,
+            &vector.nonce,
+            &vector.signature,
+        );
+        for _ in 0..=DEFAULT_BUCKET.capacity as usize {
+            let wrong_err = authorize_for_test(
+                &wrong,
+                vector.body.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect_err("wrong signature");
+            let unknown_err = authorize_for_test(
+                &unknown,
+                vector.body.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect_err("unknown caller");
+            assert_eq!(wrong_err, unknown_err);
+            assert_eq!(wrong_err.code, ErrorCode::Unauthorized);
+        }
+        assert!(nonces.is_empty());
+        assert!(buckets.buckets.is_empty());
+        let valid = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        assert!(authorize_for_test(
+            &valid,
+            vector.body.as_bytes(),
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn pipeline_rejected_json_is_secret_safe_and_cannot_be_replayed() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let marker = "synthetic-oauth-body-marker";
+        let raw = format!("{{\"access_token\":\"{marker}\",\"action\":");
+        let nonce = test_nonce();
+        let sig = sign(
+            vector.secret.as_bytes(),
+            &vector.timestamp,
+            &nonce,
+            raw.as_bytes(),
+        );
+        let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+        let err = authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
+            .expect_err("malformed JSON");
+        assert_eq!(err.code, ErrorCode::Malformed);
+        assert_eq!(err.log_reason, "bad_json");
+        assert!(!format!("{err:?}").contains(marker));
+        assert!(!format!("{err}").contains(marker));
+        let err = authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
+            .expect_err("rejected JSON still burned its nonce");
+        assert_eq!(err.code, ErrorCode::Replayed);
+    }
+
+    #[test]
+    fn rotation_removes_old_key_without_forgetting_replay_state() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        authorize_for_test(
+            &headers,
+            vector.body.as_bytes(),
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+        )
+        .expect("old key accepted during overlap");
+        let rotated = KeyRing::new(vec![SigningKey {
+            id: "web2".to_owned(),
+            secret: vec2().secret.as_bytes().to_vec(),
+        }]);
+        assert!(!rotated.verify(
+            "web",
+            &vector.signature,
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes(),
+        ));
+        let sig = sign(
+            vec2().secret.as_bytes(),
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes(),
+        );
+        let headers = signed_headers("web2", &vector.timestamp, &vector.nonce, &sig);
+        let err = authorize(
+            &headers,
+            vector.body.as_bytes(),
+            &rotated,
+            &InternalFlags::from_map(&HashMap::new()),
+            true,
+            true,
+            SKEW_SECONDS,
+            now_ms / 1000,
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+        )
+        .expect_err("rotation must not reset global replay memory");
+        assert_eq!(err.code, ErrorCode::Replayed);
+    }
+
+    #[test]
+    fn bind_guard_checks_mapped_ipv6_and_private_range_edges() {
+        for host in [
+            "::ffff:ac10:1",
+            "[::ffff:c0a8:1]",
+            "172.16.0.1",
+            "172.31.255.254",
+            "100.64.0.1",
+            "100.127.255.254",
+            "febf::1",
+        ] {
+            assert!(assert_private_bind(host).is_ok(), "{host}");
+        }
+        for host in [
+            "::ffff:808:808",
+            "[::ffff:0:0]",
+            "172.15.255.254",
+            "172.32.0.1",
+            "100.63.255.254",
+            "100.128.0.1",
+            "fec0::1",
+            "ff02::1",
+            "10.0.0.1:8080",
+        ] {
+            assert!(assert_private_bind(host).is_err(), "{host}");
         }
     }
 
