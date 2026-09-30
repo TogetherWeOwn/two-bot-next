@@ -22,6 +22,21 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
+      TWO_CUSTOM_COMMAND_TEST_CI: "1"
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -52,6 +67,12 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --locked
+
+      - name: core db-feature clippy
+        run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
+
+      - name: custom-command Postgres proof
+        run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
