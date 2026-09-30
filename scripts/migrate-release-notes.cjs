@@ -23,6 +23,26 @@ const releaseHeading = /^##? \[?v?\d+\.\d+\.\d+.*$/gm;
 const NATIVE_NOTES_BRANCH = 'release-please--branches--main--components--two-bot-next--release-notes';
 const NATIVE_NOTES_FILE = 'release-notes.md';
 const NATIVE_OVERFLOW_SENTENCE = 'This release is too large to preview in the pull request body. View the full release notes here:';
+// Native PR-body limit (MAX_ISSUE_BODY_SIZE in the pinned
+// FilePullRequestOverflowHandler): bodies longer than this overflow natively,
+// and GitHub rejects a PATCH carrying more than this. The workflow applies the
+// same threshold to its reconciled output before choosing the write path, so a
+// migration that grows a large normal body past the limit takes the native
+// overflow representation instead of a PATCH every retry would repeat.
+const MAX_ISSUE_BODY_SIZE = 65536;
+
+function selectBodyWrite(text) {
+  return text.length > MAX_ISSUE_BODY_SIZE ? 'overflow' : 'patch';
+}
+
+// The visible body for a migration-created overflow: exactly the native
+// single-line link form, so parseOverflowLink/resolveNotesBody and PR lint
+// handle it like a native overflow on the next run.
+function buildOverflowBody(repo, notesBranch) {
+  assert.match(repo, /^[\w.-]+\/[\w.-]+$/);
+  assert.equal(notesBranch, NATIVE_NOTES_BRANCH, 'Unexpected release-notes branch for overflow body');
+  return `${NATIVE_OVERFLOW_SENTENCE} https://github.com/${repo}/blob/${notesBranch}/${NATIVE_NOTES_FILE}`;
+}
 
 function parseOverflowLink(visibleBody) {
   const normalized = visibleBody.trim().replace(/\r\n/g, '\n');
@@ -106,7 +126,7 @@ function migrateReleaseNotes(changelog, body) {
   };
 }
 
-module.exports = {migrateReleaseNotes, parseOverflowLink, resolveNotesBody, NATIVE_NOTES_BRANCH, NATIVE_NOTES_FILE, NATIVE_OVERFLOW_SENTENCE};
+module.exports = {migrateReleaseNotes, parseOverflowLink, resolveNotesBody, selectBodyWrite, buildOverflowBody, NATIVE_NOTES_BRANCH, NATIVE_NOTES_FILE, NATIVE_OVERFLOW_SENTENCE, MAX_ISSUE_BODY_SIZE};
 
 if (require.main === module) {
   const [changelogPath, bodyPath, notesPath] = process.argv.slice(2);

@@ -101,12 +101,29 @@ jobs:
             # its own branch so the link keeps resolving; the PR body link is
             # native-owned and never PATCHed.
             if ! cmp -s "$NOTES_FILE.before" "$NOTES_FILE"; then
-              python3 -c 'import base64, json, pathlib, sys; print(json.dumps({"message": "chore(release): preserve bootstrap release notes", "content": base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode()}))' "$NOTES_FILE" > "$NOTES_FILE.json"
+              # The Contents API reads the branch from the JSON payload: with
+              # --input, gh puts -f field flags into the URL query instead, so
+              # the branch MUST be part of the payload (gh api --help).
+              NOTES_BRANCH="$NOTES_BRANCH" python3 -c 'import base64, json, os, pathlib, sys; print(json.dumps({"message": "chore(release): preserve bootstrap release notes", "content": base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode(), "branch": os.environ["NOTES_BRANCH"]}))' "$NOTES_FILE" > "$NOTES_FILE.json"
               NOTES_SHA=$(gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" --jq .sha)
               python3 -c 'import json, pathlib, sys; payload = json.loads(pathlib.Path(sys.argv[1]).read_text()); payload["sha"] = sys.argv[2]; pathlib.Path(sys.argv[1]).write_text(json.dumps(payload))' "$NOTES_FILE.json" "$NOTES_SHA"
-              gh api --method PUT "repos/$GH_REPO/contents/release-notes.md" --input "$NOTES_FILE.json" -f branch="$NOTES_BRANCH" --silent
+              gh api --method PUT "repos/$GH_REPO/contents/release-notes.md" --input "$NOTES_FILE.json" --silent
             fi
           elif ! cmp -s "$BODY_FILE.before" "$BODY_FILE"; then
+            # Migration can grow a large normal body past the native PR-body
+            # limit; GitHub would reject that PATCH, and retries would repeat
+            # the same request indefinitely. Route the reconciled output through
+            # the same overflow representation native uses: full notes in
+            # release-notes.md on the derived notes branch, visible body as the
+            # single-line link (which the next run resolves like a native
+            # overflow). The file may not exist yet, so the sha lookup tolerates
+            # a missing file and the payload carries a sha only on update.
+            if [ "$(node -e "process.stdout.write(require('./scripts/migrate-release-notes.cjs').selectBodyWrite(require('node:fs').readFileSync(process.argv[1], 'utf8')))" "$BODY_FILE")" = "overflow" ]; then
+              NOTES_SHA=$(gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" --jq .sha 2>/dev/null || true)
+              NOTES_BRANCH="$NOTES_BRANCH" NOTES_SHA="$NOTES_SHA" python3 -c 'import base64, json, os, pathlib, sys; payload = {"message": "chore(release): preserve bootstrap release notes", "content": base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode(), "branch": os.environ["NOTES_BRANCH"]}; sha = os.environ["NOTES_SHA"]; print(json.dumps({**payload, **({"sha": sha} if sha else {})}))' "$BODY_FILE" > "$NOTES_FILE.json"
+              gh api --method PUT "repos/$GH_REPO/contents/release-notes.md" --input "$NOTES_FILE.json" --silent
+              NOTES_BRANCH="$NOTES_BRANCH" node -e "require('node:fs').writeFileSync(process.argv[1], require('./scripts/migrate-release-notes.cjs').buildOverflowBody(process.env.GH_REPO, process.env.NOTES_BRANCH) + '\n')" "$BODY_FILE"
+            fi
             python3 -c 'import json, pathlib, sys; print(json.dumps({"body": pathlib.Path(sys.argv[1]).read_text()}))' "$BODY_FILE" > "$BODY_FILE.json"
             gh api --method PATCH "repos/$GH_REPO/pulls/$PR_NUMBER" --input "$BODY_FILE.json" --silent
           fi

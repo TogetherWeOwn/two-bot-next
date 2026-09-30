@@ -11,7 +11,7 @@ const {parseConventionalCommits} = require(path.join(library, 'build/src/commit'
 const {DefaultVersioningStrategy} = require(path.join(library, 'build/src/versioning-strategies/default'));
 const {parseCargoManifest, parseCargoLockfile} = require(path.join(library, 'build/src/updaters/rust/common'));
 const {FilePullRequestOverflowHandler} = require(path.join(library, 'build/src/util/pull-request-overflow-handler'));
-const {migrateReleaseNotes, parseOverflowLink, resolveNotesBody, NATIVE_NOTES_BRANCH, NATIVE_OVERFLOW_SENTENCE} = require('./migrate-release-notes.cjs');
+const {migrateReleaseNotes, parseOverflowLink, resolveNotesBody, selectBodyWrite, buildOverflowBody, NATIVE_NOTES_BRANCH, NATIVE_OVERFLOW_SENTENCE, MAX_ISSUE_BODY_SIZE} = require('./migrate-release-notes.cjs');
 const {findNewestNativeCommit, findGenerationSnapshot, NATIVE_RELEASE_COMMIT_PATTERN} = require('./release-pr-state.cjs');
 // Native 17.6.0 derives the component from the root package name; the live
 // library assertions below fail loudly if either constant drifts.
@@ -197,6 +197,21 @@ assert.throws(() => resolveNotesBody(overflowBody, () => ''), /Missing stored re
 assert.equal(resolveNotesBody('plain body', () => { throw new Error('must not fetch for normal bodies'); }), 'plain body');
 console.log('PASS 8 overflow link guards: exact sentence, single line, branch match, fail-closed fetch');
 
+// Body write-path selection shares the native 65,536-char PR-body limit: the
+// workflow routes reconciled output at or under the limit through PATCH and
+// anything larger through the native overflow representation (stored notes +
+// single-line link), so GitHub never sees a rejected oversized PATCH.
+assert.equal(MAX_ISSUE_BODY_SIZE, 65536, 'Write-path limit must match the native PR-body limit');
+assert.equal(selectBodyWrite('x'.repeat(65536)), 'patch', 'At-limit output takes the PATCH path');
+assert.equal(selectBodyWrite('x'.repeat(65537)), 'overflow', 'Over-limit output takes the overflow path');
+assert.equal(selectBodyWrite('normal body'), 'patch');
+const migrationLink = buildOverflowBody('TogetherWeOwn/two-bot-next', NATIVE_NOTES_BRANCH);
+assert(!migrationLink.includes('\n'), 'Migration-created overflow body is a single line');
+assert.deepEqual(parseOverflowLink(migrationLink), {url: migrationLink.slice(NATIVE_OVERFLOW_SENTENCE.length + 1), branchName: NATIVE_NOTES_BRANCH});
+assert.throws(() => buildOverflowBody('TogetherWeOwn/two-bot-next', 'other--release-notes'), /Unexpected release-notes branch/);
+assert.throws(() => buildOverflowBody('not a repo', NATIVE_NOTES_BRANCH), /match/);
+console.log('PASS 5 body write-path guards: shared native limit, boundary, overflow-link form, fail-closed branch');
+
 // Generation-snapshot tracking binds reuse to the snapshot that produced the
 // metadata, not mere ancestry (Update-branch merges keep ancestry while stale).
 const shaA = 'a'.repeat(40);
@@ -275,8 +290,62 @@ async function overflowLifecycle() {
   console.log(`PASS overflow lifecycle: 490 commits, ${fullBody.length}-char native body, stored-notes migration idempotent`);
 }
 
+async function migrationGrowthOverflowLifecycle() {
+  // The reviewer's P2: a real native normal body (351 conventional commits,
+  // 65,109 chars) that bootstrap migration grows past the 65,536-char PR
+  // limit. The reconciled output must take the overflow representation, and
+  // the next run must resolve it like a native overflow.
+  const snapshot = {...bootstrapSnapshot};
+  const content = {...snapshot};
+  // Calibrated so the real native body lands just under the 65,536-char
+  // limit while the migrated body (native notes + bootstrap RSVP notes)
+  // crosses it: 351 commits at this padding yield ~65.1k chars in-suite.
+  const pad = i => `feat: scoped release item ${String(i).padStart(3, '0')} ${'x'.repeat(57)}`;
+  const github = {
+    repository: {owner: 'fixture', repo: 'two-bot-next'},
+    async getFileJson(file) { return JSON.parse(content[file]); },
+    async getFileContentsOnBranch(file) {
+      return {content: Buffer.from(content[file]).toString('base64'), parsedContent: content[file], sha: 'fixture-content'};
+    },
+    async findFilesByGlobAndRef(glob) {
+      if (glob === 'crates/*/Cargo.toml') return members.map(member => `${member}/Cargo.toml`);
+      return [glob];
+    },
+    async *releaseIterator() {},
+    async *tagIterator() {},
+    async *mergeCommitIterator() {
+      for (let i = 0; i < 351; i++) yield {sha: i.toString(16).padStart(40, '0'), message: pad(i), files: ['crates/core/src/lib.rs']};
+    },
+    async *pullRequestIterator() {},
+  };
+  const manifest = await Manifest.fromManifest(github, 'main', undefined, undefined, {logger});
+  const pr = (await manifest.buildPullRequests())[0];
+  for (const update of pr.updates) {
+    if (content[update.path] === undefined && !update.createIfMissing) continue;
+    content[update.path] = update.updater.updateContent(content[update.path] || '', logger);
+  }
+  const normalBody = pr.body.toString();
+  assert(normalBody.length <= MAX_ISSUE_BODY_SIZE, `Fixture must start as a normal body, got ${normalBody.length}`);
+  const migrated = migrateReleaseNotes(content['CHANGELOG.md'], normalBody);
+  assert.notEqual(migrated.changelog, content['CHANGELOG.md'], 'Migration must consume the bootstrap tail');
+  assert(migrated.body.length > MAX_ISSUE_BODY_SIZE, `Migrated body must exceed the limit, got ${migrated.body.length}`);
+  assert.equal(selectBodyWrite(migrated.body), 'overflow', 'Grown output takes the overflow path, never PATCH');
+  // The workflow's overflow representation: stored notes + single-line link.
+  const storedNotes = migrated.body;
+  const visible = buildOverflowBody('fixture/two-bot-next', NATIVE_NOTES_BRANCH);
+  assert(!visible.includes('\n'), 'Visible overflow body is a single line');
+  const resolved = resolveNotesBody(visible, () => storedNotes);
+  assert.equal(resolved, storedNotes, 'Next run resolves the stored notes');
+  assert.equal(migrateReleaseNotes(migrated.changelog, resolved).body, storedNotes, 'Retry reconciliation is a no-op');
+  for (const note of originalNotes) {
+    assert.equal(storedNotes.split(note).length - 1, 1, 'Stored notes preserve each RSVP note once');
+  }
+  console.log(`PASS migration-growth overflow: normal ${normalBody.length} chars -> migrated ${migrated.body.length} chars -> overflow representation`);
+}
+
 (async () => {
   await overflowLifecycle();
+  await migrationGrowthOverflowLifecycle();
   const scopes = ['src/lib.rs', ...members.map(member => `${member}/src/${member === 'crates/bot' ? 'main' : 'lib'}.rs`), 'wrangler/src/index.ts'];
   const cases = [
     ...scopes.map(file => ({message: 'feat: scoped feature', file})),

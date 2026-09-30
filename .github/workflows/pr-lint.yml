@@ -80,6 +80,35 @@ jobs:
                       or head_name.lower() != repo.lower()):
                   raise SystemExit("Dispatch ref/SHA must match an open same-repository PR targeting main")
               title, body, author = pr["title"], pr["body"], pr["author"]["login"]
+              # Native overflow PRs carry only a single-line link in the
+              # visible body; the full notes (including the card footer) live
+              # in release-notes.md on the derived notes branch. Resolve that
+              # file before the card-reference gate, without weakening it: the
+              # link must be the exact native sentence and its branch must be
+              # exactly this release's notes branch from the already-validated
+              # same-repo head. Anything else fails closed.
+              overflow_prefix = ("This release is too large to preview in the pull "
+                                 "request body. View the full release notes here: ")
+              lines = (body or "").strip().splitlines()
+              if len(lines) == 1 and lines[0].startswith(overflow_prefix):
+                  from urllib.parse import urlparse
+                  parts, overflow_branch = None, ""
+                  try:
+                      parts = urlparse(lines[0][len(overflow_prefix):].strip())
+                      chunks = parts.path.split("/blob/", 1)
+                      overflow_branch = (chunks[1].rsplit("/release-notes.md", 1)[0]
+                                         if len(chunks) == 2 and chunks[1].endswith("/release-notes.md")
+                                         else "")
+                  except Exception:
+                      parts, overflow_branch = None, ""
+                  if parts is None or not parts.netloc or overflow_branch != f"{pr['headRefName']}--release-notes":
+                      raise SystemExit("Overflow link must resolve to this release's notes branch")
+                  encoded = subprocess.check_output([
+                      "gh", "api", f"repos/{repo}/contents/release-notes.md?ref={overflow_branch}",
+                      "--jq", ".content",
+                  ], text=True)
+                  import base64
+                  body = base64.b64decode("".join(encoded.split())).decode("utf-8")
               event = "pull_request"
           else:
               title = os.environ.get("EVENT_TITLE", "")

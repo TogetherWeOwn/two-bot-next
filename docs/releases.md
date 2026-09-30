@@ -105,6 +105,15 @@ derived `<head>--release-notes` branch. The workflow reconciles that stored
 file (never PATCHing the native-owned link) only when the visible body parses
 as the exact native overflow link; a dangling link fails closed before any
 push or dispatch, and a stale notes branch alongside a normal body is ignored.
+The stored-notes Contents PUT carries the branch inside the JSON payload
+(`gh api --input` moves `-f` flags to the URL query, which the Contents API
+ignores). PR lint resolves the same validated notes-branch file before its
+card-reference check, so required lint passes on overflow PRs without
+weakening the `Refs: TOG-*` gate. Migration can also grow a large normal body
+past the native 65,536-char limit; the workflow routes that reconciled output
+through the same overflow representation (stored notes plus link) instead of an
+oversized PATCH that GitHub would reject on every retry. The next run resolves
+the new representation exactly like a native overflow.
 
 `python3 scripts/test-release-retry.py` runs the workflow's actual reconciliation
 shell and state CLI using complete disposable local Git repositories and a

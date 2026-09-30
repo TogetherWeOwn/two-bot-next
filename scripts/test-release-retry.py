@@ -45,6 +45,7 @@ args = sys.argv[1:]
 assert args[0] == "api", args
 repo = "repos/fixture/repo"
 branch = "__BRANCH__"
+NOTES_BRANCH = branch + "--release-notes"
 git = os.environ["RETRY_REAL_GIT"]
 remote = os.environ["RETRY_REMOTE"]
 head = subprocess.check_output([git, "--git-dir", remote, "rev-parse", "refs/heads/" + branch], text=True).strip()
@@ -94,7 +95,14 @@ elif args[1:4] == ["--method", "PUT", repo + "/contents/release-notes.md"]:
         state_path.write_text(json.dumps(state))
         sys.exit(1)
     payload = json.loads(pathlib.Path(args[args.index("--input") + 1]).read_text())
-    assert payload["sha"] == state["notes_sha"], (payload["sha"], state["notes_sha"])
+    # The Contents API reads the branch from the JSON payload: with --input,
+    # gh puts -f field flags into the URL query instead (gh api --help), so a
+    # payload without branch would target the default branch. Fail closed.
+    assert payload.get("branch") == NOTES_BRANCH, payload.get("branch")
+    if "sha" in payload:
+        assert payload["sha"] == state["notes_sha"], (payload["sha"], state["notes_sha"])
+    else:
+        assert state["notes"] is None, "Create without sha requires absent file"
     state["notes"] = base64.b64decode(payload["content"]).decode()
     state["notes_sha"] = "notes-sha-%d" % state["notes_put_attempts"]
     state["notes_puts"] += 1
@@ -339,6 +347,48 @@ class ReleaseRetryTests(unittest.TestCase):
         self.assertEqual(self.state()["pushes"], 1)
         self.assertEqual(self.state()["patches"], 1)
         self.assertEqual(self.state()["notes"], "stale stored notes")
+        self.assertEqual(self.state()["notes_puts"], 0)
+        self.assert_reconciled()
+
+    def test_migration_grown_body_takes_overflow_path(self):
+        # A normal native body whose migrated notes exceed the PR-body limit
+        # (bulk lives in the first changelog section, as in the reviewer's
+        # 351-commit native body) must take the overflow representation
+        # instead of a PATCH the API would reject (and every retry repeat).
+        filler = "\n".join(f"* generated item {i:04d} {'x' * 60}" for i in range(900))
+        big_changelog = f"# Changelog\n\n{NOTES}\n\n{filler}\n\n## Changelog\n\n## Unreleased\n\n### Fixed\n\n- historical RSVP repair\n"
+        big_body = f":robot: release\n---\n\n{NOTES}\n\n{filler}\n\n---\nRefs: TOG-9865\n"
+        self.assertGreater(len(big_body), 65536, "Fixture must exceed the native body limit")
+        (self.repo / "CHANGELOG.md").write_text(big_changelog)
+        self.state(body=big_body)
+        self.reconcile()
+        self.assertEqual(self.state()["pushes"], 1)
+        self.assertEqual(self.state()["notes_puts"], 1)
+        # The visible body really changes (normal body -> overflow link), so
+        # exactly one small-link PATCH is published; the oversized text never
+        # goes through PATCH.
+        self.assertEqual(self.state()["patches"], 1)
+        self.assertLess(len(self.state()["body"]), 1000)
+        self.assertGreater(len(self.state()["notes"]), 65536)
+        self.assertEqual(self.state()["notes"].count("- historical RSVP repair"), 1)
+        overflow = self.state()["body"]
+        self.assertNotIn("\n", overflow.strip())
+        self.assertTrue(overflow.strip().startswith(OVERFLOW_SENTENCE))
+        self.assertIn(NOTES_BRANCH, overflow)
+        # Retry reconciles the new overflow representation without repeats.
+        before = self.state()
+        self.fresh_checkout()
+        self.reconcile()
+        overflow_state = self.state()
+        self.assertEqual(overflow_state["pushes"], before["pushes"])
+        self.assertEqual(overflow_state["notes_puts"], before["notes_puts"])
+        self.assertEqual(overflow_state["patches"], before["patches"])
+
+    def test_normal_body_stays_on_patch_path(self):
+        self.assertLess(len(BODY), 65536)
+        self.reconcile()
+        self.assertEqual(self.state()["pushes"], 1)
+        self.assertEqual(self.state()["patches"], 1)
         self.assertEqual(self.state()["notes_puts"], 0)
         self.assert_reconciled()
 
