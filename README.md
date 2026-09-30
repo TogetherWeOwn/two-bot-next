@@ -1,5 +1,7 @@
 # two-bot-next
 
+[![Release](https://img.shields.io/github/v/release/TogetherWeOwn/two-bot-next)](https://github.com/TogetherWeOwn/two-bot-next/releases)
+
 The Together We Own Discord bot (Owen), rewritten in Rust to run in a single always-on
 Cloudflare Container. It replaces [two-bot](https://github.com/TogetherWeOwn/two-bot)
 (TypeScript/discord.js), which is now in maintenance mode: fixes only, no new features.
@@ -18,6 +20,10 @@ Postgres with two-web-next. Migration plan: TOG-9671.
 Squash-merge only; PR titles follow Conventional Commits and the body carries
 `Refs: TOG-1234`. `gitleaks` and `pr-lint` are required; `check` (fmt, clippy, test)
 becomes required with the first Rust code.
+
+Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/build-cache.md),
+not a new `target/` in each worktree. The runbook includes offline cache tests,
+fail-closed retention auditing, `/home` available-byte alarms and the Operator rollout.
 
 ## License
 

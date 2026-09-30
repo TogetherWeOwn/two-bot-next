@@ -7,11 +7,16 @@ live in `feature_commands.rs`.
 
 ## Verification
 
+On the controller, use the bounded cache wrapper (see `docs/build-cache.md`):
+
 ```sh
-cargo test -p two-bot-core --locked
-cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
-cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib custom_commands
+python3 scripts/cargo_cache.py run -- clippy -p two-bot-core --all-targets --features db -- -D warnings
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test custom_command_store -- --ignored
 ```
+
+Hosted CI uses the equivalent direct Cargo commands on its ephemeral runner.
+A refused controller cache admission is not permission to compile outside it.
 
 The last command connects only to `agent-testdb:5432`, database/user
 `agent_test`, empty password. It never reads `DATABASE_URL` or application
@@ -27,10 +32,10 @@ need no live service; the explicit database test fails loudly when unavailable.
 
 ## Shared router/executor handoff
 
-There is no production interaction router or response executor in this slice's
-base checkout. These modules do **not** publish commands or reply to Discord.
-Wire them through the shared S4 interfaces when those land; do not add a private
-dispatcher or HTTP client.
+The shared S4 interaction router and REST executor are now present on `main`.
+This domain/store slice does **not** yet publish commands or reply to Discord.
+Runtime integration remains a follow-up through those shared interfaces; do not
+add a private dispatcher or HTTP client.
 
 1. Scope admin interactions to the configured guild, enforce ManageGuild at
    runtime, and call `require_automations_enabled` before any admin read/write.
