@@ -21,7 +21,7 @@ pub(crate) fn sanitize_message(body: &mut Value) {
         embeds.truncate(text::EMBED_LIMIT);
         // Discord's 6000-character budget is shared across ALL embeds.
         let mut remaining = text::EMBED_TOTAL_LIMIT;
-        for embed in embeds {
+        for embed in embeds.iter_mut() {
             bound_text(embed, "title", text::EMBED_TITLE_LIMIT, &mut remaining);
             bound_text(
                 embed,
