@@ -14,8 +14,9 @@
 //!   `POST\n/internal/actions\n{ts}\n{nonce}\n{sha256_hex(body)}`, the
 //!   rotation-aware `KeyRing` with its constant-time unknown-key decoy, and
 //!   `parseKeys` for `TWO_INTERNAL_KEYS`.
-//! - `nonce.ts` — in-process replay guard (240 s TTL, twice the ±120 s skew)
-//!   plus the skew check itself.
+//! - `nonce.ts` — in-process replay guard (legacy 240 s TTL, now 241 s: the
+//!   smallest TTL covering the whole ±120 s skew acceptance interval given
+//!   whole-second freshness rounding) plus the skew check itself.
 //! - `rateLimit.ts` — per-key token buckets applied AFTER verify: default 20
 //!   burst / 1 per s, `guild.add_member` 10 burst / 0.5 per s, `Retry-After`
 //!   never 0.
@@ -56,8 +57,14 @@ use super::moderation::{require_moderation_reason, ModerationAction, ReasonError
 pub const ACTIONS_PATH: &str = "/internal/actions";
 /// Timestamp freshness window each way, seconds (legacy default `skewSeconds`).
 pub const SKEW_SECONDS: u64 = 120;
-/// Nonce memory: twice the skew window (legacy `NONCE_TTL_SECONDS`).
-pub const NONCE_TTL_SECONDS: u64 = 240;
+/// Nonce memory (legacy `NONCE_TTL_SECONDS`, raised from 240 to 241).
+///
+/// Legacy's 240 s TTL is one second short of the true acceptance interval:
+/// [`within_skew`] compares in whole seconds, so a signed timestamp stays
+/// fresh up to a second past its nominal skew distance, and a nonce burned at
+/// delivery must still be live then. 241 s is the smallest TTL that covers
+/// every accepted instant for the default skew.
+pub const NONCE_TTL_SECONDS: u64 = 241;
 /// Crash-recovery valve for `in_flight` idempotency claims (legacy
 /// `CLAIM_STALE_SECONDS`). The claim state machine itself lives with the db
 /// slice; the constant lives here so both sides agree.
@@ -258,7 +265,12 @@ impl KeyRing {
             nonce,
             raw,
         );
-        secret.is_some() && signatures_match(&expected, signature)
+        // Evaluate the constant-time compare unconditionally: short-circuiting
+        // on unknown ids would skip the compare and break the equal-work
+        // invariant above. `matched` alone never authenticates — an unknown id
+        // still refuses even if its decoy signature is presented.
+        let matched = signatures_match(&expected, signature);
+        secret.is_some() && matched
     }
 }
 
@@ -297,11 +309,14 @@ pub fn valid_nonce_format(nonce: &str) -> bool {
 /// lands with the db slice; this guard covers auth-only operation and unit
 /// tests exactly the way the legacy `NonceCache` did.
 ///
-/// The TTL must cover the whole acceptance interval: [`within_skew`] accepts a
-/// timestamp whose distance from now is *equal* to the skew, so a nonce burned
-/// then must still be live when that same signed request is still fresh.
-/// Expiry is exclusive on both paths (`offer` and `sweep`), keeping them
-/// consistent: a nonce is live while `now - seen <= ttl`.
+/// The TTL must cover the whole acceptance interval. [`within_skew`] compares
+/// in whole seconds, so a signed timestamp can stay fresh up to one second
+/// *past* its nominal skew distance (fractional-second rounding),
+/// and the skew itself is configurable independently of the TTL. A TTL that is
+/// shorter than the acceptance interval would let a replay through, so every
+/// constructor below enforces `ttl >= 2 * skew + 1` and fails loudly
+/// otherwise. Expiry is exclusive on both paths (`offer` and `sweep`),
+/// keeping them consistent: a nonce is live while `now - seen <= ttl`.
 #[derive(Debug, Clone)]
 pub struct NonceCache {
     seen: HashMap<String, u64>,
@@ -309,8 +324,38 @@ pub struct NonceCache {
 }
 
 impl NonceCache {
+    /// Guard for the default wiring: skew [`SKEW_SECONDS`], TTL
+    /// [`NONCE_TTL_SECONDS`]. Panics if those constants ever drift out of the
+    /// `ttl >= 2 * skew + 1` relation — a compile-visible tripwire, not a
+    /// silent replay window.
     #[must_use]
     pub fn new(ttl_seconds: u64) -> Self {
+        Self::for_skew(ttl_seconds, SKEW_SECONDS)
+    }
+
+    /// The TTL in milliseconds. The pipeline reads it to verify the
+    /// configured skew/TTL pair covers the whole acceptance interval before
+    /// burning the nonce.
+    #[must_use]
+    pub fn ttl_ms(&self) -> u64 {
+        self.ttl_ms
+    }
+
+    /// Guard for an explicit skew (mirrors legacy's independently optional
+    /// `skewSeconds`/`nonceTtlSeconds`). Fails loudly when the TTL cannot
+    /// cover the whole acceptance interval: a nonce must outlive every
+    /// instant its signed timestamp is still fresh.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ttl_seconds < 2 * skew_seconds + 1`.
+    #[must_use]
+    pub fn for_skew(ttl_seconds: u64, skew_seconds: u64) -> Self {
+        let minimum = skew_seconds.saturating_mul(2).saturating_add(1);
+        assert!(
+            ttl_seconds >= minimum,
+            "nonce TTL ({ttl_seconds}s) must cover the ±{skew_seconds}s skew window (need ≥{minimum}s)"
+        );
         Self {
             seen: HashMap::new(),
             ttl_ms: ttl_seconds * 1000,
@@ -1442,8 +1487,26 @@ pub fn authorize(
     if !within_skew(headers.timestamp, skew_seconds, now_unix_secs) {
         return Err(ActionError::new(
             ErrorCode::StaleRequest,
-            "Timestamp is outside the ±120s window",
+            format!("Timestamp is outside the ±{skew_seconds}s window"),
             "stale_timestamp",
+        ));
+    }
+    // The skew is configurable independently of the cache TTL, so enforce the
+    // coverage relation on the live pair: a nonce must still be live at every
+    // instant its signed timestamp is fresh. A skew-180/TTL-240 wiring would
+    // otherwise silently re-open a replay window after the nonce expires.
+    // This is a 500, not a 401: the caller's request is well-formed, the
+    // server is misconfigured.
+    if nonces.ttl_ms()
+        < skew_seconds
+            .saturating_mul(2)
+            .saturating_add(1)
+            .saturating_mul(1000)
+    {
+        return Err(ActionError::new(
+            ErrorCode::Internal,
+            "Server misconfigured: nonce TTL does not cover the skew window",
+            "nonce_ttl_too_short",
         ));
     }
     if !nonces.offer(headers.nonce, now_ms) {
@@ -1799,17 +1862,35 @@ mod tests {
 
     #[test]
     fn nonce_cache_rejects_replay_until_expiry() {
-        let mut cache = NonceCache::new(240);
+        let mut cache = NonceCache::new(NONCE_TTL_SECONDS);
         assert!(cache.offer("n1", 1_000));
         assert!(!cache.offer("n1", 2_000));
         assert!(cache.offer("n2", 2_000));
         // The boundary is inclusive: exactly one TTL later the nonce is still
         // live, so the same signed request — still fresh at the skew edge —
         // is a replay, not a second acceptance.
-        assert!(!cache.offer("n1", 1_000 + 240_000));
+        assert!(!cache.offer("n1", 1_000 + 241_000));
         // Past the TTL it is usable again.
-        assert!(cache.offer("n1", 1_000 + 240_001));
+        assert!(cache.offer("n1", 1_000 + 241_001));
         assert_eq!(cache.len(), 2);
+        // The constructor enforces the skew/TTL coverage relation: a TTL that
+        // cannot outlive the acceptance interval is a replay window, not a
+        // tuning knob.
+        let _ = NonceCache::for_skew(241, 120);
+    }
+
+    #[test]
+    #[should_panic(expected = "must cover the ±120s skew window")]
+    fn nonce_cache_rejects_ttl_shorter_than_skew_window() {
+        // Legacy's 240 s TTL with the default 120 s skew: the exact wiring
+        // that re-opened a 1-second replay window at the freshness edge.
+        let _ = NonceCache::for_skew(240, 120);
+    }
+
+    #[test]
+    #[should_panic(expected = "must cover the ±180s skew window")]
+    fn nonce_cache_rejects_wide_skew_with_default_ttl() {
+        let _ = NonceCache::for_skew(NONCE_TTL_SECONDS, 180);
     }
 
     #[test]
@@ -2074,6 +2155,19 @@ mod tests {
         );
         assert_eq!(
             require_reason(&json!(42)).expect_err("non-string").code,
+            ErrorCode::Malformed
+        );
+        // Legacy JS `length` counts UTF-16 units: 300 astral characters are
+        // 600 units, past the 512 ceiling, even though they are 300 scalars.
+        let astral_256 = "\u{1F600}".repeat(256);
+        assert_eq!(astral_256.encode_utf16().count(), 512);
+        assert!(require_reason(&json!(astral_256)).is_ok());
+        let astral_257 = "\u{1F600}".repeat(257);
+        assert_eq!(astral_257.encode_utf16().count(), 514);
+        assert_eq!(
+            require_reason(&json!(astral_257))
+                .expect_err("astral over ceiling")
+                .code,
             ErrorCode::Malformed
         );
     }
@@ -2542,6 +2636,62 @@ mod tests {
         )
         .expect_err("boundary replay");
         assert_eq!(err.code, ErrorCode::Replayed);
+        // Fractional-millisecond edge: signed at 1000120 (fractional clock
+        // 999999.999), delivered 1 ms after the nominal boundary. The
+        // timestamp is still fresh by whole-second rounding
+        // (|1000240 − 1000120| = 120), and the nonce — burned at ~1.000s —
+        // is 240001 ms old, past a 240 s TTL. With the coverage TTL it is
+        // still live, so this is a replay, not a second acceptance.
+        let mut buckets = TokenBuckets::new();
+        let headers = signed_headers("web", "1000120", &nonce, &sig);
+        let err = authorize(
+            &headers,
+            raw,
+            &keys,
+            &flags,
+            false,
+            false,
+            SKEW_SECONDS,
+            1_000_240,
+            1_000_240_001,
+            &mut nonces,
+            &mut buckets,
+        )
+        .expect_err("fractional-ms replay");
+        assert_eq!(err.code, ErrorCode::Replayed);
+    }
+
+    #[test]
+    fn pipeline_rejects_skew_wider_than_nonce_ttl() {
+        // Skew 180 with the 241 s TTL cannot cover the acceptance interval
+        // (needs 361 s), so the pipeline refuses with a 500-series
+        // misconfiguration error instead of authorizing into a replay window.
+        // No nonce is burned: the refusal lands before the replay check.
+        let keys = ring();
+        let flags = InternalFlags::from_map(&HashMap::new());
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let raw = br#"{"action":"role.assign"}"#;
+        let nonce = test_nonce(42);
+        let sig = sign(vec1().secret.as_bytes(), "1000180", &nonce, raw);
+        let headers = signed_headers("web", "1000180", &nonce, &sig);
+        let err = authorize(
+            &headers,
+            raw,
+            &keys,
+            &flags,
+            false,
+            false,
+            180,
+            1_000_000,
+            1_000_000_000,
+            &mut nonces,
+            &mut buckets,
+        )
+        .expect_err("wide skew refused");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(err.log_reason, "nonce_ttl_too_short");
+        assert_eq!(nonces.len(), 0);
     }
 
     #[test]
