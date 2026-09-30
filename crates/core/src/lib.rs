@@ -60,11 +60,11 @@ pub use invites::{
 pub use lfg::{
     adjudicate_signup, close_reply, created_reply, iso_millis_utc, leave_reply, lfg_content,
     lfg_custom_id, lfg_nonce, lfg_select_options, normalize_starts_at, parse_lfg_select,
-    parse_role_spec, require_manage_events, role_fill, signup_reply, spec_roles, valid_role_key,
-    validate_title, LfgPermissionError, LfgPost, LfgRole, LfgRoleSpec, LfgSelectAction,
-    LfgSelectOption, LfgSignup, LfgStatus, RoleSpecError, SignupOutcome, StartsAtError, TitleError,
-    LFG_LEAVE_VALUE, LFG_SELECT_PREFIX, MAX_LFG_ROLES, MAX_MESSAGE_CHARS, MAX_OPTION_LABEL_CHARS,
-    MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
+    parse_role_spec, require_manage_events as lfg_require_manage_events, role_fill, signup_reply,
+    spec_roles, valid_role_key, validate_title, LfgPermissionError, LfgPost, LfgRole, LfgRoleSpec,
+    LfgSelectAction, LfgSelectOption, LfgSignup, LfgStatus, RoleSpecError, SignupOutcome,
+    StartsAtError, TitleError, LFG_LEAVE_VALUE, LFG_SELECT_PREFIX, MAX_LFG_ROLES,
+    MAX_MESSAGE_CHARS, MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
 };
 pub use moderation::{
     assert_moderation_allowed, moderation_commands, moderation_target_protection,
