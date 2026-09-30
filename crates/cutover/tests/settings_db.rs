@@ -126,6 +126,49 @@ impl TestDb {
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn numeric_settings_round_trip_into_integer_config_readers() -> TestResult {
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let key = "TWO_AUTOMOD_REPEAT_COUNT";
+    let mut cache = SettingsCache::default();
+    for literal in ["3", "3.0", "3e0"] {
+        store
+            .set("g1", key, Some(serde_json::from_str(literal)?), "writer")
+            .await?;
+        let marks = store.poll_marks().await?;
+        assert!(cache.needs_refresh(marks.0, marks.1));
+        cache.refresh(&store.load_snapshot().await?);
+        let env = cache.env_snapshot(Some("g1"));
+        assert_eq!(env.get(key).map(String::as_str), Some("3"), "{literal}");
+        let config = two_bot_core::AutomodConfig::from_map(&env)?;
+        assert_eq!(config.policy.repeated_message_count, 3, "{literal}");
+    }
+    store.set("g1", key, Some(json!(3.5)), "writer").await?;
+    cache.refresh(&store.load_snapshot().await?);
+    assert!(two_bot_core::AutomodConfig::from_map(&cache.env_snapshot(Some("g1"))).is_err());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM guild_settings_audit WHERE key = $1")
+        .bind(key)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(count, 4, "one audit per numeric write");
+
+    let id_key = "DISCORD_AUDIT_LOG_CHANNEL_ID";
+    for value in [9_007_199_254_740_993_u64, u64::MAX] {
+        store
+            .set("g1", id_key, Some(json!(value)), "writer")
+            .await?;
+        cache.refresh(&store.load_snapshot().await?);
+        assert_eq!(
+            cache.env_snapshot(Some("g1")).get(id_key),
+            Some(&value.to_string()),
+            "integer IDs must survive the DB/cache/renderer without f64 rounding"
+        );
+    }
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
 async fn lower_sequence_commit_and_same_count_delete_are_seen_by_one_poll() -> TestResult {
     let db = TestDb::new().await?;
     let store = SettingsStore::new(&db.pool);

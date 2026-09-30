@@ -307,7 +307,22 @@ pub fn to_env_string(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
         Value::Bool(b) => Some(if *b { "1".to_owned() } else { "0".to_owned() }),
-        Value::Number(n) => Some(n.to_string()),
+        Value::Number(n) => {
+            // JSON/JSONB can carry integer thresholds as 3.0 or 3e0, but env
+            // readers require "3". Never send native i64/u64 values through
+            // f64: snowflakes above 2^53 must retain every digit.
+            if n.is_f64() {
+                let f = n.as_f64()?;
+                if f.fract() == 0.0 {
+                    return Some(if f == 0.0 {
+                        "0".to_owned()
+                    } else {
+                        format!("{f:.0}")
+                    });
+                }
+            }
+            Some(n.to_string())
+        }
         Value::String(s) => Some(s.clone()),
         // Id lists are comma-separated in the environment and stay that way,
         // so the dashboard can store a real array without every reader
@@ -843,6 +858,52 @@ mod tests {
         assert_eq!(to_env_string(&json!("delete")), Some("delete".to_owned()));
         assert_eq!(to_env_string(&json!(["1", "2"])), Some("1,2".to_owned()));
         assert_eq!(to_env_string(&Value::Null), None);
+    }
+
+    #[test]
+    fn integral_numbers_render_without_decimals_or_integer_precision_loss() {
+        for (value, expected) in [
+            (json!(3.0), "3"),
+            (serde_json::from_str("3e0").unwrap(), "3"),
+            (json!(-3.0), "-3"),
+            (json!(-0.0), "0"),
+            (json!(1e20), "100000000000000000000"),
+            (json!(9_007_199_254_740_993_u64), "9007199254740993"),
+            (json!(u64::MAX), "18446744073709551615"),
+            (json!(i64::MIN), "-9223372036854775808"),
+            (json!(i64::MAX), "9223372036854775807"),
+            (json!(3.5), "3.5"),
+            (json!(-3.5), "-3.5"),
+        ] {
+            assert_eq!(to_env_string(&value).as_deref(), Some(expected), "{value}");
+        }
+        assert_eq!(
+            to_env_string(&json!([3.0, u64::MAX])).as_deref(),
+            Some("3,18446744073709551615")
+        );
+    }
+
+    #[test]
+    fn integral_settings_snapshots_feed_the_automod_integer_reader() {
+        for literal in ["3", "3.0", "3e0"] {
+            let cache = SettingsCache::load(&snapshot(
+                1,
+                vec![row(
+                    "g1",
+                    "TWO_AUTOMOD_REPEAT_COUNT",
+                    serde_json::from_str(literal).unwrap(),
+                    1,
+                )],
+            ));
+            let config = crate::AutomodConfig::from_map(&cache.env_snapshot(Some("g1")))
+                .expect("integral JSON settings must parse as integer env values");
+            assert_eq!(config.policy.repeated_message_count, 3, "{literal}");
+        }
+        let cache = SettingsCache::load(&snapshot(
+            1,
+            vec![row("g1", "TWO_AUTOMOD_REPEAT_COUNT", json!(3.5), 1)],
+        ));
+        assert!(crate::AutomodConfig::from_map(&cache.env_snapshot(Some("g1"))).is_err());
     }
 
     fn row(guild: &str, key: &str, value: Value, version: i64) -> SettingRow {

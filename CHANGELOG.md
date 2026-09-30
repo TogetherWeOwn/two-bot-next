@@ -14,5 +14,6 @@
 - Serialize settings reads, writes, and audits, including concurrent inserts into absent keys; load cache rows and revision from one consistent database snapshot.
 - Refuse environment-only and unknown settings through the cache getter as well as environment snapshots.
 - Enforce append-only settings audit data for updates, deletes, and truncation.
+- Render integral JSON settings as integer environment strings so decimal/exponent thresholds survive database round-trips into config readers, without rounding integer IDs through floating point.
 - Serialize concurrent first RSVP responses before reading the previous status, including when no response row exists yet.
 - Fail configured RSVP database-test setup errors instead of silently skipping, and isolate each test invocation in its own schema.
