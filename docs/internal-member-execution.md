@@ -74,14 +74,18 @@ It asserts routes/bodies, all four byte-exact success responses, hierarchy and
 allowlist refusal, 403/404, caller-controlled 429 retry, and token-free tracing
 on success, error and timeout.
 
-`internal_member_store` runs explicitly against `agent-testdb:5432/agent_test`,
-user `agent_test`, empty password, using the **same guard** as the existing core
-store suite. It creates and removes only its own generated schema. No other DB
-URL or credential fallback is allowed. CI explicitly invokes the ignored tests.
+`internal_member_store` uses `two-bot-testsupport::TestDatabase`, the **same guard**
+as the existing core store suite. It accepts only `agent-testdb:5432`, user
+`agent_test`, explicit empty password, and a pre-created `two_bot_test_*` bootstrap
+database. Each test creates, migrates and removes its own disposable database;
+the bootstrap is never modified. URL overrides and ambient libpq configuration
+are refused. CI explicitly invokes the ignored tests.
+
+On the controller, use the bounded build-cache wrapper:
 
 ```sh
-cargo test -p two-bot-discord --locked --test internal_member
-TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test \
-  cargo test -p two-bot-discord --features db --locked \
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test internal_member
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_ci \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db \
   --test internal_member_store -- --ignored
 ```

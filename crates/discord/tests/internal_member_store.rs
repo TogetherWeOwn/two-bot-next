@@ -2,12 +2,10 @@
 
 #[allow(dead_code)]
 mod common;
-#[path = "../../core/tests/common/internal_testdb.rs"]
-mod internal_testdb;
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::json;
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use two_bot_core::internal_action_store::{
     InternalActionStore, ReconciliationEvidence, RequestIdentity, TerminalFailure, TerminalResponse,
@@ -15,6 +13,7 @@ use two_bot_core::internal_action_store::{
 use two_bot_core::internal_actions::ErrorCode;
 use two_bot_discord::executor::member::{store::MemberActionConfig, MemberOutcome};
 use two_bot_discord::ActionExecutor;
+use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "100000000000000001";
 const USER: &str = "100000000000000002";
@@ -24,63 +23,21 @@ const BOT_ROLE: &str = "100000000000000005";
 const TOKEN: &str = "fixture-only-oauth-DO-NOT-PERSIST";
 
 struct TestDb {
-    admin: PgPool,
+    fixture: TestDatabase,
     pool: PgPool,
-    schema: String,
 }
 impl TestDb {
     async fn new() -> Self {
         let url =
             std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test-container URL required");
-        let options =
-            internal_testdb::test_options(&url).expect("refusing non-test-container target");
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options.clone())
+        let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
             .await
             .unwrap();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("ia10861_{}_{nanos}", std::process::id());
-        assert!(
-            schema.len() <= 63
-                && schema
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        );
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await
-            .unwrap();
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect_with(options.options([("search_path", &schema)]))
-            .await
-            .unwrap();
-        sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0350_internal_actions.sql"
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
-        Self {
-            admin,
-            pool,
-            schema,
-        }
+        let pool = fixture.pool().clone();
+        Self { fixture, pool }
     }
     async fn cleanup(self) {
-        self.pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
-        )))
-        .execute(&self.admin)
-        .await
-        .unwrap();
-        self.admin.close().await;
+        self.fixture.close().await.unwrap();
     }
 }
 fn config(keys: &HashMap<String, String>) -> MemberActionConfig<'_> {
