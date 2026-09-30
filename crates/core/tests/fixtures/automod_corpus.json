@@ -2231,7 +2231,9 @@
       "assertions": [
         "test/unit.automod.test.ts:78"
       ],
-      "env": {},
+      "env": {
+        "TWO_AUTOMOD": "1"
+      },
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10261",
       "reason": "AutomodConfig is a pure gate reader and carries no guild/token identity. The boot activation fence belongs to the runtime adapter, not this core fixture.",
@@ -2239,7 +2241,11 @@
         "setup": {
           "enabled": true,
           "guild": "synthetic-unapproved",
-          "bot": "synthetic-unapproved"
+          "bot": "synthetic-approved-bot",
+          "permitted_pair": {
+            "guild": "synthetic-approved-guild",
+            "bot": "synthetic-approved-bot"
+          }
         },
         "checks": {
           "test/unit.automod.test.ts:78": "activation outside the permitted guild/bot pair throws allowlist refused automod"
@@ -3080,7 +3086,20 @@
       "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
       "legacy_expected": {
         "setup": {
-          "target": "hierarchy",
+          "target": {
+            "user_id": "fixture-author",
+            "role_ids": [],
+            "highest_role_position": 10,
+            "is_bot": false,
+            "is_guild_owner": false
+          },
+          "bot_highest_role_position": 10,
+          "moderation_policy": {
+            "owen_user_id": "fixture-owen",
+            "bot_user_id": "fixture-owen",
+            "protected_role_ids": []
+          },
+          "dry_run": false,
           "ladder": "1:timeout:600",
           "416": "audit omits content",
           "replay_same_id": true
@@ -3218,7 +3237,24 @@
       "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
       "legacy_expected": {
         "setup": {
-          "target": "ordinary member without protected role",
+          "target": {
+            "user_id": "fixture-author",
+            "role_ids": [],
+            "highest_role_position": 1,
+            "is_bot": false,
+            "is_guild_owner": false
+          },
+          "moderation_policy": {
+            "owen_user_id": "fixture-owen",
+            "bot_user_id": "fixture-owen",
+            "protected_role_ids": [
+              "fixture-staff"
+            ]
+          },
+          "bot_highest_role_position": 10,
+          "dry_run": false,
+          "message_content": "blocked phrase",
+          "ladder": "1:delete,2:warn,3:timeout:600",
           "distinct_messages": 3
         },
         "checks": {
@@ -3254,13 +3290,26 @@
         "test/unit.automod.test.ts:568",
         "test/unit.automod.test.ts:569"
       ],
-      "env": {},
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1",
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase",
+        "TWO_AUTOMOD_SANCTIONS": "1:timeout:600"
+      },
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
       "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
       "legacy_expected": {
         "setup": {
-          "target_resolution": "fails before mutation",
+          "dry_run": false,
+          "message_id": "unexpected-resolver",
+          "message_content": "blocked phrase",
+          "ladder": "1:timeout:600",
+          "target_resolution": {
+            "error_code": "action_not_allowed",
+            "message": "Unexpected resolver refusal",
+            "log_reason": "unexpected_resolver_refusal"
+          },
           "same_id_retry": "released for retry"
         },
         "checks": {
@@ -3385,14 +3434,78 @@
       "assertions": [
         "test/unit.automodwiring.test.ts:147#2"
       ],
-      "env": {},
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1",
+        "TWO_AUTOMOD_BAD_WORDS": "blocked",
+        "TWO_AUTOMOD_SANCTIONS": "1:delete",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10261",
       "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
       "legacy_expected": {
         "setup": {
           "failure": "release",
-          "message": "blocked"
+          "dry_run": false,
+          "automod_guild_id": "fixture-guild",
+          "owen_user_id": "fixture-owen",
+          "bot_highest_role_position": 10,
+          "policy": {
+            "bad_words": [
+              "blocked"
+            ],
+            "blocked_attachment_extensions": [],
+            "allowed_domains": [],
+            "repeated_message_count": 3,
+            "repeated_message_window_seconds": 30,
+            "mention_limit": 3,
+            "bypass_role_ids": [],
+            "exempt_channel_ids": [],
+            "sanctions": [
+              {
+                "violations": 1,
+                "action": "delete"
+              }
+            ]
+          },
+          "message": {
+            "guild_id": "fixture-guild",
+            "channel_id": "fixture-channel",
+            "message_id": "release-failure",
+            "author_id": "fixture-author",
+            "author_is_bot": false,
+            "role_ids": [
+              "fixture-member-role"
+            ],
+            "content": "blocked",
+            "mentioned_user_ids": [],
+            "attachment_names": []
+          },
+          "target": {
+            "user_id": "fixture-author",
+            "role_ids": [],
+            "highest_role_position": 1,
+            "is_bot": false,
+            "is_guild_owner": false
+          },
+          "target_protection": null,
+          "claim": {
+            "state": "claimed"
+          },
+          "delete": {
+            "error_code": "discord_rejected",
+            "http_status": 403,
+            "outcome": "definite refusal"
+          },
+          "release": {
+            "error": "release unavailable"
+          },
+          "operation_order": [
+            "claim successfully",
+            "delete refuses with 403",
+            "release throws"
+          ]
         },
         "checks": {
           "test/unit.automodwiring.test.ts:147#2": 0
@@ -3444,9 +3557,34 @@
       "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
       "legacy_expected": {
         "setup": {
+          "clock_ms": 2000,
           "events": [
-            "cached edit",
-            "fetched partial edit"
+            {
+              "type": "cached edit",
+              "old_message": {
+                "id": "edited-1",
+                "content": "allowed"
+              },
+              "message": {
+                "id": "edited-1",
+                "content": "blocked",
+                "partial": false
+              }
+            },
+            {
+              "type": "fetched partial edit",
+              "old_message": null,
+              "message": {
+                "id": "edited-2",
+                "content": "blocked",
+                "partial": true
+              },
+              "fetch_result": {
+                "id": "edited-2",
+                "content": "blocked",
+                "partial": false
+              }
+            }
           ]
         },
         "checks": {

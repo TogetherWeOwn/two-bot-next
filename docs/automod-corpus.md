@@ -81,6 +81,15 @@ The runner prints executed and deferred totals with `--nocapture`. Deferred
 records preserve setup, expected result and the issue that owns the missing
 runtime verification. They are not waivers for automod activation.
 
+Deferred setup retains branch prerequisites, not just the final assertions:
+the bad-guild activation case keeps the bot approved; gateway release failure
+follows a successful claim and definite `discord_rejected`/403 deletion refusal
+in enforcing mode against an ordinary target. The hierarchy refusal uses equal
+role positions, the ordinary-target control keeps a configured protected role,
+the resolver refusal retains its typed error and timeout-at-one ladder, and the
+partial-edit case has no cached old message. These are source-fidelity records,
+not executed service/gateway checks.
+
 | Case family | Preserved expectation / limitation | Tracking |
 | --- | --- | --- |
 | Raw leading-dot extension policy | Legacy matcher accepts raw `['.exe']`; next matcher expects normalized `['exe']`. `AutomodConfig::from_map` normalizes this correctly, but raw public policy does not. The legacy direct-policy assertion is deferred, not substituted with the config-normalized check. | [TOG-10089](/TOG/issues/TOG-10089) |
