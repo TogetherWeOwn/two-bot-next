@@ -48,7 +48,8 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV) {
     start(options: StartConfig) {
       assert.equal(this.running, false, "must not start an already-running container");
       starts.push(structuredClone(options));
-      // Model Rust's LISTEN_ADDR (or the image default), not the SDK target.
+      // Model LISTEN_ADDR wiring (or the image default), not the SDK target.
+      // Rust's invalid-gateway-config fallback is tested by bot/tests/startup.rs.
       listenerPort = Number(options.env?.LISTEN_ADDR?.split(":").at(-1) ?? 8080);
       this.running = true;
     },
