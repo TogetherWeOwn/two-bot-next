@@ -738,6 +738,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2193,9 +2194,18 @@ dependencies = [
 name = "two-bot-core"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64",
+ "bytes",
+ "flate2",
+ "futures-util",
  "hex",
  "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "rand",
  "regex",
  "serde",
@@ -2246,6 +2256,10 @@ dependencies = [
  "twilight-model",
  "two-bot-core",
 ]
+
+[[package]]
+name = "two-bot-next"
+version = "0.1.0"
 
 [[package]]
 name = "typenum"
