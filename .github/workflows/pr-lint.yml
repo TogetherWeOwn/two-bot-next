@@ -27,9 +27,7 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
-  pull-requests: read
+permissions: {}
 
 concurrency:
   group: pr-lint-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
@@ -41,6 +39,9 @@ env:
 jobs:
   pr-lint:
     name: pr-lint
+    permissions:
+      contents: read # Resolve stored overflow notes through the Contents API.
+      pull-requests: read # Fetch and validate the dispatched release PR metadata.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

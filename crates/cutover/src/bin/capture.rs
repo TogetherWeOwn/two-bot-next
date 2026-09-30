@@ -9,6 +9,9 @@
 //!
 //! `capture --dry-run` reports and writes nothing.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use std::collections::BTreeMap;
 use twilight_model::id::Id;
 use two_bot_cutover::cli::{now_iso, open_db, Args};

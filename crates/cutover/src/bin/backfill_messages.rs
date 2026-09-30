@@ -7,6 +7,9 @@
 //!
 //! `backfill-messages --dry-run` reports and writes nothing.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use std::collections::HashMap;
 use twilight_model::channel::ChannelType;
 use twilight_model::id::Id;

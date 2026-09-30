@@ -12,8 +12,7 @@ on:
   # / `worker check` would never run on the release PR without this path.
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: check-${{ github.event.pull_request.number || github.sha }}
@@ -22,6 +21,8 @@ concurrency:
 jobs:
   check:
     name: check
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -47,7 +48,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 1
+
+      - name: Source-level CI gate regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
+      - name: Reject hard-coded source snowflakes
+        run: python3 scripts/ci/check-src-snowflakes.py
+
+      - name: Verify CODEOWNERS syntax and coverage
+        run: python3 scripts/ci/verify-codeowners.py
+
+      - name: Install pinned zizmor
+        run: |
+          python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/zizmor" 'zizmor==1.30.1'
+
+      - name: Audit GitHub Actions workflows
+        # Offline static audits need no GitHub credentials or security-events writes.
+        run: '"$RUNNER_TEMP/zizmor/bin/zizmor" --offline --strict-collection --no-progress .github/workflows'
 
       - name: offline build-cache safety regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
@@ -148,11 +167,13 @@ jobs:
 
   community-db:
     name: community db
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:17
+        image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: postgres
@@ -166,6 +187,8 @@ jobs:
       TWO_TEST_DATABASE_URL: postgres://agent_test@localhost:5432/postgres
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
@@ -180,6 +203,8 @@ jobs:
 
   worker:
     name: worker check
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -188,6 +213,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -206,7 +232,9 @@ jobs:
       - name: Verify release reconciliation retries
         run: python3 ../scripts/test-release-retry.py
       - name: Verify offline release lifecycle
-        run: |
+        # Match the library bundled by the pinned release action, in an isolated
+        # API-double fixture with lifecycle scripts disabled and no write token.
+        run: | # zizmor: ignore[adhoc-packages] pinned offline release fixture only
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs

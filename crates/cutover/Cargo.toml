@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 # Cutover data path (TOG-9882): one-shot MEE6 XP / reward / history
 # import-backfill operator tools. Library modules port the pure legacy logic
 # (parse, plan, reconcile); `src/db.rs` + `src/rest.rs` hold the sqlx and

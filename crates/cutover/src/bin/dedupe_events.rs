@@ -8,6 +8,9 @@
 //! `dedupe-events --dry-run` counts, changes nothing; without it, deletes
 //! the copies in 200-id chunks.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use std::collections::HashSet;
 use two_bot_cutover::cli::{open_db, Args};
 use two_bot_cutover::{collapse_cross_source_duplicates, DedupableEvent, DEFAULT_TOLERANCE_MS};

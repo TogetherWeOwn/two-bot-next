@@ -4,6 +4,9 @@
 //! Exit codes: 0 fine, 1 the export or the write did not reconcile,
 //! 2 usage / refused guild.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use two_bot_cutover::cli::{now_iso, open_db, require_guild, require_guild_read, Args};
 use two_bot_cutover::{run_mee6_import, ImportError};
 

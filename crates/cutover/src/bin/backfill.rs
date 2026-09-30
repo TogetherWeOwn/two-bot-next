@@ -8,6 +8,9 @@
 //! `backfill --dry-run` reports and writes nothing. Env: `DISCORD_TOKEN` (or
 //! `DISCORD_BOT_TOKEN`), `DISCORD_GUILD_ID`, `TWO_DATABASE_URL`.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use std::collections::HashSet;
 use twilight_model::channel::ChannelType;
 use twilight_model::id::Id;

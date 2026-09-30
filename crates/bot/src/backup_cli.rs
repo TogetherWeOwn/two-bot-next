@@ -14,6 +14,9 @@
 //! last line is the only success for restores), 1 failure, 2 usage/guard
 //! refusal, 3 tampered guild-config snapshot.
 
+// Operator commands intentionally emit human-readable/JSON output to stdout.
+#![allow(clippy::print_stdout)]
+
 use std::env;
 use std::path::{Path, PathBuf};
 
