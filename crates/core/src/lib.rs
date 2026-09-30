@@ -7,6 +7,9 @@
 
 pub mod automod;
 pub mod commands;
+pub mod community;
+#[cfg(feature = "db")]
+pub mod community_store;
 pub mod config;
 pub mod events;
 pub mod expected_joins;
@@ -14,9 +17,15 @@ pub mod feature_commands;
 pub mod funnel;
 pub mod handlers;
 pub mod health;
+pub mod inactivity;
+#[cfg(feature = "db")]
+pub mod inactivity_store;
 pub mod invites;
 pub mod leveling;
 pub mod moderation;
+pub mod presence;
+#[cfg(feature = "db")]
+pub mod presence_store;
 pub mod voice;
 
 pub use automod::{
@@ -26,6 +35,12 @@ pub use automod::{
     DEFAULT_SANCTIONS,
 };
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
+pub use community::{
+    build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
+    week_start_ms, Classification, ClassifierConfig, ClassifyInput, FactRow, ScorecardGates,
+    ScorecardInputs, ScorecardOutcome, StreamCoverage, COMMUNITY_CLASSIFICATIONS,
+    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS,
+};
 pub use config::Config;
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
@@ -44,6 +59,11 @@ pub use handlers::{
     VoiceInput, VoiceStartedFact,
 };
 pub use health::{ComponentStatus, HealthReport};
+pub use inactivity::{
+    flag_inactive, inactivity_cutoff_ms, member_inactive_event_key, parse_inactivity_days,
+    select_inactive, should_flag, FlaggedMember, InactivityCandidate, InactivityOutcome,
+    INACTIVITY_EVENT_SOURCE, INACTIVITY_EVENT_TYPE, INACTIVITY_SWEEP_INTERVAL_MS,
+};
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
     summarize_attribution_split, AttributionCategory, AttributionSplit, DowntimeWindow,
@@ -55,6 +75,12 @@ pub use moderation::{
     require_moderation_reason, ModerationAction, ModerationActor, ModerationGateError,
     ModerationGates, ModerationPolicy, ModerationRequest, ModerationTarget, PolicyError,
     ReasonError, TargetProtection,
+};
+pub use presence::{
+    bot_floor_due, daily_peaks, decide_probe_cycle, evaluate_trigger, latest_bot_floor,
+    sanitize_presence_count, DailyPeak, PresenceReading, ProbeDecision, TriggerOptions,
+    TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS, PRESENCE_PROBE_INTERVAL_MS,
+    REOPEN_PEAK_THRESHOLD,
 };
 pub use voice::{
     average_known_voice_duration, count_unknown_starts_per_window, find_blind_windows,
