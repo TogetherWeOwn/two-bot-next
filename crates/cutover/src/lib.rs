@@ -25,6 +25,7 @@ pub mod mee6_xp;
 pub mod message_scan;
 pub mod parse;
 pub mod rest;
+pub mod tickets;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
 pub use db::{

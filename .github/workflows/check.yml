@@ -60,6 +60,41 @@ jobs:
         with:
           command: check all
 
+  tickets-postgres:
+    name: tickets postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TICKET_TEST_DB_HOST: 127.0.0.1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        with:
+          toolchain: stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-tickets-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Ticket lifecycle and migration integration tests
+        run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
+
   worker:
     name: worker check
     runs-on: ubuntu-latest

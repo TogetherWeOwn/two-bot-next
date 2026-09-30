@@ -16,6 +16,7 @@ pub mod health;
 pub mod invites;
 pub mod leveling;
 pub mod moderation;
+pub mod tickets;
 pub mod voice;
 
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
