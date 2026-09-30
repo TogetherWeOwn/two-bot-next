@@ -7,6 +7,9 @@
 
 pub mod action_outcomes;
 pub mod audit;
+pub mod audit_mirror;
+#[cfg(feature = "db")]
+pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
 pub mod automod;
@@ -15,6 +18,7 @@ pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;
+pub mod command_permissions;
 pub mod commands;
 pub mod community;
 pub mod community_snapshots;
