@@ -213,7 +213,7 @@ Full catalogue: legacy `src/core/settingsCatalog.ts` (~90 keys in `env_only`/`co
 
 | Behaviour | Detail | Map |
 |---|---|---|
-| Structured JSON logs (`{ts,level,msg,…}`, `debug/info/error`, `LOG_LEVEL`) | ~208 line names: lifecycle, funnel, onboarding, audit mirror, alerts, automod/moderation, rota, REST/backoff | **S2+** (tracing equivalents; exact names not frozen) |
+| Structured JSON logs (`{ts,level,msg,…}`, `debug/info/error`, `LOG_LEVEL`) | ~208 line names: lifecycle, funnel, onboarding, audit mirror, alerts, automod/moderation, rota, REST/backoff | **S2+** ([stable lifecycle log contract](logging.md); remaining feature names port with their slices) |
 | Audit channels (audit/voice/moderation, metadata-only `key=value`, 300/2000 truncation, audit-event identity prefix) |arches fallback voice/moderation → audit | **S5** |
 | Audit kill switch (`audit-switch --halt/--resume/--status`) | presence = halt | **S5** |
 | Rate limits: staging-verifier 3 retries ≤30s; REST pacing §6; internal buckets §6; raid-watch 5 joins/60s + 900s cooldown; ticket cooldown 300s; containment per-executor cooldown | alert cooldowns + sweep/lease bounds (audit 5-min lease, 1-h recheck, claim ≤25) | with feature (**S3/S4/S5**), internal buckets [TOG-9880](/TOG/issues/TOG-9880) |

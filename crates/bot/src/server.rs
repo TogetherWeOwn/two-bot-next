@@ -25,7 +25,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(crate::logging::http_span))
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -51,7 +51,7 @@ async fn readyz(
 /// Bind before starting the gateway so liveness never waits for Discord.
 pub async fn bind(addr: &str) -> std::io::Result<TcpListener> {
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!(addr, "listening");
+    tracing::info!(msg = "http_listening", addr, "listening");
     Ok(listener)
 }
 
@@ -59,7 +59,9 @@ pub async fn bind(addr: &str) -> std::io::Result<TcpListener> {
 pub async fn serve(listener: TcpListener, state: SharedState) -> std::io::Result<()> {
     axum::serve(listener, router(state).into_make_service())
         .with_graceful_shutdown(shutdown_signal())
-        .await
+        .await?;
+    tracing::info!(msg = "shutdown_completed");
+    Ok(())
 }
 
 async fn shutdown_signal() {
@@ -69,8 +71,8 @@ async fn shutdown_signal() {
     let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
 
     tokio::select! {
-        _ = term.recv() => tracing::info!("SIGTERM received; draining"),
-        _ = int.recv() => tracing::info!("SIGINT received; draining"),
+        _ = term.recv() => tracing::info!(msg = "shutdown_started", signal = "SIGTERM", "SIGTERM received; draining"),
+        _ = int.recv() => tracing::info!(msg = "shutdown_started", signal = "SIGINT", "SIGINT received; draining"),
     }
 }
 

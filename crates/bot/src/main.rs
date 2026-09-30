@@ -11,6 +11,7 @@ mod gateway;
 mod gateway_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+mod logging;
 mod preflight;
 mod server;
 mod sticky_runtime;
@@ -20,7 +21,7 @@ mod sticky_runtime_tests;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, Instrument};
 use two_bot_core::{ComponentStatus, Config};
 
 use gateway::{
@@ -55,15 +56,13 @@ async fn main() {
         print_backup_help_and_exit().await;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "two_bot=info".into()),
-        )
-        .init();
+    logging::init();
+    run().instrument(logging::run_span()).await;
+}
 
+async fn run() {
     let config = Config::from_env().unwrap_or_else(|err| {
-        tracing::warn!(error = %err, "config invalid; continuing with safe defaults");
+        tracing::warn!(msg = "config_invalid", error = %err, "config invalid; continuing with safe defaults");
         Config {
             discord_token: None,
             database_url: None,
@@ -102,7 +101,7 @@ async fn main() {
             let token = token.to_owned();
             let url = url.to_owned();
             let state = Arc::clone(&state);
-            Some(tokio::spawn(async move {
+            let task = async move {
                 let result: Result<(), sqlx::Error> = async {
                     let db =
                         two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
@@ -129,6 +128,7 @@ async fn main() {
                         gateway_url.as_deref(),
                     );
                     info!(
+                        msg = "gateway_connecting",
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
@@ -138,16 +138,21 @@ async fn main() {
                 if result.is_err() {
                     // Do not print sqlx errors: configuration errors may contain a URL.
                     tracing::error!(
+                        msg = "gateway_failed",
                         "durable gateway failed; checkpoint unchanged, readiness unavailable"
                     );
                     *state.write().await = GatewayState::Armed;
                 }
                 result
-            }))
+            };
+            Some(tokio::spawn(
+                task.instrument(logging::gateway_span(guild_id)),
+            ))
         }
         Err(missing) => {
             *state.write().await = GatewayState::Unconfigured;
             info!(
+                msg = "gateway_parked",
                 missing,
                 status = ?ComponentStatus::Down,
                 "gateway prerequisites missing; gateway parked, /readyz reports down"
@@ -162,7 +167,7 @@ async fn main() {
         None => http.await,
     };
     if let Err(err) = result {
-        tracing::error!(error = %err, "container service failed");
+        tracing::error!(msg = "shutdown_failed", error = %err, "container service failed");
         std::process::exit(1);
     }
 }

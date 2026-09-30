@@ -189,7 +189,7 @@ async fn run_loop(
 ) -> Result<(), sqlx::Error> {
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
-    info!(shard = ?ShardId::ONE, "gateway shard loop started");
+    info!(msg = "gateway_started", shard = ?ShardId::ONE, "gateway shard loop started");
     while let Some(item) = shard.next().await {
         let message = match item {
             Ok(message) => message,
@@ -200,7 +200,10 @@ async fn run_loop(
                 ) =>
             {
                 *state.write().await = GatewayState::Armed;
-                warn!("gateway reconnect failed; Twilight will retry");
+                warn!(
+                    msg = "gateway_reconnect_failed",
+                    "gateway reconnect failed; Twilight will retry"
+                );
                 continue;
             }
             Err(_) => {
@@ -210,6 +213,7 @@ async fn run_loop(
             }
         };
         let Message::Text(text) = message else {
+            crate::logging::shard_closed(&message);
             *state.write().await = GatewayState::Armed;
             // Twilight 0.17.1 retains its session on gateway-initiated closes.
             // Discord requires a new session for these two reconnectable codes.
@@ -291,10 +295,14 @@ async fn run_loop(
                 "gateway dispatch parse failed; checkpoint unchanged".into(),
             )
         })?;
-        let mut connected = false;
+        let mut connected = None;
         if let Some(parsed) = parsed {
             let event = Event::from(parsed);
-            connected = matches!(event, Event::Ready(_) | Event::Resumed);
+            connected = match event {
+                Event::Ready(_) => Some("ready"),
+                Event::Resumed => Some("gateway_resumed"),
+                _ => None,
+            };
             pipeline.handle(&event);
             // Detached dispatch only: awaiting sticky work inline would stall
             // heartbeat polling (see `run_shard` docs).
@@ -309,12 +317,15 @@ async fn run_loop(
         )
         .await?;
         committed = Some(checkpoint);
-        if connected {
+        if let Some(msg) = connected {
             *state.write().await = GatewayState::Connected;
-            info!(sequence, "gateway ready; checkpoint committed");
+            info!(msg, sequence, shard = ?shard.id());
         }
     }
-    warn!("gateway shard stream ended; supervisor reports down until restart");
+    warn!(
+        msg = "gateway_stream_ended",
+        "gateway shard stream ended; supervisor reports down until restart"
+    );
     Ok(())
 }
 
