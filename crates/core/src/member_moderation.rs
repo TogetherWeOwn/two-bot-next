@@ -7,8 +7,8 @@
 //! the interaction router (TOG-10075) feeds executions in and the REST
 //! executor (TOG-10076) carries the [`DiscordCall`]s out, so this module never
 //! touches twilight or HTTP. Storage lives behind [`MemberModerationStore`]
-//! (the sqlx implementation ports with this card in `two-bot-cutover`;
-//! tests use [`MemMemberStore`]).
+//! (the sqlx implementation is `member_moderation_store` behind
+//! the `db` feature; tests use [`MemMemberStore`]).
 //!
 //! Source files (legacy `two-bot`, frozen `main`):
 //! - service: `src/moderation/service.ts` (`ModerationService.execute`,
@@ -28,7 +28,7 @@
 //!   moderator asked to be temporary.
 //! - sweep claims are atomic: two overlapping sweeps cannot process one job.
 //!
-//! Staging gate: serving these handlers requires [`ModerationGates`] enabled
+//! Staging gate: serving requires [`crate::moderation::ModerationGates`] enabled
 //! (`TWO_MODERATION=1`); this module carries no gate check itself — the
 //! router slice decides which slices to serve, same posture as slice 3.
 //!
@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use sha2::{Digest, Sha256};
 
@@ -101,7 +101,7 @@ impl MemberOutcome {
 
     /// Parse a stored outcome string back (idempotency replay path).
     #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_stored(s: &str) -> Option<Self> {
         match s {
             "banned" => Some(Self::Banned),
             "temporarily_banned" => Some(Self::TemporarilyBanned),
@@ -664,9 +664,13 @@ where
                 Ok(false) => {}
                 Err(err) => {
                     if matches!(&err, MemberError::Discord(d) if d.is_safe_pre_mutation()) {
-                        self.store
+                        if let Err(store_error) = self
+                            .store
                             .requeue_unban(&job.request_id, &job.claim_token)
-                            .await?;
+                            .await
+                        {
+                            first_error.get_or_insert(MemberError::Store(store_error));
+                        }
                     }
                     first_error.get_or_insert(err);
                 }
@@ -711,7 +715,7 @@ where
             .await?
         {
             ClaimState::Replayed { outcome } => {
-                let outcome = MemberOutcome::from_str(&outcome).ok_or(MemberError::Store(
+                let outcome = MemberOutcome::from_stored(&outcome).ok_or(MemberError::Store(
                     StoreError::new(format!("stored unknown outcome: {outcome}")),
                 ))?;
                 return Ok(MemberResult {
@@ -808,10 +812,9 @@ where
                     .await
                 {
                     if err.is_safe_pre_mutation() {
-                        let _ = self
-                            .store
+                        self.store
                             .cancel_staged_unban(&exec.request_id, &format_iso_millis((self.now)()))
-                            .await;
+                            .await?;
                     }
                     return Err(MemberError::Discord(err));
                 }
@@ -994,14 +997,49 @@ struct MemInner {
     audits: Vec<AuditRow>,
     warnings: Vec<(String, String, String, String, String, String)>,
     unbans: HashMap<String, UnbanRow>,
+    claim_sequence: u64,
 }
 
-/// In-memory [`MemberModerationStore`] for unit tests (same role as
-/// `MemStore` in `handlers.rs`). Single-mutex: every method is atomic, so
-/// `serialize_member` just runs its closure.
-#[derive(Debug, Default)]
+/// Local FIFO queues, shared by store clones. Like the legacy service, one
+/// moderation service owns a guild; these are not cross-process locks.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct MemberQueues {
+    locks: Arc<Mutex<MemberLocks>>,
+}
+
+type MemberLocks = HashMap<(String, String), Weak<tokio::sync::Mutex<()>>>;
+
+impl MemberQueues {
+    pub(crate) async fn run<T, F, Fut>(&self, guild: &str, user: &str, run: F) -> T
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = T> + Send,
+    {
+        let lock = {
+            let mut locks = self.locks.lock().expect("member queues lock");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let entry = locks
+                .entry((guild.to_owned(), user.to_owned()))
+                .or_default();
+            if let Some(lock) = entry.upgrade() {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                *entry = Arc::downgrade(&lock);
+                lock
+            }
+        };
+        let _guard = lock.lock().await;
+        run().await
+    }
+}
+
+/// In-memory persistence double. Method-level atomicity and member queues
+/// model both durable claims and serialization across Discord awaits.
+#[derive(Debug, Default, Clone)]
 pub struct MemMemberStore {
-    inner: Mutex<MemInner>,
+    inner: Arc<Mutex<MemInner>>,
+    queues: MemberQueues,
 }
 
 impl MemMemberStore {
@@ -1041,12 +1079,12 @@ impl MemMemberStore {
 }
 
 impl MemberModerationStore for MemMemberStore {
-    async fn serialize_member<T, F, Fut>(&self, _guild_id: &str, _user_id: &str, run: F) -> T
+    async fn serialize_member<T, F, Fut>(&self, guild_id: &str, user_id: &str, run: F) -> T
     where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = T> + Send,
     {
-        run().await
+        self.queues.run(guild_id, user_id, run).await
     }
 
     async fn claim(
@@ -1091,13 +1129,13 @@ impl MemberModerationStore for MemMemberStore {
         _completed_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
-        if let Some(row) = inner
+        let row = inner
             .idempotency
             .get_mut(&(guild_id.to_owned(), idempotency_key.to_owned()))
-        {
-            row.state = IdemState::Done;
-            row.outcome = Some(outcome.to_owned());
-        }
+            .filter(|row| row.state == IdemState::InFlight)
+            .ok_or_else(|| StoreError::new("lost moderation claim"))?;
+        row.state = IdemState::Done;
+        row.outcome = Some(outcome.to_owned());
         Ok(())
     }
 
@@ -1156,6 +1194,11 @@ impl MemberModerationStore for MemMemberStore {
         created_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
+        if inner.unbans.get(request_id).is_some_and(|row| {
+            row.state != UnbanState::Cancelled || row.guild_id != guild_id || row.user_id != user_id
+        }) {
+            return Err(StoreError::new("unban request id is already in use"));
+        }
         inner.unbans.insert(
             request_id.to_owned(),
             UnbanRow {
@@ -1180,10 +1223,18 @@ impl MemberModerationStore for MemMemberStore {
         completed_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
+        if !inner.unbans.get(request_id).is_some_and(|row| {
+            row.state == UnbanState::Staged && row.guild_id == guild_id && row.user_id == user_id
+        }) {
+            return Err(StoreError::new("lost staged unban"));
+        }
         for (id, row) in inner.unbans.iter_mut() {
             if row.guild_id == guild_id
                 && row.user_id == user_id
-                && matches!(row.state, UnbanState::Pending | UnbanState::Running)
+                && matches!(
+                    row.state,
+                    UnbanState::Staged | UnbanState::Pending | UnbanState::Running
+                )
                 && id != request_id
             {
                 row.state = UnbanState::Superseded;
@@ -1216,32 +1267,39 @@ impl MemberModerationStore for MemMemberStore {
     }
 
     async fn claim_due_unbans(&self, now: &str, limit: i64) -> Result<Vec<UnbanJob>, StoreError> {
-        let mut inner = self.lock();
-        // Activate crash-staged rows first (durable schedule predates the
-        // mutation, so activation is safe).
-        let staged: Vec<(String, String, String)> = inner
+        // Recheck after acquiring the same queue as tempban: a staged row
+        // may belong to a live ban call, not a crashed process.
+        let mut staged: Vec<_> = self
+            .lock()
             .unbans
             .iter()
             .filter(|(_, r)| r.state == UnbanState::Staged)
-            .map(|(id, r)| (id.clone(), r.guild_id.clone(), r.user_id.clone()))
+            .map(|(id, r)| {
+                (
+                    r.created_at.clone(),
+                    id.clone(),
+                    r.guild_id.clone(),
+                    r.user_id.clone(),
+                )
+            })
             .collect();
-        for (id, guild_id, user_id) in staged {
-            for (other_id, row) in inner.unbans.iter_mut() {
-                if row.guild_id == guild_id
-                    && row.user_id == user_id
-                    && matches!(row.state, UnbanState::Pending | UnbanState::Running)
-                    && *other_id != id
+        staged.sort_by(|a, b| b.cmp(a));
+        for (_, id, guild_id, user_id) in staged {
+            self.serialize_member(&guild_id, &user_id, || async {
+                if self
+                    .lock()
+                    .unbans
+                    .get(&id)
+                    .is_some_and(|r| r.state == UnbanState::Staged)
                 {
-                    row.state = UnbanState::Superseded;
-                    row.claim_token = None;
+                    self.activate_staged_unban(&guild_id, &user_id, &id, now)
+                        .await?;
                 }
-            }
-            if let Some(row) = inner.unbans.get_mut(&id) {
-                if row.state == UnbanState::Staged {
-                    row.state = UnbanState::Pending;
-                }
-            }
+                Ok::<(), StoreError>(())
+            })
+            .await?;
         }
+        let mut inner = self.lock();
         let mut due: Vec<(String, UnbanRow)> = inner
             .unbans
             .iter()
@@ -1255,7 +1313,8 @@ impl MemberModerationStore for MemMemberStore {
         });
         let mut jobs = Vec::new();
         for (id, row) in due.into_iter().take(limit.max(0) as usize) {
-            let token = format!("mem-{}", jobs.len());
+            inner.claim_sequence += 1;
+            let token = format!("mem-{}", inner.claim_sequence);
             if let Some(stored) = inner.unbans.get_mut(&id) {
                 if stored.state != UnbanState::Pending {
                     continue;
@@ -1316,9 +1375,9 @@ impl MemberModerationStore for MemMemberStore {
 
 /// Scripted [`MemberDiscord`] double: records every call, optionally fails
 /// one method once (or always) with a fixed error.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MockMemberDiscord {
-    inner: Mutex<MockInner>,
+    inner: Arc<Mutex<MockInner>>,
 }
 
 #[derive(Debug, Default)]
@@ -1800,9 +1859,9 @@ mod tests {
             MemberOutcome::Warned,
             MemberOutcome::Unbanned,
         ] {
-            assert_eq!(MemberOutcome::from_str(outcome.as_str()), Some(outcome));
+            assert_eq!(MemberOutcome::from_stored(outcome.as_str()), Some(outcome));
         }
-        assert_eq!(MemberOutcome::from_str("purged"), None);
+        assert_eq!(MemberOutcome::from_stored("purged"), None);
     }
 
     #[tokio::test]

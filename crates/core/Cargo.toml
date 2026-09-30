@@ -17,10 +17,11 @@ tracing = { workspace = true }
 # Database access lives behind the `db` feature so unit tests for pure
 # domain logic never need a Postgres driver or a live database.
 sqlx = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 [features]
 default = []
-db = ["dep:sqlx"]
+db = ["dep:sqlx", "dep:rand"]
 
 [dev-dependencies]
 tokio = { workspace = true }

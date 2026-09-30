@@ -16,6 +16,8 @@ pub mod health;
 pub mod invites;
 pub mod leveling;
 pub mod member_moderation;
+#[cfg(feature = "db")]
+pub mod member_moderation_store;
 pub mod moderation;
 pub mod voice;
 
