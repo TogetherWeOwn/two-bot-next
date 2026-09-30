@@ -15,7 +15,6 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 time = { workspace = true }
 thiserror = { workspace = true }
-time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = { workspace = true }
