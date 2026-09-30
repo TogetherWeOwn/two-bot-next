@@ -1046,15 +1046,32 @@ where
                     }
                     return Err(MemberError::Discord(err));
                 }
-                self.store
+                // The DELETE landed: persist the observed-success audit
+                // independently of the completion write. If completion fails
+                // afterward the claim stays `running` (uncertain, correct),
+                // but the audit of the successful unban already exists.
+                if let Err(err) = self
+                    .store
                     .complete_unban(&job.request_id, &job.claim_token)
-                    .await?;
+                    .await
+                {
+                    self.audit_unban_job(job).await;
+                    return Err(MemberError::Store(err));
+                }
                 Ok(true)
             })
             .await?;
         if !acted {
             return Ok(false);
         }
+        self.audit_unban_job(job).await;
+        Ok(true)
+    }
+
+    /// Best-effort audit of a dispatched scheduled unban. Idempotent on the
+    /// derived request id, so a later retry never duplicates it; loss is
+    /// logged, never fatal, and never releases or repeats the DELETE.
+    async fn audit_unban_job(&self, job: &UnbanJob) {
         let bot_id = self
             .policy
             .bot_user_id
@@ -1081,7 +1098,6 @@ where
                 "moderation_unban_audit_failed"
             );
         }
-        Ok(true)
     }
 }
 
@@ -1445,10 +1461,10 @@ impl MemberModerationStore for MemMemberStore {
             .collect();
         for id in old_ids {
             if let Some(row) = inner.unbans.get_mut(&id) {
-                if matches!(
-                    row.state,
-                    UnbanState::Staged | UnbanState::Pending | UnbanState::Running
-                ) {
+                // Never-dispatched schedules supersede here; a `running` row
+                // holds a dispatched DELETE that may still land, so only
+                // authoritative `resolve_uncertain_unban` may close it.
+                if matches!(row.state, UnbanState::Staged | UnbanState::Pending) {
                     row.state = UnbanState::Superseded;
                     row.completed_at = Some(completed_at.to_owned());
                     row.claim_token = None;

@@ -388,6 +388,11 @@ impl MemberModerationStore for PgMemberModerationStore {
         // Strict generation comparison prevents a late older confirmation
         // from superseding any newer schedule. Failure rolls acceptance back
         // to prepared, retaining its conservative fence against older jobs.
+        // Only never-dispatched schedules (`staged`/`pending`) supersede
+        // here: a `running` row holds a dispatched DELETE whose remote effect
+        // may still land, so only authoritative `resolve_uncertain_unban`
+        // evidence may close it — clearing its token here would let the late
+        // DELETE remove this newly confirmed ban.
         sqlx::query(
             "UPDATE moderation_scheduled_unbans AS job SET state = 'superseded',
                completed_at = $1::text::timestamptz, claim_token = NULL
@@ -395,7 +400,7 @@ impl MemberModerationStore for PgMemberModerationStore {
              WHERE job.guild_id = $2 AND job.user_id = $3
                AND job.request_id = older.request_id
                AND older.guild_id = job.guild_id AND older.user_id = job.user_id
-               AND older.generation < $4 AND job.state IN ('staged', 'pending', 'running')",
+               AND older.generation < $4 AND job.state IN ('staged', 'pending')",
         )
         .bind(now)
         .bind(&self.guild_id)

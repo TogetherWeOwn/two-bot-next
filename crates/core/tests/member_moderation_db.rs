@@ -66,6 +66,7 @@ async fn database() -> (PgPool, PgPool, String) {
         for migration in [
             include_str!("../../cutover/migrations/0110_moderation_member.sql"),
             include_str!("../../cutover/migrations/0111_moderation_ban_ownership.sql"),
+            include_str!("../../cutover/migrations/0112_moderation_legacy_timestamps.sql"),
         ] {
             sqlx::raw_sql(migration)
                 .execute(&pool)
