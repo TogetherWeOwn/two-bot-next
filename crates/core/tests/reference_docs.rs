@@ -163,7 +163,7 @@ fn render_commands() -> String {
         }
         output.push('\n');
     }
-    output
+    output.trim_end_matches('\n').to_owned() + "\n"
 }
 
 fn setting_defaults() -> BTreeMap<&'static str, Value> {
