@@ -545,18 +545,9 @@ mod tests {
             .max_connections(3)
             .connect_with(options.options([("search_path", schema.as_str())]))
             .await?;
-        // `community_facts` lands in 0160 (TOG-10083, unmerged); at runtime
-        // 0160 < 0311 applies first, so the table exists. This test cannot
-        // see 0160 yet, so it scaffolds the exact legacy 0018 DDL inline —
-        // test scaffolding only, deleted when 0160 merges.
-        sqlx::raw_sql(include_str!("community_facts_test_scaffold.sql"))
-            .execute(&pool)
-            .await?;
-        sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0311_community_scorecard.sql"
-        ))
-        .execute(&pool)
-        .await?;
+        // Use the runtime migration chain, including 0160's community_facts,
+        // rather than a test-only table that could hide migration conflicts.
+        sqlx::migrate!("../cutover/migrations").run(&pool).await?;
         Ok((pool, schema))
     }
 

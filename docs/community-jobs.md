@@ -49,11 +49,19 @@ executor merge.
 
 ## Verification
 
-- `cargo test -p two-bot-core --features db` with `TWO_TEST_DATABASE_URL`
-  pointing at agent-testdb: 114 tests, including a Monday run replayed against
-  a golden scorecard produced by the real legacy build (frozen two-bot @
-  `d5d11793`), the week-boundary exactly-once tick, and the inactivity
-  never-messages invariant (exactly one `member_inactive` event row across two
-  sweeps).
+- Run `cargo test -p two-bot-core --features db --locked --lib <filter>`
+  separately for `community::tests`, `presence::tests`, `inactivity::tests`,
+  `funnel::tests`, `community_store`, `presence_store`, and `inactivity_store`,
+  with `TWO_TEST_DATABASE_URL` pointing at agent-testdb. Cargo accepts one
+  positional test filter per invocation.
+- The store regressions include a Monday run replayed against a golden scorecard
+  produced by the real legacy build (frozen two-bot @ `d5d11793`) and the
+  inactivity never-messages invariant (exactly one `member_inactive` event row
+  across two sweeps). Domain tests cover the week-boundary exactly-once tick,
+  out-of-order message backfills, and missing versus explicit-null voice duration.
+- Scorecard store tests apply the actual `crates/cutover/migrations` chain in
+  isolated schemas, including 0160 and 0310–0311; no test-only fact table is used.
+  `sqlx::migrate!` resolves its path relative to the crate's `Cargo.toml`:
+  <https://docs.rs/sqlx/0.9.0/sqlx/macro.migrate.html>.
 - Legacy table/column names kept verbatim; `CREATE TABLE / INDEX IF NOT EXISTS`
   throughout so S6 re-runs never fail on DDL.

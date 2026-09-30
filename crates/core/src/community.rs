@@ -444,11 +444,12 @@ fn meta_str(meta: &serde_json::Map<String, serde_json::Value>, key: &str) -> Opt
     }
 }
 
-/// Legacy `Number(metadata.durationSeconds)` coercion: `null`/missing is 0
-/// (valid), strings parse as floats, anything else is invalid.
+/// Legacy `Number(metadata.durationSeconds)` coercion: explicit `null` is 0,
+/// while a missing property is undefined/NaN and cannot count as voice activity.
 fn voice_duration_seconds(meta: &serde_json::Map<String, serde_json::Value>) -> Option<f64> {
     match meta.get("durationSeconds") {
-        None | Some(serde_json::Value::Null) => Some(0.0),
+        None => None,
+        Some(serde_json::Value::Null) => Some(0.0),
         Some(serde_json::Value::Number(n)) => n.as_f64(),
         Some(serde_json::Value::String(s)) => s.parse::<f64>().ok(),
         Some(_) => None,
@@ -649,7 +650,11 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
         if f.row.event_type != "voice_session_ended" {
             return true;
         }
-        voice_duration_seconds(&f.meta).is_some_and(|d| d.is_finite() && d >= 0.0)
+        // Legacy coverage exempts missing/null durations even though missing
+        // durations are excluded by the voice-activity calculation.
+        !f.meta.contains_key("durationSeconds")
+            || f.meta.get("durationSeconds") == Some(&serde_json::Value::Null)
+            || voice_duration_seconds(&f.meta).is_some_and(|d| d.is_finite() && d >= 0.0)
     });
     if !voice_ok {
         ingestion_errors.push("invalid_voice_duration".to_owned());
@@ -722,9 +727,9 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
         }
         let start = meta_str(&f.meta, "startedAt").and_then(|s| parse_iso_millis(&s));
         let end = parse_iso_millis(&f.row.occurred_at);
-        // `Number(null) === 0`: an unknown duration passes the finiteness
-        // checks and the interval still merges — only NaN/non-finite/
-        // negative is dropped.
+        // `Number(null) === 0`: explicit null passes the finiteness checks
+        // and the interval still merges; missing/NaN/non-finite/negative
+        // durations are dropped.
         let duration = voice_duration_seconds(&f.meta);
         let (Some(start), Some(end), Some(duration)) = (start, end, duration) else {
             continue;
@@ -851,7 +856,7 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
             })
             .or_insert(f.row.occurred_at.as_str());
     }
-    let channel_messages: Vec<&ParsedFact> = facts
+    let mut channel_messages: Vec<&ParsedFact> = facts
         .iter()
         .filter(|f| {
             f.row.event_type == "message_created"
@@ -865,6 +870,7 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
                 )
         })
         .collect();
+    channel_messages.sort_by(|a, b| a.row.occurred_at.cmp(&b.row.occurred_at));
     let mut durations: Vec<f64> = Vec::new();
     let mut no_reply_within_24h = 0usize;
     let mut pending = 0usize;
@@ -1254,6 +1260,110 @@ mod tests {
             .ingestion_errors
             .iter()
             .any(|e| e.starts_with("missing_stream_coverage:")));
+    }
+
+    #[test]
+    fn first_reply_uses_occurrence_order_for_backfilled_messages() {
+        let own = r#"{"channelClass":"welcome"}"#;
+        let reply = r#"{"channelClass":"human"}"#;
+        for late_actor in ["helper", "newcomer"] {
+            let scorecard = build(vec![
+                fact(
+                    1,
+                    "member_joined",
+                    Some("newcomer"),
+                    "2026-09-01T00:00:00.000Z",
+                    "eligible_human",
+                    None,
+                ),
+                fact(
+                    2,
+                    "message_created",
+                    Some(late_actor),
+                    "2026-09-03T00:00:00.000Z",
+                    "eligible_human",
+                    Some(own),
+                ),
+                fact(
+                    3,
+                    "message_created",
+                    Some("newcomer"),
+                    "2026-09-01T00:30:00.000Z",
+                    "eligible_human",
+                    Some(own),
+                ),
+                fact(
+                    4,
+                    "message_created",
+                    Some("helper"),
+                    "2026-09-01T01:00:00.000Z",
+                    "eligible_human",
+                    Some(reply),
+                ),
+            ]);
+            let reply = scorecard.first_human_reply.expect("complete coverage");
+            assert_eq!(reply.median_seconds, Some(3600.0), "{late_actor}");
+            assert_eq!(reply.resolved_count, 1);
+            assert_eq!(reply.no_reply_within_24h_count, 0);
+            assert_eq!(reply.pending_count, 0);
+        }
+    }
+
+    #[test]
+    fn missing_voice_duration_is_coverage_exempt_but_not_activity() {
+        let missing = r#"{"startedAt":"2026-09-02T10:00:00.000Z"}"#;
+        let null = r#"{"startedAt":"2026-09-02T10:00:00.000Z","durationSeconds":null}"#;
+        for (metadata, expected_active) in [(missing, 0), (null, 5)] {
+            let facts = ["a", "b", "c", "d", "e"]
+                .iter()
+                .enumerate()
+                .map(|(i, actor)| {
+                    fact(
+                        i as i64 + 1,
+                        "voice_session_ended",
+                        Some(actor),
+                        "2026-09-02T10:10:00.000Z",
+                        "eligible_human",
+                        Some(metadata),
+                    )
+                })
+                .collect();
+            let scorecard = build(facts);
+            assert_eq!(scorecard.coverage_state, "complete");
+            assert!(scorecard.ingestion_errors.is_empty());
+            assert_eq!(scorecard.weekly_active_humans, Some(expected_active));
+            assert_eq!(
+                scorecard.evidence_state,
+                if expected_active == 0 {
+                    "insufficient"
+                } else {
+                    "sufficient"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_voice_duration_still_fails_coverage_closed() {
+        for duration in [r#""invalid""#, "-1"] {
+            let metadata = format!(
+                r#"{{"startedAt":"2026-09-02T10:00:00.000Z","durationSeconds":{duration}}}"#
+            );
+            let scorecard = build(vec![fact(
+                1,
+                "voice_session_ended",
+                Some("human"),
+                "2026-09-02T10:10:00.000Z",
+                "eligible_human",
+                Some(&metadata),
+            )]);
+            assert_eq!(scorecard.coverage_state, "incomplete");
+            assert_eq!(scorecard.weekly_active_humans, None);
+            assert!(scorecard
+                .ingestion_errors
+                .iter()
+                .any(|e| e == "invalid_voice_duration"));
+        }
     }
 
     #[test]

@@ -2188,13 +2188,17 @@ dependencies = [
 name = "two-bot-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "hex",
+ "hmac",
  "regex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
+ "subtle",
  "thiserror",
+ "time",
  "tokio",
  "tracing",
  "unicode-normalization",
@@ -2213,6 +2217,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "twilight-http",
  "twilight-model",
  "two-bot-core",
