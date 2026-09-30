@@ -38,7 +38,14 @@ ALTER TABLE operational_audit_log
     -- Preflight-only release parks the row out of queue discovery until this
     -- bound expires. Retry scheduling only, never a POST attempt count; a
     -- later preparation clears it.
-    ADD COLUMN IF NOT EXISTS delivery_deferred_until TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS delivery_deferred_until TIMESTAMPTZ,
+    -- Fairness cursor: last time the row yielded its queue position through a
+    -- preflight deferral or a failure release. Queue discovery serves
+    -- never-yielded rows first, then least-recently-yielded, so a bounded
+    -- batch rotates past repeatedly failing rows instead of starving healthy
+    -- ones after a backoff expires. Never a POST attempt count; attempts stay
+    -- on delivery_attempts and terminal evidence is untouched.
+    ADD COLUMN IF NOT EXISTS delivery_yielded_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_operational_audit_time
     ON operational_audit_log (guild_id, occurred_at);

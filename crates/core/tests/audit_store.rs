@@ -728,3 +728,123 @@ async fn preflight_deferral_rotates_the_bounded_queue_without_counting_attempts(
     );
     db.finish().await
 }
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
+async fn expired_deferrals_yield_queue_head_to_healthy_rows() -> TestResult {
+    let db = TestDb::new(true).await?;
+    let store = AuditStore::new(&db.pool);
+    for i in 0..26 {
+        store
+            .record(&event(&format!("fair-{i:02}")), Some("123"))
+            .await?;
+    }
+    for id in store.pending_ids().await? {
+        let claim = store.claim(&id).await?.unwrap();
+        assert!(store.defer_preflight(&claim).await?);
+    }
+    assert_eq!(store.pending_ids().await?, vec!["fair-25".to_owned()]);
+    // After the backoff expires the parked rows are retryable, but they must
+    // sort behind the never-yielded healthy row instead of reclaiming the
+    // head of the bounded batch.
+    sqlx::query("UPDATE operational_audit_log SET delivery_deferred_until = clock_timestamp() - interval '1 second' WHERE delivery_deferred_until IS NOT NULL")
+        .execute(&db.pool).await?;
+    let batch = store.pending_ids().await?;
+    assert_eq!(batch.len(), 25);
+    assert_eq!(batch[0], "fair-25");
+    assert!(batch[1..]
+        .iter()
+        .all(|id| id.starts_with("fair-") && id != "fair-25"));
+    for id in ["fair-00", "fair-01"] {
+        assert_eq!(store.get(id).await?.unwrap().attempts, 0);
+    }
+    let healthy = store.claim("fair-25").await?.unwrap();
+    assert_eq!(healthy.intent(), DeliveryIntent::Send);
+    assert_eq!(
+        store.prepare_send(&healthy, "0").await?,
+        PrepareSend::Prepared
+    );
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
+async fn reconciliation_failure_release_rotates_behind_healthy_send() -> TestResult {
+    let db = TestDb::new(true).await?;
+    let store = AuditStore::new(&db.pool);
+    for id in ["rot-00", "rot-01", "rot-02"] {
+        store.record(&event(id), Some("123")).await?;
+    }
+    // Two rows gain a durable ambiguity boundary; the third stays unattempted.
+    for id in ["rot-00", "rot-01"] {
+        let sending = store.claim(id).await?.unwrap();
+        assert_eq!(
+            store.prepare_send(&sending, "200").await?,
+            PrepareSend::Prepared
+        );
+    }
+    db.expire("rot-00").await?;
+    db.expire("rot-01").await?;
+    for id in ["rot-00", "rot-01"] {
+        let recovery = store.claim(id).await?.unwrap();
+        assert_eq!(recovery.intent(), DeliveryIntent::Reconcile);
+        assert!(
+            store
+                .fail_attempt(&recovery, DeliveryFailure::UncertainAcceptance)
+                .await?
+        );
+    }
+    // The uncertain releases keep their boundary and attempt count but yield
+    // queue position, so the healthy unattempted row leads the batch.
+    let batch = store.pending_ids().await?;
+    assert_eq!(batch[0], "rot-02");
+    for id in ["rot-00", "rot-01"] {
+        let row = store.get(id).await?.unwrap();
+        assert_eq!(row.search_before.as_deref(), Some("200"));
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.state, DeliveryState::Pending);
+    }
+    let healthy = store.claim("rot-02").await?.unwrap();
+    assert_eq!(healthy.intent(), DeliveryIntent::Send);
+    assert_eq!(
+        store.prepare_send(&healthy, "0").await?,
+        PrepareSend::Prepared
+    );
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
+async fn ineligible_claim_never_waits_on_row_or_halt_guard() -> TestResult {
+    let db = TestDb::new(true).await?;
+    let store = AuditStore::new(&db.pool);
+    store.record(&event("terminal-row"), Some("123")).await?;
+    let owner = store.claim("terminal-row").await?.unwrap();
+    assert_eq!(
+        store.prepare_send(&owner, "0").await?,
+        PrepareSend::Prepared
+    );
+    assert!(store.note_accepted(&owner, "234").await?);
+    assert!(store.complete(&owner).await?);
+    // A third party parks on the terminal row without changing it.
+    let locker_pool = db.peer().await?;
+    let mut locker = locker_pool.begin().await?;
+    sqlx::query("SELECT 1 FROM operational_audit_log WHERE entry_id = 'terminal-row' FOR UPDATE")
+        .fetch_all(&mut *locker)
+        .await?;
+    // The ineligible claim must return from the lock-free precheck without
+    // waiting on the row while holding the shared halt guard; without the
+    // precheck this blocks until the locker commits and delays halt writers.
+    let idle = tokio::time::timeout(Duration::from_secs(10), store.claim("terminal-row"))
+        .await
+        .expect("ineligible claim waited on the row lock")?;
+    assert!(idle.is_none());
+    // The halt writer proceeds while the row lock is still held.
+    assert!(store.engage_halt("456").await?);
+    assert!(store.delivery_halt().await?.is_some());
+    assert!(store.disengage_halt().await?);
+    assert!(store.claim("missing-row").await?.is_none());
+    locker.commit().await?;
+    locker_pool.close().await;
+    db.finish().await
+}

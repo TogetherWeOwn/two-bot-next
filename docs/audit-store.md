@@ -18,8 +18,10 @@ cutover runner discovers it automatically.
 The migration reuses `operational_audit_log` and `audit_kill_switch` from frozen
 legacy two-bot `b0a26a5e3882dd0784d208079f309893e2ede7e8`, including timestamp,
 string-snowflake, destination, nonce, search-boundary, message-ID and mirror-check
-columns. New columns are `delivery_generation`, `delivery_accepted_at` and
-`delivery_deferred_until` (preflight retry scheduling; never a POST attempt count).
+columns. New columns are `delivery_generation`, `delivery_accepted_at`,
+`delivery_deferred_until` (preflight retry scheduling; never a POST attempt
+count) and `delivery_yielded_at` (queue-fairness cursor stamped by deferral
+and failure releases; never a POST attempt count).
 Migration replay preserves populated legacy rows and the presence-based halt.
 Existing delivered rows stay delivered; no historical delivery is requeued.
 Legacy `rota_notice` rows are retained but excluded from claims/queue discovery.
@@ -43,11 +45,17 @@ instants round-trip as UTC ISO strings with millisecond precision, matching lega
   including attempts, boundary, accepted message ID/time, and completion time.
 - `pending_ids() -> Vec<String>`: discovery only, maximum 25; excludes terminal,
   store-only, unsupported kinds and preflight-deferred rows whose backoff has
-  not expired. Each candidate still requires a claim.
+  not expired. Rows that yielded queue position (preflight deferral or failure
+  release) sort after never-yielded rows, least-recently-yielded first, so a
+  bounded batch rotates past repeatedly failing rows. Each candidate still
+  requires a claim.
 - `claim(entry_id) -> Option<AuditClaim>`: five-minute lease with opaque random
   owner token and monotonic generation. Only the winning UPDATE returns a claim.
-  A claim exposes a read-only row and `intent()`, never public fencing fields.
-  Claiming clears any preflight deferral on the row.
+  A lock-free eligibility precheck rejects missing/terminal/store-only,
+  deferred and halted rows before any lock is taken, so a doomed claim never
+  waits on a row lock while holding the shared halt guard; the conditional
+  UPDATE remains the authority. A claim exposes a read-only row and `intent()`,
+  never public fencing fields. Claiming clears any preflight deferral on the row.
 - `prepare_send(claim, search_before) -> PrepareSend`: `Prepared` is the only
   successful send preparation. It commits the boundary, attempted timestamp and
   incremented attempt count **before** a POST. `Halted` or `LostClaim` means no
@@ -60,20 +68,24 @@ instants round-trip as UTC ISO strings with millisecond precision, matching lega
   Clears ownership, preserves evidence, sets completion time. Completion is
   terminal: no API reclaims, releases, quarantines or rewrites a delivered row.
 - `release_unattempted(claim) -> bool`: releases preflight/held claims only when
-  no boundary or acceptance exists. Does not count a send attempt. Keeps the
-  row's queue position; use `defer_preflight` for destination-tied preflight
-  failures that must rotate the queue.
+  no boundary or acceptance exists. Does not count a send attempt. Stamps the
+  fairness yield so the released row rotates behind never-yielded rows; use
+  `defer_preflight` for destination-tied preflight failures that must also
+  hide from discovery during the backoff.
 - `defer_preflight(claim) -> bool`: parks a preflight-failed claim out of queue
   discovery for `PREFLIGHT_DEFER_SECONDS` (60 s) without counting a POST
   attempt, so a repeatedly failing destination cannot starve healthy rows in
-  the bounded batch. The next successful claim clears the deferral.
+  the bounded batch. Also stamps the fairness yield, so after the backoff
+  expires the row still sorts behind never-yielded rows. The next successful
+  claim clears the deferral.
 - `fail_attempt(claim, DeliveryFailure) -> bool`: authoritative
   `DefinitelyRejected` (including a guaranteed not-sent request) clears the
   sending owner's boundary and permits retry. `UncertainAcceptance` retains it
   and permits **reconciliation only**. A reconciliation worker cannot use a
   read rejection to clear an earlier POST's ambiguity. Accepted IDs cannot be
   cleared by either path. Attempt count was already persisted at preparation;
-  release/completion/recovery do not count it again.
+  release/completion/recovery do not count it again. Both paths stamp the
+  fairness yield so the released row rotates behind never-yielded rows.
 - `renew(claim) -> bool`: only a still-active owner can renew. An expired worker
   cannot revive a lease or affect a replacement owner.
 - `quarantine(claim, QuarantineReason) -> bool`: terminal hold with bounded

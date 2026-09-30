@@ -210,7 +210,11 @@ impl AuditStore {
     /// Bounded queue discovery, not ownership or send authorization. A switch
     /// engaged after discovery is observed again by each claim/prepare.
     /// Preflight-deferred rows stay hidden until their backoff expires; the
-    /// backoff is retry scheduling, never a POST attempt count.
+    /// backoff is retry scheduling, never a POST attempt count. Rows that
+    /// yielded their queue position (preflight deferral or failure release)
+    /// sort after never-yielded rows, least-recently-yielded first, so a
+    /// bounded batch rotates past repeatedly failing rows instead of
+    /// starving healthy ones once a backoff expires.
     pub async fn pending_ids(&self) -> Result<Vec<String>, AuditStoreError> {
         Ok(sqlx::query_scalar(
             "SELECT entry_id FROM operational_audit_log
@@ -220,7 +224,8 @@ impl AuditStore {
                AND (delivery_deferred_until IS NULL
                  OR delivery_deferred_until <= clock_timestamp())
                AND NOT EXISTS (SELECT 1 FROM audit_kill_switch WHERE id = 1)
-             ORDER BY delivery_attempted_at NULLS FIRST, created_at, entry_id LIMIT 25",
+             ORDER BY delivery_yielded_at NULLS FIRST, delivery_attempted_at NULLS FIRST,
+               created_at, entry_id LIMIT 25",
         )
         .bind(KINDS)
         .fetch_all(&self.pool)
@@ -231,7 +236,28 @@ impl AuditStore {
     /// rotates both fences but retains every ambiguity/acceptance marker.
     /// The row lock is taken before the expiry predicate is evaluated, so a
     /// claimant blocked behind an unchanged locker cannot win on a stale read.
+    /// A lock-free eligibility precheck rejects ineligible rows (missing,
+    /// terminal, store-only, deferred, halted) before any lock is taken, so a
+    /// doomed claim never waits on a row lock while holding the shared halt
+    /// guard and delaying an exclusive halt writer. The conditional UPDATE
+    /// below remains the authority; the precheck only skips doomed lock waits.
     pub async fn claim(&self, entry_id: &str) -> Result<Option<AuditClaim>, AuditStoreError> {
+        let eligible: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM operational_audit_log
+               WHERE entry_id = $1 AND mirror_channel_id IS NOT NULL AND event_kind = ANY($2)
+                 AND (delivery_state = 'pending' OR (delivery_state = 'delivering'
+                   AND delivery_lease_until <= clock_timestamp()))
+                 AND (delivery_deferred_until IS NULL
+                   OR delivery_deferred_until <= clock_timestamp())
+                 AND NOT EXISTS (SELECT 1 FROM audit_kill_switch WHERE id = 1))",
+        )
+        .bind(entry_id)
+        .bind(KINDS)
+        .fetch_one(&self.pool)
+        .await?;
+        if !eligible {
+            return Ok(None);
+        }
         let mut tx = self.pool.begin().await?;
         lock_halt(&mut tx, false).await?;
         if !lock_row(&mut tx, entry_id).await? {
@@ -383,12 +409,15 @@ impl AuditStore {
     /// that arrived before preparation; never clears earlier ambiguous
     /// acceptance evidence. A preflight failure that should rotate the queue
     /// uses `defer_preflight` instead so the row does not keep its priority.
+    /// A halt-driven release marks the same fairness yield so a held batch
+    /// does not keep its position indefinitely.
     pub async fn release_unattempted(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_row(&mut tx, &claim.row.event.entry_id).await?;
         let updated = sqlx::query(
             "UPDATE operational_audit_log SET delivery_state = 'pending',
-               delivery_claim_token = NULL, delivery_lease_until = NULL
+               delivery_claim_token = NULL, delivery_lease_until = NULL,
+               delivery_yielded_at = clock_timestamp()
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
                AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
                AND delivery_search_before IS NULL AND mirror_message_id IS NULL",
@@ -410,6 +439,8 @@ impl AuditStore {
     /// history read, halt observed before preparation) fails for a reason tied
     /// to the destination rather than the row: the bounded queue then rotates
     /// to healthy rows instead of returning the same failing batch every tick.
+    /// Yielding also stamps the fairness cursor, so once the backoff expires
+    /// the row sorts behind never-yielded rows instead of reclaiming the head.
     pub async fn defer_preflight(&self, claim: &AuditClaim) -> Result<bool, AuditStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_row(&mut tx, &claim.row.event.entry_id).await?;
@@ -417,7 +448,8 @@ impl AuditStore {
             "UPDATE operational_audit_log SET delivery_state = 'pending',
                delivery_claim_token = NULL, delivery_lease_until = NULL,
                delivery_deferred_until =
-                 clock_timestamp() + ($4::double precision * interval '1 second')
+                 clock_timestamp() + ($4::double precision * interval '1 second'),
+               delivery_yielded_at = clock_timestamp()
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
                AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
                AND delivery_search_before IS NULL AND mirror_message_id IS NULL",
@@ -436,7 +468,10 @@ impl AuditStore {
 
     /// Only an authoritative non-acceptance permits another send. Uncertainty
     /// preserves the boundary so the next claim is reconciliation-only.
-    /// Neither classification can clear an already accepted message ID.
+    /// Neither classification can clear an already accepted message ID. Both
+    /// stamp the fairness yield so the released row rotates behind
+    /// never-yielded rows instead of reclaiming the head of the bounded batch;
+    /// attempts, boundary and accepted evidence are preserved untouched.
     pub async fn fail_attempt(
         &self,
         claim: &AuditClaim,
@@ -455,6 +490,7 @@ impl AuditStore {
             "UPDATE operational_audit_log SET delivery_state = 'pending',
                delivery_claim_token = NULL, delivery_lease_until = NULL,
                delivery_last_error = $4,
+               delivery_yielded_at = clock_timestamp(),
                delivery_search_before = CASE WHEN $5 THEN NULL ELSE delivery_search_before END
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
                AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
