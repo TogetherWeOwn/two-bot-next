@@ -86,29 +86,33 @@ pub(crate) fn route(request: &Request) -> &'static str {
 
 /// Cancellation (including the outer moderation timeout) is a transport failure,
 /// not a lost attempt. Each send records exactly one completion or cancellation.
-pub(crate) struct Attempt {
+pub(crate) struct Attempt<'a> {
+    metrics: &'a metrics::Metrics,
     route: &'static str,
     complete: bool,
 }
 
-impl Attempt {
+impl Attempt<'static> {
     pub(crate) fn new(request: &Request) -> Self {
         Self {
+            metrics: metrics::global(),
             route: route(request),
             complete: false,
         }
     }
+}
 
+impl Attempt<'_> {
     pub(crate) fn finish(&mut self, status: Option<u16>) {
-        metrics::global().rest_response(self.route, status);
+        self.metrics.rest_response(self.route, status);
         self.complete = true;
     }
 }
 
-impl Drop for Attempt {
+impl Drop for Attempt<'_> {
     fn drop(&mut self) {
         if !self.complete {
-            metrics::global().rest_response(self.route, None);
+            self.metrics.rest_response(self.route, None);
         }
     }
 }
@@ -117,6 +121,39 @@ impl Drop for Attempt {
 mod tests {
     use super::*;
     use twilight_http::request::RequestBuilder;
+
+    #[tokio::test]
+    async fn cancellation_and_headers_each_count_exactly_one_send() {
+        let metrics = metrics::Metrics::default();
+        let route = "GET /channels/:channel";
+        let pending = async {
+            let _attempt = Attempt {
+                metrics: &metrics,
+                route,
+                complete: false,
+            };
+            std::future::pending::<()>().await;
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), pending)
+                .await
+                .is_err()
+        );
+        {
+            let mut attempt = Attempt {
+                metrics: &metrics,
+                route,
+                complete: false,
+            };
+            attempt.finish(Some(429));
+            // Dropping after headers, even on body failure, must not count twice.
+        }
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_rest_requests_total{route=\"GET /channels/:channel\",result=\"transport\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_rest_requests_total{route=\"GET /channels/:channel\",result=\"429\"} 1\n"
+        ));
+    }
 
     #[test]
     fn request_templates_drop_snowflakes_queries_and_tokens() {

@@ -20,7 +20,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
-| `two_bot_rest_requests_total{route,result}` | Executor-visible sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` or `transport` (including cancellation/timeout/body-read failure) |
+| `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
 | `two_bot_db_pool_configured` | Whether gateway initialization has registered a pool |
 | `two_bot_db_pool_connections` | Current pool size |
 | `two_bot_db_pool_idle_connections` | Current idle connections |

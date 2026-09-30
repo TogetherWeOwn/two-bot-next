@@ -351,12 +351,14 @@ impl HyperTransport {
         let hyper_req = builder
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
+        let mut attempt = crate::executor_metrics::Attempt::new(request);
         let response = self
             .inner
             .request(hyper_req)
             .await
             .map_err(|e| format!("transport: {e}"))?;
         let status = response.status().as_u16();
+        attempt.finish(Some(status));
         let retry_after_header = response
             .headers()
             .get("retry-after")
@@ -486,10 +488,7 @@ impl ActionExecutor {
 
     async fn send(&self, request: &Request) -> Result<RawResponse, String> {
         self.count();
-        let mut attempt = crate::executor_metrics::Attempt::new(request);
-        let response = self.inner.transport.send_request(request).await;
-        attempt.finish(response.as_ref().ok().map(|response| response.status));
-        response
+        self.inner.transport.send_request(request).await
     }
 
     /// Build a twilight [`Request`] from a builder without sending (keeps
