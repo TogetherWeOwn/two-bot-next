@@ -161,7 +161,7 @@ async fn existing_cutover_schema_is_preserved_in_both_orders() {
         let ledgers: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM _two_bot_migrations), (SELECT count(*) FROM _sqlx_migrations)")
             .fetch_one(&f.pool).await.unwrap();
         assert!(ledgers.0 >= 6);
-        assert_eq!(ledgers.1, 2);
+        assert_eq!(ledgers.1, cutover.iter().count() as i64);
         f.finish().await;
     }
 }
