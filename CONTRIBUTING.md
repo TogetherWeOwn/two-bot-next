@@ -14,11 +14,16 @@
 
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 (`release-please-config.json` + `.release-please-manifest.json`, release-type
-`rust`, single `.` package). Merge a conventional commit to `main` and
-release-please opens or updates a release PR; merging that PR writes
-`CHANGELOG.md`, bumps the root workspace version (member crates are internal
-and stay pinned — see `release.yml`), tags `vX.Y.Z` and
-publishes a GitHub Release. Never tag or release by hand.
+`rust`, single `.` package). The root package has a small release-metadata
+library at `src/lib.rs` so it is a valid Cargo package, not a targetless
+manifest. The native Rust strategy synchronizes the root and all four member
+versions, local dependency requirements, and `Cargo.lock`. Using one root
+strategy includes changes anywhere in the repository and produces one flat
+`vX.Y.Z` tag, not one release per crate.
+
+Merge a conventional commit to `main` and release-please opens or updates a
+release PR containing the version and root `CHANGELOG.md` updates. Merging
+that PR publishes the tag and GitHub Release. Never tag or release by hand.
 
 `CHANGELOG.md` uses the [Common Changelog](https://common-changelog.org/)
 categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),

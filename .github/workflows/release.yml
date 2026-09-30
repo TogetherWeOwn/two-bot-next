@@ -3,11 +3,10 @@ name: release
 # release-please (TOG-9865, TOG-10035): CHANGELOG.md + SemVer tags + GitHub
 # Releases from Conventional Commits on main. Single `.` rust package
 # (release-please-config.json + .release-please-manifest.json): the workspace
-# root carries the one `[package]` version release-please bumps, tagged as
-# flat `vX.Y.Z`. The four member crates are internal (never published, only
-# the container image ships): their manifests keep literal `0.1.0` versions
-# with explicit intra-workspace version reqs, which path resolution keeps
-# satisfied as the root advances — only the root version moves per release.
+# root is a real, non-published release-metadata library, tagged as flat
+# `vX.Y.Z`. The native Rust strategy synchronizes all four member versions,
+# intra-workspace dependency requirements, and Cargo.lock with the root.
+# A root strategy includes changes anywhere in the repo in the changelog.
 # Stay 0.x until production cutover; 1.0.0 = cutover.
 #
 # Required-checks fix: PRs opened with GITHUB_TOKEN trigger no workflows, so

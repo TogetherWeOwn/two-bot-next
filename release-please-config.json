@@ -3,6 +3,8 @@
   "packages": {
     ".": {
       "release-type": "rust",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": false,
       "include-component-in-tag": false,
       "pull-request-footer": "Refs: TOG-9865",
       "changelog-sections": [
