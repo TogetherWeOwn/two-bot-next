@@ -57,10 +57,10 @@ intent fails closed rather than silently becoming an empty selection.
 ## Verification
 
 ```sh
-cargo test -p two-bot-core self_roles --locked
-cargo test -p two-bot-core -p two-bot-cutover --lib --locked
-cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
-cargo clippy -p two-bot-core -p two-bot-cutover --all-targets --locked -- -D warnings
+python3 scripts/cargo_cache.py run -- test -p two-bot-core self_roles
+python3 scripts/cargo_cache.py run -- test -p two-bot-core -p two-bot-cutover --lib
+python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test self_role_store -- --ignored
+python3 scripts/cargo_cache.py run -- clippy -p two-bot-core -p two-bot-cutover --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
@@ -76,23 +76,20 @@ isolated `agent-testdb` Postgres service. No database port is published. The
 required `check` job waits for that result and fails on failure, cancellation
 or skip; the normal workspace test run alone still skips this opt-in test.
 
-The merged gateway/funnel pipeline at `main@eb88087` does not provide the S4
-interaction router or role-action executor. Those are tracked separately by
-[TOG-10075](/TOG/issues/TOG-10075) and
-[TOG-10076](/TOG/issues/TOG-10076).
+The S4 interaction router and REST executor are now merged in
+[PR #57](https://github.com/TogetherWeOwn/two-bot-next/pull/57) and
+[PR #63](https://github.com/TogetherWeOwn/two-bot-next/pull/63), respectively.
 This PR remains domain/store-only as permitted by the slice contract.
-[TOG-10292](/TOG/issues/TOG-10292) owns the
-bounded runtime follow-up and is blocked on this slice and both shared seams.
-It wires handlers, partial fetches and compensation after all three merge,
-never a feature-private dispatcher/HTTP client.
+[TOG-10292](/TOG/issues/TOG-10292) owns the bounded runtime follow-up and
+still requires this slice to merge. It wires handlers, partial fetches and
+compensation through those shared seams, never a feature-private dispatcher
+or HTTP client.
 
 A Common Changelog entry and Conventional Commit feature checkpoints provide
-release notes. Release-please installation and first automated release are
-owned by [TOG-10035](/TOG/issues/TOG-10035)
-and [PR #20](https://github.com/TogetherWeOwn/two-bot-next/pull/20), not a second
-feature-local workflow or version scheme. That implementation is not merged
-at the baseline above; its completed adverse review is not approval. This
-slice waits on that release-standard card before final review/closeout.
+release notes. The release standard owned by
+[TOG-10035](/TOG/issues/TOG-10035) is merged, and the flow published
+[v0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0).
+This slice's entry remains under Unreleased; it was not part of that release.
 Do not manually bump Cargo versions, publish tags or create a release.
 Non-author exact-SHA review and green required CI still gate squash merge.
 No production guild, token, staging database or real Discord endpoint was

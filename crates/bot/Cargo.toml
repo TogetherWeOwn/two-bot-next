@@ -1,6 +1,6 @@
 [package]
 name = "two-bot"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,14 +13,18 @@ path = "src/main.rs"
 # path): cargo-deny `wildcards = "deny"` rejects version-less deps, and the
 # version pins the API contract between crates at a glance.
 [dependencies]
-two-bot-core = { version = "0.1.0", path = "../core" }
-two-bot-discord = { version = "0.1.0", path = "../discord" }
+two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
+two-bot-discord = { version = "0.2.0", path = "../discord" }
+two-bot-cutover = { version = "0.2.0", path = "../cutover" }
+futures-util = { workspace = true }
+serde = { workspace = true }
 axum = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
 # exactly one provider feature enabled. Declared here (not on a lib) so the
 # release binary and `cargo test` share the same provider.
 rustls = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -28,3 +32,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
+
+[dev-dependencies]
+tokio-websockets = { workspace = true }

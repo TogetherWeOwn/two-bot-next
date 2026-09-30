@@ -1,0 +1,12 @@
+# TOG-10153: exact historical false-positive fingerprint.
+# Line crates/bot/tests/startup.rs:27 of commit 6b05d0646e487058033f7f44bdda472bc6967ae3
+# carries a synthetic DISCORD_TOKEN test dummy (authored as a fixture, never a
+# real credential, never read from env or a secret service). The secret-scan
+# workflow scans full history (--log-opts=HEAD), so the match survives
+# shortening the dummy in later commits; this single fingerprint exception
+# covers only that historical line. Verified offline: HEAD scans clean with
+# this file, while a newly authored file carrying the same triggering literal
+# is still detected. Full rules, detectors and workflow unchanged.
+# Permitted by Director of Engineering decision on TOG-10153 (accepted
+# request_confirmation, resolved 2026-09-30).
+6b05d0646e487058033f7f44bdda472bc6967ae3:crates/bot/tests/startup.rs:discord-client-secret:27

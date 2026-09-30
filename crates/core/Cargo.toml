@@ -1,19 +1,36 @@
 [package]
 name = "two-bot-core"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = { workspace = true }
 regex = { workspace = true }
 url = { workspace = true }
+# Row-by-row dump streaming only (TryStreamExt::try_next); same locked
+# version the bot and discord crates already use.
+futures-util = { workspace = true }
 
 # Database access lives behind the `db` feature so unit tests for pure
 # domain logic never need a Postgres driver or a live database.
@@ -24,4 +41,8 @@ default = []
 db = ["dep:sqlx"]
 
 [dev-dependencies]
+rand = { workspace = true }
 tokio = { workspace = true }
+axum = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
