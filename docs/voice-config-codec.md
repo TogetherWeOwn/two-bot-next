@@ -13,6 +13,11 @@ It has no Discord, database or template-engine dependency and performs no writes
 - `validate_configuration(&config, &inventory)` also validates in-memory values.
 - `VOICE_CONFIG_VERSION` is `1`; there are no implicit migrations or defaults
   between versions. Unknown fields and enum values fail rather than being lost.
+- Import requires JSON objects at the document and every nested DTO boundary,
+  including permission sources. Positional arrays and duplicate object keys fail.
+- Every exported field must be present, including nullable `logging`, both
+  creator/channel `status_template` fields and viewer/command role IDs. Explicit
+  `null` disables or clears those values; omission is malformed, never a default.
 - IDs are canonical, nonzero decimal `u64` **strings**, never JSON numbers.
   This preserves snowflakes above JavaScript's safe integer range.
 

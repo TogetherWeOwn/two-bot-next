@@ -156,6 +156,14 @@ fn malformed_json_wrong_types_missing_and_unknown_fields_are_rejected() {
         assert!(!error.to_string().contains("untrusted-content"));
     }
     let valid = export_configuration(&fixture().0, &inventory).unwrap();
+    for suffix in [b" trailing".as_slice(), b" {}", b" []"] {
+        let mut trailing = valid.clone();
+        trailing.extend_from_slice(suffix);
+        assert!(matches!(
+            import_configuration(&trailing, &inventory),
+            Err(VoiceConfigError::Malformed { .. })
+        ));
+    }
     let duplicate = String::from_utf8(valid).unwrap().replacen(
         "\"version\": 1",
         "\"version\": 1, \"version\": 1",
@@ -165,6 +173,184 @@ fn malformed_json_wrong_types_missing_and_unknown_fields_are_rejected() {
         import_configuration(duplicate.as_bytes(), &inventory),
         Err(VoiceConfigError::Malformed { .. })
     ));
+}
+
+#[test]
+fn every_permission_source_variant_rejects_extra_fields() {
+    let (config, inventory) = fixture();
+    let original = serde_json::to_value(config).unwrap();
+    for source in [
+        json!({"kind": "creator"}),
+        json!({"kind": "category"}),
+        json!({"kind": "channel", "channel_id": "105"}),
+    ] {
+        for extra in ["unrecognized", "channel_id", "role_id"] {
+            if source.get(extra).is_some() {
+                continue;
+            }
+            let mut value = original.clone();
+            let mut invalid_source = source.clone();
+            invalid_source[extra] = json!("999");
+            value["creators"][0]["permission_source"] = invalid_source;
+            assert!(
+                matches!(
+                    import_value(&value, &inventory),
+                    Err(VoiceConfigError::Malformed { .. })
+                ),
+                "{source} with {extra}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nullable_fields_require_presence_but_explicit_null_round_trips() {
+    let (config, inventory) = fixture();
+    let original = serde_json::to_value(config).unwrap();
+    for (parent, field) in [
+        ("", "logging"),
+        ("/creators/0", "status_template"),
+        ("/templates/0", "status_template"),
+        ("/settings", "text_viewer_role_id"),
+        ("/settings", "command_role_id"),
+    ] {
+        let mut value = original.clone();
+        value
+            .pointer_mut(parent)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(
+            matches!(
+                import_value(&value, &inventory),
+                Err(VoiceConfigError::Malformed { .. })
+            ),
+            "missing {parent}/{field}"
+        );
+        value.pointer_mut(parent).unwrap()[field] = Value::Null;
+        let decoded = import_value(&value, &inventory).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), value);
+        assert_eq!(
+            import_configuration(
+                &export_configuration(&decoded, &inventory).unwrap(),
+                &inventory
+            )
+            .unwrap(),
+            decoded
+        );
+    }
+}
+
+#[test]
+fn populated_positional_arrays_are_rejected_at_every_object_boundary() {
+    let (config, inventory) = fixture();
+    let original = serde_json::to_value(config).unwrap();
+    for (path, fields) in [
+        (
+            "",
+            vec![
+                "version",
+                "guild_id",
+                "creators",
+                "templates",
+                "aliases",
+                "lists",
+                "logging",
+                "settings",
+            ],
+        ),
+        (
+            "/creators/0",
+            vec![
+                "channel_id",
+                "name_template",
+                "status_template",
+                "default_limit",
+                "always_private",
+                "text_channels",
+                "position",
+                "first_number",
+                "group_by_category",
+                "permission_source",
+            ],
+        ),
+        (
+            "/templates/0",
+            vec!["channel_id", "name_template", "status_template"],
+        ),
+        ("/aliases/0", vec!["game", "alias"]),
+        ("/lists/0", vec!["name", "choices"]),
+        (
+            "/logging",
+            vec![
+                "channel_id",
+                "detail",
+                "mention_member_ids",
+                "mention_role_ids",
+            ],
+        ),
+        (
+            "/settings",
+            vec![
+                "creation_enabled",
+                "unique_names",
+                "no_game_label",
+                "force_single_game",
+                "count_members_without_activity",
+                "time_zone",
+                "text_channel_name",
+                "text_viewer_role_id",
+                "command_role_id",
+                "command_roles",
+            ],
+        ),
+        ("/settings/command_roles/0", vec!["command", "role_ids"]),
+        ("/creators/0/permission_source", vec!["kind", "channel_id"]),
+    ] {
+        let mut value = original.clone();
+        let object = value.pointer_mut(path).unwrap();
+        let array = fields.iter().map(|field| object[*field].clone()).collect();
+        *object = Value::Array(array);
+        assert!(
+            matches!(
+                import_value(&value, &inventory),
+                Err(VoiceConfigError::Malformed { .. })
+            ),
+            "positional array at {path}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_json_keys_are_rejected_at_every_object_boundary() {
+    let (config, inventory) = fixture();
+    let original = serde_json::to_value(config).unwrap();
+    let json = serde_json::to_string(&original).unwrap();
+    for (path, field) in [
+        ("", "version"),
+        ("/creators/0", "status_template"),
+        ("/templates/0", "status_template"),
+        ("/aliases/0", "game"),
+        ("/lists/0", "name"),
+        ("/logging", "channel_id"),
+        ("/settings", "command_role_id"),
+        ("/settings/command_roles/0", "command"),
+        ("/creators/0/permission_source", "kind"),
+        ("/creators/0/permission_source", "channel_id"),
+    ] {
+        let object = original.pointer(path).unwrap();
+        let encoded = serde_json::to_string(object).unwrap();
+        let duplicate = format!("{{\"{field}\":{},{}", object[field], &encoded[1..]);
+        let invalid = json.replacen(&encoded, &duplicate, 1);
+        assert!(
+            matches!(
+                import_configuration(invalid.as_bytes(), &inventory),
+                Err(VoiceConfigError::Malformed { .. })
+            ),
+            "duplicate {path}/{field}"
+        );
+    }
 }
 
 #[test]
