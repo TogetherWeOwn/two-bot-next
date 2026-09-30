@@ -102,7 +102,14 @@ regeneration; a closed/merged PR also leaves publication and creation enabled.
 
 Selection after the action queries GitHub, rather than relying on `prs_created`:
 a native no-op or prior migration failure must still reconcile the existing PR
-and dispatch its checks. The workflow pushes a changelog diff only when needed,
+and dispatch its checks. When publication leaves no open PR, selection emits
+`pr_available=false` and valid empty-object `pr={}` JSON. Actions evaluates
+step environment expressions even when the step's `if` is false, so an empty
+string would make the skipped reconciliation step fail at `fromJSON` after
+successful publication. The availability guards skip checkout, reconciliation
+and check dispatch; native publication stays enabled. The retry fixture parses
+the actual no-PR CLI output and checks these guards without making mutations.
+The workflow pushes a changelog diff only when needed,
 then PATCHes a body diff independently via the supported REST API. A successful
 push followed by a failed PATCH therefore repairs only the body on retry.
 Unchanged reconciliation makes no commit, push or body-PATCH calls. Checks may
