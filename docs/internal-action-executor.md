@@ -37,10 +37,31 @@ otherwise retries 429 internally even with its rate limiter disabled. Hyper's
 cancelled pooled-connection retry is also explicitly disabled. There are no
 application status retries or redirects. The production origin is fixed to
 `https://discord.com`; only module-local test code overrides it with loopback.
-The adapter does not share Twilight's limiter; the receiver must enforce its
-own per-caller/action throttling before obtaining an execution claim.
+The raw transport sends the required `DiscordBot (URL, version)` User-Agent.
 
-One 10-second deadline covers sending, response headers and success-body
+The adapter does not share Twilight's limiter or install a governor. In addition
+to per-caller/action admission throttling, the receiver **must** feed every
+`RateLimited(RateLimitCooldown)` into one shared governor for this bot token,
+covering all callers/guild workers and any other Discord transports. Install the
+cooldown before admitting a subsequent independent intent. `Global` pauses all
+sends with that token; `Channel(id)` conservatively pauses all buckets using that
+channel major resource (this executor implements just the create-message route,
+so no raw provider bucket ID is needed or exposed). Start the returned
+`retry_after_ms` wait when consuming the outcome. Do not reset/shorten an existing
+longer cooldown. If timing is `None`, pause the scope until independent
+reconciliation; never invent a short default delay. This is a typed caller
+obligation, not a claim that shared runtime rate limiting is already wired.
+
+Timing uses the longer valid `Retry-After` header/body `retry_after`, in seconds
+rounded up to milliseconds, without shortening long waits. Global header/body
+signals win over channel signals; ambiguous scope defaults to global. Error
+bodies are also bounded by size and deadline; malformed, truncated, oversized or
+slow 429 bodies preserve known headers and definite no-effect status. Only typed
+scope/IDs/timing leave the adapter, never provider bucket/error text. A 429 does
+**not** schedule a retry: the original key remains terminal, and the shared
+cooldown applies to later, genuinely new intents.
+
+One 10-second deadline covers sending, response headers and body
 collection. Bodies are capped at 64 KiB. A receipt requires HTTP 200/201,
 validated string message/channel IDs, and the expected channel. Only those two
 IDs are returned; the full Discord message model is never returned or cached.
@@ -53,7 +74,8 @@ request values, token headers and provider error sources are dropped.
 | `NoEffect(Malformed)` | Local validation refusal, no request sent | Terminal `Malformed` |
 | `NoEffect(ActionNotAllowed)` | Unknown verb/key, no request sent | Terminal `ActionNotAllowed` |
 | `NoEffect(InvalidChannelConfiguration / LocalConfiguration)` | Invalid mapping/header or missing client authentication, no request sent | Terminal `NoEffect`; repair configuration separately |
-| `NoEffect(DiscordRejected / RateLimited)` | Discord rejected with 400/401/403/404/405/413/415/422/429 | Terminal `DiscordRejected`; no automatic resend |
+| `NoEffect(DiscordRejected)` | Discord rejected with 400/401/403/404/405/413/415/422 | Terminal `DiscordRejected`; no automatic resend |
+| `RateLimited(cooldown)` | Discord rejected with 429; timing/scope retained safely | Apply shared token/channel governor cooldown, then persist terminal `DiscordRejected`; never resend this key |
 | `Unknown(reason)` | Timeout, transport failure, redirect/408/5xx/unrecognized status, malformed/truncated/oversized success or wrong channel | `mark_unknown`; retain claim, require independent reconciliation |
 
 The receiver must authorize, burn the nonce, check capability, and commit its
@@ -72,7 +94,9 @@ A genuinely new user intent requires a new key.
 
 `cargo test -p two-bot-discord --lib internal_actions` exercises real Twilight
 request validation/serialization against an ephemeral loopback HTTP proxy.
-Tests pin exact route/payload, disabled mentions, UTF-16 ceilings, channel and
+Tests pin the required User-Agent, rate-limit header/body timing and global/channel
+scope (including absent/invalid timing and slow/broken bodies), redacted buckets,
+exact route/payload, disabled mentions, UTF-16 ceilings, channel and
 capability refusal, missing authentication, confirmed rejections, no resends on
 429/5xx/timeouts/disconnects, complete-response deadline, bounded success decode,
 safe receipts, and log/Debug/serialization redaction. Only generated non-secret

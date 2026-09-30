@@ -5,7 +5,7 @@
 //! executor capabilities. No runtime flags, stores or listeners are installed.
 
 use bytes::Bytes;
-use http::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use http::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -22,6 +22,11 @@ use two_bot_core::internal_actions::{is_snowflake, validate_announcement, ErrorC
 
 pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post"];
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const BOT_USER_AGENT: &str = concat!(
+    "DiscordBot (https://github.com/TogetherWeOwn/two-bot-next, ",
+    env!("CARGO_PKG_VERSION"),
+    ")"
+);
 
 type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
@@ -34,7 +39,25 @@ pub enum Refusal {
     InvalidChannelConfiguration,
     LocalConfiguration,
     DiscordRejected,
-    RateLimited,
+}
+
+/// Apply before any new intent in the caller's shared token governor. Channel
+/// scope deliberately covers all buckets on this major resource; bucket strings
+/// and provider text never escape. Missing/ambiguous scope is token-wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CooldownScope {
+    Global,
+    Channel(Id<ChannelMarker>),
+}
+
+/// A 429 proves no effect, but also constrains later, independent intents.
+/// `None` means timing was unavailable: pause this scope pending reconciliation,
+/// not a guessed short delay. Never retry the original POST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RateLimitCooldown {
+    pub scope: CooldownScope,
+    pub retry_after_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -73,6 +96,7 @@ impl AnnouncementReceipt {
 pub enum ExecutionOutcome {
     Posted(AnnouncementReceipt),
     NoEffect(Refusal),
+    RateLimited(RateLimitCooldown),
     Unknown(UnknownReason),
 }
 
@@ -170,6 +194,7 @@ impl AnnouncementExecutor {
             .uri(format!("{}/api/v10/{}", self.api_origin, request.path()))
             .header(AUTHORIZATION, authorization)
             .header(CONTENT_TYPE, "application/json")
+            .header(USER_AGENT, BOT_USER_AGENT)
             .body(Full::new(Bytes::copy_from_slice(
                 request.body().unwrap_or_default(),
             ))) {
@@ -177,48 +202,108 @@ impl AnnouncementExecutor {
             Err(_) => return ExecutionOutcome::NoEffect(Refusal::LocalConfiguration),
         };
 
-        let attempt = async {
-            let response = match self.http.request(outbound).await {
-                Ok(response) => response,
-                Err(_) => return ExecutionOutcome::Unknown(UnknownReason::Transport),
-            };
-            match response.status().as_u16() {
-                // Narrow confirmed-rejection allowlist. 408, other statuses,
-                // redirects and 5xx are NOT proof of no message being created.
-                400 | 401 | 403 | 404 | 405 | 413 | 415 | 422 => {
-                    return ExecutionOutcome::NoEffect(Refusal::DiscordRejected);
-                }
-                429 => return ExecutionOutcome::NoEffect(Refusal::RateLimited),
-                200 | 201 => {}
-                _ => return ExecutionOutcome::Unknown(UnknownReason::Upstream),
-            }
-            let bytes = match Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
-                .collect()
-                .await
-            {
-                Ok(body) => body.to_bytes(),
-                Err(_) => return ExecutionOutcome::Unknown(UnknownReason::InvalidResponse),
-            };
-            // Deserialize only scalar IDs; do not retain content or OAuth fields.
-            let wire: MessageIds = match serde_json::from_slice(&bytes) {
-                Ok(ids) => ids,
-                Err(_) => return ExecutionOutcome::Unknown(UnknownReason::InvalidResponse),
-            };
-            let Some(message_id) = parse_id::<MessageMarker>(&wire.id) else {
-                return ExecutionOutcome::Unknown(UnknownReason::InvalidResponse);
-            };
-            if parse_id::<ChannelMarker>(&wire.channel_id) != Some(channel_id) {
-                return ExecutionOutcome::Unknown(UnknownReason::InvalidResponse);
-            }
-            ExecutionOutcome::Posted(AnnouncementReceipt {
-                channel_id,
-                message_id,
-            })
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let response = match tokio::time::timeout_at(deadline, self.http.request(outbound)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return ExecutionOutcome::Unknown(UnknownReason::Transport),
+            Err(_) => return ExecutionOutcome::Unknown(UnknownReason::Timeout),
         };
-        tokio::time::timeout(self.timeout, attempt)
-            .await
-            .unwrap_or(ExecutionOutcome::Unknown(UnknownReason::Timeout))
+        match response.status().as_u16() {
+            // Narrow confirmed-rejection allowlist. 408, other statuses,
+            // redirects and 5xx are NOT proof of no message being created.
+            400 | 401 | 403 | 404 | 405 | 413 | 415 | 422 => {
+                return ExecutionOutcome::NoEffect(Refusal::DiscordRejected);
+            }
+            429 => {
+                return ExecutionOutcome::RateLimited(
+                    rate_limit_cooldown(response, channel_id, deadline).await,
+                );
+            }
+            200 | 201 => {}
+            _ => return ExecutionOutcome::Unknown(UnknownReason::Upstream),
+        }
+        let bytes = match tokio::time::timeout_at(
+            deadline,
+            Limited::new(response.into_body(), MAX_RESPONSE_BYTES).collect(),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body.to_bytes(),
+            Ok(Err(_)) => return ExecutionOutcome::Unknown(UnknownReason::InvalidResponse),
+            Err(_) => return ExecutionOutcome::Unknown(UnknownReason::Timeout),
+        };
+        // Deserialize only scalar IDs; do not retain content or OAuth fields.
+        let wire: MessageIds = match serde_json::from_slice(&bytes) {
+            Ok(ids) => ids,
+            Err(_) => return ExecutionOutcome::Unknown(UnknownReason::InvalidResponse),
+        };
+        let Some(message_id) = parse_id::<MessageMarker>(&wire.id) else {
+            return ExecutionOutcome::Unknown(UnknownReason::InvalidResponse);
+        };
+        if parse_id::<ChannelMarker>(&wire.channel_id) != Some(channel_id) {
+            return ExecutionOutcome::Unknown(UnknownReason::InvalidResponse);
+        }
+        ExecutionOutcome::Posted(AnnouncementReceipt {
+            channel_id,
+            message_id,
+        })
     }
+}
+
+async fn rate_limit_cooldown(
+    response: http::Response<hyper::body::Incoming>,
+    channel_id: Id<ChannelMarker>,
+    deadline: tokio::time::Instant,
+) -> RateLimitCooldown {
+    let headers = response.headers();
+    let header_delay = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .and_then(delay_ms);
+    let header_global = headers.contains_key("x-ratelimit-global")
+        || headers
+            .get("x-ratelimit-scope")
+            .is_some_and(|value| value == "global");
+    let header_channel = headers
+        .get("x-ratelimit-scope")
+        .is_some_and(|value| value == "user" || value == "shared");
+    // The status already proved no effect. Slow, broken or oversized error
+    // bodies must not discard known headers or turn this into an unknown effect.
+    let body = tokio::time::timeout_at(
+        deadline,
+        Limited::new(response.into_body(), MAX_RESPONSE_BYTES).collect(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|body| serde_json::from_slice::<RateLimitWire>(&body.to_bytes()).ok());
+    let scope = if header_global || body.as_ref().is_some_and(|body| body.global == Some(true)) {
+        CooldownScope::Global
+    } else if header_channel || body.as_ref().is_some_and(|body| body.global == Some(false)) {
+        CooldownScope::Channel(channel_id)
+    } else {
+        CooldownScope::Global
+    };
+    let body_delay = body.and_then(|body| body.retry_after).and_then(delay_ms);
+    RateLimitCooldown {
+        scope,
+        // Never shorten a valid cooldown if header and body disagree.
+        retry_after_ms: header_delay.max(body_delay),
+    }
+}
+
+fn delay_ms(seconds: f64) -> Option<u64> {
+    let milliseconds = (seconds * 1000.0).ceil();
+    // Do not cap long waits downward or interpret invalid timing as zero.
+    (seconds.is_finite() && seconds >= 0.0 && milliseconds < u64::MAX as f64)
+        .then_some(milliseconds as u64)
+}
+
+#[derive(Deserialize)]
+struct RateLimitWire {
+    retry_after: Option<f64>,
+    global: Option<bool>,
 }
 
 #[derive(Deserialize)]

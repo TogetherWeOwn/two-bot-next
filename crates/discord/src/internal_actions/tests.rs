@@ -13,6 +13,7 @@ const MESSAGE: &str = "444444444444444444";
 #[derive(Clone)]
 struct Reply {
     status: u16,
+    headers: String,
     body: String,
     delay: Duration,
     body_delay: Duration,
@@ -24,6 +25,7 @@ impl Reply {
     fn new(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
+            headers: String::new(),
             body: body.into(),
             delay: Duration::ZERO,
             body_delay: Duration::ZERO,
@@ -43,6 +45,7 @@ impl Reply {
 struct Recorded {
     method: String,
     path: String,
+    user_agent: Option<String>,
     body: Value,
 }
 
@@ -95,6 +98,11 @@ impl MockDiscord {
                 seen.lock().unwrap().push(Recorded {
                     method: first_line.next().unwrap().to_owned(),
                     path: first_line.next().unwrap().to_owned(),
+                    user_agent: head.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("user-agent")
+                            .then(|| value.trim().to_owned())
+                    }),
                     body: serde_json::from_slice(&bytes[head_end..head_end + content_length])
                         .unwrap(),
                 });
@@ -103,8 +111,8 @@ impl MockDiscord {
                 }
                 tokio::time::sleep(reply.delay).await;
                 let response = format!(
-                    "HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    reply.status, reply.body.len(),
+                    "HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{}connection: close\r\n\r\n",
+                    reply.status, reply.body.len(), reply.headers,
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
                 tokio::time::sleep(reply.body_delay).await;
@@ -188,6 +196,14 @@ async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
     let requests = mock.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, "POST");
+    assert_eq!(
+        requests[0].user_agent.as_deref(),
+        Some(concat!(
+            "DiscordBot (https://github.com/TogetherWeOwn/two-bot-next, ",
+            env!("CARGO_PKG_VERSION"),
+            ")"
+        ))
+    );
     assert_eq!(
         requests[0].path,
         format!("/api/v10/channels/{CHANNEL}/messages")
@@ -280,14 +296,118 @@ async fn definite_discord_rejections_and_rate_limit_are_one_attempt() {
         // proves rejection, without decoding/echoing the provider body.
         let mock = MockDiscord::start(Reply::new(status, "provider-secret-not-json")).await;
         let executor = mock.executor(keys());
-        let refusal = if status == 429 {
-            Refusal::RateLimited
+        let outcome = if status == 429 {
+            ExecutionOutcome::RateLimited(RateLimitCooldown {
+                scope: CooldownScope::Global,
+                retry_after_ms: None,
+            })
         } else {
-            Refusal::DiscordRejected
+            ExecutionOutcome::NoEffect(Refusal::DiscordRejected)
         };
         assert_eq!(
             run_once(&executor, &announcement("private-message")).await,
-            ExecutionOutcome::NoEffect(refusal)
+            outcome
+        );
+        assert_eq!(mock.count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn rate_limits_preserve_timing_and_conservative_scope_for_shared_governor() {
+    let channel = CooldownScope::Channel(Id::new(CHANNEL.parse().unwrap()));
+    for (headers, body, scope, delay) in [
+        (
+            "Retry-After: 65\r\nX-RateLimit-Scope: user\r\n",
+            r#"{"retry_after":64.57,"global":false}"#,
+            channel,
+            Some(65_000),
+        ),
+        (
+            "Retry-After: 1\r\n",
+            r#"{"retry_after":1.2345,"global":false}"#,
+            channel,
+            Some(1235),
+        ),
+        (
+            "",
+            r#"{"retry_after":0.5,"global":true}"#,
+            CooldownScope::Global,
+            Some(500),
+        ),
+        (
+            "Retry-After: 2\r\nX-RateLimit-Global: true\r\n",
+            r#"{"global":false}"#,
+            CooldownScope::Global,
+            Some(2000),
+        ),
+        (
+            "Retry-After: 3\r\nX-RateLimit-Scope: global\r\n",
+            "not-json",
+            CooldownScope::Global,
+            Some(3000),
+        ),
+        (
+            "Retry-After: 4\r\nX-RateLimit-Scope: shared\r\n",
+            "not-json",
+            channel,
+            Some(4000),
+        ),
+        (
+            "Retry-After: NaN\r\n",
+            r#"{"retry_after":-1}"#,
+            CooldownScope::Global,
+            None,
+        ),
+        (
+            "Retry-After: inf\r\n",
+            r#"{"retry_after":1e100}"#,
+            CooldownScope::Global,
+            None,
+        ),
+        (
+            "Retry-After: 86400\r\n",
+            "{}",
+            CooldownScope::Global,
+            Some(86_400_000),
+        ),
+    ] {
+        let mut reply = Reply::new(429, body);
+        reply.headers = format!("{headers}X-RateLimit-Bucket: private-provider-bucket\r\n");
+        let mock = MockDiscord::start(reply).await;
+        let executor = mock.executor(keys());
+        let outcome = run_once(&executor, &announcement("private-message")).await;
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::RateLimited(RateLimitCooldown {
+                scope,
+                retry_after_ms: delay,
+            })
+        );
+        assert_eq!(mock.count(), 1);
+        let safe = format!("{outcome:?} {}", serde_json::to_string(&outcome).unwrap());
+        assert!(!safe.contains("private-provider-bucket"));
+        assert!(!safe.contains(body));
+    }
+}
+
+#[tokio::test]
+async fn broken_rate_limit_bodies_retain_headers_and_definite_no_effect() {
+    let mut slow = Reply::new(429, r#"{"retry_after":1,"global":true}"#);
+    slow.body_delay = Duration::from_secs(1);
+    let mut truncated = slow.clone();
+    truncated.body_delay = Duration::ZERO;
+    truncated.truncate = true;
+    let oversized = Reply::new(429, "x".repeat(MAX_RESPONSE_BYTES + 1));
+    for mut reply in [slow, truncated, oversized] {
+        reply.headers = "Retry-After: 6.5\r\nX-RateLimit-Global: true\r\n".to_owned();
+        let mock = MockDiscord::start(reply).await;
+        let executor = mock.executor(keys());
+        assert_eq!(
+            run_once(&executor, &announcement("ok")).await,
+            ExecutionOutcome::RateLimited(RateLimitCooldown {
+                scope: CooldownScope::Global,
+                retry_after_ms: Some(6500),
+            })
         );
         assert_eq!(mock.count(), 1);
     }
@@ -429,8 +549,18 @@ async fn outcomes_debug_serialization_and_logs_never_echo_sensitive_values() {
         &payload(json!({"channel_key": "private-channel-key", "body": "private-request-body"})),
     )
     .await;
+    let mut rate_reply = Reply::new(
+        429,
+        r#"{"retry_after":2,"global":true,"message":"private-rate-message"}"#,
+    );
+    rate_reply.headers = "X-RateLimit-Bucket: private-provider-bucket\r\n".to_owned();
+    let rate_mock = MockDiscord::start(rate_reply).await;
+    let rate_executor = rate_mock.executor(keys());
+    let limited = run_once(&rate_executor, &body).await;
+    assert!(matches!(limited, ExecutionOutcome::RateLimited(_)));
     let output = format!(
-        "{posted:?} {refused:?} {} {} {}",
+        "{posted:?} {refused:?} {limited:?} {} {} {} {}",
+        serde_json::to_string(&limited).unwrap(),
         serde_json::to_string(&posted).unwrap(),
         serde_json::to_string(&refused).unwrap(),
         String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
@@ -442,6 +572,8 @@ async fn outcomes_debug_serialization_and_logs_never_echo_sensitive_values() {
         "private-oauth-response",
         "private-oauth-request",
         "private-channel-key",
+        "private-rate-message",
+        "private-provider-bucket",
         &format!("local-fixture-{}", std::process::id()),
     ] {
         assert!(
