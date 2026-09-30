@@ -38,6 +38,50 @@ table_grants(role_name, oid, privilege) AS (
     WHERE o.kind = 'table'
     UNION ALL
     SELECT 'two_web_reader', oid, 'SELECT' FROM objects WHERE kind = 'view'
+    UNION ALL
+    SELECT 'two_bot_migrator', o.oid, p.name FROM objects o
+    CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) p(name)
+    WHERE o.kind IN ('table', 'ledger', 'view')
+),
+-- System objects have ordinary PUBLIC catalog access. Compare additional grants
+-- with initdb's immutable PUBLIC baseline, not the possibly drifted current ACL.
+-- Membership/attribute findings separately reject all inherited/bypass access.
+-- Column baselines include table-wide rights; redundant non-grantable access is safe.
+-- information_schema is installed after initdb records pg_init_privs. Its shipped
+-- objects (OID < FirstNormalObjectId = 16384) allow SELECT and schema USAGE only.
+-- User-added objects in that namespace do not inherit this exception.
+information_schema_initial AS (
+    SELECT c.oid, ARRAY[makeaclitem(0, c.relowner, 'SELECT', false)] AS acl
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'information_schema' AND c.oid < 16384 AND c.relkind IN ('r', 'v')
+),
+system_acls AS (
+    SELECT c.oid::regclass::text AS target,
+        coalesce(c.relacl, acldefault(CASE WHEN c.relkind = 'S' THEN 's'::"char" ELSE 'r'::"char" END, c.relowner)) AS acl,
+        coalesce(i.initprivs, (SELECT acl FROM information_schema_initial WHERE oid = c.oid),
+            acldefault(CASE WHEN c.relkind = 'S' THEN 's'::"char" ELSE 'r'::"char" END, c.relowner)) AS initial_acl
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_init_privs i ON i.objoid = c.oid AND i.classoid = 'pg_class'::regclass AND i.objsubid = 0 AND i.privtype = 'i'
+    WHERE NOT EXISTS (SELECT FROM app_schemas a WHERE a.oid = n.oid) AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+    UNION ALL
+    SELECT c.oid::regclass::text || '.' || a.attname, a.attacl,
+        coalesce(i.initprivs, (SELECT acl FROM information_schema_initial WHERE oid = c.oid),
+            acldefault('r', c.relowner)) || coalesce(ci.initprivs, ARRAY[]::aclitem[])
+    FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+    LEFT JOIN pg_init_privs i ON i.objoid = c.oid AND i.classoid = 'pg_class'::regclass AND i.objsubid = 0 AND i.privtype = 'i'
+    LEFT JOIN pg_init_privs ci ON ci.objoid = c.oid AND ci.classoid = 'pg_class'::regclass AND ci.objsubid = a.attnum AND ci.privtype = 'i'
+    WHERE NOT EXISTS (SELECT FROM app_schemas n WHERE n.oid = c.relnamespace) AND a.attnum > 0 AND NOT a.attisdropped
+    UNION ALL
+    SELECT p.oid::regprocedure::text, coalesce(p.proacl, acldefault('f', p.proowner)),
+        coalesce(i.initprivs, acldefault('f', p.proowner))
+    FROM pg_proc p LEFT JOIN pg_init_privs i ON i.objoid = p.oid AND i.classoid = 'pg_proc'::regclass AND i.objsubid = 0 AND i.privtype = 'i'
+    WHERE NOT EXISTS (SELECT FROM app_schemas n WHERE n.oid = p.pronamespace)
+    UNION ALL
+    SELECT n.nspname, coalesce(n.nspacl, acldefault('n', n.nspowner)),
+        coalesce(i.initprivs, CASE WHEN n.nspname = 'information_schema' AND n.oid < 16384
+            THEN ARRAY[makeaclitem(0, n.nspowner, 'USAGE', false)] ELSE acldefault('n', n.nspowner) END)
+    FROM pg_namespace n LEFT JOIN pg_init_privs i ON i.objoid = n.oid AND i.classoid = 'pg_namespace'::regclass AND i.objsubid = 0 AND i.privtype = 'i'
+    WHERE NOT EXISTS (SELECT FROM app_schemas a WHERE a.oid = n.oid)
 ),
 findings AS (
     SELECT 'missing role: ' || e.name AS finding
@@ -49,6 +93,19 @@ findings AS (
     SELECT 'outgoing role membership: ' || r.rolname || ' -> ' || parent.rolname
     FROM roles r JOIN pg_auth_members m ON m.member = r.oid
     JOIN pg_roles parent ON parent.oid = m.roleid
+    UNION ALL
+    -- PostgreSQL 15+ parameter ACLs are cluster-wide, including PUBLIC grants.
+    -- No group may acquire SET/ALTER SYSTEM through an explicit parameter ACL.
+    SELECT 'unexpected parameter privilege: ' || r.rolname || '/' || p.parname || '/' || x.privilege_type
+    FROM pg_parameter_acl p CROSS JOIN LATERAL aclexplode(p.paracl) x
+    JOIN roles r ON x.grantee IN (0, r.oid)
+    UNION ALL
+    SELECT 'unexpected system privilege: ' || r.rolname || '/' || a.target || '/' || x.privilege_type
+    FROM system_acls a CROSS JOIN LATERAL aclexplode(a.acl) x JOIN roles r ON x.grantee IN (0, r.oid)
+    WHERE x.is_grantable OR NOT EXISTS (
+        SELECT FROM aclexplode(a.initial_acl) baseline
+        WHERE baseline.grantee = 0 AND baseline.privilege_type = x.privilege_type
+    )
     UNION ALL
     SELECT 'missing CONNECT: ' || rolname FROM roles
     WHERE NOT has_database_privilege(oid, current_database(), 'CONNECT')
@@ -122,6 +179,15 @@ findings AS (
       AND has_sequence_privilege(r.oid, c.oid, p.name) IS DISTINCT FROM
         (r.rolname = 'two_bot_runtime' AND p.name IN ('USAGE', 'SELECT') AND EXISTS (SELECT FROM sequences s WHERE s.oid = c.oid))
     UNION ALL
+    SELECT 'missing migrator sequence privilege: ' || c.oid::regclass::text || '/' || p.name
+    FROM roles r CROSS JOIN sequences s JOIN relations c ON c.oid = s.oid
+    CROSS JOIN (VALUES ('USAGE'), ('SELECT'), ('UPDATE')) p(name)
+    WHERE r.rolname = 'two_bot_migrator' AND NOT has_sequence_privilege(r.oid, c.oid, p.name)
+    UNION ALL
+    SELECT 'missing function EXECUTE: ' || o.schema_name || '.' || o.name
+    FROM objects o JOIN roles r ON r.rolname = 'two_bot_migrator'
+    WHERE o.kind = 'function' AND NOT has_function_privilege(r.oid, o.oid, 'EXECUTE')
+    UNION ALL
     SELECT 'function owner/security differs: ' || o.schema_name || '.' || o.name
     FROM objects o JOIN pg_proc p ON p.oid = o.oid WHERE o.kind = 'function'
       AND (p.proowner IS DISTINCT FROM (SELECT oid FROM roles WHERE rolname = 'two_bot_migrator') OR p.prosecdef)
@@ -133,7 +199,10 @@ findings AS (
         (r.rolname = 'two_web_reader' AND EXISTS (SELECT FROM objects o WHERE o.oid = p.oid AND o.kind = 'function' AND o.schema_name = 'web_v1'))
     UNION ALL
     SELECT 'security_invoker view: ' || c.oid::regclass::text FROM objects o JOIN relations c ON c.oid = o.oid
-    WHERE o.kind = 'view' AND 'security_invoker=true' = ANY(coalesce(c.reloptions, ARRAY[]::text[]))
+    WHERE o.kind = 'view' AND EXISTS (
+        SELECT FROM pg_options_to_table(c.reloptions) option
+        WHERE option.option_name = 'security_invoker' AND option.option_value::boolean
+    )
     UNION ALL
     SELECT 'unexpected grant option: ' || r.rolname || '/' || a.target || '/' || x.privilege_type
     FROM (

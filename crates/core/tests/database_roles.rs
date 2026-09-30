@@ -186,11 +186,104 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         execute(pool, restore).await?;
         require(findings(pool, roles).await?.is_empty(), "restored drift remained")?;
     }
+    verifier_gap_regressions(pool, roles).await?;
     require(
         findings(pool, roles).await?.is_empty(),
         "restored matrix drifted",
     )?;
     Ok(())
+}
+
+async fn verifier_gap_regressions(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    let (migrator, runtime, reader) = (&roles[0], &roles[1], &roles[2]);
+    // Catalog probes inspect privileges only; never read password verifiers or files.
+    as_role(pool, reader, "SELECT count(*) FROM pg_catalog.pg_class").await?;
+    denied(pool, reader, "SELECT rolname FROM pg_catalog.pg_authid").await?;
+    denied(
+        pool,
+        runtime,
+        "SET LOCAL session_replication_role = replica",
+    )
+    .await?;
+    for (change, expected) in [
+        (format!("GRANT SET ON PARAMETER session_replication_role TO {runtime}"), "unexpected parameter privilege:"),
+        (format!("GRANT ALTER SYSTEM ON PARAMETER session_replication_role TO {migrator}"), "unexpected parameter privilege:"),
+        (format!("GRANT SET ON PARAMETER session_replication_role TO {reader} WITH GRANT OPTION"), "unexpected parameter privilege:"),
+        (format!("GRANT SET, ALTER SYSTEM ON PARAMETER \"{runtime}.probe\" TO PUBLIC"), "unexpected parameter privilege:"),
+        (format!("GRANT SELECT ON pg_catalog.pg_authid TO {reader}"), "unexpected system privilege:"),
+        (format!("GRANT SELECT (rolpassword) ON pg_catalog.pg_authid TO {reader}"), "unexpected system privilege:"),
+        ("GRANT SELECT ON pg_catalog.pg_authid TO PUBLIC".to_owned(), "unexpected system privilege:"),
+        (format!("GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO {reader}"), "unexpected system privilege:"),
+        ("GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO PUBLIC".to_owned(), "unexpected system privilege:"),
+        (format!("GRANT SELECT ON pg_catalog.pg_class TO {reader} WITH GRANT OPTION"), "unexpected system privilege:"),
+        (format!("REVOKE SELECT ON public.members FROM {migrator}"), "missing table privilege:"),
+        (format!("REVOKE EXECUTE ON FUNCTION web_v1._iso(timestamptz) FROM {migrator}"), "missing function EXECUTE:"),
+        (format!("ALTER SEQUENCE public.events_id_seq OWNED BY NONE; REVOKE USAGE, SELECT ON SEQUENCE public.events_id_seq FROM {runtime}"), "sequence privilege differs:"),
+    ] {
+        let detected = transactional_drift(pool, roles, &change).await?;
+        require(detected.iter().any(|f| f.starts_with(expected)), &format!("missed drift: {change}"))?;
+        require(findings(pool, roles).await?.is_empty(), "rollback drifted")?;
+    }
+    for spelling in ["true", "on", "yes", "1", "t", "y", "TRUE", "ON"] {
+        let change = format!("ALTER VIEW web_v1.members SET (security_invoker = '{spelling}')");
+        let detected = transactional_drift(pool, roles, &change).await?;
+        require(
+            detected
+                .iter()
+                .any(|f| f.starts_with("security_invoker view:")),
+            &format!("missed boolean: {spelling}"),
+        )?;
+    }
+    for spelling in ["false", "off", "no", "0", "f", "n", "FALSE", "OFF"] {
+        let change = format!("ALTER VIEW web_v1.members SET (security_invoker = '{spelling}')");
+        require(
+            transactional_drift(pool, roles, &change).await?.is_empty(),
+            &format!("false boolean drifted: {spelling}"),
+        )?;
+    }
+    // Reapplication must repair revoked owner rights and detached serial sequences.
+    execute(pool, format!("REVOKE SELECT ON public.members FROM {migrator}; REVOKE EXECUTE ON FUNCTION web_v1._iso(timestamptz) FROM {migrator}; ALTER SEQUENCE public.events_id_seq OWNED BY NONE; REVOKE USAGE, SELECT ON SEQUENCE public.events_id_seq FROM {runtime}")).await?;
+    execute(pool, isolated(&database_roles::plan(), roles)).await?;
+    require(
+        findings(pool, roles).await?.is_empty(),
+        "reapplied plan did not repair required grants",
+    )?;
+    as_role(pool, reader, "SELECT * FROM web_v1.members").await?;
+    as_role(pool, runtime, "INSERT INTO public.events (event_type, guild_id, occurred_at, source, idempotency_key) VALUES ('roles', 'roles', now(), 'roles', 'roles')").await?;
+    execute(
+        pool,
+        "ALTER SEQUENCE public.events_id_seq OWNED BY public.events.id".to_owned(),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn transactional_drift(
+    pool: &PgPool,
+    roles: &[String],
+    change: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    // Parameter ACLs and PUBLIC grants are transactional too: never leave a
+    // cluster-wide test grant behind on an assertion or query failure.
+    let mut tx = pool.begin().await?;
+    let sql = include_str!("../../../sql/verify_database_roles.sql").replace(
+        "-- @matrix",
+        include_str!("../../../sql/database_role_matrix.sql"),
+    );
+    let result = async {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(change.to_owned()))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::raw_sql("SET LOCAL search_path = pg_catalog, pg_temp")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query_scalar(sqlx::AssertSqlSafe(isolated(&sql, roles)))
+            .fetch_all(&mut *tx)
+            .await
+    }
+    .await;
+    tx.rollback().await?;
+    result
 }
 
 #[tokio::test]

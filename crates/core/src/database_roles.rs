@@ -63,13 +63,23 @@ mod tests {
             include_str!("../../cutover/migrations/0340_operational_audit.sql"),
             include_str!("../../cutover/migrations/0350_internal_actions.sql"),
         ] {
+            let mut table = None;
             for line in migration.lines() {
-                let Some(rest) = line.strip_prefix("CREATE TABLE ") else {
-                    continue;
-                };
-                let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
-                let name = rest.split_whitespace().next().unwrap();
-                assert!(MATRIX.contains(&format!("'public', '{name}', 'table'")));
+                if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
+                    let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+                    let name = rest.split_whitespace().next().unwrap();
+                    assert!(MATRIX.contains(&format!("'public', '{name}', 'table'")));
+                    table = Some(name);
+                } else {
+                    let mut words = line.split_whitespace();
+                    if let (Some(column), Some("BIGSERIAL" | "SERIAL" | "SMALLSERIAL")) =
+                        (words.next(), words.next())
+                    {
+                        let table = table.expect("serial column outside table");
+                        assert!(MATRIX
+                            .contains(&format!("'public', '{table}_{column}_seq', 'sequence'")));
+                    }
+                }
             }
         }
         for line in include_str!("../../../sql/web_v1.sql").lines() {

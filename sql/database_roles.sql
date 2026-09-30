@@ -60,6 +60,7 @@ BEGIN
             END IF;
             EXECUTE format('ALTER FUNCTION %s OWNER TO two_bot_migrator', target);
             EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC, two_bot_runtime, two_web_reader', target);
+            EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO two_bot_migrator', target);
             IF obj.schema_name = 'web_v1' THEN
                 EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO two_web_reader', target);
             END IF;
@@ -68,11 +69,14 @@ BEGIN
             IF obj.kind = 'sequence' THEN
                 EXECUTE format('ALTER SEQUENCE %s OWNER TO two_bot_migrator', target);
                 EXECUTE format('REVOKE ALL ON SEQUENCE %s FROM PUBLIC, two_bot_runtime, two_web_reader', target);
+                EXECUTE format('GRANT ALL ON SEQUENCE %s TO two_bot_migrator', target);
                 EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE %s TO two_bot_runtime', target);
             ELSE
                 EXECUTE format('ALTER %s %s OWNER TO two_bot_migrator',
                     CASE WHEN obj.kind = 'view' THEN 'VIEW' ELSE 'TABLE' END, target);
                 EXECUTE format('REVOKE ALL ON TABLE %s FROM PUBLIC, two_bot_runtime, two_web_reader', target);
+                -- Ownership retains grant authority, not revoked ordinary rights.
+                EXECUTE format('GRANT ALL ON TABLE %s TO two_bot_migrator', target);
                 IF obj.kind = 'table' THEN
                     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE %s TO two_bot_runtime', target);
                 ELSIF obj.kind = 'view' THEN

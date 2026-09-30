@@ -49,14 +49,35 @@ arguments exit 2. Connection errors with potentially sensitive details are
 withheld. Findings identify objects/privileges, never table contents or passwords.
 Drift is a failure, not an automatic repair.
 
-Verification checks missing groups/objects, group attributes and memberships,
-database/schema privileges, ownership/object kinds, effective table/column/
-sequence/function privileges (including PUBLIC), grant options, view invoker
-settings and unsafe future grants. Explicit grants cover the current migrations'
-41 bot tables, SQLx ledger ownership, associated SERIAL/IDENTITY sequences and
-`guild_settings_version_seq`, nine web views and five functions. New relations
-need a reviewed matrix update; there are **no wildcard future-table grants**.
-Migrator-created functions default to no PUBLIC EXECUTE.
+The tooling requires **PostgreSQL 15 or newer**, including parameter ACLs and
+view `security_invoker` options; an unsupported catalog/query fails verification,
+never returns PASS. Verification checks missing groups/objects, group attributes
+and memberships, database/schema privileges, ownership/object kinds, effective
+table/column/sequence/function privileges (including PUBLIC), grant options, parsed
+boolean view invoker settings and unsafe future grants. Explicit grants cover the
+current migrations' 41 bot tables, SQLx ledger, eight named SERIAL sequences and
+`guild_settings_version_seq`, nine web views and five functions. A detached SERIAL
+sequence remains required even after `OWNED BY NONE`. New relations/sequences need
+a reviewed matrix update; there are **no wildcard future-table grants**.
+Migrator-created functions default to no PUBLIC EXECUTE. Ownership alone does not
+prove ordinary ACL privileges: verification checks the migrator's required table,
+sequence and helper-function rights, and reapplication restores those rights.
+
+No group may hold explicit parameter SET/ALTER SYSTEM grants, including grants
+through PUBLIC or with grant options. Such grants (e.g. `session_replication_role`)
+can disable audit triggers without a superuser attribute. They are cluster-wide:
+the plan does not revoke them automatically; any correction needs an independently
+reviewed operator change.
+
+Normal PUBLIC catalog reads/functions remain available. Additional system-schema
+relation, column, function and schema grants are checked against PostgreSQL's
+`pg_init_privs` initial PUBLIC ACLs (or its default ACL where no initial ACL exists),
+not the possibly drifted current PUBLIC grants. Built-in `information_schema`
+objects have no initial ACL records: the policy allows SELECT and schema USAGE
+only on its shipped objects (OID below `FirstNormalObjectId`, 16384); user-added
+objects do not inherit that exception. Sensitive catalogs such as `pg_authid` and
+restricted catalog functions do not gain an exception. Tests check grants without
+reading password-verifier values or server files.
 
 A group-only PASS does **not** certify independently provisioned login identities,
 other databases in the PostgreSQL cluster, RLS policy behavior, arbitrary changed
