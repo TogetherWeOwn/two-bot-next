@@ -4,22 +4,23 @@
 
 ### Added
 
+- Port game/session picker decisions, legacy/session/anchor welcome modes, rules-gate prompt eligibility and mention-free session goodbyes to the Rust domain core. Preserve legacy funnel rows with a sqlx prompt guard, migration 0190 and isolated agent-testdb/mock delivery tests. Runtime router/REST wiring remains a follow-up.
+- Port sticky-message domain logic, debounce claims and PostgreSQL persistence, with a legacy timestamp upgrade and UTF-16-compatible body limits. Discord command and REST wiring remains in the S4 integration slices.
+- RSVP domain logic and database store for going, interested and declined responses, namespaced attendance totals, and ManageEvents-gated host check-in facts, with legacy-compatible tables and replies.
 - Member moderation domain for ban, tempban, kick, timeout and warn, with
   idempotent claims, durable scheduled-unban recovery and audit/warning ledgers.
 - Feature-gated Postgres moderation store and isolated test-container CI coverage.
-- Port sticky-message domain logic, debounce claims and PostgreSQL persistence, with a legacy timestamp upgrade and UTF-16-compatible body limits. Discord command and REST wiring remains in the S4 integration slices.
-- RSVP domain logic and database store for going, interested and declined responses, namespaced attendance totals, and ManageEvents-gated host check-in facts, with legacy-compatible tables and replies.
 
 ### Fixed
 
+- Serialize concurrent first RSVP responses before reading the previous status, including when no response row exists yet.
+- Fail configured RSVP database-test setup errors instead of silently skipping, and isolate each test invocation in its own schema.
 - Scope unban recovery to its guild, fence older expiries with durable ban
   generations, and recover only explicitly accepted bans rather than guessed
   staging. Permanent bans supersede older tempbans; failed refusal cleanup keeps
   a reconciliation fence instead of scheduling an unsafe unban.
 - Claim sweep jobs individually so cancellation cannot strand an undispatched
   batch, and bound the final generated expiry reason with Unicode-safe truncation.
-- Serialize concurrent first RSVP responses before reading the previous status, including when no response row exists yet.
-- Fail configured RSVP database-test setup errors instead of silently skipping, and isolate each test invocation in its own schema.
 
 ### Notes
 
