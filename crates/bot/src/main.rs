@@ -8,6 +8,8 @@
 mod gateway;
 #[cfg(test)]
 mod gateway_tests;
+#[cfg(test)]
+mod lifecycle_tests;
 mod server;
 
 use std::sync::Arc;
@@ -50,11 +52,11 @@ async fn main() {
 
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
 
-    if let Some(token) = config.discord_token.clone().filter(|t| !t.is_empty()) {
+    let gateway_task = if let Some(token) = config.discord_token.clone().filter(|t| !t.is_empty()) {
         let database_url = config.database_url.clone();
         let guild_id = config.guild_id;
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let result: Result<(), sqlx::Error> = async {
                 let url = database_url
                     .as_deref()
@@ -91,17 +93,45 @@ async fn main() {
                 );
                 *state.write().await = GatewayState::Armed;
             }
-        });
+            result
+        }))
     } else {
         info!(
             status = ?ComponentStatus::Down,
             "no discord token; gateway parked, /readyz reports down"
         );
-    }
+        None
+    };
 
-    if let Err(err) = serve(&config.listen_addr, state).await {
-        tracing::error!(error = %err, "http server failed");
+    let http = serve(&config.listen_addr, state);
+    let result = match gateway_task {
+        Some(task) => supervise_gateway(task, http).await,
+        None => http.await,
+    };
+    if let Err(err) = result {
+        tracing::error!(error = %err, "container service failed");
         std::process::exit(1);
+    }
+}
+
+/// A configured gateway is essential: never leave a health-only zombie after
+/// initialization/dispatch failure, stream termination, or a task panic. Exit
+/// nonzero so the Container supervisor can restart from the committed checkpoint.
+/// Source: https://docs.rs/tokio/1/tokio/macro.select.html#cancellation-safety
+async fn supervise_gateway(
+    mut task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
+    http: impl std::future::Future<Output = std::io::Result<()>>,
+) -> std::io::Result<()> {
+    tokio::select! {
+        biased;
+        // Never expose task/SQL errors: they may contain connection secrets.
+        _ = &mut task => Err(std::io::Error::other(
+            "gateway task stopped; container restart required",
+        )),
+        result = http => {
+            task.abort();
+            result
+        }
     }
 }
 

@@ -26,6 +26,8 @@ use crate::gateway::{
     build_pipeline, ensure_crypto_provider, load_boot_session, run_shard, GatewayState,
 };
 
+mod recovery;
+
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";
 
@@ -257,6 +259,11 @@ impl MockGateway {
     /// Two connections in invalid-session mode: reject RESUME with opcode 9,
     /// then accept IDENTIFY. Otherwise run the supplied dispatch script.
     async fn new(invalid: bool, resume: bool) -> Self {
+        Self::with_close(invalid, resume, None).await
+    }
+
+    async fn with_close(invalid: bool, resume: bool, close: Option<u16>) -> Self {
+        let invalid = invalid || close.is_some();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock listen");
         let url = format!("ws://{}", listener.local_addr().expect("address"));
         let (sender, auth) = mpsc::channel(4);
@@ -287,9 +294,14 @@ impl MockGateway {
                         Some(2 | 6) => {
                             sender.send(packet).await.expect("auth capture");
                             if invalid && connection == 0 {
-                                ws.send(Message::text("{\"op\":9,\"d\":false}".to_owned()))
-                                    .await
-                                    .expect("invalid session");
+                                let rejection = match close {
+                                    Some(code) => Message::close(
+                                        Some(tokio_websockets::CloseCode::try_from(code).unwrap()),
+                                        "invalid session",
+                                    ),
+                                    None => Message::text("{\"op\":9,\"d\":false}".to_owned()),
+                                };
+                                ws.send(rejection).await.expect("invalid session");
                                 // Wait for Twilight's normal-close response before
                                 // accepting its IDENTIFY reconnect.
                                 while let Some(Ok(message)) = ws.next().await {

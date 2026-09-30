@@ -168,9 +168,21 @@ async fn run_loop(
         };
         let Message::Text(text) = message else {
             *state.write().await = GatewayState::Armed;
-            if shard.session().is_none() {
+            // Twilight 0.17.1 retains its session on gateway-initiated closes.
+            // Discord requires a new session for these two reconnectable codes.
+            // Source: https://docs.discord.com/developers/topics/opcodes-and-status-codes#gateway-gateway-close-event-codes
+            let rejected = matches!(
+                message,
+                Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009)
+            );
+            if rejected || shard.session().is_none() {
                 store.clear().await?;
                 committed = None;
+            }
+            if rejected {
+                // Shard construction consumed the config's saved session/URL,
+                // so this fresh shard IDENTIFYs while retaining intents/queue.
+                *shard = Shard::with_config(shard.id(), shard.config().clone());
             }
             continue;
         };
@@ -197,8 +209,17 @@ async fn run_loop(
             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing sequence".into()))?;
         let session = session_snapshot(shard)
             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing session".into()))?;
+        // Twilight drops resume_url on a failed connect, but retains the session
+        // and may successfully RESUME at its bootstrap endpoint. RESUMED carries
+        // no new URL: retain READY's committed URL only for this same session.
         let resume_url = shard
             .resume_url()
+            .or_else(|| {
+                committed
+                    .as_ref()
+                    .filter(|saved| saved.session_id == session.id())
+                    .map(|saved| saved.resume_url.as_str())
+            })
             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
         let checkpoint = GatewaySession {
             session_id: session.id().to_owned(),

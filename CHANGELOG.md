@@ -20,3 +20,4 @@
 - Render integral JSON settings as integer environment strings so decimal/exponent thresholds survive database round-trips into config readers, without rounding integer IDs through floating point.
 - Serialize concurrent first RSVP responses before reading the previous status, including when no response row exists yet.
 - Fail configured RSVP database-test setup errors instead of silently skipping, and isolate each test invocation in its own schema.
+- Recover gateway sessions rejected with close codes 4007/4009, preserve the committed READY URL after endpoint fallback, and exit for Container restart when the essential gateway task stops instead of serving a healthy zombie.
