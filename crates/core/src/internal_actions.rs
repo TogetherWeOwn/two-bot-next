@@ -1,12 +1,11 @@
-//! Website-to-bot internal actions: pure-domain half of `POST /internal/actions`.
+//! Website-to-bot internal actions: authentication and domain checks.
 //!
 //! Ports `src/internal/*` from legacy two-bot (frozen `main`, card acceptance
-//! criteria) as framework-free data plus pure functions. The axum route, the
-//! twilight Discord calls land in later slices in the bot crate. The durable
-//! guards live in `internal_action_store` behind the `db` feature; this
-//! module owns the order of the checks and every refusal the caller can see, so
-//! the whole pipeline below is unit-testable without Discord, Postgres, or a
-//! socket.
+//! criteria) as framework-free data plus pure functions. The Axum listener and
+//! Discord executor are separate concerns. Durable guards live in
+//! `internal_action_store` behind `db`; [`AuthenticatedRequest`] bridges its
+//! async nonce commit to the shared post-replay checks. The in-memory
+//! [`authorize`] path remains unit-testable without Discord, Postgres or sockets.
 //!
 //! Legacy map (`src/internal/*.ts`):
 //! - `signing.ts` — HMAC-SHA256 `sha256=` over
@@ -1439,6 +1438,131 @@ impl std::fmt::Debug for AuthDecision {
     }
 }
 
+/// A signature-verified, fresh request, before replay protection or JSON parsing.
+/// The raw bytes and authenticated headers stay bound together across an async
+/// database wait. No `Clone` or `Debug`: this is a one-use capability, not a log.
+pub struct AuthenticatedRequest<'a> {
+    key_id: &'a str,
+    #[cfg(feature = "db")]
+    timestamp: &'a str,
+    #[cfg(feature = "db")]
+    skew_seconds: u64,
+    nonce: &'a str,
+    raw: &'a [u8],
+}
+
+/// A request whose nonce has been committed. Only this type can perform the
+/// post-replay checks. Neither type exposes a public constructor.
+pub struct NonceBurnedRequest<'a>(AuthenticatedRequest<'a>);
+
+impl<'a> AuthenticatedRequest<'a> {
+    /// Authenticate headers and exact bytes without parsing JSON or touching
+    /// replay/rate-limit state. Malformed authenticated bodies must reach the
+    /// nonce burn; unverified requests must never reach it.
+    pub fn verify(
+        headers: &AuthHeaders<'a>,
+        raw: &'a [u8],
+        keys: &KeyRing,
+        skew_seconds: u64,
+        now_unix_secs: u64,
+    ) -> Result<Self, ActionError> {
+        if headers.key_id.is_empty()
+            || headers.timestamp.is_empty()
+            || headers.nonce.is_empty()
+            || headers.signature.is_empty()
+        {
+            return Err(auth_failure("missing_auth_headers"));
+        }
+        if !valid_nonce_format(headers.nonce) {
+            return Err(auth_failure("bad_nonce_format"));
+        }
+        if !keys.verify(
+            headers.key_id,
+            headers.signature,
+            headers.timestamp,
+            headers.nonce,
+            raw,
+        ) {
+            return Err(auth_failure("bad_signature"));
+        }
+        if !within_skew(headers.timestamp, skew_seconds, now_unix_secs) {
+            return Err(ActionError::new(
+                ErrorCode::StaleRequest,
+                format!("Timestamp is outside the ±{skew_seconds}s window"),
+                "stale_timestamp",
+            ));
+        }
+        Ok(Self {
+            key_id: headers.key_id,
+            #[cfg(feature = "db")]
+            timestamp: headers.timestamp,
+            #[cfg(feature = "db")]
+            skew_seconds,
+            nonce: headers.nonce,
+            raw,
+        })
+    }
+
+    /// Re-check freshness against database time and commit the nonce before any
+    /// JSON, bucket or action check. Only a successful new burn grants the next
+    /// stage. Cancellation/DB failure never grants a volatile fallback.
+    #[cfg(feature = "db")]
+    pub async fn burn_durably(
+        self,
+        store: &crate::internal_action_store::InternalActionStore,
+    ) -> Result<NonceBurnedRequest<'a>, ActionError> {
+        use crate::internal_action_store::InternalStoreError;
+
+        // The store's commit-time clock and retention use this fixed window.
+        // Do not silently widen a caller's narrower window during a DB wait.
+        if self.skew_seconds != SKEW_SECONDS {
+            return Err(ActionError::new(
+                ErrorCode::Internal,
+                "Server misconfigured: durable nonce skew mismatch",
+                "nonce_skew_mismatch",
+            ));
+        }
+        match store.burn_nonce(self.nonce, self.timestamp).await {
+            Ok(true) => Ok(NonceBurnedRequest(self)),
+            Ok(false) => Err(replayed_nonce()),
+            Err(InternalStoreError::InvalidInput) => Err(ActionError::new(
+                ErrorCode::StaleRequest,
+                "Request expired before nonce commit",
+                "stale_timestamp",
+            )),
+            Err(_) => Err(ActionError::new(
+                ErrorCode::Internal,
+                "Internal action storage unavailable",
+                "nonce_store_unavailable",
+            )),
+        }
+    }
+}
+
+impl NonceBurnedRequest<'_> {
+    /// Continue only after the nonce burn. Uses the same signed bytes, never a
+    /// separately supplied/re-serialized payload. Idempotency and per-verb
+    /// validation still belong before execution, not inside authentication.
+    pub fn authorize(
+        self,
+        flags: &InternalFlags,
+        has_store: bool,
+        has_settings: bool,
+        now_ms: u64,
+        buckets: &mut TokenBuckets,
+    ) -> Result<AuthDecision, ActionError> {
+        authorize_burned(self.0, flags, has_store, has_settings, now_ms, buckets)
+    }
+}
+
+fn replayed_nonce() -> ActionError {
+    ActionError::new(
+        ErrorCode::Replayed,
+        "This nonce has already been used",
+        "replayed_nonce",
+    )
+}
+
 /// Authorise one request against the load-bearing check order:
 ///
 /// 1. headers present → 2. signature (unknown id and bad signature are one
@@ -1464,32 +1588,7 @@ pub fn authorize(
     nonces: &mut NonceCache,
     buckets: &mut TokenBuckets,
 ) -> Result<AuthDecision, ActionError> {
-    if headers.key_id.is_empty()
-        || headers.timestamp.is_empty()
-        || headers.nonce.is_empty()
-        || headers.signature.is_empty()
-    {
-        return Err(auth_failure("missing_auth_headers"));
-    }
-    if !valid_nonce_format(headers.nonce) {
-        return Err(auth_failure("bad_nonce_format"));
-    }
-    if !keys.verify(
-        headers.key_id,
-        headers.signature,
-        headers.timestamp,
-        headers.nonce,
-        raw,
-    ) {
-        return Err(auth_failure("bad_signature"));
-    }
-    if !within_skew(headers.timestamp, skew_seconds, now_unix_secs) {
-        return Err(ActionError::new(
-            ErrorCode::StaleRequest,
-            format!("Timestamp is outside the ±{skew_seconds}s window"),
-            "stale_timestamp",
-        ));
-    }
+    let verified = AuthenticatedRequest::verify(headers, raw, keys, skew_seconds, now_unix_secs)?;
     // The skew is configurable independently of the cache TTL, so enforce the
     // coverage relation on the live pair: a nonce must still be live at every
     // instant its signed timestamp is fresh. A skew-180/TTL-240 wiring would
@@ -1508,14 +1607,21 @@ pub fn authorize(
             "nonce_ttl_too_short",
         ));
     }
-    if !nonces.offer(headers.nonce, now_ms) {
-        return Err(ActionError::new(
-            ErrorCode::Replayed,
-            "This nonce has already been used",
-            "replayed_nonce",
-        ));
+    if !nonces.offer(verified.nonce, now_ms) {
+        return Err(replayed_nonce());
     }
-    let per_key = buckets.take(&format!("key:{}", headers.key_id), DEFAULT_BUCKET, now_ms);
+    NonceBurnedRequest(verified).authorize(flags, has_store, has_settings, now_ms, buckets)
+}
+
+fn authorize_burned(
+    verified: AuthenticatedRequest<'_>,
+    flags: &InternalFlags,
+    has_store: bool,
+    has_settings: bool,
+    now_ms: u64,
+    buckets: &mut TokenBuckets,
+) -> Result<AuthDecision, ActionError> {
+    let per_key = buckets.take(&format!("key:{}", verified.key_id), DEFAULT_BUCKET, now_ms);
     if !per_key.allowed {
         return Err(ActionError::new(
             ErrorCode::RateLimited,
@@ -1525,7 +1631,7 @@ pub fn authorize(
         .with_retry_after(per_key.retry_after_secs));
     }
 
-    let body = parse_body_object(raw)?;
+    let body = parse_body_object(verified.raw)?;
     let action = match body.get("action").and_then(Value::as_str) {
         Some(a) if !a.is_empty() => a.to_owned(),
         _ => {
@@ -1540,7 +1646,7 @@ pub fn authorize(
 
     if action == "guild.add_member" {
         let per_action = buckets.take(
-            &format!("key:{}:add_member", headers.key_id),
+            &format!("key:{}:add_member", verified.key_id),
             ADD_MEMBER_BUCKET,
             now_ms,
         );
@@ -1555,7 +1661,7 @@ pub fn authorize(
     }
 
     Ok(AuthDecision {
-        key_id: headers.key_id.to_owned(),
+        key_id: verified.key_id.to_owned(),
         action,
         body,
     })

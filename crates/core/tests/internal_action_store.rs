@@ -49,6 +49,199 @@ async fn db_now_secs(pool: &PgPool) -> i64 {
         .unwrap()
 }
 
+// Public cross-implementation signing fixture, never runtime key material.
+fn signing_key() -> two_bot_core::internal_actions::SigningKey {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/internal-action-signing.json");
+    let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    two_bot_core::internal_actions::SigningKey {
+        id: "fixture-caller".to_owned(),
+        secret: fixture["vectors"][0]["secret"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn authenticated_malformed_body_burns_before_parsing_and_survives_restart() {
+    use two_bot_core::internal_actions::{
+        sign, AuthHeaders, AuthenticatedRequest, ErrorCode, InternalFlags, KeyRing, TokenBuckets,
+    };
+
+    let db = TestDb::new().await;
+    let key = signing_key();
+    let keys = KeyRing::new(vec![key.clone()]);
+    let now = db_now_secs(&db.pool).await as u64;
+    let timestamp = now.to_string();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
+    let raw = b"not json";
+    let signature = sign(&key.secret, &timestamp, &nonce, raw);
+    let headers = AuthHeaders {
+        key_id: &key.id,
+        timestamp: &timestamp,
+        nonce: &nonce,
+        signature: &signature,
+    };
+    let verified = AuthenticatedRequest::verify(&headers, raw, &keys, SKEW_SECONDS, now).unwrap();
+    let burned = verified.burn_durably(&db.store()).await.unwrap();
+    let flags = InternalFlags::from_map(&std::collections::HashMap::new());
+    let error = burned
+        .authorize(&flags, true, false, now * 1000, &mut TokenBuckets::new())
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Malformed);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_nonces")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let restarted = db.independent_pool().await;
+    let verified = AuthenticatedRequest::verify(&headers, raw, &keys, SKEW_SECONDS, now).unwrap();
+    let error = verified
+        .burn_durably(&InternalActionStore::new(restarted.clone()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, ErrorCode::Replayed);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    restarted.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn invalid_authentication_cannot_burn_or_drain_buckets() {
+    use two_bot_core::internal_actions::{
+        sign, AuthHeaders, AuthenticatedRequest, ErrorCode, InternalFlags, KeyRing, TokenBuckets,
+    };
+
+    let db = TestDb::new().await;
+    let key = signing_key();
+    let keys = KeyRing::new(vec![key.clone()]);
+    let now = db_now_secs(&db.pool).await as u64;
+    let timestamp = now.to_string();
+    let stale = (now - SKEW_SECONDS - 1).to_string();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
+    let raw = br#"{"action":"role.assign"}"#;
+    let good = sign(&key.secret, &timestamp, &nonce, raw);
+    let old = sign(&key.secret, &stale, &nonce, raw);
+    let mut buckets = TokenBuckets::new();
+    for (id, timestamp, signature, expected) in [
+        (
+            key.id.as_str(),
+            timestamp.as_str(),
+            "sha256=invalid",
+            ErrorCode::Unauthorized,
+        ),
+        (
+            "unknown",
+            timestamp.as_str(),
+            good.as_str(),
+            ErrorCode::Unauthorized,
+        ),
+        (
+            key.id.as_str(),
+            stale.as_str(),
+            old.as_str(),
+            ErrorCode::StaleRequest,
+        ),
+    ] {
+        for _ in 0..25 {
+            let headers = AuthHeaders {
+                key_id: id,
+                timestamp,
+                nonce: &nonce,
+                signature,
+            };
+            let error = AuthenticatedRequest::verify(&headers, raw, &keys, SKEW_SECONDS, now)
+                .err()
+                .unwrap();
+            assert_eq!(error.code, expected);
+        }
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_nonces")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let headers = AuthHeaders {
+        key_id: &key.id,
+        timestamp: &timestamp,
+        nonce: &nonce,
+        signature: &good,
+    };
+    let burned = AuthenticatedRequest::verify(&headers, raw, &keys, SKEW_SECONDS, now)
+        .unwrap()
+        .burn_durably(&db.store())
+        .await
+        .unwrap();
+    let flags = InternalFlags::from_map(&std::collections::HashMap::new());
+    let decision = burned
+        .authorize(&flags, true, false, now * 1000, &mut buckets)
+        .unwrap();
+    assert_eq!(decision.action, "role.assign");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_nonce_storage_and_incompatible_skew_cannot_grant_authorization() {
+    use two_bot_core::internal_actions::{
+        sign, AuthHeaders, AuthenticatedRequest, ErrorCode, KeyRing,
+    };
+
+    let db = TestDb::new().await;
+    let key = signing_key();
+    let keys = KeyRing::new(vec![key.clone()]);
+    let now = db_now_secs(&db.pool).await as u64;
+    let timestamp = now.to_string();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
+    let raw = br#"{"action":"role.assign"}"#;
+    let signature = sign(&key.secret, &timestamp, &nonce, raw);
+    let headers = AuthHeaders {
+        key_id: &key.id,
+        timestamp: &timestamp,
+        nonce: &nonce,
+        signature: &signature,
+    };
+    for skew in [SKEW_SECONDS - 1, SKEW_SECONDS + 1] {
+        let error = AuthenticatedRequest::verify(&headers, raw, &keys, skew, now)
+            .unwrap()
+            .burn_durably(&db.store())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.log_reason, "nonce_skew_mismatch");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_nonces")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    let closed = db.independent_pool().await;
+    closed.close().await;
+    let error = AuthenticatedRequest::verify(&headers, raw, &keys, SKEW_SECONDS, now)
+        .unwrap()
+        .burn_durably(&InternalActionStore::new(closed))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(error.log_reason, "nonce_store_unavailable");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_nonces")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    db.cleanup().await;
+}
+
 async fn wait_for_uniqueness_lock(db: &TestDb, table: &str) {
     // Observe only this owned test database's sessions. Bounded synchronization
     // proves the VALUES clock was sampled before rollback; no timing-only sleep.
