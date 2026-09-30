@@ -368,7 +368,9 @@ async function migrationGrowthOverflowLifecycle() {
       postReleaseCount++;
     }
   }
-  assert.equal(bootstrapCount, 18, 'Retain all existing bootstrap lifecycle cases');
-  assert.equal(postReleaseCount, 18, 'Exercise the actual next native release for every generated snapshot');
+  const expectedLifecycles = 2 * (members.length + 5); // root + Worker + three commit types, tagged/untagged
+  assert(expectedLifecycles >= 18, 'Retain all existing workspace lifecycle coverage');
+  assert.equal(bootstrapCount, expectedLifecycles, 'Exercise bootstrap for every workspace scope');
+  assert.equal(postReleaseCount, expectedLifecycles, 'Exercise the actual next native release for every generated snapshot');
   console.log(`PASS ${bootstrapCount} bootstrap + ${postReleaseCount} generated post-release native lifecycles; 5 migration guards; 8 overflow guards; 4 snapshot guards; 1 overflow lifecycle`);
 })().catch(error => { console.error(error.stack); process.exitCode = 1; });
