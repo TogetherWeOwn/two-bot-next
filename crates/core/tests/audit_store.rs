@@ -2,6 +2,7 @@
 //! cargo test -p two-bot-core --features db --test audit_store --locked -- --ignored
 #![cfg(feature = "db")]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
@@ -13,6 +14,21 @@ use two_bot_core::audit_store::{
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 const MIGRATION: &str = include_str!("../../cutover/migrations/0340_operational_audit.sql");
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "audit_test_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
 
 struct TestDb {
     admin: PgPool,
@@ -42,11 +58,7 @@ impl TestDb {
             .acquire_timeout(Duration::from_secs(5))
             .connect_with(options.clone())
             .await?;
-        let schema = format!(
-            "audit_test_{}_{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        );
+        let schema = schema_name_at(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos());
         QueryBuilder::<sqlx::Postgres>::new("CREATE SCHEMA ")
             .push(&schema)
             .build()
