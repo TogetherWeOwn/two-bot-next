@@ -6,7 +6,7 @@
 //! Discord failures, and clear recovery state only after restoration succeeds.
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use std::str::FromStr;
 
 use super::channel_moderation::LockdownRecord;
@@ -277,6 +277,23 @@ impl ChannelModerationStore {
         result_json: &str,
         completed_at: &str,
     ) -> Result<bool, sqlx::Error> {
+        Self::complete_on(
+            &mut *self.pool.acquire().await?,
+            ticket,
+            outcome,
+            result_json,
+            completed_at,
+        )
+        .await
+    }
+
+    async fn complete_on(
+        connection: &mut PgConnection,
+        ticket: &ChannelClaimTicket,
+        outcome: &str,
+        result_json: &str,
+        completed_at: &str,
+    ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE moderation_idempotency
                 SET state = 'done', outcome = $1, result_json = $2, completed_at = $3
@@ -289,9 +306,136 @@ impl ChannelModerationStore {
         .bind(&ticket.guild_id)
         .bind(&ticket.idempotency_key)
         .bind(&ticket.claim_token)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Reserve a channel before reading recovery state or making any Discord
+    /// call. Shared by slash and website executors; distinct request keys do not
+    /// bypass it. Busy callers release their unused request claim and retry later.
+    /// A cancelled/uncertain mutation keeps the fence until explicit reconciliation.
+    pub async fn reserve_channel(
+        &self,
+        ticket: &ChannelClaimTicket,
+        channel_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO moderation_channel_executions
+               (channel_id, guild_id, idempotency_key, claim_token)
+             SELECT $1, guild_id, idempotency_key, claim_token
+               FROM moderation_idempotency
+              WHERE guild_id = $2 AND idempotency_key = $3
+                AND claim_token = $4 AND state = 'in_flight'
+             ON CONFLICT (channel_id) DO NOTHING",
+        )
+        .bind(channel_id)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(&ticket.claim_token)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Atomically record the audit/result and free the channel. Optional recovery
+    /// cleanup is fenced to the exact generation restored (or a newly recorded
+    /// seed whose write was provably rejected). Any stale ticket/generation or
+    /// database failure rolls back everything and retains the execution fence.
+    pub async fn finish_channel(
+        &self,
+        ticket: &ChannelClaimTicket,
+        audit: &ChannelAuditRow,
+        result_json: &str,
+        clear_generation: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        self.settle_channel(ticket, audit, Some(result_json), clear_generation)
+            .await
+    }
+
+    /// Proven no-mutation failure: audit the refusal and release both fences
+    /// atomically so the same key can be retried after the cause is fixed.
+    pub async fn abort_channel(
+        &self,
+        ticket: &ChannelClaimTicket,
+        audit: &ChannelAuditRow,
+        clear_generation: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        self.settle_channel(ticket, audit, None, clear_generation)
+            .await
+    }
+
+    async fn settle_channel(
+        &self,
+        ticket: &ChannelClaimTicket,
+        audit: &ChannelAuditRow,
+        result_json: Option<&str>,
+        clear_generation: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let channel_id = audit.channel_id.as_deref().ok_or_else(|| {
+            sqlx::Error::InvalidArgument("channel audit requires channel_id".to_owned())
+        })?;
+        if audit.guild_id != ticket.guild_id || audit.idempotency_key != ticket.idempotency_key {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        let held = sqlx::query(
+            "DELETE FROM moderation_channel_executions
+              WHERE channel_id = $1 AND guild_id = $2
+                AND idempotency_key = $3 AND claim_token = $4",
+        )
+        .bind(channel_id)
+        .bind(&ticket.guild_id)
+        .bind(&ticket.idempotency_key)
+        .bind(&ticket.claim_token)
+        .execute(&mut *tx)
+        .await?;
+        if held.rows_affected() != 1 {
+            return Ok(false);
+        }
+        if let Some(generation) = clear_generation {
+            let cleared = sqlx::query(
+                "DELETE FROM moderation_lockdowns
+                  WHERE channel_id = $1 AND guild_id = $2 AND recovery_generation = $3",
+            )
+            .bind(channel_id)
+            .bind(&ticket.guild_id)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?;
+            if cleared.rows_affected() != 1 {
+                return Ok(false);
+            }
+        }
+        let settled = if let Some(result_json) = result_json {
+            Self::complete_on(
+                &mut tx,
+                ticket,
+                &audit.outcome,
+                result_json,
+                &audit.created_at,
+            )
+            .await?
+        } else {
+            sqlx::query(
+                "DELETE FROM moderation_idempotency
+                  WHERE guild_id = $1 AND idempotency_key = $2
+                    AND claim_token = $3 AND state = 'in_flight'",
+            )
+            .bind(&ticket.guild_id)
+            .bind(&ticket.idempotency_key)
+            .bind(&ticket.claim_token)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1
+        };
+        if !settled {
+            return Ok(false);
+        }
+        Self::record_audit_on(&mut tx, audit).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Release only when the executor can prove no Discord mutation occurred.
@@ -316,6 +460,13 @@ impl ChannelModerationStore {
     /// action, so a retry must never duplicate the mutation over an audit
     /// write failure (legacy `recordAudit`).
     pub async fn record_audit(&self, row: &ChannelAuditRow) -> Result<(), sqlx::Error> {
+        Self::record_audit_on(&mut *self.pool.acquire().await?, row).await
+    }
+
+    async fn record_audit_on(
+        connection: &mut PgConnection,
+        row: &ChannelAuditRow,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO moderation_audit
                (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
@@ -333,7 +484,7 @@ impl ChannelModerationStore {
         .bind(&row.idempotency_key)
         .bind(&row.metadata_json)
         .bind(&row.created_at)
-        .execute(&self.pool)
+        .execute(connection)
         .await?;
         Ok(())
     }

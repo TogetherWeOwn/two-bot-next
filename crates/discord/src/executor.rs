@@ -808,6 +808,27 @@ impl ActionExecutor {
         channel_id: &str,
         guild_id: &str,
     ) -> Result<Option<EveryoneOverwrite>, DiscordError> {
+        self.read_everyone_overwrite(channel_id, guild_id, false)
+            .await
+    }
+
+    /// Resolve a website moderation channel inside the configured guild. Fail
+    /// closed on unreadable identity/type before a claim can mutate another guild.
+    pub async fn get_guild_channel_overwrite(
+        &self,
+        channel_id: &str,
+        guild_id: &str,
+    ) -> Result<Option<EveryoneOverwrite>, DiscordError> {
+        self.read_everyone_overwrite(channel_id, guild_id, true)
+            .await
+    }
+
+    async fn read_everyone_overwrite(
+        &self,
+        channel_id: &str,
+        guild_id: &str,
+        enforce_guild: bool,
+    ) -> Result<Option<EveryoneOverwrite>, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
         // The requested guild identity is validated with the same snowflake
         // rules the PUT target uses, before any I/O: the read must compare
@@ -828,6 +849,24 @@ impl ActionExecutor {
         let doc: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
             DiscordError::Rejected(format!("unreadable channel {channel_id}: body is not JSON"))
         })?;
+        if enforce_guild {
+            let doc_channel = doc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|id| snowflake::<ChannelMarker>(id).ok());
+            let doc_guild = doc
+                .get("guild_id")
+                .and_then(|v| v.as_str())
+                .and_then(|id| snowflake::<GuildMarker>(id).ok());
+            if doc_channel != Some(channel)
+                || doc_guild != Some(target)
+                || !matches!(doc.get("type").and_then(|v| v.as_u64()), Some(0 | 5))
+            {
+                return Err(DiscordError::Rejected(
+                    "channel is not a text channel in the configured guild".to_owned(),
+                ));
+            }
+        }
         let overwrites = doc.get("permission_overwrites").ok_or_else(|| {
             DiscordError::Rejected(format!(
                 "unreadable channel {channel_id}: missing permission_overwrites"
