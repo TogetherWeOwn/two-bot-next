@@ -1292,9 +1292,9 @@ impl ActionExecutor {
                 .map_err(DiscordError::Unavailable)?;
             match res.status {
                 200..=299 => {
-                    return serde_json::from_slice(&res.body).map_err(|_| {
-                        DiscordError::Unavailable("invalid guild command response".into())
-                    })
+                    return crate::command_registry::decode_guild_commands(&res.body).map_err(
+                        |_| DiscordError::Unavailable("invalid guild command response".into()),
+                    )
                 }
                 429 if attempt < MAX_HTTP_TRIES - 1 => {
                     tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;

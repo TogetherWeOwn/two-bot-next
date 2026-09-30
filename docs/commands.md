@@ -89,6 +89,13 @@ publication/refusal happens before opening the gateway database or connecting
 the shard; failure stops the configured gateway task rather than continuing with
 an unknown registry. With the opt-in absent, existing server behavior is unchanged.
 
+This synchronizes command definitions only; it does not wire missing interaction
+handlers or certify a command cutover. Keep it disabled until the required
+handlers are connected and the rollout is approved. A successful replacement
+can precede a later database/session/shard startup failure; those failures do
+not roll the registry back. Use the explicit CLI dry run to inspect removals
+before opting into this boot behavior.
+
 Each enabled boot fetches the full registry, including localizations, and
 compares canonical SHA-256 hashes. A matching fetched hash skips PUT. This
 fetch-and-compare approach needs no DB publication-hash table, works across
@@ -98,8 +105,10 @@ cached success. Boot logs only the desired hash and whether it applied a write.
 Canonicalization ignores server IDs/versions, guild-irrelevant global settings,
 command-list order, object-key order, and null/empty/default-false optional
 fields. It preserves descriptions, localizations, permission bitfields, command
-types, and **option/choice order**. No default permission gate is distinct from
-bitfield `"0"` (administrator-only). Guild user/role permission overrides are
+types, and **option/choice order**. Permission bits unknown to the pinned
+Twilight model are retained from the raw response rather than truncated. No
+default permission gate is distinct from bitfield `"0"` (administrator-only).
+Guild user/role permission overrides are
 outside this command-definition comparison.
 
 ## Verification
@@ -112,8 +121,9 @@ production/staging database is needed.
 On the persistent controller, compiling tests must use the bounded Cargo pool:
 
 ```sh
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --lib command_registry
 python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test command_registry_sync
-python3 scripts/cargo_cache.py run -- test -p two-bot commands_cli
+python3 scripts/cargo_cache.py run -- test -p two-bot --test commands_cli
 ```
 
 If pool admission is unavailable, stop local compilation and use hosted CI;

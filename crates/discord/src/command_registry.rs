@@ -3,9 +3,35 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
+use serde::de::Error as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use twilight_model::application::command::Command;
+use twilight_model::{application::command::Command, guild::Permissions};
+
+/// Twilight's Permissions deserializer truncates bits unknown to its pinned
+/// model. Restore the raw u64 so future Discord permission bits remain drift.
+pub(crate) fn decode_guild_commands(body: &[u8]) -> Result<Vec<Command>, serde_json::Error> {
+    let values: Vec<Value> = serde_json::from_slice(body)?;
+    values
+        .into_iter()
+        .map(|value| {
+            let bits = match value.get("default_member_permissions") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(raw)) => {
+                    Some(raw.parse::<u64>().map_err(serde_json::Error::custom)?)
+                }
+                Some(_) => {
+                    return Err(serde_json::Error::custom(
+                        "default_member_permissions must be a decimal string or null",
+                    ))
+                }
+            };
+            let mut command: Command = serde_json::from_value(value)?;
+            command.default_member_permissions = bits.map(Permissions::from_bits_retain);
+            Ok(command)
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegistrySnapshot {
@@ -114,7 +140,11 @@ fn normalize(value: Value) -> Value {
                             && value.as_array().is_some_and(Vec::is_empty)
                         || key.ends_with("_localizations")
                             && value.as_object().is_some_and(serde_json::Map::is_empty);
-                    (!empty).then(|| (key, normalize(value)))
+                    if empty {
+                        None
+                    } else {
+                        Some((key, normalize(value)))
+                    }
                 })
                 .collect();
             Value::Object(sorted.into_iter().collect())
@@ -207,7 +237,10 @@ mod tests {
         base.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        serde_json::from_value(base).unwrap()
+        decode_guild_commands(&serde_json::to_vec(&vec![base]).unwrap())
+            .unwrap()
+            .pop()
+            .unwrap()
     }
 
     #[test]
@@ -236,6 +269,18 @@ mod tests {
                 json!({"default_member_permissions":"4"}),
                 json!({"default_member_permissions":"8"}),
                 true,
+            ),
+            (
+                "future permission bit",
+                json!({"default_member_permissions":"4"}),
+                json!({"default_member_permissions":"281474976710660"}),
+                true,
+            ),
+            (
+                "permission decimal normalization",
+                json!({"default_member_permissions":"0004"}),
+                json!({"default_member_permissions":"4"}),
+                false,
             ),
             (
                 "no permissions vs zero",
