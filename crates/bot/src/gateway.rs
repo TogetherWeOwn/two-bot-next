@@ -11,7 +11,10 @@
 //! funnel batch commits with its checkpoint; persistence/dispatch failures
 //! stop the runner rather than checkpointing ahead of uncommitted effects.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
@@ -153,27 +156,40 @@ struct Hello {
 /// responses on an acquired connection. Never restore readiness during drain.
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
+    generation: &AtomicU64,
     deadline: std::time::Duration,
     operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, sqlx::Error> {
-    let previous = {
+    let (previous, observed_generation) = {
         let mut state = state.write().await;
         let previous = *state;
         if previous != GatewayState::Draining {
             *state = GatewayState::Armed;
         }
-        previous
+        (previous, generation.load(Ordering::Acquire))
     };
     let result = tokio::time::timeout(deadline, operation)
         .await
         .map_err(|_| sqlx::Error::InvalidArgument("gateway checkpoint deadline exceeded".into()))?;
     if result.is_ok() {
         let mut state = state.write().await;
-        if *state != GatewayState::Draining {
+        if *state != GatewayState::Draining
+            && generation.load(Ordering::Acquire) == observed_generation
+        {
             *state = previous;
         }
     }
     result
+}
+
+async fn transport_disconnected(state: &RwLock<GatewayState>, generation: &AtomicU64) {
+    // Share the lock with checkpoint restoration and READY publication so a
+    // disconnect cannot land between their generation check and state write.
+    let mut state = state.write().await;
+    generation.fetch_add(1, Ordering::AcqRel);
+    if *state != GatewayState::Draining {
+        *state = GatewayState::Armed;
+    }
 }
 
 struct ReceivedDispatch {
@@ -209,9 +225,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
     pipeline: Arc<GatewayPipeline<I>>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
+    shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
-    let saved = checkpoint_io(&state, CHECKPOINT_IO_MAX, store.load()).await?;
-    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let generation = Arc::new(AtomicU64::new(0));
+    let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;
     let receive_generation = Arc::clone(&generation);
     let receive_state = Arc::clone(&state);
     let events = futures_util::stream::unfold(
@@ -226,16 +243,14 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let message = match item {
                             Ok(message) => message,
                             Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
-                                generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                                *state.write().await = GatewayState::Armed;
+                                transport_disconnected(&state, &generation).await;
                                 warn!("gateway reconnect failed; Twilight will retry");
                                 continue;
                             }
                             Err(_) => return Err(sqlx::Error::InvalidArgument("gateway receive failed".into())),
                         };
                         let Message::Text(text) = message else {
-                            generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                            *state.write().await = GatewayState::Armed;
+                            transport_disconnected(&state, &generation).await;
                             let rejected = matches!(message, Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009));
                             let clear = rejected || shard.session().is_none();
                             if rejected { shard = Shard::with_config(shard.id(), shard.config().clone()); }
@@ -252,8 +267,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if header.op == 9 {
                             let packet: serde_json::Value = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway session packet".into()))?;
                             let resumable = packet["d"].as_bool().ok_or_else(|| sqlx::Error::InvalidArgument("invalid gateway session flag".into()))?;
-                            generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                            *state.write().await = GatewayState::Armed;
+                            transport_disconnected(&state, &generation).await;
                             if invalidates_session(resumable) { received = None; return Ok(Some(ReceivedWork::Clear(deadline))); }
                         }
                         if header.op != 0 { continue; }
@@ -283,11 +297,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let worker_state = Arc::clone(&state);
     let stop_state = Arc::clone(&state);
     let result = crate::dispatch::dispatch_bounded(
-        events,
+        // Ending reception is cooperative: dispatch_bounded keeps supervising
+        // and draining its blocking writer instead of being aborted/dropped.
+        events.take_until(shutdown),
         crate::dispatch::DISPATCH_BACKLOG,
         move |work| match work {
             ReceivedWork::Clear(deadline) => handle
-                .block_on(checkpoint_io(&worker_state, deadline, store.clear()))
+                .block_on(checkpoint_io(
+                    &worker_state,
+                    &generation,
+                    deadline,
+                    store.clear(),
+                ))
                 .unwrap_or_else(|_| panic!("gateway clear failed")),
             ReceivedWork::Failed => panic!("gateway receive failed; checkpoint unchanged"),
             ReceivedWork::Dispatch {
@@ -304,16 +325,17 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 handle
                     .block_on(checkpoint_io(
                         &worker_state,
+                        &generation,
                         deadline,
                         store
                             .commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
                     ))
                     .unwrap_or_else(|_| panic!("gateway checkpoint failed"));
-                if connected
-                    && generation.load(std::sync::atomic::Ordering::Acquire) == observed_generation
-                {
+                if connected {
                     let mut state = handle.block_on(worker_state.write());
-                    if *state != GatewayState::Draining {
+                    if *state != GatewayState::Draining
+                        && generation.load(Ordering::Acquire) == observed_generation
+                    {
                         *state = GatewayState::Connected;
                     }
                 }
@@ -326,14 +348,8 @@ pub async fn run_shard<I: InviteSource + 'static>(
         crate::dispatch::DISPATCH_DRAIN_MAX,
     )
     .await;
-    // A timed-out blocking handler can still be running until process exit.
-    // Keep Draining sticky so it cannot restore Connected in that interval.
-    if !matches!(
-        result,
-        Err("dispatch I/O deadline exceeded" | "dispatch drain deadline exceeded")
-    ) {
-        *state.write().await = GatewayState::Armed;
-    }
+    // Reception does not restart in this runner. Keep Draining sticky through
+    // both successful shutdown and fatal exit, including any remaining writer.
     result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()))
 }
 
@@ -485,6 +501,7 @@ mod tests {
         let state = RwLock::new(GatewayState::Connected);
         let result = checkpoint_io(
             &state,
+            &AtomicU64::new(0),
             std::time::Duration::from_millis(10),
             std::future::pending::<Result<(), sqlx::Error>>(),
         )
@@ -496,14 +513,14 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_io_restores_readiness_only_after_success() {
         let state = RwLock::new(GatewayState::Connected);
-        checkpoint_io(&state, CHECKPOINT_IO_MAX, async {
+        checkpoint_io(&state, &AtomicU64::new(0), CHECKPOINT_IO_MAX, async {
             assert_eq!(*state.read().await, GatewayState::Armed);
             Ok(())
         })
         .await
         .unwrap();
         assert_eq!(*state.read().await, GatewayState::Connected);
-        let result = checkpoint_io(&state, CHECKPOINT_IO_MAX, async {
+        let result = checkpoint_io(&state, &AtomicU64::new(0), CHECKPOINT_IO_MAX, async {
             Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
         })
         .await;
@@ -512,9 +529,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_completion_cannot_overwrite_a_transport_disconnect() {
+        let state = RwLock::new(GatewayState::Connected);
+        let generation = AtomicU64::new(0);
+        checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+            assert_eq!(*state.read().await, GatewayState::Armed);
+            transport_disconnected(&state, &generation).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert_eq!(*state.read().await, GatewayState::Armed);
+        assert_ne!(state.read().await.status(), ComponentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn transport_disconnect_cannot_clear_draining() {
+        let state = RwLock::new(GatewayState::Draining);
+        transport_disconnected(&state, &AtomicU64::new(0)).await;
+        assert_eq!(*state.read().await, GatewayState::Draining);
+    }
+
+    #[tokio::test]
     async fn checkpoint_completion_cannot_restore_readiness_after_reception_stops() {
         let state = RwLock::new(GatewayState::Connected);
-        checkpoint_io(&state, CHECKPOINT_IO_MAX, async {
+        checkpoint_io(&state, &AtomicU64::new(0), CHECKPOINT_IO_MAX, async {
             *state.write().await = GatewayState::Draining;
             Ok(())
         })
@@ -535,10 +575,15 @@ mod tests {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let guard = Cancelled(Arc::clone(&cancelled));
         let state = RwLock::new(GatewayState::Connected);
-        let result = checkpoint_io(&state, std::time::Duration::from_millis(10), async move {
-            let _guard = guard;
-            std::future::pending::<Result<(), sqlx::Error>>().await
-        })
+        let result = checkpoint_io(
+            &state,
+            &AtomicU64::new(0),
+            std::time::Duration::from_millis(10),
+            async move {
+                let _guard = guard;
+                std::future::pending::<Result<(), sqlx::Error>>().await
+            },
+        )
         .await;
         assert!(result.is_err());
         assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));

@@ -261,7 +261,14 @@ mod tests {
         start.await.unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            crate::supervise_gateway(worker, std::future::pending()),
+            crate::supervise_gateway(
+                worker,
+                std::future::pending(),
+                Arc::new(tokio::sync::RwLock::new(
+                    crate::gateway::GatewayState::Connected,
+                )),
+                watch::channel(false).0,
+            ),
         )
         .await;
         let stopped = stop.try_recv();

@@ -140,6 +140,61 @@ async fn migrations_contract_and_checksum_guard() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires authorized TEST_DATABASE_URL"]
+async fn contract_schema_and_dependencies_use_the_same_pool_session() {
+    let a = Fixture::new().await;
+    let b = Fixture::new().await;
+    migrate(&a.pool).await.unwrap();
+    migrate(&b.pool).await.unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(a.pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let mut first = pool.acquire().await.unwrap();
+    let mut second = pool.acquire().await.unwrap();
+    for (connection, schema) in [(&mut first, &a.schema), (&mut second, &b.schema)] {
+        sqlx::query("SELECT set_config('search_path', $1, false)")
+            .bind(schema)
+            .execute(&mut **connection)
+            .await
+            .unwrap();
+    }
+    drop(first);
+    drop(second);
+    // The old implementation acquired once for current_schema and again for
+    // DDL: those acquisitions alternate between these two idle sessions.
+    for _ in 0..2 {
+        two_bot_store::apply_web_contract(&pool).await.unwrap();
+        let dependencies: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT view_ns.nspname::text, table_ns.nspname::text
+             FROM pg_rewrite r
+             JOIN pg_class v ON v.oid = r.ev_class
+             JOIN pg_namespace view_ns ON view_ns.oid = v.relnamespace
+             JOIN pg_depend d ON d.objid = r.oid AND d.classid = 'pg_rewrite'::regclass
+             JOIN pg_class t ON t.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+             JOIN pg_namespace table_ns ON table_ns.oid = t.relnamespace
+             WHERE v.relname = 'members' AND t.relname = 'members'
+               AND t.relkind = 'r' AND view_ns.nspname = ANY($1)",
+        )
+        .bind(vec![
+            format!("{}_web_v1", a.schema),
+            format!("{}_web_v1", b.schema),
+        ])
+        .fetch_all(&a.admin)
+        .await
+        .unwrap();
+        assert!(!dependencies.is_empty(), "contract view must exist");
+        for (view_schema, table_schema) in dependencies {
+            assert_eq!(view_schema, format!("{table_schema}_web_v1"));
+        }
+    }
+    pool.close().await;
+    a.finish().await;
+    b.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires authorized TEST_DATABASE_URL"]
 async fn legacy_normalization_rejects_dependencies_without_losing_views_or_grants() {
     let f = Fixture::new().await;
     let mut legacy = sqlx::migrate::Migrator::with_migrations(

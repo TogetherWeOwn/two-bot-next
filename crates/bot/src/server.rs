@@ -38,16 +38,27 @@ async fn health() -> Json<serde_json::Value> {
 async fn readyz(
     axum::extract::State(state): axum::extract::State<SharedState>,
 ) -> (StatusCode, Json<HealthReport>) {
-    let gateway = *state.gateway.read().await;
-    let database_ready = match &state.database {
-        Some(pool) => {
-            tokio::time::timeout(std::time::Duration::from_secs(2), two_bot_store::ping(pool))
-                .await
-                .unwrap_or(false)
+    readiness_after_ping(&state.gateway, async {
+        match &state.database {
+            Some(pool) => {
+                tokio::time::timeout(std::time::Duration::from_secs(2), two_bot_store::ping(pool))
+                    .await
+                    .unwrap_or(false)
+            }
+            None => false,
         }
-        None => false,
-    };
-    let report = readiness_report(gateway, database_ready);
+    })
+    .await
+}
+
+async fn readiness_after_ping(
+    gateway: &RwLock<GatewayState>,
+    ping: impl std::future::Future<Output = bool>,
+) -> (StatusCode, Json<HealthReport>) {
+    let database_ready = ping.await;
+    // Reception can stop while the database probe waits. Never publish the
+    // pre-probe Connected snapshot after a drain or disconnect.
+    let report = readiness_report(*gateway.read().await, database_ready);
     let code = if report.ready() {
         StatusCode::OK
     } else {
@@ -72,11 +83,20 @@ fn readiness_report(gateway: GatewayState, database_ready: bool) -> HealthReport
 }
 
 /// Serve until SIGTERM/SIGINT (Container stop) or a bind failure.
-pub async fn serve(addr: &str, state: SharedState) -> std::io::Result<()> {
+pub async fn serve(
+    addr: &str,
+    state: SharedState,
+    shutdown: tokio::sync::watch::Sender<bool>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(addr, "listening");
+    let gateway = Arc::clone(&state.gateway);
     axum::serve(listener, router(state).into_make_service())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            *gateway.write().await = GatewayState::Draining;
+            shutdown.send_replace(true);
+        })
         .await
 }
 
@@ -142,6 +162,22 @@ mod tests {
         assert!(!readiness_report(GatewayState::Connected, false).ready());
         assert!(!readiness_report(GatewayState::Unconfigured, true).ready());
         assert!(!readiness_report(GatewayState::Draining, true).ready());
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_cannot_publish_a_pre_drain_snapshot() {
+        for stopped in [GatewayState::Draining, GatewayState::Armed] {
+            let gateway = RwLock::new(GatewayState::Connected);
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let response = readiness_after_ping(&gateway, async { wait.await.unwrap() });
+            futures_util::pin_mut!(response);
+            assert!(futures_util::poll!(&mut response).is_pending());
+            *gateway.write().await = stopped;
+            release.send(true).unwrap();
+            let (code, report) = response.await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!report.0.ready());
+        }
     }
 
     #[tokio::test]

@@ -389,7 +389,13 @@ async fn spawn_runner(
         db.store.milestones().await.expect("milestones"),
     ));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
-    let task = tokio::spawn(run_shard(shard, pipeline, state.clone(), db.store.clone()));
+    let task = tokio::spawn(run_shard(
+        shard,
+        pipeline,
+        state.clone(),
+        db.store.clone(),
+        std::future::pending(),
+    ));
     (task, state)
 }
 

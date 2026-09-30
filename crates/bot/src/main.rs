@@ -73,6 +73,7 @@ async fn main() {
         database: store.as_ref().map(|s| s.pool().clone()),
     };
 
+    let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
     let gateway_task = if let Some(token) = config.discord_token.clone().filter(|t| !t.is_empty()) {
         let guild_id = config.guild_id;
         let state = Arc::clone(&gateway);
@@ -109,7 +110,10 @@ async fn main() {
                     resume = saved.is_some(),
                     "durable gateway initialized; shard connecting"
                 );
-                run_shard(shard, pipeline, Arc::clone(&state), store).await
+                run_shard(shard, pipeline, Arc::clone(&state), store, async move {
+                    let _ = stopping.wait_for(|stopping| *stopping).await;
+                })
+                .await
             }
             .await;
             if result.is_err() {
@@ -132,9 +136,9 @@ async fn main() {
         None
     };
 
-    let http = serve(&config.listen_addr, state);
+    let http = serve(&config.listen_addr, state, shutdown.clone());
     let result = match gateway_task {
-        Some(task) => supervise_gateway(task, http).await,
+        Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
     };
     if let Err(err) = result {
@@ -148,20 +152,61 @@ async fn main() {
 /// nonzero so the Container supervisor can restart from the committed checkpoint.
 /// Source: https://docs.rs/tokio/1/tokio/macro.select.html#cancellation-safety
 async fn supervise_gateway(
+    task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
+    http: impl std::future::Future<Output = std::io::Result<()>>,
+    state: Arc<RwLock<GatewayState>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+) -> std::io::Result<()> {
+    supervise_gateway_bounded(
+        task,
+        http,
+        state,
+        shutdown,
+        dispatch::DISPATCH_DRAIN_MAX + std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+async fn supervise_gateway_bounded(
     mut task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
     http: impl std::future::Future<Output = std::io::Result<()>>,
+    state: Arc<RwLock<GatewayState>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    shutdown_max: std::time::Duration,
 ) -> std::io::Result<()> {
-    tokio::select! {
+    let mut stopping = shutdown.subscribe();
+    futures_util::pin_mut!(http);
+    let http_result = tokio::select! {
         biased;
+        _ = stopping.wait_for(|stopping| *stopping) => None,
+        result = &mut http => Some(result),
         // Never expose task/SQL errors: they may contain connection secrets.
-        _ = &mut task => Err(std::io::Error::other(
+        _ = &mut task => return Err(std::io::Error::other(
             "gateway task stopped; container restart required",
         )),
-        result = http => {
-            task.abort();
-            result
+    };
+    *state.write().await = GatewayState::Draining;
+    shutdown.send_replace(true);
+    // Do not abort/drop the gateway future: it supervises a non-cancellable
+    // blocking writer. Signal reception to stop and retain its bounded drain.
+    // Any deadline/failure returns Err, and main exits immediately rather than
+    // waiting indefinitely for Tokio to shut down a detached blocking writer.
+    tokio::time::timeout(shutdown_max, async {
+        match task.await {
+            Ok(Ok(())) => {}
+            _ => {
+                return Err(std::io::Error::other(
+                    "gateway drain failed; restart required",
+                ))
+            }
         }
-    }
+        match http_result {
+            Some(result) => result,
+            None => http.await,
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err(std::io::Error::other("service shutdown deadline exceeded")))
 }
 
 /// Probe /health over plain HTTP using only tokio (no client dependency).

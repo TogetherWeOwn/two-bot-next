@@ -18,18 +18,25 @@ pub const WEB_V1_SQL: &str = include_str!("../sql/web_v1.sql");
 /// Apply the `web_v1` views to `pool`. Idempotent; safe to run at every boot
 /// after [`crate::migrations::migrate`].
 pub async fn apply_web_contract(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
+    // Discover and apply on one session: pooled connections can have different
+    // search paths, and PostgreSQL freezes unqualified view dependencies at DDL.
+    let mut tx = pool.begin().await?;
     let schema: String = sqlx::query_scalar("SELECT current_schema()")
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
     let contract_schema = if schema == "public" {
         "web_v1".to_owned()
     } else {
         format!("{schema}_web_v1")
     };
+    if contract_schema.len() > 63 {
+        return Err(sqlx::Error::InvalidArgument(
+            "contract schema exceeds PostgreSQL identifier limit".into(),
+        ));
+    }
     let quoted = format!("\"{}\"", contract_schema.replace('"', "\"\""));
     let sql = WEB_V1_SQL.replace("web_v1", &quoted);
     // Only the schema identifier varies; double quotes are escaped above.
-    let mut tx = pool.begin().await?;
     sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
         .execute(&mut *tx)
         .await?;
