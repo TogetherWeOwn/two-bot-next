@@ -13,3 +13,16 @@ updates:
     directory: /
     schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
     commit-message: { prefix: "ci(deps)" }
+    groups:
+      minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: /wrangler
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+    commit-message: { prefix: "chore(deps)" }
+    groups:
+      minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
