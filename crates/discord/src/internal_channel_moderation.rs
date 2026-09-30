@@ -305,6 +305,16 @@ impl InternalChannelExecutor {
                     .get_lockdown(&request.channel_id)
                     .await
                     .map_err(database_error)?;
+                if existing
+                    .as_ref()
+                    .is_some_and(|record| record.guild_id != self.config.guild_id)
+                {
+                    self.abort(&ticket, &audit, None).await?;
+                    return Err(error(
+                        ErrorCode::ActionNotAllowed,
+                        "recovery state belongs to another guild",
+                    ));
+                }
                 let record = self
                     .store
                     .record_lockdown(

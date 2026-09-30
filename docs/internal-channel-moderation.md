@@ -1,0 +1,78 @@
+# Internal channel moderation executor
+
+`two_bot_discord::internal_channel_moderation` (feature `db`) executes
+`moderation.purge`, `moderation.slowmode`, `moderation.lockdown` and
+`moderation.unlock`. It is a library seam, not an HTTP receiver or slash-command
+registration. Member moderation is separate.
+
+## Runtime contract
+
+The receiver must authorize the internal request (HMAC, allowlist, nonce/replay
+rules), then parse its body with `InternalChannelRequest::from_body`. Resolve the
+requested `actor_id` from the **configured guild**, using actual member roles and
+permissions; never construct `ModerationActor` from body-supplied permissions.
+Pass server-generated request ID and timestamp, and the authorized idempotency
+key, to `InternalChannelExecutor::execute`.
+
+`InternalChannelConfig::enabled` must combine **both** `TWO_MODERATION` and
+`TWO_INTERNAL_ALLOW_MODERATION`. The executor checks enablement, resolved actor
+identity, and the existing moderation policy before claiming a request or making
+REST calls. It retains legacy ordered request hashing, successful replay response
+shape, and plain Discord actor attribution in `moderation_audit`. The audit's
+human reason remains unsigned, trimmed, and complete. Only the human suffix of
+the signed Discord wire reason is shortened to fit 512 UTF-16 units; the entire
+`core::mac` marker survives.
+
+Intentional validation tightening: IDs must be canonical nonzero u64 snowflakes;
+REST must return the requested channel ID, configured guild ID, and text or
+announcement channel type (0 or 5). Foreign-guild/malformed channels and missing
+lockdown recovery state never cause a permission mutation.
+
+## Shared ledger and recovery
+
+Run the embedded migrations, including `0123_channel_execution_fence.sql`.
+The existing `(guild_id, idempotency_key)` claim token controls replay. The new
+`moderation_channel_executions` row additionally serializes different keys on the
+same channel, across independent pools/workers. Future slash-command wiring must
+use this reservation/settlement protocol too; the low-level REST executor's
+unrecorded unlock fallback is **not** a durable unlock path.
+
+Lockdown stores the original exact `@everyone` allow/deny masks before REST and
+changes only `SEND_MESSAGES`. Repeated lockdown preserves the first seed and its
+recovery generation. Unlock restores those masks, or deletes the overwrite if
+none originally existed. Settlement checks both request claim and recovery
+generation. Successful result/audit persistence, optional recovery deletion,
+and channel release happen in one transaction.
+
+Proven pre-mutation failures release the request/channel reservation atomically
+with a refused audit. Rejected first lockdown also removes only its newly created
+seed; rejected repeated lockdown keeps the original seed. Uncertain mutation
+results (timeouts, transport errors, rate limits, 5xx), cancellation, or failed
+post-mutation database settlement keep the channel/request fences. Later same-key
+and distinct-key requests are refused as in progress, rather than repeating a
+possibly accepted effect.
+
+There is deliberately **no expiry or automatic reconciliation**: a delayed unlock
+must never overwrite a newer lockdown. Recovery requires separately authorized
+reconciliation that proves the old REST effect has settled and inspects the
+matching claim/channel/recovery generations. This slice supplies no force-release
+endpoint and does not deploy or exercise a live guild.
+
+## Verification
+
+The integration suite uses scripted mock Discord REST and a unique schema on the
+empty-password disposable `agent-testdb` container. It refuses credential-bearing
+or non-test URLs and bypasses pgpass. CI additionally permits the same service on
+loopback only when `GITHUB_ACTIONS=true`.
+
+```sh
+TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
+  cargo test -p two-bot-discord --features db --locked \
+  --test internal_channel_moderation -- --include-ignored
+```
+
+Coverage includes all four actions and replay, legacy actor attribution, signed
+Unicode reason bounds, permission/guild refusals, exact mask/absence restoration,
+both overlap directions across independent pools, uncertain/rejected writes,
+stale request/recovery generations, and atomic rollback after a terminal audit
+failure. CI runs the suite against its existing disposable service container.
