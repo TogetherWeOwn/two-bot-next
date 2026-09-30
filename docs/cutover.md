@@ -126,9 +126,51 @@ stale session. Reconfirm first Next boot has RESUME disabled (see below).
 ## Tool availability and command sheet
 
 Baseline checked: `44338b2` on 2026-09-30. Recheck the candidate source and
-`--help` at execution time. The following are **planned, not merged into this
-baseline**; do not paste them into a production shell or invent flags to make
-them work:
+`--help` at execution time. `two-bot` with no subcommand starts the server;
+`two-bot --help` describes the backup CLI. `two-bot serve` is **not** supported.
+
+### Existing tools: limited recovery, not the full cutover data path
+
+| Implemented command | Binding / important limit |
+|---|---|
+| `two-bot backup` | `TWO_DATABASE_URL`, `TWO_BACKUP_DIR`, `TWO_BACKUP_KEEP`, `TWO_BACKUP_UPLOAD_CMD`; consistent allowlisted snapshot, then retention/pruning and upload. Never point retention at incident-preservation evidence |
+| `two-bot restore <backup.ndjson.gz> --force [--dry-run]` | `TWO_RESTORE_URL` deliberately differs from the source binding. Actual restore **truncates/replaces** allowlisted tables; it is not a merge/delta reconciliation. Target schema must already exist |
+| `two-bot backup-upload <dump.ndjson.gz>` | Uploads one dump using approved S3 bindings; an upload is not proof of completeness or restore compatibility |
+| `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
+
+Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L82),
+[restore implementation](../crates/bot/src/backup_cli.rs#L354) and
+[backup runbook](backup.md). `restore --dry-run` optionally reads a target when
+`TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
+For local fixture/artifact inspection **without any DB connection**:
+
+```sh
+# File-integrity receipt only; does not establish table/content parity.
+sha256sum --check receipts.sha256
+# No target URL: validates the NDJSON/gzip manifest and reports its contents.
+env -u TWO_RESTORE_URL two-bot restore fixture.ndjson.gz --dry-run
+```
+
+Use a disposable fixture for a test. Missing/tampered file or nonzero exit means
+FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
+verify canonical content and required table coverage. The generic allowlist
+omits leveling, gateway checkpoints, guild settings, internal actions and other
+Next tables, and requires some legacy tables absent from embedded migrations.
+It can fail against a fresh Next schema. See
+[`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44). Do not treat its
+per-table count checks as complete final-copy verification.
+
+MEE6 XP/backfill/capture/reward utilities are **separate binaries**, not a
+legacy-table copier or rollback journal. Some default to writes, and even some
+previews run migrations on connect; they are not production preflight tools.
+Do not use `dedupe-events` during cutover: it defaults to deletion and has no
+guild fence. Their exact behavior is in the
+[cutover CLI sources](../crates/cutover/src/bin) and is outside this procedure.
+
+### Planned copy, registry and preflight tools
+
+The following are **planned, not merged into this baseline**; do not paste them
+into a production shell or invent flags to make them work:
 
 | Planned invocation | Owner / use / missing evidence |
 |---|---|
@@ -145,6 +187,41 @@ These are required **capabilities**, not claimed existing subcommands. B4 must
 attach a reviewed, fixture-rehearsed execution/restore command sheet covering
 them before GO. Likewise, the merged generic backup is not a complete snapshot
 of all Next state; a backup upload receipt alone cannot satisfy the data gate.
+
+### Runtime gates found in the baseline
+
+- Server binds `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID`, and optional
+  `LISTEN_ADDR`. Cutover utilities instead use `TWO_DATABASE_URL`, and some
+  use `DISCORD_GUILD_ID`. Do not silently substitute bindings. Worker forwarding
+  currently covers token/database/guild/listener, **not feature flags**:
+  [configuration](../crates/core/src/config.rs#L34),
+  [tool connection](../crates/cutover/src/cli.rs#L102),
+  [Worker environment](../wrangler/src/index.ts#L73).
+- Configured server startup runs embedded migrations; it is not a read-only
+  preflight. Gateway boot wires the funnel pipeline, not the full feature/job
+  stack. Domain/store libraries and command definitions are not activated
+  runtime evidence: [boot](../crates/bot/src/main.rs#L78),
+  [pipeline construction](../crates/bot/src/gateway.rs#L336).
+- Fresh checkpoints (up to 15 minutes old) automatically trigger RESUME.
+  Persistence deduplicates funnel batches, not all Discord effects:
+  [session policy](../crates/core/src/gateway_session.rs#L4),
+  [boot resume](../crates/bot/src/gateway.rs#L315). A reviewed force-fresh path is
+  required for first production boot; do not assume a restart gives IDENTIFY.
+- SIGTERM drains HTTP only, then main aborts the gateway task. No final
+  gateway/job checkpoint-drain acknowledgment exists here:
+  [shutdown](../crates/bot/src/server.rs#L50),
+  [gateway abort](../crates/bot/src/main.rs#L156).
+- The baseline has no wired scheduled-unban handoff/sweeper. Moderator sign-off
+  must identify a verified executor for every pending deadline before GO:
+  [moderation port boundary](../crates/core/src/moderation.rs#L7).
+- `/health` reports process liveness; `/readyz` covers process + gateway only.
+  The baseline server does not expose `/internal/actions` or `/metrics`:
+  [HTTP routes and readiness](../crates/bot/src/server.rs#L21). Feature and
+  internal-action acceptance therefore require separate merged runtime evidence.
+
+These are execution blockers to resolve on the implementation/acceptance cards,
+not features delivered by this documentation PR. Do not bypass them with a raw
+REST PUT, a forced dump restore or a manual database edit.
 
 For command snapshots/restoration, the authorized REST tool must cover:
 
@@ -208,7 +285,7 @@ from which all subsequent Next/web writes will be reconciled.
    has not already started a gateway.
 4. Start **one** Next Container. Record first READY, gateway budget remaining,
    process/gateway readiness, DB initialization and internal-action readiness.
-   Check internal `/healthz` and `/readyz` and deployment/runtime logs. A 200
+   Check internal `/health` and `/readyz` and deployment/runtime logs. A 200
    proves only the components listed in its response, not every feature.
 5. Compare real observed join/message/voice events with the moderator record,
    and verify agreed non-destructive command/web journeys. Do not generate
