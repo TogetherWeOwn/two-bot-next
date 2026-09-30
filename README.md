@@ -6,11 +6,17 @@ The Together We Own Discord bot (Owen), rewritten in Rust to run in a single alw
 Cloudflare Container. It replaces [two-bot](https://github.com/TogetherWeOwn/two-bot)
 (TypeScript/discord.js), which is now in maintenance mode: fixes only, no new features.
 
-Status: scaffold (S1). Twilight is the chosen Discord framework — see
-`docs/adr/0001-discord-framework.md`. The workspace (`crates/core`,
-`crates/discord`, `crates/bot`), CI `check` job, `Dockerfile` and the
-`wrangler/` Container + Worker/DO wrapper are in place; the gateway
-supervisor connects in S3.
+Status: Rust gateway and durable recovery implemented; feature/core and storage
+ports are in place, with runtime integration still incomplete. Twilight is the
+Discord framework — see [ADR 0001](docs/adr/0001-discord-framework.md). The
+`two-bot` binary exposes health/readiness, persists gateway sessions and funnel
+effects, and provides backup/restore operator commands. The `wrangler/` wrapper
+targets one Cloudflare Container; this is not a production-cutover or soak claim.
+
+On-call: [operations runbook](docs/runbook.md) — health/logs, redeploy/rollback,
+RESUME semantics, kill-switch/feature wiring boundaries, backups and common
+failures. See also [backup procedures](docs/backup.md) and
+[staging soak](docs/staging-soak.md).
 
 Targets: `lite` Container instance (under 256 MiB RSS), one gateway session, shared
 Postgres with two-web-next. Migration plan: TOG-9671.
@@ -18,8 +24,9 @@ Postgres with two-web-next. Migration plan: TOG-9671.
 ## Contributing
 
 Squash-merge only; PR titles follow Conventional Commits and the body carries
-`Refs: TOG-1234`. `gitleaks` and `pr-lint` are required; `check` (fmt, clippy, test)
-becomes required with the first Rust code.
+`Refs: TOG-1234`. Required exact-head checks include `gitleaks`, `pr-lint`,
+`check` (fmt, clippy -D warnings, tests, cargo-deny) and `worker check` (including
+the runbook command-drift test). The approving non-author reviewer squash-merges.
 
 ## License
 
