@@ -712,7 +712,11 @@ async fn public_deferred_error_is_deleted_then_sent_as_private_followup() {
     use two_bot_discord::{
         dispatch_interaction, ActionExecutor, DispatchOptions, InteractionReplyTransport,
     };
-    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(204)).await;
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204), ScriptedResponse::status(204)],
+        ScriptedResponse::json(200, serde_json::json!({"id": "42"})),
+    )
+    .await;
     let executor =
         ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
     let interaction = slash("rank", Some(0));
@@ -752,6 +756,107 @@ async fn public_deferred_error_is_deleted_then_sent_as_private_followup() {
         .starts_with("Something went wrong (ref "));
     assert!(!body.to_string().contains("database"));
     mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn private_progress_and_completion_edit_the_created_followup_on_the_wire() {
+    use common::{MockRest, ScriptedResponse};
+    use two_bot_core::router::replies::{InteractionReply, ReplyError};
+    use two_bot_discord::{
+        dispatch_interaction, ActionExecutor, DispatchOptions, InteractionReplyTransport,
+    };
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, serde_json::json!({"id": "424242"})),
+        ],
+        ScriptedResponse::status(200),
+    )
+    .await;
+    let executor =
+        ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
+    let interaction = slash("rank", Some(0));
+    let transport = InteractionReplyTransport::new(&executor, &interaction);
+    dispatch_interaction(
+        &InteractionRouter::new(all_on()),
+        &interaction,
+        &transport,
+        DispatchOptions::default(),
+        |_, session| async move {
+            session.defer(false).await?;
+            session
+                .respond(InteractionReply::new("private progress", true))
+                .await?;
+            session
+                .respond(InteractionReply::new("more private progress", true))
+                .await?;
+            Ok::<_, ReplyError<two_bot_discord::DiscordError>>(InteractionReply::new(
+                "@everyone final result",
+                true,
+            ))
+        },
+    )
+    .await
+    .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[1].method, "DELETE");
+    assert!(requests[1]
+        .path
+        .replace("%40", "@")
+        .ends_with("/messages/@original"));
+    assert_eq!(requests[2].method, "POST");
+    let followup: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(followup["flags"], 64);
+    for (request, content) in requests[3..]
+        .iter()
+        .zip(["more private progress", "@everyone final result"])
+    {
+        assert_eq!(request.method, "PATCH");
+        assert_eq!(
+            request.path,
+            "/api/v10/webhooks/1111/routing-test-token/messages/424242"
+        );
+        let edit: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(edit["content"], content);
+        assert_eq!(edit["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert!(edit.get("flags").is_none());
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn followup_requires_a_valid_message_identity_without_retrying() {
+    use common::{MockRest, ScriptedResponse};
+    use two_bot_core::router::replies::ReplyOperation;
+    use two_bot_discord::ActionExecutor;
+    for response in [
+        ScriptedResponse::status(204),
+        ScriptedResponse::json(200, serde_json::json!({"id": "0"})),
+        ScriptedResponse::json(200, serde_json::json!({"id": "not-a-snowflake"})),
+    ] {
+        let mock = MockRest::start(Vec::new(), response).await;
+        let executor =
+            ActionExecutor::with_proxy("reply-test-token".into(), Some(mock.origin())).unwrap();
+        let result = executor
+            .execute_reply_operation(
+                1111,
+                7,
+                "routing-test-token",
+                ReplyOperation::Followup(two_bot_core::router::replies::InteractionReply::new(
+                    "private", true,
+                )),
+            )
+            .await;
+        assert!(result.is_err(), "must not invent a followup edit target");
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "uncertain creation is not retried"
+        );
+        mock.shutdown().await;
+    }
 }
 
 #[tokio::test]

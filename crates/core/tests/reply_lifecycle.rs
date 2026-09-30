@@ -14,6 +14,8 @@ struct Transport {
     sent_at: Mutex<Vec<tokio::time::Instant>>,
     delay: Duration,
     fail: bool,
+    fail_edit: bool,
+    original_deleted: Mutex<bool>,
 }
 
 impl Transport {
@@ -25,8 +27,21 @@ impl Transport {
 impl ReplyTransport for Transport {
     type Error = std::io::Error;
 
-    async fn execute(&self, operation: ReplyOperation) -> Result<(), Self::Error> {
-        self.operations.lock().unwrap().push(operation);
+    async fn execute(&self, operation: ReplyOperation) -> Result<Option<u64>, Self::Error> {
+        let creates_followup = matches!(operation, ReplyOperation::Followup(_));
+        self.operations.lock().unwrap().push(operation.clone());
+        match operation {
+            ReplyOperation::DeleteOriginal => *self.original_deleted.lock().unwrap() = true,
+            ReplyOperation::EditOriginal { .. } => {
+                if *self.original_deleted.lock().unwrap() {
+                    return Err(std::io::Error::other("original was deleted"));
+                }
+                if self.fail_edit {
+                    return Err(std::io::Error::other("progress edit rejected"));
+                }
+            }
+            _ => {}
+        }
         self.sent_at
             .lock()
             .unwrap()
@@ -37,7 +52,7 @@ impl ReplyTransport for Transport {
         if self.fail {
             Err(std::io::Error::other("transport unavailable"))
         } else {
-            Ok(())
+            Ok(creates_followup.then_some(42))
         }
     }
 }
@@ -226,8 +241,35 @@ async fn handler_ack_and_timer_never_double_ack() {
     }
 }
 
+// Use one subscriber for this test binary: thread-local subscribers can race
+// global callsite interest updates from concurrently executing handler tests.
+// Only capture/clear is serialized; other tests may also append fixture logs.
+static LOG_CAPTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone, Default)]
 struct Log(Arc<Mutex<Vec<u8>>>);
+impl Log {
+    fn capture() -> Self {
+        static LOG: std::sync::OnceLock<Log> = std::sync::OnceLock::new();
+        let log = LOG
+            .get_or_init(|| {
+                let log = Log::default();
+                let writer = log.clone();
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::fmt()
+                        .without_time()
+                        .with_ansi(false)
+                        .with_writer(move || writer.clone())
+                        .finish(),
+                )
+                .unwrap();
+                log
+            })
+            .clone();
+        log.0.lock().unwrap().clear();
+        log
+    }
+}
 impl Write for Log {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(bytes);
@@ -262,15 +304,9 @@ fn reference(content: &str) -> &str {
 
 #[tokio::test(start_paused = true)]
 async fn failure_is_private_redacted_and_logged_with_the_same_reference() {
+    let _capture = LOG_CAPTURE.lock().await;
     let transport = Transport::default();
-    let log = Log::default();
-    let writer = log.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let log = Log::capture();
     run_handler(&transport, ReplyPolicy::default(), false, |_| async {
         Err::<InteractionReply, _>("private database detail")
     })
@@ -399,6 +435,107 @@ async fn callback_failure_propagates_and_is_not_retried() {
     .await;
     assert!(matches!(result, Err(ReplyError::DeliveryUncertain)));
     assert_eq!(transport.operations().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn private_progress_after_public_defer_keeps_a_live_completion_target() {
+    let transport = Transport::default();
+    run_handler(
+        &transport,
+        ReplyPolicy::default(),
+        false,
+        |session| async move {
+            session.defer(false).await?;
+            session.respond(reply("private progress", true)).await?;
+            session
+                .respond(reply("more private progress", true))
+                .await?;
+            Ok::<_, ReplyError<std::io::Error>>(reply("final result", true))
+        },
+    )
+    .await
+    .expect("completion must not edit the deleted original");
+    assert_eq!(
+        transport.operations(),
+        [
+            ReplyOperation::Defer { ephemeral: false },
+            ReplyOperation::DeleteOriginal,
+            ReplyOperation::Followup(reply("private progress", true)),
+            ReplyOperation::EditFollowup {
+                message_id: 42,
+                content: "more private progress".into()
+            },
+            ReplyOperation::EditFollowup {
+                message_id: 42,
+                content: "final result".into()
+            },
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_progress_edit_preserves_ack_for_a_private_error_followup() {
+    let transport = Transport {
+        fail_edit: true,
+        ..Default::default()
+    };
+    run_handler(
+        &transport,
+        ReplyPolicy::default(),
+        false,
+        |session| async move {
+            session.respond(reply("working", false)).await?;
+            session.respond(reply("more progress", false)).await?;
+            Ok::<_, ReplyError<std::io::Error>>(reply("final result", false))
+        },
+    )
+    .await
+    .expect("a failed edit must not erase a known ACK");
+    let ops = transport.operations();
+    assert_eq!(ops.len(), 3);
+    assert!(matches!(ops[2], ReplyOperation::Followup(_)));
+    reference(error_content(&ops));
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_handler_failure_is_logged_even_when_inflight_defer_fails() {
+    let _capture = LOG_CAPTURE.lock().await;
+    for panic in [false, true] {
+        let transport = Transport {
+            fail: true,
+            delay: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let log = Log::capture();
+        let result = run_handler(&transport, ReplyPolicy::default(), false, |_| async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert_eq!(transport.operations().len(), 1, "ACK is in flight");
+            if panic {
+                panic!("completed handler panic sentinel");
+            }
+            Err::<InteractionReply, _>("completed handler error sentinel")
+        })
+        .await;
+        assert!(matches!(result, Err(ReplyError::Transport(_))));
+        assert_eq!(
+            transport.operations().len(),
+            1,
+            "never retry an uncertain ACK"
+        );
+        let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("reference="),
+            "correlation log missing: {logs}"
+        );
+        assert!(
+            logs.contains(if panic {
+                "completed handler panic sentinel"
+            } else {
+                "completed handler error sentinel"
+            }),
+            "completed failure lost: {logs}"
+        );
+    }
 }
 
 #[test]

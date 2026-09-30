@@ -175,7 +175,7 @@ impl<'a> InteractionReplyTransport<'a> {
 impl ReplyTransport for InteractionReplyTransport<'_> {
     type Error = DiscordError;
 
-    async fn execute(&self, operation: ReplyOperation) -> Result<(), Self::Error> {
+    async fn execute(&self, operation: ReplyOperation) -> Result<Option<u64>, Self::Error> {
         self.executor
             .execute_reply_operation(
                 self.interaction.application_id.get(),

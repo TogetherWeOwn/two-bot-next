@@ -29,6 +29,10 @@ Handlers that ACK early must use `session.respond(...)` or
 `session.defer(ephemeral)`, not raw HTTP. The session serializes them with the
 auto-defer timer, so exactly one initial callback is sent. On completion the
 wrapper edits an acknowledged original instead of sending another callback.
+If private progress replaces a public deferred original, the transport returns
+that followup's message ID and subsequent progress/completion edits target that
+same replacement, not the deleted `@original`. Feature handler signatures do
+not change; the transport contract returns an optional created-followup ID.
 It does not cancel the handler when the budget expires or detach tasks.
 
 ## Reply and error contract
@@ -39,6 +43,7 @@ It does not cancel the handler when the budget expires or detach tasks.
 | Ephemeral type 5 defer | PATCH original | PATCH original (still private) |
 | Public type 5 defer | PATCH original | DELETE public placeholder, POST ephemeral followup |
 | Handler already replied | PATCH original | POST ephemeral followup |
+| Private followup replaced original | PATCH followup by returned message ID | POST ephemeral followup |
 
 Discord fixes visibility at the initial ACK; PATCH cannot turn a public
 original ephemeral. A private success returned after a public defer also
@@ -52,9 +57,13 @@ logs `reference` and the internal error at ERROR level. The only error text
 sent to Discord is `Something went wrong (ref XXXXXXXX)`; the eight hex digits
 are random and contain no interaction token or user data. Transport failures
 are returned to the caller, not falsely reported as successful replies.
-Failed/uncertain sends are not retried: Discord may already have received the
-ACK. A failed callback abandons this wrapper's pending handler rather than
-performing blind retries. No delivery guarantee is made while Discord is
+Failed/uncertain callbacks are not retried: Discord may already have received
+the ACK. Failed progress edits preserve that known ACK and any replacement
+message identity so a propagated handler error can still send a private generic
+followup. A failed callback abandons this wrapper's pending handler rather than
+performing blind retries; a handler error/panic that finished during the
+in-flight callback is logged with its reference even when the callback fails.
+No delivery guarantee is made while Discord is
 unavailable. Panic isolation needs `panic = "unwind"`, including the release
 profile; it cannot isolate process aborts or double panics in destructors.
 

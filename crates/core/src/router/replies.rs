@@ -33,6 +33,7 @@ pub enum ReplyOperation {
     Respond(InteractionReply),
     Defer { ephemeral: bool },
     EditOriginal { content: String },
+    EditFollowup { message_id: u64, content: String },
     Followup(InteractionReply),
     DeleteOriginal,
 }
@@ -49,10 +50,11 @@ pub enum ReplyError<E: std::error::Error> {
 pub trait ReplyTransport: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Return the created message ID for Followup, and None for other operations.
     fn execute(
         &self,
         operation: ReplyOperation,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<u64>, Self::Error>> + Send;
 }
 
 /// Time to start the deferred ACK, leaving headroom before Discord's 3 s limit.
@@ -90,6 +92,9 @@ enum ReplyState {
     Unanswered,
     Deferred { ephemeral: bool },
     Replied,
+    Followup { message_id: u64 },
+    // The initial ACK is known, but its original is no longer a safe edit target.
+    OriginalDeleted,
     // A failed ACK may have reached Discord. Do not send a second callback.
     Failed,
 }
@@ -135,45 +140,81 @@ impl<'a, T: ReplyTransport> ReplySession<'a, T> {
         Ok(())
     }
 
-    /// An early reply or the handler's completion: callback once, then edit.
+    async fn followup(
+        &self,
+        state: &mut ReplyState,
+        reply: InteractionReply,
+    ) -> Result<(), ReplyError<T::Error>> {
+        let message_id = self
+            .transport
+            .execute(ReplyOperation::Followup(reply))
+            .await
+            .map_err(ReplyError::Transport)?
+            .filter(|id| *id != 0)
+            .ok_or(ReplyError::DeliveryUncertain)?;
+        *state = ReplyState::Followup { message_id };
+        Ok(())
+    }
+
+    /// An early reply or the handler's completion: callback once, then edit
+    /// the original or its private replacement. An edit failure never erases
+    /// a known ACK, so a propagated handler error can still send a followup.
     pub async fn respond(&self, reply: InteractionReply) -> Result<(), ReplyError<T::Error>> {
         let mut state = self.state.lock().await;
         let reply = InteractionReply::new(reply.content, reply.ephemeral);
         let operation = match *state {
-            ReplyState::Unanswered => ReplyOperation::Respond(reply),
-            ReplyState::Deferred { ephemeral: false } if reply.ephemeral => {
+            ReplyState::Unanswered => {
                 *state = ReplyState::Failed;
+                ReplyOperation::Respond(reply)
+            }
+            ReplyState::Deferred { ephemeral: false } if reply.ephemeral => {
+                // Keep the ACK knowledge even if delete/followup fails. Never
+                // edit or retry deleting an original whose deletion is uncertain.
+                *state = ReplyState::OriginalDeleted;
                 self.transport
                     .execute(ReplyOperation::DeleteOriginal)
                     .await
                     .map_err(ReplyError::Transport)?;
-                ReplyOperation::Followup(reply)
+                return self.followup(&mut state, reply).await;
             }
-            ReplyState::Deferred { .. } | ReplyState::Replied => ReplyOperation::EditOriginal {
+            ReplyState::OriginalDeleted => {
+                return self
+                    .followup(&mut state, InteractionReply::new(reply.content, true))
+                    .await;
+            }
+            ReplyState::Followup { message_id } => ReplyOperation::EditFollowup {
+                message_id,
                 content: reply.content,
             },
+            ReplyState::Deferred { .. } | ReplyState::Replied => {
+                *state = ReplyState::Replied;
+                ReplyOperation::EditOriginal {
+                    content: reply.content,
+                }
+            }
             ReplyState::Failed => return Err(ReplyError::DeliveryUncertain),
         };
-        *state = ReplyState::Failed;
         self.transport
             .execute(operation)
             .await
             .map_err(ReplyError::Transport)?;
-        *state = ReplyState::Replied;
+        if !matches!(*state, ReplyState::Followup { .. }) {
+            *state = ReplyState::Replied;
+        }
         Ok(())
     }
 
     async fn fail(&self, content: String) -> Result<(), ReplyError<T::Error>> {
         let mut state = self.state.lock().await;
-        let previous = *state;
-        *state = ReplyState::Failed;
         let reply = InteractionReply::new(content, true);
-        match previous {
-            ReplyState::Unanswered => self
-                .transport
-                .execute(ReplyOperation::Respond(reply))
-                .await
-                .map_err(ReplyError::Transport)?,
+        match *state {
+            ReplyState::Unanswered => {
+                *state = ReplyState::Failed;
+                self.transport
+                    .execute(ReplyOperation::Respond(reply))
+                    .await
+                    .map_err(ReplyError::Transport)?;
+            }
             ReplyState::Deferred { ephemeral: true } => {
                 self.transport
                     .execute(ReplyOperation::EditOriginal {
@@ -185,20 +226,16 @@ impl<'a, T: ReplyTransport> ReplySession<'a, T> {
             ReplyState::Deferred { ephemeral: false } => {
                 // Discord cannot change visibility on an edit. Remove the
                 // public loading placeholder, then create a private followup.
+                *state = ReplyState::OriginalDeleted;
                 self.transport
                     .execute(ReplyOperation::DeleteOriginal)
                     .await
                     .map_err(ReplyError::Transport)?;
-                self.transport
-                    .execute(ReplyOperation::Followup(reply))
-                    .await
-                    .map_err(ReplyError::Transport)?;
+                return self.followup(&mut state, reply).await;
             }
-            ReplyState::Replied => self
-                .transport
-                .execute(ReplyOperation::Followup(reply))
-                .await
-                .map_err(ReplyError::Transport)?,
+            ReplyState::Replied | ReplyState::Followup { .. } | ReplyState::OriginalDeleted => {
+                return self.followup(&mut state, reply).await;
+            }
             ReplyState::Failed => return Err(ReplyError::DeliveryUncertain),
         }
         *state = ReplyState::Replied;
@@ -227,7 +264,12 @@ where
     let deadline = tokio::time::sleep(policy.budget());
     let result = match std::panic::catch_unwind(AssertUnwindSafe(|| handler(session.clone()))) {
         Ok(future) => {
-            let future = AssertUnwindSafe(future).catch_unwind();
+            let future = async {
+                // Record a completed failure before awaiting any in-flight ACK.
+                // try_join may abandon a pending handler on transport failure,
+                // but must not discard the failure of one that already finished.
+                completed_reply(AssertUnwindSafe(future).catch_unwind().await)
+            };
             tokio::pin!(future);
             tokio::pin!(deadline);
             tokio::select! {
@@ -245,28 +287,33 @@ where
                 }
             }
         }
-        Err(panic) => Err(panic),
+        Err(panic) => completed_reply::<E>(Err(panic)),
     };
     match result {
-        Ok(Ok(reply)) => session.respond(reply).await,
-        failure => {
-            // Eight hex digits, independent of user data/interaction tokens.
-            let reference = format!("{:08X}", rand::random::<u32>());
-            match failure {
-                Ok(Err(error)) => tracing::error!(%reference, ?error, "interaction handler failed"),
-                Err(panic) => {
-                    let error = panic
-                        .downcast_ref::<String>()
-                        .map(String::as_str)
-                        .or_else(|| panic.downcast_ref::<&str>().copied())
-                        .unwrap_or("non-string panic");
-                    tracing::error!(%reference, error, "interaction handler panicked");
-                }
-                Ok(Ok(_)) => unreachable!(),
-            }
-            session
-                .fail(format!("Something went wrong (ref {reference})"))
-                .await
-        }
+        Ok(reply) => session.respond(reply).await,
+        Err(content) => session.fail(content).await,
     }
+}
+
+fn completed_reply<E: Debug>(
+    result: std::thread::Result<Result<InteractionReply, E>>,
+) -> Result<InteractionReply, String> {
+    if let Ok(Ok(reply)) = result {
+        return Ok(reply);
+    }
+    // Eight hex digits, independent of user data/interaction tokens.
+    let reference = format!("{:08X}", rand::random::<u32>());
+    match result {
+        Ok(Err(error)) => tracing::error!(%reference, ?error, "interaction handler failed"),
+        Err(panic) => {
+            let error = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic");
+            tracing::error!(%reference, error, "interaction handler panicked");
+        }
+        Ok(Ok(_)) => unreachable!(),
+    }
+    Err(format!("Something went wrong (ref {reference})"))
 }
