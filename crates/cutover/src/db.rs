@@ -168,7 +168,7 @@ pub async fn record_event(
 /// Members projection guards (legacy `EventStore.project`): joins overwrite
 /// the arrival columns but clear `left_at`; milestone columns are
 /// earliest/first-wins; recency only ever moves forward.
-async fn project_event(
+pub(crate) async fn project_event(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     e: &FunnelWrite,
 ) -> Result<(), sqlx::Error> {
@@ -246,7 +246,7 @@ async fn project_event(
 }
 
 /// Recency never moves backwards (legacy `advance`).
-async fn advance_activity(
+pub(crate) async fn advance_activity(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     guild_id: &str,
     member_id: &str,

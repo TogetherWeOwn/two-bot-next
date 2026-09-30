@@ -10,6 +10,7 @@
 - Port website-contract counter, rank and scheduled-events domain logic and transactional storage, with legacy-shaped read views. Runtime job wiring remains deferred.
 - Port the guild-settings catalogue, 15-second poll contract, cache, sqlx store, and migration to Rust. Runtime ticker and interaction integration remain follow-up work.
 - Run isolated settings persistence and concurrency regressions against a disposable Postgres CI service without credentials.
+- Persist gateway session, resume URL and processed sequence across Container restarts. Commit funnel rows and checkpoints atomically, restore message milestones, discard stale sessions, and fall back to IDENTIFY when Discord invalidates a session.
 
 ### Fixed
 
@@ -23,3 +24,5 @@
 - Preserve isolated bot schemas when applying the website contract, without rebinding the public read views.
 - Refuse non-test targets before resetting the website-contract acceptance database.
 - Reject malformed scheduled-event timestamps without panicking or replacing the last good mirror.
+- Recover gateway sessions rejected with close codes 4007/4009, preserve the committed READY URL after endpoint fallback, and exit for Container restart when the essential gateway task stops instead of serving a healthy zombie.
+- Bound total checkpoint SQL waits to a heartbeat-safe deadline and report readiness unavailable while persistence is pending; fail closed and restore from committed state after a slow-database restart.

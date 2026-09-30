@@ -5,7 +5,9 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod audit;
 pub mod automod;
+pub mod classify;
 pub mod commands;
 pub mod community_snapshots;
 pub mod config;
@@ -14,10 +16,13 @@ pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod funnel;
+pub mod gateway_funnel;
+pub mod gateway_session;
 pub mod handlers;
 pub mod health;
 pub mod invites;
 pub mod leveling;
+pub mod mac;
 pub mod moderation;
 pub mod onboarding;
 #[cfg(feature = "db")]
@@ -29,6 +34,9 @@ pub mod scheduled_events;
 pub mod settings;
 pub mod sticky;
 pub mod voice;
+pub mod voice_config;
+pub mod voice_ownership;
+pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
 
@@ -68,7 +76,10 @@ pub use handlers::{
     NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow, VoiceEndedFact,
     VoiceInput, VoiceStartedFact,
 };
-pub use health::{ComponentStatus, HealthReport};
+pub use health::{
+    classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
+    VoiceFailureKind, VoiceHealthReport, VoicePermission, VoicePermissionScope, VoiceReadiness,
+};
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
     summarize_attribution_split, AttributionCategory, AttributionSplit, DowntimeWindow,
@@ -137,6 +148,10 @@ pub use voice::{
     known_voice_durations, parse_voice_end_metadata, resolve_voice_end, summarize_voice_durations,
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
+};
+pub use voice_vote_kick::{
+    RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
+    VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts, VOTE_KICK_TTL_MS,
 };
 #[cfg(feature = "db")]
 pub use website_store::{
