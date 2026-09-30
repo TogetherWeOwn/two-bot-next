@@ -20,6 +20,10 @@ use crate::{
 
 pub const NAMES: [&str; 3] = ["counter", "rank", "scheduled_events"];
 
+#[cfg(test)]
+#[path = "website_jobs_tests.rs"]
+mod tests;
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,

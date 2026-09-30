@@ -60,7 +60,7 @@ pub fn statuses(names: &[&str], parked: bool) -> SharedStatus {
     ))
 }
 
-/// Uniform startup offset in [0, min(cadence, 5 seconds)]. The caller samples
+/// Bounded startup offset in [0, min(cadence, 5 seconds)]. The caller samples
 /// once per job, so all later deadlines keep that phase, without cadence drift.
 pub fn startup_jitter(cadence: Duration, sample: u64) -> Duration {
     let bound = cadence.min(Duration::from_secs(5)).as_millis() as u64;
