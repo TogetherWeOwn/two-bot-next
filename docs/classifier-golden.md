@@ -1,7 +1,7 @@
 # Legacy classifier / attribution golden corpus
 
-Tracking: [TOG-10883](/TOG/issues/TOG-10883). Scope-gap disposition:
-[TOG-10973](/TOG/issues/TOG-10973), assigned to the Director of Engineering.
+Tracking: [TOG-10883](/TOG/issues/TOG-10883). The Director of Engineering recorded
+report-only scope disposition on [TOG-10973](/TOG/issues/TOG-10973).
 
 ## Oracle and boundaries
 
@@ -57,11 +57,17 @@ behavior represented**, with one attendance payload site only partially mapped;
 13 use the missing report-only unknown helper and nine are evaluator/scorer
 contracts. Do not describe this as 48 passing Rust assertions.
 
-For a strictly runtime-only denominator, **25/26 sites (96.2%) are fully mapped**
-and one is partial. For runtime plus the unknown-report helper, only **25/39
-(64.1%) are fully mapped**. The broader 48-site inventory is not a claim of ≥90%
-executable parity. TOG-10973 must resolve whether the report-helper sites belong
-in the acceptance denominator; there is no unconditional coverage PASS here.
+For the runtime-only denominator, **25/26 sites (96.2%) are fully mapped** and
+one is partial. Before excluding the unknown-report helper, only **25/39 (64.1%)**
+are fully mapped. The broader 48-site inventory is not a claim of ≥90% executable
+parity. On 2026-09-30 the Director of Engineering recorded the seven distinct
+unknown/backfill booleans as deliberate report-only exclusions on TOG-10973:
+the concrete consumer is legacy `scripts/unknown-attribution.ts` through
+`buildUnknownReport`. The six additional join-path linkage sites call that same
+excluded helper; they are separately inventoried, not credited as passing.
+No two-web consumer requirement was verified. The ≥90% **mapping** figure above
+is scoped to the bot runtime after these explicit exclusions; it does not mean
+the Rust tests passed or that persisted attendance rows were verified.
 
 | Legacy test / assertion lines | Sites | Mapping or explicit remainder |
 | --- | ---: | --- |
@@ -102,9 +108,10 @@ backfill. Using `attribution_category` as the unknown-report helper would test
 the wrong contract. The fixture keeps the seven original booleans verbatim and
 the inventory identifies six more join-path linkage sites using that helper.
 
-TOG-10973 requests a concrete consuming API or an explicit dropped-report scope
-disposition. If a website/runtime consumer still needs it, retain the booleans
-and implement/test that consumer on a separate slice. No golden expectation has
+TOG-10973 records the concrete legacy report consumer and deliberate exclusion.
+The manager did not verify a two-web requirement or delegate speculative code.
+If a website/runtime consumer is later established, retain the booleans and
+implement/test that consumer on a separate slice. No golden expectation has
 been changed to make the port pass.
 
 ## Persisted metadata bytes
