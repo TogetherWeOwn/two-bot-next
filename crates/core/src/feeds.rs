@@ -245,33 +245,33 @@ pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
                 .children()
                 .filter(|node| named(*node, "link"))
                 .collect();
+            // Legacy `resolveLink` only promotes an alternate link when its
+            // href is itself HTTP(S). A mailto alternate must not shadow the
+            // valid HTTPS alternate that follows it.
             let link = links
                 .iter()
                 .find(|node| {
-                    node.attribute("href").is_some()
-                        && node
-                            .attribute("rel")
-                            .unwrap_or("alternate")
-                            .eq_ignore_ascii_case("alternate")
+                    node.attribute("rel")
+                        .unwrap_or("alternate")
+                        .eq_ignore_ascii_case("alternate")
+                        && is_item_url(&link_href(**node))
                 })
+                .or_else(|| links.iter().find(|node| is_item_url(&link_href(**node))))
+                // Legacy falls back to the first non-empty href, not the
+                // first link element: `hrefs[0]` is drawn from the filtered list.
                 .or_else(|| {
                     links
                         .iter()
-                        .find(|node| node.attribute("href").is_some_and(is_item_url))
-                })
-                .or_else(|| links.first());
+                        .find(|node| !link_href(**node).trim().is_empty())
+                });
             let url = link
-                .map(|node| {
-                    node.attribute("href")
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| text(*node))
-                })
+                .map(|node| link_href(*node))
                 .unwrap_or_default()
                 .trim()
                 .to_owned();
             let key = [
-                child_text(entry, "guid"),
-                child_text(entry, "id"),
+                legacy_key_text(entry, "guid"),
+                legacy_key_text(entry, "id"),
                 url.clone(),
             ]
             .into_iter()
@@ -301,6 +301,39 @@ pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
 
 fn named(node: Node<'_, '_>, name: &str) -> bool {
     node.is_element() && node.tag_name().name() == name
+}
+
+/// Resolve one `<link>` element the way legacy `resolveLink` resolves a
+/// single record: the `href` attribute wins when present, and an
+/// attribute-bearing element without `href` contributes nothing (legacy
+/// only consults `record.href`, never the text body). A bare text link
+/// resolves to its text.
+fn link_href(node: Node<'_, '_>) -> String {
+    if let Some(href) = node.attribute("href") {
+        return href.trim().to_owned();
+    }
+    if node.attributes().next().is_none() {
+        return text(node);
+    }
+    String::new()
+}
+
+/// Legacy `textValue` for `<guid>`/`<id>`: only the element's own text
+/// (the parsed record's `#text`). Nested markup contributes nothing, so a
+/// structured guid falls through to the id/link key like legacy does.
+fn legacy_key_text(entry: Node<'_, '_>, name: &str) -> String {
+    entry
+        .children()
+        .find(|child| named(*child, name))
+        .map(|node| {
+            node.children()
+                .filter(|child| child.is_text())
+                .filter_map(|child| child.text())
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
 }
 
 fn text(node: Node<'_, '_>) -> String {

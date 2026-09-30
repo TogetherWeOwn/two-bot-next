@@ -240,6 +240,65 @@ fn twitch_is_legacy_xml_not_helix_api() {
 }
 
 #[test]
+fn atom_link_resolution_matches_legacy_resolve_link() {
+    // A mailto alternate must not shadow the HTTPS alternate that follows it.
+    let xml = "<feed><entry><id>x</id><title>t</title>\
+        <link rel=\"alternate\" href=\"mailto:owner@example.org\"/>\
+        <link rel=\"alternate\" href=\"https://example.org/post\"/>\
+        </entry></feed>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].url, "https://example.org/post");
+
+    // An attribute-bearing link without href contributes nothing (legacy
+    // only consults record.href, never the text body); resolution falls
+    // through to the bare text link.
+    let xml = "<feed><entry><id>x</id><title>t</title>\
+        <link rel=\"alternate\" type=\"text/html\">https://example.org/shadowed</link>\
+        <link>https://example.org/plain</link>\
+        </entry></feed>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].url, "https://example.org/plain");
+
+    // An empty href is ignored (legacy filters falsy hrefs before
+    // considering hrefs[0]), so the nonempty candidates decide.
+    let xml = "<feed><entry><id>x</id><title>t</title>\
+        <link rel=\"alternate\" href=\"\"/>\
+        <link rel=\"alternate\" href=\"javascript:alert(1)\"/>\
+        <link>https://example.org/plain</link>\
+        </entry></feed>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].url, "https://example.org/plain");
+}
+
+#[test]
+fn structured_guid_falls_through_to_id_like_legacy_text_value() {
+    // Legacy textValue only reads the record's own #text: nested markup in
+    // <guid> contributes nothing, so the key falls through to the link URL.
+    let xml = "<rss><channel><item>\
+        <guid><value>nested</value></guid><link>https://example.org/post</link>\
+        </item></channel></rss>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "https://example.org/post");
+    let xml = "<rss><channel><item>\
+        <guid><value>nested</value></guid><id>real-key</id>\
+        <link>https://example.org/post</link>\
+        </item></channel></rss>";
+    let items = parse_xml_feed(xml).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "real-key");
+    // Sanity: a plain-text guid still wins over id and link.
+    let xml_plain = "<rss><channel><item>\
+        <guid>guid-key</guid><id>id-key</id>\
+        <link>https://example.org/post</link>\
+        </item></channel></rss>";
+    assert_eq!(parse_xml_feed(xml_plain).unwrap()[0].key, "guid-key");
+}
+
+#[test]
 fn rejects_xml_entities_malformed_size_and_item_explosion() {
     for xml in ["<rss>", "<html/>",
         "<!DOCTYPE rss [<!ENTITY secret SYSTEM 'file:///etc/passwd'>]><rss><channel><item><title>&secret;</title></item></channel></rss>",
