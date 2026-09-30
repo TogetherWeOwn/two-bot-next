@@ -6,8 +6,8 @@
 //! or advance the funnel. A failed/uncertain inspection must not be accepted.
 
 use crate::automod::{
-    match_automod, sanction_for, AutomodConfig, AutomodFilter, AutomodMessage, AutomodSanction,
-    RepeatTracker, SanctionAction,
+    match_automod_with_clock, sanction_for, AutomodConfig, AutomodFilter, AutomodMessage,
+    AutomodSanction, RepeatObservation, RepeatTracker, SanctionAction,
 };
 use crate::commands::PERM_MODERATE_MEMBERS;
 use crate::moderation::{
@@ -47,6 +47,9 @@ pub struct MessageDelivery {
     pub channel_id: String,
     pub message_id: String,
     pub snapshot: Option<AutomodMessage>,
+    /// Immutable CREATE facts awaiting authoritative member roles. Not an
+    /// inspectable snapshot; enrichment may replace only its role IDs.
+    pub create_pending_roles: Option<AutomodMessage>,
     /// Discord's stable edit timestamp, not the gateway receipt timestamp.
     pub edited_timestamp_ms: Option<u64>,
     pub observed_timestamp_ms: u64,
@@ -238,41 +241,42 @@ impl AutomodRuntime {
         }
         let mut message = snapshot.clone();
         if delivery.kind == MessageDeliveryKind::Update {
-            // Stable revision clock: re-inspection of the same edit revision
-            // stays deterministic across gateway retries (same key, same
-            // clock) instead of degrading to a fresh acceptance as the receipt
-            // clock advances past the repeat window. Fall back to receipt time
-            // only when Discord supplied no stable edit stamp.
+            // Inspect the revision's interval, not a later retry receipt.
+            // The durable preserved decision remains authoritative on retry;
+            // a stable clock alone cannot preserve swept mutable history.
+            // Unstamped updates inspect at receipt time without advancing it.
             message.observed_timestamp_ms = delivery
                 .edited_timestamp_ms
                 .unwrap_or(delivery.observed_timestamp_ms);
         }
-        // Sweep on the message clock, never on a receipt clock ahead of it: a
-        // receipt-clocked update must not expire other authors' pending
-        // message-clock create batches. Per-author window pruning still runs
-        // at the full observation time inside `observe`, so edit-window expiry
-        // for the updating author is preserved. The shared maintenance tick
-        // only expires idle authors between dispatches.
-        let sweep_ms = match delivery.kind {
-            MessageDeliveryKind::Create => message.observed_timestamp_ms,
-            MessageDeliveryKind::Update => match self.newest_observation_ms {
-                Some(newest) => message.observed_timestamp_ms.min(newest),
-                None => message.observed_timestamp_ms,
-            },
+        // Only creates advance expiry. A revision may predate retained rows;
+        // an unstamped metadata update has no message clock at all. Neither
+        // may prune the same author's (or another author's) delayed history.
+        let observation = match delivery.kind {
+            MessageDeliveryKind::Create => {
+                self.repeats.expire(
+                    message.observed_timestamp_ms,
+                    self.config.policy.repeated_message_window_seconds,
+                );
+                self.newest_observation_ms = Some(
+                    self.newest_observation_ms
+                        .map_or(message.observed_timestamp_ms, |newest| {
+                            newest.max(message.observed_timestamp_ms)
+                        }),
+                );
+                RepeatObservation::Create
+            }
+            MessageDeliveryKind::Update if delivery.edited_timestamp_ms.is_some() => {
+                RepeatObservation::Revision
+            }
+            MessageDeliveryKind::Update => RepeatObservation::UnstampedUpdate,
         };
-        self.repeats
-            .expire(sweep_ms, self.config.policy.repeated_message_window_seconds);
-        // Delay-ordered dispatches carry their own clock: only advance the
-        // newest observation, never step it back for an older message.
-        if delivery.kind == MessageDeliveryKind::Create {
-            self.newest_observation_ms = Some(
-                self.newest_observation_ms
-                    .map_or(message.observed_timestamp_ms, |newest| {
-                        newest.max(message.observed_timestamp_ms)
-                    }),
-            );
-        }
-        let Some(filter) = match_automod(&message, &self.config.policy, &mut self.repeats) else {
+        let Some(filter) = match_automod_with_clock(
+            &message,
+            &self.config.policy,
+            &mut self.repeats,
+            observation,
+        ) else {
             return Inspection::Accepted(delivery.kind.funnel(false));
         };
         Inspection::Matched(AutomodMatch {

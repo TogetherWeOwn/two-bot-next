@@ -20,6 +20,12 @@ No legacy or production service is changed.
    without member roles, and every update, requires authoritative enrichment.
    Fetch the exact channel/message and resolve that author's guild roles; pass
    them to `with_fetched_message`. Failed lookups are **not** empty roles/content.
+   A create awaiting roles retains its immutable gateway facts in
+   `create_pending_roles`, with no inspectable snapshot/key until resolution.
+   Enrichment replaces only role IDs, checking the author identity too; content,
+   mentions, attachments, message time and revision remain the original CREATE.
+   A later REST revision belongs to an UPDATE, not to the original create's
+   funnel decision.
    Route a MESSAGE_UPDATE dispatch's raw `d` object through
    `PartialEdit::from_dispatch` + `partial_edit_delivery` **before**
    `twilight_gateway::parse`: minimal edits omit the fields a full Twilight
@@ -30,11 +36,12 @@ No legacy or production service is changed.
    is not persisted. Acquire `AutomodStore::claim` **before** `inspect` changes
    repeat history. `InFlight` and `Replayed` must not inspect, award, or send
    effects again; use `FunnelDisposition::None` for their cache-only handling.
-   A released pre-count claim replays as `Preserved(claim, match)` instead:
-   after `inspect` returns a match, the gateway calls
+   An enforcing released pre-count claim replays as `Preserved(claim, match)`
+   instead: after `inspect` returns an **enforce-mode** match, the gateway calls
    `AutomodStore::preserve_match` immediately, before target resolution, so a
    same-revision retry replays the stored IDs/reason code without re-running
    the mutable in-memory repeat tracker that unrelated traffic may have swept.
+   **Dry-run skips preservation** (the store rejects it for dry-run claims).
    `Preserved` must not inspect; it still reconciles through target
    resolution, counting and planning with its rotated claim.
 3. `AutomodRuntime::inspect` returns explicit acceptance, match, fetch, ignore,
@@ -45,7 +52,12 @@ No legacy or production service is changed.
    bot identity, bot/staff protection, roles, bot permissions and hierarchy.
    Call `target_gate` **before** counting or deleting. Unavailable facts emit
    nothing and count nothing. Resolved protected matches retain legacy counting
-   but have no effects. Dry-run fetches no target and never touches the ledger.
+   but have no effects. For dry-run, use `plan` with `ViolationRecord { count: 0,
+   inserted: false }` and no target. Its `DryRun` plan preserves capture-only for
+   matches and emits no effects. Handle that funnel disposition once and complete
+   the claim with `StoredOutcome { matched: true, deleted: false, outcome:
+   CompletionKind::DryRun }`. Do not preserve, count, fetch a target or mark a
+   mutation for dry-run.
 5. For a resolved enforce match, call `record_violation` with the acquired claim.
    Its insert-first transaction counts a `(guild_id, message_id)` once across
    edit revisions. Pass the returned `ViolationRecord` to `plan`.
@@ -69,16 +81,18 @@ No legacy or production service is changed.
    once-per-message when modes change. Do not replay ingestion just because an
    enforcing claim is new.
 9. Invoke `expire_repeat_history(now_ms)` from the shared maintenance tick.
-   Inspection also sweeps inactive authors. Both run on the message clock:
-   delayed/resumed batches never erase the repeat history they still need,
-   and an idle tick never sweeps ahead of the newest observation. Updates
-   inspect on the stable `edited_timestamp_ms` revision clock (receipt time
-   only when Discord supplied no edit stamp), so a same-revision retry
-   re-inspects deterministically; the global sweep for an update is clamped
-   to the newest message-clock observation and never advances on a receipt
-   clock ahead of it. Per-author window pruning still runs at the full
-   observation time, preserving edit-window expiry. No private ticker is
-   introduced.
+   CREATE inspection also sweeps inactive authors on the message clock; an
+   idle tick never sweeps ahead of the newest CREATE observation. Updates do
+   not advance expiry or prune an author's delayed CREATE history. Stamped
+   updates inspect the bounded interval `[edit time - window, edit time]`,
+   excluding future rows without discarding them. The bounded tracker retains
+   the newest observations by timestamp, not revision arrival order.
+   Unstamped updates evaluate content at receipt time without recording or
+   pruning repeat history: metadata is not a new message-clock observation.
+   They still re-inspect all other filters and never award XP. Same-revision
+   enforcing matched retries must use the durable preserved decision rather
+   than assume mutable repeat history remains unchanged. No private ticker
+   is introduced.
 
 The caller must serialize repeat-history observations in gateway order. Do not
 hold a synchronous pipeline mutex across an await. Target policy/activation
@@ -114,11 +128,12 @@ no repeated sanctions over pretending exactly-once remote execution.
 Pre-count resolver failures may release an unmutated claim. When the claim
 carries a preserved decision, a same-revision retry replays the stored
 IDs/reason code instead of re-running the mutable in-memory repeat tracker,
-which unrelated traffic may have swept in the meantime; without a preserved
-decision the retry re-inspects deterministically on the stable edit clock.
-Either way the retry must still reconcile through target resolution,
-counting and planning. An unavailable inspection must not award XP. No
-automatic recovery, retention deletion, or claim reset is included here.
+which unrelated traffic may have swept in the meantime. An enforcing matched
+claim must not be released before preservation succeeds; a false/error result
+is a fail-closed integration error, not permission to re-inspect and award.
+The replay must still reconcile through target resolution, counting and planning.
+An unavailable inspection must not award XP. No automatic recovery, retention
+deletion, or claim reset is included here.
 Shared integration must make the funnel's own writes idempotent for crash
 recovery and mode transitions; the synchronous S3 in-memory pipeline is not
 a durable production store.
@@ -145,9 +160,9 @@ a durable production store.
 Commands (existing Rust installation, target directory outside the synced tree):
 
 ```sh
-cargo test --workspace --all-features --locked
-cargo test -p two-bot-core --features db --locked --test automod_store -- --ignored
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --offline --locked -p two-bot-core -p two-bot-discord --test automod_runtime --test automod_translation
+cargo test --offline --locked -p two-bot-core --features db --test automod_store --test automod_preserved_replay -- --ignored
+cargo clippy --offline --locked -p two-bot-core -p two-bot-discord --features two-bot-core/db --lib --test automod_runtime --test automod_translation --test automod_store --test automod_preserved_replay -- -D warnings
 cargo fmt --all -- --check
 ```
 

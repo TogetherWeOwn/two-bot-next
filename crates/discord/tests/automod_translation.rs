@@ -217,6 +217,69 @@ fn mock_attachment_is_blocked_and_reply_without_ping_is_not_mention_spam() {
 }
 
 #[test]
+fn role_enrichment_must_not_replace_blocked_create_with_edited_content() {
+    let mut original = message();
+    original.content = "blocked".into();
+    original.member = None;
+    let mut mention = serde_json::to_value(&original.author).unwrap();
+    mention["public_flags"] = serde_json::json!(0);
+    original.mentions = vec![serde_json::from_value(mention).unwrap()];
+    original.attachments = serde_json::from_value(serde_json::json!([{
+        "id": "888888888888888888", "filename": "Setup.EXE", "size": 1,
+        "url": "http://mock.invalid/file", "proxy_url": "http://mock.invalid/file"
+    }]))
+    .unwrap();
+    let event = Event::MessageCreate(Box::new(MessageCreate(original.clone())));
+    let delivery = event_to_automod(&event, 1_790_726_401_000).unwrap();
+    assert!(matches!(
+        runtime().inspect(&delivery),
+        Inspection::FetchMessage { .. }
+    ));
+    assert!(DeliveryKey::from_delivery(&delivery, true).is_none());
+    let mut fetched = original.clone();
+    fetched.content = "clean".into();
+    fetched.mentions.clear();
+    fetched.attachments.clear();
+    fetched.timestamp =
+        twilight_model::util::Timestamp::parse("2026-09-30T00:00:03.000000+00:00").unwrap();
+    fetched.edited_timestamp =
+        Some(twilight_model::util::Timestamp::parse("2026-09-30T00:00:02.000000+00:00").unwrap());
+    let complete =
+        with_fetched_message(&delivery, &fetched, &["555555555555555555".into()]).unwrap();
+    let facts = complete.snapshot.as_ref().unwrap();
+    assert_eq!(facts.content, original.content);
+    assert_eq!(
+        facts.mentioned_user_ids,
+        vec![original.author.id.to_string()]
+    );
+    assert_eq!(facts.attachment_names, vec!["Setup.EXE"]);
+    assert_eq!(facts.role_ids, vec!["555555555555555555"]);
+    assert_eq!(facts.observed_timestamp_ms, 1_790_726_400_000);
+    assert_eq!(complete.edited_timestamp_ms, delivery.edited_timestamp_ms);
+    assert!(
+        matches!(runtime().inspect(&complete), Inspection::Matched(m)
+        if m.filter == AutomodFilter::BadWords && m.funnel == FunnelDisposition::CaptureOnly)
+    );
+    fetched.author.id = Id::new(999);
+    assert!(with_fetched_message(&delivery, &fetched, &[]).is_none());
+}
+
+#[test]
+fn original_create_with_roles_is_capture_only_control() {
+    let mut original = message();
+    original.content = "blocked".into();
+    let delivery = event_to_automod(
+        &Event::MessageCreate(Box::new(MessageCreate(original))),
+        1_790_726_401_000,
+    )
+    .unwrap();
+    assert!(
+        matches!(runtime().inspect(&delivery), Inspection::Matched(m)
+        if m.filter == AutomodFilter::BadWords && m.funnel == FunnelDisposition::CaptureOnly)
+    );
+}
+
+#[test]
 fn raw_partial_edit_reaches_fetch_and_enrichment_without_full_decode() {
     use two_bot_discord::automod::{partial_edit_delivery, PartialEdit};
     // Minimal Discord MESSAGE_UPDATE: IDs + changed content, no author,

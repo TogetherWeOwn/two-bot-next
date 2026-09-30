@@ -30,6 +30,7 @@ fn delivery(kind: MessageDeliveryKind, content: &str) -> MessageDelivery {
         message_id: "333333333333333333".into(),
         observed_timestamp_ms: 1_000_000,
         edited_timestamp_ms: None,
+        create_pending_roles: None,
         snapshot: Some(AutomodMessage {
             guild_id: STAGING_GUILD_ID.into(),
             channel_id: "222222222222222222".into(),
@@ -436,6 +437,144 @@ fn interleaved_update_does_not_erase_delayed_create_history() {
         matches!(&interleaved, Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage),
         "unrelated update must not erase delayed creates"
     );
+}
+
+fn timed_delivery(
+    kind: MessageDeliveryKind,
+    id: &str,
+    content: &str,
+    at_ms: u64,
+) -> MessageDelivery {
+    let mut msg = delivery(kind, content);
+    msg.message_id = id.into();
+    msg.observed_timestamp_ms = at_ms;
+    let snapshot = msg.snapshot.as_mut().unwrap();
+    snapshot.message_id = id.into();
+    snapshot.observed_timestamp_ms = at_ms;
+    msg
+}
+
+#[test]
+fn old_edit_must_not_count_future_messages_outside_window() {
+    let mut runtime = runtime(true);
+    for (id, at_ms) in [("1", 60_000), ("2", 70_000)] {
+        assert_eq!(
+            runtime.inspect(&timed_delivery(
+                MessageDeliveryKind::Create,
+                id,
+                "same",
+                at_ms
+            )),
+            Inspection::Accepted(FunnelDisposition::Accept)
+        );
+    }
+    let mut edit = timed_delivery(MessageDeliveryKind::Update, "99", "same", 80_000);
+    edit.edited_timestamp_ms = Some(0);
+    assert_eq!(
+        runtime.inspect(&edit),
+        Inspection::Accepted(FunnelDisposition::None)
+    );
+    // Inspecting the old revision must also leave future rows available.
+    assert!(matches!(
+        runtime.inspect(&timed_delivery(MessageDeliveryKind::Create, "3", "same", 80_000)),
+        Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage
+    ));
+}
+
+#[test]
+fn old_revision_must_not_replace_newer_observation_of_same_message() {
+    let mut runtime = runtime(true);
+    for (id, at_ms) in [("1", 60_000), ("2", 70_000)] {
+        runtime.inspect(&timed_delivery(
+            MessageDeliveryKind::Create,
+            id,
+            "same",
+            at_ms,
+        ));
+    }
+    let mut edit = timed_delivery(MessageDeliveryKind::Update, "1", "same", 80_000);
+    edit.edited_timestamp_ms = Some(0);
+    assert_eq!(
+        runtime.inspect(&edit),
+        Inspection::Accepted(FunnelDisposition::None)
+    );
+    assert!(matches!(
+        runtime.inspect(&timed_delivery(MessageDeliveryKind::Create, "3", "same", 80_000)),
+        Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage
+    ));
+}
+
+#[test]
+fn repeats_preserve_legacy_nearest_observation_capacity() {
+    for kind in [MessageDeliveryKind::Create, MessageDeliveryKind::Update] {
+        let mut runtime = runtime(true);
+        for (id, content, at_ms) in [
+            ("1", "same", 0),
+            ("2", "different", 1_000),
+            ("3", "same", 2_000),
+        ] {
+            runtime.inspect(&timed_delivery(
+                MessageDeliveryKind::Create,
+                id,
+                content,
+                at_ms,
+            ));
+        }
+        let mut next = timed_delivery(kind, "4", "same", 3_000);
+        if kind == MessageDeliveryKind::Update {
+            next.edited_timestamp_ms = Some(3_000);
+        }
+        assert_eq!(
+            runtime.inspect(&next),
+            Inspection::Accepted(kind.funnel(false)),
+            "the oldest same-content row is outside the last three observations"
+        );
+    }
+}
+
+fn same_author_batch(with_update: bool) -> Inspection {
+    let mut runtime = runtime(true);
+    for (id, at_ms) in [("1", 0), ("2", 10_000)] {
+        assert_eq!(
+            runtime.inspect(&timed_delivery(
+                MessageDeliveryKind::Create,
+                id,
+                "same",
+                at_ms
+            )),
+            Inspection::Accepted(FunnelDisposition::Accept)
+        );
+    }
+    if with_update {
+        // More than the tracker's capacity: metadata must not evict history
+        // by insertion either, even when every update belongs to this author.
+        for id in ["99", "100", "101", "102"] {
+            let edit = timed_delivery(MessageDeliveryKind::Update, id, "unrelated", 60_000);
+            assert_eq!(
+                runtime.inspect(&edit),
+                Inspection::Accepted(FunnelDisposition::None)
+            );
+        }
+    }
+    runtime.inspect(&timed_delivery(
+        MessageDeliveryKind::Create,
+        "3",
+        "same",
+        20_000,
+    ))
+}
+
+#[test]
+fn same_author_unstamped_update_must_not_erase_delayed_creates() {
+    assert!(matches!(same_author_batch(true), Inspection::Matched(m)
+        if m.filter == two_bot_core::AutomodFilter::RepeatedMessage
+        && m.funnel == FunnelDisposition::CaptureOnly));
+}
+
+#[test]
+fn timely_repeat_control_matches() {
+    assert!(matches!(same_author_batch(false), Inspection::Matched(m)
+        if m.filter == two_bot_core::AutomodFilter::RepeatedMessage));
 }
 
 #[test]

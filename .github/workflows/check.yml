@@ -117,7 +117,7 @@ jobs:
       - name: automod durable dedupe (CI service container only)
         env:
           AUTOMOD_CI_TESTDB: '1'
-        run: cargo test -p two-bot-core --features db --locked --test automod_store -- --ignored
+        run: cargo test -p two-bot-core --features db --locked --test automod_store --test automod_preserved_replay -- --ignored
 
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored

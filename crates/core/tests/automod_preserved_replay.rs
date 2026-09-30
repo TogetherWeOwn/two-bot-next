@@ -65,6 +65,7 @@ fn delivery(
         message_id: id.into(),
         edited_timestamp_ms: (kind == MessageDeliveryKind::Update).then_some(20_000),
         observed_timestamp_ms: receipt_ms,
+        create_pending_roles: None,
         snapshot: Some(AutomodMessage {
             guild_id: STAGING_GUILD_ID.into(),
             channel_id: "222222222222222222".into(),

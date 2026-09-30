@@ -325,9 +325,9 @@ fn has_bad_word(normalized: &str, words: &[String]) -> bool {
 }
 
 /// Pure repeat tracker (legacy `MemoryRepeatTracker` minus timers): explicit
-/// timestamps, rows pruned by window on every observe, at most
-/// `repeated_message_count` rows per guild+author. The adapter needs no sweep
-/// — stale rows drop on the key's next observe.
+/// timestamps and at most `repeated_message_count` rows per guild+author.
+/// Creates advance history; historical revisions never expire newer rows, and
+/// unstamped updates inspect without recording a receipt-clock observation.
 ///
 /// Content identity is a non-cryptographic hash of the normalized text; the
 /// legacy HMAC key only avoids storing message text, which this tracker
@@ -335,6 +335,13 @@ fn has_bad_word(normalized: &str, words: &[String]) -> bool {
 #[derive(Debug, Default)]
 pub struct RepeatTracker {
     rows: HashMap<String, Vec<RepeatRow>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepeatObservation {
+    Create,
+    Revision,
+    UnstampedUpdate,
 }
 
 #[derive(Debug, Clone)]
@@ -376,25 +383,70 @@ impl RepeatTracker {
         normalized: &str,
         policy: &AutomodPolicy,
     ) -> bool {
+        self.observe_with_clock(message, normalized, policy, RepeatObservation::Create)
+    }
+
+    fn observe_with_clock(
+        &mut self,
+        message: &AutomodMessage,
+        normalized: &str,
+        policy: &AutomodPolicy,
+        observation: RepeatObservation,
+    ) -> bool {
         if normalized.is_empty() {
             return false;
         }
         let window_ms = policy.repeated_message_window_seconds.saturating_mul(1000);
         let cutoff = message.observed_timestamp_ms.saturating_sub(window_ms);
         let key = format!("{}:{}", message.guild_id, message.author_id);
+        let digest = digest_content(normalized);
+        let keep = policy.repeated_message_count.max(1) as usize;
+        let matches_window = |rows: &[RepeatRow]| {
+            // Include this revision once, then the nearest preceding rows in
+            // its interval, retaining legacy last-N observation semantics.
+            rows.iter()
+                .rev()
+                .filter(|row| {
+                    row.message_id != message.message_id
+                        && row.at_ms >= cutoff
+                        && row.at_ms <= message.observed_timestamp_ms
+                })
+                .take(keep - 1)
+                .filter(|row| row.digest == digest)
+                .count()
+                + 1
+                >= keep
+        };
+        if observation == RepeatObservation::UnstampedUpdate {
+            // No revision clock: evaluate content at receipt time, but do not
+            // prune or insert metadata into a delayed author's create history.
+            return matches_window(self.rows.get(&key).map_or(&[], Vec::as_slice));
+        }
         let rows = self.rows.entry(key).or_default();
-        rows.retain(|row| row.at_ms >= cutoff && row.message_id != message.message_id);
+        if rows.iter().any(|row| {
+            row.message_id == message.message_id && row.at_ms > message.observed_timestamp_ms
+        }) {
+            // An old revision can be inspected, but cannot replace a newer
+            // observation of this message already needed by later dispatches.
+            return matches_window(rows);
+        }
+        rows.retain(|row| {
+            row.message_id != message.message_id
+                && (observation != RepeatObservation::Create || row.at_ms >= cutoff)
+        });
+        let matched = matches_window(rows);
         rows.push(RepeatRow {
             message_id: message.message_id.clone(),
-            digest: digest_content(normalized),
+            digest,
             at_ms: message.observed_timestamp_ms,
         });
-        let keep = policy.repeated_message_count.max(1) as usize;
+        // Historical revisions must not evict newer observations by arrival
+        // order. Evaluate their bounded interval before retaining newest rows.
+        rows.sort_by_key(|row| row.at_ms);
         if rows.len() > keep {
             rows.drain(..rows.len() - keep);
         }
-        let digest = digest_content(normalized);
-        rows.iter().filter(|row| row.digest == digest).count() >= keep
+        matched
     }
 }
 
@@ -409,6 +461,15 @@ pub fn match_automod(
     policy: &AutomodPolicy,
     repeats: &mut RepeatTracker,
 ) -> Option<AutomodFilter> {
+    match_automod_with_clock(message, policy, repeats, RepeatObservation::Create)
+}
+
+pub(crate) fn match_automod_with_clock(
+    message: &AutomodMessage,
+    policy: &AutomodPolicy,
+    repeats: &mut RepeatTracker,
+    observation: RepeatObservation,
+) -> Option<AutomodFilter> {
     let normalized = normalize_content(&message.content);
     let link_content: String = normalized
         .chars()
@@ -417,7 +478,7 @@ pub fn match_automod(
     if has_bad_word(&normalized, &policy.bad_words) {
         return Some(AutomodFilter::BadWords);
     }
-    if repeats.observe(message, &normalized, policy) {
+    if repeats.observe_with_clock(message, &normalized, policy, observation) {
         return Some(AutomodFilter::RepeatedMessage);
     }
     if message.mentioned_user_ids.len() >= policy.mention_limit {

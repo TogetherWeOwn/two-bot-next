@@ -187,6 +187,20 @@ async fn durable_claims_ledger_concurrency_and_recovery() {
 
     // Dry run is fenced at persistence, not just at the plan/executor seam.
     let dry = acquire(&store, &key("dry", "create", true)).await;
+    assert!(
+        store
+            .preserve_match(
+                &dry,
+                &AutomodMatch {
+                    subject: subject("dry"),
+                    filter: AutomodFilter::BadWords,
+                    funnel: FunnelDisposition::CaptureOnly,
+                }
+            )
+            .await
+            .is_err(),
+        "preservation is enforce-only; dry-run must skip it"
+    );
     assert!(!store.mark_mutation_started(&dry).await.unwrap());
     assert!(store
         .record_violation(&dry, &subject("dry"), AutomodFilter::BadWords, at)

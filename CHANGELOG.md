@@ -35,6 +35,10 @@
 
 ### Fixed
 
+- Bound automod repeat inspection to each revision's time window without letting
+  unstamped updates prune delayed creates; retain immutable CREATE facts during
+  role enrichment and clarify enforce-only preserved-match recovery. Run the
+  preserved-replay database regression alongside durable dedupe in CI. (TOG-10089)
 - Match legacy ECMAScript whitespace trimming for LFG roles, slot numbers, and titles, including BOM and NEL edge cases.
 - Detect settings changes with a commit-ordered transactional revision instead of a sequence maximum, including deletes and late commits with lower row versions.
 - Serialize settings reads, writes, and audits, including concurrent inserts into absent keys; load cache rows and revision from one consistent database snapshot.

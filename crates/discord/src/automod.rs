@@ -52,6 +52,7 @@ pub fn partial_edit_delivery(edit: &PartialEdit, receipt_ms: u64) -> MessageDeli
         channel_id: edit.channel_id.clone(),
         message_id: edit.message_id.clone(),
         snapshot: None,
+        create_pending_roles: None,
         edited_timestamp_ms: edit
             .edited_timestamp
             .as_deref()
@@ -72,22 +73,18 @@ pub fn event_to_automod(event: &Event, receipt_ms: u64) -> Option<MessageDeliver
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
             });
-            let snapshot = if let Some(roles) = roles {
-                Some(snapshot(
-                    message,
-                    message.guild_id?.to_string(),
-                    &roles,
-                    millis(message.timestamp)?,
-                ))
-            } else if message.author.bot {
-                Some(snapshot(
-                    message,
-                    message.guild_id?.to_string(),
-                    &[],
-                    millis(message.timestamp)?,
-                ))
+            let facts = snapshot(
+                message,
+                message.guild_id?.to_string(),
+                roles.as_deref().unwrap_or_default(),
+                millis(message.timestamp)?,
+            );
+            let (snapshot, create_pending_roles) = if roles.is_some() || message.author.bot {
+                (Some(facts), None)
             } else {
-                None
+                // Retain the gateway revision while waiting for member facts.
+                // REST may already contain a later edit of this same message.
+                (None, Some(facts))
             };
             Some(MessageDelivery {
                 kind: MessageDeliveryKind::Create,
@@ -95,6 +92,7 @@ pub fn event_to_automod(event: &Event, receipt_ms: u64) -> Option<MessageDeliver
                 channel_id: message.channel_id.to_string(),
                 message_id: message.id.to_string(),
                 snapshot,
+                create_pending_roles,
                 edited_timestamp_ms: message.edited_timestamp.and_then(millis),
                 observed_timestamp_ms: receipt_ms,
             })
@@ -105,6 +103,7 @@ pub fn event_to_automod(event: &Event, receipt_ms: u64) -> Option<MessageDeliver
             channel_id: message.channel_id.to_string(),
             message_id: message.id.to_string(),
             snapshot: None,
+            create_pending_roles: None,
             edited_timestamp_ms: message.edited_timestamp.and_then(millis),
             observed_timestamp_ms: receipt_ms,
         }),
@@ -116,6 +115,7 @@ pub fn event_to_automod(event: &Event, receipt_ms: u64) -> Option<MessageDeliver
 /// its author in the requested guild. REST messages need not include guild_id
 /// or member. The shared adapter must resolve the member, not pass an empty
 /// list after a lookup failure. An identity mismatch is never inspected.
+/// CREATE enrichment changes roles only; later REST revisions belong to UPDATE.
 #[must_use]
 pub fn with_fetched_message(
     delivery: &MessageDelivery,
@@ -131,18 +131,37 @@ pub fn with_fetched_message(
     {
         return None;
     }
-    let observed_ms = match delivery.kind {
-        MessageDeliveryKind::Create => millis(message.timestamp)?,
-        MessageDeliveryKind::Update => delivery.observed_timestamp_ms,
+    let (facts, edited_timestamp_ms) = match delivery.kind {
+        MessageDeliveryKind::Create => {
+            let original = delivery
+                .create_pending_roles
+                .as_ref()
+                .or(delivery.snapshot.as_ref())?;
+            if original.guild_id != *guild_id
+                || original.channel_id != delivery.channel_id
+                || original.message_id != delivery.message_id
+                || original.author_id != message.author.id.to_string()
+            {
+                return None;
+            }
+            let mut facts = original.clone();
+            facts.role_ids = author_role_ids.to_vec();
+            (facts, delivery.edited_timestamp_ms)
+        }
+        MessageDeliveryKind::Update => (
+            snapshot(
+                message,
+                guild_id.clone(),
+                author_role_ids,
+                delivery.observed_timestamp_ms,
+            ),
+            message.edited_timestamp.and_then(millis),
+        ),
     };
     Some(MessageDelivery {
-        snapshot: Some(snapshot(
-            message,
-            guild_id.clone(),
-            author_role_ids,
-            observed_ms,
-        )),
-        edited_timestamp_ms: message.edited_timestamp.and_then(millis),
+        snapshot: Some(facts),
+        create_pending_roles: None,
+        edited_timestamp_ms,
         ..delivery.clone()
     })
 }
