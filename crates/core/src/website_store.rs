@@ -1,0 +1,318 @@
+//! sqlx store for the website-contract jobs (TOG-10090).
+//!
+//! Ports the write paths of `src/jobs/communitySnapshots.ts`
+//! (`writeCounterTables`, `writeRankTables`) and `src/jobs/scheduledEvents.ts`
+//! (`replaceEvents`), the raid-window grounding read (`readRaidWindows`), and
+//! the `web_v1` view applier (legacy `src/store/webContract.ts`; the SQL is
+//! the contract in `sql/web_v1.sql`).
+//!
+//! Tick recipe (the S4 REST executor supplies the fetches when it lands; until
+//! then this module is storage behind plain-data outcomes — no dispatcher, no
+//! HTTP client, no timers here):
+//!
+//! 1. Hold a [`crate::JobGate`] guard across the whole tick (single-flight: a
+//!    tick that cannot acquire the gate skips instead of overlapping).
+//! 2. Counter tick: [`read_raid_windows`] → `None` is
+//!    [`crate::CounterSkip::RaidHistoryNotGrounded`]; else fetch the roster,
+//!    [`crate::build_counter_reading`], then [`write_counter`].
+//! 3. Rank tick: additionally [`crate::match_rank_roles`] (`None` is
+//!    [`crate::RankSkip::RankRoleMissing`]), then
+//!    [`crate::build_community_snapshot`], then [`write_rank_snapshot`]. The
+//!    `Invariant` error below is [`crate::RankSkip::RanksNotNested`].
+//! 4. Events tick: fetch, [`crate::normalize_events`], then
+//!    [`replace_events`].
+//!
+//! A failed or ungrounded read returns before any write, so stale numbers age
+//! out in `web_v1` on their own; a failed or malformed events read leaves the
+//! last good mirror in place. Counts write as whole rows: a count and its
+//! read time move together or not at all (the schema enforces the same rule).
+
+use sqlx::{Pool, Postgres, Transaction};
+
+use super::community_snapshots::{window_bounds, CommunitySnapshot, RaidWindow, RAID_ANOMALIES};
+use super::scheduled_events::ScheduledEvent;
+
+/// The contract version this build implements. Must match the row seeded in
+/// migration 0300 and the changelog in `sql/web_v1.sql`.
+pub const WEB_CONTRACT_VERSION: &str = "1.0";
+
+/// Every view in the contract, in `sql/web_v1.sql` order. The website reads
+/// exactly these; a view added here needs a `web_v1` edit, not a migration.
+pub const WEB_CONTRACT_VIEWS: [&str; 9] = [
+    "contract_meta",
+    "live_counts",
+    "rank_counts",
+    "members",
+    "member_milestones",
+    "upcoming_events",
+    "next_event",
+    "funnel_daily",
+    "funnel_by_source",
+];
+
+/// The `web_v1` contract DDL. `include_str!` (not a runtime file read) so the
+/// release binary carries the exact SQL the tests exercise; a missing file
+/// fails the build, never a boot.
+const WEB_CONTRACT_SQL: &str = include_str!("../../../sql/web_v1.sql");
+
+/// Store failure: database error vs the rank invariant backstop.
+#[derive(Debug, thiserror::Error)]
+pub enum WebsiteStoreError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+    /// The snapshot is not publishable (non-nested ladder, or more ranked
+    /// members than humans). Nothing was written; the tick maps this to
+    /// [`crate::RankSkip::RanksNotNested`].
+    #[error(
+        "rank snapshot violates the website invariant (nested={nested}, ranked={ranked}, humans={humans}); wrote nothing"
+    )]
+    Invariant {
+        nested: bool,
+        ranked: usize,
+        humans: usize,
+    },
+}
+
+/// Ground the raid windows against the funnel history (legacy
+/// `readRaidWindows`): for each known raid window, members who joined inside
+/// it and are still present without ever posting or entering voice are the
+/// exclusion set (the exact `scripts/raid-list.ts` removal rule).
+///
+/// Returns `None` when any window has no joins on file — the history the
+/// exclusion grounds on is not there yet, so the tick must publish nothing
+/// (legacy `raid_history_not_grounded`).
+pub async fn read_raid_windows(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+) -> Result<Option<Vec<RaidWindow>>, sqlx::Error> {
+    let mut windows = Vec::with_capacity(RAID_ANOMALIES.len());
+    for anomaly in RAID_ANOMALIES {
+        let Some((from, to)) = window_bounds(anomaly.start, anomaly.end) else {
+            return Ok(None);
+        };
+        let rows: Vec<(String, bool, bool, bool)> = sqlx::query_as(
+            "SELECT member_id,
+                    first_message_at IS NULL AS no_message,
+                    first_voice_at IS NULL AS no_voice,
+                    left_at IS NULL AS present
+               FROM members
+              WHERE guild_id = $1
+                AND joined_at >= $2::timestamptz
+                AND joined_at < $3::timestamptz
+                AND NOT is_bot",
+        )
+        .bind(guild_id)
+        .bind(&from)
+        .bind(&to)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        windows.push(RaidWindow {
+            id: anomaly.id.to_owned(),
+            excluded_member_ids: rows
+                .into_iter()
+                .filter(|(_, no_message, no_voice, present)| *no_message && *no_voice && *present)
+                .map(|(member_id, _, _, _)| member_id)
+                .collect(),
+        });
+    }
+    Ok(Some(windows))
+}
+
+/// Counter tick write (legacy `writeCommunitySnapshot` → `writeCounterTables`):
+/// the same reading lands in `guild_counters` (what `web_v1.live_counts`
+/// serves) and `counter_snapshots` (the audit trail) in one transaction, and
+/// the contract pins to this guild.
+pub async fn write_counter(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    observed_at: &str,
+    human_member_count: i32,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    write_counter_tables(&mut tx, guild_id, observed_at, human_member_count).await?;
+    tx.commit().await
+}
+
+async fn write_counter_tables(
+    tx: &mut Transaction<'_, Postgres>,
+    guild_id: &str,
+    observed_at: &str,
+    human_member_count: i32,
+) -> Result<(), sqlx::Error> {
+    // Two static statements, not one formatted loop: the table names stay
+    // reviewable and sqlx-visible, matching the cutover `db.rs` convention.
+    sqlx::query(
+        "INSERT INTO counter_snapshots (guild_id, human_member_count, human_member_count_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (guild_id) DO UPDATE SET
+           human_member_count = excluded.human_member_count,
+           human_member_count_at = excluded.human_member_count_at",
+    )
+    .bind(guild_id)
+    .bind(human_member_count)
+    .bind(observed_at)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO guild_counters (guild_id, human_member_count, human_member_count_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (guild_id) DO UPDATE SET
+           human_member_count = excluded.human_member_count,
+           human_member_count_at = excluded.human_member_count_at",
+    )
+    .bind(guild_id)
+    .bind(human_member_count)
+    .bind(observed_at)
+    .execute(&mut **tx)
+    .await?;
+    // Pin the contract to the guild whose aggregates this transaction wrote.
+    sqlx::query("UPDATE web_contract_meta SET guild_id = $1 WHERE singleton = TRUE")
+        .bind(guild_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Rank tick write (legacy `runRankSnapshotCycle` transaction): the counter,
+/// the five rank aggregates, the per-member highest-rank cache and the public
+/// exclusions commit together. Publishing a new denominator with yesterday's
+/// ladder would make the cross-view invariant unprovable at the exact moment
+/// it matters, so this is one commit or nothing.
+///
+/// Refuses a non-nested ladder or a ranked-over-human count before opening
+/// the transaction (legacy `rank_snapshot_invariant_failed`): a finding, not
+/// a row.
+pub async fn write_rank_snapshot(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    observed_at: &str,
+    snapshot: &CommunitySnapshot,
+) -> Result<(), WebsiteStoreError> {
+    if !snapshot.nested || snapshot.ranked_member_count > snapshot.human_member_count {
+        return Err(WebsiteStoreError::Invariant {
+            nested: snapshot.nested,
+            ranked: snapshot.ranked_member_count,
+            humans: snapshot.human_member_count,
+        });
+    }
+    let mut tx = pool.begin().await?;
+    write_counter_tables(
+        &mut tx,
+        guild_id,
+        observed_at,
+        snapshot.human_member_count as i32,
+    )
+    .await?;
+    for row in &snapshot.rank_rows {
+        sqlx::query("UPDATE rank_ladder SET rank_label = $1, role_id = $2 WHERE rank_key = $3")
+            .bind(row.key.label())
+            .bind(&row.role_id)
+            .bind(row.key.key())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO rank_snapshots (guild_id, rank_key, member_count, holders_count, snapshot_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (guild_id, rank_key) DO UPDATE SET
+               member_count = excluded.member_count,
+               holders_count = excluded.holders_count,
+               snapshot_at = excluded.snapshot_at",
+        )
+        .bind(guild_id)
+        .bind(row.key.key())
+        .bind(row.member_count as i32)
+        .bind(row.holders_count as i32)
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("DELETE FROM member_ranks WHERE guild_id = $1")
+        .bind(guild_id)
+        .execute(&mut *tx)
+        .await?;
+    for member in &snapshot.member_ranks {
+        sqlx::query(
+            "INSERT INTO member_ranks (guild_id, member_id, rank_key, updated_at)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(guild_id)
+        .bind(&member.member_id)
+        .bind(member.rank_key.map(|k| k.key()))
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("DELETE FROM member_exclusions WHERE guild_id = $1")
+        .bind(guild_id)
+        .execute(&mut *tx)
+        .await?;
+    for member_id in &snapshot.excluded_member_ids {
+        sqlx::query(
+            "INSERT INTO member_exclusions (guild_id, member_id, reason, updated_at)
+             VALUES ($1, $2, 'raid', $3)",
+        )
+        .bind(guild_id)
+        .bind(member_id)
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Events tick write (legacy `replaceEvents`): a successful Discord read
+/// replaces the guild's mirror atomically — including replacing it with zero
+/// rows. The tick only calls this after [`crate::normalize_events`] accepts
+/// the whole response, so a failed or malformed read never reaches here and
+/// the last good snapshot stays in place.
+pub async fn replace_events(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    observed_at: &str,
+    events: &[ScheduledEvent],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM scheduled_events WHERE guild_id = $1")
+        .bind(guild_id)
+        .execute(&mut *tx)
+        .await?;
+    for event in events {
+        sqlx::query(
+            "INSERT INTO scheduled_events
+               (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(guild_id)
+        .bind(&event.id)
+        .bind(&event.name)
+        .bind(&event.starts_at)
+        .bind(&event.channel_id)
+        .bind(&event.description)
+        .bind(event.status.as_str())
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("UPDATE web_contract_meta SET guild_id = $1 WHERE singleton = TRUE")
+        .bind(guild_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+/// Apply the `web_v1` contract views (legacy `applyWebContract`: the SQL file
+/// is the contract, this only runs it). Idempotent — everything in the file
+/// is `CREATE OR REPLACE` / `IF NOT EXISTS` — so the boot path can run it on
+/// every start; a `web_v1` edit that renames, reorders, removes or retypes a
+/// column fails here loudly instead of silently breaking the website.
+pub async fn apply_web_contract(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
+    // Multi-statement DDL with plpgsql bodies: `raw_sql`, not `query` (the
+    // extended protocol runs one statement; `;`-splitting would shred the
+    // function bodies).
+    sqlx::raw_sql(WEB_CONTRACT_SQL).execute(pool).await?;
+    Ok(())
+}
