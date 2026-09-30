@@ -102,6 +102,9 @@ jobs:
       - name: cargo test (docs)
         run: cargo test --workspace --doc --features two-bot-core/db --locked
 
+      - name: audit database regressions (CI service only)
+        run: cargo test -p two-bot-core --features db --test audit_store --locked -- --ignored
+
       - name: LFG store regressions (CI service container only)
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
@@ -124,6 +127,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
+
+      - name: Internal-action durable store regressions (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-core --features db --locked --test internal_action_store -- --ignored
 
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
@@ -198,3 +206,4 @@ jobs:
         run: |
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
+          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs

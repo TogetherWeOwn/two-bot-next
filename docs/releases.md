@@ -66,6 +66,14 @@ changelog and body are reconciled independently, so retries recover if only one
 side was updated. Once they agree the reconciliation is a no-op; unexpected
 layouts fail closed. The lifecycle fixture asserts each historical note in both
 outputs and the resulting release payload, with one title and no stranded notes.
+The configured PR header keeps Summary/Changes/Testing before the FIRST native
+`---` delimiter. Placing them inside the notes before the version heading makes
+17.6.0 parse zero releases and silently publish an empty notes payload. Worker CI
+runs `scripts/test-release-publication.cjs` against an immutable real first-PR
+body, asserting the full native publication payload and a misplaced-template
+negative control. Reconciliation also repairs the first-release comparison
+against the unpublished 0.1.0 seed in both changelog and body; regeneration must
+not restore a link to a nonexistent tag.
 Cargo CI still validates compilation and the real release flow still validates
 GitHub writes.
 
