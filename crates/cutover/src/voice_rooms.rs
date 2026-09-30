@@ -229,7 +229,9 @@ fn decode_creator(row: &PgRow) -> Result<CreatorChannel, sqlx::Error> {
         name_template: row.try_get("name_template")?,
         permission_source,
         permission_channel_id,
-        default_limit: row.try_get::<Option<i32>, _>("default_limit")?.map(i64::from),
+        default_limit: row
+            .try_get::<Option<i32>, _>("default_limit")?
+            .map(i64::from),
         private_default: row.try_get("private_default")?,
         text_channels: row.try_get("text_channels")?,
         position,

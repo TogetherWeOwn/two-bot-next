@@ -14,6 +14,7 @@ pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
 pub mod pipeline;
+pub mod voice_rooms;
 
 pub use adapter::event_to_core;
 pub use executor::{

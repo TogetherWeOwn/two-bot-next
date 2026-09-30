@@ -28,6 +28,7 @@ twilight-model = { workspace = true }
 
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
+axum = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 rustls = { workspace = true }
 serde_json = { workspace = true }
