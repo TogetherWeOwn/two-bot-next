@@ -111,8 +111,9 @@ impl ChannelModerationStore {
 
     /// Remember exactly what the `@everyone` overwrite was before Owen denied
     /// `SendMessages`. Insert-only: a repeated lockdown refreshes the reason
-    /// but can never replace the original pre-lock masks with the
-    /// already-locked masks (legacy `recordLockdown`, TOG-1659 High 1).
+    /// but can never replace the original pre-lock masks (or the original
+    /// recovery generation) with the already-locked masks (legacy
+    /// `recordLockdown`, TOG-1659 High 1).
     pub async fn record_lockdown(
         &self,
         channel_id: &str,
@@ -128,7 +129,8 @@ impl ChannelModerationStore {
              ON CONFLICT (channel_id) DO UPDATE
                SET reason = excluded.reason,
                    locked_at = excluded.locked_at
-             RETURNING channel_id, guild_id, prior_allow, prior_deny, prior_exists, reason",
+             RETURNING channel_id, guild_id, prior_allow, prior_deny, prior_exists, reason,
+                       recovery_generation",
         )
         .bind(channel_id)
         .bind(guild_id)
@@ -146,6 +148,7 @@ impl ChannelModerationStore {
             prior_deny: row.get("prior_deny"),
             prior_exists: row.get("prior_exists"),
             reason: row.get("reason"),
+            recovery_generation: row.get("recovery_generation"),
         })
     }
 
@@ -156,7 +159,8 @@ impl ChannelModerationStore {
         channel_id: &str,
     ) -> Result<Option<LockdownRecord>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT channel_id, guild_id, prior_allow, prior_deny, prior_exists, reason
+            "SELECT channel_id, guild_id, prior_allow, prior_deny, prior_exists, reason,
+                    recovery_generation
                FROM moderation_lockdowns WHERE channel_id = $1",
         )
         .bind(channel_id)
@@ -169,17 +173,33 @@ impl ChannelModerationStore {
             prior_deny: row.get("prior_deny"),
             prior_exists: row.get("prior_exists"),
             reason: row.get("reason"),
+            recovery_generation: row.get("recovery_generation"),
         }))
     }
 
     /// Delete recovery state only after Discord accepted the exact
-    /// restoration (legacy `clearLockdown`).
-    pub async fn clear_lockdown(&self, channel_id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM moderation_lockdowns WHERE channel_id = $1")
-            .bind(channel_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// restoration the caller planned from the matching generation (legacy
+    /// `clearLockdown`). A delayed unlock — or a retried cleanup whose
+    /// earlier result was lost — must present the generation it restored;
+    /// a stale generation (including one for a deleted-and-recreated row
+    /// with identical masks) deletes nothing and returns false, so a later
+    /// lockdown cycle's seed survives. The runtime caller must still
+    /// serialize channel-scoped mutations; claim tokens fence only the
+    /// request ledger (wiring follow-up: TOG-10174).
+    pub async fn clear_lockdown(
+        &self,
+        channel_id: &str,
+        recovery_generation: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM moderation_lockdowns
+              WHERE channel_id = $1 AND recovery_generation = $2",
+        )
+        .bind(channel_id)
+        .bind(recovery_generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Claim `(guild_id, idempotency_key)` before any Discord mutation
@@ -475,9 +495,10 @@ mod tests {
         assert_eq!(rec.prior_allow, "1024");
         assert_eq!(rec.prior_deny, "8192");
         assert!(rec.prior_exists);
+        assert!(!rec.recovery_generation.is_empty());
         // Unlock restores exactly what was stored.
         let got = store.get_lockdown(channel).await.expect("reads");
-        assert_eq!(got, Some(rec));
+        assert_eq!(got, Some(rec.clone()));
         assert_eq!(
             crate::channel_moderation::plan_unlock(got.as_ref()),
             Ok(crate::channel_moderation::UnlockPlan::Restore {
@@ -486,7 +507,10 @@ mod tests {
             })
         );
         // Only after the restore lands does the caller clear.
-        store.clear_lockdown(channel).await.expect("clears");
+        assert!(store
+            .clear_lockdown(channel, &rec.recovery_generation)
+            .await
+            .expect("clears"));
         assert_eq!(store.get_lockdown(channel).await.expect("reads"), None);
         assert_eq!(
             crate::channel_moderation::plan_unlock(None),
@@ -503,7 +527,7 @@ mod tests {
         // already-locked masks.
         let store = test_store().await;
         let channel = "t-lock-repeat";
-        store
+        let first = store
             .record_lockdown(
                 channel,
                 "g1",
@@ -534,7 +558,168 @@ mod tests {
         assert_eq!(second.prior_allow, "1024");
         assert_eq!(second.prior_deny, "8192");
         assert_eq!(second.reason, "second");
-        store.clear_lockdown(channel).await.expect("clears");
+        // A repeated lockdown preserves the original recovery generation
+        // alongside the original seed; cleanup fences on it.
+        assert!(!first.recovery_generation.is_empty());
+        assert_eq!(second.recovery_generation, first.recovery_generation);
+        assert!(store
+            .clear_lockdown(channel, &second.recovery_generation)
+            .await
+            .expect("clears"));
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn delayed_unlock_cleanup_cannot_delete_a_later_lockdown() {
+        // Two unlock requests with distinct idempotency keys both read the
+        // same first-cycle recovery state. The second unlock's delayed
+        // cleanup must not delete the new lockdown recorded after the first
+        // unlock cleared its own generation. No Discord call is involved:
+        // both first-cycle restorations are treated as already successful.
+        let store = test_store().await;
+        let channel = "t-lock-stale-cleanup";
+        let time = "2026-09-30T00:00:00.000Z";
+        let first = store
+            .record_lockdown(
+                channel,
+                "g1",
+                &super::super::channel_moderation::LockdownSeed {
+                    prior_allow: "1024".to_owned(),
+                    prior_deny: "8192".to_owned(),
+                    prior_exists: true,
+                },
+                "first cycle",
+                time,
+            )
+            .await
+            .expect("records first cycle");
+        // Distinct request keys are both granted; claim tokens fence only
+        // the request ledger, not this channel's recovery row.
+        for key in ["t-unlock-a", "t-unlock-b"] {
+            assert!(
+                matches!(
+                    store
+                        .claim("g1", key, "moderation.unlock", key, time)
+                        .await
+                        .expect("claims"),
+                    ChannelClaim::Claimed { .. }
+                ),
+                "distinct unlock keys are both granted"
+            );
+        }
+        let stale_a = store
+            .get_lockdown(channel)
+            .await
+            .expect("reads")
+            .expect("first cycle present");
+        let stale_b = store
+            .get_lockdown(channel)
+            .await
+            .expect("reads")
+            .expect("first cycle present");
+        assert_eq!(stale_a, first);
+        assert_eq!(stale_b, first);
+        // The first unlock restores its own generation and clears it.
+        assert_eq!(
+            crate::channel_moderation::plan_unlock(Some(&stale_a)),
+            crate::channel_moderation::plan_unlock(Some(&stale_b))
+        );
+        assert!(store
+            .clear_lockdown(channel, &stale_a.recovery_generation)
+            .await
+            .expect("clears first cycle"));
+        let second = store
+            .record_lockdown(
+                channel,
+                "g1",
+                &super::super::channel_moderation::LockdownSeed {
+                    prior_allow: "4096".to_owned(),
+                    prior_deny: "16384".to_owned(),
+                    prior_exists: true,
+                },
+                "new cycle",
+                time,
+            )
+            .await
+            .expect("records new cycle");
+        assert_ne!(
+            second.recovery_generation, first.recovery_generation,
+            "a new lockdown cycle mints a new recovery generation"
+        );
+        // The delayed second cleanup restores only the old record, so it
+        // reports stale and the new cycle's seed survives.
+        assert!(!store
+            .clear_lockdown(channel, &stale_b.recovery_generation)
+            .await
+            .expect("stale cleanup no-ops"));
+        assert_eq!(
+            store.get_lockdown(channel).await.expect("reads"),
+            Some(second.clone())
+        );
+        assert!(
+            crate::channel_moderation::plan_unlock(Some(&second)).is_ok(),
+            "the new cycle still unlocks"
+        );
+        assert!(store
+            .clear_lockdown(channel, &second.recovery_generation)
+            .await
+            .expect("clears new cycle"));
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn retried_cleanup_after_recreation_reports_stale() {
+        // A cleanup whose earlier result was lost must not delete a
+        // recreated row even when the masks are identical: generations
+        // differ, so the retry no-ops and the live seed survives.
+        let store = test_store().await;
+        let channel = "t-lock-retry-cleanup";
+        let seed = super::super::channel_moderation::LockdownSeed {
+            prior_allow: "1024".to_owned(),
+            prior_deny: "8192".to_owned(),
+            prior_exists: true,
+        };
+        let time = "2026-09-30T00:00:00.000Z";
+        let first = store
+            .record_lockdown(channel, "g1", &seed, "first", time)
+            .await
+            .expect("records");
+        assert!(store
+            .clear_lockdown(channel, &first.recovery_generation)
+            .await
+            .expect("clears"));
+        let second = store
+            .record_lockdown(channel, "g1", &seed, "recreated", time)
+            .await
+            .expect("recreates with identical masks");
+        assert_ne!(
+            second.recovery_generation, first.recovery_generation,
+            "recreation mints a new recovery generation"
+        );
+        // The lost-result retry of the first cleanup reports stale.
+        assert!(!store
+            .clear_lockdown(channel, &first.recovery_generation)
+            .await
+            .expect("retry no-ops"));
+        assert_eq!(
+            store.get_lockdown(channel).await.expect("reads"),
+            Some(second.clone())
+        );
+        // A wrong generation on a live row deletes nothing either.
+        assert!(!store
+            .clear_lockdown(channel, "no-such-generation")
+            .await
+            .expect("unknown generation no-ops"));
+        assert_eq!(
+            store.get_lockdown(channel).await.expect("reads"),
+            Some(second.clone())
+        );
+        assert!(store
+            .clear_lockdown(channel, &second.recovery_generation)
+            .await
+            .expect("clears"));
         store.cleanup().await;
     }
 

@@ -111,6 +111,14 @@ pub struct LockdownRecord {
     pub prior_deny: String,
     pub prior_exists: bool,
     pub reason: String,
+    /// Opaque recovery generation assigned by the store at insert time.
+    /// Repeated lockdowns preserve the original generation alongside the
+    /// original seed; cleanup must present it so a delayed unlock cannot
+    /// delete a later lockdown cycle's recovery state. The runtime caller is
+    /// responsible for serializing channel-scoped mutations (claim tokens
+    /// fence only the request ledger, not this recovery row); this token
+    /// fences only the cleanup half. Wiring follow-up: TOG-10174.
+    pub recovery_generation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +213,7 @@ mod tests {
             prior_deny: prior_deny.to_owned(),
             prior_exists,
             reason: "raid".to_owned(),
+            recovery_generation: "test-generation".to_owned(),
         }
     }
 

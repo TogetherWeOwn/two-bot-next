@@ -16,6 +16,10 @@
   exact lockdown overwrite recovery, refusal of unlock without recorded state,
   generation-fenced idempotency claims and audit rows. Router/REST execution wiring follows when
   the shared S4 seams are merged.
+- Fence lockdown recovery cleanup to the generation that was restored, so a delayed
+  unlock (or a retried cleanup whose earlier result was lost) reports stale instead of
+  deleting a later lockdown cycle's seed. Repeated lockdowns preserve the original
+  generation alongside the original seed (migration 0122).
 
 ### Fixed
 
