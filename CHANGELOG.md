@@ -14,6 +14,14 @@
 - Port the guild-settings catalogue, 15-second poll contract, cache, sqlx store, and migration to Rust. Runtime ticker and interaction integration remain follow-up work.
 - Run isolated settings persistence and concurrency regressions against a disposable Postgres CI service without credentials.
 - Persist gateway session, resume URL and processed sequence across Container restarts. Commit funnel rows and checkpoints atomically, restore message milestones, discard stale sessions, and fall back to IDENTIFY when Discord invalidates a session.
+- Channel moderation domain and SQL store for purge bounds, slowmode bounds,
+  exact lockdown overwrite recovery, refusal of unlock without recorded state,
+  generation-fenced idempotency claims and audit rows. Router/REST execution wiring follows when
+  the shared S4 seams are merged.
+- Fence lockdown recovery cleanup to the generation that was restored, so a delayed
+  unlock (or a retried cleanup whose earlier result was lost) reports stale instead of
+  deleting a later lockdown cycle's seed. Repeated lockdowns preserve the original
+  generation alongside the original seed (migration 0122).
 
 ### Fixed
 

@@ -7,6 +7,9 @@
 
 pub mod audit;
 pub mod automod;
+pub mod channel_moderation;
+#[cfg(feature = "db")]
+pub mod channel_moderation_store;
 pub mod classify;
 pub mod commands;
 pub mod community;
@@ -58,6 +61,18 @@ pub use automod::{
     AutomodExportError, AutomodExportRule, AutomodFilter, AutomodGateError, AutomodMessage,
     AutomodPolicy, AutomodSanction, RepeatTracker, SanctionAction, DEFAULT_BLOCKED_ATTACHMENTS,
     DEFAULT_SANCTIONS,
+};
+pub use channel_moderation::{
+    moderation_result_text, plan_lockdown, plan_unlock, require_channel_reason,
+    validate_purge_count, validate_slowmode_seconds, BoundsError, ChannelModerationVerb,
+    ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord, LockdownSeed, MaskError,
+    UnlockError, UnlockPlan, MAX_PURGE_COUNT, MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT,
+    SEND_MESSAGES_BIT,
+};
+#[cfg(feature = "db")]
+pub use channel_moderation_store::{
+    ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore, DB_POOL_MAX_DEFAULT,
+    STATEMENT_TIMEOUT_MS,
 };
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use community::{
