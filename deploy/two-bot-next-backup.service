@@ -1,0 +1,51 @@
+# Nightly backup, paired with two-bot-next-backup.timer.
+#
+#   sudo cp deploy/two-bot-next-backup.{service,timer} /etc/systemd/system/
+#   sudo systemctl enable --now two-bot-next-backup.timer
+#   systemctl list-timers two-bot-next-backup
+#
+# Dumps the bot-owned Postgres tables with the verified v3 NDJSON format
+# (`two-bot backup`), keeps the newest TWO_BACKUP_KEEP files, then PUTs the
+# night's dump to S3-compatible storage via TWO_BACKUP_UPLOAD_CMD.
+#
+# This unit does NOT get the Discord token. A backup needs the database and
+# nothing else, which is why the connection string lives in its own
+# environment file rather than in the bot's.
+
+[Unit]
+Description=Back up the two-bot-next funnel log
+After=two-bot-next.service
+
+[Service]
+Type=oneshot
+User=twobot
+Group=twobot
+WorkingDirectory=/opt/two-bot-next
+
+# TWO_DATABASE_URL, TWO_BACKUP_UPLOAD_CMD, and whatever credentials that upload
+# command needs. Root-owned, chmod 600. See docs/backup.md.
+EnvironmentFile=/etc/two-bot-next/backup.env
+Environment=TWO_BACKUP_DIR=/var/backups/two-bot-next
+Environment=TWO_BACKUP_KEEP=14
+ExecStart=/opt/two-bot-next/two-bot backup
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=two-bot-next-backup
+
+# Same posture as the bot: this writes to one directory and talks to Postgres.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/two-bot-next
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
