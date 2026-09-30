@@ -34,6 +34,7 @@ export interface Env {
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
   GUILD_ID?: string;
+  TWO_ANNOUNCEMENTS?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
   /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
@@ -85,6 +86,9 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;
+  if (env.TWO_ANNOUNCEMENTS !== undefined) {
+    vars["TWO_ANNOUNCEMENTS"] = env.TWO_ANNOUNCEMENTS;
+  }
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   return vars;
 }

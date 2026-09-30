@@ -14,6 +14,7 @@ const WORKER_ENV = {
   DATABASE_URL: "synthetic-database-value",
   GUILD_ID: "111222333444555666",
   KEEPALIVE_SECONDS: "60",
+  TWO_ANNOUNCEMENTS: "1",
   REDIRECT_FALLBACK_CODE: "not-a-container-var",
   REDIRECT_MAPPINGS_JSON: "[]",
 };
@@ -22,6 +23,7 @@ const EXPECTED_ENV = {
   DATABASE_URL: WORKER_ENV.DATABASE_URL,
   GUILD_ID: WORKER_ENV.GUILD_ID,
   LISTEN_ADDR: "0.0.0.0:8080",
+  TWO_ANNOUNCEMENTS: WORKER_ENV.TWO_ANNOUNCEMENTS,
 };
 
 type StartConfig = {
@@ -168,6 +170,14 @@ test("missing optionals are omitted; token and guild work without DATABASE_URL",
     LISTEN_ADDR: "0.0.0.0:8080",
   });
 });
+
+for (const value of ["0", "true", ""]) {
+  test(`announcement gate ${JSON.stringify(value)} is forwarded without coercion`, async (t) => {
+    const h = await harness(t, { ...WORKER_ENV, TWO_ANNOUNCEMENTS: value });
+    await h.bot.fetch(new Request("https://worker.invalid/health"));
+    assert.deepEqual(h.starts[0]?.env, { ...EXPECTED_ENV, TWO_ANNOUNCEMENTS: value });
+  });
+}
 
 test("health-only config never fabricates credentials or gateway readiness", async (t) => {
   const h = await harness(t, { DISCORD_TOKEN: "", DATABASE_URL: "", GUILD_ID: "" });

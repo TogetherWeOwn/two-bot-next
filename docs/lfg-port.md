@@ -22,7 +22,11 @@ Nonce recovery reads at most three 100-message history pages and matches the sta
 
 Legacy create/signup/leave/close outcomes use the available shared `rsvp_store::write_audit` announcements seam. Its pool-only insert is not atomic with the domain mutation; an audit failure surfaces as failure rather than a false success. Refresh failure explicitly says the saved mutation remains.
 
-**Production activation is not yet delivered in this checkpoint:** gateway dispatch, authoritative READY bot identity and full-registry publication still require hookup on this same card. Do not treat the tested runtime as live command coverage yet.
+The container entrypoint now loads guild-scoped boot settings (cold announcement gates, environment fallback), resolves bot/application identity through the shared executor before IDENTIFY **or RESUME**, and wires gateway interactions into the shared runtime. READY must agree with that identity; foreign-application interactions are ignored. Worker SDK auto-start, keepalive and explicit-start paths forward the optional `TWO_ANNOUNCEMENTS` string without enabling it by default. No deployed configuration is changed by this PR.
+
+SQL/REST interaction work runs in a bounded `JoinSet` (32 in flight) rather than awaiting on Twilight's polling/checkpoint path. Saturation or a task panic fails closed; shard teardown aborts tasks and retains any already-persisted LFG state for nonce recovery. Gateway checkpoints persist funnel dispatches; this slice does **not** add a durable interaction inbox or guarantee replay of an interaction aborted during restart. Sources: [Twilight shard polling requirement](https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html), [Tokio JoinSet ownership](https://docs.rs/tokio/1/tokio/task/struct.JoinSet.html), and [current bot identity](https://docs.rs/twilight-http/0.17.1/twilight_http/client/struct.Client.html#method.current_user).
+
+Publication uses the router's **whole** gate-filtered registry, never an LFG-only replacement. With automations disabled, custom rows are intentionally excluded by the router. With automations enabled, publication is deferred until TOG-10080 supplies an authoritative custom-command store/load: unavailable storage is not an empty custom set. Existing remote registrations are left untouched in that case. Missing/failed settings, identity or attempted registry publication stops startup rather than pretending success. Staging/production deployment and enabling announcements remain separately gated.
 
 No private dispatcher, Discord client, or temporary voice channel feature is included here.
 
@@ -30,10 +34,11 @@ No private dispatcher, Discord client, or temporary voice channel feature is inc
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
-cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
-cargo test -p two-bot-discord --features db --locked --test lfg_interactions -- --ignored --test-threads=1
+python3 scripts/cargo_cache.py run -- check -p two-bot
+python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot interactions::
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db lfg_store:: -- --ignored --test-threads=1
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_interactions -- --ignored --test-threads=1
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test executor_identity
 ```
 
 The actual-router tests additionally cover lifecycle/audit outcomes, ordinary-member signup/leave, refusals, persist-before-POST ordering, ambiguous acceptance, failed-post cleanup, uncertain history preservation, recovery without role/signup/closure replacement and cross-guild targeting. They apply real migrations in a unique test schema and use only the fixed agent-testdb endpoint or CI service above. Discord REST is a scripted loopback double.
@@ -46,4 +51,4 @@ The store tests cover round trips, guild fencing, leave, capacity, atomic moves,
 
 Revert the feature code and keep announcements disabled until runtime integration is independently reviewed. Migration `0170` is additive: leave the tables in place rather than deleting signup data. No destructive rollback is performed by this slice.
 
-The PR/commits use Conventional Commits and `CHANGELOG.md` has an Unreleased entry. This base has no release-please configuration; no release workflow was added by this feature slice.
+The PR/commits use Conventional Commits and `CHANGELOG.md` has an Unreleased entry. The existing release workflow is unchanged. Controller compilation requires the deployed bounded pool; a refused/missing pool is not permission to compile elsewhere. Hosted CI retains its ephemeral build/test services and runs all targeted regressions.

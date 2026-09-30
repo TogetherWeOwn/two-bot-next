@@ -82,6 +82,22 @@ fn runtime(pool: sqlx::PgPool, mock: &MockRest, enabled: bool) -> InteractionRun
     )
 }
 
+#[tokio::test]
+async fn foreign_application_is_ignored_before_callback_or_store() {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .unwrap();
+    let runtime = runtime(pool, &mock, true);
+    runtime.set_application_id(BOT + 1);
+    assert!(!runtime
+        .handle(&create(901, PERM_MANAGE_EVENTS))
+        .await
+        .unwrap());
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
 struct TestDb {
     pool: sqlx::PgPool,
     admin: sqlx::PgPool,

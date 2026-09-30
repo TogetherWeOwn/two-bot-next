@@ -9,6 +9,7 @@ mod backup_cli;
 mod gateway;
 #[cfg(test)]
 mod gateway_tests;
+mod interactions;
 #[cfg(test)]
 mod lifecycle_tests;
 mod server;
@@ -86,12 +87,22 @@ async fn main() {
                     );
                     let saved = gateway::load_boot_session(&store).await?;
                     let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                    let interactions =
+                        interactions::initialize(db.pool().clone(), guild_id, token.clone())
+                            .await?;
                     let shard = build_shard(token, intents_from_env(), saved.as_ref());
                     info!(
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store).await
+                    run_shard(
+                        shard,
+                        pipeline,
+                        Arc::clone(&state),
+                        store,
+                        Some(interactions),
+                    )
+                    .await
                 }
                 .await;
                 if result.is_err() {

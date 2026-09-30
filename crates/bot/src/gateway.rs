@@ -169,8 +169,9 @@ pub async fn run_shard(
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
+    mut interactions: Option<crate::interactions::InteractionDispatch>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store).await;
+    let result = run_loop(&mut shard, &pipeline, &state, &store, interactions.as_mut()).await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -180,6 +181,7 @@ async fn run_loop(
     pipeline: &GatewayPipeline,
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
+    mut interactions: Option<&mut crate::interactions::InteractionDispatch>,
 ) -> Result<(), sqlx::Error> {
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
@@ -290,6 +292,9 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
+            if let Some(runtime) = interactions.as_deref_mut() {
+                runtime.handle(&event)?;
+            }
         }
         checkpoint_io(
             state,

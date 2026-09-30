@@ -133,6 +133,7 @@ pub struct InteractionRuntime {
     executor: crate::ActionExecutor,
     lfg: crate::lfg_interactions::LfgInteractions,
     bot_user_id: std::sync::atomic::AtomicU64,
+    application_id: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "db")]
@@ -158,6 +159,7 @@ impl InteractionRuntime {
             executor,
             lfg: crate::lfg_interactions::LfgInteractions::new(pool),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
+            application_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -166,8 +168,19 @@ impl InteractionRuntime {
             .store(id, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub fn set_application_id(&self, id: u64) {
+        self.application_id
+            .store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Returns false for interactions owned by another feature or guild.
     pub async fn handle(&self, interaction: &Interaction) -> Result<bool, crate::DiscordError> {
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return Ok(false);
+        }
         use crate::lfg_interactions::{LfgError, LfgRequest};
         use twilight_model::application::interaction::application_command::CommandOptionValue;
         use twilight_model::channel::message::{component::ComponentType, AllowedMentions};
