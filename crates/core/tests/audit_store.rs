@@ -260,6 +260,13 @@ async fn crash_after_prepare_is_reconciliation_only_and_can_quarantine() -> Test
             .await?
     );
     assert!(!restarted.release_unattempted(&recovery).await?);
+    assert!(!restarted.note_accepted(&old, "234").await?);
+    assert!(!restarted.complete(&old).await?);
+    assert!(
+        !restarted
+            .fail_attempt(&old, DeliveryFailure::DefinitelyRejected)
+            .await?
+    );
     assert!(
         restarted
             .quarantine(&recovery, QuarantineReason::MarkerMissing)
@@ -462,6 +469,65 @@ async fn failed_record_never_produces_a_send_or_a_partial_pending_row() -> TestR
         .await?;
     assert!(store.get("write-failure").await?.is_none());
     assert!(store.claim("write-failure").await?.is_none());
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI Postgres service"]
+async fn switch_read_and_ack_write_errors_never_authorize_a_post() -> TestResult {
+    use two_bot_core::audit::{KillSwitchLog, KillSwitchSnapshot};
+
+    let db = TestDb::new(true).await?;
+    let store = AuditStore::new(&db.pool);
+    store.record(&event("switch-error"), Some("123")).await?;
+    let claim = store.claim("switch-error").await?.unwrap();
+    sqlx::query("ALTER TABLE audit_kill_switch RENAME TO unavailable_switch")
+        .execute(&db.pool)
+        .await?;
+    let read = store.delivery_halt().await;
+    assert!(read.is_err());
+    let decision = KillSwitchSnapshot {
+        observed_halted: None,
+        halted: false,
+        read_failed: read.is_err(),
+    }
+    .decide();
+    assert!(!decision.halted);
+    assert_eq!(decision.log, Some(KillSwitchLog::ReadFailed));
+    // The legacy fail-open switch decision cannot repair failed preparation.
+    assert!(store.prepare_send(&claim, "0").await.is_err());
+    assert_eq!(store.get("switch-error").await?.unwrap().attempts, 0);
+    assert!(store.release_unattempted(&claim).await?);
+    sqlx::query("ALTER TABLE unavailable_switch RENAME TO audit_kill_switch")
+        .execute(&db.pool)
+        .await?;
+
+    store.record(&event("ack-error"), Some("123")).await?;
+    let sending = store.claim("ack-error").await?.unwrap();
+    assert_eq!(
+        store.prepare_send(&sending, "200").await?,
+        PrepareSend::Prepared
+    );
+    // A fake Discord acceptance happened; then the acknowledgement DB is
+    // unavailable. Never retry the POST; recover the already-durable boundary.
+    sqlx::query("ALTER TABLE operational_audit_log RENAME TO unavailable_audit")
+        .execute(&db.pool)
+        .await?;
+    assert!(store.note_accepted(&sending, "234").await.is_err());
+    sqlx::query("ALTER TABLE unavailable_audit RENAME TO operational_audit_log")
+        .execute(&db.pool)
+        .await?;
+    db.expire("ack-error").await?;
+    let recovery = store.claim("ack-error").await?.unwrap();
+    assert_eq!(recovery.intent(), DeliveryIntent::Reconcile);
+    assert_eq!(recovery.row().attempts, 1);
+    assert_eq!(recovery.row().search_before.as_deref(), Some("200"));
+    assert_eq!(
+        store.prepare_send(&recovery, "0").await?,
+        PrepareSend::LostClaim
+    );
+    assert!(store.note_accepted(&recovery, "234").await?);
+    assert!(store.complete(&recovery).await?);
     db.finish().await
 }
 

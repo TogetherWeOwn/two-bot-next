@@ -221,7 +221,7 @@ impl AuditStore {
     /// rotates both fences but retains every ambiguity/acceptance marker.
     pub async fn claim(&self, entry_id: &str) -> Result<Option<AuditClaim>, AuditStoreError> {
         let mut tx = self.pool.begin().await?;
-        lock_halt(&mut tx).await?;
+        lock_halt(&mut tx, false).await?;
         let row = sqlx::query(
             "UPDATE operational_audit_log SET delivery_state = 'delivering',
                delivery_claim_token = gen_random_uuid()::text,
@@ -268,7 +268,7 @@ impl AuditStore {
             return Ok(PrepareSend::LostClaim);
         }
         let mut tx = self.pool.begin().await?;
-        lock_halt(&mut tx).await?;
+        lock_halt(&mut tx, false).await?;
         let halted: bool =
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM audit_kill_switch WHERE id = 1)")
                 .fetch_one(&mut *tx)
@@ -460,7 +460,7 @@ impl AuditStore {
             return Err(AuditStoreError::Invalid("halt actor ID"));
         }
         let mut tx = self.pool.begin().await?;
-        lock_halt(&mut tx).await?;
+        lock_halt(&mut tx, true).await?;
         let inserted = sqlx::query(
             "INSERT INTO audit_kill_switch (id, engaged_at, engaged_by)
              VALUES (1,clock_timestamp(),$1) ON CONFLICT (id) DO NOTHING",
@@ -476,7 +476,7 @@ impl AuditStore {
 
     pub async fn disengage_halt(&self) -> Result<bool, AuditStoreError> {
         let mut tx = self.pool.begin().await?;
-        lock_halt(&mut tx).await?;
+        lock_halt(&mut tx, true).await?;
         let removed = sqlx::query("DELETE FROM audit_kill_switch WHERE id = 1")
             .execute(&mut *tx)
             .await?
@@ -490,9 +490,16 @@ impl AuditStore {
 // Serialize halt changes with claim/send preparation even when the switch row
 // is absent. Locks end before any network send; this is not a Discord lock.
 // Source: https://www.postgresql.org/docs/current/explicit-locking.html
-async fn lock_halt(tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':audit-delivery-halt', 0))")
-        .execute(&mut **tx).await?;
+async fn lock_halt(tx: &mut Transaction<'_, Postgres>, write: bool) -> Result<(), sqlx::Error> {
+    // Shared readers allow independent workers to race the row-level UPDATE.
+    // A database-wide key also works when pools use different search paths
+    // that resolve to the same tables. Hash collision only adds contention.
+    let query = if write {
+        "SELECT pg_advisory_xact_lock(hashtextextended('two-bot-next:audit-delivery-halt', 0))"
+    } else {
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended('two-bot-next:audit-delivery-halt', 0))"
+    };
+    sqlx::query(query).execute(&mut **tx).await?;
     Ok(())
 }
 

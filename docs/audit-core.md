@@ -83,7 +83,7 @@ TOG-9810 is not complete until the following have been implemented and tested:
    runtime; readyz/retry lifecycle exercised in a container.
 
 Storage acceptance is implemented in [TOG-10344](/TOG/issues/TOG-10344):
-unit decisions and 11 isolated Postgres tests cover replay, concurrent workers,
+unit decisions and 12 isolated Postgres tests cover replay, concurrent workers,
 fenced writes, restart, ambiguity/quarantine, halt, fresh embedded migrations
 and populated legacy upgrade. This does not claim the service/runtime is complete.
 
