@@ -1044,8 +1044,8 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
 }
 
 #[cfg(test)]
-mod credential_tests {
-    use super::load_staging_token;
+mod tests {
+    use super::{load_staging_token, prune_backups};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1133,5 +1133,29 @@ mod credential_tests {
         .unwrap_err();
         assert!(err.contains("cannot read discord_staging_token"));
         assert!(err.contains("refusing environment fallback"));
+    }
+
+    #[test]
+    fn retention_counts_only_published_archive_names() {
+        let dir = Credentials::new();
+        let published = dir.0.join("two-funnel-previous.ndjson.gz");
+        std::fs::write(&published, b"previous archive").unwrap();
+        let interrupted = [
+            ".two-funnel-interrupted.ndjson.gz.tmp",
+            "two-funnel-interrupted.ndjson.gz.partial",
+        ];
+        for name in interrupted {
+            std::fs::write(dir.0.join(name), b"partial output").unwrap();
+        }
+        assert!(prune_backups(&dir.0, 1).unwrap().is_empty());
+        assert_eq!(std::fs::read(&published).unwrap(), b"previous archive");
+
+        let next = dir.0.join("two-funnel-next.ndjson.gz");
+        std::fs::write(&next, b"next archive").unwrap();
+        assert_eq!(prune_backups(&dir.0, 1).unwrap().len(), 1);
+        assert_eq!(usize::from(published.exists()) + usize::from(next.exists()), 1);
+        for name in interrupted {
+            assert_eq!(std::fs::read(dir.0.join(name)).unwrap(), b"partial output");
+        }
     }
 }
