@@ -112,6 +112,38 @@ jobs:
         with:
           command: check all
 
+  community-db:
+    name: community db
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      TWO_TEST_DATABASE_URL: postgres://agent_test@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Check feature-gated community stores
+        run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
+      - name: Test presence, scorecard and inactivity ledgers on ephemeral Postgres
+        run: |
+          cargo test -p two-bot-core --features db --locked --lib community_store
+          cargo test -p two-bot-core --features db --locked --lib presence_store
+          cargo test -p two-bot-core --features db --locked --lib inactivity_store
+
   worker:
     name: worker check
     runs-on: ubuntu-latest
