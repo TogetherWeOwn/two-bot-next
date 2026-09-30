@@ -241,6 +241,14 @@ async fn run_loop(
 /// a fresh IDENTIFY.
 #[must_use]
 pub fn build_shard(token: String, intents: Intents, session: Option<&GatewaySession>) -> Shard {
+    Shard::with_config(ShardId::ONE, build_shard_config(token, intents, session))
+}
+
+pub fn build_shard_config(
+    token: String,
+    intents: Intents,
+    session: Option<&GatewaySession>,
+) -> twilight_gateway::Config {
     use twilight_gateway::ConfigBuilder;
     let mut builder = ConfigBuilder::new(token, intents);
     // Both fields are required to resume the saved session at its proper URL.
@@ -250,7 +258,7 @@ pub fn build_shard(token: String, intents: Intents, session: Option<&GatewaySess
             .session(Session::new(session.sequence, session.session_id.clone()))
             .resume_url(session.resume_url.clone());
     }
-    Shard::with_config(ShardId::ONE, builder.build())
+    builder.build()
 }
 
 #[must_use]
