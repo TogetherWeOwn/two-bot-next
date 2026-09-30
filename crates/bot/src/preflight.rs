@@ -521,11 +521,13 @@ pub async fn dispatch(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let token = env("DISCORD_TOKEN");
-    let token = if token.is_empty() {
-        env("DISCORD_BOT_TOKEN")
-    } else {
-        token
+    // The alias is a legacy fallback for an absent primary only. A
+    // present-but-empty primary is a configuration error, never permission
+    // to try another credential.
+    let token = match std::env::var("DISCORD_TOKEN") {
+        Ok(token) => token,
+        Err(std::env::VarError::NotPresent) => env("DISCORD_BOT_TOKEN"),
+        Err(_) => String::new(),
     };
     if token.trim().is_empty() {
         report

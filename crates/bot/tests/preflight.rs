@@ -76,7 +76,13 @@ async fn cli(mock: &MockRest, args: &[&str], vars: &[(&str, &str)]) -> std::proc
         .env("DATABASE_URL", "postgresql://must-not-be-used.invalid/bot")
         .kill_on_drop(true);
     for (key, value) in vars {
-        command.env(key, value);
+        // Test-only sentinel: prove absent-primary alias selection without
+        // weakening the helper's default of a present primary.
+        if *key == "__REMOVE_DISCORD_TOKEN__" {
+            command.env_remove("DISCORD_TOKEN");
+        } else {
+            command.env(key, value);
+        }
     }
     let output = tokio::time::timeout(Duration::from_secs(15), command.output())
         .await
@@ -308,6 +314,47 @@ async fn denied_application_and_channel_reads_are_failures_not_successful_skips(
         assert_eq!(mock.requests().len(), index + 1);
         mock.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn present_empty_primary_never_selects_the_alias() {
+    let mock = mock(vec![]).await;
+    let output = cli(
+        &mock,
+        &["--json"],
+        &[
+            ("DISCORD_TOKEN", ""),
+            ("DISCORD_BOT_TOKEN", "usable-fixture-token"),
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ready"], false);
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn absent_primary_still_selects_the_alias() {
+    let mock = mock(script(permissions(), 1 << 15, 1, false, channel())).await;
+    let output = cli(
+        &mock,
+        &["--json"],
+        &[
+            ("__REMOVE_DISCORD_TOKEN__", "1"),
+            ("DISCORD_BOT_TOKEN", TOKEN),
+        ],
+    )
+    .await;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!mock.requests().is_empty());
+    mock.shutdown().await;
 }
 
 #[tokio::test]

@@ -22,8 +22,10 @@ two-bot preflight --json
 Required environment:
 
 - `DISCORD_TOKEN`: the runtime bot credential. `DISCORD_BOT_TOKEN` is accepted
-  only when `DISCORD_TOKEN` is absent/empty, for legacy operator environments.
-  A rejected credential stops the check; there is no retry with the alias.
+  only when `DISCORD_TOKEN` is absent (unset), for legacy operator environments.
+  A present-but-empty primary is a configuration error, not permission to try
+  the alias. A rejected credential stops the check; there is no retry with the
+  alias.
 - `GUILD_ID`: one nonzero guild snowflake, pinned to the deployment under test.
   `DISCORD_GUILD_ID` is a legacy fallback when `GUILD_ID` is absent/empty.
 - The same feature/channel configuration supplied to the bot at startup.
