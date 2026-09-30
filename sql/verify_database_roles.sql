@@ -83,6 +83,16 @@ system_acls AS (
     FROM pg_namespace n LEFT JOIN pg_init_privs i ON i.objoid = n.oid AND i.classoid = 'pg_namespace'::regclass AND i.objsubid = 0 AND i.privtype = 'i'
     WHERE NOT EXISTS (SELECT FROM app_schemas a WHERE a.oid = n.oid)
 ),
+system_owners AS (
+    SELECT c.oid::regclass::text AS target, c.relowner AS owner FROM pg_class c
+    WHERE NOT EXISTS (SELECT FROM app_schemas n WHERE n.oid = c.relnamespace)
+    UNION ALL
+    SELECT p.oid::regprocedure::text, p.proowner FROM pg_proc p
+    WHERE NOT EXISTS (SELECT FROM app_schemas n WHERE n.oid = p.pronamespace)
+    UNION ALL
+    SELECT n.nspname, n.nspowner FROM pg_namespace n
+    WHERE NOT EXISTS (SELECT FROM app_schemas a WHERE a.oid = n.oid)
+),
 findings AS (
     SELECT 'missing role: ' || e.name AS finding
     FROM expected_roles e LEFT JOIN roles r ON r.rolname = e.name WHERE r.oid IS NULL
@@ -99,6 +109,9 @@ findings AS (
     SELECT 'unexpected parameter privilege: ' || r.rolname || '/' || p.parname || '/' || x.privilege_type
     FROM pg_parameter_acl p CROSS JOIN LATERAL aclexplode(p.paracl) x
     JOIN roles r ON x.grantee IN (0, r.oid)
+    UNION ALL
+    SELECT 'unexpected system owner: ' || r.rolname || '/' || o.target
+    FROM system_owners o JOIN roles r ON r.oid = o.owner
     UNION ALL
     SELECT 'unexpected system privilege: ' || r.rolname || '/' || a.target || '/' || x.privilege_type
     FROM system_acls a CROSS JOIN LATERAL aclexplode(a.acl) x JOIN roles r ON x.grantee IN (0, r.oid)

@@ -197,7 +197,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
 async fn verifier_gap_regressions(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     let (migrator, runtime, reader) = (&roles[0], &roles[1], &roles[2]);
     // Catalog probes inspect privileges only; never read password verifiers or files.
-    as_role(pool, reader, "SELECT count(*) FROM pg_catalog.pg_class").await?;
+    as_role(pool, reader, "SELECT count(*) FROM pg_catalog.pg_class; SELECT count(*) FROM information_schema.columns; SELECT pg_catalog.lower('OK')").await?;
     denied(pool, reader, "SELECT rolname FROM pg_catalog.pg_authid").await?;
     denied(
         pool,
@@ -216,6 +216,9 @@ async fn verifier_gap_regressions(pool: &PgPool, roles: &[String]) -> Result<(),
         (format!("GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO {reader}"), "unexpected system privilege:"),
         ("GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO PUBLIC".to_owned(), "unexpected system privilege:"),
         (format!("GRANT SELECT ON pg_catalog.pg_class TO {reader} WITH GRANT OPTION"), "unexpected system privilege:"),
+        (format!("ALTER FUNCTION pg_catalog.lower(text) OWNER TO {reader}"), "unexpected system owner:"),
+        (format!("ALTER SCHEMA information_schema OWNER TO {runtime}"), "unexpected system owner:"),
+        (format!("ALTER SEQUENCE public.events_id_seq OWNED BY NONE; ALTER SEQUENCE public.events_id_seq OWNER TO agent_test"), "object kind/owner differs:"),
         (format!("REVOKE SELECT ON public.members FROM {migrator}"), "missing table privilege:"),
         (format!("REVOKE EXECUTE ON FUNCTION web_v1._iso(timestamptz) FROM {migrator}"), "missing function EXECUTE:"),
         (format!("ALTER SEQUENCE public.events_id_seq OWNED BY NONE; REVOKE USAGE, SELECT ON SEQUENCE public.events_id_seq FROM {runtime}"), "sequence privilege differs:"),
