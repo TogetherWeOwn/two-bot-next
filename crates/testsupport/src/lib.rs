@@ -10,8 +10,9 @@ use url::Url;
 
 /// Validate before any connection is opened. Errors never echo the URL.
 ///
-/// Only the passwordless test principal on the disposable service (or the CI
-/// service's loopback port) is accepted. No libpq query overrides are permitted.
+/// Only the passwordless test principal on the named disposable service is
+/// accepted. CI aliases that service as agent-testdb; no loopback URLs or libpq
+/// query overrides are permitted.
 pub fn guard_database_url(raw: &str) -> Result<()> {
     if raw
         .bytes()
@@ -24,8 +25,8 @@ pub fn guard_database_url(raw: &str) -> Result<()> {
         bail!("test database URL must use postgres or postgresql");
     }
     let host = url.host_str().unwrap_or_default();
-    if !matches!(host, "agent-testdb" | "127.0.0.1") || url.port() != Some(5432) {
-        bail!("test database must use agent-testdb or CI loopback on explicit port 5432");
+    if host != "agent-testdb" || url.port() != Some(5432) {
+        bail!("test database must use agent-testdb on explicit port 5432");
     }
     // Url normalizes an explicitly empty password to None. Compare the raw
     // authority too, so omissions, percent escapes and alternate credentials
@@ -95,7 +96,8 @@ fn connect_options(raw: &str) -> Result<PgConnectOptions> {
         .username("agent_test")
         .password("")
         .database(url.path().trim_start_matches('/'))
-        .ssl_mode(PgSslMode::Disable))
+        .ssl_mode(PgSslMode::Disable)
+        .options([("statement_timeout", "5000ms")]))
 }
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -213,12 +215,15 @@ impl TestDatabase {
         &self.cleanup.as_ref().expect("fixture not closed").name
     }
 
+    /// Await verified teardown without cancelling it if the caller is dropped.
     pub async fn close(mut self) -> Result<()> {
-        self.cleanup
-            .take()
-            .expect("fixture not closed")
-            .close()
+        let cleanup = self.cleanup.take().expect("fixture not closed");
+        // The task owns cleanup before the first await. Dropping/aborting this
+        // future only detaches the join handle; teardown continues while the
+        // runtime lives, including when a checked-out connection delays close.
+        tokio::spawn(cleanup.close())
             .await
+            .context("join disposable test database teardown")?
     }
 }
 
@@ -245,12 +250,10 @@ mod tests {
     #[test]
     fn accepts_only_explicit_test_connections() {
         for scheme in ["postgres", "postgresql"] {
-            for host in ["agent-testdb", "127.0.0.1"] {
-                guard_database_url(&format!(
-                    "{scheme}://agent_test:@{host}:5432/two_bot_test_suite_123"
-                ))
-                .unwrap();
-            }
+            guard_database_url(&format!(
+                "{scheme}://agent_test:@agent-testdb:5432/two_bot_test_suite_123"
+            ))
+            .unwrap();
         }
     }
 
@@ -262,6 +265,7 @@ mod tests {
             "postgres://agent_test:@production:5432/two_bot_test_guard",
             "postgres://agent_test:@staging:5432/two_bot_test_guard",
             "postgres://agent_test:@localhost:5432/two_bot_test_guard",
+            "postgres://agent_test:@127.0.0.1:5432/two_bot_test_guard",
             "postgres://agent_test:@[::1]:5432/two_bot_test_guard",
             "postgres://agent_test:@agent-testdb:5433/two_bot_test_guard",
             "postgres://agent_test:@agent-testdb/two_bot_test_guard",

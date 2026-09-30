@@ -48,7 +48,8 @@ cargo test --workspace --locked
 ### Database tests
 
 Tests run only on the disposable `agent-testdb` service or a CI Postgres service
-container published at `127.0.0.1:5432`, **never staging or production**. Do not
+container aliased as `agent-testdb:5432`, **never staging or production**. The
+shared guard refuses loopback URLs even with CI flags set. Do not
 use `DATABASE_URL`, application credentials, credential fallbacks, or libpq
 `PG*` connection variables. A configured connection/setup failure must fail the
 test, not skip it.
@@ -94,11 +95,14 @@ async fn persists_a_row() {
 ```
 
 Each fixture creates a unique database, applies the supplied migrations, and
-closes/drops only that owned database. The bootstrap is never migrated or
+closes/drops only that owned database. All fixture connections, including
+independent pools, enforce a five-second SQL statement timeout. The bootstrap is never migrated or
 dropped. Call `close().await` explicitly so teardown errors fail the test;
 `Drop` provides only best-effort cleanup while a Tokio runtime remains alive.
-Migration failures clean up immediately. Do not rely on panic/runtime shutdown
-cleanup. The lifecycle test proves concurrent isolation and failure cleanup.
+Migration failures clean up immediately. Cancelling explicit close detaches
+teardown rather than cancelling it, but the runtime must stay alive. Do not rely
+on panic/runtime shutdown cleanup. The lifecycle test proves concurrent
+isolation, failure/cancellation cleanup, and the held-lock timeout.
 
 Feature-gate store tests with `#![cfg(feature = "db")]`, but do not mark new
 DB suites ignored. The normal CI integration step already supplies the single

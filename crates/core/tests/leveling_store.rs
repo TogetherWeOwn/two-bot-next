@@ -1,8 +1,10 @@
 #![cfg(feature = "db")]
 
-//! Opt-in database proof, restricted to agent-testdb or the CI service
-//! container. Run:
-//! cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
+//! Database proof restricted to the named disposable agent-testdb service.
+//! Create an empty two_bot_test_local bootstrap as described in CONTRIBUTING.md,
+//! then run all 13 tests:
+//! TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+//! cargo test -p two-bot-core --features db --locked --test leveling_store
 //! No DATABASE_URL or inherited application credentials are consulted.
 //!
 //! Ports the runtime half of legacy `test/unit.leveling.test.ts` against the

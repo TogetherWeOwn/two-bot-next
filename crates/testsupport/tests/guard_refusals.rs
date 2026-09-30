@@ -116,3 +116,38 @@ fn rejects_actual_inherited_configuration_before_connecting() {
     }
     guard_database_url(SAFE).unwrap();
 }
+
+#[test]
+fn host_allowlist_child() {
+    if std::env::var_os("TESTSUPPORT_HOST_PROBE").is_some() {
+        for scheme in ["postgres", "postgresql"] {
+            guard_database_url(&format!(
+                "{scheme}://agent_test:@agent-testdb:5432/two_bot_test_guard"
+            ))
+            .unwrap();
+            assert!(guard_database_url(&format!(
+                "{scheme}://agent_test:@127.0.0.1:5432/two_bot_test_guard"
+            ))
+            .is_err());
+        }
+    }
+}
+
+#[test]
+fn loopback_is_refused_with_and_without_ci_flags() {
+    for ci in [false, true] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["host_allowlist_child", "--exact"])
+            .env_clear()
+            .env("TESTSUPPORT_HOST_PROBE", "1");
+        if ci {
+            child
+                .env("CI", "true")
+                .env("GITHUB_ACTIONS", "true")
+                .env("TWO_LEVELING_TEST_CI", "1");
+        }
+        let output = child.output().expect("run isolated host allowlist probe");
+        assert!(output.status.success(), "host probe failed (CI={ci})");
+    }
+}
