@@ -30,6 +30,7 @@ pub mod rsvp_store;
 pub mod settings;
 pub mod sticky;
 pub mod voice;
+pub mod voice_config;
 pub mod voice_ownership;
 pub mod voice_vote_kick;
 
