@@ -1,52 +1,20 @@
-//! Onboarding domain: game/session pickers, welcome modes, gate-clear prompt, goodbye.
+//! Framework-free onboarding decisions (TOG-10086): game/session pickers,
+//! legacy/session/anchor welcomes, gate-clear eligibility and session goodbye.
 //!
-//! Slice TOG-10086 of TOG-9809 (S4). Ports the framework-free decision logic
-//! from legacy two-bot as pure inputs → plain-data outcomes, in the same style
-//! as `leveling.rs` / `moderation.rs`:
+//! Parity source: TogetherWeOwn/two-bot @ d5d11793, `src/onboarding/{flow,
+//! catalog,session,mode,anchorEvent}.ts` and `src/discord/{onboarding,
+//! sessionWelcome,anchorWelcome}.ts`; see `docs/parity.md` §§2, 3, 8.
+//! Card-directed difference: anchor is selected by `TWO_ONBOARDING_MODE`, not
+//! by the presence of `DISCORD_ANCHOR_WELCOME_CHANNEL_ID`.
 //!
-//! Source files (legacy `two-bot`, frozen `main`):
-//! - decisions: `src/onboarding/flow.ts` (`decidePrompt`, `planSelection`,
-//!   `resolveDestination`, `currentGameKeys`, `OnboardingRecorder` funnel writes)
-//! - catalog: `src/onboarding/catalog.ts` (`GAME_PICKS`, `PLATFORM_PICKS`,
-//!   hub/intro ids — live TWO ids read from the API 2026-08-19)
-//! - session: `src/onboarding/session.ts` (`planSession`, `sessionAckText`,
-//!   `sessionWelcomeText`, `goodbyeText`, `daysInGuild`, `SESSION_SELECT_ID`,
-//!   `SessionRecorder` — the roleless flow live since TOG-2795)
-//! - mode: `src/onboarding/mode.ts` (`levelRoleWritesForOnboardingMode`)
-//! - anchor: `src/onboarding/anchorEvent.ts` (Sunday Squad recurrence + copy,
-//!   TWO-66 §5.3–§5.4) + `src/discord/anchorWelcome.ts` (one-message rule)
-//! - adapters (behaviour contracts only — no discord.js here):
-//!   `src/discord/onboarding.ts` (`GAME_SELECT_ID`, picker add/remove-to-match,
-//!   ephemeral replies, no-DM, no-dark-links), `src/discord/sessionWelcome.ts`
-//!   (zero role writes, goodbye with `parse: []`), `src/index.ts` (exactly one
-//!   handler owns the gate-clear moment; mode switch `TWO_ONBOARDING_MODE`).
+//! Outcomes describe guild-channel posts and ephemeral replies, never DMs.
+//! Session picks have no role fields. Game routing preserves the legacy hub
+//! fallback; the executor must re-resolve visibility after granting roles.
+//! Goodbyes require empty allowed-mentions even for mention-like usernames.
+//! The store's prompt guard serializes successful join/gate-clear sends.
 //!
-//! Mode switch divergence (card-directed): legacy selects the anchor welcome
-//! via `DISCORD_ANCHOR_WELCOME_CHANNEL_ID` presence while `TWO_ONBOARDING_MODE`
-//! only knows `legacy | session`. This card requires
-//! `legacy / session / anchor via TWO_ONBOARDING_MODE`, so the port parses all
-//! three modes from the one switch (unset = `legacy`, exactly like legacy).
-//!
-//! Wiring: handlers register through the interaction router (TOG-10075) and
-//! emit side effects through the REST executor (TOG-10076). Neither is merged
-//! yet, so this module stops at outcome enums (`WelcomeEffect`,
-//! `GamePickerOutcome`, `SessionPickerOutcome`, `GoodbyeEffect`) — the router
-//! matches on them and the executor renders them. No private dispatcher and no
-//! HTTP client live here. Persistence is `onboarding_store.rs` (behind the
-//! `db` feature) + `crates/cutover/migrations/0190_onboarding.sql`.
-//!
-//! Hard rules, enforced by construction rather than intention:
-//! - NO DMs: outcomes only describe channel posts and ephemeral replies.
-//! - NO LINKS TO DARK CHANNELS: every destination passes a caller-supplied
-//!   `visible` check (the adapter's live permission answer) before it is
-//!   linked; unknown fallbacks go to the hub, never to a 404.
-//! - Session mode writes ZERO roles: [`SessionPlan`] has no role fields, and
-//!   [`adjudicate_game_select`] returns `None` in session mode.
-//! - Goodbyes never ping: [`GoodbyeEffect::Post`] carries `mention_user_id:
-//!   None`, which the executor renders as `allowedMentions: { parse: [] }`.
-//! - Idempotent `onboarding_prompted`: [`decide_prompt`] refuses an already
-//!   prompted member; the store enforces it with the once-per-member
-//!   idempotency key (same format as legacy `idempotencyKey()`).
+//! Runtime wiring belongs to the shared S4 router/REST executor. This slice
+//! supplies outcomes, not a private dispatcher or HTTP client.
 
 use std::collections::{HashMap, HashSet};
 
@@ -124,8 +92,9 @@ pub fn game_picker_allowed(mode: OnboardingMode) -> bool {
 pub struct OnboardingGates {
     /// `TWO_ONBOARDING_MODE` (unset = legacy).
     pub mode: OnboardingMode,
-    /// `TWO_ONBOARDING_DRY_RUN=1`: decide and record nothing, write no roles,
-    /// post nothing (legacy `onboardingDryRun`, used by preflight).
+    /// `TWO_ONBOARDING_DRY_RUN=1`: no role writes, no legacy/anchor welcomes
+    /// and no session goodbyes. Roleless session welcomes/picker replies still
+    /// run and record, matching legacy `sessionWelcome.ts`.
     pub dry_run: bool,
 }
 
@@ -545,6 +514,25 @@ pub struct GamePickerOutcome {
     pub routed: GameSelection,
 }
 
+/// Build the successful ephemeral reply from a post-grant visibility plan.
+#[must_use]
+pub fn game_picker_reply(plan: &GameSelection, guild_id: u64) -> String {
+    let mut lines = vec!["Done. Here is where to go:".to_owned(), String::new()];
+    let mut seen = HashSet::new();
+    for destination in &plan.destinations {
+        let line = format!(
+            "{} **{}** → {}",
+            destination.emoji,
+            destination.label,
+            channel_link(guild_id, &destination.channel_id)
+        );
+        if seen.insert(line.clone()) {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
 /// Adjudicate one game-picker submission. `member_role_ids` is the member's
 /// current role set; unticked game roles they hold are removed so roles never
 /// drift from the declared answer. Unknown keys are logged by the caller, not
@@ -597,24 +585,12 @@ pub fn adjudicate_game_select(
         .filter(|r| !selected.contains(r) && member_role_ids.contains(r))
         .map(str::to_owned)
         .collect();
-    // Re-resolve post-grant in the caller; the reply links the planned rooms.
-    let mut lines = vec!["Done. Here is where to go:".to_owned(), String::new()];
-    let mut seen = HashSet::new();
-    for d in &plan.destinations {
-        let line = format!(
-            "{} **{}** → {}",
-            d.emoji,
-            d.label,
-            channel_link(guild_id, &d.channel_id)
-        );
-        if seen.insert(line.clone()) {
-            lines.push(line);
-        }
-    }
+    // Provisional reply: rebuild with game_picker_reply after role writes and
+    // post-grant visibility resolution, not with stale pre-grant permissions.
     Some(GamePickerOutcome {
         add_role_ids: plan.role_ids.clone(),
         remove_role_ids,
-        reply: lines.join("\n"),
+        reply: game_picker_reply(&plan, guild_id),
         ephemeral: true,
         record_selected: true,
         record_routed: true,
@@ -987,31 +963,6 @@ pub fn occurrence_context(now_secs: i64, spec: AnchorSpec) -> OccurrenceContext 
     }
 }
 
-/// Next `count` starts, epoch secs (legacy `occurrencesFrom`).
-#[must_use]
-pub fn anchor_occurrences_from(now_secs: i64, count: usize, spec: AnchorSpec) -> Vec<i64> {
-    let mut out = Vec::with_capacity(count);
-    let mut cursor = now_secs;
-    for _ in 0..count {
-        let next = next_anchor_occurrence(cursor, spec);
-        out.push(next);
-        cursor = next;
-    }
-    out
-}
-
-/// Live-series start for (re)creating the Discord recurring card
-/// (legacy `liveSeriesStartEpoch`). Before run 1: run 1. After: the next
-/// independently-computed local Sunday — never a recreated missed card, and
-/// Discord cannot create events in the past.
-#[must_use]
-pub fn live_series_start_epoch(now_secs: i64, spec: AnchorSpec) -> i64 {
-    if now_secs < spec.series_start_epoch {
-        return spec.series_start_epoch;
-    }
-    next_anchor_occurrence(now_secs, spec)
-}
-
 /// Anchor welcome copy (legacy `anchorWelcomeText`, TWO-66 §5.3 verbatim).
 /// Nothing may be appended — no picker, no buttons, no footer.
 #[must_use]
@@ -1077,10 +1028,9 @@ pub fn preselected_game_keys(member_role_ids: &[&str]) -> Vec<String> {
 }
 
 /// Adjudicate the welcome for one promptable member. The caller has already
-/// run [`decide_prompt`] (idempotency) and picked the first postable landing
-/// channel (or none); dry run short-circuits to a log-only skip *before* the
-/// channel check, exactly like legacy (a dry run with no channel still logs
-/// `onboarding_dry_run`, never `no_landing_channel`).
+/// run [`decide_prompt`] and picked a postable guild channel (no DMs). Session
+/// welcomes still post in dry run because they never grant roles; legacy and
+/// anchor do not. The executor acquires the store's prompt guard before sending.
 #[must_use]
 pub fn adjudicate_welcome(
     mode: OnboardingMode,
@@ -1091,7 +1041,12 @@ pub fn adjudicate_welcome(
     anchor_spec: AnchorSpec,
     dry_run: bool,
 ) -> WelcomeEffect {
-    if dry_run {
+    if mode != OnboardingMode::Anchor && landing_channel_id.is_none() {
+        return WelcomeEffect::Skip {
+            reason: "no_landing_channel",
+        };
+    }
+    if dry_run && mode != OnboardingMode::Session {
         return WelcomeEffect::Skip { reason: "dry_run" };
     }
     match mode {
@@ -1126,14 +1081,26 @@ pub fn adjudicate_welcome(
     }
 }
 
+/// Explicit executor contract: disable mention parsing, allowing only the
+/// named welcome recipient (when present). Never allow roles or everyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MentionPolicy {
+    None,
+    Member(u64),
+}
+
 /// Goodbye outcome for member-remove (session mode only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoodbyeEffect {
     /// No goodbye channel, or dry run: log, post nothing.
     Skip { reason: &'static str },
-    /// Post the goodbye. `mention_user_id` is always `None` — the person who
-    /// left is named in plain text, never pinged (`parse: []`).
-    Post { channel_id: String, content: String },
+    /// Post the goodbye with `MentionPolicy::None` (`parse: []`). The person
+    /// who left is named in plain text, never pinged.
+    Post {
+        channel_id: String,
+        content: String,
+        mentions: MentionPolicy,
+    },
 }
 
 /// Days between join and leave, floored; `None` when the join is unknown
@@ -1151,8 +1118,8 @@ pub fn days_in_guild(joined_at_ms: Option<i64>, left_at_ms: Option<i64>) -> Opti
 /// detail already lands in the funnel as `member_leave`.
 ///
 /// The username is legacy-trusted display text; the executor must render it
-/// as plain text (no mention parsing) — enforced by `GoodbyeEffect::Post`
-/// carrying no mention id.
+/// as plain text (no mention parsing) — `GoodbyeEffect::Post` explicitly
+/// supplies `MentionPolicy::None`.
 #[must_use]
 pub fn goodbye_text(username: &str, days: Option<i64>) -> String {
     let stay = match days {
@@ -1191,92 +1158,9 @@ pub fn adjudicate_goodbye(
         Some(channel) => Some(GoodbyeEffect::Post {
             channel_id: channel.to_owned(),
             content: goodbye_text(username, days),
+            mentions: MentionPolicy::None,
         }),
     }
-}
-
-// --- scheduled-event payloads ----------------------------------------------------
-// Bodies for POST /guilds/{guild}/scheduled-events (legacy
-// `scheduledEventPayload` / `individualEventPayloads`). Plain data; the
-// executor serializes and posts.
-
-/// Discord recurrence frequency: weekly. `by_weekday` is Monday-based, so
-/// Sunday = 6 (unlike everything else here). `entity_type` 2 = VOICE,
-/// `privacy_level` 2 = GUILD_ONLY.
-pub const DISCORD_FREQUENCY_WEEKLY: u8 = 2;
-pub const DISCORD_WEEKDAY_SUNDAY: u8 = 6;
-pub const DISCORD_ENTITY_VOICE: u8 = 2;
-pub const DISCORD_PRIVACY_GUILD_ONLY: u8 = 2;
-
-/// Anchor sidebar description, TWO-66 §5.4 verbatim.
-pub const SUNDAY_SQUAD_DESCRIPTION: &str = "Fall Guys, an hour, every Sunday. It runs whether there's two of us or eight — a party of two still drops into a full public show. Free on PC, PlayStation, Xbox, Switch and Android, and nothing to be rusty at.\n\nDrop in whenever. No sign-up, no need to say you're coming, and if you haven't got it installed there's something we can play in the room itself.";
-
-/// Format epoch secs as `YYYY-MM-DDTHH:MM:SS.000Z` (legacy `toISOString()`
-/// byte shape; Discord parses second precision).
-#[must_use]
-pub fn format_iso(epoch_secs: i64) -> String {
-    let days = epoch_secs.div_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
-    let tod = epoch_secs.rem_euclid(86_400);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z",
-        tod / 3600,
-        (tod % 3600) / 60,
-        tod % 60
-    )
-}
-
-/// Recurring-series body. `start_epoch` defaults to the series start rather
-/// than "next Sunday": the card is a series, and anchoring anywhere but run 1
-/// shifts every later occurrence. Pass an explicit start only when
-/// re-creating a series that has already begun (via
-/// [`live_series_start_epoch`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScheduledEventPayload {
-    pub name: String,
-    pub description: String,
-    pub channel_id: String,
-    pub entity_type: u8,
-    pub privacy_level: u8,
-    pub scheduled_start_time: String,
-    pub scheduled_end_time: String,
-    pub recurrence_start: String,
-    pub recurrence_frequency: u8,
-    pub recurrence_interval: u8,
-    pub recurrence_by_weekday: Vec<u8>,
-}
-
-#[must_use]
-pub fn scheduled_event_payload(spec: AnchorSpec, start_epoch: i64) -> ScheduledEventPayload {
-    let end = start_epoch + (spec.duration_minutes as i64) * 60;
-    ScheduledEventPayload {
-        name: spec.name.to_owned(),
-        description: SUNDAY_SQUAD_DESCRIPTION.to_owned(),
-        channel_id: spec.channel_id.to_owned(),
-        entity_type: DISCORD_ENTITY_VOICE,
-        privacy_level: DISCORD_PRIVACY_GUILD_ONLY,
-        scheduled_start_time: format_iso(start_epoch),
-        scheduled_end_time: format_iso(end),
-        recurrence_start: format_iso(start_epoch),
-        recurrence_frequency: DISCORD_FREQUENCY_WEEKLY,
-        recurrence_interval: 1,
-        recurrence_by_weekday: vec![DISCORD_WEEKDAY_SUNDAY],
-    }
-}
-
-/// Individual events for the weeks ahead, for when Discord refuses
-/// `recurrence_rule` on a guild — N cards topped up by hand beat one card
-/// that is a week wrong (legacy `individualEventPayloads`).
-#[must_use]
-pub fn individual_event_payloads(
-    now_secs: i64,
-    count: usize,
-    spec: AnchorSpec,
-) -> Vec<ScheduledEventPayload> {
-    anchor_occurrences_from(now_secs, count, spec)
-        .into_iter()
-        .map(|epoch| scheduled_event_payload(spec, epoch))
-        .collect()
 }
 
 // --- funnel rows ---------------------------------------------------------------
@@ -1766,25 +1650,19 @@ mod tests {
 
     #[test]
     fn first_six_occurrences_are_the_ones_the_spec_names() {
-        assert_eq!(
-            anchor_occurrences_from(BEFORE_RUN_1, 6, SUNDAY_SQUAD),
-            vec![
-                1_787_529_600,
-                1_788_134_400,
-                1_788_739_200,
-                1_789_344_000,
-                1_789_948_800,
-                1_790_553_600,
-            ]
-        );
-        assert_eq!(SUNDAY_SQUAD.series_start_epoch, RUN_1);
-        assert_eq!(live_series_start_epoch(BEFORE_RUN_1, SUNDAY_SQUAD), RUN_1);
-        // After run 1 the card advances to the next local Sunday, never a
-        // recreated missed card.
-        assert_eq!(
-            live_series_start_epoch(RUN_1 + 3600, SUNDAY_SQUAD),
-            1_788_134_400
-        );
+        let mut cursor = BEFORE_RUN_1;
+        for expected in [
+            1_787_529_600,
+            1_788_134_400,
+            1_788_739_200,
+            1_789_344_000,
+            1_789_948_800,
+            1_790_553_600,
+        ] {
+            let next = next_anchor_occurrence(cursor, SUNDAY_SQUAD);
+            assert_eq!(next, expected);
+            cursor = next;
+        }
     }
 
     #[test]
@@ -1852,27 +1730,6 @@ mod tests {
         assert!(!near.contains("<t:"), "near copy names no timestamp");
         let live = anchor_welcome_text(MEMBER, RUN_1 + 1800, SUNDAY_SQUAD);
         assert!(live.contains("happening right now"));
-    }
-
-    #[test]
-    fn scheduled_event_payload_matches_discord_shape() {
-        let payload = scheduled_event_payload(SUNDAY_SQUAD, RUN_1);
-        assert_eq!(payload.name, "Sunday Squad");
-        assert_eq!(payload.channel_id, ANCHOR_CHANNEL_ID);
-        assert_eq!(payload.entity_type, DISCORD_ENTITY_VOICE);
-        assert_eq!(payload.privacy_level, DISCORD_PRIVACY_GUILD_ONLY);
-        assert_eq!(payload.scheduled_start_time, "2026-08-24T00:00:00.000Z");
-        assert_eq!(payload.scheduled_end_time, "2026-08-24T01:00:00.000Z");
-        assert_eq!(payload.recurrence_frequency, DISCORD_FREQUENCY_WEEKLY);
-        assert_eq!(payload.recurrence_interval, 1);
-        assert_eq!(payload.recurrence_by_weekday, vec![DISCORD_WEEKDAY_SUNDAY]);
-        assert!(payload.description.contains("Fall Guys"));
-        let six = individual_event_payloads(BEFORE_RUN_1, 6, SUNDAY_SQUAD);
-        assert_eq!(six.len(), 6);
-        assert!(six
-            .windows(2)
-            .all(|w| w[0].scheduled_start_time < w[1].scheduled_start_time));
-        assert_eq!(six[0].scheduled_start_time, "2026-08-24T00:00:00.000Z");
     }
 
     // --- welcome + goodbye ---------------------------------------------------------------------
@@ -1951,7 +1808,36 @@ mod tests {
             ),
             WelcomeEffect::Skip { .. }
         ));
-        // Dry run decides against posting before the channel check.
+        for mode in [OnboardingMode::Legacy, OnboardingMode::Anchor] {
+            assert!(matches!(
+                adjudicate_welcome(
+                    mode,
+                    MEMBER,
+                    Some("111"),
+                    ANCHOR_CHANNEL_ID,
+                    BEFORE_RUN_1,
+                    SUNDAY_SQUAD,
+                    true
+                ),
+                WelcomeEffect::Skip { reason: "dry_run" }
+            ));
+        }
+        // Session's roleless welcome still posts in dry run, like legacy.
+        assert!(matches!(
+            adjudicate_welcome(
+                OnboardingMode::Session,
+                MEMBER,
+                Some("111"),
+                ANCHOR_CHANNEL_ID,
+                BEFORE_RUN_1,
+                SUNDAY_SQUAD,
+                true
+            ),
+            WelcomeEffect::Post {
+                picker: Some(PickerKind::Session),
+                ..
+            }
+        ));
         assert!(matches!(
             adjudicate_welcome(
                 OnboardingMode::Session,
@@ -1962,7 +1848,9 @@ mod tests {
                 SUNDAY_SQUAD,
                 true
             ),
-            WelcomeEffect::Skip { reason: "dry_run" }
+            WelcomeEffect::Skip {
+                reason: "no_landing_channel"
+            }
         ));
     }
 
@@ -2014,13 +1902,15 @@ mod tests {
             Some(GoodbyeEffect::Post {
                 channel_id,
                 content,
+                mentions,
             }) => {
+                assert_eq!(mentions, MentionPolicy::None);
                 assert_eq!(channel_id, "999");
                 assert!(content.starts_with("**dave** left the server (was here 3 days)."));
             }
             _ => panic!("session with a channel posts the goodbye"),
         }
-        // GoodbyeEffect::Post carries no mention id by construction — the
+        // GoodbyeEffect::Post uses explicit MentionPolicy::None — the
         // executor renders allowedMentions { parse: [] }.
         assert!(matches!(
             adjudicate_goodbye(OnboardingMode::Session, "dave", None, None, false),

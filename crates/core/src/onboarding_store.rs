@@ -1,32 +1,26 @@
-//! Onboarding sqlx store (TOG-10086, migration block 0190–0199).
+//! Onboarding persistence over the legacy funnel `events` table.
 //!
-//! Thin persistence over the funnel `events` table (legacy names preserved):
-//! the once-per-member `onboarding_prompted` guard plus the three recorder
-//! writes from [`crate::onboarding`]. Insert-first arbitration
-//! (`ON CONFLICT DO NOTHING` on the idempotency key) decides the winner
-//! atomically — the same rule as the cutover seam in `two-bot-cutover` and
-//! legacy `EventStore.record` — and the members projection is untouched
-//! (onboarding rows project nothing; `members` columns for this flow do not
-//! exist, by the same design that keeps `second_message` a log marker).
-//!
-//! Behind the `db` feature so pure-domain unit tests never need Postgres.
+//! Use [`begin_prompt`] before executing a welcome. The transaction-scoped
+//! member lock serializes join/gate-clear redeliveries, then checks the durable
+//! marker. Record only after a successful send; a failed send drops the guard
+//! and leaves the member eligible for retry. Like the legacy send-then-record
+//! path, a process crash after Discord accepted the message but before commit
+//! is not an exactly-once delivery guarantee across those two systems.
 
-use sqlx::{Pool, Postgres};
+use sqlx::{PgConnection, Pool, Postgres, Transaction};
 
 use super::onboarding::{
     channel_routed_row, funnel_idempotency_key, game_selected_row, prompted_row,
     session_routed_row, FunnelRow, GameSelection, SessionPlan, EVENT_ONBOARDING_PROMPTED,
 };
 
-/// Store failure (transparent sqlx error; messages never include secrets).
 #[derive(Debug, thiserror::Error)]
 pub enum OnboardingStoreError {
     #[error("onboarding store: {0}")]
     Sqlx(#[from] sqlx::Error),
 }
 
-async fn insert_row(pool: &Pool<Postgres>, row: &FunnelRow) -> Result<bool, sqlx::Error> {
-    let key = funnel_idempotency_key(row);
+async fn insert_row(connection: &mut PgConnection, row: &FunnelRow) -> Result<bool, sqlx::Error> {
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
          VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
@@ -38,34 +32,90 @@ async fn insert_row(pool: &Pool<Postgres>, row: &FunnelRow) -> Result<bool, sqlx
     .bind(&row.occurred_at)
     .bind(&row.source)
     .bind(&row.metadata)
-    .bind(&key)
-    .fetch_optional(pool)
+    .bind(funnel_idempotency_key(row))
+    .fetch_optional(connection)
     .await?;
     Ok(inserted.is_some())
 }
 
-/// The once-per-member guard behind [`crate::onboarding::decide_prompt`]:
-/// true once the welcome has been recorded (legacy `store.hasEvent(…,
-/// 'onboarding_prompted')`). The insert path arbitrates again at write time,
-/// so a race between the check and the write still prompts once.
-pub async fn has_onboarding_prompt(
-    pool: &Pool<Postgres>,
+async fn has_prompt(
+    connection: &mut PgConnection,
     guild_id: &str,
     member_id: &str,
-) -> Result<bool, OnboardingStoreError> {
+) -> Result<bool, sqlx::Error> {
     let row: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 FROM events WHERE guild_id = $1 AND member_id = $2 AND event_type = $3 LIMIT 1",
     )
     .bind(guild_id)
     .bind(member_id)
     .bind(EVENT_ONBOARDING_PROMPTED)
-    .fetch_optional(pool)
+    .fetch_optional(connection)
     .await?;
     Ok(row.is_some())
 }
 
-/// Record the welcome (legacy `OnboardingRecorder::prompted` /
-/// `SessionRecorder::prompted`). Returns false when the row already existed.
+/// Read-only fast path for `decide_prompt`. This alone is not a claim: before
+/// sending, use `begin_prompt` to re-check under the member lock.
+pub async fn has_onboarding_prompt(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    member_id: &str,
+) -> Result<bool, OnboardingStoreError> {
+    Ok(has_prompt(&mut *pool.acquire().await?, guild_id, member_id).await?)
+}
+
+/// Permission to execute one welcome, held until its result is recorded.
+/// Dropping the guard without `record_sent` rolls back and releases the lock.
+/// Keep the executor's send timeout bounded; this guard holds a DB connection.
+pub struct PromptGuard {
+    transaction: Transaction<'static, Postgres>,
+    guild_id: String,
+    member_id: String,
+}
+
+impl PromptGuard {
+    /// Call only when Discord has accepted the welcome. No failed sends or
+    /// log-only dry runs may count as prompted. Returns the insert result.
+    pub async fn record_sent(
+        mut self,
+        channel_id: &str,
+        occurred_at: &str,
+    ) -> Result<bool, OnboardingStoreError> {
+        let row = prompted_row(&self.guild_id, &self.member_id, channel_id, occurred_at);
+        let inserted = insert_row(&mut self.transaction, &row).await?;
+        self.transaction.commit().await?;
+        Ok(inserted)
+    }
+}
+
+/// Acquire the per-guild/member prompt lock, then re-check the legacy marker.
+/// `None` means another welcome already succeeded; do not post again.
+pub async fn begin_prompt(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    member_id: &str,
+) -> Result<Option<PromptGuard>, OnboardingStoreError> {
+    let mut transaction = pool.begin().await?;
+    // Stable across processes, independent of Rust's randomized hash seed.
+    // Hash collisions only serialize unrelated members; they never skip one.
+    let key = format!("{guild_id}:{member_id}:onboarding_prompted");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(key)
+        .execute(&mut *transaction)
+        .await?;
+    if has_prompt(&mut transaction, guild_id, member_id).await? {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+    Ok(Some(PromptGuard {
+        transaction,
+        guild_id: guild_id.to_owned(),
+        member_id: member_id.to_owned(),
+    }))
+}
+
+/// Idempotently import/record a welcome that has already been sent. Runtime
+/// senders should hold a `PromptGuard` instead of checking then sending.
 pub async fn record_prompted(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -73,14 +123,13 @@ pub async fn record_prompted(
     channel_id: &str,
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
-    Ok(insert_row(
-        pool,
-        &prompted_row(guild_id, member_id, channel_id, occurred_at),
-    )
-    .await?)
+    match begin_prompt(pool, guild_id, member_id).await? {
+        Some(guard) => guard.record_sent(channel_id, occurred_at).await,
+        None => Ok(false),
+    }
 }
 
-/// Record granted game roles (legacy `OnboardingRecorder::selected`).
+/// Record granted game roles after the executor's role writes succeed.
 pub async fn record_game_selected(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -89,13 +138,13 @@ pub async fn record_game_selected(
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
     Ok(insert_row(
-        pool,
+        &mut *pool.acquire().await?,
         &game_selected_row(guild_id, member_id, keys, occurred_at),
     )
     .await?)
 }
 
-/// Record linked destinations (legacy `OnboardingRecorder::routed`).
+/// Record the destinations re-resolved after successful role writes.
 pub async fn record_channel_routed(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -104,7 +153,7 @@ pub async fn record_channel_routed(
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
     Ok(insert_row(
-        pool,
+        &mut *pool.acquire().await?,
         &channel_routed_row(
             guild_id,
             member_id,
@@ -116,7 +165,7 @@ pub async fn record_channel_routed(
     .await?)
 }
 
-/// Record session routing (legacy `SessionRecorder::routed`).
+/// Record roleless session routing; repeated picks at new timestamps count.
 pub async fn record_session_routed(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -125,7 +174,7 @@ pub async fn record_session_routed(
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
     Ok(insert_row(
-        pool,
+        &mut *pool.acquire().await?,
         &session_routed_row(guild_id, member_id, plan, occurred_at),
     )
     .await?)

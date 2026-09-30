@@ -61,28 +61,25 @@ pub use moderation::{
 };
 pub use onboarding::{
     adjudicate_game_select, adjudicate_goodbye, adjudicate_session_select, adjudicate_welcome,
-    anchor_occurrences_from, anchor_welcome_text, build_session_picks, channel_link,
-    channel_routed_row, current_game_keys, days_in_guild, decide_prompt, funnel_idempotency_key,
-    game_picker_allowed, game_selected_row, goodbye_text, individual_event_payloads,
-    level_role_writes_allowed, live_series_start_epoch, next_anchor_occurrence, occurrence_context,
+    anchor_welcome_text, build_session_picks, channel_link, channel_routed_row, current_game_keys,
+    days_in_guild, decide_prompt, funnel_idempotency_key, game_picker_allowed, game_selected_row,
+    goodbye_text, level_role_writes_allowed, next_anchor_occurrence, occurrence_context,
     pick_by_key, plan_game_selection, plan_session, preselected_game_keys, prompted_row,
-    resolve_destination, scheduled_event_payload, session_ack_text, session_pick_by_key,
-    session_routed_row, session_welcome_text, staging_session_picks, zoned_epoch_secs, AnchorSpec,
+    resolve_destination, session_ack_text, session_pick_by_key, session_routed_row,
+    session_welcome_text, staging_session_picks, welcome_trigger, zoned_epoch_secs, AnchorSpec,
     Destination, FunnelRow, GamePick, GamePickerOutcome, GameSelection, GoodbyeEffect,
-    MembershipTrigger, OccurrenceContext, OnboardingGateError, OnboardingGates, OnboardingMode,
-    PickerKind, PromptDecision, PromptSkip, ScheduledEventPayload, SessionPick,
-    SessionPickerOutcome, SessionPlan, WelcomeEffect, ANCHOR_CHANNEL_ID, DISCORD_ENTITY_VOICE,
-    DISCORD_FREQUENCY_WEEKLY, DISCORD_PRIVACY_GUILD_ONLY, DISCORD_WEEKDAY_SUNDAY,
-    EVENT_CHANNEL_ROUTED, EVENT_GAME_ROLES_SELECTED, EVENT_ONBOARDING_PROMPTED,
-    GAME_HUB_CHANNEL_ID, GAME_PICKS, GAME_SELECT_ID, INTRO_CHANNEL_ID, NEAR_EVENT_SECS,
-    PICKER_CLEARED_REPLY, PICKER_DRY_RUN_REPLY, PICKER_ROLE_FAILURE_REPLY, PLATFORM_PICKS,
-    SESSION_SELECT_ID, SOURCE_PICKER, SOURCE_SESSION_PICKER, STAGING_LOBBY_VOICE_CHANNEL_ID,
-    STAGING_LOOKING_TO_PLAY_CHANNEL_ID, SUNDAY_SQUAD, SUNDAY_SQUAD_DESCRIPTION, TWO_GUILD_ID,
+    MembershipTrigger, MentionPolicy, OccurrenceContext, OnboardingGateError, OnboardingGates,
+    OnboardingMode, PickerKind, PromptDecision, PromptSkip, SessionPick, SessionPickerOutcome,
+    SessionPlan, WelcomeEffect, ANCHOR_CHANNEL_ID, EVENT_CHANNEL_ROUTED, EVENT_GAME_ROLES_SELECTED,
+    EVENT_ONBOARDING_PROMPTED, GAME_HUB_CHANNEL_ID, GAME_PICKS, GAME_SELECT_ID, INTRO_CHANNEL_ID,
+    NEAR_EVENT_SECS, PICKER_CLEARED_REPLY, PICKER_DRY_RUN_REPLY, PICKER_ROLE_FAILURE_REPLY,
+    PLATFORM_PICKS, SESSION_SELECT_ID, SOURCE_PICKER, SOURCE_SESSION_PICKER,
+    STAGING_LOBBY_VOICE_CHANNEL_ID, STAGING_LOOKING_TO_PLAY_CHANNEL_ID, SUNDAY_SQUAD, TWO_GUILD_ID,
 };
 #[cfg(feature = "db")]
 pub use onboarding_store::{
-    has_onboarding_prompt, record_channel_routed, record_game_selected, record_prompted,
-    record_session_routed, OnboardingStoreError,
+    begin_prompt, has_onboarding_prompt, record_channel_routed, record_game_selected,
+    record_prompted, record_session_routed, OnboardingStoreError, PromptGuard,
 };
 pub use voice::{
     average_known_voice_duration, count_unknown_starts_per_window, find_blind_windows,

@@ -32,7 +32,9 @@ CREATE INDEX IF NOT EXISTS idx_events_route_time
 DO $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'chk_events_onboarding_vocabulary'
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chk_events_onboarding_vocabulary'
+      AND conrelid = 'events'::regclass
   ) THEN
     ALTER TABLE events ADD CONSTRAINT chk_events_onboarding_vocabulary CHECK (
       event_type NOT IN ('onboarding_prompted', 'game_roles_selected', 'channel_routed')
