@@ -144,7 +144,11 @@ def stop_group(child):
     child.wait()
 
 
-def run_cargo(pool, args, cargo='cargo', interval=1):
+def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
+    # _before_stop is a deterministic transition seam for the offline suite:
+    # it runs inside cleanup after cancellation starts but before termination
+    # handlers are ignored, reproducing the exact window a second signal can
+    # land in. Production callers leave it None.
     pool = real_directory(pool)
     workspace = real_directory(Path.cwd())
     validate_cargo_args(args, workspace)
@@ -159,6 +163,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1):
     child = None
     previous = {}
     clean_exit = False
+    cancelling = False
     try:
         # Exclusive create + persistent sentinel protect against wrapper death.
         with (slot / 'lease.json').open('x') as output:
@@ -181,6 +186,10 @@ def run_cargo(pool, args, cargo='cargo', interval=1):
                                  pass_fds=(fd,))
 
         def interrupted(signum, frame):
+            nonlocal cancelling
+            if cancelling:
+                return  # a later signal during cleanup must not raise again
+            cancelling = True
             raise Refusal(f'build interrupted by signal {signum}; lease retained')
 
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -200,10 +209,14 @@ def run_cargo(pool, args, cargo='cargo', interval=1):
     finally:
         try:
             if child is not None and not clean_exit:
-                # The raising handler above is still installed: a second
-                # SIGINT/SIGTERM during the SIGTERM wait would raise out of
-                # cleanup before SIGKILL and leave a writer alive. Hold
-                # termination signals until the process group is dead.
+                # Cancellation is idempotent from the first signal onward:
+                # interrupted() sets cancelling before raising, and every
+                # later signal is a no-op, so no signal can raise out of this
+                # cleanup and stop_group always runs. Mark it here too so a
+                # non-signal Refusal (budget/floor) gets the same protection.
+                cancelling = True
+                if _before_stop is not None:
+                    _before_stop()
                 for sig in (signal.SIGINT, signal.SIGTERM):
                     signal.signal(sig, signal.SIG_IGN)
                 stop_group(child)
@@ -340,11 +353,16 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
     if not isinstance(rows, list):
         raise Refusal('inventory workspaces must be a list')
     indexed = {}
+    identities = {}
     for row in rows:
         raw = row['path']
-        # Raw inventory strings can spell one directory two ways
-        # ('/worktrees/a' vs '/worktrees/./a'); canonicalize and reject
-        # duplicate identities so a conflicting live row cannot be ignored.
+        # Inventory paths must be absolute strings. Lexical canonicalization
+        # alone cannot catch symlink/bind-mount aliases, so resolve symlink
+        # spellings and reconcile (st_dev, st_ino) identities for existing
+        # workspaces before indexing; any conflicting live row must refuse
+        # the whole audit, not be ignored.
+        if not isinstance(raw, str) or not os.path.isabs(raw):
+            raise Refusal('ambiguous workspace attribution')
         canonical = os.path.normpath(raw)
         if raw != canonical or canonical in indexed:
             raise Refusal('ambiguous workspace attribution')
@@ -353,6 +371,23 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         if not row.get('issue_id') or row.get('status') not in TERMINAL | {
                 'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
             raise Refusal('missing issue attribution/status')
+        try:
+            resolved = os.path.realpath(canonical)
+        except OSError:
+            raise Refusal('ambiguous workspace attribution')
+        if resolved != canonical:
+            raise Refusal('ambiguous workspace attribution')
+        try:
+            info = os.stat(canonical)
+        except FileNotFoundError:
+            identity = None  # path does not exist; no identity to reconcile
+        except (PermissionError, OSError):
+            raise Refusal(f'incomplete workspace visibility: {canonical}')
+        else:
+            identity = (info.st_dev, info.st_ino)
+            if identity in identities:
+                raise Refusal('ambiguous workspace attribution')
+            identities[identity] = canonical
         indexed[canonical] = row
     refs = process_references(proc_root)
     results = []
@@ -373,6 +408,18 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
             continue
         if row['status'] not in TERMINAL or row['live_run'] or row['referenced']:
             result['reason'] = 'live run, workspace reference, or nonterminal issue'
+            continue
+        # Filename heuristics cannot establish provenance: an ignored target
+        # can hold evidence/archives/sources under Cargo's own subtrees
+        # (e.g. debug/incident-20260930.json, debug/snapshot.tar.gz,
+        # debug/src/main.py all pass name checks). Eligibility requires an
+        # independently recorded, exact-target Operator classification in the
+        # inventory row; missing/unknown/mixed provenance stays ineligible.
+        # This classification is attested control-plane data, never minted
+        # from the filename heuristics below (which remain as a backstop).
+        if row.get('target_provenance') != 'build_output_only':
+            result['reason'] = ('unclassified or mixed target provenance; '
+                                'Operator build-output-only classification required')
             continue
         tracked = subprocess.run(['git', '-C', str(workspace), 'ls-files', '-z', '--', 'target'],
                                  capture_output=True, check=True)

@@ -44,7 +44,11 @@ inspection. A crashed wrapper's sentinel is **never stolen**, regardless of PID
 reuse or issue status. Cargo inherits the lease FD too. Normal completed Cargo
 invocations release the lease, including commands returning a compile/test error.
 An outliving process group leaves the sentinel. Do not clear a sentinel without
-both control-plane and actual-process checks.
+both control-plane and actual-process checks. Build cancellation is idempotent
+from the first signal onward: the first SIGINT/SIGTERM raises out of the poll
+loop, and every later signal is a no-op, so cleanup always reaches the
+SIGTERM/SIGKILL process-group stop and a second signal can never abandon a live
+writer before SIGKILL.
 
 ### What is and is not bounded
 
@@ -138,13 +142,16 @@ stopped, and signals leave a crash sentinel. It also tests inherited external
 Cargo/temp/**repository-scratch** overrides
 (`PAPERCLIP_RUN_SCRATCH_DIR`/`PAPERCLIP_SCRATCH_DIR`, which `mac.rs` tests
 prefer over `temp_dir`), real `tempfile` placement, unchanged parent
-environment, repeated signals during shutdown, missing/symlink scratch refusal,
+environment, repeated signals during shutdown plus a deterministic second-signal
+transition fixture, missing/symlink scratch refusal,
 retained-scratch admission limits, missing scratch-coverage attestation, and
 preservation of the three external path fixtures. Retention tests
 include an **actual Linux child process with an open FD and mmap**, plus container
-path aliases checked by device/inode identity, build-output-only preservation
-vetoes for material stashed inside ignored targets, and refusal of noncanonical
-or aliased inventory rows. All fixtures live in the run scratch
+path aliases checked by device/inode identity, attested Operator
+`target_provenance` gating with tiny unclassified/mixed `.json`/archive/source
+fixtures under allowed subtrees alongside build-output-only preservation
+vetoes for material the heuristics do catch, and refusal of noncanonical,
+symlink-spelled, or device/inode-aliased inventory rows. All fixtures live in the run scratch
 folder when `PAPERCLIP_RUN_SCRATCH_DIR` is set. No Rust build, multi-GiB fixture,
 network, Discord or production/staging store is required. These tests do **not**
 measure real Rust peak size or prove a production quota. The Operator must record
@@ -170,7 +177,8 @@ a fresh, complete, **host-scope** control-plane inventory:
       "issue_id": "actual-issue-uuid",
       "status": "done",
       "live_run": false,
-      "referenced": false
+      "referenced": false,
+      "target_provenance": "build_output_only"
     }
   ]
 }
@@ -184,6 +192,20 @@ host workspace path; ambiguous/missing attribution is not permission to prune.
 Mark `complete` only after accounting for the whole relevant control-plane set.
 Do not infer these booleans from terminal status, a PID lookup, or a directory name.
 The tool intentionally does not guess an API/storage schema or obtain credentials.
+
+`target_provenance` is an independently recorded, exact-target Operator
+classification: `build_output_only` means the Operator has verified this exact
+target directory holds only regenerable Cargo output; `unclassified`, `mixed`,
+or `unknown` (or a missing field) keeps the candidate ineligible. Filename
+heuristics inside the tool cannot establish this — evidence, archives, or
+sources stashed under Cargo's own subtrees (e.g. `debug/incident-20260930.json`)
+pass every name check — so the classification is attested control-plane data,
+never minted from the tool's own heuristics (which remain only as a backstop
+veto). Inventory paths must be absolute canonical host spellings: symlink
+spellings are refused outright, and rows whose existing workspaces share a
+`(st_dev, st_ino)` identity with another row refuse the whole audit, so a
+conflicting live row under an alias path cannot be ignored. Inaccessible
+workspace paths refuse the audit rather than being silently skipped.
 
 Run on the **host in its PID namespace**, with read access to *all* process cwd,
 exe, fd and map entries, including Docker/container processes. A container's own
@@ -200,16 +222,21 @@ python3 scripts/cargo_cache.py audit \
 
 Output is JSON with `audit_only: true`; **the tool never deletes anything**.
 An eligible candidate needs terminal issue attribution, no live run/reference,
-zero tracked target files, a Git-ignored target, no symlink, no actual process
-reference anywhere in its workspace (source/evidence included), and
-**build-output-only target contents**: only Cargo's own top-level entries
+an attested Operator `target_provenance: build_output_only` classification on
+its exact-target inventory row, zero tracked target files, a Git-ignored target,
+no symlink, no actual process reference anywhere in its workspace
+(source/evidence included), and **build-output-only target contents**: only
+Cargo's own top-level entries
 (`debug`, `release`, `doc`, `package`, `tmp`, `.rustc_info.json`, `.cargo-lock`,
 `CACHEDIR.TAG`), with nested build-script codegen (`debug`/`release`
 `build/*/out/*.rs`) expected. A `.gitignore` entry
 proves nothing about provenance, so preserved evidence/backups/archives/sources
-or any other foreign entry inside `target/` vetoes eligibility (fail closed).
-Inventory paths must be canonical and unique: noncanonical spellings
-(`/worktrees/./a`) or duplicate identities with conflicting rows refuse the whole
+or any other foreign entry inside `target/` vetoes eligibility (fail closed),
+and foreign files under Cargo's own subtrees that pass every name check stay
+ineligible without the Operator classification. Inventory paths must be
+absolute, canonical, and unique: noncanonical spellings
+(`/worktrees/./a`), symlink spellings, or duplicate filesystem
+(`st_dev`, `st_ino`) identities with conflicting rows refuse the whole
 audit. A complete control-
 plane snapshot and a proc scan are still not atomic with future dispatch. Therefore
 an audit receipt is not deletion authority. For any approved deletion, the Operator

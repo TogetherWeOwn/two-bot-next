@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -235,6 +236,36 @@ class CacheTests(unittest.TestCase):
         self.assertIn(b'interrupted by signal', error)
         self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
 
+    def test_second_signal_before_handler_ignore_is_noop(self):
+        # Deterministic transition fixture for the exact window a real second
+        # signal can hit: after cancellation starts but before the ignores
+        # take effect. The first SIGTERM (timer thread) starts cleanup; the
+        # _before_stop seam delivers a second SIGTERM while the raising
+        # handler is still installed. Later signals must be no-ops from the
+        # first cancellation onward, so cleanup still reaches stop_group, the
+        # SIGTERM-ignoring fake is SIGKILLed, and the sentinel is retained.
+        import signal as sigmod
+        import threading
+        self.fake.write_text('#!' + sys.executable + '\n'
+                             'import os,signal,time,pathlib\n'
+                             'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                             'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
+                             'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
+                             '(target/"ready").write_text("ready")\n'
+                             'while not (target/"release").exists(): time.sleep(.01)\n')
+        before = sigmod.getsignal(sigmod.SIGTERM)
+        timer = threading.Timer(2.0, lambda: os.kill(os.getpid(), sigmod.SIGTERM))
+        timer.start()
+        try:
+            with self.assertRaisesRegex(cache.Refusal, 'interrupted by signal'):
+                cache.run_cargo(
+                    self.pool, ['check'], cargo=str(self.fake), interval=.01,
+                    _before_stop=lambda: os.kill(os.getpid(), sigmod.SIGTERM))
+        finally:
+            timer.cancel()
+        self.assertIs(sigmod.getsignal(sigmod.SIGTERM), before)
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
     def test_low_disk_prevents_launch(self):
         with patch.object(cache, 'available', return_value=0):
             with self.assertRaisesRegex(cache.Refusal, 'insufficient'):
@@ -306,7 +337,8 @@ class RetentionTests(unittest.TestCase):
         self.proc.mkdir()
         self.now = time.time()
         self.row = {'path': str(self.workspace), 'issue_id': 'fixture-terminal',
-                    'status': 'done', 'live_run': False, 'referenced': False}
+                    'status': 'done', 'live_run': False, 'referenced': False,
+                    'target_provenance': 'build_output_only'}
         self.inventory = {'version': 1, 'complete': True, 'process_scope': 'host',
                           'captured_at_unix': self.now, 'workspaces': [self.row]}
 
@@ -315,6 +347,22 @@ class RetentionTests(unittest.TestCase):
 
     def reason(self):
         return self.audit()['candidates'][0]['reason']
+
+    def make_workspace(self, name):
+        # A second ignored-target workspace that reaches every gate the
+        # fixture workspace reaches, so multi-row tests use one row per
+        # distinct canonical path.
+        workspace = self.worktrees / name
+        workspace.mkdir()
+        subprocess.run(['git', 'init', '-q', str(workspace)], check=True)
+        (workspace / '.gitignore').write_text('/target/\n')
+        target = workspace / 'target'
+        (target / 'debug').mkdir(parents=True)
+        (target / 'debug' / 'fixture').write_bytes(b'x' * 4096)
+        return workspace
+
+    def by_target(self):
+        return {row['target']: row for row in self.audit()['candidates']}
 
     def fake_pid(self):
         pid = self.proc / '123'
@@ -333,21 +381,51 @@ class RetentionTests(unittest.TestCase):
         self.assertTrue((self.target / 'debug' / 'fixture').exists())
         self.assertEqual((self.workspace / 'evidence.md').read_text(), 'preserve me')
 
-    def test_preserved_material_inside_ignored_target_vetoes_eligibility(self):
-        # .gitignore proves nothing about provenance: evidence, sources and
-        # backups stashed inside target/ must veto retention, fail closed.
+    def test_unclassified_or_foreign_target_is_ineligible(self):
+        # P1: filename heuristics cannot mint provenance. An attested
+        # Operator build-output-only classification is required; these three
+        # foreign files all pass the name checks (debug subtree, no
+        # protected stem/suffix), so without the classification gate they
+        # would be reported eligible.
+        (self.target / 'debug' / 'incident-20260930.json').write_bytes(b'x' * 64)
+        (self.target / 'debug' / 'snapshot.tar.gz').write_bytes(b'x' * 64)
+        (self.target / 'debug' / 'src').mkdir()
+        (self.target / 'debug' / 'src' / 'main.py').write_bytes(b'x' * 64)
+        extras = [self.make_workspace(f'provenance-{provenance}')
+                  for provenance in ('unclassified', 'mixed', 'unknown')]
+        self.inventory['workspaces'] = [self.row] + [
+            dict(self.row, path=str(workspace), target_provenance=provenance)
+            for workspace, provenance in
+            zip(extras, ('unclassified', 'mixed', 'unknown'))]
+        by_target = self.by_target()
+        for workspace in extras:
+            candidate = by_target[str(workspace / 'target')]
+            self.assertFalse(candidate['eligible'])
+            self.assertIn('provenance', candidate['reason'])
+        self.assertTrue(by_target[str(self.target)]['eligible'])
+        self.inventory['workspaces'] = [self.row]
+        for workspace in extras:
+            shutil.rmtree(workspace)
+        key = str(self.target)
+        self.assertTrue(self.by_target()[key]['eligible'])
+
+        def primary_reason():
+            return self.by_target()[key]['reason']
+
+        # Build-output-only heuristics remain as a backstop: material the
+        # heuristics do catch still vetoes even with a classification.
         (self.target / 'evidence').mkdir()
         (self.target / 'evidence' / 'incident.md').write_bytes(b'x' * 64)
-        self.assertIn('preserved', self.reason())
+        self.assertIn('preserved', primary_reason())
         (self.target / 'evidence' / 'incident.md').unlink()
         (self.target / 'evidence').rmdir()
         (self.target / 'debug' / 'stashed-source.rs').write_bytes(b'x' * 64)
-        self.assertIn('preserved', self.reason())
+        self.assertIn('preserved', primary_reason())
         (self.target / 'debug' / 'stashed-source.rs').unlink()
         (self.target / 'incident-report.md').write_bytes(b'x' * 64)
-        self.assertIn('preserved', self.reason())
+        self.assertIn('preserved', primary_reason())
         (self.target / 'incident-report.md').unlink()
-        self.assertTrue(self.audit()['candidates'][0]['eligible'])
+        self.assertTrue(self.by_target()[key]['eligible'])
 
     def test_live_runs_and_referenced_terminal_workspaces_preserved(self):
         for key in ('live_run', 'referenced'):
@@ -378,6 +456,25 @@ class RetentionTests(unittest.TestCase):
             self.audit()
         live = self.row | {'live_run': True, 'referenced': True}
         self.inventory['workspaces'] = [self.row, live]
+        with self.assertRaisesRegex(cache.Refusal, 'ambiguous'):
+            self.audit()
+
+    def test_conflicting_symlink_inventory_rows_refused(self):
+        # Symlink/bind-mount aliases share (st_dev, st_ino) with the real
+        # workspace. A terminal row under the real path and a live/queued row
+        # under the alias — with no process entry — must refuse the whole
+        # audit, not select only the terminal row.
+        alias_dir = self.root / 'alias-worktrees'
+        alias_dir.mkdir()
+        link = alias_dir / 'terminal-card'
+        link.symlink_to(self.workspace, target_is_directory=True)
+        live = self.row | {'path': str(link), 'live_run': True,
+                           'referenced': True, 'status': 'in_progress'}
+        self.inventory['workspaces'] = [self.row, live]
+        with self.assertRaisesRegex(cache.Refusal, 'ambiguous'):
+            self.audit()
+        # Symlink spellings are refused outright.
+        self.inventory['workspaces'] = [self.row | {'path': str(link)}]
         with self.assertRaisesRegex(cache.Refusal, 'ambiguous'):
             self.audit()
 
