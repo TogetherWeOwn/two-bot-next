@@ -54,6 +54,7 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod metrics;
 pub mod moderation;
 pub mod onboarding;
 #[cfg(feature = "db")]

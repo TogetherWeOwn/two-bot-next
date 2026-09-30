@@ -9,6 +9,7 @@ pub mod adapter;
 pub mod audit_mirror;
 pub mod channel_access;
 pub mod executor;
+mod executor_metrics;
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
