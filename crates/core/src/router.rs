@@ -556,10 +556,35 @@ impl InteractionRouter {
         self.route_component(custom_id, guild_id)
     }
 
+    /// Every built-in slash name the dispatch table recognizes, independent
+    /// of gates. [`InteractionRouter::route_slash`] matches builtins before
+    /// custom rows — and refuses the disabled ones rather than falling
+    /// through — so a custom row under one of these names could never
+    /// execute. Publish reserves the same set.
+    fn all_builtin_names() -> HashSet<String> {
+        core_commands()
+            .iter()
+            .chain(std::iter::once(&scorecard_attendance_command()))
+            .chain(automation_commands().iter())
+            .chain(announcement_commands().iter())
+            .chain(super::moderation::moderation_commands().iter())
+            .map(|def| def.name.clone())
+            .collect()
+    }
+
     /// Assemble the ONE complete guild command set for publish-on-ready
     /// (legacy `CommandRegistry::sync` order: community, automation,
     /// announcement, moderation — then DB custom commands). First-wins dedupe
     /// and the 100-command ceiling come from `merge_commands`.
+    ///
+    /// Two publish/routing agreements keep a published command executable:
+    /// - custom rows publish only while automations are on. Every custom
+    ///   invocation refuses as [`RouterRefusal::AutomationsDisabled`] while
+    ///   off, so leaving them in the set only burns the ceiling.
+    /// - every built-in name is reserved even when its feature is off.
+    ///   Dispatch matches builtins first (moderation included) and refuses
+    ///   the disabled row, so a same-named custom command would publish yet
+    ///   never execute.
     pub fn publish_set(
         &self,
         custom: &[CustomCommand],
@@ -577,7 +602,21 @@ impl InteractionRouter {
         if self.gates.moderation {
             extra.push(super::moderation::moderation_commands());
         }
-        merge_commands(&extra, custom)
+        // `merge_commands` reserves the active builtins; the router additionally
+        // withholds disabled builtin names (same precedence as dispatch) and
+        // all custom rows while automations are off. `merge_commands` still
+        // applies its enabled/dedupe/ceiling rules on top.
+        let reserved = Self::all_builtin_names();
+        let visible: Vec<CustomCommand> = if self.gates.automations {
+            custom
+                .iter()
+                .filter(|cmd| !reserved.contains(&cmd.name))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        merge_commands(&extra, &visible)
     }
 }
 
@@ -842,6 +881,62 @@ mod tests {
     }
 
     #[test]
+    fn attendance_requires_manage_events() {
+        let r = router();
+        // Denied and missing permission bits refuse, mirroring
+        // `rsvp::require_manage_events`; Discord picker hiding is not
+        // authorization.
+        assert_eq!(
+            r.route_slash(&ctx("attendance", Some(GUILD), Some(0))),
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::ManageEventsRequired
+            }
+        );
+        assert_eq!(
+            r.route_slash(&ctx("attendance", Some(GUILD), None)),
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::ManageEventsRequired
+            }
+        );
+        assert_eq!(
+            r.route_slash(&ctx("attendance", Some(GUILD), Some(PERM_MANAGE_EVENTS))),
+            SlashOutcome::Handled {
+                handler: HandlerId::ScorecardAttendance
+            }
+        );
+    }
+
+    #[test]
+    fn picker_components_enforce_the_guild_fence() {
+        let r = router();
+        let unconfigured = InteractionRouter::new(RouterGates {
+            configured_guild: None,
+            ..all_on()
+        });
+        for id in [GAME_SELECT_ID, "two:self-role:games"] {
+            // Foreign guild, missing guild, and unconfigured router: silence
+            // on both the component and modal paths (modals share the table).
+            for (router, guild, label) in [
+                (&r, Some(9999), "foreign guild"),
+                (&r, None, "missing guild"),
+                (&unconfigured, Some(GUILD), "unconfigured router"),
+                (&unconfigured, None, "unconfigured router, no guild"),
+            ] {
+                assert_eq!(
+                    router.route_component(id, guild),
+                    ComponentOutcome::Ignore,
+                    "{id} ignores {label}"
+                );
+                assert_eq!(
+                    router.route_modal(id, guild),
+                    ComponentOutcome::Ignore,
+                    "{id} modal ignores {label}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn guild_fence_binds_everything() {
         let r = router();
         // Wrong guild: silence everywhere except moderation's refusal.
@@ -1080,6 +1175,67 @@ mod tests {
         let set = off.publish_set(&[]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["rank", "leaderboard"]);
+    }
+
+    #[test]
+    fn publish_withholds_custom_rows_while_automations_off() {
+        let off = InteractionRouter::new(RouterGates {
+            scorecard: false,
+            automations: false,
+            announcements: false,
+            moderation: false,
+            ..all_on()
+        });
+        let row = || CustomCommand {
+            name: "faq".to_owned(),
+            description: "FAQ".to_owned(),
+            enabled: true,
+        };
+        // A stored catalog is not published while gated off — every such
+        // invocation refuses at dispatch, so publishing burns the ceiling.
+        let set = off.publish_set(&[row()]).expect("core-only set");
+        let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["rank", "leaderboard"]);
+        // Over-limit stored catalogs no longer fail the publish either.
+        let crowded: Vec<_> = (0..99)
+            .map(|i| CustomCommand {
+                name: format!("c{i}"),
+                description: "crowd".to_owned(),
+                enabled: true,
+            })
+            .collect();
+        let set = off.publish_set(&crowded).expect("core-only set");
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn publish_reserves_disabled_builtin_names() {
+        // `ban` routes (as a refusal) even while moderation is off, so a
+        // same-named custom row could never execute — publish withholds it,
+        // matching dispatch precedence.
+        for (gate, builtin) in [
+            ("moderation", "ban"),
+            ("announcements", "lfg"),
+            ("scorecard", "attendance"),
+        ] {
+            let mut gates = all_on();
+            match gate {
+                "moderation" => gates.moderation = false,
+                "announcements" => gates.announcements = false,
+                _ => gates.scorecard = false,
+            }
+            let r = InteractionRouter::new(gates);
+            let row = CustomCommand {
+                name: builtin.to_owned(),
+                description: "shadow".to_owned(),
+                enabled: true,
+            };
+            let set = r.publish_set(&[row]).expect("assembles");
+            assert!(
+                !set.iter().any(|c| c.name == builtin),
+                "{builtin} stays unpublished while {gate} is off"
+            );
+        }
     }
 
     #[test]
