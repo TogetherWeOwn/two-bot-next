@@ -303,8 +303,16 @@ the scratch target must already have the schema, despite the old dry-run
 output mentioning migration. Unknown restore options refuse (exit 2).
 
 Guild-config capture/restore is different: it talks to Discord. Do not run it
-with live tokens or as a database test. With separate authorization for the
-TWO Staging guild/Owen QA Test identity, the available operator commands are:
+with live tokens or as a database test. Before either command, the authorized
+operator must have `DISCORD_STAGING_GUILD_ID` set from the approved TWO Staging
+guild configuration/deployment record, plus the provisioned Owen QA Test staging
+credential described below. This non-secret identifier is independently required
+and checked against the pinned TWO Staging guild by
+[`staging_guild_id`](../crates/core/src/backup/guild_config.rs); gateway `GUILD_ID`
+is **not** a substitute. A missing or mismatched staging identifier refuses before
+capture/planning. This is not authorization to provision a guild or credentials.
+With separate authorization for that staging guild/identity, the available
+operator commands are:
 
 ```bash
 two-bot guild-config-snapshot
@@ -403,9 +411,12 @@ host address, database derivation or drill is promoted into current authority.
 npm --prefix wrangler test
 ```
 
-`wrangler/test/runbook.test.ts` greps binary dispatch/options for every shell
-example, checks npm script names, and invokes **only `--help`** on the installed
-pinned Wrangler for each operational example. Typo fixtures verify refusal.
+`wrangler/test/runbook.test.ts` greps each selected binary dispatch/parser for
+supported options, requires operational npm aliases to invoke pinned Wrangler,
+and invokes **only command-path `--help`** on the installed pinned Wrangler.
+It checks example flags against that command's advertised flag sections because
+`--help` alone skips argument validation. Cross-command flags, misspelled options
+and malformed-alias fixtures verify refusal.
 It runs in `worker check` without credentials or deployed services. It verifies
 command existence, **not authorization, successful deployment, backup custody,
 Discord effects, or a live rollback**. Required exact-head merge gates remain
