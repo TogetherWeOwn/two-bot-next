@@ -349,6 +349,19 @@ pub fn plan_restore(
     for category in &source_categories {
         let name = str_field(category, "name");
         let actual = existing_candidate(category, None, &current_channels, None, &channel_ids)?;
+        // TOG-9970 finding 1: resolve the full saved overwrite set BEFORE
+        // creation, so a private category is restricted from its first
+        // instant — never initially public with a later repair. Role
+        // references stay symbolic; role creates precede channel creates in
+        // op order, so they resolve at apply time. The separate overwrite
+        // PATCH below stays as an idempotent repair.
+        let expected = overwrites_of(category);
+        let create_overwrites = Value::Array(
+            expected
+                .iter()
+                .map(|o| overwrite_value(o, snapshot_guild))
+                .collect(),
+        );
         if let Some(actual) = actual {
             channel_ids.insert(
                 str_field(category, "id").to_owned(),
@@ -378,6 +391,7 @@ pub fn plan_restore(
                     "name": name,
                     "type": 4,
                     "position": category.get("position").cloned().unwrap_or(Value::Null),
+                    "permission_overwrites": create_overwrites,
                 }),
                 capture_id: Some(("channel".to_owned(), str_field(category, "id").to_owned())),
             });
@@ -389,7 +403,6 @@ pub fn plan_restore(
             "position": category.get("position").cloned().unwrap_or(Value::Null),
         }));
 
-        let expected = overwrites_of(category);
         if overwrites_differ(&expected, actual, &role_ids) {
             for o in &expected {
                 if o.overwrite_type == 0
@@ -446,6 +459,16 @@ pub fn plan_restore(
         );
         let target_body = channel_core_body(channel, target_parent);
 
+        // TOG-9970 finding 1: full saved overwrite set goes into the create
+        // POST too — a private channel is restricted from its first instant.
+        // Expected value first; the overwrite PATCH below stays as repair.
+        let expected = overwrites_of(channel);
+        let create_overwrites = Value::Array(
+            expected
+                .iter()
+                .map(|o| overwrite_value(o, snapshot_guild))
+                .collect(),
+        );
         if let Some(actual) = actual {
             channel_ids.insert(
                 str_field(channel, "id").to_owned(),
@@ -473,6 +496,7 @@ pub fn plan_restore(
         } else {
             let mut create_body = target_body.clone();
             create_body["position"] = channel.get("position").cloned().unwrap_or(Value::Null);
+            create_body["permission_overwrites"] = create_overwrites;
             channel_ops.push(RestoreOperation {
                 label: format!("create channel {name}"),
                 method: "POST".to_owned(),
@@ -491,7 +515,6 @@ pub fn plan_restore(
             "position": channel.get("position").cloned().unwrap_or(Value::Null),
         }));
 
-        let expected = overwrites_of(channel);
         if overwrites_differ(&expected, actual, &role_ids) {
             for o in &expected {
                 if o.overwrite_type == 0
@@ -607,16 +630,31 @@ pub fn plan_restore(
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_object).cloned().collect())
         .unwrap_or_default();
-    let current_by_name: BTreeMap<&str, &Map<String, Value>> = current_emojis
+    // TOG-9970 finding 6: reserve compatible surviving unmanaged emoji IDs
+    // first — identity is the ID, not the name. A surviving emoji renamed
+    // after capture patches its original ID; name fallback below is only
+    // for genuinely missing identities.
+    for emoji in snapshot_emojis
         .iter()
-        .filter(|e| e.get("name").and_then(Value::as_str).is_some())
-        .map(|e| (str_field(e, "name"), e))
-        .collect();
+        .filter(|e| !e.get("managed").and_then(Value::as_bool).unwrap_or(false))
+    {
+        let source_id = str_field(emoji, "id");
+        if current_emojis.iter().any(|actual| {
+            str_field(actual, "id") == source_id
+                && !actual
+                    .get("managed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }) {
+            emoji_ids.insert(source_id.to_owned(), source_id.to_owned());
+        }
+    }
     for emoji in snapshot_emojis.iter().filter(|e| {
         !e.get("managed").and_then(Value::as_bool).unwrap_or(false)
             && e.get("name").and_then(Value::as_str).is_some()
     }) {
         let name = str_field(emoji, "name");
+        let source_id = str_field(emoji, "id");
         let roles: Vec<Value> = emoji
             .get("roles")
             .and_then(Value::as_array)
@@ -648,7 +686,42 @@ pub fn plan_restore(
                     .any(|r| !role_ids.contains_key(r))
             })
             .unwrap_or(false);
-        match current_by_name.get(name) {
+        // Identity first: a surviving ID wins over any name. Name fallback
+        // applies only when the ID is genuinely gone, and only to a unique,
+        // unclaimed unmanaged live emoji — swapped/duplicate names must not
+        // crosswire or merge distinct identities.
+        let actual: Option<&Map<String, Value>> = match emoji_ids.get(source_id).and_then(|live| {
+            current_emojis
+                .iter()
+                .find(|a| !is_managed(a) && str_field(a, "id") == live)
+        }) {
+            Some(actual) => Some(actual),
+            None => {
+                let candidates: Vec<&Map<String, Value>> = current_emojis
+                    .iter()
+                    .filter(|a| {
+                        !is_managed(a) && a.get("name").and_then(Value::as_str) == Some(name)
+                    })
+                    .collect();
+                match candidates.as_slice() {
+                    [] => None,
+                    [one] => {
+                        if emoji_ids.values().any(|id| id == str_field(one, "id")) {
+                            return Err(fail(format!(
+                                "Target emoji {name} is already claimed by another source; restore would not be injective."
+                            )));
+                        }
+                        Some(*one)
+                    }
+                    _ => {
+                        return Err(fail(format!(
+                            "Target has multiple emoji {name} candidates; restore is ambiguous."
+                        )));
+                    }
+                }
+            }
+        };
+        match actual {
             None => {
                 emoji_ops.push(RestoreOperation {
                     label: format!("create emoji {name}"),

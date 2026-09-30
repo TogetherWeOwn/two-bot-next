@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use futures_util::TryStreamExt;
 use serde_json::{Map, Value};
 use sqlx::{PgPool, Row};
 use thiserror::Error;
@@ -80,8 +81,14 @@ fn order_for(table: &str, columns: &[String]) -> String {
 }
 
 /// Postgres caps a statement at 65535 bound parameters. Stay well under.
-fn batch_size_for(column_count: usize) -> i64 {
-    (60_000 / column_count.max(1) as i64).max(1)
+///
+/// This bounds multi-row INSERT pages on the *restore* path only. It must
+/// never size the *dump* SELECT: a bind-parameter ceiling is not a memory
+/// budget, and buffering a whole page before the bounded writer sees any row
+/// lets multi-megabyte source cells exhaust memory before the decoded-line
+/// refusal (TOG-9970 finding 5). The dump streams row-by-row instead.
+fn batch_size_for(column_count: usize) -> usize {
+    (60_000 / column_count.max(1) as i64).max(1) as usize
 }
 
 /// Mark a dynamically built statement as manually audited (sqlx 0.9 gate).
@@ -203,35 +210,28 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
             .collect();
         let select_list = quoted.join(", ");
         let order = order_for(&table.name, &table.columns);
-        let batch = batch_size_for(table.columns.len());
-        let mut offset: i64 = 0;
-        loop {
-            // Table/column names are gated; values travel as bound params only
-            // on the restore side. Here the only interpolation is identifiers.
-            let page = sqlx::query(audited(format!(
-                "SELECT {select_list} FROM {} ORDER BY {order} LIMIT {batch} OFFSET {offset}",
-                table.name
-            )))
-            .fetch_all(&mut *tx)
-            .await?;
-            if page.is_empty() {
-                break;
+        // Stream row-by-row: each row passes through the bounded writer
+        // (8 MiB decoded-line cap, cumulative budgets) BEFORE the next row
+        // is materialised. An early oversized row refuses before later rows
+        // are read; a row-count ceiling never sizes this SELECT. Table/column
+        // names are gated; no values are interpolated here.
+        let mut stream = sqlx::query(audited(format!(
+            "SELECT {select_list} FROM {} ORDER BY {order}",
+            table.name
+        )))
+        .fetch(&mut *tx);
+        while let Some(row) = stream.try_next().await? {
+            let mut data = Map::with_capacity(table.columns.len());
+            for (i, col) in table.columns.iter().enumerate() {
+                let raw: Option<String> = row.try_get(i).map_err(|e| {
+                    DbDumpError::Refused(format!("column {col}: cannot read as text: {e}"))
+                })?;
+                data.insert(col.clone(), raw.map(Value::String).unwrap_or(Value::Null));
             }
-            let n = page.len() as i64;
-            for row in page {
-                let mut data = Map::with_capacity(table.columns.len());
-                for (i, col) in table.columns.iter().enumerate() {
-                    let raw: Option<String> = row.try_get(i).map_err(|e| {
-                        DbDumpError::Refused(format!("column {col}: cannot read as text: {e}"))
-                    })?;
-                    data.insert(col.clone(), raw.map(Value::String).unwrap_or(Value::Null));
-                }
-                writer.write_line(
-                    &serde_json::json!({"kind": "row", "table": table.name, "data": data}),
-                )?;
-                rows += 1;
-            }
-            offset += n;
+            writer.write_line(
+                &serde_json::json!({"kind": "row", "table": table.name, "data": data}),
+            )?;
+            rows += 1;
         }
     }
     tx.commit().await?;
@@ -333,7 +333,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             .map(|(c, _)| format!("\"{}\"", c.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(", ");
-        let batch = batch_size_for(kept.len()) as usize;
+        let batch = batch_size_for(kept.len());
         for page in rows.chunks(batch) {
             // One multi-row INSERT per page: VALUES ($1::t1, $2::t2), ...
             let mut sql = format!("INSERT INTO {} ({quoted}) VALUES ", table.name);

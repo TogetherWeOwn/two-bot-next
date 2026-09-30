@@ -190,7 +190,11 @@ async fn cmd_backup() -> i32 {
         }
     };
 
-    let mut empty = false;
+    // Semantic acceptance precedes retention and upload: a refused dump
+    // must never evict the last usable archive or reach off-box storage.
+    // A failed dump publishes nothing (the `.dump-writing-*.tmp` temporary
+    // neither matches retention's predicate nor survives its own Drop), so
+    // both error paths below leave every existing recovery point untouched.
     match dump::dump(&pool, &out).await {
         Ok(manifest) => {
             for table in &manifest.tables {
@@ -215,8 +219,12 @@ async fn cmd_backup() -> i32 {
                 .unwrap_or(0)
                 == 0
             {
-                eprintln!("backup: the event log is empty. Refusing to call this a good backup.");
-                empty = true;
+                eprintln!(
+                    "backup: the event log is empty. Refusing to call this a good backup: \
+                     keeping existing archives, skipping upload."
+                );
+                pool.close().await;
+                return 1;
             }
         }
         Err(err) => {
@@ -270,9 +278,6 @@ async fn cmd_backup() -> i32 {
         }
     }
 
-    if empty {
-        return 1;
-    }
     println!("backup: done");
     0
 }
@@ -309,24 +314,56 @@ fn prune_backups(dir: &Path, keep: usize) -> Result<Vec<String>, String> {
 // restore
 // ---------------------------------------------------------------------------
 
-async fn cmd_restore(args: &[String]) -> i32 {
-    let flags: Vec<&str> = args
-        .iter()
-        .filter(|a| a.starts_with("--"))
-        .map(String::as_str)
-        .collect();
-    let file = args.iter().find(|a| !a.starts_with("--")).cloned();
-    let dry_run = flags.contains(&"--dry-run");
-
+/// Strict restore grammar: exactly one file positional, and only `--force`
+/// and `--dry-run` as options. Unknown options, extra positionals and
+/// malformed forms refuse (exit 2) before any file access, connection or
+/// destructive branch — a misspelled `--dryrun` must never select the
+/// destructive path (TOG-9970 finding 3).
+fn parse_restore_args(args: &[String]) -> Result<(String, bool, bool), String> {
+    const USAGE: &str = "restore: usage: two-bot restore <backup.ndjson.gz> --force [--dry-run]";
+    let mut file: Option<String> = None;
+    let mut force = false;
+    let mut dry_run = false;
+    let mut options_ended = false;
+    for arg in args {
+        if !options_ended && arg == "--" {
+            options_ended = true;
+            continue;
+        }
+        if !options_ended && arg.starts_with("--") {
+            match arg.as_str() {
+                "--force" => force = true,
+                "--dry-run" => dry_run = true,
+                unknown => return Err(format!("restore: unknown option {unknown:?}.\n{USAGE}")),
+            }
+            continue;
+        }
+        if file.is_some() {
+            return Err(format!(
+                "restore: unexpected extra argument {arg:?}.\n{USAGE}"
+            ));
+        }
+        file = Some(arg.clone());
+    }
     let Some(file) = file else {
-        eprintln!("restore: usage: two-bot restore <backup.ndjson.gz> --force [--dry-run]");
-        return 2;
+        return Err(USAGE.to_owned());
+    };
+    Ok((file, force, dry_run))
+}
+
+async fn cmd_restore(args: &[String]) -> i32 {
+    let (file, force, dry_run) = match parse_restore_args(args) {
+        Ok(parsed) => parsed,
+        Err(usage) => {
+            eprintln!("{usage}");
+            return 2;
+        }
     };
     if !Path::new(&file).is_file() {
         eprintln!("restore: no such file: {file}");
         return 1;
     }
-    if !dry_run && !flags.contains(&"--force") {
+    if !dry_run && !force {
         eprintln!("restore: this wipes the target. Pass --force if that is what you mean.");
         return 2;
     }
@@ -962,14 +999,18 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let remaining = match guild_config_restore::plan_restore(&snapshot, &after) {
+    // Remap BEFORE residual planning: apply captured source→live ids, so a
+    // correctly recreated resource (e.g. two same-name roles with new Discord
+    // ids) is recognised as done rather than refused as ambiguous
+    // (TOG-9970 finding 7).
+    let remapped_source = guild_config_restore::remap_snapshot_ids(&snapshot, &restored_ids);
+    let remaining = match guild_config_restore::plan_restore(&remapped_source, &after) {
         Ok(remaining) => remaining,
         Err(err) => {
             eprintln!("guild-config-restore: post-restore plan failed: {err}");
             return 1;
         }
     };
-    let remapped_source = guild_config_restore::remap_snapshot_ids(&snapshot, &restored_ids);
     let source_hash = guild_config::config_hash(&guild_config::canonical_snapshot(&snapshot));
     let semantic_source_hash =
         guild_config::config_hash(&guild_config::canonical_snapshot(&remapped_source));

@@ -242,6 +242,37 @@ impl GuildConfigDiscordApi {
             })
             .fold(0, |a, b| a | b);
         let administrator = permissions & (1 << 3) != 0;
+        // TOG-9970 finding 4: an @everyone permissions PATCH leads op order
+        // (roles first), so later channel/overwrite/settings writes execute
+        // under POST-transition authority, not live authority. A saved mask
+        // that revokes a bit the bot holds via live @everyone passes a
+        // live-only preflight, then strands the later writes mid-restore.
+        // Derive the post-transition held union from the planned PATCH and
+        // refuse the whole plan before any mutation when the transition
+        // makes the planned later ops unexecutable.
+        let everyone_live: u128 = roles
+            .iter()
+            .find(|r| r.get("id").and_then(Value::as_str) == Some(self.guild_id.as_str()))
+            .and_then(|r| r.get("permissions"))
+            .map(perm_mask)
+            .unwrap_or(0);
+        let everyone_path = format!("/guilds/{}/roles/{}", self.guild_id, self.guild_id);
+        let mut post_permissions = permissions;
+        for op in &plan.operations {
+            if op.method != "PATCH" {
+                continue;
+            }
+            let super::guild_config_restore::RestorePath::Literal(path) = &op.path else {
+                continue;
+            };
+            if path == &everyone_path {
+                if let Some(mask) = op.body.get("permissions").map(perm_mask) {
+                    post_permissions = (permissions & !everyone_live) | mask;
+                }
+                break;
+            }
+        }
+        let post_administrator = post_permissions & (1 << 3) != 0;
         let needs_manage_roles = plan.counts.roles > 0 || plan.counts.overwrites > 0;
         let mut required: Vec<(&str, u128)> = Vec::new();
         if plan.counts.settings > 0 {
@@ -270,6 +301,29 @@ impl GuildConfigDiscordApi {
                 "Restore permission preflight failed: missing {}.",
                 missing.join(", ")
             )));
+        }
+        // The @everyone PATCH leads op order, so every later write runs
+        // under post-transition authority. If the transition drops a bit
+        // the rest of the plan needs, refuse the whole plan now — before
+        // any mutation — rather than stranding a partial restore.
+        if post_permissions != permissions {
+            let post_missing: Vec<&str> = if post_administrator {
+                vec![]
+            } else {
+                required
+                    .iter()
+                    .filter(|(_, bit)| post_permissions & bit == 0)
+                    .map(|(name, _)| *name)
+                    .collect()
+            };
+            if !post_missing.is_empty() {
+                return Err(GuildConfigApiError::Discord(format!(
+                    "Restore permission preflight failed: the planned @everyone \
+                     permission transition removes {} required by later restore \
+                     operations; refusing before any mutation.",
+                    post_missing.join(", ")
+                )));
+            }
         }
         let owner_id = snapshot
             .get("guild")
@@ -415,18 +469,20 @@ impl GuildConfigDiscordApi {
                 )));
             }
         }
-        if !administrator {
+        // Channel and overwrite writes run after the @everyone PATCH, so
+        // their effective bits derive from post-transition authority.
+        if !post_administrator {
             let mut blocked_targets = Vec::new();
             for target in &plan.overwrite_targets {
                 let ceiling = effective_permissions(
-                    permissions,
+                    post_permissions,
                     &held_ids,
                     &self.guild_id,
                     &self.application_id,
                     &target.permission_ceiling_overwrites,
                 );
                 let action = effective_permissions(
-                    permissions,
+                    post_permissions,
                     &held_ids,
                     &self.guild_id,
                     &self.application_id,
@@ -602,6 +658,16 @@ impl GuildConfigDiscordApi {
         }
         self.writes += 1;
         Ok(response)
+    }
+}
+
+/// Permission masks arrive as strings in sealed snapshots but the planned
+/// @everyone PATCH body passes the value through verbatim, so tolerate both.
+fn perm_mask(value: &Value) -> u128 {
+    match value {
+        Value::String(s) => s.parse::<u128>().unwrap_or(0),
+        Value::Number(n) => n.as_u64().map(u128::from).unwrap_or(0),
+        _ => 0,
     }
 }
 
