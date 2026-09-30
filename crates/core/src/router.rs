@@ -32,10 +32,11 @@
 //! 3. Permission bits — the handler-level check legacy performs even though
 //!    `default_member_permissions` hides the command from non-admin pickers.
 //!
-//! Unknown slash names (no builtin, no custom row) and unknown `custom_id`s
-//! are `Ignore`: some other application's command, not ours to answer —
-//! exactly the legacy fall-through. Legacy has no modal submits; modals route
-//! through the same component-id table so future slices have a place to land.
+//! Unknown slash names and `custom_id`s in the configured guild get a uniform
+//! ephemeral reply (a deliberate improvement on legacy's silent fall-through).
+//! Foreign/missing guilds remain fenced. Legacy has no modal submits; modals
+//! route through the component-id table. [`replies`] owns async reply timing,
+//! error redaction and panic isolation; the adapter supplies the transport.
 //!
 //! Publish: [`InteractionRouter::publish_set`] assembles the ONE complete
 //! guild set (core + enabled features in legacy order + custom) via
@@ -48,6 +49,8 @@
 //! (gateway `automationMessageAccepted`, not interactions), reaction-role
 //! grant/revoke (`MessageReactionAdd/Remove`), and `/rota-acknowledge`
 //! (dropped with the rota stack, matrix §9).
+
+pub mod replies;
 
 use std::collections::{HashMap, HashSet};
 
@@ -263,6 +266,7 @@ impl RouterRefusal {
 pub enum SlashOutcome {
     Handled { handler: HandlerId },
     Refuse { refusal: RouterRefusal },
+    Unknown,
     Ignore,
 }
 
@@ -270,6 +274,7 @@ pub enum SlashOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentOutcome {
     Handled { handler: ComponentHandler },
+    Unknown,
     Ignore,
 }
 
@@ -355,6 +360,7 @@ impl InteractionRouter {
                     handler: HandlerId::AutomationCustom,
                 }
             }
+            Some(false) | None if self.guild_ok(ctx.guild_id) => SlashOutcome::Unknown,
             Some(false) | None => SlashOutcome::Ignore,
         }
     }
@@ -544,7 +550,11 @@ impl InteractionRouter {
             }
             ComponentHandler::SelfRole
         } else {
-            return ComponentOutcome::Ignore;
+            return if self.guild_ok(guild_id) {
+                ComponentOutcome::Unknown
+            } else {
+                ComponentOutcome::Ignore
+            };
         };
         ComponentOutcome::Handled { handler }
     }
@@ -986,10 +996,9 @@ mod tests {
                 handler: HandlerId::AutomationCustom
             }
         );
-        // Disabled row: silence (legacy `if (!custom.enabled) return`).
-        assert_eq!(r.route_slash(&custom(Some(false))), SlashOutcome::Ignore);
-        // No row: another app's command, not ours.
-        assert_eq!(r.route_slash(&custom(None)), SlashOutcome::Ignore);
+        // Disabled/missing rows now get the uniform stale-interaction reply.
+        assert_eq!(r.route_slash(&custom(Some(false))), SlashOutcome::Unknown);
+        assert_eq!(r.route_slash(&custom(None)), SlashOutcome::Unknown);
         // Builtin names shadow custom rows (publish merge does the same).
         let shadow = SlashContext {
             name: "rank",
@@ -1016,21 +1025,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_slash_names_are_ignored() {
+    fn unknown_slash_names_reply_only_inside_the_guild_fence() {
         let r = router();
-        assert_eq!(
-            r.route_slash(&ctx("rota-acknowledge", Some(GUILD), Some(u64::MAX))),
-            SlashOutcome::Ignore,
-            "dropped rota command is not ours"
-        );
-        assert_eq!(
-            r.route_slash(&ctx(
-                "definitely-not-a-command",
-                Some(GUILD),
-                Some(u64::MAX)
-            )),
-            SlashOutcome::Ignore
-        );
+        for name in ["rota-acknowledge", "definitely-not-a-command"] {
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
+                SlashOutcome::Unknown
+            );
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(9999), Some(u64::MAX))),
+                SlashOutcome::Ignore
+            );
+            assert_eq!(r.route_slash(&ctx(name, None, None)), SlashOutcome::Ignore);
+        }
     }
 
     #[test]
@@ -1075,15 +1082,15 @@ mod tests {
                 handler: ComponentHandler::SelfRole
             }
         );
-        // Unknown ids are not ours.
-        assert_eq!(
-            r.route_component("two:unknown:thing", Some(GUILD)),
-            ComponentOutcome::Ignore
-        );
-        assert_eq!(
-            r.route_component("other", Some(GUILD)),
-            ComponentOutcome::Ignore
-        );
+        // Unknown ids reply consistently without escaping the guild fence.
+        for id in ["two:unknown:thing", "other"] {
+            assert_eq!(
+                r.route_component(id, Some(GUILD)),
+                ComponentOutcome::Unknown
+            );
+            assert_eq!(r.route_component(id, Some(9999)), ComponentOutcome::Ignore);
+            assert_eq!(r.route_component(id, None), ComponentOutcome::Ignore);
+        }
         // Modal submits share the table.
         assert_eq!(
             r.route_modal("two:lfg:abc123", Some(GUILD)),
@@ -1093,7 +1100,7 @@ mod tests {
         );
         assert_eq!(
             r.route_modal("two:unknown:thing", Some(GUILD)),
-            ComponentOutcome::Ignore
+            ComponentOutcome::Unknown
         );
     }
 

@@ -1238,6 +1238,65 @@ impl ActionExecutor {
         }
     }
 
+    /// Execute a router reply operation in the unpaced interaction lane.
+    /// No automatic retries: a lost callback response may already be an ACK.
+    pub async fn execute_reply_operation(
+        &self,
+        application_id: u64,
+        interaction_id: u64,
+        interaction_token: &str,
+        operation: two_bot_core::router::replies::ReplyOperation,
+    ) -> Result<(), DiscordError> {
+        use twilight_model::channel::message::{AllowedMentions, MessageFlags};
+        use two_bot_core::router::replies::ReplyOperation;
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let client = self.inner.factory.interaction(application);
+        let mentions = AllowedMentions::default();
+        let req = match operation {
+            ReplyOperation::Respond(reply) => {
+                let response = super::interactions::text_response(reply);
+                return self
+                    .answer_interaction(interaction_id, interaction_token, &response)
+                    .await;
+            }
+            ReplyOperation::Defer { ephemeral } => {
+                let response = super::interactions::deferred_response(ephemeral);
+                return self
+                    .answer_interaction(interaction_id, interaction_token, &response)
+                    .await;
+            }
+            ReplyOperation::EditOriginal { content } => Self::request_of(
+                client
+                    .update_response(interaction_token)
+                    .content(Some(&content))
+                    .allowed_mentions(Some(&mentions)),
+            )?,
+            ReplyOperation::Followup(reply) => Self::request_of(
+                client
+                    .create_followup(interaction_token)
+                    .content(&reply.content)
+                    .flags(if reply.ephemeral {
+                        MessageFlags::EPHEMERAL
+                    } else {
+                        MessageFlags::empty()
+                    })
+                    .allowed_mentions(Some(&mentions)),
+            )?,
+            ReplyOperation::DeleteOriginal => {
+                Self::request_of(client.delete_response(interaction_token))?
+            }
+        };
+        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
+            .await
+            .map_err(|_| DiscordError::Timeout)?
+            .map_err(DiscordError::Unavailable)?;
+        match res.status {
+            200..=299 => Ok(()),
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
     /// (legacy `ModerationService::carryOut` verb mapping; warn is
     /// store-only and never reaches the wire).

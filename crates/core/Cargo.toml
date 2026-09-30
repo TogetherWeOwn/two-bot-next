@@ -41,8 +41,9 @@ default = []
 db = ["dep:sqlx"]
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 rand = { workspace = true }
-tokio = { workspace = true }
 axum = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

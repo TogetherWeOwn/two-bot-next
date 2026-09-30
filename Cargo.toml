@@ -120,5 +120,6 @@ twilight-model = "0.17"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# Router handler panics must unwind so one failed command cannot kill the bot.
+panic = "unwind"
 strip = true

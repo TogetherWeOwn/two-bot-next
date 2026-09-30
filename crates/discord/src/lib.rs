@@ -20,8 +20,9 @@ pub use executor::{
 };
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use interactions::{
-    command_to_twilight, publish_commands, refusal_response, response_for_slash, route_interaction,
-    RoutedInteraction,
+    command_to_twilight, deferred_response, dispatch_interaction, publish_commands,
+    refusal_response, response_for_slash, route_interaction, text_response, DispatchOptions,
+    InteractionReplyTransport, RoutedInteraction,
 };
 pub use pipeline::{
     build_cache, ChannelClassifier, InviteSource, MemPipeline, NoClassification, NoInvites,
