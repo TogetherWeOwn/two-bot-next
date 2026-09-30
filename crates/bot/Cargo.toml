@@ -37,5 +37,6 @@ twilight-gateway = { workspace = true }
 twilight-model = { workspace = true }
 
 [dev-dependencies]
+two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }

@@ -63,8 +63,9 @@ Cadences cannot be overridden in a deployed binary. Test builds alone accept
 positive `TWO_TEST_COUNTER_INTERVAL_MS`, `TWO_TEST_RANK_INTERVAL_MS`, and
 `TWO_TEST_EVENTS_INTERVAL_MS` values. Paused-time regressions cover phase,
 jitter bounds, overrun skips, timeouts, panic isolation and shutdown. The REST
-adapter integration test uses the existing mock double and the shared strict
-website test-database guard, applying migrations in a unique schema. Run it
+adapter integration test uses the existing mock double and shared strict
+`two-bot-testsupport` fixture, applying migrations in a unique disposable database
+without migrating or resetting the bootstrap. Teardown is awaited. Run it
 with an explicitly disposable database only. On the persistent controller, use
 the bounded-cache wrapper (see [build-cache.md](build-cache.md)); refusal is not
 permission to fall back to direct Cargo:

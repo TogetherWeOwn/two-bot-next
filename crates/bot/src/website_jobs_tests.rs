@@ -1,12 +1,10 @@
 use super::*;
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
+use two_bot_testsupport::TestDatabase;
 
 #[allow(dead_code)]
 #[path = "../../discord/tests/common/mod.rs"]
 mod common;
-#[path = "../../core/tests/common/website_db.rs"]
-mod website_db;
 
 use common::{MockRest, ScriptedResponse};
 
@@ -65,8 +63,8 @@ async fn roster_paginates_and_rejects_failed_or_repeated_pages() {
 }
 
 /// Real migrations + actual REST executor/mock + all three scheduled actions.
-/// Shares the existing strict test-container guard, but uses a unique schema:
-/// no public reset and no interference with the core acceptance tests.
+/// Uses the shared strict fixture and a unique disposable database:
+/// no bootstrap reset and no interference with the core acceptance tests.
 #[tokio::test]
 async fn three_website_ticks_publish_rows_and_fail_closed() {
     let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
@@ -77,38 +75,10 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         eprintln!("SKIP website job integration: TWO_TEST_DATABASE_URL is not set");
         return;
     };
-    let options = website_db::test_db_options(&url).expect("refusing non-test database");
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options.clone())
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
         .await
-        .expect("agent-testdb only");
-    let schema = format!("jobs_10855_{:016x}", rand::random::<u64>());
-    // Audited identifiers contain only this fixed prefix and random hex digits.
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let search_path = schema.clone();
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .after_connect(move |connection, _| {
-            let search_path = search_path.clone();
-            Box::pin(async move {
-                sqlx::query("SELECT set_config('search_path', $1, false)")
-                    .bind(&search_path)
-                    .execute(connection)
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect_with(options)
-        .await
-        .unwrap();
-    sqlx::migrate!("../cutover/migrations")
-        .run(&pool)
-        .await
-        .unwrap();
+        .expect("create migrated agent-testdb fixture");
+    let pool = fixture.pool().clone();
     apply_web_contract(&pool).await.unwrap();
     let guild = "2222";
     let observation = Arc::new(Mutex::new(()));
@@ -262,15 +232,10 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         }
     }
     concurrent_publications_keep_newest_counter(&pool, roles).await;
-    pool.close().await;
-    // Same generated hex-only identifiers as the CREATE above.
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "DROP SCHEMA {schema}_web_v1 CASCADE; DROP SCHEMA {schema} CASCADE;"
-    )))
-    .execute(&admin)
-    .await
-    .unwrap();
-    admin.close().await;
+    fixture
+        .close()
+        .await
+        .expect("drop disposable test database");
 }
 
 fn assert_iso_millis(timestamp: &str) {
