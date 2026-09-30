@@ -77,6 +77,10 @@ pub(crate) fn route(request: &Request) -> &'static str {
         (Put, [Some("applications"), Some(_), Some("commands"), None, None, None]) => {
             "PUT /applications/:application/commands"
         }
+        (
+            Put,
+            [Some("applications"), Some(_), Some("guilds"), Some(_), Some("commands"), None],
+        ) => "PUT /applications/:application/guilds/:guild/commands",
         (Post, [Some("interactions"), Some(_), Some(_), Some("callback"), None, None]) => {
             "POST /interactions/:interaction/:token/callback"
         }
@@ -121,6 +125,10 @@ impl Drop for Attempt<'_> {
 mod tests {
     use super::*;
     use twilight_http::request::RequestBuilder;
+    use twilight_model::id::{
+        Id,
+        marker::{ApplicationMarker, GuildMarker},
+    };
 
     #[tokio::test]
     async fn cancellation_and_headers_each_count_exactly_one_send() {
@@ -153,6 +161,24 @@ mod tests {
         assert!(text.contains(
             "two_bot_rest_requests_total{route=\"GET /channels/:channel\",result=\"429\"} 1\n"
         ));
+    }
+
+    #[test]
+    fn guild_command_publish_classifies_to_guild_template() {
+        use twilight_http::request::TryIntoRequest;
+        // Real twilight builder: the exact request publish_guild_commands sends.
+        let client = twilight_http::Client::builder().build();
+        let request = client
+            .interaction(Id::<ApplicationMarker>::new(1))
+            .set_guild_commands(Id::<GuildMarker>::new(2), &[])
+            .try_into_request()
+            .unwrap();
+        assert_eq!(request.method(), Method::Put);
+        assert_eq!(
+            route(&request),
+            "PUT /applications/:application/guilds/:guild/commands"
+        );
+        assert!(metrics::REST_ROUTES.contains(&route(&request)));
     }
 
     #[test]
@@ -196,6 +222,7 @@ mod tests {
             "guilds/1/scheduled-events",
             "guilds/1/scheduled-events/2",
             "applications/1/commands",
+            "applications/1/guilds/2/commands",
             "interactions/1/secret/callback",
             "unknown",
         ];

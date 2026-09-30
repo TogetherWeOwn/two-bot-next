@@ -24,6 +24,7 @@ import { Container } from "@cloudflare/containers";
 import {
   TokenBuckets,
   handleRedirect,
+  isReservedInternal,
   type Campaign,
   type RedirectClick,
 } from "./redirect.ts";
@@ -175,7 +176,9 @@ export default {
     }
 
     // Metrics are container-internal, never a public proxy or invite campaign.
-    if (url.pathname === "/metrics" || url.pathname.startsWith("/metrics/")) {
+    // Canonicalized like the campaign lookup so /METRICS, /%6detrics,
+    // //metrics and /metrics/* cannot become a campaign redirect.
+    if (isReservedInternal(url.pathname)) {
       return new Response("not found", { status: 404 });
     }
 

@@ -37,6 +37,7 @@ pub const REST_ROUTES: &[&str] = &[
     "DELETE /guilds/:guild/bans/:member",
     "DELETE /channels/:channel/permissions/:overwrite",
     "PUT /applications/:application/commands",
+    "PUT /applications/:application/guilds/:guild/commands",
     "POST /interactions/:interaction/:token/callback",
     "POST /channels/:channel/messages",
     "DELETE /channels/:channel/messages/:message",

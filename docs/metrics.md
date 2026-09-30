@@ -4,8 +4,9 @@ The Rust process exposes `GET /metrics` on its existing `LISTEN_ADDR` listener.
 This is **internal-only**, unauthenticated operational data: scrape only from the
 container/private network. Do not expose the container port publicly, add a Worker
 proxy route, or route this through a public ingress. Both the Worker entrypoint
-and the Container DO refuse `/metrics`; the Worker also reserves `/metrics/*`
-before invite-campaign lookup. No Prometheus server is added by this change.
+and the Container DO refuse `/metrics`; the Worker also reserves `/metrics`,
+`/metrics/*` and canonical case/encoding/slash aliases before
+invite-campaign lookup. No Prometheus server is added by this change.
 
 Format: Prometheus text 0.0.4, `text/plain; version=0.0.4; charset=utf-8`, `no-store`.
 Counters reset when the process restarts; timestamps use Unix seconds. Missing
@@ -57,7 +58,9 @@ controller's bounded cache pool was missing at implementation time.
 - Server tests: the existing router returns `/metrics` 200 with the expected
   names/content type; lazy authorized test-pool bookkeeping requires no DB I/O.
 - Worker/DO fixture tests: GET/HEAD/POST metrics routes are 404, do not fetch/start
-  a container, and cannot become a configured invite redirect.
+  a container, and cannot become a configured invite redirect — including
+  canonical case/encoding/slash aliases (`/METRICS`, `/%6detrics`, `//metrics`,
+  `/metrics/*`); near-miss slugs like `metricsfoo` still resolve.
 - Prometheus wire contract:
   <https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details>
 - SQLx pool gauges:

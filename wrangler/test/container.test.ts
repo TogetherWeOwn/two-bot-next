@@ -205,7 +205,7 @@ for (const method of ["start", "startAndWaitForPorts"] as const) {
   });
 }
 
-for (const path of ["/metrics", "/metrics?token=synthetic", "/metrics/", "/metrics/extra"]) {
+for (const path of ["/metrics", "/metrics?token=synthetic", "/metrics/", "/metrics/extra", "/METRICS", "/%6detrics", "//metrics", "/metrics//extra"]) {
   for (const method of ["GET", "HEAD", "POST"]) {
     test(`${method} ${path} is never publicly routed or sent to the container`, async (t) => {
       const h = await harness(t);
