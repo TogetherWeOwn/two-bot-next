@@ -49,7 +49,9 @@ README. Staging deploys from `main`; production is a separate manual gate.
 - [Commands](docs/commands.md): built-ins, options, registry bounds and default
   Discord permissions, rendered from the compiled all-enabled registry.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
-  defaults, descriptions and the distinction between hot-eligible and live-wired.
+  defaults, descriptions and hot/cold/env_only classes. Hot is a legacy-catalog
+  reload classification only; the Container currently wires no settings
+  store/poller/consumer, so every key is restart-applied (see the reference).
 - [Gateway recovery runbook](docs/gateway-recovery.md): readiness, durable RESUME,
   failure handling and rollback.
 - [Staging soak acceptance](docs/staging-soak.md): the evidence required before

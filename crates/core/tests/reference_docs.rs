@@ -39,8 +39,12 @@ loaders or the classification-only catalog; it does not imply a legacy default,\
 a required value or an implemented consumer. Secret defaults are never rendered.\n\n\
 - `env_only`: never dashboard-stored. Unknown names and `TWO_INTERNAL_*` fail closed.\n\
 - `cold`: storable, applied after restart.\n\
-- `hot`: eligible for reload, not a guarantee of live application. Only `HOT_WIRED`\n\
-  keys are live-wired; other hot keys still require a consumer restart.\n\n\
+- `hot`: reload classification from the legacy catalog, not a claim of runtime\n\
+  wiring. Keys in legacy `HOT_WIRED` are classified “reload-report hot” (the\n\
+  `RefreshReport::hot` partition in `settings.rs`); the Container startup\n\
+  (`crates/bot/src/main.rs`) currently constructs no settings cache/store,\n\
+  poller or reload consumer, so no key is live-applied. Treat every hot key\n\
+  as restart-applied until store/poller/consumer integration lands.\n\n\
 ## Container bootstrap\n\n\
 `Config` separately reads `DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR` and\n\
 `GUILD_ID` (see `crates/core/src/config.rs`). These are not aliases automatically\n\
@@ -233,8 +237,10 @@ fn render_configuration() -> String {
         let (class, application) = match class {
             SettingClass::EnvOnly => ("env_only", "environment only"),
             SettingClass::Cold => ("cold", "restart"),
-            SettingClass::Hot if HOT_WIRED.contains(&key) => ("hot", "live-wired"),
-            SettingClass::Hot => ("hot", "restart (not live-wired)"),
+            SettingClass::Hot if HOT_WIRED.contains(&key) => {
+                ("hot", "restart (reload-report hot)")
+            }
+            SettingClass::Hot => ("hot", "restart"),
         };
         let default = if is_secret_key(key) {
             "Not rendered (secret)".to_owned()
