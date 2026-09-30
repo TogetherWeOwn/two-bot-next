@@ -128,7 +128,7 @@ const INSPECT_LIMITS: InspectLimits = InspectLimits {
 
 // Both paths count the newline, not just the JSON payload. Check before
 // growing a buffer or handing another line to the compressor.
-fn account_decoded(
+fn reserve_decoded_bytes(
     decoded: &mut u64,
     line_len: u64,
     added: u64,
@@ -165,7 +165,7 @@ fn read_capped_line(
             .iter()
             .position(|b| *b == b'\n')
             .map_or(bytes.len(), |i| i + 1);
-        account_decoded(decoded, line.len() as u64, n as u64, limits)?;
+        reserve_decoded_bytes(decoded, line.len() as u64, n as u64, limits)?;
         let complete = bytes[n - 1] == b'\n';
         line.extend_from_slice(&bytes[..n]);
         reader.consume(n);
@@ -371,7 +371,7 @@ impl DumpWriter {
         serde_json::to_writer(&mut line, value)
             .map_err(|e| refuse(format!("cannot serialise dump line: {e}")))?;
         line.write_all(b"\n")?;
-        account_decoded(&mut self.decoded, 0, line.written, self.limits)?;
+        reserve_decoded_bytes(&mut self.decoded, 0, line.written, self.limits)?;
         // The reader budgets allocated capacities, not just string lengths.
         // Parse the actual bytes so writer/reader accounting sees the same
         // capacities, rather than capacities inherited from database values.

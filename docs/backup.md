@@ -206,6 +206,12 @@ cutover plan and gates separately; these examples are scratch-only.
   limits, production/staging resources, usable Discord credentials or off-box
   buckets were used. Physical power-loss durability and real Discord behavior
   remain outside this test evidence.
+- CodeQL CLI 2.27.1's name heuristic classified the former `account_decoded`
+  byte-budget helper as an account-ID source despite its exclusively numeric
+  inputs. It is now accurately named `reserve_decoded_bytes`; no logging,
+  scanner configuration, alert disposition or dataflow behavior was weakened.
+  Public pinned-model evidence is recorded in the author verification report;
+  fresh exact-head CI remains required, not an alert dismissal.
 
 ## S6 hook (Founding Engineer)
 
