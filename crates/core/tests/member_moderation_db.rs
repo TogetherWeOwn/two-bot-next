@@ -719,8 +719,8 @@ async fn postgres_generation_wins_over_timestamp_and_confirmation_order() {
         HashSet::from(["a-new-tie".to_owned(), "a-new-backward".to_owned()])
     );
 
-    // An older acceptance arriving after a newer acceptance cannot supersede
-    // the newer schedule or resurrect its own already superseded expiry.
+    // New staging now refuses unresolved old PUTs. An inconsistent imported
+    // ledger must also fence the newer expiry until the exact old PUT resolves.
     store
         .stage_unban(
             "guild",
@@ -732,34 +732,37 @@ async fn postgres_generation_wins_over_timestamp_and_confirmation_order() {
         )
         .await
         .expect("older prepared");
-    accepted_unban(
-        &store,
-        "guild",
-        "late-confirm",
-        "newer-first-confirm",
-        NOW,
-        NOW,
-    )
-    .await;
-    store
-        .activate_staged_unban("guild", "late-confirm", "newer-first-confirm", NOW)
+    assert!(store
+        .stage_ban("guild", "late-confirm", "newer-first-confirm", NOW)
         .await
-        .expect("newer pending");
+        .is_err());
+    sqlx::query("INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('newer-first-confirm', 'guild', 'late-confirm', 'accepted', $1::text::timestamptz)")
+        .bind(NOW).execute(&pool).await.expect("historical newer acceptance");
+    sqlx::query("INSERT INTO moderation_scheduled_unbans (request_id, guild_id, user_id, execute_at, reason, state, created_at) VALUES ('newer-first-confirm', 'guild', 'late-confirm', $1::text::timestamptz, 'expiry', 'staged', $1::text::timestamptz)")
+        .bind(NOW).execute(&pool).await.expect("historical newer expiry");
     assert!(store
         .confirm_ban("guild", "late-confirm", "older-late-confirm", DUE)
         .await
         .is_err());
-    assert_eq!(ban_state(&pool, "older-late-confirm").await, "prepared");
-    assert_eq!(unban_state(&pool, "newer-first-confirm").await, "pending");
-    assert_eq!(unban_state(&pool, "older-late-confirm").await, "superseded");
     assert!(store
-        .activate_staged_unban("guild", "late-confirm", "older-late-confirm", DUE)
+        .activate_staged_unban("guild", "late-confirm", "newer-first-confirm", NOW)
         .await
         .is_err());
+    assert!(store
+        .claim_due_unbans("guild", DUE, 25)
+        .await
+        .expect("older PUT fences recovery")
+        .is_empty());
+    assert_eq!(ban_state(&pool, "older-late-confirm").await, "prepared");
+    assert_eq!(unban_state(&pool, "older-late-confirm").await, "staged");
+    store
+        .reject_ban("guild", "late-confirm", "older-late-confirm", DUE)
+        .await
+        .expect("authoritative old PUT refusal");
     let jobs = store
         .claim_due_unbans("guild", DUE, 25)
         .await
-        .expect("only newer survives");
+        .expect("newer recovers after proof");
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].request_id, "newer-first-confirm");
     cleanup(admin, pool, schema).await;
@@ -1002,6 +1005,50 @@ async fn postgres_stage_atomicity_and_rejected_retry_generation() {
 
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_old_prepared_put_fences_new_staging_and_newer_accepted_expiry() {
+    let (admin, pool, schema) = database().await;
+    let store = PgMemberModerationStore::new(pool.clone(), "guild");
+    store
+        .stage_ban("guild", "user", "old-put", NOW)
+        .await
+        .expect("uncertain old PUT");
+    let permanent = store.stage_ban("guild", "user", "new-put", DUE).await;
+    let temporary = store
+        .stage_unban("guild", "user", DUE, "expiry", "new-temp", DUE)
+        .await;
+    // Model a pre-repair/imported ledger with an older uncertain operation
+    // and a newer accepted tempban. Generation alone is not remote ordering.
+    sqlx::raw_sql("DELETE FROM moderation_scheduled_unbans WHERE request_id = 'new-temp'; DELETE FROM moderation_member_bans WHERE request_id IN ('new-put', 'new-temp');")
+        .execute(&pool).await.expect("remove probe intents only");
+    sqlx::query("INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('historical-new-temp', 'guild', 'user', 'accepted', $1::text::timestamptz)")
+        .bind(NOW).execute(&pool).await.expect("historical accepted newer PUT");
+    sqlx::query("INSERT INTO moderation_scheduled_unbans (request_id, guild_id, user_id, execute_at, reason, state, created_at) VALUES ('historical-new-temp', 'guild', 'user', $1::text::timestamptz, 'expiry', 'pending', $1::text::timestamptz)")
+        .bind(NOW).execute(&pool).await.expect("historical expiry");
+    let jobs = store
+        .claim_due_unbans("guild", DUE, 25)
+        .await
+        .expect("uncertainty check");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM moderation_member_bans WHERE state = 'prepared'")
+            .fetch_one(&pool)
+            .await
+            .expect("old fence remains");
+    cleanup(admin, pool, schema).await;
+    assert!(permanent
+        .expect_err("fresh permanent must refuse")
+        .is_safe_pre_mutation());
+    assert!(temporary
+        .expect_err("fresh tempban must refuse")
+        .is_safe_pre_mutation());
+    assert_eq!(count, 1);
+    assert!(
+        jobs.is_empty(),
+        "no DELETE may race an older unfinished PUT"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
 async fn postgres_imported_unbans_are_quarantined_without_acceptance_inference() {
     let (admin, pool, schema) = database().await;
     let store = PgMemberModerationStore::new(pool.clone(), "guild");
@@ -1227,7 +1274,12 @@ async fn postgres_accepted_bans_audit_before_confirmation_and_activation() {
         (ModerationAction::Ban, "confirmation-loss"),
         (ModerationAction::TempBan, "activation-loss"),
     ] {
-        let request = execution(action, id);
+        let mut request = execution(action, id);
+        // The first case retains a prepared PUT fence. Exercise activation
+        // failure independently on a different member, not through that fence.
+        if id == "activation-loss" {
+            request.target.as_mut().expect("target").user_id = "444444444444444444".into();
+        }
         let error = svc
             .execute(&request)
             .await

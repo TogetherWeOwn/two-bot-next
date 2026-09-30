@@ -1192,22 +1192,23 @@ struct MemInner {
 }
 
 impl MemInner {
-    // F1: a `running` schedule holds a dispatched unban whose remote DELETE
-    // may still land. Refuse fresh staging until authoritative resolution
-    // clears the fence — a late DELETE must never remove a new ban.
-    fn refuse_running_unban(&self, guild: &str, user: &str) -> Result<(), StoreError> {
+    // Local generations do not order unfinished remote PUTs or DELETEs.
+    // Both directions of uncertainty fence new mutations for this member.
+    fn refuse_uncertain_effects(&self, guild: &str, user: &str) -> Result<(), StoreError> {
         if self.unbans.values().any(|row| {
             row.guild_id == guild && row.user_id == user && row.state == UnbanState::Running
+        }) || self.bans.values().any(|row| {
+            row.guild_id == guild && row.user_id == user && row.state == BanState::Prepared
         }) {
             return Err(StoreError::rolled_back(
-                "member has an uncertain dispatched unban; resolve it before banning",
+                "member has an uncertain ban or unban; resolve it before banning",
             ));
         }
         Ok(())
     }
 
     fn stage_ban(&mut self, guild: &str, user: &str, request: &str) -> Result<(), StoreError> {
-        self.refuse_running_unban(guild, user)?;
+        self.refuse_uncertain_effects(guild, user)?;
         if self.bans.get(request).is_some_and(|row| {
             row.state != BanState::Rejected || row.guild_id != guild || row.user_id != user
         }) {
@@ -1237,8 +1238,8 @@ impl MemInner {
             && !self.bans.values().any(|other| {
                 other.guild_id == row.guild_id
                     && other.user_id == row.user_id
-                    && other.state != BanState::Rejected
-                    && other.generation > row.generation
+                    && ((other.state == BanState::Prepared && other.generation != row.generation)
+                        || (other.state != BanState::Rejected && other.generation > row.generation))
             })
     }
 
@@ -1500,7 +1501,7 @@ impl MemberModerationStore for MemMemberStore {
         created_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
-        inner.refuse_running_unban(guild_id, user_id)?;
+        inner.refuse_uncertain_effects(guild_id, user_id)?;
         if inner.unbans.get(request_id).is_some_and(|row| {
             row.state != UnbanState::Cancelled || row.guild_id != guild_id || row.user_id != user_id
         }) {

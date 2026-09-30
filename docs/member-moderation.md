@@ -37,8 +37,13 @@ until the shared S4 interaction router and REST executor merge.
   tick, never retried within this sweep. Undispatched later jobs stay pending.
 - Surface prepared/uncertain ban intents and `running` jobs for reconciliation.
   Never silently take them over. New permanent and temporary bans refuse while
-  any `running` schedule exists for that guild/member: a timed-out or cancelled
-  DELETE can still land after a new PUT. Under the member queue, only
+  any prepared PUT or `running` DELETE exists for that guild/member. An unfinished
+  old PUT may land after a newer temporary ban expires, just as an unfinished
+  DELETE may land after a new PUT. Every prepared PUT also fences expiry selection,
+  recovery and dispatch, regardless of whether its generation is older or newer.
+  Under the member queue, `confirm_ban` / `reject_ban` may reconcile the exact
+  prepared intent only with proof the PUT finished or provably cannot still land;
+  neither a current banned snapshot nor local cancellation supplies that proof. Under the member queue, only
   `resolve_uncertain_unban(request_id, claim_token, resolution)` may close this
   uncertainty. `Completed` requires proof the DELETE finished; `Void` requires
   proof it cannot still land, and requeues a still-required accepted expiry with

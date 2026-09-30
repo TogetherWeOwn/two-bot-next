@@ -99,7 +99,8 @@ impl PgMemberModerationStore {
                AND NOT EXISTS (
                  SELECT 1 FROM moderation_member_bans AS newer
                  WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
-                   AND newer.generation > intent.generation AND newer.state <> 'rejected'
+                   AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
+                     OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
                )",
         )
         .bind(request)
@@ -115,21 +116,21 @@ impl PgMemberModerationStore {
         Ok(())
     }
 
-    // F1: a member with a `running` schedule holds a dispatched unban whose
-    // remote DELETE may still land. Staging a fresh ban while that
-    // uncertainty is unresolved would let the late DELETE remove the new
-    // ban, so every staging path refuses until authoritative
-    // `resolve_uncertain_unban` evidence clears the fence. SQLSTATE-only
-    // error: no row contents reach the message.
-    async fn refuse_running_unban_fence(
+    // Either direction of unresolved HTTP mutation fences this member. A
+    // late DELETE can undo a new PUT; a late PUT can outlive a newer expiry.
+    // Generations order local ownership, not unfinished remote effects.
+    async fn refuse_uncertain_effects(
         executor: impl sqlx::Executor<'_, Database = Postgres>,
         guild: &str,
         user: &str,
     ) -> Result<(), StoreError> {
-        let running: bool = sqlx::query_scalar(
+        let uncertain: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                SELECT 1 FROM moderation_scheduled_unbans AS job
                WHERE job.guild_id = $1 AND job.user_id = $2 AND job.state = 'running'
+             ) OR EXISTS (
+               SELECT 1 FROM moderation_member_bans AS intent
+               WHERE intent.guild_id = $1 AND intent.user_id = $2 AND intent.state = 'prepared'
              )",
         )
         .bind(guild)
@@ -137,9 +138,9 @@ impl PgMemberModerationStore {
         .fetch_one(executor)
         .await
         .map_err(db_error)?;
-        if running {
+        if uncertain {
             return Err(StoreError::rolled_back(
-                "member has an uncertain dispatched unban; resolve it before banning",
+                "member has an uncertain ban or unban; resolve it before banning",
             ));
         }
         Ok(())
@@ -343,7 +344,7 @@ impl MemberModerationStore for PgMemberModerationStore {
     ) -> Result<(), StoreError> {
         self.ensure_guild(guild)?;
         let mut tx = self.pool.begin().await.map_err(db_error)?;
-        Self::refuse_running_unban_fence(&mut *tx, &self.guild_id, user).await?;
+        Self::refuse_uncertain_effects(&mut *tx, &self.guild_id, user).await?;
         // A fresh intent that survives the fence must itself fence; every
         // staging path owns the member queue, so the check-then-insert is
         // atomic against this store's consumers. Every `prepare` failure
@@ -372,7 +373,8 @@ impl MemberModerationStore for PgMemberModerationStore {
                AND NOT EXISTS (
                  SELECT 1 FROM moderation_member_bans AS newer
                  WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
-                   AND newer.generation > intent.generation AND newer.state <> 'rejected'
+                   AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
+                     OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
                )
              RETURNING intent.generation",
         )
@@ -423,7 +425,7 @@ impl MemberModerationStore for PgMemberModerationStore {
     ) -> Result<(), StoreError> {
         self.ensure_guild(guild)?;
         let mut tx = self.pool.begin().await.map_err(db_error)?;
-        Self::refuse_running_unban_fence(&mut *tx, &self.guild_id, user).await?;
+        Self::refuse_uncertain_effects(&mut *tx, &self.guild_id, user).await?;
         // As in `stage_ban`: `prepare` failures precede any write for this
         // request, so the rolled-back transaction stays mutation-free.
         self.prepare(&mut tx, guild, user, request, now).await?;
@@ -521,7 +523,8 @@ impl MemberModerationStore for PgMemberModerationStore {
                AND NOT EXISTS (
                  SELECT 1 FROM moderation_member_bans AS newer
                  WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
-                   AND newer.generation > intent.generation AND newer.state <> 'rejected'
+                   AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
+                     OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
                )
              ORDER BY intent.generation DESC",
         )
@@ -551,7 +554,8 @@ impl MemberModerationStore for PgMemberModerationStore {
                  AND NOT EXISTS (
                    SELECT 1 FROM moderation_member_bans AS newer
                    WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
-                     AND newer.generation > intent.generation AND newer.state <> 'rejected'
+                     AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
+                     OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
                  )
                ORDER BY job.execute_at, intent.generation LIMIT $3 FOR UPDATE OF job SKIP LOCKED
              ) UPDATE moderation_scheduled_unbans AS job SET state = 'running',
@@ -590,7 +594,8 @@ impl MemberModerationStore for PgMemberModerationStore {
                  AND NOT EXISTS (
                    SELECT 1 FROM moderation_member_bans AS newer
                    WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
-                     AND newer.generation > intent.generation AND newer.state <> 'rejected'
+                     AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
+                     OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
                  )
              )",
         )

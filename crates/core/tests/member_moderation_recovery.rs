@@ -180,6 +180,53 @@ async fn uncertain_ban_fences_old_expiry_until_explicit_reconciliation() {
 }
 
 #[tokio::test]
+async fn uncertain_old_put_refuses_new_bans_and_preserves_retry_until_reconciled() {
+    for old_action in [ModerationAction::Ban, ModerationAction::TempBan] {
+        for new_action in [ModerationAction::Ban, ModerationAction::TempBan] {
+            let clock = AtomicI64::new(1_700_000_000_000);
+            let discord = MockMemberDiscord::new();
+            let store = MemMemberStore::new();
+            let svc =
+                MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+                    clock.load(Ordering::SeqCst)
+                });
+            discord.fail_with("ban", DiscordError::Timeout);
+            assert!(svc
+                .execute(&execution(old_action, "old-put"))
+                .await
+                .is_err());
+            discord.clear_failure("ban");
+            let new = execution(new_action, "new-put");
+            assert!(svc.execute(&new).await.is_err(), "old PUT can still land");
+            assert_eq!(discord.call_count("ban"), 1, "no newer PUT was dispatched");
+            clock.store(1_700_003_600_000, Ordering::SeqCst);
+            assert_eq!(svc.run_due_unbans(GUILD).await.expect("fenced sweep"), 0);
+            assert_eq!(discord.call_count("unban"), 0);
+            // Exact-operation proof that the old PUT cannot land, not age,
+            // local cancellation, or the current banned status.
+            store
+                .reject_ban(
+                    GUILD,
+                    &new.target.as_ref().expect("target").user_id,
+                    "old-put",
+                    DUE,
+                )
+                .await
+                .expect("authoritative refusal");
+            svc.execute(&new)
+                .await
+                .expect("same never-dispatched key retries");
+            assert_eq!(discord.call_count("ban"), 2);
+            clock.store(1_700_007_200_000, Ordering::SeqCst);
+            assert_eq!(
+                svc.run_due_unbans(GUILD).await.expect("safe expiry"),
+                usize::from(new_action == ModerationAction::TempBan)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn prepared_staging_is_never_activated_without_acceptance() {
     let store = MemMemberStore::new();
     store
