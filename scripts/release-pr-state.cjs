@@ -73,7 +73,9 @@ function inspectReleasePr(repository, mainSha, request, mode) {
   const pr = findReleasePr(pages.flat(), repository);
   if (mode === 'select') return {
     pr_available: String(Boolean(pr)),
-    pr: pr ? JSON.stringify({number: pr.number, headBranchName: pr.head.ref}) : '',
+    // Actions evaluates step env expressions even when its if guard is false.
+    // After publication there may be no open PR; fromJSON must still be valid.
+    pr: JSON.stringify(pr ? {number: pr.number, headBranchName: pr.head.ref} : {}),
   };
   assert.equal(mode, 'plan', 'Expected plan or select mode');
   assert.match(mainSha, /^[a-f0-9]{40}$/);
