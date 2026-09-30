@@ -14,7 +14,7 @@ use bytes::Bytes;
 use http::{Method, Request, StatusCode};
 
 pub use http::Method as HttpMethod;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -33,6 +33,10 @@ pub enum HttpError {
     Transport { url: String, reason: String },
     #[error("request to {url:?} timed out after {secs}s")]
     Timeout { url: String, secs: u64 },
+    #[error(
+        "response from {url:?} exceeds the {limit}-byte cap; refusing rather than buffering it"
+    )]
+    TooLarge { url: String, limit: usize },
     #[error("unexpected status {status} from {url:?}{detail}")]
     Status {
         url: String,
@@ -80,6 +84,12 @@ impl HttpResponse {
         }
     }
 }
+
+/// Largest response body this client will buffer. Discord JSON, S3 XML
+/// errors and CDN emoji images are kilobytes; anything past 8 MiB is not one
+/// of ours — a wrong endpoint (or a compromised one) must fail the run, not
+/// eat the host's RAM (PR #11 review).
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 fn check_url(url: &str) -> Result<(), HttpError> {
     if url.starts_with("https://") {
@@ -144,13 +154,21 @@ pub async fn request(
             .iter()
             .map(|(n, v)| (n.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
             .collect();
-        let body = res
-            .into_body()
+        let body = Limited::new(res.into_body(), MAX_RESPONSE_BYTES)
             .collect()
             .await
-            .map_err(|e| HttpError::Transport {
-                url: url_owned.clone(),
-                reason: e.to_string(),
+            .map_err(|e| {
+                if e.downcast_ref::<LengthLimitError>().is_some() {
+                    HttpError::TooLarge {
+                        url: url_owned.clone(),
+                        limit: MAX_RESPONSE_BYTES,
+                    }
+                } else {
+                    HttpError::Transport {
+                        url: url_owned.clone(),
+                        reason: e.to_string(),
+                    }
+                }
             })?
             .to_bytes()
             .to_vec();
@@ -226,5 +244,43 @@ mod tests {
             .await
             .expect_err("closed port must fail");
         assert!(matches!(err, HttpError::Transport { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn oversize_response_is_refused_instead_of_buffered() {
+        // A wrong (or compromised) endpoint must fail the run, not eat the
+        // host's RAM: bodies past MAX_RESPONSE_BYTES surface as TooLarge.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            // Drain the request head first: closing with an unread request
+            // pending makes the OS send RST, which would fail the client's
+            // in-flight body read before the size cap trips.
+            let mut buf = vec![0u8; 4096];
+            let mut head_read = Vec::new();
+            loop {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                head_read.extend_from_slice(&buf[..n]);
+                if head_read.windows(4).any(|w| w == b"\r\n\r\n") || head_read.len() > 65_536 {
+                    break;
+                }
+            }
+            let filler = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                filler.len()
+            );
+            socket.write_all(head.as_bytes()).await.ok();
+            socket.write_all(&filler).await.ok();
+        });
+        let err = get(&format!("http://127.0.0.1:{port}/big"), vec![], 30)
+            .await
+            .expect_err("oversize body must be refused");
+        assert!(matches!(err, HttpError::TooLarge { .. }), "{err}");
     }
 }

@@ -99,6 +99,22 @@ pub struct DumpManifest {
     pub schema_migrations: Vec<String>,
 }
 
+/// Largest dump `inspect` will buffer: the reader holds the whole file and
+/// the restore holds every row, so an unbounded read lets a swapped-in wrong
+/// file eat the host's RAM. Nightly dumps of the bot's 22 tables are
+/// megabytes; anything past a gibibyte is not ours (PR #11 review).
+pub const MAX_DUMP_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn ensure_within_size_cap(len: u64, what: &str) -> Result<(), DumpError> {
+    if len > MAX_DUMP_BYTES {
+        return Err(refuse(format!(
+            "{what} is {len} bytes, past the {MAX_DUMP_BYTES}-byte dump cap; \
+             refusing rather than buffering it"
+        )));
+    }
+    Ok(())
+}
+
 /// A file-level refusal: the dump is not ours, truncated, or internally
 /// inconsistent. Never a database error; see [`super::dump`] for those.
 #[derive(Debug, Error)]
@@ -169,6 +185,7 @@ pub struct DumpContents {
 /// `restore --dry-run` calls it *instead*, which is what makes the dry run a
 /// real check of the backup rather than a check that a URL parses.
 pub fn inspect_bytes(bytes: &[u8]) -> Result<DumpContents, DumpError> {
+    ensure_within_size_cap(bytes.len() as u64, "dump")?;
     let decoder = GzDecoder::new(bytes);
     let reader = std::io::BufReader::new(decoder);
     let mut manifest: Option<DumpManifest> = None;
@@ -225,6 +242,19 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<DumpContents, DumpError> {
                     .and_then(Value::as_object)
                     .ok_or_else(|| refuse("dump row has no data object"))?
                     .clone();
+                // This build stores Postgres text-output form (strings and
+                // nulls only). A native JSON cell — a number, boolean, array
+                // or object — would reach the restore as a bound NULL,
+                // silently wiping the value. Refuse the file instead of
+                // restoring a corruption (PR #11 review).
+                for (col, value) in &data {
+                    if !(value.is_string() || value.is_null()) {
+                        return Err(refuse(format!(
+                            "{table} row on line {line_no}: column {col:?} is not a string or null; \
+                             refusing rather than restoring it as NULL"
+                        )));
+                    }
+                }
                 buffers.entry(table.to_owned()).or_default().push(data);
             }
             "end" => {
@@ -278,6 +308,9 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<DumpContents, DumpError> {
 
 /// Read and validate a dump file from disk.
 pub fn inspect(path: &Path) -> Result<DumpContents, DumpError> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        ensure_within_size_cap(meta.len(), &format!("dump file {}", path.display()))?;
+    }
     let bytes = std::fs::read(path)?;
     inspect_bytes(&bytes)
 }
@@ -462,6 +495,47 @@ mod tests {
         let bytes = gzip_lines(&[manifest(tables), serde_json::json!({"kind":"end","rows":0})]);
         let err = inspect_bytes(&bytes).expect_err("missing tables");
         assert!(err.to_string().contains("missing tables"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_row_with_a_native_json_cell() {
+        // This build stores Postgres text-output form (strings and nulls).
+        // A native number/boolean would restore as a bound NULL, silently
+        // wiping the value — refuse the file instead.
+        let mut over = BTreeMap::new();
+        over.insert("events", (vec!["id"], 1));
+        let bytes = gzip_lines(&[
+            manifest(complete_tables(&over)),
+            serde_json::json!({"kind":"row","table":"events","data":{"id": 1}}),
+            serde_json::json!({"kind":"end","rows":1}),
+        ]);
+        let err = inspect_bytes(&bytes).expect_err("native cell must be refused");
+        assert!(err.to_string().contains("not a string or null"), "{err}");
+    }
+
+    #[test]
+    fn size_cap_refuses_past_the_limit_and_accepts_at_it() {
+        ensure_within_size_cap(MAX_DUMP_BYTES, "dump").expect("at cap is fine");
+        let err = ensure_within_size_cap(MAX_DUMP_BYTES + 1, "dump").expect_err("past cap refused");
+        assert!(err.to_string().contains("past the"), "{err}");
+    }
+
+    #[test]
+    fn inspect_refuses_an_oversize_file_from_metadata_without_reading_it() {
+        // Sparse file: the length is metadata, no bytes are allocated, and
+        // `inspect` refuses from the metadata before `fs::read` runs.
+        let dir =
+            std::env::temp_dir().join(format!("two-bot-backup-cap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oversize.ndjson.gz");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_DUMP_BYTES + 1)
+            .unwrap();
+        let err = inspect(&path).expect_err("oversize must be refused");
+        assert!(err.to_string().contains("past the"), "{err}");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]

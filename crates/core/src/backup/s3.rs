@@ -59,6 +59,31 @@ fn get_env(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Host part of an endpoint already checked to start with `http://`,
+/// lowercased, without port or brackets.
+fn loopback_host_of_http_endpoint(endpoint: &str) -> &str {
+    let rest = endpoint.strip_prefix("http://").unwrap_or(endpoint);
+    let authority = rest.split('/').next().unwrap_or("");
+    // Strip one trailing-dot FQDN marker (`localhost.`), then split the port.
+    let authority = authority.strip_suffix('.').unwrap_or(authority);
+    // IPv6 loopback arrives bracketed (`[::1]:9000`); bare `::1` has no port.
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        return bracketed.split(']').next().unwrap_or("");
+    }
+    authority.split(':').next().unwrap_or("")
+}
+
+/// True when an `http://` endpoint points at this machine. The host is
+/// compared exactly — a `starts_with` check would accept
+/// `http://localhost.evil.com` and ship the dump plus its signing
+/// credential in clear text to an attacker (PR #11 review).
+#[must_use]
+pub fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let lowered = endpoint.to_ascii_lowercase();
+    let host = loopback_host_of_http_endpoint(&lowered);
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
 /// Read the off-box destination out of the environment.
 ///
 /// Region defaults to `auto`, which is what R2 wants and what any S3 provider
@@ -87,10 +112,12 @@ pub fn load_s3_target(env: &dyn Fn(&str) -> Option<String>) -> Result<S3Target, 
     }
     // http:// to anything but a local test server would ship the funnel log,
     // and the credential signing it, in clear text across the internet.
-    if endpoint.starts_with("http://")
-        && !endpoint.starts_with("http://localhost")
-        && !endpoint.starts_with("http://127.0.0.1")
-    {
+    // The host is compared exactly: a prefix match would accept
+    // `http://localhost.evil.com` (PR #11 review). Same rule as legacy
+    // `s3Config.ts` (`/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/`), plus
+    // `::1`, which `http::check_url` and the guild-config seams also treat
+    // as loopback.
+    if endpoint.starts_with("http://") && !is_loopback_endpoint(&endpoint) {
         return Err(S3ConfigError(format!(
             "TWO_BACKUP_S3_ENDPOINT must be https:// for a remote host (got {endpoint:?}). \
              Plain http would send the dump and its credentials in clear text."
@@ -259,12 +286,16 @@ pub fn sign_put(
     date_stamp: &str,
 ) -> SignedRequest {
     let endpoint = target.endpoint.trim_end_matches('/');
-    let host = endpoint
+    let without_scheme = endpoint
         .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("");
+        .trim_start_matches("http://");
+    let host = without_scheme.split('/').next().unwrap_or("");
+    // An endpoint may carry a path prefix (a reverse proxy, a MinIO
+    // sub-path, a test fake mounted under `/s3`): that prefix is part of
+    // the request-target S3 signs, so it must be part of BOTH the signed
+    // path and the URL. Dropping it signs one thing and sends another —
+    // a 403 at best, a write to the wrong place at worst (PR #11 review).
+    let endpoint_prefix = without_scheme.split_at(host.len()).1.trim_end_matches('/');
     let scheme = if target.endpoint.starts_with("http://") {
         "http"
     } else {
@@ -273,7 +304,12 @@ pub fn sign_put(
     let service = "s3";
 
     let payload_hash = sha256_hex(body);
-    let path = canonical_path(&format!("/{}/{}", target.bucket, key));
+    let resource = format!("/{}/{}", target.bucket, key);
+    let path = if endpoint_prefix.is_empty() {
+        canonical_path(&resource)
+    } else {
+        canonical_path(&format!("{endpoint_prefix}{resource}"))
+    };
 
     let headers = vec![
         ("host".to_owned(), host.to_owned()),
@@ -506,6 +542,68 @@ mod tests {
         let t = load_s3_target(&|k| vars.get(k).cloned()).expect("loopback http is for tests");
         assert_eq!(t.region, "auto");
         assert_eq!(t.prefix, None);
+    }
+
+    #[test]
+    fn loopback_allowlist_compares_the_host_exactly() {
+        // A prefix match would accept `localhost.evil.com` and ship the dump
+        // plus its signing credential in clear text to an attacker.
+        for ok in [
+            "http://localhost:9000",
+            "http://localhost/minio",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+            "http://LOCALHOST:9000",
+        ] {
+            assert!(is_loopback_endpoint(ok), "{ok}");
+        }
+        for bad in [
+            "http://localhost.evil.com/x",
+            "http://127.0.0.1.evil.com/",
+            "http://notlocalhost:9000",
+            "http://s3.example.com/",
+        ] {
+            assert!(!is_loopback_endpoint(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn config_refuses_clear_text_to_a_lookalike_host() {
+        let vars = env_of(&[
+            (
+                "TWO_BACKUP_S3_ENDPOINT",
+                "http://localhost.evil.com/backups",
+            ),
+            ("TWO_BACKUP_S3_BUCKET", "paperclip-backups"),
+            ("TWO_BACKUP_S3_ACCESS_KEY_ID", "id"),
+            ("TWO_BACKUP_S3_SECRET_ACCESS_KEY", "secret"),
+        ]);
+        let err = load_s3_target(&|k| vars.get(k).cloned()).expect_err("lookalike host");
+        assert!(err.0.contains("must be https://"), "{err}");
+    }
+
+    #[test]
+    fn sign_put_keeps_an_endpoint_path_prefix_in_signed_path_and_url() {
+        let mut prefixed = target();
+        prefixed.endpoint = "https://proxy.example.com/s3-prefix".to_owned();
+        let req = sign_put(
+            &prefixed,
+            "two-bot/f.gz",
+            b"data",
+            "20260903T041700Z",
+            "20260903",
+        );
+        assert_eq!(
+            req.url,
+            "https://proxy.example.com/s3-prefix/paperclip-backups/two-bot/f.gz"
+        );
+        // The host header stays the bare host; the prefix lives in the path.
+        let host = req
+            .headers
+            .iter()
+            .find(|(n, _)| n == "host")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(host, Some("proxy.example.com"));
     }
 
     #[test]

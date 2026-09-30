@@ -166,11 +166,27 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
     let seq: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(id), 0) FROM events")
         .fetch_one(&mut *tx)
         .await?;
+    // The manifest records the source's applied migrations for diagnosing
+    // an old backup. Only an ABSENT record table (SQLSTATE 42P01) falls back
+    // to an empty list — a fresh source whose migration runner has not
+    // created its ledger yet, matching legacy's `.catch(() => [])`. Any other
+    // failure propagates: silently writing a manifest that claims nothing was
+    // applied would lie to whoever diagnoses the restore (PR #11 review).
     let migrations: Vec<(String,)> =
-        sqlx::query_as("SELECT id::text FROM schema_migrations ORDER BY id")
+        match sqlx::query_as("SELECT id::text FROM schema_migrations ORDER BY id")
             .fetch_all(&mut *tx)
             .await
-            .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P01") => {
+                Vec::new()
+            }
+            Err(e) => {
+                return Err(DbDumpError::Refused(format!(
+                    "cannot read schema_migrations: {e}"
+                )));
+            }
+        };
 
     let manifest = DumpManifest {
         kind: "manifest".to_owned(),
@@ -341,6 +357,10 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
                     let target_type = target_types.get(col.as_str()).copied().unwrap_or("text");
                     tuple.push(format!("${index}::{target_type}"));
                     index += 1;
+                    // `inspect` refused every non-string/non-null cell before
+                    // the transaction opened, so `as_str` here only maps
+                    // JSON null to SQL NULL — it can never silently wipe a
+                    // value (PR #11 review; see `inspect_bytes`).
                     let value = row.get(*col).and_then(Value::as_str).map(str::to_owned);
                     params.push(value);
                 }

@@ -21,6 +21,9 @@ inside one `REPEATABLE READ` transaction, the `events` high-water mark, and
 the source's applied migrations. Values are stored in Postgres text-output
 form with a `$n::type` cast on restore — faithful for every owned type
 without per-type decoding. `column_types` is additive to the legacy envelope.
+Row cells are strings or nulls; a native JSON cell (number, boolean, array,
+object) is refused by `inspect` rather than restored as NULL. Dumps past
+1 GiB (`MAX_DUMP_BYTES`) are refused from file metadata before buffering.
 
 All 22 bot-owned tables are dumped (see `DUMP_TABLES` in
 `crates/core/src/backup/dump_file.rs`); the website's tables are not ours.
@@ -107,12 +110,14 @@ TWO_RESTORE_URL=postgres://.../two_scratch two-bot restore /var/backups/two-bot-
 TWO_RESTORE_URL="$TWO_DATABASE_URL" two-bot restore /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --force
 ```
 
-### Drill evidence — 2026-09-29 (TOG-9881, scratch only)
+### Drill evidence — 2026-09-30 (TOG-9881, scratch only)
 
 - Backup: `two-bot backup` against agent-testdb `two_next_backup_test`,
-  wrote `two-funnel-20260929T220127Z.ndjson.gz` (1.2 KiB, 13 rows over 22
-  tables; tables seeded by the round-trip test).
-- Dry run: `restore … --dry-run` → `DRY RUN VERIFIED`, 13 rows verified,
+  wrote `two-funnel-20260930T004531Z.ndjson.gz` (1.2 KiB, 14 rows over 22
+  tables; tables seeded by the round-trip test). Run with the CHANGES-fix
+  build (exact-host loopback allowlist, endpoint path prefix, cell-type and
+  size-cap refusals, migration-record propagation, bounded HTTP bodies).
+- Dry run: `restore … --dry-run` → `DRY RUN VERIFIED`, 14 rows verified,
   nothing written.
 - Restore: `restore … --force` with
   `TWO_RESTORE_URL=postgres://agent_test@agent-testdb:5432/two_next_restore_drill`
