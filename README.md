@@ -28,6 +28,10 @@ Squash-merge only; PR titles follow Conventional Commits and the body carries
 `check` (fmt, clippy -D warnings, tests, cargo-deny) and `worker check` (including
 the runbook command-drift test). The approving non-author reviewer squash-merges.
 
+Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/build-cache.md),
+not a new `target/` in each worktree. The runbook includes offline cache tests,
+fail-closed retention auditing, `/home` available-byte alarms and the Operator rollout.
+
 ## License
 
 Business Source License 1.1, converting to MIT three years after each release. See [LICENSE](LICENSE).
