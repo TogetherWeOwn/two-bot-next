@@ -12,7 +12,8 @@ pub mod executor;
 
 #[cfg(feature = "db")]
 pub use channel_moderation::{
-    register_channel_handlers, ChannelModerationRuntime, ChannelReply, ChannelRuntimeError,
+    register_channel_handlers, ChannelModerationRuntime, ChannelReply, ChannelResponseError,
+    ChannelRuntimeError,
 };
 pub mod intents;
 pub mod interactions;

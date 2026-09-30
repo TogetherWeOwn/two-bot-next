@@ -4,9 +4,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use twilight_model::application::interaction::{
-    application_command::{CommandData, CommandOptionValue},
-    Interaction, InteractionData,
+use twilight_model::{
+    application::interaction::{
+        application_command::{CommandData, CommandOptionValue},
+        Interaction, InteractionData, InteractionType,
+    },
+    channel::message::MessageFlags,
+    http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
     channel_moderation::{self as domain, ChannelOutcome, EveryoneOverwrite, UnlockPlan},
@@ -66,6 +70,18 @@ pub enum ChannelRuntimeError {
     StoredResult,
 }
 
+/// Bounded, token-free lifecycle errors. Details of SQL/HTTP failures must not
+/// be logged: they can contain connection URLs or interaction webhook tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChannelResponseError {
+    #[error("interaction defer failed; no channel mutation attempted")]
+    Defer,
+    #[error("channel action persistence failed; reconciliation required")]
+    Persistence,
+    #[error("interaction result edit failed; do not repeat the channel action")]
+    Edit,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelModerationRuntime {
     store: ChannelModerationStore,
@@ -90,6 +106,61 @@ impl ChannelModerationRuntime {
     #[must_use]
     pub fn new(store: ChannelModerationStore, executor: ActionExecutor) -> Self {
         Self { store, executor }
+    }
+
+    /// Ownership only, never authorization. The shared router still adjudicates
+    /// every request (including disabled commands and persisted-result replays).
+    #[must_use]
+    pub fn accepts(interaction: &Interaction) -> bool {
+        matches!(
+            (interaction.kind, interaction.data.as_ref()),
+            (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data)))
+                if ModerationAction::ALL.into_iter().any(|a| !a.targets_member() && a.command_name() == data.name)
+        )
+    }
+
+    /// Complete the ephemeral interaction lifecycle through the shared executor.
+    /// Defer before any SQL or channel HTTP, with no mutation if acknowledgement
+    /// is rejected or ambiguous. A result-edit failure never retries the action.
+    pub async fn respond(
+        &self,
+        router: &InteractionRouter,
+        interaction: &Interaction,
+    ) -> Result<bool, ChannelResponseError> {
+        if !Self::accepts(interaction) {
+            return Ok(false);
+        }
+        let defer = InteractionResponse {
+            kind: InteractionResponseType::DeferredChannelMessageWithSource,
+            data: Some(InteractionResponseData {
+                flags: Some(MessageFlags::EPHEMERAL),
+                ..Default::default()
+            }),
+        };
+        // Discord's initial response deadline is three seconds. Leave a margin
+        // rather than using the executor's five-second mutation abort here.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.executor
+                .answer_interaction(interaction.id.get(), &interaction.token, &defer),
+        )
+        .await
+        .map_err(|_| ChannelResponseError::Defer)?
+        .map_err(|_| ChannelResponseError::Defer)?;
+        let result = self.execute(router, interaction).await;
+        let text = match &result {
+            Ok(Some(reply)) => reply.text.as_str(),
+            _ => "The channel action requires reconciliation; do not repeat it.",
+        };
+        let edit = self
+            .executor
+            .edit_interaction_response(interaction.application_id.get(), &interaction.token, text)
+            .await;
+        if result.is_err() {
+            return Err(ChannelResponseError::Persistence);
+        }
+        edit.map_err(|_| ChannelResponseError::Edit)?;
+        Ok(true)
     }
 
     /// Returns None for other slices. The caller defers an ephemeral response

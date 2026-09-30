@@ -12,7 +12,9 @@ use two_bot_core::{
     ChannelClaim, ChannelModerationStore, HandlerId, InteractionRouter, ModerationAction,
     RouterGates,
 };
-use two_bot_discord::{register_channel_handlers, ActionExecutor, ChannelModerationRuntime};
+use two_bot_discord::{
+    register_channel_handlers, ActionExecutor, ChannelModerationRuntime, ChannelResponseError,
+};
 
 const GUILD: &str = "111111111111111111";
 const CHANNEL: &str = "222222222222222222";
@@ -152,6 +154,213 @@ fn overwrite(allow: &str, deny: &str) -> ScriptedResponse {
         200,
         json!({"permission_overwrites":[{"id":GUILD,"type":0,"allow":allow,"deny":deny}]}),
     )
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn defer_precedes_sql_and_effect_then_edits_original_with_no_mentions() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204).delayed(std::time::Duration::from_millis(300)),
+            ScriptedResponse::status(200),
+            ScriptedResponse::status(200),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let request = interaction(900, "slowmode", options(Some(("seconds", 0))), PERMISSIONS);
+    let worker = tokio::spawn({
+        let runtime = runtime.clone();
+        let request = request.clone();
+        async move { runtime.respond(&router(true), &request).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while mock.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!worker.is_finished());
+    assert_eq!(db.count("moderation_idempotency").await, 0);
+    assert_eq!(db.count("moderation_audit").await, 0);
+    assert_eq!(worker.await.unwrap(), Ok(true));
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "POST");
+    assert!(requests[0].path.ends_with("/callback"));
+    let defer: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(defer["type"], 5);
+    assert_eq!(defer["data"]["flags"], 64);
+    assert_eq!(requests[1].path, format!("/api/v10/channels/{CHANNEL}"));
+    assert_eq!(requests[2].method, "PATCH");
+    assert_eq!(
+        requests[2].path,
+        "/api/v10/webhooks/444444444444444444/synthetic-interaction-token/messages/@original"
+    );
+    let edit: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(
+        edit["content"],
+        "Moderation action completed: slowmode_updated."
+    );
+    assert_eq!(edit["allowed_mentions"]["parse"], json!([]));
+    assert_eq!(db.count("moderation_audit").await, 1);
+    assert!(
+        runtime
+            .execute(&router(true), &request)
+            .await
+            .unwrap()
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(mock.requests().len(), 3);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn rejected_or_ambiguous_defer_never_claims_or_mutates() {
+    let db = Database::open().await;
+    for response in [
+        ScriptedResponse::status(403),
+        ScriptedResponse::status(503),
+        ScriptedResponse::status(429),
+        ScriptedResponse::status(204).delayed(std::time::Duration::from_millis(2200)),
+    ] {
+        let mock = MockRest::start(vec![response], ScriptedResponse::status(200)).await;
+        let runtime = runtime(&db, &mock);
+        assert_eq!(
+            runtime
+                .respond(
+                    &router(true),
+                    &interaction(901, "lockdown", options(None), PERMISSIONS)
+                )
+                .await,
+            Err(ChannelResponseError::Defer)
+        );
+        assert_eq!(mock.requests().len(), 1);
+        assert_eq!(db.count("moderation_idempotency").await, 0);
+        assert_eq!(db.count("moderation_lockdowns").await, 0);
+        assert_eq!(db.count("moderation_audit").await, 0);
+        mock.shutdown().await;
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn failed_result_edit_never_repeats_a_completed_effect() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(200),
+            ScriptedResponse::status(503),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let request = interaction(902, "slowmode", options(Some(("seconds", 1))), PERMISSIONS);
+    assert_eq!(
+        runtime.respond(&router(true), &request).await,
+        Err(ChannelResponseError::Edit)
+    );
+    assert!(
+        runtime
+            .execute(&router(true), &request)
+            .await
+            .unwrap()
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(mock.requests().len(), 3);
+    assert_eq!(db.count("moderation_audit").await, 1);
+    assert_eq!(db.count("moderation_channel_execution").await, 0);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn persistence_failure_edits_safe_reconciliation_reply_and_keeps_lane() {
+    let db = Database::open().await;
+    sqlx::query("ALTER TABLE moderation_audit ADD CONSTRAINT reject_success CHECK (outcome <> 'slowmode_updated')").execute(db.store.pool()).await.unwrap();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(200),
+            ScriptedResponse::status(200),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let request = interaction(903, "slowmode", options(Some(("seconds", 1))), PERMISSIONS);
+    assert_eq!(
+        runtime.respond(&router(true), &request).await,
+        Err(ChannelResponseError::Persistence)
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    let edit: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(
+        edit["content"],
+        "The channel action requires reconciliation; do not repeat it."
+    );
+    assert_eq!(edit["allowed_mentions"]["parse"], json!([]));
+    assert_eq!(db.count("moderation_channel_execution").await, 1);
+    assert_eq!(
+        runtime
+            .execute(&router(true), &request)
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        "in_progress"
+    );
+    assert_eq!(mock.requests().len(), 3);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service"]
+async fn disabled_command_uses_ephemeral_lifecycle_and_other_slices_are_untouched() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204), ScriptedResponse::status(200)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    assert_eq!(
+        runtime
+            .respond(
+                &router(false),
+                &interaction(904, "purge", options(Some(("count", 1))), PERMISSIONS)
+            )
+            .await,
+        Ok(true)
+    );
+    assert_eq!(mock.requests().len(), 2);
+    assert_eq!(db.count("moderation_audit").await, 1);
+    assert_eq!(db.count("moderation_idempotency").await, 0);
+    assert_eq!(
+        runtime
+            .respond(
+                &router(true),
+                &interaction(905, "ban", options(None), PERMISSIONS)
+            )
+            .await,
+        Ok(false)
+    );
+    assert_eq!(mock.requests().len(), 2);
+    mock.shutdown().await;
+    db.close().await;
 }
 
 #[tokio::test]

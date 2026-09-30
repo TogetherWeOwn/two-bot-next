@@ -1238,6 +1238,46 @@ impl ActionExecutor {
         }
     }
 
+    /// Edit a deferred interaction's original response. Single attempt: an edit
+    /// failure must never cause the caller to repeat an accepted moderation effect.
+    /// Tokens stay in memory and are never included in returned errors.
+    pub async fn edit_interaction_response(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let mentions = AllowedMentions {
+            parse: vec![],
+            replied_user: false,
+            roles: vec![],
+            users: vec![],
+        };
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .interaction(application)
+                .update_response(interaction_token)
+                .content(Some(content))
+                .allowed_mentions(Some(&mentions)),
+        )
+        .map_err(|_| DiscordError::Rejected("invalid interaction result".to_owned()))?;
+        self.call_once(req, &[200])
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                DiscordError::Rejected(_) => {
+                    DiscordError::Rejected("interaction edit refused".to_owned())
+                }
+                DiscordError::Unavailable(_) => {
+                    DiscordError::Unavailable("interaction edit unavailable".to_owned())
+                }
+                other => other,
+            })
+    }
+
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
     /// (legacy `ModerationService::carryOut` verb mapping; warn is
     /// store-only and never reaches the wire).

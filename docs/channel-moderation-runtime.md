@@ -75,10 +75,17 @@ finishes accepted effects atomically and retries that persistence step only. A p
 rejected first lock retires its newly recorded seed because the original overwrite
 was never changed; a rejected repeated lock keeps the original recovery seed.
 
+`ChannelModerationRuntime::respond` now defers an ephemeral response before any
+SQL or channel HTTP, with a two-second acknowledgement deadline. A rejected or
+ambiguous defer admits no mutation. It edits the original response through the
+shared executor with mention suppression. Persistence failures produce a bounded
+reconciliation reply; edit failures never repeat an accepted effect. Five additional
+mock/isolated-DB regressions prove this lifecycle, bringing runtime acceptance to 15.
+The shared edit seam also validates IDs/content before sending.
+
 Remaining: startup composition, complete-set publication on READY and bounded async
-gateway dispatch. Defer an ephemeral response before REST/SQL waits, then edit through
-the shared executor; suppress mentions. Do not block the heartbeat/checkpoint loop.
-The current executor has no original-response edit method, so add that shared seam
-with mock coverage rather than a private client. Exercise both actual stores once
-the member slice merges. Then ship one PR, exact-head CI and independent Code Reviewer
-squash merge. No startup activation, PR review or merge is claimed yet.
+gateway dispatch without blocking heartbeat/checkpoint work. Automation catalogue
+loading is not yet integrated; never replace enabled custom commands with an empty
+partial publish set. Exercise both actual stores once the member slice merges.
+Then ship one PR, exact-head CI and independent Code Reviewer squash merge.
+No startup activation, PR review or merge is claimed yet.

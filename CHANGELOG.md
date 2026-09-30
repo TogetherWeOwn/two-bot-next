@@ -35,7 +35,9 @@
 - Register channel moderation adapters on the shared interaction router and execute
   purge, slowmode, lockdown and recorded-state unlock through the shared REST executor.
   Verify gates, exact overwrite recovery, durable retry exclusion and finalization-only
-  retries with mock REST and isolated PostgreSQL tests. Startup activation remains pending.
+  retries with mock REST and isolated PostgreSQL tests. Defer ephemerally before SQL/REST
+  work, then edit the original response through the shared executor without mentions
+  or effect retries. Startup activation remains pending.
 
 ### Fixed
 
