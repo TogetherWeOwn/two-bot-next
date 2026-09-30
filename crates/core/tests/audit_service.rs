@@ -386,7 +386,8 @@ async fn unreadable_history_defers_then_preserves_recovery_until_healthy() -> Te
         .unwrap()
         .search_before
         .is_none());
-    db.expire(&ev.entry_id).await?;
+    sqlx::query("UPDATE operational_audit_log SET delivery_deferred_until = clock_timestamp() - interval '1 second' WHERE entry_id = $1")
+        .bind(&ev.entry_id).execute(&db.pool).await?;
     mirror
         .post_script
         .lock()
