@@ -9,9 +9,11 @@ mod backup_cli;
 mod gateway;
 #[cfg(test)]
 mod gateway_tests;
+mod jobs;
 #[cfg(test)]
 mod lifecycle_tests;
 mod server;
+mod website_jobs;
 
 use std::sync::Arc;
 
@@ -22,7 +24,7 @@ use two_bot_core::{ComponentStatus, Config};
 use gateway::{
     build_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard, GatewayState,
 };
-use server::serve;
+use website_jobs::serve;
 
 #[tokio::main]
 async fn main() {
@@ -115,7 +117,7 @@ async fn main() {
         }
     };
 
-    let http = serve(&config.listen_addr, state);
+    let http = serve(&config, state);
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http).await,
         None => http.await,

@@ -18,6 +18,8 @@ two-bot-discord = { version = "0.2.0", path = "../discord" }
 two-bot-cutover = { version = "0.2.0", path = "../cutover" }
 futures-util = { workspace = true }
 serde = { workspace = true }
+rand = { workspace = true }
+time = { workspace = true }
 axum = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
 # exactly one provider feature enabled. Declared here (not on a lib) so the
@@ -34,4 +36,5 @@ twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }
