@@ -1,0 +1,3875 @@
+{
+  "version": 1,
+  "legacy_revision": "a8d9f53f6958d036a1f6fc34afcca70baa8e45a4",
+  "sources": {
+    "test/unit.automodmatcher.test.ts": [
+      70,
+      76,
+      77,
+      79,
+      83,
+      84,
+      85,
+      86,
+      101,
+      109,
+      138,
+      152,
+      155,
+      163,
+      164,
+      169,
+      174,
+      184,
+      185,
+      186,
+      187,
+      188,
+      198,
+      209,
+      210,
+      211,
+      212,
+      217,
+      223,
+      224,
+      225,
+      230,
+      235,
+      243,
+      244
+    ],
+    "test/unit.automod.test.ts": [
+      75,
+      76,
+      77,
+      78,
+      89,
+      90,
+      91,
+      92,
+      93,
+      122,
+      128,
+      129,
+      130,
+      131,
+      132,
+      164,
+      165,
+      166,
+      170,
+      171,
+      173,
+      174,
+      177,
+      178,
+      201,
+      212,
+      213,
+      238,
+      240,
+      241,
+      248,
+      249,
+      250,
+      251,
+      276,
+      308,
+      309,
+      330,
+      331,
+      332,
+      334,
+      335,
+      396,
+      401,
+      406,
+      407,
+      416,
+      419,
+      420,
+      421,
+      422,
+      476,
+      481,
+      486,
+      487,
+      488,
+      498,
+      499,
+      532,
+      533,
+      534,
+      535,
+      539,
+      566,
+      567,
+      568,
+      569,
+      591,
+      592,
+      593
+    ],
+    "test/unit.automodwiring.test.ts": [
+      127,
+      128,
+      129,
+      133,
+      134,
+      147,
+      196,
+      199,
+      203,
+      204,
+      209,
+      210,
+      211,
+      233,
+      234,
+      235,
+      247,
+      248
+    ]
+  },
+  "expanded_checks": 212,
+  "expanded_site_multiplicities": {
+    "test/unit.automodmatcher.test.ts": {
+      "70": 14,
+      "101": 8,
+      "109": 3,
+      "138": 21,
+      "152": 6,
+      "198": 5
+    },
+    "test/unit.automod.test.ts": {
+      "122": 22,
+      "396": 2,
+      "401": 2,
+      "406": 2,
+      "407": 2,
+      "416": 2,
+      "419": 2,
+      "420": 2,
+      "421": 2,
+      "422": 2,
+      "476": 2,
+      "481": 2,
+      "486": 2,
+      "487": 2,
+      "488": 2,
+      "498": 2,
+      "499": 2
+    },
+    "test/unit.automodwiring.test.ts": {
+      "147": 2
+    }
+  },
+  "cases": [
+    {
+      "id": "supplement-nfkc",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "spamword"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "ＳＰＡＭＷＯＲＤ",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "supplement-cyrillic-not-folded",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "spamword"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "spаmword",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "supplement-badword-boundary",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "spamword"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "spamwordish",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "supplement-spaced-badword",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "spamword"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "s p a m w o r d",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "supplement-invisible-badword",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "spamword"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "s​p‌am‍word",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "supplement-badword-before-invite",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "spamword"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "spamword https://discord.gg/fixture",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-bat",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.BAT"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-cmd",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.CMD"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-com",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.COM"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-exe",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.EXE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-js",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.JS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-jse",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.JSE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-msi",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.MSI"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-ps1",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.PS1"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-scr",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.SCR"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-vbs",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.VBS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-extension-wsf",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "attached",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.WSF"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-host-userinfo",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "allowed.example.com"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "https://allowed.example.com@denied.example.com",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "supplement-host-subdomain",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "allowed.example.com"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "https://sub.allowed.example.com",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "supplement-host-suffix",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "allowed.example.com"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "https://allowed.example.com.denied.example.com",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "supplement-host-query",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "allowed.example.com"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "https://allowed.example.com?q=denied.example.com",
+          "expected": "external_link"
+        },
+        {
+          "content": "https://allowed.example.com?q=harmless-text",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "supplement-host-idna",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "xn--vil-9la.gg"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "https://évil.gg",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "supplement-host-invalid",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "allowed.example.com"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "https://[invalid]",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "supplement-config-empty-words",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": ",   ,blocked phrase"
+      },
+      "kind": "policy",
+      "expected": {
+        "bad_words": [
+          "blocked phrase"
+        ]
+      }
+    },
+    {
+      "id": "supplement-first-timeout-sanction",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1",
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase",
+        "TWO_AUTOMOD_SANCTIONS": "1:timeout:600"
+      },
+      "kind": "sanction",
+      "count": 1,
+      "action": "timeout",
+      "timeout_seconds": 600
+    },
+    {
+      "id": "supplement-sanction-0",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_SANCTIONS": "1:delete,2:warn,3:timeout:600"
+      },
+      "kind": "sanction",
+      "count": 0,
+      "action": "delete",
+      "timeout_seconds": null
+    },
+    {
+      "id": "supplement-sanction-1",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_SANCTIONS": "1:delete,2:warn,3:timeout:600"
+      },
+      "kind": "sanction",
+      "count": 1,
+      "action": "delete",
+      "timeout_seconds": null
+    },
+    {
+      "id": "supplement-sanction-2",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_SANCTIONS": "1:delete,2:warn,3:timeout:600"
+      },
+      "kind": "sanction",
+      "count": 2,
+      "action": "warn",
+      "timeout_seconds": null
+    },
+    {
+      "id": "supplement-sanction-3",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_SANCTIONS": "1:delete,2:warn,3:timeout:600"
+      },
+      "kind": "sanction",
+      "count": 3,
+      "action": "timeout",
+      "timeout_seconds": 600
+    },
+    {
+      "id": "supplement-sanction-99",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_SANCTIONS": "1:delete,2:warn,3:timeout:600"
+      },
+      "kind": "sanction",
+      "count": 99,
+      "action": "timeout",
+      "timeout_seconds": 600
+    },
+    {
+      "id": "supplement-protection-owner",
+      "assertions": [],
+      "env": {},
+      "kind": "protection",
+      "target": {
+        "owner": true
+      },
+      "expected": "GuildOwner"
+    },
+    {
+      "id": "supplement-protection-owen",
+      "assertions": [],
+      "env": {},
+      "kind": "protection",
+      "target": {
+        "owen": true
+      },
+      "expected": "Owen"
+    },
+    {
+      "id": "supplement-protection-bot",
+      "assertions": [],
+      "env": {},
+      "kind": "protection",
+      "target": {
+        "bot": true
+      },
+      "expected": "Bot"
+    },
+    {
+      "id": "supplement-protection-staff",
+      "assertions": [],
+      "env": {},
+      "kind": "protection",
+      "target": {
+        "staff": true
+      },
+      "expected": "StaffRole"
+    },
+    {
+      "id": "supplement-protection-member",
+      "assertions": [],
+      "env": {},
+      "kind": "protection",
+      "target": {},
+      "expected": null
+    },
+    {
+      "id": "supplement-gates-default",
+      "assertions": [],
+      "env": {},
+      "kind": "config",
+      "enabled": false,
+      "dry_run": true
+    },
+    {
+      "id": "supplement-gates-dry-run",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD": "1"
+      },
+      "kind": "config",
+      "enabled": true,
+      "dry_run": true
+    },
+    {
+      "id": "supplement-gates-enforce",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1"
+      },
+      "kind": "config",
+      "enabled": true,
+      "dry_run": false
+    },
+    {
+      "id": "legacy-M-bad-whole-phrase",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#1"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "that was BLOCKED   PHRASE.",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-case",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#2"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "THAT WAS blocked phrase",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-nfkc",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#3"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "that was ｂｌｏｃｋｅｄ ｐｈｒａｓｅ",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-spaces",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#4"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "that was b l o c k e d p h r a s e",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-zero-width",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#5"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "that was blocked​phrase",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-punctuation",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#6"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "that was (blocked phrase!)",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-regex-literal",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#7"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "i love c++ lots",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-regex-miss",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#8"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "i love cxx lots",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-word-boundary",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#9"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "blocked phrases written",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-underscore",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#10"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "blocked_phrase news",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-substring",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#11"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "unblockedphrase thing",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-clean",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#12"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-empty",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#13"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-bad-whitespace",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:70#14"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "   ",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-empty-policy-clean",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:76"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "raw_bad_words": [
+        "",
+        "   ",
+        "blocked phrase"
+      ],
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-empty-policy-hit",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:77"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "raw_bad_words": [
+        "",
+        "   ",
+        "blocked phrase"
+      ],
+      "messages": [
+        {
+          "content": "that was blocked phrase",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-blank-policy",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:79"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "raw_bad_words": [
+        "",
+        "   "
+      ],
+      "messages": [
+        {
+          "content": "anything synthetic",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-mentions-0",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:83"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null,
+          "mentions": []
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-mentions-2",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:84"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null,
+          "mentions": [
+            "0",
+            "1"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-mentions-3",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:85"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": "mention_spam",
+          "mentions": [
+            "0",
+            "1",
+            "2"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-mentions-4",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:86"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": "mention_spam",
+          "mentions": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-1",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:101#1"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join https://discord.gg/fixture",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-2",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:101#2"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join http://discord.gg/fixture",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-3",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:101#3"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join discord.gg/fixture",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-4",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:101#4"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join www.discord.gg/fixture",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-5",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:101#5"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join https://discord.com/invite/fixture",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-6",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:101#6"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join https://discordapp.com/invite/fixture",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-7",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:101#7"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "JOIN HTTPS://DISCORD.GG/FIXTURE",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-8",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:101#8"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join discord​.gg/fixture",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-control-1",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:109#1"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-control-2",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:109#2"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "see https://discord.com/channels/fixture/fixture",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-invite-control-3",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:109#3"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "you are invited",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-exact",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#1"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read https://trusted.gg/rules",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-www",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#2"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read https://www.trusted.gg/rules",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-subdomain",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#3"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read https://foo.trusted.gg/rules",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-bare-allowed",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#4"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read trusted.gg/rules",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-angle",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#5"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read <https://trusted.gg/rules>",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-punct",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#6"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read https://trusted.gg/rules.",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-uppercase",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#7"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read HTTPS://WWW.TRUSTED.GG/RULES",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-external",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#8"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read https://outside.example.net/rules",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-www-outside",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#9"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read www.outside.example/path",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-bare-outside",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#10"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read outside.example.net/path",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-bare-sub",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#11"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read foo.outside.example.com/path",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-invisible",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#12"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read outside.example​.net/path",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-external-punct",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#13"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "see https://outside.example.net/rules.",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-email",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#14"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "email fixture@outside.example.net",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-stem",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#15"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "see config.dev please",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-nonstem",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#16"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "see outside.dev please",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-package",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#17"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "inspect package.json",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-source",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#18"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "inspect src/config.ts",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-readme",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#19"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "inspect README.md",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-tsconfig",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#20"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "inspect tsconfig.json",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-link-clean",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:138#21"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-attachment-1",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:152#1"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.EXE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-attachment-2",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:152#2"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.tar.exe"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-attachment-3",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:152#3"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null,
+          "attachments": [
+            "synthetic.png"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-attachment-4",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:152#4"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null,
+          "attachments": [
+            "README"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-attachment-5",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:152#5"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null,
+          "attachments": [
+            "synthetic."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-attachment-6",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:152#6"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null,
+          "attachments": []
+        }
+      ]
+    },
+    {
+      "id": "known-raw-leading-dot-policy",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:155"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "Legacy matcher strips leading dots from raw policy extensions. Next matcher requires normalized extensions; from_map strips dots but raw AutomodPolicy does not. Adapter normalization/parity is tracked on the runtime slice.",
+      "legacy_expected": {
+        "setup": {
+          "raw_policy": {
+            "blocked_attachment_extensions": [
+              ".exe"
+            ]
+          },
+          "attachments": [
+            "synthetic.exe"
+          ],
+          "next_core_expected": null
+        },
+        "checks": {
+          "test/unit.automodmatcher.test.ts:155": "attachment_type"
+        }
+      }
+    },
+    {
+      "id": "legacy-M-order-bad-before-invite",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:163"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "blocked phrase join https://discord.gg/fixture",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-order-invite-before-link",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:164"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join https://discord.gg/fixture see https://outside.example.net/y",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-order-link-before-attachment",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:169"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "see https://outside.example.net/y",
+          "expected": "external_link",
+          "attachments": [
+            "synthetic.exe"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-order-mentions-before-attachment",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:174"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": "mention_spam",
+          "mentions": [
+            "1",
+            "2",
+            "3"
+          ],
+          "attachments": [
+            "synthetic.exe"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-repeat-edit",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:184",
+        "test/unit.automodmatcher.test.ts:185",
+        "test/unit.automodmatcher.test.ts:186",
+        "test/unit.automodmatcher.test.ts:187",
+        "test/unit.automodmatcher.test.ts:188"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "repeat fixture",
+          "id": "1",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "different fixture",
+          "id": "1",
+          "at_ms": 1000500,
+          "expected": null
+        },
+        {
+          "content": "repeat fixture",
+          "id": "2",
+          "at_ms": 1001000,
+          "expected": null
+        },
+        {
+          "content": "repeat fixture",
+          "id": "3",
+          "at_ms": 1002000,
+          "expected": null
+        },
+        {
+          "content": "repeat fixture",
+          "id": "1",
+          "at_ms": 1003000,
+          "expected": "repeated_message"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-blank-repeat",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:198#1",
+        "test/unit.automodmatcher.test.ts:198#2",
+        "test/unit.automodmatcher.test.ts:198#3",
+        "test/unit.automodmatcher.test.ts:198#4",
+        "test/unit.automodmatcher.test.ts:198#5"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "   ",
+          "id": "e0",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "   ",
+          "id": "e1",
+          "at_ms": 1001000,
+          "expected": null
+        },
+        {
+          "content": "   ",
+          "id": "e2",
+          "at_ms": 1002000,
+          "expected": null
+        },
+        {
+          "content": "   ",
+          "id": "e3",
+          "at_ms": 1003000,
+          "expected": null
+        },
+        {
+          "content": "   ",
+          "id": "e4",
+          "at_ms": 1004000,
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-author-guild-isolation",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:209",
+        "test/unit.automodmatcher.test.ts:210",
+        "test/unit.automodmatcher.test.ts:211",
+        "test/unit.automodmatcher.test.ts:212",
+        "test/unit.automodmatcher.test.ts:217"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "same fixture",
+          "id": "a1",
+          "at_ms": 1000000,
+          "expected": null,
+          "author": "fixture-a"
+        },
+        {
+          "content": "same fixture",
+          "id": "b1",
+          "at_ms": 1001000,
+          "expected": null,
+          "author": "fixture-b"
+        },
+        {
+          "content": "same fixture",
+          "id": "b2",
+          "at_ms": 1002000,
+          "expected": null,
+          "author": "fixture-b"
+        },
+        {
+          "content": "same fixture",
+          "id": "b3",
+          "at_ms": 1003000,
+          "expected": "repeated_message",
+          "author": "fixture-b"
+        },
+        {
+          "content": "same fixture",
+          "id": "a2",
+          "at_ms": 1004000,
+          "expected": null,
+          "author": "fixture-a",
+          "guild": "other-fixture"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-window",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:223",
+        "test/unit.automodmatcher.test.ts:224",
+        "test/unit.automodmatcher.test.ts:225",
+        "test/unit.automodmatcher.test.ts:230",
+        "test/unit.automodmatcher.test.ts:235"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "window fixture",
+          "id": "w1",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "window fixture",
+          "id": "w2",
+          "at_ms": 1001000,
+          "expected": null
+        },
+        {
+          "content": "window fixture",
+          "id": "w3",
+          "at_ms": 1031000,
+          "expected": null
+        },
+        {
+          "content": "window fixture",
+          "id": "w4",
+          "at_ms": 1032000,
+          "expected": null
+        },
+        {
+          "content": "window fixture",
+          "id": "w5",
+          "at_ms": 1033000,
+          "expected": "repeated_message"
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-clean-default",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:243"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-M-clean-chat",
+      "assertions": [
+        "test/unit.automodmatcher.test.ts:244"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "hello fixture, practice soon",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-config-disabled",
+      "assertions": [
+        "test/unit.automod.test.ts:75"
+      ],
+      "env": {},
+      "kind": "config",
+      "enabled": false,
+      "dry_run": true
+    },
+    {
+      "id": "legacy-A-config-dry",
+      "assertions": [
+        "test/unit.automod.test.ts:76"
+      ],
+      "env": {
+        "TWO_AUTOMOD": "1"
+      },
+      "kind": "config",
+      "enabled": true,
+      "dry_run": true
+    },
+    {
+      "id": "legacy-A-config-enforce",
+      "assertions": [
+        "test/unit.automod.test.ts:77"
+      ],
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1"
+      },
+      "kind": "config",
+      "enabled": true,
+      "dry_run": false
+    },
+    {
+      "id": "legacy-A-config-custom",
+      "assertions": [
+        "test/unit.automod.test.ts:89"
+      ],
+      "env": {
+        "TWO_AUTOMOD": "1"
+      },
+      "kind": "config",
+      "enabled": true,
+      "dry_run": true
+    },
+    {
+      "id": "known-activation-fence",
+      "assertions": [
+        "test/unit.automod.test.ts:78"
+      ],
+      "env": {
+        "TWO_AUTOMOD": "1"
+      },
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10261",
+      "reason": "AutomodConfig is a pure gate reader and carries no guild/token identity. The boot activation fence belongs to the runtime adapter, not this core fixture.",
+      "legacy_expected": {
+        "setup": {
+          "enabled": true,
+          "guild": "synthetic-unapproved",
+          "bot": "synthetic-approved-bot",
+          "permitted_pair": {
+            "guild": "synthetic-approved-guild",
+            "bot": "synthetic-approved-bot"
+          }
+        },
+        "checks": {
+          "test/unit.automod.test.ts:78": "activation outside the permitted guild/bot pair throws allowlist refused automod"
+        }
+      }
+    },
+    {
+      "id": "legacy-A-config-words",
+      "assertions": [
+        "test/unit.automod.test.ts:90"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "one,two"
+      },
+      "kind": "policy",
+      "expected": {
+        "bad_words": [
+          "one",
+          "two"
+        ]
+      }
+    },
+    {
+      "id": "legacy-A-config-ladder",
+      "assertions": [
+        "test/unit.automod.test.ts:91"
+      ],
+      "env": {
+        "TWO_AUTOMOD_SANCTIONS": "1:delete,2:warn,4:timeout:900"
+      },
+      "kind": "policy",
+      "expected": {
+        "sanctions": [
+          {
+            "violations": 1,
+            "action": "delete",
+            "timeout_seconds": null
+          },
+          {
+            "violations": 2,
+            "action": "warn",
+            "timeout_seconds": null
+          },
+          {
+            "violations": 4,
+            "action": "timeout",
+            "timeout_seconds": 900
+          }
+        ]
+      }
+    },
+    {
+      "id": "legacy-A-invalid-action",
+      "assertions": [
+        "test/unit.automod.test.ts:92"
+      ],
+      "env": {
+        "TWO_AUTOMOD_SANCTIONS": "1:ban"
+      },
+      "kind": "config_error",
+      "contains": "actions must be"
+    },
+    {
+      "id": "legacy-A-invalid-first-rung",
+      "assertions": [
+        "test/unit.automod.test.ts:93"
+      ],
+      "env": {
+        "TWO_AUTOMOD_SANCTIONS": "2:timeout:600"
+      },
+      "kind": "config_error",
+      "contains": "must start at violation 1"
+    },
+    {
+      "id": "legacy-A-filter-1-phrase",
+      "assertions": [
+        "test/unit.automod.test.ts:122#1"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "that was BLOCKED   PHRASE.",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-2-invisible",
+      "assertions": [
+        "test/unit.automod.test.ts:122#2"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "that was blocked​phrase",
+          "expected": "bad_words"
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-3-boundary",
+      "assertions": [
+        "test/unit.automod.test.ts:122#3"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "blocked phrases written",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-4-duplicates",
+      "assertions": [
+        "test/unit.automod.test.ts:122#4"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": "mention_spam",
+          "mentions": [
+            "1",
+            "1",
+            "1"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-5-invite",
+      "assertions": [
+        "test/unit.automod.test.ts:122#5"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join https://discord.gg/fixture",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-6-invisible-invite",
+      "assertions": [
+        "test/unit.automod.test.ts:122#6"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "join discord​.gg/fixture",
+          "expected": "invite_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-7-www",
+      "assertions": [
+        "test/unit.automod.test.ts:122#7"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read https://www.trusted.gg/rules",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-8-bare-allowed",
+      "assertions": [
+        "test/unit.automod.test.ts:122#8"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read trusted.gg/rules",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-9-angle",
+      "assertions": [
+        "test/unit.automod.test.ts:122#9"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read <https://trusted.gg/rules>",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-10-punct",
+      "assertions": [
+        "test/unit.automod.test.ts:122#10"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read https://trusted.gg/rules.",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-11-email",
+      "assertions": [
+        "test/unit.automod.test.ts:122#11"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "email fixture@outside.example.net",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-12-external",
+      "assertions": [
+        "test/unit.automod.test.ts:122#12"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read https://outside.example.net/rules",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-13-www-outside",
+      "assertions": [
+        "test/unit.automod.test.ts:122#13"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read www.outside.example/path",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-14-bare-outside",
+      "assertions": [
+        "test/unit.automod.test.ts:122#14"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read outside.example.net/path",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-15-bare-sub",
+      "assertions": [
+        "test/unit.automod.test.ts:122#15"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read foo.outside.example.com/path",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-16-invisible",
+      "assertions": [
+        "test/unit.automod.test.ts:122#16"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "read outside.example​.net/path",
+          "expected": "external_link"
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-17-package",
+      "assertions": [
+        "test/unit.automod.test.ts:122#17"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "inspect package.json",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-18-source",
+      "assertions": [
+        "test/unit.automod.test.ts:122#18"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "inspect src/config.ts",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-19-readme",
+      "assertions": [
+        "test/unit.automod.test.ts:122#19"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "inspect README.md",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-20-tsconfig",
+      "assertions": [
+        "test/unit.automod.test.ts:122#20"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "inspect tsconfig.json",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-21-attachment",
+      "assertions": [
+        "test/unit.automod.test.ts:122#21"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.EXE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-filter-22-safe-attachment",
+      "assertions": [
+        "test/unit.automod.test.ts:122#22"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null,
+          "attachments": [
+            "synthetic.png"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy-A-repeat-edit",
+      "assertions": [
+        "test/unit.automod.test.ts:128",
+        "test/unit.automod.test.ts:129",
+        "test/unit.automod.test.ts:130",
+        "test/unit.automod.test.ts:131",
+        "test/unit.automod.test.ts:132"
+      ],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "repeat fixture",
+          "id": "1",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "different fixture",
+          "id": "1",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "repeat fixture",
+          "id": "2",
+          "at_ms": 1001000,
+          "expected": null
+        },
+        {
+          "content": "repeat fixture",
+          "id": "3",
+          "at_ms": 1002000,
+          "expected": null
+        },
+        {
+          "content": "repeat fixture",
+          "id": "1",
+          "at_ms": 1003000,
+          "expected": "repeated_message"
+        }
+      ]
+    },
+    {
+      "id": "known-service-ladder",
+      "assertions": [
+        "test/unit.automod.test.ts:164",
+        "test/unit.automod.test.ts:165",
+        "test/unit.automod.test.ts:166",
+        "test/unit.automod.test.ts:170",
+        "test/unit.automod.test.ts:171",
+        "test/unit.automod.test.ts:173",
+        "test/unit.automod.test.ts:174",
+        "test/unit.automod.test.ts:177",
+        "test/unit.automod.test.ts:178"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "messages": [
+            "m1",
+            "m2",
+            "m3",
+            "m3-replay"
+          ],
+          "content": "blocked phrase",
+          "mode": "enforce",
+          "target": "ordinary",
+          "174": "all audit metadata omits content"
+        },
+        "checks": {
+          "test/unit.automod.test.ts:164": [
+            "delete",
+            "warn",
+            "timeout"
+          ],
+          "test/unit.automod.test.ts:165": [
+            "delete:m1",
+            "delete:m2",
+            "delete:m3"
+          ],
+          "test/unit.automod.test.ts:166": "timeout:fixture-author:[two-audit:v1:<32hex>:moderation.timeout:fixture-owen:<16hex>] Automod bad words; violation 3",
+          "test/unit.automod.test.ts:170": 1,
+          "test/unit.automod.test.ts:171": 5,
+          "test/unit.automod.test.ts:173": 3,
+          "test/unit.automod.test.ts:174": true,
+          "test/unit.automod.test.ts:177": true,
+          "test/unit.automod.test.ts:178": 4
+        }
+      }
+    },
+    {
+      "id": "known-dry-run-ledger",
+      "assertions": [
+        "test/unit.automod.test.ts:201",
+        "test/unit.automod.test.ts:212",
+        "test/unit.automod.test.ts:213"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "mode_sequence": [
+            "dry-run",
+            "dry-run",
+            "enforce"
+          ],
+          "ids": [
+            "same-message",
+            "dry-2",
+            "same-message"
+          ],
+          "target_resolution_in_dry_run": "must not happen"
+        },
+        "checks": {
+          "test/unit.automod.test.ts:201": 0,
+          "test/unit.automod.test.ts:212": "delete",
+          "test/unit.automod.test.ts:213": [
+            "delete:same-message"
+          ]
+        }
+      }
+    },
+    {
+      "id": "known-delete-refusal-retry",
+      "assertions": [
+        "test/unit.automod.test.ts:238",
+        "test/unit.automod.test.ts:240",
+        "test/unit.automod.test.ts:241"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "delete_outcomes": [
+            "definite 403",
+            "success"
+          ],
+          "same_id": true
+        },
+        "checks": {
+          "test/unit.automod.test.ts:238": "Discord refused",
+          "test/unit.automod.test.ts:240": true,
+          "test/unit.automod.test.ts:241": 2
+        }
+      }
+    },
+    {
+      "id": "known-delayed-store-retry",
+      "assertions": [
+        "test/unit.automod.test.ts:248",
+        "test/unit.automod.test.ts:249",
+        "test/unit.automod.test.ts:250",
+        "test/unit.automod.test.ts:251"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "record_violation_ids": [
+            "m1",
+            "m2",
+            "m1"
+          ]
+        },
+        "checks": {
+          "test/unit.automod.test.ts:248": 1,
+          "test/unit.automod.test.ts:249": 2,
+          "test/unit.automod.test.ts:250": 2,
+          "test/unit.automod.test.ts:251": 2
+        }
+      }
+    },
+    {
+      "id": "known-inflight-duplicate",
+      "assertions": [
+        "test/unit.automod.test.ts:276"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "preclaimed": true,
+          "filter": "bad_words"
+        },
+        "checks": {
+          "test/unit.automod.test.ts:276": {
+            "error": "AutomodProcessingError",
+            "matched": true
+          }
+        }
+      }
+    },
+    {
+      "id": "known-postmutation-completion-failure",
+      "assertions": [
+        "test/unit.automod.test.ts:308",
+        "test/unit.automod.test.ts:309"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "delete": "success",
+          "outer_completion": "fails",
+          "retry_same_id": true
+        },
+        "checks": {
+          "test/unit.automod.test.ts:308": "completion unavailable",
+          "test/unit.automod.test.ts:309": "uncertain outcome"
+        }
+      }
+    },
+    {
+      "id": "known-exempt-and-dry-run-effects",
+      "assertions": [
+        "test/unit.automod.test.ts:330",
+        "test/unit.automod.test.ts:331",
+        "test/unit.automod.test.ts:332",
+        "test/unit.automod.test.ts:334",
+        "test/unit.automod.test.ts:335"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "first_three_inputs": [
+            "bypass-role",
+            "exempt-channel",
+            "bot"
+          ],
+          "fourth_input": "ordinary dry-run match",
+          "all_content": "blocked phrase"
+        },
+        "checks": {
+          "test/unit.automod.test.ts:330": false,
+          "test/unit.automod.test.ts:331": false,
+          "test/unit.automod.test.ts:332": false,
+          "test/unit.automod.test.ts:334": {
+            "matched": true,
+            "deleted": false,
+            "filter": "bad_words",
+            "sanction": "delete"
+          },
+          "test/unit.automod.test.ts:335": 0
+        }
+      }
+    },
+    {
+      "id": "known-refusal-staff",
+      "assertions": [
+        "test/unit.automod.test.ts:396#1",
+        "test/unit.automod.test.ts:401#1",
+        "test/unit.automod.test.ts:406#1",
+        "test/unit.automod.test.ts:407#1",
+        "test/unit.automod.test.ts:416#1",
+        "test/unit.automod.test.ts:419#1",
+        "test/unit.automod.test.ts:420#1",
+        "test/unit.automod.test.ts:421#1",
+        "test/unit.automod.test.ts:422#1"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "target": "staff",
+          "ladder": "1:timeout:600",
+          "416": "audit omits content",
+          "replay_same_id": true
+        },
+        "checks": {
+          "test/unit.automod.test.ts:396#1": {
+            "matched": true,
+            "deleted": false,
+            "filter": "bad_words",
+            "sanction": "timeout"
+          },
+          "test/unit.automod.test.ts:401#1": [],
+          "test/unit.automod.test.ts:406#1": "refused",
+          "test/unit.automod.test.ts:407#1": {
+            "message_id": "refused-target_staff_role",
+            "filter": "bad_words",
+            "violation_count": 1,
+            "sanction": "timeout",
+            "timeout_seconds": 600,
+            "dry_run": false,
+            "refusal_reason": "target_staff_role"
+          },
+          "test/unit.automod.test.ts:416#1": true,
+          "test/unit.automod.test.ts:419#1": true,
+          "test/unit.automod.test.ts:420#1": [],
+          "test/unit.automod.test.ts:421#1": 1,
+          "test/unit.automod.test.ts:422#1": 1
+        }
+      }
+    },
+    {
+      "id": "known-refusal-hierarchy",
+      "assertions": [
+        "test/unit.automod.test.ts:396#2",
+        "test/unit.automod.test.ts:401#2",
+        "test/unit.automod.test.ts:406#2",
+        "test/unit.automod.test.ts:407#2",
+        "test/unit.automod.test.ts:416#2",
+        "test/unit.automod.test.ts:419#2",
+        "test/unit.automod.test.ts:420#2",
+        "test/unit.automod.test.ts:421#2",
+        "test/unit.automod.test.ts:422#2"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "target": {
+            "user_id": "fixture-author",
+            "role_ids": [],
+            "highest_role_position": 10,
+            "is_bot": false,
+            "is_guild_owner": false
+          },
+          "bot_highest_role_position": 10,
+          "moderation_policy": {
+            "owen_user_id": "fixture-owen",
+            "bot_user_id": "fixture-owen",
+            "protected_role_ids": []
+          },
+          "dry_run": false,
+          "ladder": "1:timeout:600",
+          "416": "audit omits content",
+          "replay_same_id": true
+        },
+        "checks": {
+          "test/unit.automod.test.ts:396#2": {
+            "matched": true,
+            "deleted": true,
+            "filter": "bad_words",
+            "sanction": "timeout"
+          },
+          "test/unit.automod.test.ts:401#2": [
+            "delete:refused-actor_hierarchy"
+          ],
+          "test/unit.automod.test.ts:406#2": "refused",
+          "test/unit.automod.test.ts:407#2": {
+            "message_id": "refused-actor_hierarchy",
+            "filter": "bad_words",
+            "violation_count": 1,
+            "sanction": "timeout",
+            "timeout_seconds": 600,
+            "dry_run": false,
+            "refusal_reason": "actor_hierarchy"
+          },
+          "test/unit.automod.test.ts:416#2": true,
+          "test/unit.automod.test.ts:419#2": true,
+          "test/unit.automod.test.ts:420#2": [
+            "delete:refused-actor_hierarchy"
+          ],
+          "test/unit.automod.test.ts:421#2": 1,
+          "test/unit.automod.test.ts:422#2": 1
+        }
+      }
+    },
+    {
+      "id": "known-protection-before-delete-owner",
+      "assertions": [
+        "test/unit.automod.test.ts:476#1",
+        "test/unit.automod.test.ts:481#1",
+        "test/unit.automod.test.ts:486#1",
+        "test/unit.automod.test.ts:487#1",
+        "test/unit.automod.test.ts:488#1",
+        "test/unit.automod.test.ts:498#1",
+        "test/unit.automod.test.ts:499#1"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "target": "owner",
+          "ladder": "1:delete,2:warn,3:timeout:600",
+          "replay_same_id": true
+        },
+        "checks": {
+          "test/unit.automod.test.ts:476#1": {
+            "matched": true,
+            "deleted": false,
+            "filter": "bad_words",
+            "sanction": "delete"
+          },
+          "test/unit.automod.test.ts:481#1": [],
+          "test/unit.automod.test.ts:486#1": 1,
+          "test/unit.automod.test.ts:487#1": "refused",
+          "test/unit.automod.test.ts:488#1": {
+            "message_id": "protected-target_guild_owner",
+            "filter": "bad_words",
+            "violation_count": 1,
+            "sanction": "delete",
+            "dry_run": false,
+            "refusal_reason": "target_guild_owner"
+          },
+          "test/unit.automod.test.ts:498#1": true,
+          "test/unit.automod.test.ts:499#1": []
+        }
+      }
+    },
+    {
+      "id": "known-protection-before-delete-staff",
+      "assertions": [
+        "test/unit.automod.test.ts:476#2",
+        "test/unit.automod.test.ts:481#2",
+        "test/unit.automod.test.ts:486#2",
+        "test/unit.automod.test.ts:487#2",
+        "test/unit.automod.test.ts:488#2",
+        "test/unit.automod.test.ts:498#2",
+        "test/unit.automod.test.ts:499#2"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "target": "staff",
+          "ladder": "1:delete,2:warn,3:timeout:600",
+          "replay_same_id": true
+        },
+        "checks": {
+          "test/unit.automod.test.ts:476#2": {
+            "matched": true,
+            "deleted": false,
+            "filter": "bad_words",
+            "sanction": "delete"
+          },
+          "test/unit.automod.test.ts:481#2": [],
+          "test/unit.automod.test.ts:486#2": 1,
+          "test/unit.automod.test.ts:487#2": "refused",
+          "test/unit.automod.test.ts:488#2": {
+            "message_id": "protected-target_staff_role",
+            "filter": "bad_words",
+            "violation_count": 1,
+            "sanction": "delete",
+            "dry_run": false,
+            "refusal_reason": "target_staff_role"
+          },
+          "test/unit.automod.test.ts:498#2": true,
+          "test/unit.automod.test.ts:499#2": []
+        }
+      }
+    },
+    {
+      "id": "known-unprotected-complete-ladder",
+      "assertions": [
+        "test/unit.automod.test.ts:532",
+        "test/unit.automod.test.ts:533",
+        "test/unit.automod.test.ts:534",
+        "test/unit.automod.test.ts:535",
+        "test/unit.automod.test.ts:539"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "target": {
+            "user_id": "fixture-author",
+            "role_ids": [],
+            "highest_role_position": 1,
+            "is_bot": false,
+            "is_guild_owner": false
+          },
+          "moderation_policy": {
+            "owen_user_id": "fixture-owen",
+            "bot_user_id": "fixture-owen",
+            "protected_role_ids": [
+              "fixture-staff"
+            ]
+          },
+          "bot_highest_role_position": 10,
+          "dry_run": false,
+          "message_content": "blocked phrase",
+          "ladder": "1:delete,2:warn,3:timeout:600",
+          "distinct_messages": 3
+        },
+        "checks": {
+          "test/unit.automod.test.ts:532": [
+            "delete",
+            "warn",
+            "timeout"
+          ],
+          "test/unit.automod.test.ts:533": [
+            true,
+            true,
+            true
+          ],
+          "test/unit.automod.test.ts:534": [
+            "delete:plain-1",
+            "delete:plain-2",
+            "delete:plain-3"
+          ],
+          "test/unit.automod.test.ts:535": "timeout:fixture-author",
+          "test/unit.automod.test.ts:539": [
+            "deleted",
+            "warn",
+            "timeout"
+          ]
+        }
+      }
+    },
+    {
+      "id": "known-resolver-refusal",
+      "assertions": [
+        "test/unit.automod.test.ts:566",
+        "test/unit.automod.test.ts:567",
+        "test/unit.automod.test.ts:568",
+        "test/unit.automod.test.ts:569"
+      ],
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1",
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase",
+        "TWO_AUTOMOD_SANCTIONS": "1:timeout:600"
+      },
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "dry_run": false,
+          "message_id": "unexpected-resolver",
+          "message_content": "blocked phrase",
+          "ladder": "1:timeout:600",
+          "target_resolution": {
+            "error_code": "action_not_allowed",
+            "message": "Unexpected resolver refusal",
+            "log_reason": "unexpected_resolver_refusal"
+          },
+          "same_id_retry": "released for retry"
+        },
+        "checks": {
+          "test/unit.automod.test.ts:566": "Unexpected resolver refusal",
+          "test/unit.automod.test.ts:567": "Unexpected resolver refusal",
+          "test/unit.automod.test.ts:568": [],
+          "test/unit.automod.test.ts:569": 0
+        }
+      }
+    },
+    {
+      "id": "known-sanction-transport-failure",
+      "assertions": [
+        "test/unit.automod.test.ts:591",
+        "test/unit.automod.test.ts:592",
+        "test/unit.automod.test.ts:593"
+      ],
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1",
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase",
+        "TWO_AUTOMOD_SANCTIONS": "1:timeout:600"
+      },
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10089",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "dry_run": false,
+          "message": {
+            "guild_id": "fixture-guild",
+            "channel_id": "fixture-channel",
+            "message_id": "unexpected-sanction",
+            "author_id": "fixture-author",
+            "content": "blocked phrase"
+          },
+          "target": {
+            "user_id": "fixture-author",
+            "role_ids": [],
+            "highest_role_position": 1,
+            "is_bot": false,
+            "is_guild_owner": false
+          },
+          "moderation_policy": {
+            "owen_user_id": "fixture-owen",
+            "bot_user_id": "fixture-owen",
+            "protected_role_ids": []
+          },
+          "bot_highest_role_position": 10,
+          "sanctions": [
+            {
+              "violations": 1,
+              "action": "timeout",
+              "timeout_seconds": 600
+            }
+          ],
+          "delete": "success",
+          "timeout": "uncertain failure",
+          "retry_same_id": true
+        },
+        "checks": {
+          "test/unit.automod.test.ts:591": "timeout transport failed",
+          "test/unit.automod.test.ts:592": "uncertain outcome",
+          "test/unit.automod.test.ts:593": 0
+        }
+      }
+    },
+    {
+      "id": "known-gateway-create-routing",
+      "assertions": [
+        "test/unit.automodwiring.test.ts:127",
+        "test/unit.automodwiring.test.ts:128",
+        "test/unit.automodwiring.test.ts:129",
+        "test/unit.automodwiring.test.ts:133",
+        "test/unit.automodwiring.test.ts:134"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10261",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "message_create": [
+            "blocked-1",
+            "allowed-1"
+          ]
+        },
+        "checks": {
+          "test/unit.automodwiring.test.ts:127": [
+            "blocked-1:blocked"
+          ],
+          "test/unit.automodwiring.test.ts:128": 0,
+          "test/unit.automodwiring.test.ts:129": [],
+          "test/unit.automodwiring.test.ts:133": 1,
+          "test/unit.automodwiring.test.ts:134": [
+            "allowed-1"
+          ]
+        }
+      }
+    },
+    {
+      "id": "known-gateway-storage-failure-claim",
+      "assertions": [
+        "test/unit.automodwiring.test.ts:147#1"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10261",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "failure": "claim",
+          "message": "blocked"
+        },
+        "checks": {
+          "test/unit.automodwiring.test.ts:147#1": 0
+        }
+      }
+    },
+    {
+      "id": "known-gateway-storage-failure-release",
+      "assertions": [
+        "test/unit.automodwiring.test.ts:147#2"
+      ],
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1",
+        "TWO_AUTOMOD_BAD_WORDS": "blocked",
+        "TWO_AUTOMOD_SANCTIONS": "1:delete",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10261",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "failure": "release",
+          "dry_run": false,
+          "automod_guild_id": "fixture-guild",
+          "owen_user_id": "fixture-owen",
+          "bot_highest_role_position": 10,
+          "policy": {
+            "bad_words": [
+              "blocked"
+            ],
+            "blocked_attachment_extensions": [],
+            "allowed_domains": [],
+            "repeated_message_count": 3,
+            "repeated_message_window_seconds": 30,
+            "mention_limit": 3,
+            "bypass_role_ids": [],
+            "exempt_channel_ids": [],
+            "sanctions": [
+              {
+                "violations": 1,
+                "action": "delete"
+              }
+            ]
+          },
+          "message": {
+            "guild_id": "fixture-guild",
+            "channel_id": "fixture-channel",
+            "message_id": "release-failure",
+            "author_id": "fixture-author",
+            "author_is_bot": false,
+            "role_ids": [
+              "fixture-member-role"
+            ],
+            "content": "blocked",
+            "mentioned_user_ids": [],
+            "attachment_names": []
+          },
+          "target": {
+            "user_id": "fixture-author",
+            "role_ids": [],
+            "highest_role_position": 1,
+            "is_bot": false,
+            "is_guild_owner": false
+          },
+          "target_protection": null,
+          "claim": {
+            "state": "claimed"
+          },
+          "delete": {
+            "error_code": "discord_rejected",
+            "http_status": 403,
+            "outcome": "definite refusal"
+          },
+          "release": {
+            "error": "release unavailable"
+          },
+          "operation_order": [
+            "claim successfully",
+            "delete refuses with 403",
+            "release throws"
+          ]
+        },
+        "checks": {
+          "test/unit.automodwiring.test.ts:147#2": 0
+        }
+      }
+    },
+    {
+      "id": "known-gateway-protected-refusal",
+      "assertions": [
+        "test/unit.automodwiring.test.ts:196",
+        "test/unit.automodwiring.test.ts:199",
+        "test/unit.automodwiring.test.ts:203",
+        "test/unit.automodwiring.test.ts:204",
+        "test/unit.automodwiring.test.ts:209",
+        "test/unit.automodwiring.test.ts:210",
+        "test/unit.automodwiring.test.ts:211"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10261",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "target": "protected staff",
+          "first_rung": "timeout:600",
+          "same_id_replay": true
+        },
+        "checks": {
+          "test/unit.automodwiring.test.ts:196": 0,
+          "test/unit.automodwiring.test.ts:199": [],
+          "test/unit.automodwiring.test.ts:203": "refused",
+          "test/unit.automodwiring.test.ts:204": "target_staff_role",
+          "test/unit.automodwiring.test.ts:209": 0,
+          "test/unit.automodwiring.test.ts:210": [],
+          "test/unit.automodwiring.test.ts:211": 1
+        }
+      }
+    },
+    {
+      "id": "known-gateway-edits",
+      "assertions": [
+        "test/unit.automodwiring.test.ts:233",
+        "test/unit.automodwiring.test.ts:234",
+        "test/unit.automodwiring.test.ts:235"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10261",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "clock_ms": 2000,
+          "events": [
+            {
+              "type": "cached edit",
+              "old_message": {
+                "id": "edited-1",
+                "content": "allowed"
+              },
+              "message": {
+                "id": "edited-1",
+                "content": "blocked",
+                "partial": false
+              }
+            },
+            {
+              "type": "fetched partial edit",
+              "old_message": null,
+              "message": {
+                "id": "edited-2",
+                "content": "blocked",
+                "partial": true
+              },
+              "fetch_result": {
+                "id": "edited-2",
+                "content": "blocked",
+                "partial": false
+              }
+            }
+          ]
+        },
+        "checks": {
+          "test/unit.automodwiring.test.ts:233": [
+            "edited-1:blocked",
+            "edited-2:blocked"
+          ],
+          "test/unit.automodwiring.test.ts:234": [
+            2000,
+            2000
+          ],
+          "test/unit.automodwiring.test.ts:235": 0
+        }
+      }
+    },
+    {
+      "id": "known-gateway-other-guild",
+      "assertions": [
+        "test/unit.automodwiring.test.ts:247",
+        "test/unit.automodwiring.test.ts:248"
+      ],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10261",
+      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "legacy_expected": {
+        "setup": {
+          "guild": "other-fixture",
+          "content": "blocked"
+        },
+        "checks": {
+          "test/unit.automodwiring.test.ts:247": [],
+          "test/unit.automodwiring.test.ts:248": 1
+        }
+      }
+    },
+    {
+      "id": "supplement-exemption-role",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BYPASS_ROLE_IDS": "111111111111111111",
+        "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS": "222222222222222222"
+      },
+      "kind": "exempt",
+      "bot": false,
+      "channel": "fixture-channel",
+      "roles": [
+        "111111111111111111"
+      ],
+      "expected": true
+    },
+    {
+      "id": "supplement-exemption-channel",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BYPASS_ROLE_IDS": "111111111111111111",
+        "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS": "222222222222222222"
+      },
+      "kind": "exempt",
+      "bot": false,
+      "channel": "222222222222222222",
+      "roles": [],
+      "expected": true
+    },
+    {
+      "id": "supplement-exemption-bot",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BYPASS_ROLE_IDS": "111111111111111111",
+        "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS": "222222222222222222"
+      },
+      "kind": "exempt",
+      "bot": true,
+      "channel": "fixture-channel",
+      "roles": [],
+      "expected": true
+    },
+    {
+      "id": "supplement-leading-dot-config",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": ".exe"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": "attachment_type",
+          "attachments": [
+            "synthetic.exe"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "supplement-repeat-inclusive-cutoff",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "boundary fixture",
+          "id": "b1",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "boundary fixture",
+          "id": "b2",
+          "at_ms": 1001000,
+          "expected": null
+        },
+        {
+          "content": "boundary fixture",
+          "id": "b3",
+          "at_ms": 1030000,
+          "expected": "repeated_message"
+        }
+      ]
+    },
+    {
+      "id": "supplement-repeat-normalization",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "ＮＦＫＣ fixture",
+          "id": "n1",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": " nfkc   fixture ",
+          "id": "n2",
+          "at_ms": 1001000,
+          "expected": null
+        },
+        {
+          "content": "NFKC fixture",
+          "id": "n3",
+          "at_ms": 1002000,
+          "expected": "repeated_message"
+        }
+      ]
+    },
+    {
+      "id": "staging-default-mentions-4",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": null,
+          "mentions": [
+            "fixture-user",
+            "fixture-user",
+            "fixture-user",
+            "fixture-user"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "staging-default-mentions-5",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic greeting",
+          "expected": "mention_spam",
+          "mentions": [
+            "fixture-user",
+            "fixture-user",
+            "fixture-user",
+            "fixture-user",
+            "fixture-user"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "staging-implicit-reply-not-explicit",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "synthetic reply",
+          "expected": null,
+          "mentions": []
+        }
+      ]
+    },
+    {
+      "id": "staging-plain-discord",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "plain discord",
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "staging-ordinary-not-exempt",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BYPASS_ROLE_IDS": "111111111111111111",
+        "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS": "222222222222222222"
+      },
+      "kind": "exempt",
+      "bot": false,
+      "channel": "fixture-general",
+      "roles": [],
+      "expected": false
+    },
+    {
+      "id": "staging-edit-classification",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase,c++",
+        "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
+        "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
+        "TWO_AUTOMOD_MENTION_LIMIT": "3"
+      },
+      "kind": "match",
+      "messages": [
+        {
+          "content": "ordinary fixture",
+          "id": "edit-fixture",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "blocked phrase",
+          "id": "edit-fixture",
+          "at_ms": 1001000,
+          "expected": "bad_words"
+        },
+        {
+          "content": "ordinary fixture",
+          "id": "edit-fixture",
+          "at_ms": 1002000,
+          "expected": null
+        }
+      ]
+    },
+    {
+      "id": "known-native-discord-rule",
+      "assertions": [],
+      "env": {},
+      "kind": "deferred",
+      "issue": "/TOG/issues/TOG-10261",
+      "reason": "Native Discord mention-raid detection is not the custom matcher. Preserve the scrubbed export structurally; this fixture does not execute Discord native rules.",
+      "legacy_expected": {
+        "rules": [
+          {
+            "id": "333333333333333333",
+            "guild_id": "444444444444444444",
+            "creator_id": "555555555555555555",
+            "name": "Synthetic mention-spam fixture",
+            "event_type": 1,
+            "actions": [
+              {
+                "type": 1,
+                "metadata": {}
+              }
+            ],
+            "trigger_type": 5,
+            "enabled": true,
+            "exempt_roles": [],
+            "exempt_channels": [],
+            "trigger_metadata": {
+              "mention_total_limit": 20,
+              "mention_raid_protection_enabled": true
+            }
+          }
+        ],
+        "action": "block"
+      }
+    }
+  ]
+}
