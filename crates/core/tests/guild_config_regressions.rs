@@ -755,13 +755,33 @@ async fn ordered_new_role_category_channel_settings_and_emoji_dependencies_resol
     let ids = apply_restore_plan(&mut fake.api, &plan).await.unwrap();
     assert_eq!(fake.api.writes as usize, plan.operations.len());
     let state = fake.state.lock().unwrap();
+    // The overwrite repair is the PATCH carrying permission_overwrites: the
+    // category/channel creates now also carry the key (private at create,
+    // TOG-9970 finding 1), so select by method, not mere key presence.
     let overwrite = state
         .writes
         .iter()
-        .find(|(_, _, body)| body.get("permission_overwrites").is_some())
+        .find(|(method, _, body)| method == "PATCH" && body.get("permission_overwrites").is_some())
         .unwrap();
     assert_eq!(
         overwrite.2["permission_overwrites"][0]["id"],
+        ids.roles["r1"]
+    );
+    // Finding 1 pin: the channel create itself already restricts to the
+    // saved overwrite set (resolved to the created role id), so the
+    // channel is never initially public with a later repair.
+    let created_alpha = state
+        .writes
+        .iter()
+        .find(|(method, path, body)| {
+            method == "POST"
+                && path == "/guilds/g/channels"
+                && body.get("name").and_then(Value::as_str) == Some("alpha")
+        })
+        .map(|(_, _, body)| body)
+        .unwrap();
+    assert_eq!(
+        created_alpha["permission_overwrites"][0]["id"],
         ids.roles["r1"]
     );
     assert_eq!(
