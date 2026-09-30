@@ -6,6 +6,7 @@
 
 - Port the guild-settings catalogue, 15-second poll contract, cache, sqlx store, and migration to Rust. Runtime ticker and interaction integration remain follow-up work.
 - Run isolated settings persistence and concurrency regressions against a disposable Postgres CI service without credentials.
+- RSVP domain logic and database store for going, interested and declined responses, namespaced attendance totals, and ManageEvents-gated host check-in facts, with legacy-compatible tables and replies.
 
 ### Fixed
 
@@ -13,3 +14,5 @@
 - Serialize settings reads, writes, and audits, including concurrent inserts into absent keys; load cache rows and revision from one consistent database snapshot.
 - Refuse environment-only and unknown settings through the cache getter as well as environment snapshots.
 - Enforce append-only settings audit data for updates, deletes, and truncation.
+- Serialize concurrent first RSVP responses before reading the previous status, including when no response row exists yet.
+- Fail configured RSVP database-test setup errors instead of silently skipping, and isolate each test invocation in its own schema.
