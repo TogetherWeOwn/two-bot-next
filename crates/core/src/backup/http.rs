@@ -21,37 +21,54 @@ use hyper_util::rt::TokioExecutor;
 use thiserror::Error;
 use tokio::time::Duration;
 
-/// HTTP transport failure. Bodies are truncated: an S3 XML error fits, a
-/// full dump echoed back does not belong in a log line.
+use crate::Secret;
+
+/// HTTP transport failure. URLs, parser errors and remote response details
+/// can carry credentials (including webhook paths or echoed Authorization).
 #[derive(Debug, Error)]
 pub enum HttpError {
     #[error("invalid url {url:?}: {reason}")]
-    InvalidUrl { url: String, reason: String },
+    InvalidUrl {
+        url: Secret<String>,
+        reason: Secret<String>,
+    },
     #[error("refusing clear-text {url:?}: remote hosts must be https://")]
-    ClearText { url: String },
+    ClearText { url: Secret<String> },
     #[error("request to {url:?} failed: {reason}")]
-    Transport { url: String, reason: String },
+    Transport {
+        url: Secret<String>,
+        reason: Secret<String>,
+    },
     #[error("request to {url:?} timed out after {secs}s")]
-    Timeout { url: String, secs: u64 },
+    Timeout { url: Secret<String>, secs: u64 },
     #[error(
         "response from {url:?} exceeds the {limit}-byte cap; refusing rather than buffering it"
     )]
-    TooLarge { url: String, limit: usize },
-    #[error("unexpected status {status} from {url:?}{detail}")]
+    TooLarge { url: Secret<String>, limit: usize },
+    #[error("unexpected status {status} from {url:?}: {detail}")]
     Status {
-        url: String,
+        url: Secret<String>,
         status: StatusCode,
-        detail: String,
+        detail: Secret<String>,
     },
 }
 
 /// A fetched response: status plus the bounded body.
-#[derive(Debug)]
 pub struct HttpResponse {
     pub status: StatusCode,
     pub body: Vec<u8>,
     /// Response headers as received (lowercase names), for etag/content-type.
     pub headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("body_bytes", &self.body.len())
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
 }
 
 impl HttpResponse {
@@ -70,18 +87,12 @@ impl HttpResponse {
         serde_json::from_slice(&self.body).ok()
     }
 
-    /// First 500 chars of the body for error detail (mirrors the legacy
-    /// uploader's S3 XML inclusion: the status alone does not distinguish a
-    /// wrong key from a wrong bucket).
+    /// Bounded remote error detail. Formatting is redacted: servers can echo
+    /// credentials even in short error bodies; truncation is not sanitization.
     #[must_use]
-    pub fn detail(&self) -> String {
+    pub fn detail(&self) -> Secret<String> {
         let text = String::from_utf8_lossy(&self.body);
-        let snippet: String = text.chars().take(500).collect();
-        if snippet.trim().is_empty() {
-            String::new()
-        } else {
-            format!(": {}", snippet.trim())
-        }
+        Secret::new(text.chars().take(500).collect())
     }
 }
 
@@ -101,12 +112,12 @@ fn check_url(url: &str) -> Result<(), HttpError> {
             return Ok(());
         }
         return Err(HttpError::ClearText {
-            url: url.to_owned(),
+            url: Secret::new(url.to_owned()),
         });
     }
     Err(HttpError::InvalidUrl {
-        url: url.to_owned(),
-        reason: "must start with https:// or http://".to_owned(),
+        url: Secret::new(url.to_owned()),
+        reason: Secret::new("must start with https:// or http://".to_owned()),
     })
 }
 
@@ -135,18 +146,18 @@ pub async fn request(
     let req = builder
         .body(Full::new(Bytes::from(body.unwrap_or_default())))
         .map_err(|e| HttpError::InvalidUrl {
-            url: url.to_owned(),
-            reason: e.to_string(),
+            url: Secret::new(url.to_owned()),
+            reason: Secret::new(e.to_string()),
         })?;
 
-    let url_owned = url.to_owned();
+    let url_owned = Secret::new(url.to_owned());
     let fut = async {
         let res = client
             .request(req)
             .await
             .map_err(|e| HttpError::Transport {
                 url: url_owned.clone(),
-                reason: e.to_string(),
+                reason: Secret::new(e.to_string()),
             })?;
         let status = res.status();
         let headers: Vec<(String, String)> = res
@@ -166,7 +177,7 @@ pub async fn request(
                 } else {
                     HttpError::Transport {
                         url: url_owned.clone(),
-                        reason: e.to_string(),
+                        reason: Secret::new(e.to_string()),
                     }
                 }
             })?
@@ -182,7 +193,7 @@ pub async fn request(
     tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
         .await
         .map_err(|_| HttpError::Timeout {
-            url: url.to_owned(),
+            url: Secret::new(url.to_owned()),
             secs: timeout_secs,
         })?
 }

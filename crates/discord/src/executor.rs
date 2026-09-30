@@ -1593,6 +1593,25 @@ pub fn pace_delay_ms(last_at_ms: u64, interval_ms: u64, now_ms: u64) -> u64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn debug_redacts_transport_and_nested_executor_token() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let marker = "fixture-rest-executor-bot-token";
+        let transport = HyperTransport::new(marker.to_owned()).unwrap();
+        let executor = ActionExecutor::new(marker.to_owned()).unwrap();
+        for output in [
+            format!("{transport:?}"),
+            format!("{transport:#?}"),
+            format!("{executor:?}"),
+            format!("{executor:#?}"),
+            format!("{:?}", executor.inner),
+        ] {
+            assert!(!output.contains(marker));
+            assert!(output.contains("[REDACTED]"));
+        }
+        assert_eq!(transport.token.expose(), &format!("Bot {marker}"));
+    }
+
     #[test]
     fn constants_match_legacy() {
         assert_eq!(PACE_INTERVAL_MS, 110);

@@ -221,9 +221,14 @@ async fn s3_put_round_trip_with_verified_signature() {
     let signed = s3::sign_put(&target, &key, &body, &amz_date, &date_stamp);
 
     // The real transport path: hyper PUT with the signed headers.
-    let res = two_bot_core::backup::http::put(signed.url.expose(), signed.headers.expose().clone(), body.clone(), 30)
-        .await
-        .expect("PUT to fake S3");
+    let res = two_bot_core::backup::http::put(
+        signed.url.expose(),
+        signed.headers.expose().clone(),
+        body.clone(),
+        30,
+    )
+    .await
+    .expect("PUT to fake S3");
     assert_eq!(
         res.status.as_u16(),
         200,
@@ -256,9 +261,14 @@ async fn s3_put_with_wrong_secret_is_403_not_success() {
     let body = b"test dump bytes".to_vec();
     let (amz_date, date_stamp) = s3::amz_stamps(1_787_735_020);
     let signed = s3::sign_put(&target, "f.gz", &body, &amz_date, &date_stamp);
-    let res = two_bot_core::backup::http::put(signed.url.expose(), signed.headers.expose().clone(), body, 30)
-        .await
-        .expect("transport works; signature does not");
+    let res = two_bot_core::backup::http::put(
+        signed.url.expose(),
+        signed.headers.expose().clone(),
+        body,
+        30,
+    )
+    .await
+    .expect("transport works; signature does not");
     assert_eq!(res.status.as_u16(), 403, "bad signature must fail loudly");
 }
 

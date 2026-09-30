@@ -53,7 +53,7 @@ pub enum ChannelClaim {
 pub struct ChannelClaimTicket {
     guild_id: String,
     idempotency_key: String,
-    claim_token: String,
+    claim_token: crate::Secret<String>,
 }
 
 /// Durable store for the channel-moderation slice.
@@ -92,7 +92,8 @@ impl ChannelModerationStore {
         let pool = PgPoolOptions::new()
             .max_connections(pool_max)
             .connect_with(options)
-            .await?;
+            .await
+            .map_err(|_| sqlx::Error::InvalidArgument("database connection failed".to_owned()))?;
         Ok(Self { pool })
     }
 
@@ -232,7 +233,7 @@ impl ChannelModerationStore {
                 ticket: ChannelClaimTicket {
                     guild_id: guild_id.to_owned(),
                     idempotency_key: idempotency_key.to_owned(),
-                    claim_token: row.get("claim_token"),
+                    claim_token: crate::Secret::new(row.get("claim_token")),
                 },
             });
         }
@@ -288,7 +289,7 @@ impl ChannelModerationStore {
         .bind(completed_at)
         .bind(&ticket.guild_id)
         .bind(&ticket.idempotency_key)
-        .bind(&ticket.claim_token)
+        .bind(ticket.claim_token.expose())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -305,7 +306,7 @@ impl ChannelModerationStore {
         )
         .bind(&ticket.guild_id)
         .bind(&ticket.idempotency_key)
-        .bind(&ticket.claim_token)
+        .bind(ticket.claim_token.expose())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -342,6 +343,27 @@ impl ChannelModerationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_channel_claim_ticket_and_nested_claim() {
+        let ticket = ChannelClaimTicket {
+            guild_id: "1".to_owned(),
+            idempotency_key: "fixture-key".to_owned(),
+            claim_token: crate::Secret::new("fixture-channel-ownership-capability".to_owned()),
+        };
+        let claim = ChannelClaim::Claimed {
+            ticket: ticket.clone(),
+        };
+        for output in [
+            format!("{ticket:?}"),
+            format!("{ticket:#?}"),
+            format!("{claim:?}"),
+            format!("{claim:#?}"),
+        ] {
+            assert!(!output.contains("fixture-channel-ownership-capability"));
+            assert!(output.contains("[REDACTED]"));
+        }
+    }
 
     struct TestStore {
         store: ChannelModerationStore,

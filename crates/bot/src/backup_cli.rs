@@ -184,8 +184,8 @@ async fn cmd_backup() -> i32 {
 
     let pool = match sqlx::PgPool::connect(&url).await {
         Ok(pool) => pool,
-        Err(err) => {
-            eprintln!("backup: cannot connect: {err}");
+        Err(_) => {
+            eprintln!("backup: cannot connect; database details redacted");
             return 1;
         }
     };
@@ -384,8 +384,8 @@ async fn cmd_restore(args: &[String]) -> i32 {
 
     let pool = match sqlx::PgPool::connect(url.as_ref().expect("checked")).await {
         Ok(pool) => pool,
-        Err(err) => {
-            eprintln!("restore: cannot connect: {err}");
+        Err(_) => {
+            eprintln!("restore: cannot connect; database details redacted");
             return 1;
         }
     };
@@ -481,8 +481,8 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
                 }
                 probe.close().await;
             }
-            Err(err) => {
-                eprintln!("restore: cannot probe target ({err}); checking the file only.");
+            Err(_) => {
+                eprintln!("restore: cannot probe target; database details redacted; checking the file only.");
                 for name in dump_file::DUMP_TABLES {
                     before.insert((*name).to_owned(), "(not checked)".to_owned());
                 }
@@ -597,7 +597,14 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
     let timeout_ms: u64 = env_var("TWO_BACKUP_S3_TIMEOUT_MS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(300_000);
-    match http::put(signed.url.expose(), signed.headers.expose().clone(), body, timeout_ms.div_ceil(1000)).await {
+    match http::put(
+        signed.url.expose(),
+        signed.headers.expose().clone(),
+        body,
+        timeout_ms.div_ceil(1000),
+    )
+    .await
+    {
         Ok(res) => {
             if !(200..300).contains(&res.status.as_u16()) {
                 eprintln!(

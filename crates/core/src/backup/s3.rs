@@ -109,7 +109,7 @@ pub fn load_s3_target(env: &dyn Fn(&str) -> Option<String>) -> Result<S3Target, 
     let endpoint = get_env(env, "TWO_BACKUP_S3_ENDPOINT").unwrap_or_default();
     if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
         return Err(S3ConfigError(
-            "TWO_BACKUP_S3_ENDPOINT must start with https:// or http://.".to_owned()
+            "TWO_BACKUP_S3_ENDPOINT must start with https:// or http://.".to_owned(),
         ));
     }
     // http:// to anything but a local test server would ship the funnel log,
@@ -122,7 +122,8 @@ pub fn load_s3_target(env: &dyn Fn(&str) -> Option<String>) -> Result<S3Target, 
     if endpoint.starts_with("http://") && !is_loopback_endpoint(&endpoint) {
         return Err(S3ConfigError(
             "TWO_BACKUP_S3_ENDPOINT must be https:// for a remote host. \
-             Plain http would send the dump and its credentials in clear text.".to_owned()
+             Plain http would send the dump and its credentials in clear text."
+                .to_owned(),
         ));
     }
 
@@ -153,7 +154,9 @@ pub fn load_s3_target(env: &dyn Fn(&str) -> Option<String>) -> Result<S3Target, 
         region: get_env(env, "TWO_BACKUP_S3_REGION").unwrap_or_else(|| "auto".to_owned()),
         bucket,
         access_key_id: Secret::new(get_env(env, "TWO_BACKUP_S3_ACCESS_KEY_ID").unwrap_or_default()),
-        secret_access_key: Secret::new(get_env(env, "TWO_BACKUP_S3_SECRET_ACCESS_KEY").unwrap_or_default()),
+        secret_access_key: Secret::new(
+            get_env(env, "TWO_BACKUP_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+        ),
         prefix: get_env(env, "TWO_BACKUP_S3_PREFIX"),
     })
 }
@@ -496,7 +499,12 @@ mod tests {
             .url
             .expose()
             .starts_with("https://acct.r2.cloudflarestorage.com/paperclip-backups/"));
-        let names: Vec<&str> = req.headers.expose().iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = req
+            .headers
+            .expose()
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
         assert_eq!(
             names,
             [

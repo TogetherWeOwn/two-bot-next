@@ -147,14 +147,14 @@ pub fn signatures_match(a: &str, b: &str) -> bool {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SigningKey {
     pub id: String,
-    pub secret: Vec<u8>,
+    pub secret: crate::Secret<Vec<u8>>,
 }
 
 impl std::fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SigningKey")
             .field("id", &self.id)
-            .field("secret_len", &self.secret.len())
+            .field("secret_len", &self.secret.expose().len())
             .finish()
     }
 }
@@ -190,7 +190,7 @@ pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
         }
         out.push(SigningKey {
             id: id.to_owned(),
-            secret: secret.as_bytes().to_vec(),
+            secret: crate::Secret::new(secret.as_bytes().to_vec()),
         });
     }
     if out.is_empty() {
@@ -209,8 +209,8 @@ pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
 /// impl lists only the key ids, which already travel in request headers.
 #[derive(Clone)]
 pub struct KeyRing {
-    keys: HashMap<String, Vec<u8>>,
-    decoy: [u8; 32],
+    keys: HashMap<String, crate::Secret<Vec<u8>>>,
+    decoy: crate::Secret<[u8; 32]>,
 }
 
 impl std::fmt::Debug for KeyRing {
@@ -229,7 +229,7 @@ impl KeyRing {
     pub fn new(keys: Vec<SigningKey>) -> Self {
         Self {
             keys: keys.into_iter().map(|k| (k.id, k.secret)).collect(),
-            decoy: rand::random(),
+            decoy: crate::Secret::new(rand::random()),
         }
     }
 
@@ -259,7 +259,9 @@ impl KeyRing {
     ) -> bool {
         let secret = self.keys.get(key_id);
         let expected = sign(
-            secret.map_or(self.decoy.as_slice(), Vec::as_slice),
+            secret.map_or(self.decoy.expose().as_slice(), |key| {
+                key.expose().as_slice()
+            }),
             timestamp,
             nonce,
             raw,
@@ -1643,11 +1645,11 @@ mod tests {
         KeyRing::new(vec![
             SigningKey {
                 id: "web".to_owned(),
-                secret: vec1().secret.as_bytes().to_vec(),
+                secret: crate::Secret::new(vec1().secret.as_bytes().to_vec()),
             },
             SigningKey {
                 id: "web2".to_owned(),
-                secret: vec2().secret.as_bytes().to_vec(),
+                secret: crate::Secret::new(vec2().secret.as_bytes().to_vec()),
             },
         ])
     }
@@ -1756,7 +1758,7 @@ mod tests {
         let keys = ring();
         let vector = vec1();
         let signature = sign(
-            &keys.decoy,
+            keys.decoy.expose(),
             &vector.timestamp,
             &vector.nonce,
             vector.body.as_bytes(),
@@ -1790,7 +1792,7 @@ mod tests {
         let keys = KeyRing::new(Vec::new());
         let vector = vec1();
         let signature = sign(
-            &keys.decoy,
+            keys.decoy.expose(),
             &vector.timestamp,
             &vector.nonce,
             vector.body.as_bytes(),
@@ -2451,7 +2453,7 @@ mod tests {
         let secret: Vec<u8> = (0..32u8).collect();
         let key = SigningKey {
             id: "web".to_owned(),
-            secret,
+            secret: crate::Secret::new(secret),
         };
         assert_eq!(
             format!("{key:?}"),

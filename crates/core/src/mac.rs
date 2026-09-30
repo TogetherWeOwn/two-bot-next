@@ -466,7 +466,10 @@ mod tests {
             )]
             .into();
             let loaded = moderation_audit_secret(&vars, None).expect("reads");
-            assert_eq!(loaded.as_ref().map(|secret| secret.expose().as_str()), Some(vector.secret.as_str()));
+            assert_eq!(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                Some(vector.secret.as_str())
+            );
             assert_eq!(
                 moderation_audit_reason(
                     loaded.as_ref().map(|secret| secret.expose().as_str()),
@@ -478,10 +481,12 @@ mod tests {
                 ),
                 vector.reason
             );
-            assert!(
-                parse_moderation_audit_reason(loaded.as_ref().map(|secret| secret.expose().as_str()), GUILD, Some(&vector.reason))
-                    .is_some()
-            );
+            assert!(parse_moderation_audit_reason(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                GUILD,
+                Some(&vector.reason)
+            )
+            .is_some());
         }
         let vars = [("TWO_MODERATION_AUDIT_SECRET".to_owned(), String::new())].into();
         assert_eq!(moderation_audit_secret(&vars, None).expect("reads"), None);
@@ -538,7 +543,10 @@ mod tests {
         for vector in fixture.vectors {
             std::fs::write(&path, &vector.raw).expect("write public fixture");
             let loaded = moderation_audit_secret(&vars, Some(&dir)).expect("reads");
-            assert_eq!(loaded.as_ref().map(|secret| secret.expose().as_str()), Some(vector.secret.as_str()));
+            assert_eq!(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                Some(vector.secret.as_str())
+            );
             assert_eq!(
                 moderation_audit_reason(
                     loaded.as_ref().map(|secret| secret.expose().as_str()),
@@ -550,10 +558,12 @@ mod tests {
                 ),
                 vector.reason
             );
-            assert!(
-                parse_moderation_audit_reason(loaded.as_ref().map(|secret| secret.expose().as_str()), GUILD, Some(&vector.reason))
-                    .is_some()
-            );
+            assert!(parse_moderation_audit_reason(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                GUILD,
+                Some(&vector.reason)
+            )
+            .is_some());
             // File trimming must never leak into environment-key semantics.
             let env = [("TWO_MODERATION_AUDIT_SECRET".to_owned(), vector.raw.clone())].into();
             assert_eq!(

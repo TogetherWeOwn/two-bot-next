@@ -24,9 +24,9 @@ use super::http::{self, HttpError, HttpMethod};
 #[derive(Debug, Error)]
 pub enum GuildConfigApiError {
     #[error("not a URL: {0:?}")]
-    BadBase(String),
+    BadBase(Secret<String>),
     #[error("{0} is a test seam and only accepts loopback. Got host {1:?}.")]
-    NonLoopbackBase(String, String),
+    NonLoopbackBase(String, Secret<String>),
     #[error("http: {0}")]
     Http(#[from] HttpError),
     #[error("{0}")]
@@ -58,11 +58,11 @@ pub fn checked_base(
         let _ = shown;
         return Err(GuildConfigApiError::NonLoopbackBase(
             name.to_owned(),
-            host.to_owned(),
+            Secret::new(host.to_owned()),
         ));
     }
     if !raw.starts_with("https://") && !raw.starts_with("http://") {
-        return Err(GuildConfigApiError::BadBase(raw.to_owned()));
+        return Err(GuildConfigApiError::BadBase(Secret::new(raw.to_owned())));
     }
     Ok(raw.to_owned())
 }
@@ -107,7 +107,10 @@ impl GuildConfigDiscordApi {
     }
 
     fn auth_header(&self) -> (String, String) {
-        ("authorization".to_owned(), format!("Bot {}", self.token.expose()))
+        (
+            "authorization".to_owned(),
+            format!("Bot {}", self.token.expose()),
+        )
     }
 
     /// GET with Discord 429 handling: honour `retry_after` (capped at 30 s),
