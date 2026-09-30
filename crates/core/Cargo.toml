@@ -31,6 +31,7 @@ url = { workspace = true }
 # Row-by-row dump streaming only (TryStreamExt::try_next); same locked
 # version the bot and discord crates already use.
 futures-util = { workspace = true }
+roxmltree = "=0.21.1"
 
 # Database access lives behind the `db` feature so unit tests for pure
 # domain logic never need a Postgres driver or a live database.
