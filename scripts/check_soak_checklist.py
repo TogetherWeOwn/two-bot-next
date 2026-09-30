@@ -11,6 +11,29 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_ROW = (7, ("Config / env catalogue",))
 
 
+def split_cells(text):
+    """Split a table line with optional leading/trailing border pipes."""
+    body = text
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|") and not body.endswith("\\|"):
+        body = body[:-1]
+    # Escaped pipes are cell content, not table boundaries.
+    return tuple(c.strip().replace(r"\|", "|") for c in
+                 re.split(r"(?<!\\)\|", body))
+
+
+def mapped_owner(mapping):
+    """Slice/issue owner that keeps a DROP-prefixed row in scope."""
+    return re.search(r"\b(?:S\d+|B\d+|NEW-\d+|TOG-\d+)\b", mapping)
+
+
+def looks_mapped(cell):
+    """True when a last-cell value claims parity mapping of any kind."""
+    mapping = cell.replace("*", "").strip()
+    return bool(re.match(r"^DROP\b", mapping) or mapped_owner(mapping))
+
+
 def parity_rows(markdown):
     """Read Map tables in §§1–8; exclude only wholly DROP-mapped rows."""
     section = None
@@ -27,19 +50,32 @@ def parity_rows(markdown):
             continue
         if section not in range(1, 9):
             continue
-        if not line.strip().startswith("|"):
+        stripped = line.strip()
+        if not stripped or "|" not in stripped:
             headers = None
             continue
-        # Escaped pipes are cell content, not table boundaries.
-        cells = tuple(c.strip().replace(r"\|", "|") for c in
-                      re.split(r"(?<!\\)\|", line.strip())[1:-1])
+        cells = split_cells(stripped)
         if all(re.fullmatch(r":?-+:?", c) for c in cells):
             continue
         if headers is None:
-            if not cells or cells[-1] != "Map":
+            if cells and cells[-1] == "Map":
+                # A bordered or borderless header opens table scope.
+                headers = cells
+            elif not stripped.startswith("|") and looks_mapped(cells[-1]):
+                # Fail closed: a borderless mapped row separated from its
+                # table by a blank line must not silently skip coverage
+                # either. Border the row or reword the prose.
+                raise ValueError(
+                    f"§{section}: unsupported borderless table row: {stripped[:60]}")
+            elif stripped.startswith("|"):
                 raise ValueError(f"§{section}: parity table must end in Map")
-            headers = cells
+            # Borderless prose carrying pipes is ordinary prose, not a table.
             continue
+        if not stripped.startswith("|"):
+            # Fail closed: a GFM body row without its leading border must
+            # not silently skip coverage while a table is active.
+            raise ValueError(
+                f"§{section}: table row without leading border: {stripped[:60]}")
         if len(cells) != len(headers):
             raise ValueError(f"§{section}: malformed table row: {cells}")
         mapping = cells[-1].replace("*", "").strip()
@@ -47,8 +83,7 @@ def parity_rows(markdown):
             raise ValueError(f"§{section}: unmapped row: {cells}")
         # A DROP prefix can still carry mapped work, including replacement
         # owners in parentheses. Semicolons also occur within drop reasons.
-        has_owner = re.search(r"\b(?:S\d+|B\d+|NEW-\d+|TOG-\d+)\b", mapping)
-        if has_owner or not re.match(r"^DROP\b", mapping):
+        if mapped_owner(mapping) or not re.match(r"^DROP\b", mapping):
             rows.append((section, cells[:-1]))
     if seen_sections != set(range(1, 9)):
         raise ValueError("Expected all parity sections 1–8")

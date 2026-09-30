@@ -189,7 +189,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 - **Method:** `manual` (not an execution verdict).
 - **Action:** For a disposable future event invoke /rsvp event-id:<id> status:going, interested, declined; retry the last choice.
-- **Expected:** Latest status replaces earlier status once; totals have no duplicate attendee; invalid/past-event fixture refused.
+- **Expected:** Latest status replaces earlier status once; totals have no duplicate attendee; malformed event-id or unknown-status fixture refused (shape contract only — the port performs no event-time check).
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-24: 25 — `/attendance` (RSVP totals)
@@ -768,7 +768,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 - **Method:** `manual` (not an execution verdict).
 - **Action:** In contained staging observe /readyz before gateway ready, after ready and during approved restart; pair with local pre-ready fixture.
-- **Expected:** 503 gateway_disconnected pre-ready; 200 only when ready; no secret/session data in body.
+- **Expected:** 503 with per-component JSON pre-ready (process ready, gateway starting/down); 200 only when every component reports ready; no secret/session data in body. `gateway_disconnected` is the legacy matrix label, not the deployed body — see docs/staging-soak.md.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s6-10: Operational-audit mirror channel (retryable delivery, `allowedMentions:{parse:[]}`, nonce-enforced) — tamper-evident Discord mirror

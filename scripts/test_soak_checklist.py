@@ -146,6 +146,36 @@ class SoakChecklistTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must end in Map"):
             parity_rows(self.parity.replace("| Behaviour | Detail | Map |", "| Behaviour | Detail | Mapping |"))
 
+    def test_borderless_mapped_row_fails_closed(self):
+        # A GFM body row without its leading border, appended inside the
+        # §8 table scope, must fail rather than silently skip coverage.
+        changed = self.parity.replace(
+            "\n\n## 9. Drops", "\nnew observable | new effect | **S5** |\n\n## 9. Drops")
+        with self.assertRaisesRegex(ValueError, "without leading border"):
+            parity_rows(changed)
+        with self.assertRaisesRegex(ValueError, "without leading border"):
+            validate(changed, self.checklist)
+
+    def test_blank_line_borderless_mapped_row_fails_closed(self):
+        # Same fail-closed guarantee when a blank line separates the
+        # borderless mapped row from its table.
+        tail = "| Rate limits: staging-verifier 3 retries"
+        changed = self.parity.replace(
+            tail, tail.split("|")[0].rstrip() + "\n\nnew observable | new effect | **S5** |",
+            1)
+        with self.assertRaisesRegex(ValueError, "borderless table row"):
+            parity_rows(changed)
+        with self.assertRaisesRegex(ValueError, "borderless table row"):
+            validate(changed, self.checklist)
+
+    def test_borderless_prose_without_mapping_stays_prose(self):
+        # Ordinary pipe-carrying prose outside tables must not trip the
+        # fail-closed paths above.
+        changed = self.parity.replace(
+            "## 9. Drops", "A pipe | in ordinary prose carries no mapping.\n\n## 9. Drops")
+        self.assertEqual(set(parity_rows(self.parity)), set(parity_rows(changed)))
+        self.assertEqual(validate(changed, self.checklist), validate(self.parity, self.checklist))
+
     def test_escaped_pipe_stays_in_cell(self):
         changed = self.parity.replace("## 9. Drops", "| Behaviour | Detail | Map |\n|---|---|---|\n|new observable | one \\| two | **S5** |\n\n## 9. Drops")
         self.assertIn((8, ("new observable", "one | two")), parity_rows(changed))
