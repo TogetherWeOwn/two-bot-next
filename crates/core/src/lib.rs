@@ -9,7 +9,10 @@ pub mod audit;
 pub mod automod;
 pub mod classify;
 pub mod commands;
+pub mod community;
 pub mod community_snapshots;
+#[cfg(feature = "db")]
+pub mod community_store;
 pub mod config;
 pub mod containment;
 pub mod events;
@@ -20,6 +23,9 @@ pub mod gateway_funnel;
 pub mod gateway_session;
 pub mod handlers;
 pub mod health;
+pub mod inactivity;
+#[cfg(feature = "db")]
+pub mod inactivity_store;
 pub mod invites;
 pub mod leveling;
 pub mod mac;
@@ -27,6 +33,9 @@ pub mod moderation;
 pub mod onboarding;
 #[cfg(feature = "db")]
 pub mod onboarding_store;
+pub mod presence;
+#[cfg(feature = "db")]
+pub mod presence_store;
 pub mod raid;
 pub mod rsvp;
 #[cfg(feature = "db")]
@@ -48,6 +57,12 @@ pub use automod::{
     DEFAULT_SANCTIONS,
 };
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
+pub use community::{
+    build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
+    week_start_ms, Classification, ClassifierConfig, ClassifyInput, FactRow, ScorecardGates,
+    ScorecardInputs, ScorecardOutcome, StreamCoverage, COMMUNITY_CLASSIFICATIONS,
+    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS,
+};
 pub use community_snapshots::{
     build_community_snapshot, build_counter_reading, match_rank_roles, window_bounds,
     CommunitySnapshot, CounterReading, CounterSkip, JobGate, JobGuard, MemberRank, RaidAnomaly,
@@ -80,6 +95,11 @@ pub use handlers::{
 pub use health::{
     classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
     VoiceFailureKind, VoiceHealthReport, VoicePermission, VoicePermissionScope, VoiceReadiness,
+};
+pub use inactivity::{
+    flag_inactive, inactivity_cutoff_ms, member_inactive_event_key, parse_inactivity_days,
+    select_inactive, should_flag, FlaggedMember, InactivityCandidate, InactivityOutcome,
+    INACTIVITY_EVENT_SOURCE, INACTIVITY_EVENT_TYPE, INACTIVITY_SWEEP_INTERVAL_MS,
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
@@ -114,6 +134,12 @@ pub use onboarding::{
 pub use onboarding_store::{
     begin_prompt, has_onboarding_prompt, record_channel_routed, record_game_selected,
     record_prompted, record_session_routed, OnboardingStoreError, PromptGuard,
+};
+pub use presence::{
+    bot_floor_due, daily_peaks, decide_probe_cycle, evaluate_trigger, latest_bot_floor,
+    sanitize_presence_count, DailyPeak, PresenceReading, ProbeDecision, TriggerOptions,
+    TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS, PRESENCE_PROBE_INTERVAL_MS,
+    REOPEN_PEAK_THRESHOLD,
 };
 pub use raid::{
     count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,
