@@ -29,10 +29,11 @@ pub async fn apply_web_contract(pool: &Pool<Postgres>) -> Result<(), sqlx::Error
     let quoted = format!("\"{}\"", contract_schema.replace('"', "\"\""));
     let sql = WEB_V1_SQL.replace("web_v1", &quoted);
     // Only the schema identifier varies; double quotes are escaped above.
+    let mut tx = pool.begin().await?;
     sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await
 }
 
 /// Contract version this build implements (matches the

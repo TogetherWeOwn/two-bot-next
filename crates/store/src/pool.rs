@@ -47,7 +47,15 @@ impl Store {
         let pool = connect_pool(url).await?;
         let store = Self { pool };
         if !skip_migrations {
-            store.migrate().await.map_err(ConnectError::Db)?;
+            if let Err(err) = async {
+                store.migrate().await?;
+                store.apply_web_contract().await
+            }
+            .await
+            {
+                store.pool.close().await;
+                return Err(ConnectError::Db(err));
+            }
         }
         Ok(store)
     }

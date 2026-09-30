@@ -97,11 +97,11 @@ async fn migrations_contract_and_checksum_guard() {
     }
     assert!(versions.iter().all(|v| (1..=999).contains(v)));
     let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
-        .fetch_one(&f.pool)
+        .fetch_one(&f.admin)
         .await
         .unwrap();
     assert_eq!(timeout, "15s");
-    assert_eq!(f.pool.options().get_max_connections(), 5);
+    assert_eq!(f.admin.options().get_max_connections(), 5);
     two_bot_store::apply_web_contract(&f.pool).await.unwrap();
     two_bot_store::apply_web_contract(&f.pool).await.unwrap();
     let web = format!("{}_web_v1", f.schema);
@@ -255,8 +255,73 @@ async fn invite_snapshots_survive_reconstruction_and_delete_is_guild_scoped() {
     snapshots.store_all(123, &[invite.clone()]);
     let restarted = PgInviteSnapshots::new(f.pool.clone());
     assert_eq!(restarted.load(123), vec![invite]);
+    two_bot_core::InviteTracker::new(restarted.clone()).seed(
+        123,
+        InviteState {
+            code: "new-code".to_owned(),
+            uses: 0,
+            inviter_id: None,
+            channel_id: None,
+        },
+    );
+    assert_eq!(
+        restarted.load(123).len(),
+        2,
+        "seeding must not prune the guild baseline"
+    );
     restarted.delete_missing(123, &HashSet::new());
     assert!(restarted.load(123).is_empty());
     assert_eq!(restarted.load(124).len(), 1);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires authorized TEST_DATABASE_URL"]
+async fn mock_gateway_join_records_funnel_and_persisted_attribution() {
+    use twilight_model::gateway::{event::Event, payload::incoming::MemberAdd};
+    use two_bot_core::{NoopFacts, NoopLeveling};
+    use two_bot_discord::{NoClassification, Pipeline, ScriptedInvites};
+
+    let f = Fixture::new().await;
+    migrate(&f.pool).await.unwrap();
+    let pipeline = Pipeline::with_snapshots(
+        PgFunnelStore::new(f.pool.clone()),
+        Some(NoopLeveling),
+        Some(NoopFacts),
+        ScriptedInvites::new(),
+        NoClassification,
+        PgInviteSnapshots::new(f.pool.clone()),
+    );
+    let invite = InviteState {
+        code: "fixture".to_owned(),
+        uses: 5,
+        inviter_id: Some(789),
+        channel_id: None,
+    };
+    pipeline.invite_source().push(123, vec![invite.clone()]);
+    pipeline.prime_invite_snapshot(123);
+    pipeline
+        .invite_source()
+        .push(123, vec![InviteState { uses: 6, ..invite }]);
+    let member: MemberAdd = serde_json::from_value(serde_json::json!({
+        "guild_id": "123", "user": {"id":"456", "username":"fixture", "discriminator":"0", "avatar":null, "bot":false},
+        "roles":[], "joined_at":"2026-09-29T12:00:00.000+00:00", "deaf":false, "mute":false, "flags":0, "pending":false
+    })).unwrap();
+    let event = Event::MemberAdd(Box::new(member));
+    pipeline.handle(&event);
+    pipeline.handle(&event); // No second REST fixture: failure retains baseline.
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT event_type, source FROM events ORDER BY id")
+            .fetch_all(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("member_join".to_owned(), "invite:fixture".to_owned()),
+            ("gate_cleared".to_owned(), "gateway".to_owned())
+        ]
+    );
+    assert_eq!(PgInviteSnapshots::new(f.pool.clone()).load(123)[0].uses, 6);
     f.finish().await;
 }

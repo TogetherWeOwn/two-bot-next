@@ -2161,6 +2161,7 @@ dependencies = [
  "axum",
  "rustls",
  "serde_json",
+ "sqlx",
  "tokio",
  "tower",
  "tower-http",
@@ -2168,8 +2169,11 @@ dependencies = [
  "tracing-subscriber",
  "twilight-cache-inmemory",
  "twilight-gateway",
+ "twilight-http",
+ "twilight-model",
  "two-bot-core",
  "two-bot-discord",
+ "two-bot-store",
 ]
 
 [[package]]
@@ -2229,7 +2233,9 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "twilight-model",
  "two-bot-core",
+ "two-bot-discord",
 ]
 
 [[package]]

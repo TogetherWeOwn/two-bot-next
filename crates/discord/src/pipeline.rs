@@ -200,10 +200,11 @@ pub struct Pipeline<
     F = two_bot_core::NoopFacts,
     I = NoInvites,
     C = NoClassification,
+    P = PipelineSnapshots,
 > {
     cache: InMemoryCache,
     handlers: FunnelHandlers<S, L, F>,
-    invites: InviteTracker<PipelineSnapshots>,
+    invites: InviteTracker<P>,
     invite_source: I,
     expected_joins: Mutex<ExpectedJoins>,
     classifier: C,
@@ -212,7 +213,7 @@ pub struct Pipeline<
     vanity_guilds: Mutex<HashSet<Snowflake>>,
 }
 
-impl<S, L, F, I, C> std::fmt::Debug for Pipeline<S, L, F, I, C> {
+impl<S, L, F, I, C, P> std::fmt::Debug for Pipeline<S, L, F, I, C, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pipeline").finish_non_exhaustive()
     }
@@ -221,7 +222,7 @@ impl<S, L, F, I, C> std::fmt::Debug for Pipeline<S, L, F, I, C> {
 impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelClassifier>
     Pipeline<S, L, F, I, C>
 {
-    /// Build a pipeline over the given seams.
+    /// Build a pipeline over the given seams with in-memory snapshots.
     pub fn new(
         store: S,
         leveling: Option<L>,
@@ -229,12 +230,41 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
         invite_source: I,
         classifier: C,
     ) -> Self {
+        Self::with_snapshots(
+            store,
+            leveling,
+            facts,
+            invite_source,
+            classifier,
+            PipelineSnapshots::new(),
+        )
+    }
+}
+
+impl<
+        S: FunnelStore,
+        L: LevelingHook,
+        F: FactsSink,
+        I: InviteSource,
+        C: ChannelClassifier,
+        P: InviteSnapshotStore,
+    > Pipeline<S, L, F, I, C, P>
+{
+    /// Build over an explicit snapshot store (Postgres at runtime).
+    pub fn with_snapshots(
+        store: S,
+        leveling: Option<L>,
+        facts: Option<F>,
+        invite_source: I,
+        classifier: C,
+        snapshots: P,
+    ) -> Self {
         Self {
             cache: InMemoryCache::builder()
                 .resource_types(cache_resource_types())
                 .build(),
             handlers: FunnelHandlers::new(store, leveling, facts),
-            invites: InviteTracker::new(PipelineSnapshots::new()),
+            invites: InviteTracker::new(snapshots),
             invite_source,
             expected_joins: Mutex::new(ExpectedJoins::new()),
             classifier,
@@ -301,13 +331,15 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
     /// the next join's growth diff measures against, instead of treating the
     /// whole counter as new.
     fn seed_invite_code(&self, guild_id: Snowflake, code: &str) {
-        let baseline = vec![InviteState {
-            code: code.to_owned(),
-            uses: 0,
-            inviter_id: None,
-            channel_id: None,
-        }];
-        self.invites.diff_and_store(guild_id, &baseline);
+        self.invites.seed(
+            guild_id,
+            InviteState {
+                code: code.to_owned(),
+                uses: 0,
+                inviter_id: None,
+                channel_id: None,
+            },
+        );
     }
 
     /// Drop open voice sessions on (re)connect. Both recovery paths (TOG-6123):

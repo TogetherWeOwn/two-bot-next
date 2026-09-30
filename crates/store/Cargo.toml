@@ -24,3 +24,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+two-bot-discord = { version = "0.1.0", path = "../discord" }
+twilight-model = { workspace = true }

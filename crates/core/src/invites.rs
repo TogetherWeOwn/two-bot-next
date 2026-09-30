@@ -262,6 +262,12 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
         grew
     }
 
+    /// Seed a newly created code without treating it as a complete guild
+    /// listing. Pruning belongs only to a successful full snapshot.
+    pub fn seed(&self, guild_id: Snowflake, state: InviteState) {
+        self.store.store_all(guild_id, &[state]);
+    }
+
     /// Attribution string for a join, given the codes that grew.
     #[must_use]
     pub fn attribute(&self, grew: &[String], guild_has_vanity: bool) -> String {

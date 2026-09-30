@@ -15,8 +15,12 @@ use two_bot_core::{ComponentStatus, HealthReport};
 
 use crate::gateway::GatewayState;
 
-/// Shared handle the /readyz handler reads.
-pub type SharedState = Arc<RwLock<GatewayState>>;
+/// Readiness reflects the live database, not only successful boot.
+#[derive(Clone)]
+pub struct SharedState {
+    pub gateway: Arc<RwLock<GatewayState>>,
+    pub database: Option<sqlx::PgPool>,
+}
 
 /// Build the router (split out for tests: no socket needed).
 pub fn router(state: SharedState) -> Router {
@@ -34,17 +38,37 @@ async fn health() -> Json<serde_json::Value> {
 async fn readyz(
     axum::extract::State(state): axum::extract::State<SharedState>,
 ) -> (StatusCode, Json<HealthReport>) {
-    let gateway = *state.read().await;
-    let report = HealthReport::new(vec![
-        ("process".to_owned(), ComponentStatus::Ready),
-        ("gateway".to_owned(), gateway.status()),
-    ]);
+    let gateway = *state.gateway.read().await;
+    let database_ready = match &state.database {
+        Some(pool) => {
+            tokio::time::timeout(std::time::Duration::from_secs(2), two_bot_store::ping(pool))
+                .await
+                .unwrap_or(false)
+        }
+        None => false,
+    };
+    let report = readiness_report(gateway, database_ready);
     let code = if report.ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(report))
+}
+
+fn readiness_report(gateway: GatewayState, database_ready: bool) -> HealthReport {
+    HealthReport::new(vec![
+        ("process".to_owned(), ComponentStatus::Ready),
+        ("gateway".to_owned(), gateway.status()),
+        (
+            "database".to_owned(),
+            if database_ready {
+                ComponentStatus::Ready
+            } else {
+                ComponentStatus::Down
+            },
+        ),
+    ])
 }
 
 /// Serve until SIGTERM/SIGINT (Container stop) or a bind failure.
@@ -78,7 +102,10 @@ mod tests {
     use tower::ServiceExt as _;
 
     fn state(s: GatewayState) -> SharedState {
-        Arc::new(RwLock::new(s))
+        SharedState {
+            gateway: Arc::new(RwLock::new(s)),
+            database: None,
+        }
     }
 
     #[tokio::test]
@@ -109,8 +136,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    #[test]
+    fn report_is_ready_only_with_gateway_and_database() {
+        assert!(readiness_report(GatewayState::Connected, true).ready());
+        assert!(!readiness_report(GatewayState::Connected, false).ready());
+        assert!(!readiness_report(GatewayState::Unconfigured, true).ready());
+    }
+
     #[tokio::test]
-    async fn readyz_is_200_when_gateway_connected() {
+    async fn readyz_is_503_when_gateway_connected_without_database() {
         let response = router(state(GatewayState::Connected))
             .oneshot(
                 Request::builder()
@@ -120,6 +154,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

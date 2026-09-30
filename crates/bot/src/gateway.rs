@@ -19,10 +19,15 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Session, Shard, ShardId, StreamExt as _};
-use two_bot_core::{ComponentStatus, Config, FactsSink, FunnelStore, LevelingHook};
-use two_bot_discord::{
-    gateway_intents, needs_message_content, ChannelClassifier, InviteSource, MemPipeline, Pipeline,
+use two_bot_core::{
+    ComponentStatus, Config, FactsSink, FunnelStore, InviteSnapshotStore, InviteState,
+    LevelingHook, NoopFacts, NoopLeveling, Snowflake,
 };
+use two_bot_discord::{
+    gateway_intents, needs_message_content, ChannelClassifier, InviteSource, NoClassification,
+    Pipeline,
+};
+use two_bot_store::{PgFunnelStore, PgInviteSnapshots};
 
 /// Install the process-wide rustls crypto provider (ring) unless one is set.
 ///
@@ -106,9 +111,9 @@ pub fn intents_from_env() -> Intents {
 /// (legacy `Error` → `client_error` row) and the loop continues — a single
 /// poisoned dispatch must not kill the funnel. Updates `state` so /readyz
 /// tracks the connection.
-pub async fn run_shard<S, L, F, I, C>(
+pub async fn run_shard<S, L, F, I, C, P>(
     mut shard: Shard,
-    pipeline: Arc<Pipeline<S, L, F, I, C>>,
+    pipeline: Arc<Pipeline<S, L, F, I, C, P>>,
     state: Arc<RwLock<GatewayState>>,
 ) where
     S: FunnelStore,
@@ -116,6 +121,7 @@ pub async fn run_shard<S, L, F, I, C>(
     F: FactsSink,
     I: InviteSource,
     C: ChannelClassifier,
+    P: InviteSnapshotStore + Send + Sync,
 {
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
     while let Some(item) = shard.next_event(EventTypeFlags::all()).await {
@@ -152,11 +158,76 @@ pub fn build_shard(token: String, intents: Intents, session: Option<Session>) ->
     Shard::with_config(ShardId::ONE, builder.build())
 }
 
-/// The S3 supervisor: in-memory [`MemPipeline`] over the scripted-seam
-/// defaults (S6 swaps the store; the funnel dispatch stays identical).
+/// REST invite counters. A failed or incomplete read keeps the persisted
+/// baseline; it must never look like a successful empty guild listing.
+pub struct HttpInvites {
+    client: twilight_http::Client,
+    handle: tokio::runtime::Handle,
+}
+
+impl InviteSource for HttpInvites {
+    fn current(&self, guild_id: Snowflake) -> Option<Vec<InviteState>> {
+        tokio::task::block_in_place(|| {
+            self.handle.block_on(async {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let invites = self
+                        .client
+                        .guild_invites(twilight_model::id::Id::new(guild_id))
+                        .await
+                        .ok()?
+                        .model()
+                        .await
+                        .ok()?;
+                    invites
+                        .into_iter()
+                        .map(|i| {
+                            Some(InviteState {
+                                code: i.code,
+                                uses: i.uses?,
+                                inviter_id: i.inviter.map(|u| u.id.get()),
+                                channel_id: i.channel.map(|c| c.id.get()),
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .await
+                .ok()
+                .flatten();
+                if result.is_none() {
+                    warn!(
+                        guild_id,
+                        "invite counter read unavailable; retaining snapshot"
+                    );
+                }
+                result
+            })
+        })
+    }
+}
+
+pub type PgPipeline = Pipeline<
+    PgFunnelStore,
+    NoopLeveling,
+    NoopFacts,
+    HttpInvites,
+    NoClassification,
+    PgInviteSnapshots,
+>;
+
+/// The runtime never silently falls back to the replay store.
 #[must_use]
-pub fn build_pipeline() -> MemPipeline {
-    MemPipeline::for_replay()
+pub fn build_pipeline(pool: sqlx::PgPool, token: String) -> PgPipeline {
+    Pipeline::with_snapshots(
+        PgFunnelStore::new(pool.clone()),
+        Some(NoopLeveling),
+        Some(NoopFacts),
+        HttpInvites {
+            client: twilight_http::Client::new(token),
+            handle: tokio::runtime::Handle::current(),
+        },
+        NoClassification,
+        PgInviteSnapshots::new(pool),
+    )
 }
 
 #[cfg(test)]
@@ -195,5 +266,50 @@ mod tests {
         ensure_crypto_provider();
         let shard = build_shard("token".to_owned(), Intents::empty(), None);
         assert_eq!(session_snapshot(&shard), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_invite_double_distinguishes_missing_counters_from_empty_listing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        ensure_crypto_provider();
+        for (status, body, expected_len) in [
+            (
+                200,
+                r#"[{"type":0,"code":"fixture","channel":null,"uses":7}]"#,
+                Some(1),
+            ),
+            (200, r#"[{"type":0,"code":"fixture","channel":null}]"#, None),
+            (200, "[]", Some(0)),
+            (403, r#"{"message":"fixture denied","code":50013}"#, None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let host = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                assert!(String::from_utf8_lossy(&request).contains("/guilds/123/invites"));
+                let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let source = HttpInvites {
+                client: twilight_http::Client::builder()
+                    .token("fixture".to_owned())
+                    .proxy(host, true)
+                    .build(),
+                handle: tokio::runtime::Handle::current(),
+            };
+            let result = source.current(123);
+            assert_eq!(result.as_ref().map(Vec::len), expected_len);
+            if expected_len == Some(1) {
+                assert_eq!(result.unwrap()[0].uses, 7);
+            }
+            server.await.unwrap();
+        }
     }
 }

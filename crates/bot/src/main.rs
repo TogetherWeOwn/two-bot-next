@@ -17,7 +17,8 @@ use two_bot_core::{ComponentStatus, Config};
 use gateway::{
     build_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard, GatewayState,
 };
-use server::serve;
+use server::{serve, SharedState};
+use two_bot_store::Store;
 
 #[tokio::main]
 async fn main() {
@@ -46,20 +47,45 @@ async fn main() {
         }
     });
 
-    let state = Arc::new(RwLock::new(GatewayState::new(&config)));
+    let gateway = Arc::new(RwLock::new(GatewayState::new(&config)));
+    let store = match config.database_url.as_deref() {
+        Some(url) => match Store::connect(url, false).await {
+            Ok(store) => Some(store),
+            Err(_) => {
+                // No URL or server error text: either may contain credentials
+                // or row data. A failed migration never admits gateway writes.
+                tracing::error!("database initialization failed; gateway parked");
+                None
+            }
+        },
+        None => {
+            info!("no database URL; gateway parked");
+            None
+        }
+    };
+    let state = SharedState {
+        gateway: Arc::clone(&gateway),
+        database: store.as_ref().map(|s| s.pool().clone()),
+    };
 
-    if let Some(token) = config.discord_token.clone().filter(|t| !t.is_empty()) {
+    if let (Some(token), Some(store)) = (
+        config.discord_token.clone().filter(|t| !t.is_empty()),
+        &store,
+    ) {
         // S5 offers the persisted session here for RESUME; fresh IDENTIFY
-        // until then.
+        // until then. No MemStore fallback when persistence is unavailable.
+        let pipeline = Arc::new(build_pipeline(store.pool().clone(), token.clone()));
         let shard = build_shard(token, intents_from_env(), None);
-        let pipeline = Arc::new(build_pipeline());
-        info!("discord token present; gateway shard connecting");
-        tokio::spawn(run_shard(shard, pipeline, Arc::clone(&state)));
+        info!("persistent store ready; gateway shard connecting");
+        let task = tokio::spawn(run_shard(shard, pipeline, Arc::clone(&gateway)));
+        tokio::spawn(async move {
+            if task.await.is_err() {
+                *gateway.write().await = GatewayState::Armed;
+                tracing::error!("gateway task stopped; restart required");
+            }
+        });
     } else {
-        info!(
-            status = ?ComponentStatus::Down,
-            "no discord token; gateway parked, /readyz reports down"
-        );
+        info!(status = ?ComponentStatus::Down, "gateway parked, /readyz reports down");
     }
 
     if let Err(err) = serve(&config.listen_addr, state).await {
