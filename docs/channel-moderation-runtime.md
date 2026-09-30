@@ -43,17 +43,20 @@ Isolated test-service coverage proves distinct-key exclusion, safe release,
 immutable completion, audit failure rollback, stale-ticket/action rejection and
 recovery-generation rollback. End-to-end router/mock REST coverage is still pending.
 
-## Shared member ledger compatibility — unresolved integration check
+## Shared member ledger compatibility — schema contract aligned
 
 The member slice is not yet in the examined main. Read-only comparison against
 `origin/TOG-10078-two-bot-next-s4-member-moderation-handlers-ban-tempban-kick-timeout-warn-unban-sweep`
 shows that its `0110_moderation_member.sql` uses timestamptz for shared audit and
 claim timestamps, and `0112_moderation_legacy_timestamps.sql` converts existing
-TEXT columns. Channel migration 0120 uses TEXT, and channel SQL currently binds
-ISO strings without timestamptz casts. `CREATE TABLE IF NOT EXISTS` does not resolve
-this mismatch. Align the shared timestamp bindings/schema and exercise both stores
-in one isolated schema before claiming compatibility. Do not rewrite applied
-migrations. Lockdown timestamps remain TEXT independently of the shared ledger.
+TEXT columns. Additive channel migration 0124 now aligns those same three shared
+columns, leaving applied 0120 unchanged. Channel SQL binds ISO strings with
+`::text::timestamptz`, matching the member store. Lockdown timestamps remain TEXT.
+
+Isolated regressions prove legacy-row/result/generation preservation, repeat-safe
+conversion, and member-shaped/channel-shaped inserts into one ledger. This proves
+the shared schema contract, not integrated member runtime execution: a both-store
+check remains necessary once the actual member slice merges.
 
 The shared non-timestamp columns and primary keys match. Member inserts omit
 `claim_token`, so the additive 0121 default is structurally compatible; member

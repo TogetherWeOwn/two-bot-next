@@ -26,7 +26,7 @@ pub struct ChannelAuditRow {
     pub idempotency_key: String,
     /// Bounded numbers only (count/seconds/affected), serialised as JSON.
     pub metadata_json: String,
-    /// ISO-8601 UTC millis (legacy TEXT timestamps; see migration 0120).
+    /// ISO-8601 UTC millis, bound with an explicit shared-ledger timestamptz cast.
     pub created_at: String,
 }
 
@@ -216,7 +216,7 @@ impl ChannelModerationStore {
         let won = sqlx::query(
             "INSERT INTO moderation_idempotency
                (guild_id, idempotency_key, action, request_hash, state, claimed_at)
-             VALUES ($1, $2, $3, $4, 'in_flight', $5)
+             VALUES ($1, $2, $3, $4, 'in_flight', $5::text::timestamptz)
              ON CONFLICT (guild_id, idempotency_key) DO NOTHING
              RETURNING claim_token",
         )
@@ -319,7 +319,7 @@ impl ChannelModerationStore {
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query(
             "UPDATE moderation_idempotency
-                SET state = 'done', outcome = $1, result_json = $2, completed_at = $3
+                SET state = 'done', outcome = $1, result_json = $2, completed_at = $3::text::timestamptz
               WHERE guild_id = $4 AND idempotency_key = $5
                 AND claim_token = $6 AND state = 'in_flight' AND action = $7",
         )
@@ -339,7 +339,7 @@ impl ChannelModerationStore {
             "INSERT INTO moderation_audit
                (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
                 outcome, idempotency_key, metadata_json, created_at)
-             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10)
+             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10::text::timestamptz)
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(&row.request_id)
@@ -393,7 +393,7 @@ impl ChannelModerationStore {
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE moderation_idempotency
-                SET state = 'done', outcome = $1, result_json = $2, completed_at = $3
+                SET state = 'done', outcome = $1, result_json = $2, completed_at = $3::text::timestamptz
               WHERE guild_id = $4 AND idempotency_key = $5
                 AND claim_token = $6 AND state = 'in_flight'",
         )
@@ -434,7 +434,7 @@ impl ChannelModerationStore {
             "INSERT INTO moderation_audit
                (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
                 outcome, idempotency_key, metadata_json, created_at)
-             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10)
+             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10::text::timestamptz)
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(&row.request_id)
@@ -1197,6 +1197,96 @@ mod tests {
                 );
             }
         }
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn timestamp_upgrade_preserves_legacy_rows_and_claim_generations() {
+        let store = test_store().await;
+        let claim = ticket(&store, "upgrade").await;
+        let row = finish_row("upgrade", "locked_down");
+        assert!(store.finish(&claim, &row, "saved", None).await.unwrap());
+        // Reconstruct the original 0120 column types only in this isolated schema.
+        sqlx::raw_sql(
+            "ALTER TABLE moderation_audit ALTER COLUMN created_at TYPE TEXT USING created_at::text;
+             ALTER TABLE moderation_idempotency ALTER COLUMN claimed_at TYPE TEXT USING claimed_at::text;
+             ALTER TABLE moderation_idempotency ALTER COLUMN completed_at TYPE TEXT USING completed_at::text;",
+        ).execute(store.pool()).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0124_channel_shared_timestamps.sql"
+        ))
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .claim("g1", "upgrade", "moderation.lockdown", "hash", "now")
+                .await
+                .unwrap(),
+            ChannelClaim::Replayed {
+                outcome: "locked_down".to_owned(),
+                result_json: "saved".to_owned()
+            }
+        );
+        assert!(!store.release(&claim).await.unwrap());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM moderation_audit WHERE request_id = 'req-upgrade'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        store.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn shared_ledger_accepts_channel_and_member_timestamp_bindings() {
+        let store = test_store().await;
+        // The member slice uses these exact shared timestamp types and SQL
+        // shapes (0110/0112). This is a schema contract, not a member-runtime test.
+        let types: Vec<String> = sqlx::query_scalar(
+            "SELECT data_type FROM information_schema.columns
+             WHERE table_schema = current_schema() AND
+               ((table_name = 'moderation_audit' AND column_name = 'created_at') OR
+                (table_name = 'moderation_idempotency' AND column_name IN ('claimed_at', 'completed_at')))",
+        ).fetch_all(store.pool()).await.unwrap();
+        assert_eq!(types.len(), 3);
+        assert!(types.iter().all(|t| t == "timestamp with time zone"));
+        let time = "2026-09-30T00:00:00.000Z";
+        sqlx::query(
+            "INSERT INTO moderation_idempotency
+             (guild_id, idempotency_key, action, request_hash, state, claimed_at)
+             VALUES ('g1', 'member', 'moderation.warn', 'hash', 'in_flight', $1::text::timestamptz)",
+        ).bind(time).execute(store.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO moderation_audit
+             (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
+              outcome, idempotency_key, metadata_json, created_at)
+             VALUES ('member', 'g1', 'actor', 'moderation.warn', 'target', NULL,
+                     'test', 'warned', 'member', '{}', NOW())",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let claim = ticket(&store, "channel").await;
+        assert!(store
+            .finish(&claim, &finish_row("channel", "locked_down"), "{}", None)
+            .await
+            .unwrap());
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        // Repeat-safe when member migration has already converted the shared columns.
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0124_channel_shared_timestamps.sql"
+        ))
+        .execute(store.pool())
+        .await
+        .unwrap();
         store.cleanup().await;
     }
 
