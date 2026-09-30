@@ -222,7 +222,7 @@ pub fn moderation_audit_secret(
     if let Some(dir) = credential_dir {
         match std::fs::read_to_string(dir.join("moderation_audit_secret")) {
             Ok(raw) => {
-                let trimmed = raw.trim();
+                let trimmed = raw.trim_matches(is_ecmascript_trim_space);
                 if !trimmed.is_empty() {
                     return Ok(Some(trimmed.to_owned()));
                 }
@@ -235,6 +235,26 @@ pub fn moderation_audit_secret(
         .get("TWO_MODERATION_AUDIT_SECRET")
         .filter(|s| !s.is_empty())
         .cloned())
+}
+
+// ECMAScript TrimString uses WhiteSpace + LineTerminator, not Unicode
+// White_Space: it includes BOM (FEFF), but excludes NEL (0085).
+// https://tc39.es/ecma262/multipage/text-processing.html#sec-trimstring
+fn is_ecmascript_trim_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
 }
 
 /// A credential file that exists but cannot be read.
@@ -468,6 +488,79 @@ mod tests {
             moderation_audit_secret(&Default::default(), None).expect("reads"),
             None
         );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CredentialTrimFixture {
+        trimmed_codepoints: Vec<u32>,
+        vectors: Vec<CredentialTrimVector>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CredentialTrimVector {
+        raw: String,
+        secret: String,
+        reason: String,
+    }
+
+    fn credential_trim_fixture() -> CredentialTrimFixture {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/moderation-credential-trim.json");
+        let json = std::fs::read_to_string(path).expect("public credential trim fixture");
+        serde_json::from_str(&json).expect("valid credential trim vectors")
+    }
+
+    #[test]
+    fn trim_space_set_matches_node_for_all_unicode_scalars() {
+        let expected = credential_trim_fixture().trimmed_codepoints;
+        let actual: Vec<u32> = (0..=0x10ffff)
+            .filter(|&cp| char::from_u32(cp).is_some_and(is_ecmascript_trim_space))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn secret_loader_matches_node_unicode_file_trim() {
+        let fixture = credential_trim_fixture();
+        assert_eq!(fixture.trimmed_codepoints.len(), 25);
+        let base = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("mac-unicode-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let path = dir.join("moderation_audit_secret");
+        let vars = [(
+            "TWO_MODERATION_AUDIT_SECRET".to_owned(),
+            moderation_test_vectors().remove(2).secret,
+        )]
+        .into();
+        for vector in fixture.vectors {
+            std::fs::write(&path, &vector.raw).expect("write public fixture");
+            let loaded = moderation_audit_secret(&vars, Some(&dir)).expect("reads");
+            assert_eq!(loaded.as_deref(), Some(vector.secret.as_str()));
+            assert_eq!(
+                moderation_audit_reason(
+                    loaded.as_deref(),
+                    GUILD,
+                    "idem-1",
+                    "moderation.ban",
+                    ACTOR,
+                    "spam"
+                ),
+                vector.reason
+            );
+            assert!(
+                parse_moderation_audit_reason(loaded.as_deref(), GUILD, Some(&vector.reason))
+                    .is_some()
+            );
+            // File trimming must never leak into environment-key semantics.
+            let env = [("TWO_MODERATION_AUDIT_SECRET".to_owned(), vector.raw.clone())].into();
+            assert_eq!(
+                moderation_audit_secret(&env, None).expect("reads"),
+                Some(vector.raw)
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("remove fixtures");
     }
 
     #[test]

@@ -32,9 +32,16 @@ vectors live in `crates/core/tests/fixtures/moderation-mac.json` and are loaded
 only by test code; no operational key is embedded in Rust source. The original
 known-answer vector remains unchanged. No CodeQL checks or queries are disabled.
 
-Credential-file contents are trimmed; nonempty environment values retain their
-exact bytes, like legacy `readSecret`. An empty resolved mirror channel means
-store-only regardless of the event guild.
+Credential-file contents use ECMAScript `TrimString` whitespace (including
+U+FEFF/BOM, excluding U+0085/NEL), not Rust's Unicode whitespace trim. Nonempty
+environment values retain their exact bytes, like legacy `readSecret`.
+`crates/core/tests/fixtures/moderation-credential-trim.json` contains the 25
+codepoints discovered by Node `String.fromCodePoint(cp).trim() === ''` across
+all Unicode codepoints, plus five file-loading/MAC vectors generated with Node
+`trim()` and `node:crypto`. Rust asserts the complete whitespace set and verifies
+BOM trimming, NEL preservation, all-whitespace file fallback and unchanged raw
+environment loading. Source: [ECMAScript TrimString](https://tc39.es/ecma262/multipage/text-processing.html#sec-trimstring).
+An empty resolved mirror channel means store-only regardless of the event guild.
 
 ## Source contract
 
