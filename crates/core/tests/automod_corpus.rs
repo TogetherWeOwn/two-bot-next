@@ -34,6 +34,8 @@ struct Case {
 enum Check {
     Match {
         messages: Vec<Message>,
+        #[serde(default)]
+        raw_bad_words: Option<Vec<String>>,
     },
     Normalize {
         input: String,
@@ -144,8 +146,16 @@ fn legacy_automod_core_decisions() {
                     assert_eq!(&actual[field], value, "{}: {field}", case.id);
                 }
             }
-            Check::Match { messages } => {
+            Check::Match {
+                messages,
+                raw_bad_words,
+            } => {
                 assert!(!messages.is_empty(), "{}: empty sequence", case.id);
+                let mut policy = config.policy.clone();
+                // Direct legacy policies must reach the matcher unchanged.
+                if let Some(words) = raw_bad_words {
+                    policy.bad_words.clone_from(words);
+                }
                 let mut repeats = RepeatTracker::default();
                 for (index, row) in messages.iter().enumerate() {
                     let message = AutomodMessage {
@@ -163,7 +173,7 @@ fn legacy_automod_core_decisions() {
                         attachment_names: row.attachments.clone(),
                         observed_timestamp_ms: row.at_ms.unwrap_or(1_000_000 + index as u64),
                     };
-                    let actual = match_automod(&message, &config.policy, &mut repeats)
+                    let actual = match_automod(&message, &policy, &mut repeats)
                         .map(|filter| filter.as_str().to_owned());
                     assert_eq!(actual, row.expected, "{}: message {index}", case.id);
                 }
@@ -291,7 +301,35 @@ fn every_legacy_assertion_is_mapped_once_or_more() {
             );
             mapped.insert(assertion.clone());
         }
-        if let Check::Match { messages } = &case.check {
+        if let Check::Match {
+            messages,
+            raw_bad_words,
+        } = &case.check
+        {
+            let empty_word_assertions = [
+                "test/unit.automodmatcher.test.ts:76",
+                "test/unit.automodmatcher.test.ts:77",
+                "test/unit.automodmatcher.test.ts:79",
+            ];
+            if case
+                .assertions
+                .iter()
+                .any(|reference| empty_word_assertions.contains(&reference.as_str()))
+            {
+                let words = raw_bad_words.as_ref().expect("literal empty-word policy");
+                assert!(
+                    words.iter().any(String::is_empty),
+                    "{}: no empty word",
+                    case.id
+                );
+                assert!(
+                    words
+                        .iter()
+                        .any(|word| !word.is_empty() && word.trim().is_empty()),
+                    "{}: no whitespace-only word",
+                    case.id
+                );
+            }
             if !case.assertions.is_empty() {
                 assert_eq!(
                     messages.len(),

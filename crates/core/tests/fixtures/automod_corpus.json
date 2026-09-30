@@ -504,6 +504,33 @@
       ]
     },
     {
+      "id": "supplement-config-empty-words",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD_BAD_WORDS": ",   ,blocked phrase"
+      },
+      "kind": "policy",
+      "expected": {
+        "bad_words": [
+          "blocked phrase"
+        ]
+      }
+    },
+    {
+      "id": "supplement-first-timeout-sanction",
+      "assertions": [],
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1",
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase",
+        "TWO_AUTOMOD_SANCTIONS": "1:timeout:600"
+      },
+      "kind": "sanction",
+      "count": 1,
+      "action": "timeout",
+      "timeout_seconds": 600
+    },
+    {
       "id": "supplement-sanction-0",
       "assertions": [],
       "env": {
@@ -907,12 +934,16 @@
         "test/unit.automodmatcher.test.ts:76"
       ],
       "env": {
-        "TWO_AUTOMOD_BAD_WORDS": ",   ,blocked phrase",
         "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
         "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
         "TWO_AUTOMOD_MENTION_LIMIT": "3"
       },
       "kind": "match",
+      "raw_bad_words": [
+        "",
+        "   ",
+        "blocked phrase"
+      ],
       "messages": [
         {
           "content": "synthetic greeting",
@@ -926,12 +957,16 @@
         "test/unit.automodmatcher.test.ts:77"
       ],
       "env": {
-        "TWO_AUTOMOD_BAD_WORDS": ",   ,blocked phrase",
         "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
         "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
         "TWO_AUTOMOD_MENTION_LIMIT": "3"
       },
       "kind": "match",
+      "raw_bad_words": [
+        "",
+        "   ",
+        "blocked phrase"
+      ],
       "messages": [
         {
           "content": "that was blocked phrase",
@@ -945,12 +980,15 @@
         "test/unit.automodmatcher.test.ts:79"
       ],
       "env": {
-        "TWO_AUTOMOD_BAD_WORDS": ",   ",
         "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "exe",
         "TWO_AUTOMOD_ALLOWED_DOMAINS": "trusted.gg",
         "TWO_AUTOMOD_MENTION_LIMIT": "3"
       },
       "kind": "match",
+      "raw_bad_words": [
+        "",
+        "   "
+      ],
       "messages": [
         {
           "content": "anything synthetic",
@@ -3240,12 +3278,45 @@
         "test/unit.automod.test.ts:592",
         "test/unit.automod.test.ts:593"
       ],
-      "env": {},
+      "env": {
+        "TWO_AUTOMOD": "1",
+        "TWO_AUTOMOD_ENFORCE": "1",
+        "TWO_AUTOMOD_BAD_WORDS": "blocked phrase",
+        "TWO_AUTOMOD_SANCTIONS": "1:timeout:600"
+      },
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
       "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
       "legacy_expected": {
         "setup": {
+          "dry_run": false,
+          "message": {
+            "guild_id": "fixture-guild",
+            "channel_id": "fixture-channel",
+            "message_id": "unexpected-sanction",
+            "author_id": "fixture-author",
+            "content": "blocked phrase"
+          },
+          "target": {
+            "user_id": "fixture-author",
+            "role_ids": [],
+            "highest_role_position": 1,
+            "is_bot": false,
+            "is_guild_owner": false
+          },
+          "moderation_policy": {
+            "owen_user_id": "fixture-owen",
+            "bot_user_id": "fixture-owen",
+            "protected_role_ids": []
+          },
+          "bot_highest_role_position": 10,
+          "sanctions": [
+            {
+              "violations": 1,
+              "action": "timeout",
+              "timeout_seconds": 600
+            }
+          ],
           "delete": "success",
           "timeout": "uncertain failure",
           "retry_same_id": true

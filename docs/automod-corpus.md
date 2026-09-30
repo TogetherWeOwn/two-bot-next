@@ -29,7 +29,7 @@ The coverage test requires all 212 references, unique case IDs, valid references
 matching row/assertion counts, and a separate expected outcome for every deferred
 assertion. Removing a table row and its mapping fails coverage.
 
-There are **171 fixture cases: 148 executable core cases and 23 explicitly
+There are **173 fixture cases: 150 executable core cases and 23 explicitly
 deferred cases**. The latter include 92 expanded legacy checks plus one scrubbed
 native-rule export record with no unit-test assertion. Supplemental cases have
 empty source-reference lists and are not added to the legacy assertion count.
@@ -40,6 +40,10 @@ Counts distinguish mapped expectations from executed/verified parity.
 - Harmless blocked phrases: whole words, case, NFKC/fullwidth, inter-letter spaces,
   zero-width separators, punctuation, literal regex characters, empty configured
   words, empty content, and false-positive substring/underscore boundaries.
+  The three direct-policy empty-word assertions use literal `raw_bad_words`
+  arrays, passed to the real matcher without CSV/config normalization. Inventory
+  integrity requires their empty and whitespace-only entries. Config-side
+  removal of those entries is tested separately by `supplement-config-empty-words`.
 - No blanket confusable folding is claimed: the supplemental Cyrillic-lookalike
   control does not match. Legacy uses NFKC, not Unicode confusable skeletons.
 - Explicit mentions: none, below/at/above threshold, repeated mentions of one
@@ -63,6 +67,10 @@ Counts distinguish mapped expectations from executed/verified parity.
   inclusive cutoff, and NFKC/case/whitespace identity.
 - Config enable/dry-run/enforce gates, parsed policy, invalid sanctions, and
   supplementary selection of `1:delete,2:warn,3:timeout:600` at counts 0/1/2/3/99.
+  `supplement-first-timeout-sanction` proves core selection of `1:timeout:600`
+  on violation 1. The matching deferred transport-failure record preserves the
+  enforcing mode, matched message, ordinary target and bot hierarchy from legacy;
+  its service-side timeout failure and retained claim remain unexecuted.
 - Pure target-protection and exemption projections. These **do not prove** that
   the adapter invokes protection before deletion or suppresses side effects.
 
