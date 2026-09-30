@@ -18,6 +18,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2217,6 +2223,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "two-bot-testsupport",
  "unicode-normalization",
  "url",
 ]
@@ -2267,6 +2274,16 @@ dependencies = [
 [[package]]
 name = "two-bot-next"
 version = "0.2.0"
+
+[[package]]
+name = "two-bot-testsupport"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "sqlx",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "typenum"
