@@ -15,8 +15,12 @@ python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib
 ```
 
 Choose the smallest useful target. The wrapper adds `--offline --locked`, uses
-`/paperclip/.cache/two-bot-next-bounded/slot-N/target`, disables incremental
-compilation and dev/test debuginfo **only in the child environment**. It rejects
+`/paperclip/.cache/two-bot-next-bounded/slot-N/target`, and overrides inherited
+`CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`, including
+values pointing to container `/tmp`. It sets `TMPDIR`, `TMP` and `TEMP` to the
+same lease's `slot-N/scratch`, for cooperative compiler/build/test temporary files.
+It disables incremental compilation and dev/test debuginfo **only in the child
+environment**. It rejects
 output/config overrides and manifests outside the current workspace. It neither
 changes agent environments/rosters nor release profiles. `cargo fmt --all --
 --check` does not compile and may run directly. Hosted CI and the image build keep
@@ -27,11 +31,14 @@ one Cargo invocation exclusive use of a stable target directory, preserving
 artifacts for later worktrees. A third concurrent invocation exits 75 immediately;
 it does not queue indefinitely, create another target, or fall back to a local
 `target/`. Retain/continue the card rather than evading the limit. A missing pool,
-quota receipt, low filesystem headroom, bad policy, over-budget target, or crash
-sentinel also refuses admission. Do not run direct compiling Cargo commands on the
+quota receipt, scratch-coverage receipt, low filesystem headroom, bad policy,
+over-budget target/scratch, missing scratch directory, or crash sentinel also
+refuses admission. Do not run direct compiling Cargo commands on the
 controller, including when the pool is unavailable.
 
-The wrapper samples allocated blocks and `f_bavail * f_frsize` every second. A
+The wrapper samples allocated blocks for the **whole slot**, including retained
+scratch and lease metadata, and `f_bavail * f_frsize` every second. Scratch is
+retained under the same lease/quota; it is not automatically cleaned. A
 budget/floor breach terminates its own process group and leaves `lease.json` for
 inspection. A crashed wrapper's sentinel is **never stolen**, regardless of PID
 reuse or issue status. Cargo inherits the lease FD too. Normal completed Cargo
@@ -50,13 +57,72 @@ both control-plane and actual-process checks.
   `policy.json` requires an Operator quota receipt, but this is an attestation;
   the Python tool does not create, inspect, or verify kernel quotas. Do not claim
   deployment or a hard bound without independent quota evidence.
-- Existing legacy targets, the old shared `cargo-target-two-bot-next`, Cargo's
-  registry, other repos, backups and archives are **not** included in this quota.
-  No automatic deletion or migration of these is implemented. Offline admission
-  prevents the wrapper from downloading more registry content.
+- Both `target` and `scratch` must inherit the **same pool quota**; independent
+  slot trees permit two builds, not separate unbounded compiler temp areas.
+- Existing legacy targets (including external `CARGO_TARGET_DIR` in container
+  `/tmp`), the old shared `cargo-target-two-bot-next`, Cargo's registry, other
+  repos, backups and archives are **not** included in this quota. No automatic
+  deletion or migration of these is implemented. Offline admission prevents the
+  wrapper from downloading more registry content.
 - The wrapper is a cooperative repository build entry point, not a sandbox for
-  hostile build scripts/tests and not a transparent Cargo intercept. Rollout is
-  incomplete until TWO callers use it and new legacy-target growth is checked.
+  hostile build scripts/tests and not a transparent Cargo intercept. Programs
+  hardcoding `/tmp`, custom compiler wrappers, Cargo config, or direct Cargo can
+  still write outside the pool. Rollout is incomplete until TWO callers use it,
+  external paths are accounted for, and new legacy/scratch growth is checked.
+
+### Container scratch: unresolved, fail-closed rollout gate
+
+Operator evidence at 2026-09-30 03:38Z identifies Docker writable-layer data on
+host `/home`; a container's `/tmp` is **not spare root-filesystem capacity**.
+The Operator independently measured these allocated bytes; this agent did not
+remeasure them or remove anything:
+
+| Container path | Operator-measured bytes |
+| --- | ---: |
+| `/tmp/tog-10078-fixes-target` | 4,654,657,536 |
+| `/tmp/tog-10078-db-target` | 1,527,181,312 |
+| `/tmp/two-bot-next-s2` | 2,225,819,648 |
+
+The three paths total **8,407,658,496 bytes**. Peer reports of approximately 19G
+container `/tmp` and a 20.6G writable layer are **not independently verified**;
+do not add layer totals to their component paths or claim them as reclaimed.
+The host recovery receipt `/tmp/operator-20260930T033153Z-cache-reclaimed.json`
+records a separate worktree cleanup, not removal of these scratch paths.
+
+**The worktree-only retention audit below does not cover `/tmp` or arbitrary
+external targets. Its success must not clear this gate.** Do not extend candidate
+selection by globbing `/tmp/*target*`, a directory name, or issue terminal status.
+Scratch can contain source/evidence, active runs, shared data or mixed outputs.
+
+Keep the TWO build-admission hold until the Operator records a scratch-coverage
+receipt on the **same rollout card** with:
+
+1. Canonical container-to-host mount/writable-layer mapping, measured backing
+   filesystem and allocated-byte accounting for these paths and all discovered
+   TWO Cargo target/scratch overrides. Record container identity, path aliases,
+   issue/workspace attribution, and live/queued/retry/shared references. Unknown
+   attribution or inaccessible paths mean **unresolved**, not disposable.
+2. Root-visible host/container cwd/exe/fd/mmap/**cmdline** checks with no unreadable
+   process directories, accounting for mount namespace aliases. Preserve every
+   live/shared/unattributed path and all source/evidence/archives. This script
+   neither supplies external-path eligibility nor authorizes scratch deletion;
+   any proposed external cleanup needs a separately validated exact-path procedure
+   within the existing Operator handoff. No generic `/tmp` cleanup is permitted.
+3. Adoption evidence that inherited external Cargo output and cooperative temp
+   output go to the new pool; prove quota inheritance for **target and scratch**.
+   Tiny fake invocations from two isolated workspaces suffice; no full Rust build.
+   Record before/after external-target and writable-layer growth observations.
+   Existing preserved output must be explicitly accounted for within host headroom;
+   unexplained growth or a writer ignoring the wrapper/temp settings leaves this
+   gate unresolved and goes to the Director of Engineering.
+
+Only after this evidence exists may the Operator set `scratch_coverage_receipt`
+in `policy.json` and release admission. The wrapper **refuses launch** when that
+receipt is absent/blank, even with a quota receipt. Like `quota_receipt`, this is
+an attestation pointer, not code verification of host mappings or receipt contents.
+Until then rollout remains **not deployed/unresolved**; do not fill the field with
+a placeholder. No environment/roster changes, mount/service operations, archive
+pruning or new spend are authorized by this gate.
 
 ## Offline verification
 
@@ -64,10 +130,14 @@ both control-plane and actual-process checks.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
 ```
 
-The suite launches fake compilers that write 4 KiB each and block on tiny fixture
-markers. It proves two isolated invocations run simultaneously in different slots,
-a third is refused, retained allocated bytes stay below the fixture budgets, an
-oversized writer is stopped, and signals leave a crash sentinel. Retention tests
+The suite launches fake compilers that write 4 KiB to target and 4 KiB to scratch
+each and block on tiny fixture markers. It proves two isolated invocations run
+simultaneously in different slots, a third is refused, whole-slot allocated bytes
+stay below the fixture budgets, oversized target **and scratch** writers are
+stopped, and signals leave a crash sentinel. It also tests inherited external
+Cargo/temp overrides, real `tempfile` placement, unchanged parent environment,
+missing/symlink scratch refusal, retained-scratch admission limits, missing
+scratch-coverage attestation, and preservation of the three external path fixtures. Retention tests
 include an **actual Linux child process with an open FD and mmap**, plus container
 path aliases checked by device/inode identity. All fixtures live in the run scratch
 folder when `PAPERCLIP_RUN_SCRATCH_DIR` is set. No Rust build, multi-GiB fixture,
@@ -77,7 +147,10 @@ quota state and a tiny saturation/refusal check before rollout.
 
 ## Read-only legacy retention audit
 
-Only immediate `<worktrees>/<workspace>/target` directories are candidates. Supply
+Only immediate `<worktrees>/<workspace>/target` directories are candidates.
+External targets and container scratch are **not audited** and remain covered by
+the unresolved rollout gate above; no output here is a complete storage inventory.
+Supply
 a fresh, complete, **host-scope** control-plane inventory:
 
 ```json
@@ -167,8 +240,12 @@ Code merge is not host deployment. Execution requires the reviewed, merged SHA.
    immediate inventory/proc recheck per deletion. Record exact paths and reclaimed
    allocated blocks. No source/evidence/worktree, tracked file, active/shared cache,
    backup, preservation archive, Docker image or service may be removed here.
-3. Create the **new, initially empty** pool and its two `slot-N/target` directories
-   plus `slot-N/lock` regular files. Do not repoint or migrate the old shared cache.
+3. Resolve and retain the container-scratch coverage evidence above. If mapping,
+   attribution, process visibility or external growth is unresolved, **stop rollout
+   and keep admission held**; successful worktree audit alone is insufficient.
+   Create the **new, initially empty** pool and its two `slot-N/target` and
+   `slot-N/scratch` directories plus `slot-N/lock` regular files. Do not repoint or
+   migrate the old shared cache or any legacy `/tmp` output.
    Apply an existing-supported project/directory quota to the new pool **only**,
    hard limit 17179869184 bytes. Record a quota query proving path, project ID,
    inheritance and hard limit, plus a tiny disposable limit/refusal drill in a
@@ -180,7 +257,8 @@ Code merge is not host deployment. Execution requires the reviewed, merged SHA.
    ```json
    {"version":1,"slots":2,"slot_budget_bytes":6442450944,
     "hard_limit_bytes":17179869184,"min_available_bytes":10737418240,
-    "quota_receipt":"actual retained Operator evidence reference"}
+    "quota_receipt":"actual retained Operator quota evidence reference",
+    "scratch_coverage_receipt":"actual retained Operator scratch coverage evidence reference"}
    ```
    The policy/slot count is fixed while any lease exists. It must not be writable
    by unrelated projects. Expose the new path to TWO containers using the existing
@@ -191,8 +269,10 @@ Code merge is not host deployment. Execution requires the reviewed, merged SHA.
    route. Adopt the repo wrapper for subsequent TWO builds; no full Rust build is
    needed for this rollout. Record slot usage, quota enforcement and zero new
    per-worktree targets for the first concurrent isolated invocations.
-6. Release the admission hold only after the guard, quota and monitor are verified.
-   Attach quota/audit/monitor/adoption receipts to the same Operator card.
+6. Release the admission hold only after the guard, quota, monitor **and scratch
+   coverage** are verified. Attach quota/audit/monitor/adoption/scratch receipts to
+   the same Operator card. Admission tests before final policy use disposable
+   offline fixture pools; never put a synthetic receipt in the real pool.
 
 Rollback: hold new TWO compilation, let active invocations finish (do not kill
 unrelated processes), disable only the new monitor entry and pool admission policy.

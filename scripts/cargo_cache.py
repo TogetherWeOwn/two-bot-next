@@ -75,6 +75,9 @@ def load_policy(pool):
         raise Refusal('slot budgets exceed the attested hard limit')
     if not isinstance(policy.get('quota_receipt'), str) or not policy['quota_receipt'].strip():
         raise Refusal('Operator quota receipt required; sampled checks are not a hard limit')
+    if (not isinstance(policy.get('scratch_coverage_receipt'), str)
+            or not policy['scratch_coverage_receipt'].strip()):
+        raise Refusal('Operator scratch coverage receipt required; container /tmp is not covered by target audit')
     expected = {'policy.json'} | {f'slot-{n}' for n in range(policy['slots'])}
     if {p.name for p in pool.iterdir()} != expected:
         raise Refusal('pool contents do not match immutable policy')
@@ -84,9 +87,10 @@ def load_policy(pool):
 def acquire(pool, policy):
     for number in range(policy['slots']):
         slot = real_directory(pool / f'slot-{number}')
-        if {p.name for p in slot.iterdir()} - {'lock', 'target', 'lease.json'}:
+        if {p.name for p in slot.iterdir()} - {'lock', 'target', 'scratch', 'lease.json'}:
             raise Refusal(f'unexpected slot contents: {slot}')
         target = real_directory(slot / 'target')
+        real_directory(slot / 'scratch')
         fd = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -94,7 +98,7 @@ def acquire(pool, policy):
             os.close(fd)
             continue
         try:
-            usable = not (slot / 'lease.json').exists() and usage(target) < policy['slot_budget_bytes']
+            usable = not (slot / 'lease.json').exists() and usage(slot) < policy['slot_budget_bytes']
         except Exception:
             os.close(fd)
             raise
@@ -163,6 +167,8 @@ def run_cargo(pool, args, cargo='cargo', interval=1):
         env = os.environ.copy()
         env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_TARGET_DIR=str(target),
                    CARGO_BUILD_BUILD_DIR=str(target),
+                   TMPDIR=str(slot / 'scratch'), TMP=str(slot / 'scratch'),
+                   TEMP=str(slot / 'scratch'),
                    CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0',
                    CARGO_PROFILE_TEST_DEBUG='0')
         # Pass the lease FD to Cargo as well: wrapper SIGKILL must not free it.
@@ -175,7 +181,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1):
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.signal(sig, interrupted)
         while True:
-            if usage(target) >= policy['slot_budget_bytes']:
+            if usage(slot) >= policy['slot_budget_bytes']:
                 raise Refusal('slot reached sampled byte budget; lease retained')
             if available(pool) < policy['min_available_bytes']:
                 raise Refusal('filesystem available-byte floor reached; lease retained')

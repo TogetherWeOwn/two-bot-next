@@ -28,18 +28,24 @@ class CacheTests(unittest.TestCase):
         self.pool.mkdir()
         self.policy = {'version': 1, 'slots': 2, 'slot_budget_bytes': 256 * 1024,
                        'min_available_bytes': 1, 'hard_limit_bytes': 1024 * 1024,
-                       'quota_receipt': 'synthetic fixture; not a real quota receipt'}
+                       'quota_receipt': 'synthetic fixture; not a real quota receipt',
+                       'scratch_coverage_receipt': 'synthetic fixture; not host coverage'}
         self.save_policy()
         for number in range(2):
             slot = self.pool / f'slot-{number}'
             slot.mkdir()
             (slot / 'target').mkdir()
+            (slot / 'scratch').mkdir()
             (slot / 'lock').touch()
         self.fake = self.root / 'fake-cargo'
         self.fake.write_text('#!' + sys.executable + '\n'
                              'import os,time,pathlib\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
                              '(target/"fixture").write_bytes(b"x"*4096)\n'
+                             'scratch=pathlib.Path(os.environ["TMPDIR"])\n'
+                             'assert scratch == target.parent/"scratch"\n'
+                             'assert os.environ["TMP"] == os.environ["TEMP"] == str(scratch)\n'
+                             '(scratch/"fixture").write_bytes(b"x"*4096)\n'
                              'assert os.environ["CARGO_INCREMENTAL"] == "0"\n'
                              'assert os.environ["CARGO_PROFILE_DEV_DEBUG"] == "0"\n'
                              'assert os.environ["CARGO_PROFILE_TEST_DEBUG"] == "0"\n'
@@ -91,7 +97,7 @@ class CacheTests(unittest.TestCase):
         self.assertIsNone(second.poll())
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
             cache.acquire(self.pool, self.policy)
-        total = sum(cache.usage(p) for p in self.pool.glob('slot-*/target'))
+        total = sum(cache.usage(p) for p in self.pool.glob('slot-*'))
         self.assertLessEqual(total, 2 * self.policy['slot_budget_bytes'])
         print(f'concurrency receipt: 2 running slots, third refused, {total} allocated bytes')
         for slot in self.pool.glob('slot-*'):
@@ -133,6 +139,66 @@ class CacheTests(unittest.TestCase):
         self.save_policy()
         with self.assertRaisesRegex(cache.Refusal, 'quota receipt'):
             cache.load_policy(self.pool)
+
+    def test_absent_scratch_coverage_attestation_refuses_admission(self):
+        for value in (None, '', '   '):
+            with self.subTest(value=value):
+                self.policy['scratch_coverage_receipt'] = value
+                self.save_policy()
+                with self.assertRaisesRegex(cache.Refusal, 'scratch coverage'):
+                    cache.run_cargo(self.pool, ['check'], cargo=str(self.fake))
+        self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
+
+    def test_inherited_external_targets_and_temp_are_overridden_only_in_child(self):
+        external = self.root / 'external-scratch'
+        external.mkdir()
+        overrides = {key: str(external) for key in (
+            'CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR',
+            'TMPDIR', 'TMP', 'TEMP')}
+        self.fake.write_text('#!' + sys.executable + '\n'
+                             'import os,pathlib,tempfile\n'
+                             'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
+                             'assert os.environ["CARGO_BUILD_TARGET_DIR"] == str(target)\n'
+                             'assert os.environ["CARGO_BUILD_BUILD_DIR"] == str(target)\n'
+                             'assert os.environ["TMPDIR"] == os.environ["TMP"] == os.environ["TEMP"]\n'
+                             'with tempfile.NamedTemporaryFile() as f:\n'
+                             ' assert pathlib.Path(f.name).parent == target.parent/"scratch"\n'
+                             ' f.write(b"x"*4096)\n')
+        with patch.dict(os.environ, overrides):
+            self.assertEqual(cache.run_cargo(self.pool, ['check'], cargo=str(self.fake)), 0)
+            self.assertEqual({key: os.environ[key] for key in overrides}, overrides)
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_scratch_growth_is_counted_and_stopped(self):
+        self.policy['slot_budget_bytes'] = 32 * 1024
+        self.save_policy()
+        self.fake.write_text('#!' + sys.executable + '\n'
+                             'import os,time,pathlib\n'
+                             'p=pathlib.Path(os.environ["TMPDIR"])/"growing"\n'
+                             'with p.open("wb", buffering=0) as f:\n'
+                             ' while True: f.write(b"x"*4096); time.sleep(.05)\n')
+        with self.assertRaisesRegex(cache.Refusal, 'sampled byte budget'):
+            cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
+        slot = self.pool / 'slot-0'
+        self.assertTrue((slot / 'lease.json').exists())
+        self.assertEqual(list((slot / 'target').iterdir()), [])
+        self.assertGreater(cache.usage(slot), self.policy['slot_budget_bytes'] - 1)
+        self.assertLessEqual(cache.usage(slot), 40 * 1024)
+
+    def test_missing_or_symlink_scratch_refuses_admission(self):
+        scratch = self.pool / 'slot-0' / 'scratch'
+        scratch.rmdir()
+        with self.assertRaisesRegex(cache.Refusal, 'real directory'):
+            cache.acquire(self.pool, self.policy)
+        scratch.symlink_to(self.root)
+        with self.assertRaisesRegex(cache.Refusal, 'real directory'):
+            cache.acquire(self.pool, self.policy)
+
+    def test_retained_scratch_prevents_reusing_over_budget_slots(self):
+        for slot in self.pool.glob('slot-*'):
+            (slot / 'scratch' / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
+        with self.assertRaisesRegex(cache.Refusal, 'no idle'):
+            cache.acquire(self.pool, self.policy)
 
     def test_signal_stops_build_and_leaves_crash_sentinel(self):
         child = self.start_fake()
@@ -322,6 +388,17 @@ class RetentionTests(unittest.TestCase):
         self.target.rmdir()
         self.target.symlink_to(self.root)
         self.assertEqual(self.reason(), 'symlink')
+
+    def test_external_scratch_targets_are_not_retention_candidates(self):
+        scratch = self.root / 'container-tmp'
+        scratch.mkdir()
+        for name in ('tog-10078-fixes-target', 'tog-10078-db-target', 'two-bot-next-s2'):
+            target = scratch / name
+            target.mkdir()
+            (target / 'fixture').write_bytes(b'x' * 4096)
+        receipt = self.audit()
+        self.assertEqual([row['target'] for row in receipt['candidates']], [str(self.target)])
+        self.assertEqual(len(list(scratch.glob('*/fixture'))), 3)
 
     def test_shared_cache_outside_worktrees_is_never_a_candidate(self):
         shared = self.root / 'cargo-target-two-bot-next'

@@ -6,9 +6,11 @@ isolated workspace. Pick the smallest test/package that proves the change.
 The wrapper supplies offline/locked mode, lean dev/test settings and one of two
 independent cache leases. See [the build-cache runbook](docs/build-cache.md).
 
-Do not create a per-worktree `target/`, point Cargo at the old unbounded shared
-cache, change agent environments/rosters, or evade a busy/refused/missing pool by
-running Cargo directly. A missing pool/quota receipt needs the Operator rollout;
+Do not create a per-worktree `target/` or an external/container `/tmp` Cargo target,
+point Cargo at the old unbounded shared cache, change agent environments/rosters,
+or evade a busy/refused/missing pool by running Cargo directly. The wrapper places
+cooperative temporary output in quota-covered lease scratch, not container `/tmp`.
+A missing pool/quota/scratch-coverage receipt needs the Operator rollout;
 a full pool needs safe retention/continuation, not another cache. Agents must not
 clear crash sentinels, delete host caches, mount filesystems or restart services.
 
