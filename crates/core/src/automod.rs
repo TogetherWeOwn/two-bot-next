@@ -57,6 +57,22 @@ impl AutomodFilter {
             Self::AttachmentType => "attachment_type",
         }
     }
+
+    /// Inverse of [`Self::as_str`]: parses a persisted filter name back into
+    /// the match reason. Returns `None` for unknown names so a stored
+    /// decision can never become an unhandled match.
+    #[must_use]
+    pub fn from_persisted_name(s: &str) -> Option<Self> {
+        match s {
+            "bad_words" => Some(Self::BadWords),
+            "repeated_message" => Some(Self::RepeatedMessage),
+            "mention_spam" => Some(Self::MentionSpam),
+            "invite_link" => Some(Self::InviteLink),
+            "external_link" => Some(Self::ExternalLink),
+            "attachment_type" => Some(Self::AttachmentType),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for AutomodFilter {

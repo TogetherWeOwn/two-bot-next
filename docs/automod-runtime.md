@@ -30,6 +30,13 @@ No legacy or production service is changed.
    is not persisted. Acquire `AutomodStore::claim` **before** `inspect` changes
    repeat history. `InFlight` and `Replayed` must not inspect, award, or send
    effects again; use `FunnelDisposition::None` for their cache-only handling.
+   A released pre-count claim replays as `Preserved(claim, match)` instead:
+   after `inspect` returns a match, the gateway calls
+   `AutomodStore::preserve_match` immediately, before target resolution, so a
+   same-revision retry replays the stored IDs/reason code without re-running
+   the mutable in-memory repeat tracker that unrelated traffic may have swept.
+   `Preserved` must not inspect; it still reconciles through target
+   resolution, counting and planning with its rotated claim.
 3. `AutomodRuntime::inspect` returns explicit acceptance, match, fetch, ignore,
    or unavailable. Do not turn unknown/failure into ordinary acceptance. A
    matched create is `CaptureOnly`, even in dry-run; a clean create is `Accept`.
@@ -80,14 +87,22 @@ from `TWO_AUTOMOD_ENFORCE` itself.
 
 ## Persistence and recovery
 
-Apply migrations `0220`–`0222` via the existing cutover migration runner.
+Apply migrations `0220`–`0223` via the existing cutover migration runner.
 The legacy table/column names remain unchanged. Delivery claims are separate
 from the legacy processed-message ledger. Claim capabilities fence stale
 completions and safe reacquisition; keep them internal and do not log them.
 Migration `0222` records the counted phase on the claim atomically with the
 ledger commit: a counted claim survives `release_unmutated` as reconciliation
 evidence, and a retry replays it (`InFlight`) instead of acquiring a fresh
-claim that would plan `AlreadyProcessed` with no effects.
+claim that would plan `AlreadyProcessed` with no effects. Migration `0223`
+adds the preserved pre-count decision to the claim (`matched_filter` plus the
+four subject IDs, all IDs/reason code only, never message content) with a
+`released` handoff flag: `preserve_match` is owner-gated and idempotent, set
+once per active unmutated claim; `release_unmutated` marks a decided claim
+released instead of deleting it; the same-revision retry rotates the claim
+token and replays `Preserved(claim, match)`, while a concurrently owned
+unreleased row stays `InFlight` and an unknown stored filter name never
+invents a match. Stale tokens cannot start mutations, complete, or count.
 
 There is deliberately no expiring mutation lease. A crash/timeout after the
 mutation fence leaves an in-flight claim requiring recorded reconciliation,
@@ -96,15 +111,17 @@ single transaction: a crash after counting but before sending is also a
 reconciliation case, not proof that Discord acted. Duplicate suppression favours
 no repeated sanctions over pretending exactly-once remote execution.
 
-Pre-count resolver failures may release an unmutated claim. A same-revision
-retry re-inspects deterministically on the stable edit clock, so it
-reproduces the prior IDs/reason-code decision instead of degrading to a
-fresh acceptance as the receipt clock advances; the retry must still
-reconcile through target resolution, counting and planning. An unavailable
-inspection must not award XP. No automatic recovery, retention deletion, or
-claim reset is included here. Shared integration must make the funnel's own
-writes idempotent for crash recovery and mode transitions; the synchronous S3
-in-memory pipeline is not a durable production store.
+Pre-count resolver failures may release an unmutated claim. When the claim
+carries a preserved decision, a same-revision retry replays the stored
+IDs/reason code instead of re-running the mutable in-memory repeat tracker,
+which unrelated traffic may have swept in the meantime; without a preserved
+decision the retry re-inspects deterministically on the stable edit clock.
+Either way the retry must still reconcile through target resolution,
+counting and planning. An unavailable inspection must not award XP. No
+automatic recovery, retention deletion, or claim reset is included here.
+Shared integration must make the funnel's own writes idempotent for crash
+recovery and mode transitions; the synchronous S3 in-memory pipeline is not
+a durable production store.
 
 ## Gates and evidence
 
@@ -121,8 +138,9 @@ in-memory pipeline is not a durable production store.
   password), or the explicit GitHub Actions Postgres service container. It has
   no `DATABASE_URL` fallback and creates/drops only its isolated test schema.
 - DB assertions cover 20-way claim contention, edit contention, replay,
-  stale-token fencing, dry-run refusal, uncertain-mutation retention, three
-  processed messages and a final violation count of three.
+  stale-token fencing, dry-run refusal, uncertain-mutation retention,
+  counted-claim reconciliation, preserved pre-count decision replay, five
+  processed messages and a final violation count of five.
 
 Commands (existing Rust installation, target directory outside the synced tree):
 

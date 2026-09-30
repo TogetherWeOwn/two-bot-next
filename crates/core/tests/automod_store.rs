@@ -3,7 +3,8 @@
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
 use two_bot_core::automod_runtime::{
-    DeliveryKey, MessageDeliveryKind, MessageSubject, STAGING_GUILD_ID,
+    AutomodMatch, DeliveryKey, FunnelDisposition, MessageDeliveryKind, MessageSubject,
+    STAGING_GUILD_ID,
 };
 use two_bot_core::automod_store::{
     AutomodStore, ClaimResult, CompletionKind, DeliveryClaim, StoredOutcome,
@@ -88,6 +89,12 @@ async fn durable_claims_ledger_concurrency_and_recovery() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0223_automod_preserved_match.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
     let store = AutomodStore::new(pool.clone());
     let at = "2026-09-30T00:00:00.000Z";
 
@@ -106,6 +113,7 @@ async fn durable_claims_ledger_concurrency_and_recovery() {
             ClaimResult::Acquired(claim) => claims.push(claim),
             ClaimResult::InFlight => in_flight += 1,
             ClaimResult::Replayed(_) => panic!("not completed yet"),
+            ClaimResult::Preserved(_, _) => panic!("no decision preserved yet"),
         }
     }
     assert_eq!(claims.len(), 1);
@@ -257,21 +265,82 @@ async fn durable_claims_ledger_concurrency_and_recovery() {
         .await
         .is_err());
 
+    // A released pre-count decision replays after unrelated traffic sweeps
+    // the mutable in-memory repeat history: preserve the inspect decision,
+    // release before counting, then the same-revision retry rotates ownership
+    // and replays the IDs/reason code without re-running the tracker.
+    let preserved_key = key("preserved", "revision", false);
+    let preserved_first = acquire(&store, &preserved_key).await;
+    let preserved_match = AutomodMatch {
+        subject: subject("preserved"),
+        filter: AutomodFilter::BadWords,
+        funnel: FunnelDisposition::CaptureOnly,
+    };
+    assert!(store
+        .preserve_match(&preserved_first, &preserved_match)
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .preserve_match(&preserved_first, &preserved_match)
+            .await
+            .unwrap(),
+        "preserving twice is idempotent"
+    );
+    assert!(store.release_unmutated(&preserved_first).await.unwrap());
+    let ClaimResult::Preserved(retry, replayed) = store.claim(&preserved_key).await.unwrap() else {
+        panic!("released decision must replay to the retry")
+    };
+    assert_eq!(replayed.subject, subject("preserved"));
+    assert_eq!(replayed.filter, AutomodFilter::BadWords);
+    assert_eq!(replayed.funnel, FunnelDisposition::CaptureOnly);
+    let preserved_record = store
+        .record_violation(&retry, &subject("preserved"), replayed.filter, at)
+        .await
+        .unwrap();
+    assert!(preserved_record.inserted);
+    assert!(store.mark_mutation_started(&retry).await.unwrap());
+    let preserved_receipt = StoredOutcome {
+        matched: true,
+        deleted: true,
+        outcome: CompletionKind::Deleted,
+    };
+    assert!(store.complete(&retry, &preserved_receipt).await.unwrap());
+    assert!(matches!(
+        store.claim(&preserved_key).await.unwrap(),
+        ClaimResult::Replayed(r) if r == preserved_receipt
+    ));
+    // The released first token is stale: it cannot count, start, or settle.
+    assert!(store
+        .record_violation(
+            &preserved_first,
+            &subject("preserved"),
+            AutomodFilter::BadWords,
+            at
+        )
+        .await
+        .is_err());
+    assert!(!store.mark_mutation_started(&preserved_first).await.unwrap());
+    assert!(!store
+        .complete(&preserved_first, &preserved_receipt)
+        .await
+        .unwrap());
+
     // IDs/reason codes only: neither legacy table has message content columns.
-    // Four processed messages: one/two/three plus the counted-reconciliation
-    // message above, all from the same author.
+    // Five processed messages: one/two/three plus the counted-reconciliation
+    // and preserved-decision messages above, all from the same author.
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM automod_processed_messages")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
     let (count,): (i32,) = sqlx::query_as(
         "SELECT violation_count FROM automod_violations WHERE user_id = '444444444444444444'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
     let (text_columns,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema()
          AND column_name IN ('content', 'message_content', 'matched_excerpt')",
