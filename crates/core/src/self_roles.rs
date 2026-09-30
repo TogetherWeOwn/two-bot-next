@@ -226,7 +226,6 @@ impl std::fmt::Display for PlanRejection {
 ///   panel it plans a replace that drops the other held panel roles.
 /// - Already-held / already-absent inputs plan empty mutations so duplicate
 ///   gateway deliveries are idempotent no-ops.
-#[must_use]
 pub fn plan_self_role_change(
     panel: &SelfRolePanel,
     option_key: &str,
@@ -336,13 +335,18 @@ pub fn plan_select_delta(
         .map(String::as_str)
         .filter(|id| offered.contains(id))
         .collect();
-    let add_role_ids: Vec<String> = desired
-        .difference(&current)
-        .map(|s| (*s).to_owned())
+    // Keep catalogue order so repeated plans have stable mutation ordering.
+    let add_role_ids: Vec<String> = panel
+        .options
+        .iter()
+        .filter(|o| desired.contains(o.role_id.as_str()) && !current.contains(o.role_id.as_str()))
+        .map(|o| o.role_id.clone())
         .collect();
-    let remove_role_ids: Vec<String> = current
-        .difference(&desired)
-        .map(|s| (*s).to_owned())
+    let remove_role_ids: Vec<String> = panel
+        .options
+        .iter()
+        .filter(|o| current.contains(o.role_id.as_str()) && !desired.contains(o.role_id.as_str()))
+        .map(|o| o.role_id.clone())
         .collect();
     let operation = if panel.exclusive || (!add_role_ids.is_empty() && !remove_role_ids.is_empty())
     {
@@ -1419,6 +1423,48 @@ mod tests {
             .expect("plans");
         assert!(plan.remove_role_ids.is_empty());
         assert_eq!(plan.outcome, SettledOutcome::AlreadyAbsent);
+    }
+
+    #[test]
+    fn reaction_add_and_remove_duplicates_are_noops() {
+        let mut panel = panel();
+        panel.mode = PanelMode::Reaction;
+        let add = plan_self_role_change(&panel, "chess", &held(&[]), PanelMode::Reaction, false)
+            .expect("add");
+        assert_eq!(add.add_role_ids, [ROLE_A]);
+        let duplicate_add = plan_self_role_change(
+            &panel,
+            "chess",
+            &held(&[ROLE_A]),
+            PanelMode::Reaction,
+            false,
+        )
+        .expect("duplicate add");
+        assert_eq!(duplicate_add.outcome, SettledOutcome::AlreadyHeld);
+        assert!(duplicate_add.add_role_ids.is_empty());
+        let remove =
+            plan_self_role_change(&panel, "chess", &held(&[ROLE_A]), PanelMode::Reaction, true)
+                .expect("remove");
+        assert_eq!(remove.remove_role_ids, [ROLE_A]);
+        let duplicate_remove =
+            plan_self_role_change(&panel, "chess", &held(&[]), PanelMode::Reaction, true)
+                .expect("duplicate remove");
+        assert_eq!(duplicate_remove.outcome, SettledOutcome::AlreadyAbsent);
+        assert!(duplicate_remove.remove_role_ids.is_empty());
+    }
+
+    #[test]
+    fn select_plans_are_stable_and_preserve_unrelated_roles() {
+        let panel = panel();
+        let desired = vec![ROLE_B.to_owned(), ROLE_A.to_owned()];
+        let roles = held(&[ROLE_C]);
+        for _ in 0..20 {
+            let plan = plan_select_delta(&panel, &roles, &desired).expect("plan");
+            assert_eq!(plan.add_role_ids, [ROLE_A, ROLE_B]);
+            assert!(plan.remove_role_ids.is_empty());
+        }
+        let plan = plan_select_delta(&panel, &held(&[ROLE_A, ROLE_B, ROLE_C]), &[]).expect("clear");
+        assert_eq!(plan.remove_role_ids, [ROLE_A, ROLE_B]);
     }
 
     #[test]
