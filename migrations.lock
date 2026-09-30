@@ -72,6 +72,14 @@
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."
+    },
+    "crates/cutover/migrations/0200_voice_rooms.sql": {
+      "sha256": "369accb6dacb308212282b37883a52579c3a168b8ab19b41027672878c0259d5",
+      "justification": "New V1 creator/room tables for TOG-10093; no existing migration touched."
+    },
+    "crates/cutover/migrations/0201_voice_inherit_limit.sql": {
+      "sha256": "d1a9abe893e8b030db21452f29506a924d60bd7b880d7cef9debc53deb0dd4b4",
+      "justification": "New V1 nullable creator-limit inherit for TOG-10093; no existing migration touched."
     }
   }
 }

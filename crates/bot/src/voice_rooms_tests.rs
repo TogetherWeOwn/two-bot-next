@@ -826,7 +826,9 @@ fn setup_panel_surfaces_store_errors() {
         halted: false,
         store_error: Some("Unavailable".to_owned()),
     });
-    assert!(panel.description.contains("Could not load creator channels"));
+    assert!(panel
+        .description
+        .contains("Could not load creator channels"));
     assert!(!panel.description.contains("No creator channels yet"));
 }
 
