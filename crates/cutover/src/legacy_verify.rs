@@ -130,7 +130,7 @@ struct Inventory {
 }
 
 fn select_sql(table: &TableMapping, source: bool) -> Result<String, MappingError> {
-    let projections: Result<Vec<_>, _> = table
+    let projections: Result<Vec<_>, MappingError> = table
         .columns
         .iter()
         .enumerate()
