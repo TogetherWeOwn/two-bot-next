@@ -46,6 +46,13 @@ fn action_error(error: SettingsWriteError) -> ActionError {
                 WriteRefusal::EnvOnly(_) => "settings_key_env_only",
                 WriteRefusal::Unknown(_) => "settings_key_unknown",
                 WriteRefusal::MissingActor => "missing_updated_by",
+                WriteRefusal::NullCharacter => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" cannot contain U+0000",
+                        "settings_value_nul",
+                    );
+                }
             };
             ActionError::new(
                 ErrorCode::ActionNotAllowed,
@@ -78,5 +85,10 @@ mod tests {
         assert_eq!(conflict.status(), 409);
         assert_eq!(conflict.code.as_str(), "version_conflict");
         assert!(!conflict.code.retryable());
+        let malformed = action_error(SettingsWriteError::Refused(WriteRefusal::NullCharacter));
+        assert_eq!(malformed.code, ErrorCode::Malformed);
+        assert_eq!(malformed.status(), 400);
+        assert!(!malformed.code.retryable());
+        assert_eq!(malformed.log_reason, "settings_value_nul");
     }
 }

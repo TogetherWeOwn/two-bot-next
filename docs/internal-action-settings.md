@@ -31,7 +31,10 @@ No set response or log outcome includes the submitted value.
 Both actions refuse unknown and environment-only keys, including secret,
 capability, boot and network settings. Key classification is fail-closed.
 Request/result Debug output is redacted, and raw SQL error details are discarded
-at the action boundary because database errors can include row values.
+at the action boundary because database errors can include row values. Decoded
+U+0000 in any value string or nested object key is refused before SQL with a
+non-retryable `malformed`/400 result; Postgres JSONB cannot store it. The refusal
+contains no submitted value. A literal backslash-u escape is not a decoded NUL.
 
 ## Execution and optimistic concurrency
 
@@ -57,8 +60,11 @@ need a separate revision contract; this slice does not redefine legacy results.
 
 The value write/delete, audit transition and poll-revision advance commit in
 one settings transaction. Audit failure rolls back all three. Row versions
-advance on save; deletion advances the transactional poll revision. No runtime
-hot-reload consumer is changed here.
+advance on every insert/update, including supported direct SQL writers, via
+migration `0331`'s database-owned row trigger. Caller-supplied versions are
+ignored; the upgrade seeds the allocator above existing row tokens without
+changing migration `0330`. Deletion advances the transactional poll revision.
+No runtime hot-reload consumer is changed here.
 
 The outer durable store and this transaction are separate. A receiver must not
 re-execute an ambiguous write after losing a terminal-response commit. Its

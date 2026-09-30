@@ -27,7 +27,7 @@ pub struct SettingsStore<'a> {
 }
 
 impl<'a> SettingsStore<'a> {
-    /// Borrow the pool; migrations (including `0330`) are applied by
+    /// Borrow the pool; migrations (including `0330` and `0331`) are applied by
     /// [`crate::CutoverDb::migrate`], not here.
     #[must_use]
     pub fn new(pool: &'a Pool<Postgres>) -> Self {
@@ -162,22 +162,23 @@ impl<'a> SettingsStore<'a> {
                     .await?;
                 0
             }
-            WriteAction::Upsert(value) => sqlx::query_scalar(
-                "INSERT INTO guild_settings (guild_id, key, value, version, updated_at, updated_by)
-                     VALUES ($1, $2, $3, nextval('guild_settings_version_seq'), now(), $4)
+            WriteAction::Upsert(value) => {
+                sqlx::query_scalar(
+                    "INSERT INTO guild_settings (guild_id, key, value, updated_at, updated_by)
+                     VALUES ($1, $2, $3, now(), $4)
                      ON CONFLICT (guild_id, key) DO UPDATE
                        SET value = EXCLUDED.value,
-                           version = EXCLUDED.version,
                            updated_at = EXCLUDED.updated_at,
                            updated_by = EXCLUDED.updated_by
                      RETURNING version",
-            )
-            .bind(guild_id)
-            .bind(key)
-            .bind(value)
-            .bind(&validated.actor)
-            .fetch_one(&mut *tx)
-            .await?,
+                )
+                .bind(guild_id)
+                .bind(key)
+                .bind(value)
+                .bind(&validated.actor)
+                .fetch_one(&mut *tx)
+                .await?
+            }
         };
 
         let old_json = previous.map(|(v, _)| v);

@@ -26,6 +26,22 @@ struct TestDb {
 
 impl TestDb {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let db = Self::new_legacy().await?;
+        db.migrate_row_versions().await?;
+        Ok(db)
+    }
+
+    async fn migrate_row_versions(&self) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0331_guild_settings_versions.sql"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    }
+
+    async fn new_legacy() -> Result<Self, Box<dyn std::error::Error>> {
         // The endpoint is chosen here, never from DATABASE_URL or any app
         // config. CI uses only its disposable trust-authenticated service.
         let host = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
@@ -263,6 +279,143 @@ async fn internal_settings_stale_save_and_delete_leave_no_side_effects() -> Test
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn direct_sql_updates_invalidate_stale_save_and_delete_tokens() -> TestResult {
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let mut token = execute_settings(&store, GUILD, &save(json!(8), Some(0)))
+        .await?
+        .observed_version;
+    for statement in [
+        "UPDATE guild_settings SET value = '9' WHERE guild_id = $1 AND key = $2",
+        "INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
+         VALUES ($1, $2, '9', 1, 'direct-writer')
+         ON CONFLICT (guild_id, key) DO UPDATE SET value = EXCLUDED.value, version = EXCLUDED.version",
+        "UPDATE guild_settings SET version = 1 WHERE guild_id = $1 AND key = $2",
+    ] {
+        sqlx::query(statement)
+            .bind(GUILD)
+            .bind(KEY)
+            .execute(&db.pool)
+            .await?;
+        let current = store.get(GUILD, KEY).await?.unwrap();
+        assert_eq!(current.0, json!(9));
+        assert!(current.1 > token, "even supplied versions must be replaced");
+        let marks = store.poll_marks().await?;
+        for value in [json!(10), Value::Null] {
+            let error = execute_settings(&store, GUILD, &save(value, Some(token)))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::VersionConflict);
+            assert_eq!(store.get(GUILD, KEY).await?, Some(current.clone()));
+            assert_eq!(store.poll_marks().await?, marks);
+            assert_eq!(db.audit().await?.len(), 1);
+        }
+        token = current.1;
+    }
+    // The fresh token is usable, and the audit records the direct writer's value.
+    let saved = execute_settings(&store, GUILD, &save(json!(10), Some(token))).await?;
+    assert!(saved.observed_version > token);
+    assert_eq!(db.audit().await?[1], (Some(json!(9)), Some(json!(10))));
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn version_migration_preserves_rows_and_seeds_above_existing_tokens() -> TestResult {
+    let db = TestDb::new_legacy().await?;
+    // Both an extant manually assigned token and an allocated but unused token
+    // must remain below every future database-owned version.
+    sqlx::query(
+        "INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
+         VALUES ($1, $2, '8', 1000000, 'legacy-writer')",
+    )
+    .bind(GUILD)
+    .bind(KEY)
+    .execute(&db.pool)
+    .await?;
+    let store = SettingsStore::new(&db.pool);
+    let before = store.poll_marks().await?;
+    db.migrate_row_versions().await?;
+    assert_eq!(store.get(GUILD, KEY).await?, Some((json!(8), 1000000)));
+    assert_eq!(store.poll_marks().await?, before);
+    sqlx::query("UPDATE guild_settings SET value = '9' WHERE guild_id = $1 AND key = $2")
+        .bind(GUILD)
+        .bind(KEY)
+        .execute(&db.pool)
+        .await?;
+    let token = store.get(GUILD, KEY).await?.unwrap().1;
+    assert!(token > 1000000);
+    assert_eq!(
+        execute_settings(&store, GUILD, &save(json!(10), Some(1000000)))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::VersionConflict
+    );
+    assert!(db.audit().await?.is_empty());
+    db.finish().await?;
+
+    let db = TestDb::new_legacy().await?;
+    sqlx::query("SELECT setval('guild_settings_version_seq', 2000000, true)")
+        .execute(&db.pool)
+        .await?;
+    db.migrate_row_versions().await?;
+    let saved = execute_settings(
+        &SettingsStore::new(&db.pool),
+        GUILD,
+        &save(json!(8), Some(0)),
+    )
+    .await?;
+    assert!(saved.observed_version > 2000000, "allocator never rewinds");
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
+async fn json_nul_refusals_preserve_value_version_revision_and_audit() -> TestResult {
+    let db = TestDb::new().await?;
+    let store = SettingsStore::new(&db.pool);
+    let saved = execute_settings(&store, GUILD, &save(json!(8), Some(0))).await?;
+    let marks = store.poll_marks().await?;
+    for value in [
+        json!("private-value\0"),
+        json!([{"nested": ["private-value\0"]}]),
+        json!({"nested": {"private-key\0": 8}}),
+    ] {
+        let body = json!({"key": KEY, "value": value, "updated_by": ADMIN});
+        let error = SettingsCommand::parse("settings.set", body.as_object().unwrap()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Malformed);
+        assert_eq!(error.status(), 400);
+        assert!(!error.code.retryable());
+        assert!(!format!("{error:?}").contains("private-"));
+        // Alternate SettingsStore writers have the same pre-SQL guard.
+        let error = store.set(GUILD, KEY, Some(value), ADMIN).await.unwrap_err();
+        assert!(matches!(
+            error,
+            two_bot_cutover::settings::SettingsWriteError::Refused(
+                two_bot_core::settings::WriteRefusal::NullCharacter
+            )
+        ));
+        assert_eq!(
+            store.get(GUILD, KEY).await?,
+            Some((json!(8), saved.observed_version))
+        );
+        assert_eq!(store.poll_marks().await?, marks);
+        assert_eq!(db.audit().await?.len(), 1);
+    }
+    let valid = json!({"nested": ["literal \\u0000", "unicode \u{1}é😀", null]});
+    execute_settings(
+        &store,
+        GUILD,
+        &save(valid.clone(), Some(saved.observed_version)),
+    )
+    .await?;
+    assert_eq!(store.get(GUILD, KEY).await?.unwrap().0, valid);
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI Postgres service"]
 async fn internal_settings_concurrent_create_has_one_winner_and_one_audit() -> TestResult {
     let db = TestDb::new().await?;
     let store = SettingsStore::new(&db.pool);
@@ -369,7 +522,7 @@ async fn numeric_settings_round_trip_into_integer_config_readers() -> TestResult
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or the CI Postgres service"]
-async fn lower_sequence_commit_and_same_count_delete_are_seen_by_one_poll() -> TestResult {
+async fn supplied_versions_are_replaced_and_same_count_delete_is_seen_by_one_poll() -> TestResult {
     let db = TestDb::new().await?;
     let store = SettingsStore::new(&db.pool);
     store.set("g1", KEY, Some(json!(1)), "seed").await?;
@@ -385,7 +538,7 @@ async fn lower_sequence_commit_and_same_count_delete_are_seen_by_one_poll() -> T
     assert!(lower < max_before);
     let mut cache = SettingsCache::load(&store.load_snapshot().await?);
 
-    // The low sequence was allocated first, but its write commits last.
+    // An old caller-supplied sequence must not revive a prior row token.
     sqlx::query("UPDATE guild_settings SET value = '2', version = $1 WHERE key = $2")
         .bind(lower)
         .bind(KEY)
@@ -400,7 +553,10 @@ async fn lower_sequence_commit_and_same_count_delete_are_seen_by_one_poll() -> T
     let max_after: i64 = sqlx::query_scalar("SELECT max(version) FROM guild_settings")
         .fetch_one(&db.pool)
         .await?;
-    assert_eq!(max_before, max_after);
+    assert!(
+        max_after > max_before,
+        "the row trigger replaces the stale token"
+    );
     let after = store.poll_marks().await?;
     assert_eq!(before.1, after.1);
     assert!(cache.needs_refresh(after.0, after.1));

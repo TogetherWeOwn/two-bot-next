@@ -5,6 +5,7 @@ use serde_json::{json, Map, Value};
 use crate::internal_actions::{
     check_setting_value_size, require_settings_key, require_snowflake, ActionError, ErrorCode,
 };
+use crate::settings::contains_json_nul;
 
 /// Only the parser can construct a command; values are redacted from Debug.
 #[derive(Clone)]
@@ -51,6 +52,13 @@ impl SettingsCommand {
                 )
             })?;
             check_setting_value_size(value)?;
+            if contains_json_nul(value) {
+                return Err(ActionError::new(
+                    ErrorCode::Malformed,
+                    "\"value\" cannot contain U+0000",
+                    "settings_value_nul",
+                ));
+            }
             let expected_version = body
                 .get("expected_version")
                 .map(|v| {
@@ -198,6 +206,36 @@ mod tests {
                 assert_eq!(error.log_reason, reason);
                 assert!(!format!("{error:?}").contains("private-value"));
             }
+        }
+    }
+
+    #[test]
+    fn refuses_json_nul_in_nested_values_and_keys_without_echoing_input() {
+        for value in [
+            json!("private-value\0"),
+            json!([{"nested": ["private-value\0"]}]),
+            json!({"nested": {"private-key\0": 8}}),
+        ] {
+            let error = parse(
+                "settings.set",
+                json!({"key": KEY, "value": value, "updated_by": ADMIN}),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::Malformed);
+            assert_eq!(error.status(), 400);
+            assert!(!error.code.retryable());
+            assert_eq!(error.log_reason, "settings_value_nul");
+            assert!(!format!("{error:?}").contains("private-"));
+        }
+        for value in [
+            json!("literal \\u0000 is not a decoded NUL"),
+            json!({"nested": [null, true, 8, "unicode \u{1}é😀"]}),
+        ] {
+            assert!(parse(
+                "settings.set",
+                json!({"key": KEY, "value": value, "updated_by": ADMIN}),
+            )
+            .is_ok());
         }
     }
 
