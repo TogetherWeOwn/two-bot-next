@@ -237,17 +237,31 @@ impl AutomodRuntime {
             return Inspection::Accepted(delivery.kind.funnel(false));
         }
         let mut message = snapshot.clone();
-        // Creates use message time; edits use receipt time, not original creation.
         if delivery.kind == MessageDeliveryKind::Update {
-            message.observed_timestamp_ms = delivery.observed_timestamp_ms;
+            // Stable revision clock: re-inspection of the same edit revision
+            // stays deterministic across gateway retries (same key, same
+            // clock) instead of degrading to a fresh acceptance as the receipt
+            // clock advances past the repeat window. Fall back to receipt time
+            // only when Discord supplied no stable edit stamp.
+            message.observed_timestamp_ms = delivery
+                .edited_timestamp_ms
+                .unwrap_or(delivery.observed_timestamp_ms);
         }
-        // Sweep on the same clock observations use: a delayed/resumed batch of
-        // creates must not erase the repeat history it still needs. The shared
-        // maintenance tick only expires idle authors between dispatches.
-        self.repeats.expire(
-            message.observed_timestamp_ms,
-            self.config.policy.repeated_message_window_seconds,
-        );
+        // Sweep on the message clock, never on a receipt clock ahead of it: a
+        // receipt-clocked update must not expire other authors' pending
+        // message-clock create batches. Per-author window pruning still runs
+        // at the full observation time inside `observe`, so edit-window expiry
+        // for the updating author is preserved. The shared maintenance tick
+        // only expires idle authors between dispatches.
+        let sweep_ms = match delivery.kind {
+            MessageDeliveryKind::Create => message.observed_timestamp_ms,
+            MessageDeliveryKind::Update => match self.newest_observation_ms {
+                Some(newest) => message.observed_timestamp_ms.min(newest),
+                None => message.observed_timestamp_ms,
+            },
+        };
+        self.repeats
+            .expire(sweep_ms, self.config.policy.repeated_message_window_seconds);
         // Delay-ordered dispatches carry their own clock: only advance the
         // newest observation, never step it back for an older message.
         if delivery.kind == MessageDeliveryKind::Create {

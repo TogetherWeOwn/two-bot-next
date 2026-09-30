@@ -389,6 +389,96 @@ fn attachment_blocklist_and_exemptions_apply_in_runtime() {
 }
 
 #[test]
+fn interleaved_update_does_not_erase_delayed_create_history() {
+    // Mixed resumed batch: identical creates at 0/10/20 s with an unrelated
+    // update from another author between them, all received at 60 s. The
+    // receipt-clocked update must not expire the pending message-clock batch.
+    fn batch(with_update: bool) -> Inspection {
+        let mut runtime = runtime(true);
+        for (id, at_ms) in [("1", 0), ("2", 10_000)] {
+            let mut msg = delivery(MessageDeliveryKind::Create, "same");
+            msg.message_id = id.into();
+            let snapshot = msg.snapshot.as_mut().unwrap();
+            snapshot.message_id = id.into();
+            snapshot.observed_timestamp_ms = at_ms;
+            assert_eq!(
+                runtime.inspect(&msg),
+                Inspection::Accepted(FunnelDisposition::Accept)
+            );
+        }
+        if with_update {
+            let mut update = delivery(MessageDeliveryKind::Update, "unrelated");
+            update.message_id = "99".into();
+            update.edited_timestamp_ms = Some(20_000);
+            update.observed_timestamp_ms = 60_000;
+            let snapshot = update.snapshot.as_mut().unwrap();
+            snapshot.message_id = "99".into();
+            snapshot.author_id = "555555555555555555".into();
+            snapshot.observed_timestamp_ms = 0;
+            assert_eq!(
+                runtime.inspect(&update),
+                Inspection::Accepted(FunnelDisposition::None)
+            );
+        }
+        let mut third = delivery(MessageDeliveryKind::Create, "same");
+        third.message_id = "3".into();
+        let snapshot = third.snapshot.as_mut().unwrap();
+        snapshot.message_id = "3".into();
+        snapshot.observed_timestamp_ms = 20_000;
+        runtime.inspect(&third)
+    }
+    let control = batch(false);
+    assert!(
+        matches!(&control, Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage)
+    );
+    let interleaved = batch(true);
+    assert!(
+        matches!(&interleaved, Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage),
+        "unrelated update must not erase delayed creates"
+    );
+}
+
+#[test]
+fn same_revision_retry_reproduces_match_after_window_advance() {
+    // Pre-count resolver failure path: two creates establish repeat history,
+    // an edit matches, the claim is released before counting, and the same
+    // revision is retried after the receipt clock advances past the window.
+    // The stable edit stamp keeps the key and the clock identical, so the
+    // retry reproduces the match instead of degrading to a fresh acceptance.
+    let mut runtime = runtime(true);
+    for (id, at_ms) in [("1", 0), ("2", 10_000)] {
+        let mut msg = delivery(MessageDeliveryKind::Create, "same");
+        msg.message_id = id.into();
+        let snapshot = msg.snapshot.as_mut().unwrap();
+        snapshot.message_id = id.into();
+        snapshot.observed_timestamp_ms = at_ms;
+        assert_eq!(
+            runtime.inspect(&msg),
+            Inspection::Accepted(FunnelDisposition::Accept)
+        );
+    }
+    let mut edit = delivery(MessageDeliveryKind::Update, "same");
+    edit.message_id = "3".into();
+    edit.edited_timestamp_ms = Some(20_000);
+    edit.observed_timestamp_ms = 20_000;
+    let snapshot = edit.snapshot.as_mut().unwrap();
+    snapshot.message_id = "3".into();
+    snapshot.observed_timestamp_ms = 0;
+    let first = runtime.inspect(&edit);
+    assert!(
+        matches!(&first, Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage)
+    );
+    let key = DeliveryKey::from_delivery(&edit, false).unwrap();
+    edit.observed_timestamp_ms = 60_000;
+    assert_eq!(DeliveryKey::from_delivery(&edit, false).unwrap(), key);
+    let retry = runtime.inspect(&edit);
+    assert!(
+        matches!(&retry, Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage),
+        "pre-count retry must preserve an already matched decision"
+    );
+}
+
+#[test]
 fn delayed_create_batch_keeps_repeat_history_on_message_clock() {
     // Resumed gateway batch: three identical creates at 0/10/20 s, all
     // received at 60 s. The sweep must run on the message clock, so the

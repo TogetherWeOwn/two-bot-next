@@ -64,8 +64,14 @@ No legacy or production service is changed.
 9. Invoke `expire_repeat_history(now_ms)` from the shared maintenance tick.
    Inspection also sweeps inactive authors. Both run on the message clock:
    delayed/resumed batches never erase the repeat history they still need,
-   and an idle tick never sweeps ahead of the newest observation. No private
-   ticker is introduced.
+   and an idle tick never sweeps ahead of the newest observation. Updates
+   inspect on the stable `edited_timestamp_ms` revision clock (receipt time
+   only when Discord supplied no edit stamp), so a same-revision retry
+   re-inspects deterministically; the global sweep for an update is clamped
+   to the newest message-clock observation and never advances on a receipt
+   clock ahead of it. Per-author window pruning still runs at the full
+   observation time, preserving edit-window expiry. No private ticker is
+   introduced.
 
 The caller must serialize repeat-history observations in gateway order. Do not
 hold a synchronous pipeline mutex across an await. Target policy/activation
@@ -90,7 +96,11 @@ single transaction: a crash after counting but before sending is also a
 reconciliation case, not proof that Discord acted. Duplicate suppression favours
 no repeated sanctions over pretending exactly-once remote execution.
 
-Pre-count resolver failures may release an unmutated claim. An unavailable
+Pre-count resolver failures may release an unmutated claim. A same-revision
+retry re-inspects deterministically on the stable edit clock, so it
+reproduces the prior IDs/reason-code decision instead of degrading to a
+fresh acceptance as the receipt clock advances; the retry must still
+reconcile through target resolution, counting and planning. An unavailable
 inspection must not award XP. No automatic recovery, retention deletion, or
 claim reset is included here. Shared integration must make the funnel's own
 writes idempotent for crash recovery and mode transitions; the synchronous S3
