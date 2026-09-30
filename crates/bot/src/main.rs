@@ -6,6 +6,8 @@
 //! on staging config either way.
 
 mod gateway;
+#[cfg(test)]
+mod gateway_tests;
 mod server;
 
 use std::sync::Arc;
@@ -49,12 +51,47 @@ async fn main() {
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
 
     if let Some(token) = config.discord_token.clone().filter(|t| !t.is_empty()) {
-        // S5 offers the persisted session here for RESUME; fresh IDENTIFY
-        // until then.
-        let shard = build_shard(token, intents_from_env(), None);
-        let pipeline = Arc::new(build_pipeline());
-        info!("discord token present; gateway shard connecting");
-        tokio::spawn(run_shard(shard, pipeline, Arc::clone(&state)));
+        let database_url = config.database_url.clone();
+        let guild_id = config.guild_id;
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let result: Result<(), sqlx::Error> = async {
+                let url = database_url
+                    .as_deref()
+                    .filter(|url| !url.is_empty())
+                    .ok_or_else(|| {
+                        sqlx::Error::InvalidArgument(
+                            "DATABASE_URL required for gateway checkpoint".into(),
+                        )
+                    })?;
+                let guild_id = guild_id.filter(|id| *id != 0).ok_or_else(|| {
+                    sqlx::Error::InvalidArgument("GUILD_ID required for gateway checkpoint".into())
+                })?;
+                let db = two_bot_cutover::connect(url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
+                    .await?;
+                let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
+                    db.pool().clone(),
+                    guild_id.to_string(),
+                    0,
+                );
+                let saved = gateway::load_boot_session(&store).await?;
+                let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                let shard = build_shard(token, intents_from_env(), saved.as_ref());
+                info!(
+                    resume = saved.is_some(),
+                    "durable gateway initialized; shard connecting"
+                );
+                run_shard(shard, pipeline, Arc::clone(&state), store).await
+            }
+            .await;
+            if result.is_err() {
+                // Do not print sqlx errors: configuration errors may contain a URL.
+                tracing::error!(
+                    "durable gateway failed; checkpoint unchanged, readiness unavailable"
+                );
+                *state.write().await = GatewayState::Armed;
+            }
+        });
     } else {
         info!(
             status = ?ComponentStatus::Down,

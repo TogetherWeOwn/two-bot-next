@@ -15,6 +15,7 @@ pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod funnel;
+pub mod gateway_funnel;
 pub mod gateway_session;
 pub mod handlers;
 pub mod health;
