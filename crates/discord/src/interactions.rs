@@ -123,6 +123,46 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
     }
 }
 
+/// Shared interaction execution seam. Feature integrations reuse this router,
+/// database pool, and executor rather than adding a gateway dispatcher/client.
+#[cfg(feature = "db")]
+#[derive(Debug)]
+pub struct InteractionRuntime {
+    pub router: InteractionRouter,
+    pub pool: sqlx::Pool<sqlx::Postgres>,
+    pub executor: crate::ActionExecutor,
+    pub classifier: two_bot_core::ClassifierConfig,
+}
+
+#[cfg(feature = "db")]
+impl InteractionRuntime {
+    pub async fn handle(&self, interaction: &Interaction) -> Result<bool, crate::DiscordError> {
+        crate::rsvp::handle_rsvp_interaction(
+            &self.router,
+            &self.pool,
+            &self.executor,
+            &self.classifier,
+            interaction,
+        )
+        .await
+    }
+
+    /// One full registry sync, never an RSVP-only partial replacement.
+    pub async fn publish(&self, application_id: u64) -> Result<(), crate::DiscordError> {
+        let guild_id =
+            self.router.gates().configured_guild.ok_or_else(|| {
+                crate::DiscordError::Rejected("missing configured guild".to_owned())
+            })?;
+        let definitions = self
+            .router
+            .publish_set(&[])
+            .map_err(|_| crate::DiscordError::Rejected("invalid command registry".to_owned()))?;
+        self.executor
+            .publish_guild_commands(application_id, guild_id, &publish_commands(&definitions))
+            .await
+    }
+}
+
 /// Convert one registry definition to the twilight publish shape.
 ///
 /// `version`/`id` are server-assigned on bulk set — `Id::new(1)` is a

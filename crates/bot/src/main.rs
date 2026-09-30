@@ -86,12 +86,53 @@ async fn main() {
                     );
                     let saved = gateway::load_boot_session(&store).await?;
                     let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                    let features = two_bot_core::FeatureGates::from_env().map_err(|_| {
+                        sqlx::Error::InvalidArgument("invalid interaction feature gates".into())
+                    })?;
+                    let moderation = two_bot_core::ModerationGates::from_env().map_err(|_| {
+                        sqlx::Error::InvalidArgument("invalid moderation gates".into())
+                    })?;
+                    let router = two_bot_core::InteractionRouter::new(
+                        two_bot_core::RouterGates::from_slices(
+                            Some(guild_id),
+                            &features,
+                            &moderation,
+                            two_bot_core::SurfaceFlags {
+                                scorecard: std::env::var("TWO_COMMUNITY_SCORECARD")
+                                    .is_ok_and(|v| v == "1"),
+                                ..Default::default()
+                            },
+                        ),
+                    );
+                    let executor = two_bot_discord::ActionExecutor::with_proxy(
+                        token.clone(),
+                        std::env::var("DISCORD_API_BASE").ok(),
+                    )
+                    .map_err(|_| {
+                        sqlx::Error::InvalidArgument(
+                            "invalid Discord executor configuration".into(),
+                        )
+                    })?;
+                    let interactions =
+                        Arc::new(two_bot_discord::interactions::InteractionRuntime {
+                            router,
+                            pool: db.pool().clone(),
+                            executor,
+                            classifier: two_bot_core::ClassifierConfig::from_env(),
+                        });
                     let shard = build_shard(token, intents_from_env(), saved.as_ref());
                     info!(
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store).await
+                    run_shard(
+                        shard,
+                        pipeline,
+                        Arc::clone(&state),
+                        store,
+                        Some(interactions),
+                    )
+                    .await
                 }
                 .await;
                 if result.is_err() {

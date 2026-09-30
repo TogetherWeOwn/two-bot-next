@@ -10,6 +10,8 @@ pub mod executor;
 pub mod intents;
 pub mod interactions;
 pub mod pipeline;
+#[cfg(feature = "db")]
+pub mod rsvp;
 
 pub use adapter::event_to_core;
 pub use executor::{

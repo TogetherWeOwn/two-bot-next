@@ -161,6 +161,55 @@ async fn checkpoint_io<T>(
     result
 }
 
+struct BufferedPacket {
+    message: Result<Message, twilight_gateway::error::ReceiveMessageError>,
+    session: Option<Session>,
+    resume_url: Option<String>,
+}
+
+impl BufferedPacket {
+    fn capture(
+        shard: &Shard,
+        message: Result<Message, twilight_gateway::error::ReceiveMessageError>,
+    ) -> Self {
+        Self {
+            message,
+            session: session_snapshot(shard),
+            resume_url: shard.resume_url().map(str::to_owned),
+        }
+    }
+}
+
+const MAX_PENDING_PACKETS: usize = 64;
+
+/// Poll Twilight while awaiting feature I/O, but retain dispatch order and do
+/// not advance the durable checkpoint ahead of command effects. Capture session
+/// identity at receive time: a later reconnect must not relabel buffered packets.
+async fn poll_while<S, P>(
+    stream: &mut S,
+    pending: &mut std::collections::VecDeque<P>,
+    capture: impl Fn(&S, S::Item) -> P,
+    operation: impl std::future::Future<Output = Result<(), two_bot_discord::DiscordError>>,
+) -> Result<(), sqlx::Error>
+where
+    S: futures_util::Stream + Unpin,
+{
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut operation => return result.map_err(|_| sqlx::Error::InvalidArgument("interaction registry publish failed".into())),
+            item = stream.next() => {
+                let item = item.ok_or_else(|| sqlx::Error::InvalidArgument("gateway ended during feature I/O".into()))?;
+                if pending.len() >= MAX_PENDING_PACKETS {
+                    return Err(sqlx::Error::InvalidArgument("gateway feature backlog exceeded".into()));
+                }
+                pending.push_back(capture(stream, item));
+            }
+        }
+    }
+}
+
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
 /// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
@@ -169,8 +218,16 @@ pub async fn run_shard(
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
+    interactions: Option<Arc<two_bot_discord::interactions::InteractionRuntime>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store).await;
+    let result = run_loop(
+        &mut shard,
+        &pipeline,
+        &state,
+        &store,
+        interactions.as_deref(),
+    )
+    .await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -180,12 +237,21 @@ async fn run_loop(
     pipeline: &GatewayPipeline,
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
+    interactions: Option<&two_bot_discord::interactions::InteractionRuntime>,
 ) -> Result<(), sqlx::Error> {
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
+    let mut pending = std::collections::VecDeque::new();
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
-    while let Some(item) = shard.next().await {
-        let message = match item {
+    loop {
+        let packet = match pending.pop_front() {
+            Some(packet) => packet,
+            None => match shard.next().await {
+                Some(item) => BufferedPacket::capture(shard, item),
+                None => break,
+            },
+        };
+        let message = match packet.message {
             Ok(message) => message,
             Err(error)
                 if matches!(
@@ -212,7 +278,7 @@ async fn run_loop(
                 message,
                 Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009)
             );
-            if rejected || shard.session().is_none() {
+            if rejected || packet.session.is_none() {
                 checkpoint_io(state, deadline, store.clear()).await?;
                 committed = None;
             }
@@ -255,13 +321,15 @@ async fn run_loop(
         let sequence = header
             .s
             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing sequence".into()))?;
-        let session = session_snapshot(shard)
+        let session = packet
+            .session
             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing session".into()))?;
         // Twilight drops resume_url on a failed connect, but retains the session
         // and may successfully RESUME at its bootstrap endpoint. RESUMED carries
         // no new URL: retain READY's committed URL only for this same session.
-        let resume_url = shard
-            .resume_url()
+        let resume_url = packet
+            .resume_url
+            .as_deref()
             .or_else(|| {
                 committed
                     .as_ref()
@@ -290,6 +358,23 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
+            if let Some(runtime) = interactions {
+                let operation = async {
+                    match &event {
+                        Event::Ready(ready) => runtime.publish(ready.application.id.get()).await,
+                        Event::InteractionCreate(interaction) => {
+                            if runtime.handle(&interaction.0).await.is_err() {
+                                // Never repeat committed effects after an uncertain reply,
+                                // or log Discord errors that may include interaction tokens.
+                                warn!("interaction response failed; not replaying command");
+                            }
+                            Ok(())
+                        }
+                        _ => Ok(()),
+                    }
+                };
+                poll_while(shard, &mut pending, BufferedPacket::capture, operation).await?;
+            }
         }
         checkpoint_io(
             state,

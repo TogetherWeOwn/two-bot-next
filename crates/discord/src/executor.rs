@@ -1238,6 +1238,33 @@ impl ActionExecutor {
         }
     }
 
+    /// Complete a deferred ephemeral interaction. One attempt: a lost reply
+    /// must not cause the caller to repeat its already-committed store effects.
+    pub async fn edit_interaction_response(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .interaction(application)
+                .update_response(interaction_token)
+                .content(Some(content)),
+        )?;
+        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
+            .await
+            .map_err(|_| DiscordError::Timeout)?
+            .map_err(DiscordError::Unavailable)?;
+        match res.status {
+            200..=299 => Ok(()),
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
     /// (legacy `ModerationService::carryOut` verb mapping; warn is
     /// store-only and never reaches the wire).
@@ -1509,6 +1536,18 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
                 guild_id,
                 with_user_count: query_param(query, "with_user_count").is_some_and(|v| v == "true"),
             }),
+            Some(rest) if rest.starts_with("scheduled-events/") && query.is_empty() => {
+                let scheduled_event_id = rest
+                    .strip_prefix("scheduled-events/")
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .filter(|id| *id != 0)
+                    .ok_or_else(err)?;
+                Ok(Route::GetGuildScheduledEvent {
+                    guild_id,
+                    scheduled_event_id,
+                    with_user_count: false,
+                })
+            }
             _ => Err(err()),
         };
     }
