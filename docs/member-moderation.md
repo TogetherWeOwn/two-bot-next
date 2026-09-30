@@ -103,7 +103,16 @@ becomes running; process loss may make that one job uncertain, but does not
 strand the remaining batch. No running claim is reclaimed by age.
 
 Migration 0111 quarantines active imported schedules without a matching trusted
-intent; it neither invents acceptance/order nor deletes their history. Do not
+intent; it neither invents acceptance/order nor deletes their history. Its separate
+`dispatch_uncertain` marker preserves every imported running DELETE fence even
+when no claim token survived. Previously quarantined rows with a token/claim time
+are also conservatively fenced. Quarantine never makes such a member safe for a
+new PUT or another DELETE. Exact-token reconciliation can clear an imported
+DELETE's uncertainty: Completed closes it, while Void leaves the unknown expiry
+quarantined without inventing acceptance or cancelling its obligation. A missing
+token cannot be resolved through this API and requires a recorded security
+disposition; elapsed time never clears it. Replaying the migration preserves
+resolved markers and keeps all imports non-executable. Do not
 backfill generations by wall time or assume a currently banned user proves
 which request Discord accepted. Reconciliation requires authoritative evidence
 for the exact intent (including guild/member/request and generation), then

@@ -486,12 +486,13 @@ pub trait MemberModerationStore: Send + Sync {
 
     /// Close an uncertain dispatched unban with an authoritative outcome
     /// (`completed`: the DELETE provably landed; `void`: it provably cannot
-    /// land). Only `running` jobs resolve; a lost or already closed claim
-    /// errors so a double resolution surfaces instead of vanishing. The
+    /// land). Running jobs and quarantined imports with durable dispatch
+    /// uncertainty resolve by exact token; lost/already closed claims error.
+    /// Voiding an imported dispatch leaves its untrusted expiry quarantined;
+    /// it does not invent acceptance or cancel that unknown obligation. The
     /// evidence must name the exact guild/member/request; this method never
-    /// guesses from age or current remote state. Staging and confirmation
-    /// refuse while any `running` row exists for the member, so this is the
-    /// only path that lifts the fence.
+    /// guesses from age or current remote state. Staging refuses while any
+    /// unresolved dispatch exists for the member; this lifts only that fence.
     fn resolve_uncertain_unban(
         &self,
         request_id: &str,

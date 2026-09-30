@@ -1049,6 +1049,115 @@ async fn postgres_old_prepared_put_fences_new_staging_and_newer_accepted_expiry(
 
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_quarantine_preserves_imported_delete_fences() {
+    let (admin, pool, schema) = database().await;
+    let store = PgMemberModerationStore::new(pool.clone(), "guild");
+    for (id, state, token) in [
+        ("running", "running", Some("old-token")),
+        ("tokenless", "running", None),
+        (
+            "already-quarantined",
+            "quarantined",
+            Some("historical-token"),
+        ),
+    ] {
+        sqlx::query("INSERT INTO moderation_scheduled_unbans (request_id, guild_id, user_id, execute_at, reason, state, created_at, claim_token) VALUES ($1, 'guild', $1, $2::text::timestamptz, 'imported expiry', $3, $2::text::timestamptz, $4)")
+            .bind(id).bind(NOW).bind(state).bind(token).execute(&pool).await.expect("imported uncertain DELETE");
+    }
+    for _ in 0..2 {
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0111_moderation_ban_ownership.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("repeat-safe quarantine");
+    }
+    let mut refused = Vec::new();
+    for id in ["running", "tokenless", "already-quarantined"] {
+        assert_eq!(unban_state(&pool, id).await, "quarantined");
+        assert!(!store
+            .owns_unban_claim(id, "old-token")
+            .await
+            .expect("imports non-executable"));
+        refused.push(
+            store
+                .stage_ban("guild", id, &format!("new-{id}"), DUE)
+                .await
+                .is_err(),
+        );
+        refused.push(
+            store
+                .stage_unban("guild", id, DUE, "new expiry", &format!("temp-{id}"), DUE)
+                .await
+                .is_err(),
+        );
+    }
+    let due = store
+        .claim_due_unbans("guild", DUE, 25)
+        .await
+        .expect("imports inert");
+    use two_bot_core::member_moderation::UnbanResolution;
+    assert!(store
+        .resolve_uncertain_unban("running", "wrong", UnbanResolution::Completed)
+        .await
+        .is_err());
+    assert!(PgMemberModerationStore::new(pool.clone(), "other-guild")
+        .resolve_uncertain_unban("running", "old-token", UnbanResolution::Completed)
+        .await
+        .is_err());
+    store
+        .resolve_uncertain_unban("running", "old-token", UnbanResolution::Completed)
+        .await
+        .expect("exact imported DELETE completed");
+    store
+        .resolve_uncertain_unban(
+            "already-quarantined",
+            "historical-token",
+            UnbanResolution::Void,
+        )
+        .await
+        .expect("exact imported DELETE cannot land");
+    assert_eq!(unban_state(&pool, "running").await, "done");
+    assert_eq!(
+        unban_state(&pool, "already-quarantined").await,
+        "quarantined",
+        "void dispatch does not invent or cancel imported expiry ownership"
+    );
+    assert!(store
+        .resolve_uncertain_unban("running", "old-token", UnbanResolution::Completed)
+        .await
+        .is_err());
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0111_moderation_ban_ownership.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("replay after resolution");
+    store
+        .stage_ban("guild", "running", "after-completed", DUE)
+        .await
+        .expect("completed imported fence cleared");
+    store
+        .stage_ban("guild", "already-quarantined", "after-void", DUE)
+        .await
+        .expect("void imported fence cleared, quarantine remains inert");
+    assert!(store
+        .stage_ban("guild", "tokenless", "still-fenced", DUE)
+        .await
+        .is_err());
+    let inferred: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM moderation_member_bans WHERE request_id IN ('running', 'tokenless', 'already-quarantined')")
+        .fetch_one(&pool).await.expect("no acceptance invented");
+    cleanup(admin, pool, schema).await;
+    assert_eq!(inferred, 0);
+    assert!(due.is_empty());
+    assert!(
+        refused.into_iter().all(|r| r),
+        "quarantine must not drop uncertain DELETE fences, even without a token"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
 async fn postgres_imported_unbans_are_quarantined_without_acceptance_inference() {
     let (admin, pool, schema) = database().await;
     let store = PgMemberModerationStore::new(pool.clone(), "guild");

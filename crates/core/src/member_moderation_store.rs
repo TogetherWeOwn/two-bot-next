@@ -97,6 +97,12 @@ impl PgMemberModerationStore {
                AND intent.guild_id = job.guild_id AND intent.user_id = job.user_id
                AND intent.state = 'accepted'
                AND NOT EXISTS (
+                 SELECT 1 FROM moderation_scheduled_unbans AS uncertain
+                 WHERE uncertain.guild_id = job.guild_id AND uncertain.user_id = job.user_id
+                   AND uncertain.request_id <> job.request_id
+                   AND (uncertain.state = 'running' OR uncertain.dispatch_uncertain)
+               )
+               AND NOT EXISTS (
                  SELECT 1 FROM moderation_member_bans AS newer
                  WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
                    AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
@@ -127,7 +133,8 @@ impl PgMemberModerationStore {
         let uncertain: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                SELECT 1 FROM moderation_scheduled_unbans AS job
-               WHERE job.guild_id = $1 AND job.user_id = $2 AND job.state = 'running'
+               WHERE job.guild_id = $1 AND job.user_id = $2
+                 AND (job.state = 'running' OR job.dispatch_uncertain)
              ) OR EXISTS (
                SELECT 1 FROM moderation_member_bans AS intent
                WHERE intent.guild_id = $1 AND intent.user_id = $2 AND intent.state = 'prepared'
@@ -435,7 +442,7 @@ impl MemberModerationStore for PgMemberModerationStore {
              VALUES ($1, $2, $3, $4::text::timestamptz, $5, 'staged', $6::text::timestamptz)
              ON CONFLICT (request_id) DO UPDATE SET state = 'staged',
                execute_at = EXCLUDED.execute_at, reason = EXCLUDED.reason,
-               created_at = EXCLUDED.created_at, completed_at = NULL, claimed_at = NULL, claim_token = NULL
+               created_at = EXCLUDED.created_at, completed_at = NULL, claimed_at = NULL, claim_token = NULL, dispatch_uncertain = FALSE
              WHERE moderation_scheduled_unbans.state = 'cancelled'
                AND moderation_scheduled_unbans.guild_id = EXCLUDED.guild_id
                AND moderation_scheduled_unbans.user_id = EXCLUDED.user_id",
@@ -521,6 +528,12 @@ impl MemberModerationStore for PgMemberModerationStore {
                AND intent.guild_id = job.guild_id AND intent.user_id = job.user_id
              WHERE job.guild_id = $1 AND job.state = 'staged' AND intent.state = 'accepted'
                AND NOT EXISTS (
+                 SELECT 1 FROM moderation_scheduled_unbans AS uncertain
+                 WHERE uncertain.guild_id = job.guild_id AND uncertain.user_id = job.user_id
+                   AND uncertain.request_id <> job.request_id
+                   AND (uncertain.state = 'running' OR uncertain.dispatch_uncertain)
+               )
+               AND NOT EXISTS (
                  SELECT 1 FROM moderation_member_bans AS newer
                  WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
                    AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
@@ -552,6 +565,11 @@ impl MemberModerationStore for PgMemberModerationStore {
                WHERE job.guild_id = $1 AND job.state = 'pending' AND intent.state = 'accepted'
                  AND job.execute_at <= $2::text::timestamptz
                  AND NOT EXISTS (
+                   SELECT 1 FROM moderation_scheduled_unbans AS uncertain
+                   WHERE uncertain.guild_id = job.guild_id AND uncertain.user_id = job.user_id
+                     AND (uncertain.state = 'running' OR uncertain.dispatch_uncertain)
+                 )
+                 AND NOT EXISTS (
                    SELECT 1 FROM moderation_member_bans AS newer
                    WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
                      AND ((newer.state = 'prepared' AND newer.request_id <> intent.request_id)
@@ -559,7 +577,7 @@ impl MemberModerationStore for PgMemberModerationStore {
                  )
                ORDER BY job.execute_at, intent.generation LIMIT $3 FOR UPDATE OF job SKIP LOCKED
              ) UPDATE moderation_scheduled_unbans AS job SET state = 'running',
-               claimed_at = $2::text::timestamptz, claim_token = $4
+               claimed_at = $2::text::timestamptz, claim_token = $4, dispatch_uncertain = TRUE
              FROM due WHERE job.request_id = due.request_id AND job.guild_id = $1 AND job.state = 'pending'
              RETURNING job.request_id, job.guild_id, job.user_id, job.reason, job.claim_token",
         )
@@ -610,7 +628,7 @@ impl MemberModerationStore for PgMemberModerationStore {
     async fn complete_unban(&self, request: &str, token: &str) -> Result<(), StoreError> {
         let changed = sqlx::query(
             "UPDATE moderation_scheduled_unbans SET state = 'done',
-               completed_at = NOW(), claim_token = NULL
+               completed_at = NOW(), claim_token = NULL, dispatch_uncertain = FALSE
              WHERE request_id = $1 AND state = 'running' AND claim_token = $2 AND guild_id = $3",
         )
         .bind(request)
@@ -629,7 +647,7 @@ impl MemberModerationStore for PgMemberModerationStore {
     async fn requeue_unban(&self, request: &str, token: &str) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE moderation_scheduled_unbans SET state = 'pending',
-               claimed_at = NULL, claim_token = NULL
+               claimed_at = NULL, claim_token = NULL, dispatch_uncertain = FALSE
              WHERE request_id = $1 AND state = 'running' AND claim_token = $2 AND guild_id = $3",
         )
         .bind(request)
@@ -655,6 +673,7 @@ impl MemberModerationStore for PgMemberModerationStore {
             "WITH resolved AS (
                SELECT job.request_id,
                  CASE WHEN $3 = 'completed' THEN 'done'
+                   WHEN job.state = 'quarantined' THEN 'quarantined'
                    WHEN EXISTS (
                      SELECT 1 FROM moderation_member_bans AS intent
                      WHERE intent.request_id = job.request_id AND intent.guild_id = job.guild_id
@@ -666,13 +685,15 @@ impl MemberModerationStore for PgMemberModerationStore {
                        )
                    ) THEN 'pending' ELSE 'superseded' END AS state
                FROM moderation_scheduled_unbans AS job
-               WHERE job.request_id = $1 AND job.state = 'running'
+               WHERE job.request_id = $1
+                 AND (job.state = 'running' OR (job.state = 'quarantined' AND job.dispatch_uncertain))
                  AND job.claim_token = $2 AND job.guild_id = $4
              ) UPDATE moderation_scheduled_unbans AS job SET state = resolved.state,
-               completed_at = CASE WHEN resolved.state = 'pending' THEN NULL ELSE NOW() END,
-               claimed_at = NULL, claim_token = NULL
+               completed_at = CASE WHEN resolved.state IN ('pending', 'quarantined') THEN NULL ELSE NOW() END,
+               claimed_at = NULL, claim_token = NULL, dispatch_uncertain = FALSE
              FROM resolved WHERE job.request_id = resolved.request_id AND job.guild_id = $4
-               AND job.state = 'running' AND job.claim_token = $2",
+               AND (job.state = 'running' OR (job.state = 'quarantined' AND job.dispatch_uncertain))
+               AND job.claim_token = $2",
         )
         .bind(request)
         .bind(token)

@@ -16,6 +16,16 @@ CREATE TABLE IF NOT EXISTS moderation_member_bans (
 CREATE INDEX IF NOT EXISTS idx_moderation_member_bans_generation
   ON moderation_member_bans (guild_id, user_id, generation);
 
+-- Quarantine controls executability, not whether an old DELETE may still land.
+-- Preserve that uncertainty separately, including running imports without a
+-- token (those need a recorded security disposition, never guessed recovery).
+ALTER TABLE moderation_scheduled_unbans
+  ADD COLUMN IF NOT EXISTS dispatch_uncertain BOOLEAN NOT NULL DEFAULT FALSE;
+UPDATE moderation_scheduled_unbans
+SET dispatch_uncertain = TRUE
+WHERE state = 'running'
+   OR (state = 'quarantined' AND (claim_token IS NOT NULL OR claimed_at IS NOT NULL));
+
 -- 0110's schedule state is unconstrained TEXT and already supports the new
 -- 'quarantined' state. Imported deployments with a schedule-state CHECK or
 -- enum must extend that constraint/type to include 'quarantined' BEFORE this
