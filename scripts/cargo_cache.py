@@ -164,7 +164,28 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
     previous = {}
     clean_exit = False
     cancelling = False
+    spawning = True
+    pending_signal = None
+
+    def interrupted(signum, frame):
+        # Cancellation is armed before spawn. A signal landing inside Popen
+        # or before the child handle exists must neither raise out of spawn
+        # internals (which would leave child=None and bypass cleanup) nor
+        # fall through to the default handler (which would kill the wrapper
+        # without stopping the group). Record it instead; the wrapper stops
+        # the group on the pending cancellation immediately after spawn.
+        nonlocal cancelling, pending_signal
+        if cancelling:
+            return  # a later signal during cleanup must not raise again
+        cancelling = True
+        if spawning or child is None:
+            pending_signal = signum
+            return
+        raise Refusal(f'build interrupted by signal {signum}; lease retained')
+
     try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, interrupted)
         # Exclusive create + persistent sentinel protect against wrapper death.
         with (slot / 'lease.json').open('x') as output:
             json.dump({'workspace': str(workspace), 'wrapper_pid': os.getpid(),
@@ -184,16 +205,9 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
         # Pass the lease FD to Cargo as well: wrapper SIGKILL must not free it.
         child = subprocess.Popen([cargo] + args, env=env, start_new_session=True,
                                  pass_fds=(fd,))
-
-        def interrupted(signum, frame):
-            nonlocal cancelling
-            if cancelling:
-                return  # a later signal during cleanup must not raise again
-            cancelling = True
-            raise Refusal(f'build interrupted by signal {signum}; lease retained')
-
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            previous[sig] = signal.signal(sig, interrupted)
+        spawning = False
+        if pending_signal is not None:
+            raise Refusal(f'build interrupted by signal {pending_signal}; lease retained')
         while True:
             if usage(slot) >= policy['slot_budget_bytes']:
                 raise Refusal('slot reached sampled byte budget; lease retained')
@@ -229,15 +243,43 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
 
 
 def process_references(proc_root):
-    """Host PID namespace, including container processes. Denied reads fail closed."""
+    """Host PID namespace, including container processes. Denied reads fail closed.
+
+    Returns (references, deleted): live path references plus unlinked/replaced
+    artifact references kept with their deletion marker preserved. A deleted
+    entry under a container spelling cannot be mapped to a host path by
+    lexical match, and its old inode may be gone from the workspace
+    traversal, so callers must never silently treat it as no reference.
+    """
     references = []
+    deleted = []
     for entry in Path(proc_root).iterdir():
         if not entry.name.isdecimal():
             continue
         try:
             fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
-            # Kernel threads have no userspace cwd/exe; zombies have no live FDs.
-            if fields[0] == 'Z' or int(fields[6]) & 0x00200000:
+            # Kernel threads have no userspace cwd/exe/fd/maps; skip them.
+            if int(fields[6]) & 0x00200000:
+                continue
+            # A zombie leader is not proof its thread group is dead: a
+            # multithreaded process whose main thread exited can keep live
+            # workers holding workspace references. Skip a zombie only with
+            # positive evidence of a single remaining task; an ambiguous or
+            # multithreaded zombie group fails the whole audit closed.
+            if fields[0] == 'Z':
+                try:
+                    tasks = [task for task in (entry / 'task').iterdir()
+                             if task.name.isdecimal()]
+                except FileNotFoundError:
+                    if entry.exists():
+                        raise Refusal(f'incomplete process visibility: pid {entry.name}')
+                    continue  # exited between stat and task listing; no references
+                except PermissionError:
+                    raise Refusal(f'incomplete process visibility: pid {entry.name}')
+                if len(tasks) != 1:
+                    raise Refusal(
+                        f'incomplete process visibility: zombie pid {entry.name} '
+                        f'has {len(tasks)} tasks')
                 continue
             for link in [entry / 'cwd', entry / 'exe'] + list((entry / 'fd').iterdir()):
                 try:
@@ -248,21 +290,30 @@ def process_references(proc_root):
                     if not entry.exists() or (link.parent.name == 'fd' and not link.exists()):
                         continue
                     raise
-                if name.startswith('/'):
-                    references.append((name.removesuffix(' (deleted)'), info.st_dev, info.st_ino))
+                if name.endswith(' (deleted)'):
+                    deleted.append((name.removesuffix(' (deleted)'),
+                                    info.st_dev, info.st_ino))
+                elif name.startswith('/'):
+                    references.append((name, info.st_dev, info.st_ino))
             for line in (entry / 'maps').read_text().splitlines():
                 fields = line.split(None, 5)
                 if len(fields) == 6 and fields[5].startswith('/'):
-                    major, minor = fields[3].split(':')
-                    references.append((fields[5].removesuffix(' (deleted)'),
-                                       os.makedev(int(major, 16), int(minor, 16)),
-                                       int(fields[4])))
+                    if fields[5].endswith(' (deleted)'):
+                        major, minor = fields[3].split(':')
+                        deleted.append((fields[5].removesuffix(' (deleted)'),
+                                        os.makedev(int(major, 16), int(minor, 16)),
+                                        int(fields[4])))
+                    else:
+                        major, minor = fields[3].split(':')
+                        references.append((fields[5],
+                                           os.makedev(int(major, 16), int(minor, 16)),
+                                           int(fields[4])))
         except FileNotFoundError:
             if entry.exists():
                 raise Refusal(f'incomplete process visibility: pid {entry.name}')
         except PermissionError:
             raise Refusal(f'incomplete process visibility: pid {entry.name}')
-    return references
+    return references, deleted
 
 
 def within(path, root):
@@ -354,6 +405,7 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         raise Refusal('inventory workspaces must be a list')
     indexed = {}
     identities = {}
+    target_identities = {}
     for row in rows:
         raw = row['path']
         # Inventory paths must be absolute strings. Lexical canonicalization
@@ -388,8 +440,50 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
             if identity in identities:
                 raise Refusal('ambiguous workspace attribution')
             identities[identity] = canonical
+        # Workspace roots are not the only alias surface: distinct
+        # canonical roots can share one bind-aliased target directory. A
+        # terminal/unreferenced row under A and a live/queued/referenced
+        # row under B would both pass workspace-identity validation, and
+        # without target reconciliation the shared build output is offered
+        # as a retention candidate. Reconcile existing target identities
+        # across ALL rows — including live/queued/referenced rows outside
+        # the candidate directory — and refuse duplicate target attribution.
+        try:
+            target_info = os.stat(canonical + '/target')
+        except FileNotFoundError:
+            target_identity = None  # no target yet; nothing to reconcile
+        except (PermissionError, OSError):
+            raise Refusal(f'incomplete workspace visibility: {canonical}/target')
+        else:
+            target_identity = (target_info.st_dev, target_info.st_ino)
+            if target_identity in target_identities:
+                raise Refusal('ambiguous target attribution')
+            target_identities[target_identity] = canonical
         indexed[canonical] = row
-    refs = process_references(proc_root)
+    refs, deleted = process_references(proc_root)
+    # Deleted (unlinked/replaced) artifact references keep their deletion
+    # marker: under a container spelling they match neither a host path nor
+    # a current workspace inode, so they can never silently count as no
+    # reference. Resolve the real on-disk workspace set once so deleted
+    # attribution can be checked against every candidate; a deleted entry
+    # attributable to nothing still refuses the whole audit, not one row.
+    real_workspaces = {}
+    for workspace in sorted(worktrees.iterdir()):
+        target = workspace / 'target'
+        if not target.exists() and not target.is_symlink():
+            continue
+        if workspace.is_symlink() or target.is_symlink():
+            continue
+        try:
+            real = real_directory(workspace)
+        except Refusal:
+            continue
+        real_workspaces[str(real)] = real
+    # Scan workspace inodes once for the final unresolved-deleted check;
+    # per-candidate checks below reuse their own traversal.
+    all_nodes = set()
+    for real in real_workspaces.values():
+        all_nodes |= workspace_inodes(real)
     results = []
     for workspace in sorted(worktrees.iterdir()):
         target = workspace / 'target'
@@ -421,9 +515,30 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
             result['reason'] = ('unclassified or mixed target provenance; '
                                 'Operator build-output-only classification required')
             continue
+        # -C changes directory but does not neutralize an inherited
+        # GIT_INDEX_FILE, GIT_DIR, GIT_WORK_TREE, or GIT_COMMON_DIR: an
+        # alternate empty index would hide a force-tracked target file while
+        # the ignore rule still passes. Inspect the real repository index
+        # regardless of overrides, and refuse when the intended workspace
+        # repository cannot be verified.
+        git_env = {key: value for key, value in os.environ.items()
+                   if key not in {'GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE',
+                                  'GIT_COMMON_DIR', 'GIT_NAMESPACE'}}
+        try:
+            toplevel = subprocess.run(['git', '-C', str(workspace), 'rev-parse',
+                                       '--show-toplevel'],
+                                      capture_output=True, check=True, env=git_env,
+                                      text=True)
+        except subprocess.CalledProcessError:
+            result['reason'] = 'unverified workspace repository'
+            continue
+        if Path(toplevel.stdout.strip()) != workspace:
+            result['reason'] = 'unverified workspace repository'
+            continue
         tracked = subprocess.run(['git', '-C', str(workspace), 'ls-files', '-z', '--', 'target'],
-                                 capture_output=True, check=True)
-        ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'])
+                                 capture_output=True, check=True, env=git_env)
+        ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'],
+                                 env=git_env)
         if tracked.stdout or ignored.returncode != 0:
             result['reason'] = 'tracked or not ignored'
             continue
@@ -438,7 +553,29 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         if any(within(path, workspace) or (device, inode) in nodes for path, device, inode in refs):
             result['reason'] = 'actual process cwd/exe/fd/map reference'
             continue
+        # Deleted-reference attribution carries its deletion marker from
+        # the scan above. An unlinked/replaced artifact under a container
+        # spelling cannot be mapped to a host path by lexical match, and
+        # its old inode may be gone from the current workspace traversal.
+        # A deleted entry whose path reads inside this workspace or whose
+        # inode survives in its traversal vetoes this candidate. Removing
+        # a replacement never reclaims the already-unlinked mapped inode,
+        # so this is a false-negative reference finding, not a deletion
+        # plan; no destructive deletion is demonstrated or authorized.
+        if any(within(path, workspace) or (device, inode) in nodes
+               for path, device, inode in deleted):
+            result['reason'] = 'actual process cwd/exe/fd/map reference (deleted artifact)'
+            continue
         result.update(eligible=True, allocated_bytes=usage(target), reason='audit only; not deletion authority')
+    # Any deleted entry attributable to no audited workspace refuses the
+    # whole audit: unresolved namespace mapping must not silently establish
+    # no reference. Callers must supply an independently verified
+    # exact-path process-reference receipt before any such audit clears.
+    if any(not any(within(path, Path(root)) for root in real_workspaces)
+           and (device, inode) not in all_nodes
+           for path, device, inode in deleted):
+        raise Refusal('unresolved deleted process reference; '
+                      'exact-path process-reference receipt required')
     if now - captured + time.monotonic() - started > max_age:
         raise Refusal('audit took too long; capture a new inventory')
     return {'version': 1, 'audit_only': True, 'captured_at_unix': now, 'candidates': results}

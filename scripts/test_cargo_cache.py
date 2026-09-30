@@ -239,11 +239,14 @@ class CacheTests(unittest.TestCase):
     def test_second_signal_before_handler_ignore_is_noop(self):
         # Deterministic transition fixture for the exact window a real second
         # signal can hit: after cancellation starts but before the ignores
-        # take effect. The first SIGTERM (timer thread) starts cleanup; the
-        # _before_stop seam delivers a second SIGTERM while the raising
-        # handler is still installed. Later signals must be no-ops from the
-        # first cancellation onward, so cleanup still reaches stop_group, the
-        # SIGTERM-ignoring fake is SIGKILLed, and the sentinel is retained.
+        # take effect. The first SIGTERM starts cleanup only after the fake
+        # reports ready, so cancellation handlers are provably installed (no
+        # fixed timer can fire before arming and kill the suite on a delayed
+        # runner); the _before_stop seam delivers a second SIGTERM while the
+        # raising handler is still installed. Later signals must be no-ops
+        # from the first cancellation onward, so cleanup still reaches
+        # stop_group, the SIGTERM-ignoring fake is SIGKILLed, and the
+        # sentinel is retained.
         import signal as sigmod
         import threading
         self.fake.write_text('#!' + sys.executable + '\n'
@@ -253,17 +256,51 @@ class CacheTests(unittest.TestCase):
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
                              '(target/"ready").write_text("ready")\n'
                              'while not (target/"release").exists(): time.sleep(.01)\n')
+
+        def send_after_ready():
+            deadline = time.monotonic() + 10
+            while not any((slot / 'ready').exists()
+                          for slot in self.pool.glob('slot-*/target')):
+                if time.monotonic() > deadline:
+                    return
+                time.sleep(.01)
+            os.kill(os.getpid(), sigmod.SIGTERM)
+
         before = sigmod.getsignal(sigmod.SIGTERM)
-        timer = threading.Timer(2.0, lambda: os.kill(os.getpid(), sigmod.SIGTERM))
-        timer.start()
+        sender = threading.Thread(target=send_after_ready, daemon=True)
+        sender.start()
         try:
             with self.assertRaisesRegex(cache.Refusal, 'interrupted by signal'):
                 cache.run_cargo(
                     self.pool, ['check'], cargo=str(self.fake), interval=.01,
                     _before_stop=lambda: os.kill(os.getpid(), sigmod.SIGTERM))
         finally:
-            timer.cancel()
+            sender.join(timeout=10)
         self.assertIs(sigmod.getsignal(sigmod.SIGTERM), before)
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_signal_during_spawn_stops_group_and_retains_sentinel(self):
+        # Launch-transition fixture: SIGTERM lands inside Popen, before the
+        # child handle exists. Cancellation is already armed, so the signal
+        # is recorded instead of raising out of spawn internals (which would
+        # leave child=None and bypass cleanup) or hitting the default
+        # handler. The wrapper stops the group on the pending cancellation
+        # and retains the crash sentinel.
+        import signal as sigmod
+        real_popen = subprocess.Popen
+
+        def signalling_popen(*args, **kwargs):
+            os.kill(os.getpid(), sigmod.SIGTERM)
+            return real_popen(*args, **kwargs)
+
+        before = sigmod.getsignal(sigmod.SIGTERM)
+        try:
+            with patch.object(subprocess, 'Popen', signalling_popen):
+                with self.assertRaisesRegex(cache.Refusal, 'interrupted by signal'):
+                    cache.run_cargo(self.pool, ['check'], cargo=str(self.fake),
+                                    interval=.01)
+        finally:
+            self.assertIs(sigmod.getsignal(sigmod.SIGTERM), before)
         self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
 
     def test_low_disk_prevents_launch(self):
@@ -482,6 +519,69 @@ class RetentionTests(unittest.TestCase):
         subprocess.run(['git', '-C', str(self.workspace), 'add', '-f', 'target/debug/fixture'], check=True)
         self.assertEqual(self.reason(), 'tracked or not ignored')
 
+    def test_alternate_git_index_cannot_hide_tracked_output(self):
+        # -C does not neutralize an inherited GIT_INDEX_FILE: an alternate
+        # empty index would hide a force-tracked target while the ignore
+        # rule still passes. The audit must inspect the real index and keep
+        # the candidate ineligible.
+        subprocess.run(['git', '-C', str(self.workspace), 'add', '-f', 'target/debug/fixture'], check=True)
+        empty = self.root / 'empty-index'
+        empty.touch()
+        before = os.environ.get('GIT_INDEX_FILE')
+        with patch.dict(os.environ, {'GIT_INDEX_FILE': str(empty)}):
+            self.assertEqual(self.reason(), 'tracked or not ignored')
+        self.assertEqual(os.environ.get('GIT_INDEX_FILE'), before)
+
+    def test_bind_aliased_target_reconciled_across_rows(self):
+        # Two distinct canonical roots sharing one bind-aliased target: a
+        # terminal row under A and a live row under B. Without target
+        # reconciliation the shared output would be offered as a retention
+        # candidate; with it the whole audit refuses. A symlink stands in
+        # for the bind mount: os.stat follows it, so both inventory rows
+        # report the same target identity while the workspace roots stay
+        # distinct and canonical.
+        other = self.make_workspace('live-alias-root')
+        shutil.rmtree(other / 'target')
+        (other / 'target').symlink_to(self.target, target_is_directory=True)
+        live = self.row | {'path': str(other), 'live_run': True,
+                           'referenced': True, 'status': 'in_progress'}
+        self.inventory['workspaces'] = [self.row, live]
+        with self.assertRaisesRegex(cache.Refusal, 'ambiguous target'):
+            self.audit()
+
+    def test_deleted_container_reference_vetoes_or_refuses(self):
+        # An unlinked artifact opened under a container spelling matches
+        # neither the host path nor a live workspace inode. When the path
+        # reads inside the candidate workspace it vetoes that candidate;
+        # when it is attributable to nothing, the whole audit refuses.
+        # A dangling fixture symlink would be skipped by the exit-race
+        # guard, so simulate the kernel's ' (deleted)' readlink suffix
+        # with a live target (real /proc fd stat succeeds on unlinked
+        # open files too) and exercise the attribution branches exactly.
+        pid = self.fake_pid()
+        gone = self.target / 'debug' / 'replaced.so'
+        gone.write_bytes(b'x' * 64)
+        (pid / 'fd' / '7').symlink_to(gone)
+        real_readlink = os.readlink
+
+        def deleted_readlink(link):
+            if str(link).endswith('fd/7'):
+                return str(gone) + ' (deleted)'
+            return real_readlink(link)
+
+        with patch.object(cache.os, 'readlink', side_effect=deleted_readlink):
+            self.assertIn('deleted', self.reason())
+        stale = self.proc / '999'
+        stale.mkdir()
+        (stale / 'fd').mkdir()
+        (stale / 'stat').write_text('999 (fixture) S 1 999 999 0 -1 0\n')
+        (stale / 'cwd').symlink_to(self.root)
+        (stale / 'exe').symlink_to(sys.executable)
+        (stale / 'maps').write_text('100-200 r--p 00000000 00:01 999999991 '
+                                    '/different/container/mount/stale.so (deleted)\n')
+        with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+            self.audit()
+
     def test_unignored_target_preserved(self):
         (self.workspace / '.gitignore').write_text('')
         self.assertEqual(self.reason(), 'tracked or not ignored')
@@ -531,9 +631,25 @@ class RetentionTests(unittest.TestCase):
     def test_zombie_and_kernel_thread_have_no_userspace_refs(self):
         pid = self.proc / '123'
         pid.mkdir()
+        (pid / 'task').mkdir()
+        (pid / 'task' / '1').mkdir()
         for suffix in ('Z 1 1 1 0 -1 0', 'S 1 1 1 0 -1 2097152'):
             (pid / 'stat').write_text('123 (fixture) ' + suffix)
-            self.assertEqual(cache.process_references(self.proc), [])
+            refs, deleted = cache.process_references(self.proc)
+            self.assertEqual((refs, deleted), ([], []))
+
+    def test_multithreaded_zombie_group_refuses_audit(self):
+        # A Z leader with surviving worker tasks may still hold workspace
+        # references through its workers; the leader state alone must not
+        # establish group death.
+        pid = self.proc / '123'
+        pid.mkdir()
+        (pid / 'task').mkdir()
+        (pid / 'task' / '1').mkdir()
+        (pid / 'task' / '2').mkdir()
+        (pid / 'stat').write_text('123 (fixture) Z 1 1 1 0 -1 0')
+        with self.assertRaisesRegex(cache.Refusal, 'zombie pid 123'):
+            self.audit()
 
     def test_symlink_target_preserved(self):
         (self.target / 'debug' / 'fixture').unlink()
