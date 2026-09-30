@@ -281,14 +281,27 @@ where
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
 /// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
+///
+/// `sticky` dispatch stays detached. RSVP effects are awaited in dispatch order
+/// with bounded read-ahead in `poll_while`; Twilight drives heartbeats only while
+/// the shard is polled, so a full backlog pauses transport until work drains.
 pub async fn run_shard(
     mut shard: Shard,
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
     interactions: Option<Arc<two_bot_discord::interactions::InteractionRuntime>>,
+    sticky: Option<Arc<crate::sticky_runtime::StickyRuntime>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store, interactions.as_ref()).await;
+    let result = run_loop(
+        &mut shard,
+        &pipeline,
+        &state,
+        &store,
+        interactions.as_ref(),
+        sticky.as_ref(),
+    )
+    .await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -299,6 +312,7 @@ async fn run_loop(
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
     interactions: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
+    sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
 ) -> Result<(), sqlx::Error> {
     if let Some(runtime) = interactions {
         runtime.publish_current().await.map_err(|_| {
@@ -426,6 +440,9 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
+            if let Some(runtime) = sticky {
+                runtime.dispatch(&event);
+            }
             if let Some(runtime) = interactions {
                 if let Some(acknowledgement) = packet.acknowledgement {
                     let operation = async {

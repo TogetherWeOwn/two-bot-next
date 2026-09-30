@@ -165,6 +165,13 @@ pub enum ChannelCall {
         content: String,
         nonce: Option<String>,
     },
+    /// `DELETE /channels/{c}/messages/{m}` (legacy automation cleanup —
+    /// sticky retirement removes the previous re-post).
+    DeleteMessage {
+        channel_id: String,
+        message_id: String,
+        reason: String,
+    },
 }
 
 /// One observed HTTP exchange: status plus parsed bodies the retry policy
@@ -1058,6 +1065,29 @@ impl ActionExecutor {
         Ok(ids.len() as u64)
     }
 
+    /// Delete one message (legacy `ModerationDiscord` single delete — the
+    /// same request purge's one-id arm makes). Best-effort cleanup callers
+    /// (sticky retirement) treat `Rejected`/`Http` as a miss, not a crash.
+    pub async fn delete_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<(), DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let message: Id<MessageMarker> = snowflake(message_id)?;
+        let reason = audit_reason(reason)?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .delete_message(channel, message)
+                .reason(&reason),
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
+        self.call_once(req, &[200, 204]).await?;
+        Ok(())
+    }
+
     /// Post a message with mention suppression (legacy
     /// `allowed_mentions: { parse: [] }`). Asserts the legacy 2000 UTF-16-unit
     /// ceiling before sending; returns the message id (`""` when Discord
@@ -1186,6 +1216,14 @@ impl ActionExecutor {
                     message_id: self.send_message(channel_id, content, value).await?,
                 })
             }
+            ChannelCall::DeleteMessage {
+                channel_id,
+                message_id,
+                reason,
+            } => {
+                self.delete_message(channel_id, message_id, reason).await?;
+                Ok(ChannelCallOutcome::MessageDeleted)
+            }
         }
     }
 
@@ -1282,31 +1320,29 @@ impl ActionExecutor {
         }
     }
 
-    /// Complete a deferred ephemeral interaction. One attempt: a lost reply
-    /// must not cause the caller to repeat its already-committed store effects.
+    /// Complete an acknowledged interaction by editing its original response.
+    /// Like the initial callback, this bypasses the paced moderation lane.
+    /// One attempt: a lost reply must not repeat already-committed store effects.
     pub async fn edit_interaction_response(
         &self,
         application_id: u64,
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
-        let application = Id::<ApplicationMarker>::new_checked(application_id)
-            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let application =
+            Id::<ApplicationMarker>::new_checked(application_id).ok_or_else(|| {
+                DiscordError::Rejected(format!("bad application id: {application_id}"))
+            })?;
+        let mentions = AllowedMentions::default();
         let req = Self::request_of(
             self.inner
                 .factory
                 .interaction(application)
                 .update_response(interaction_token)
-                .content(Some(content)),
+                .content(Some(content))
+                .allowed_mentions(Some(&mentions)),
         )?;
-        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
-            .await
-            .map_err(|_| DiscordError::Timeout)?
-            .map_err(DiscordError::Unavailable)?;
-        match res.status {
-            200..=299 => Ok(()),
-            _ => Err(throw_for_status(&res)),
-        }
+        self.call_once_raw(req, &[200]).await.map(|_| ())
     }
 
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
@@ -1403,6 +1439,7 @@ pub enum ChannelCallOutcome {
     OverwriteWritten,
     OverwriteDeleted,
     Posted { message_id: String },
+    MessageDeleted,
 }
 
 /// @everyone overwrite masks (decimal strings, legacy schema).

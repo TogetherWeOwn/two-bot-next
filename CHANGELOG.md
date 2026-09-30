@@ -4,6 +4,7 @@
 
 ### Added
 
+- Wire `/sticky` and `/sticky-remove` through the shared interaction router and drive accepted-message re-posts through the shared REST executor. The runtime claims one re-post window atomically per burst, validates and records the replacement id before retiring the previous sticky (best-effort), releases the claim and audits `post_failed` on REST failure, and deletes an orphaned replacement when the claim moved on. Commands defer ephemerally before I/O and edit the original reply; refusals are limited to owned sticky commands. `TWO_AUTOMATIONS` gates both surfaces; ManageGuild is required, and `/sticky` validates a 1–2000 UTF-16 body with a 1–300 s debounce (default 5 s). Covered by isolated Postgres and mock REST acceptance tests.
 - Wire RSVP, namespaced RSVP totals and ManageEvents-gated host attendance through the shared interaction router, sqlx stores and REST executor, with ephemeral deferred replies and test-container/mock-Discord acceptance. Publish the full shared command registry before gateway startup, including persisted-session RESUMED boots. Defer queued commands at receipt, keep effects/checkpoints in dispatch order, and drain accepted work rather than cancel it at the feature deadline or backlog limit.
 
 ### Notes

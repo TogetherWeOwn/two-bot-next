@@ -59,6 +59,7 @@ async fn spawn(db: &TestDb, url: &str, rest: &MockRest) -> JoinHandle<Result<(),
         Arc::new(RwLock::new(GatewayState::Armed)),
         db.store.clone(),
         Some(runtime(db, rest)),
+        None,
     ))
 }
 
