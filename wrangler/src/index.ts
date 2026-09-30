@@ -86,6 +86,10 @@ export class TwoBotContainer extends Container<Env> {
   // a long sleepAfter means a missed tick or two never costs the session.
   sleepAfter = "30m";
   pingEndpoint = "health";
+  // SDK auto-start (containerFetch -> startAndWaitForPorts) bypasses start().
+  // Class defaults feed every startup path; explicit envVars replace them.
+  // https://developers.cloudflare.com/containers/examples/env-vars-and-secrets/
+  override envVars = containerEnvVars(this.env);
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -96,23 +100,6 @@ export class TwoBotContainer extends Container<Env> {
     }
 
     return new Response("not found", { status: 404 });
-  }
-
-  /**
-   * Start the container with secrets from the Worker env when it is not
-   * already running. containerFetch() auto-starts with class defaults, but
-   * secrets must be passed explicitly — this is the only place Worker
-   * secrets cross into the container, as env vars (never in image/layers).
-   */
-  override async start(...args: Parameters<Container<Env>["start"]>) {
-    const [startOptions, waitOptions] = args;
-    return super.start(
-      {
-        envVars: { ...containerEnvVars(this.env), ...startOptions?.envVars },
-        ...startOptions,
-      },
-      waitOptions,
-    );
   }
 
   /** Arm the self-perpetuating schedule() keepalive (idempotent). */
