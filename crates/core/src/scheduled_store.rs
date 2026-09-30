@@ -111,9 +111,9 @@ pub async fn get_scheduled(
     .await
 }
 
-/// Prefix-resolve an id within one guild (legacy `resolveScheduledId`:
-/// `id = ? OR id LIKE prefix || '%'`, ordered, first two decide — zero or
-/// ambiguous both refuse downstream).
+/// Literal prefix-resolve an id within one guild, matching the domain's
+/// `starts_with` semantics. Ordered, first two decide — zero or ambiguous
+/// both refuse downstream; SQL LIKE metacharacters have no special meaning.
 pub async fn resolve_scheduled_id(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -121,11 +121,10 @@ pub async fn resolve_scheduled_id(
 ) -> Result<Option<String>, sqlx::Error> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT id FROM scheduled_messages
-          WHERE guild_id = $1 AND (id = $2 OR id LIKE $3 || '%')
+          WHERE guild_id = $1 AND starts_with(id, $2)
           ORDER BY id LIMIT 2",
     )
     .bind(guild_id)
-    .bind(id_or_prefix)
     .bind(id_or_prefix)
     .fetch_all(pool)
     .await?;
@@ -152,12 +151,13 @@ pub async fn list_scheduled(
     .await
 }
 
-/// Atomically lease due rows before any outbound post (legacy
-/// `claimDueScheduled`). Postgres locks each candidate inside the UPDATE and
-/// `SKIP LOCKED` lets a second scheduler take the rest instead of blocking.
-/// The lease parks `next_run_at` at the horizon, so even a restarted process
-/// that missed the claim columns sees the row as not-due: claims happen once,
-/// so each occurrence posts once. A fresh claim takes the row's
+/// Atomically lease at most one due occurrence before its outbound post
+/// (legacy `claimDueScheduled`). `SKIP LOCKED` lets a second scheduler take
+/// another row instead of blocking. The ticker loops up to
+/// [`crate::scheduled::TICKER_BATCH_LIMIT`], supplying a fresh claim token and
+/// nonce on each call; a nonce must never be shared by distinct occurrences.
+/// The lease parks `next_run_at` at the horizon so a restarted process sees
+/// the row as not-due until the lease expires. A fresh claim takes the row's
 /// `occurrence_nonce` only when none is set — retries of an ambiguous post
 /// reuse the same nonce (legacy `COALESCE(occurrence_nonce, ?)`), so the
 /// execute-then-verify path stays idempotent across restarts.
@@ -167,20 +167,19 @@ pub async fn claim_due(
     now_iso: &str,
     claim_token: &str,
     lease_until_iso: &str,
-    limit: i64,
     occurrence_nonce: &str,
 ) -> Result<Vec<ScheduledMessageRow>, sqlx::Error> {
     sqlx::query_as::<_, ScheduledMessageRow>(
         "WITH due AS (
            SELECT id FROM scheduled_messages
             WHERE guild_id = $1 AND enabled AND next_run_at <= $2
-            ORDER BY next_run_at
-            LIMIT $5
+            ORDER BY next_run_at, id
+            LIMIT 1
             FOR UPDATE SKIP LOCKED
          )
          UPDATE scheduled_messages
             SET next_run_at = $4, claim_token = $3, claimed_at = $2,
-                occurrence_nonce = COALESCE(occurrence_nonce, $6)
+                occurrence_nonce = COALESCE(occurrence_nonce, $5)
           WHERE guild_id = $1 AND id IN (SELECT id FROM due)
             AND next_run_at <= $2
           RETURNING id, guild_id, channel_id, body, next_run_at, interval_seconds,
@@ -191,7 +190,6 @@ pub async fn claim_due(
     .bind(now_iso)
     .bind(claim_token)
     .bind(lease_until_iso)
-    .bind(limit)
     .bind(occurrence_nonce)
     .fetch_all(pool)
     .await
