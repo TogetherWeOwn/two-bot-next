@@ -3,6 +3,7 @@
 import copy
 import json
 from pathlib import Path
+import subprocess
 import unittest
 
 from check_soak_checklist import parity_rows, render, validate
@@ -39,6 +40,25 @@ class SoakChecklistTests(unittest.TestCase):
         self.assertTrue(any("Operator scripts" in str(row) for row in rows))
         changed = self.parity.replace("## 9. Drops", "| Behaviour | Detail | Map |\n|---|---|---|\n|discarded | reason | **DROP** — intentionally absent |\n\n## 9. Drops")
         self.assertEqual(set(rows), set(parity_rows(changed)))
+
+    def test_mixed_drop_requires_coverage_in_both_orders(self):
+        for mapping in (
+            "**DROP** (runtime); **S6** (shape-check)",
+            "**S6** (shape-check); **DROP** (runtime)",
+            "**DROP** (runtime); **B4** (acceptance)",
+            "**DROP** (runtime); [TOG-9881](/TOG/issues/TOG-9881)",
+            "**DROP** — replaced by session persistence (**S5**)",
+            "**DROP** (runtime); **NEW-42** (shape-check)",
+        ):
+            with self.subTest(mapping=mapping):
+                changed = self.parity.replace("## 9. Drops", "| Behaviour | Detail | Map |\n|---|---|---|\n|mixed observable | mapped remainder | " + mapping + " |\n\n## 9. Drops")
+                self.assertIn((8, ("mixed observable", "mapped remainder")), parity_rows(changed))
+                with self.assertRaisesRegex(ValueError, "missing="):
+                    validate(changed, self.checklist)
+
+    def test_drop_only_clauses_are_excluded(self):
+        changed = self.parity.replace("## 9. Drops", "| Behaviour | Detail | Map |\n|---|---|---|\n|discarded | reason | **DROP** (runtime); **DROP** (shape-check) |\n\n## 9. Drops")
+        self.assertEqual(set(parity_rows(self.parity)), set(parity_rows(changed)))
 
     def test_duplicate_rows_and_ids_fail(self):
         data = copy.deepcopy(self.checklist)
@@ -85,6 +105,18 @@ class SoakChecklistTests(unittest.TestCase):
         voice.pop("reference")
         with self.assertRaisesRegex(ValueError, "TOG-10119"):
             validate(self.parity, data)
+
+    def test_rest_verification_propagates_either_failure(self):
+        entry = next(e for e in self.checklist["entries"] if e["id"] == "s6-01")
+        prefix = "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test "
+        for first, second in ((0, 0), (17, 0), (0, 23)):
+            with self.subTest(first=first, second=second):
+                command = entry["verification"].replace(prefix + "executor_acceptance", f"(exit {first})")
+                command = command.replace(prefix + "executor_regressions", f"(exit {second})")
+                self.assertNotIn("python3", command)
+                # Only exit-status doubles execute: no Cargo, DB or network.
+                result = subprocess.run(["sh", "-c", command], check=False)
+                self.assertEqual(result.returncode, first or second)
 
     def test_config_prose_is_covered(self):
         data = copy.deepcopy(self.checklist)

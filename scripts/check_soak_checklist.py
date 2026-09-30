@@ -45,7 +45,10 @@ def parity_rows(markdown):
         mapping = cells[-1].replace("*", "").strip()
         if not mapping:
             raise ValueError(f"§{section}: unmapped row: {cells}")
-        if not re.match(r"^DROP\b", mapping):
+        # A DROP prefix can still carry mapped work, including replacement
+        # owners in parentheses. Semicolons also occur within drop reasons.
+        has_owner = re.search(r"\b(?:S\d+|B\d+|NEW-\d+|TOG-\d+)\b", mapping)
+        if has_owner or not re.match(r"^DROP\b", mapping):
             rows.append((section, cells[:-1]))
     if seen_sections != set(range(1, 9)):
         raise ValueError("Expected all parity sections 1–8")

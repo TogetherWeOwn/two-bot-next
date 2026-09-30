@@ -25,7 +25,7 @@
     "",
     "## Maintaining coverage",
     "",
-    "JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only a Map beginning with DROP is excluded; mixed mapped/DROP rows remain covered. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries.",
+    "JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only DROP-prefixed Maps without an S/B/NEW slice or TOG owner are excluded; mixed mapped/DROP rows remain covered in either order, including mapped replacement work. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries.",
     "",
     "Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, empty steps/evidence, invalid statuses, reasonless waivers, missing automated commands, missing voice links or Markdown drift fail the gate.",
     "",
@@ -885,6 +885,21 @@
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {
+      "id": "s3-21",
+      "parity": {
+        "section": 3,
+        "row": [
+          "`Dispatch/Ready/Closed/Hello/Resumed/…` staging-restart containment filter",
+          "allowlisted guild/actor payloads only"
+        ]
+      },
+      "status": "manual",
+      "action": "Attach the approved staging lifecycle receipt for persisted session plus RESUME across a Container restart (see gateway-recovery.md), including staging guild/actor allowlist checks. Use local fixtures for rejected guild/actor payloads; do not reintroduce the dropped legacy restart filter.",
+      "expected": "S5 session persistence and S6 staging containment replace the legacy filter: the approved staging session resumes and disallowed fixture payloads have no side effects. The legacy runtime filter remains dropped; voice reset evidence comes only from TOG-10119.",
+      "evidence": "Record the deployed SHA, staging identity/allowlist receipt, restart and RESUME UTC timestamps, correlated sanitized logs and local rejection-fixture result. Cross-link the existing lifecycle receipt and TOG-10119 voice receipt; no second voice procedure or production restart.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — consume its voice reset receipt; non-voice replacement assertions remain on this row."
+    },
+    {
       "id": "s4-01",
       "parity": {
         "section": 4,
@@ -1363,7 +1378,7 @@
       },
       "status": "waived",
       "action": "Run permitted/forbidden setting changes and version-poll fixtures on test DB.",
-      "expected": "Guild setting version and audit advance together; env_only/cold are not hot-writable.",
+      "expected": "Guild setting version and audit advance together for attributed hot/cold writes; wired hot changes apply live, cold changes require restart; env_only and unknown writes are refused before persistence/audit.",
       "evidence": "Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.",
       "reason": "Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence."
     },
@@ -1395,7 +1410,7 @@
       "action": "Against mock-discord REST double, script success/429/5xx/timeout/kick/moderation responses; attach fixture timestamps. Use only benign permitted staging REST during command scenarios.",
       "expected": "110ms pacing, retry-after+250ms, ≤4 exponential retries; kick 350ms/4 retries; moderation aborts at 5s without automatic retry.",
       "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test executor_acceptance; python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test executor_regressions"
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test executor_acceptance && python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test executor_regressions"
     },
     {
       "id": "s6-02",
@@ -1421,10 +1436,10 @@
         ]
       },
       "status": "automated",
-      "action": "Run guild-config snapshot emoji fixture with GUILD_CONFIG_CDN_BASE pointing to local approved mock.",
-      "expected": "Emoji bytes/metadata captured with bounded validation; no credential-bearing CDN URL or uncontrolled external fetch.",
-      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test guild_config_regressions"
+      "action": "Run backup_transport::guild_config_capture_plan_apply_round_trip, which supplies loopback Discord/CDN doubles and passes the CDN override to GuildConfigDiscordApi; no external CDN or real guild call.",
+      "expected": "The loopback CDN override is honoured: captured unmanaged emoji image starts with data:image/png;base64, and the snapshot seal verifies. This fixture does not prove oversize, timeout, invalid-content-type or deployed-network behaviour; do not claim those from its PASS.",
+      "evidence": "Attach the exact-head filtered command, executed test count (one, not zero), result and assertions at crates/core/tests/backup_transport.rs:394–420. Fixture capture/override and seal proof only, not a deployed-network or negative-validation soak receipt.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test backup_transport guild_config_capture_plan_apply_round_trip -- --exact"
     },
     {
       "id": "s6-04",
@@ -1564,8 +1579,8 @@
         ]
       },
       "status": "manual",
-      "action": "With approved synthetic configs, compare env_only/cold/hot catalogue; attempt dashboard change to each class; hot change waits 15s, cold waits approved restart. Never display token values.",
-      "expected": "Only hot keys dashboard-writable; cold flags restart-to-apply; env-only secrets remain private and validated; guild_settings version/audit reflect allowed hot change.",
+      "action": "With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD), a cold key (TWO_FEED_POLL_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.",
+      "expected": "Catalogued hot and cold keys are writable, versioned and audited; wired hot keys apply live, cold and hot-but-unwired keys are marked next-restart and do not apply live. Env_only and unknown writes are refused before persistence/audit; env-only values remain private.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {
