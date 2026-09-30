@@ -12,6 +12,7 @@ pub mod feature_commands;
 pub mod health;
 pub mod leveling;
 pub mod moderation;
+pub mod voice_naming;
 
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use config::Config;
