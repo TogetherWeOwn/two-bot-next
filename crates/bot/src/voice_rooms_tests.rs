@@ -789,6 +789,7 @@ fn setup_panel_describes_empty_running_healthy_guild() {
         tracked_rooms: 0,
         failures: vec![],
         halted: false,
+        store_error: None,
     });
     assert_eq!(panel.title, "Voice rooms");
     assert!(panel.description.contains("running"));
@@ -806,12 +807,27 @@ fn setup_panel_lists_creators_failures_and_halt() {
         tracked_rooms: 2,
         failures: vec!["create <#200>: rate limited".to_owned()],
         halted: true,
+        store_error: None,
     });
     assert!(panel.description.contains("paused"));
     assert!(panel.description.contains(&format!("<#{CREATOR}>")));
     assert!(panel.description.contains("below"));
     assert!(panel.description.contains("Tracked rooms: 2"));
     assert!(panel.description.contains("rate limited"));
+}
+
+#[test]
+fn setup_panel_surfaces_store_errors() {
+    let panel = setup_panel(&SetupSummary {
+        guild_id: GUILD,
+        creators: vec![],
+        tracked_rooms: 0,
+        failures: vec![],
+        halted: false,
+        store_error: Some("Unavailable".to_owned()),
+    });
+    assert!(panel.description.contains("Could not load creator channels"));
+    assert!(!panel.description.contains("No creator channels yet"));
 }
 
 #[test]
@@ -1258,7 +1274,24 @@ async fn execute_create_store_credential_pause() {
     let http = Http::new(trace.clone());
     let text = execute_create(&store, &http, GUILD, "lobby").await;
     assert!(text.contains("paused"));
+    assert!(text.contains("removed"));
     assert_eq!(*trace.lock().unwrap(), ["create", "delete:500"]);
+}
+
+#[tokio::test]
+async fn execute_create_failed_compensation_names_orphan_channel() {
+    let trace = Trace::default();
+    let store = Store::new(trace.clone());
+    *store.add_creator_error.lock().unwrap() = Some(StoreError::Unavailable);
+    let http = Http::new(trace.clone());
+    http.delete_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    assert!(!text.contains("was removed"));
+    assert!(text.contains("manually"));
+    assert!(text.contains("<#500>"));
 }
 
 #[tokio::test]

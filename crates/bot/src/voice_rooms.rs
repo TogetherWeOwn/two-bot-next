@@ -1563,12 +1563,15 @@ pub fn decide_create_channel(request: CreateChannelRequest) -> CreateChannelPlan
 }
 
 /// `/setup` input: creator rows plus live worker state for the guild.
+/// `store_error` is `Some` when the creator read failed — the panel surfaces
+/// it instead of rendering an empty list as "no creators".
 pub struct SetupSummary {
     pub guild_id: Snowflake,
     pub creators: Vec<CreatorChannel>,
     pub tracked_rooms: usize,
     pub failures: Vec<String>,
     pub halted: bool,
+    pub store_error: Option<String>,
 }
 
 /// `/setup` panel text. Anyone may view it; the S4 handler gates the quick
@@ -1591,8 +1594,15 @@ pub fn setup_panel(summary: &SetupSummary) -> SetupPanel {
     } else {
         lines.push("Voice rooms are running.".to_owned());
     }
+    if let Some(error) = &summary.store_error {
+        lines.push(format!(
+            "Could not load creator channels ({error}); the worker state below is current."
+        ));
+    }
     if summary.creators.is_empty() {
-        lines.push("No creator channels yet. Use /create to add the first one.".to_owned());
+        if summary.store_error.is_none() {
+            lines.push("No creator channels yet. Use /create to add the first one.".to_owned());
+        }
     } else {
         lines.push(format!("Creator channels ({})", summary.creators.len()));
         for creator in &summary.creators {
@@ -1729,7 +1739,9 @@ fn failure_line(failure: &LifecycleFailure) -> String {
 
 /// Execute one `/create`: validate the name, single-attempt the voice channel
 /// POST, then store the creator row. A REST failure refuses without touching
-/// the store; a store failure deletes the new channel as compensation.
+/// the store; a store failure deletes the new channel as compensation, and a
+/// failed compensation names the orphan channel id (untracked, so reconcile
+/// will not delete it) for manual cleanup instead of claiming removal.
 async fn execute_create<S: RoomPersistence, H: RoomWrites>(
     store: &S,
     http: &H,
@@ -1760,10 +1772,13 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
     {
         Ok(()) => format!("Created <#{channel_id}>: join it to spin up temporary voice rooms."),
         Err(error) => {
-            let _ = http.delete(channel_id, always).await;
+            let compensation = http.delete(channel_id, always).await;
+            let removed = compensation.is_ok();
             match error {
-                StoreError::CredentialRefused => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
-                _ => "Could not save the new creator channel, so it was removed. Try again.".to_owned(),
+                StoreError::CredentialRefused if removed => "Voice rooms are paused: the database refused the bot credential, so the new channel was removed. Tell an admin to fix it, then restart the bot.".to_owned(),
+                StoreError::CredentialRefused => format!("Voice rooms are paused: the database refused the bot credential, and removing the new channel failed. Delete <#{channel_id}> manually, then tell an admin to fix the database."),
+                _ if removed => "Could not save the new creator channel, so it was removed. Try again.".to_owned(),
+                _ => format!("Could not save the new creator channel, and removing it failed. Delete <#{channel_id}> manually and try again."),
             }
         }
     }
@@ -1804,7 +1819,10 @@ where
     match command {
         VoiceCommand::Setup => {
             let (store, _) = runtime.make_pair();
-            let creators = store.creators(guild_id).await.unwrap_or_default();
+            let (creators, store_error) = match store.creators(guild_id).await {
+                Ok(creators) => (creators, None),
+                Err(error) => (Vec::new(), Some(format!("{error:?}"))),
+            };
             let status = runtime.worker_status(guild_id).await;
             let panel = setup_panel(&SetupSummary {
                 guild_id,
@@ -1814,6 +1832,7 @@ where
                     .as_ref()
                     .map_or_else(Vec::new, |status| status.failures.clone()),
                 halted: status.as_ref().is_some_and(|status| status.halted),
+                store_error,
             });
             reply(ephemeral_response(&format!(
                 "**{}**\n{}",
