@@ -11,6 +11,8 @@ use two_bot_core::router::replies::{
 #[derive(Default)]
 struct Transport {
     operations: Mutex<Vec<ReplyOperation>>,
+    sent_at: Mutex<Vec<tokio::time::Instant>>,
+    delay: Duration,
     fail: bool,
 }
 
@@ -25,6 +27,13 @@ impl ReplyTransport for Transport {
 
     async fn execute(&self, operation: ReplyOperation) -> Result<(), Self::Error> {
         self.operations.lock().unwrap().push(operation);
+        self.sent_at
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         if self.fail {
             Err(std::io::Error::other("transport unavailable"))
         } else {
@@ -49,6 +58,10 @@ async fn slow_handler_defers_at_default_budget_then_edits_without_cancelling() {
                 [ReplyOperation::Defer { ephemeral }]
             );
             assert_eq!(started.elapsed(), Duration::from_secs(4));
+            assert_eq!(
+                transport.sent_at.lock().unwrap()[0] - started,
+                Duration::from_secs(2)
+            );
             Ok::<_, &str>(reply("completed", ephemeral))
         })
         .await
@@ -63,6 +76,84 @@ async fn slow_handler_defers_at_default_budget_then_edits_without_cancelling() {
             ]
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_during_handler_ack_keeps_polling_without_deadlock_or_double_ack() {
+    for early_reply in [true, false] {
+        let transport = Transport {
+            delay: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_handler(
+                &transport,
+                ReplyPolicy::default(),
+                true,
+                |session| async move {
+                    if early_reply {
+                        session.respond(reply("working", true)).await.unwrap();
+                    } else {
+                        session.defer(true).await.unwrap();
+                    }
+                    Ok::<_, &str>(reply("completed", true))
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        result.unwrap();
+        let ops = transport.operations();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            ops[1],
+            ReplyOperation::EditOriginal {
+                content: "completed".into()
+            }
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn completion_during_auto_defer_waits_for_the_ack_before_editing() {
+    let transport = Transport {
+        delay: Duration::from_secs(3),
+        ..Default::default()
+    };
+    let start = tokio::time::Instant::now();
+    run_handler(&transport, ReplyPolicy::default(), true, |_| async {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        Ok::<_, &str>(reply("done", true))
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        *transport.sent_at.lock().unwrap(),
+        [
+            start + Duration::from_secs(2),
+            start + Duration::from_secs(5)
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn private_completion_after_a_public_defer_uses_a_private_followup() {
+    let transport = Transport::default();
+    run_handler(&transport, ReplyPolicy::default(), false, |_| async {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        Ok::<_, &str>(reply("private", true))
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        transport.operations(),
+        [
+            ReplyOperation::Defer { ephemeral: false },
+            ReplyOperation::DeleteOriginal,
+            ReplyOperation::Followup(reply("private", true))
+        ]
+    );
 }
 
 #[tokio::test(start_paused = true)]

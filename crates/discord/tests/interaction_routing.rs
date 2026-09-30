@@ -394,7 +394,7 @@ fn disabled_and_ungated_wire_interactions_take_the_refusal_path() {
 }
 
 #[test]
-fn custom_rows_and_unknown_names_follow_legacy_fallthrough() {
+fn custom_rows_and_unknown_names_get_explicit_outcomes() {
     let router = InteractionRouter::new(all_on());
     let custom = slash("faq", Some(0));
     // Enabled row: everyone, no permission gate.
@@ -497,7 +497,7 @@ fn component_ids_and_prefixes_route() {
 #[test]
 fn modal_submits_share_the_component_table() {
     let router = InteractionRouter::new(all_on());
-    // Legacy has no modals; known ids route for future slices, unknown stay silent.
+    // Legacy has no modals; they share the explicit component outcomes.
     assert_eq!(
         route_interaction(&router, &modal(&format!("{LFG_PREFIX}abc123")), None),
         RoutedInteraction::Modal {
@@ -742,7 +742,7 @@ async fn public_deferred_error_is_deleted_then_sent_as_private_followup() {
     assert_eq!(requests[2].method, "POST");
     assert_eq!(
         requests[2].path,
-        "/api/v10/webhooks/1111/routing-test-token"
+        "/api/v10/webhooks/1111/routing-test-token?with_components=false"
     );
     let body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
     assert_eq!(body["flags"], 64);

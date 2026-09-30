@@ -344,8 +344,8 @@ impl InteractionRouter {
             return outcome;
         }
         // Dynamic DB-backed custom commands (#22): everyone while automations
-        // are on; explicit refusal while off; silence otherwise (legacy
-        // `registerAutomationCommands`: unknown names are another app's).
+        // are on; explicit refusal while off. Missing/disabled rows in the
+        // configured guild get the same reply as other stale interactions.
         match ctx.custom_row {
             Some(true) => {
                 if !self.guild_ok(ctx.guild_id) {
@@ -560,7 +560,7 @@ impl InteractionRouter {
     }
 
     /// Route one modal submit by `custom_id` through the same table as
-    /// components. Legacy has no modals; unknown ids are `Ignore`.
+    /// components. Unknown ids reply only inside the configured guild.
     #[must_use]
     pub fn route_modal(&self, custom_id: &str, guild_id: Option<u64>) -> ComponentOutcome {
         self.route_component(custom_id, guild_id)

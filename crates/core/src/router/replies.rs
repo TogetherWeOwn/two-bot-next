@@ -234,8 +234,14 @@ where
                 biased;
                 result = &mut future => result,
                 _ = &mut deadline => {
-                    session.defer(ephemeral).await?;
-                    future.await
+                    // Keep polling the handler while acquiring/sending the ACK:
+                    // an early handler reply may itself hold the session lock.
+                    // Wait for an in-flight defer before completing its edit.
+                    let (_, result) = tokio::try_join!(
+                        session.defer(ephemeral),
+                        async { Ok::<_, ReplyError<T::Error>>(future.await) },
+                    )?;
+                    result
                 }
             }
         }
