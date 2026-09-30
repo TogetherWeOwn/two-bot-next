@@ -10,6 +10,9 @@ pub mod automod;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
 pub mod automod_store;
+pub mod channel_moderation;
+#[cfg(feature = "db")]
+pub mod channel_moderation_store;
 pub mod classify;
 pub mod commands;
 pub mod community;
@@ -33,6 +36,9 @@ pub mod invites;
 pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
+pub mod lfg;
+#[cfg(feature = "db")]
+pub mod lfg_store;
 pub mod mac;
 pub mod moderation;
 pub mod onboarding;
@@ -42,6 +48,7 @@ pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
 pub mod raid;
+pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
@@ -60,6 +67,18 @@ pub use automod::{
     AutomodExportError, AutomodExportRule, AutomodFilter, AutomodGateError, AutomodMessage,
     AutomodPolicy, AutomodSanction, RepeatTracker, SanctionAction, DEFAULT_BLOCKED_ATTACHMENTS,
     DEFAULT_SANCTIONS,
+};
+pub use channel_moderation::{
+    moderation_result_text, plan_lockdown, plan_unlock, require_channel_reason,
+    validate_purge_count, validate_slowmode_seconds, BoundsError, ChannelModerationVerb,
+    ChannelOutcome, EveryoneOverwrite, LockdownPlan, LockdownRecord, LockdownSeed, MaskError,
+    UnlockError, UnlockPlan, MAX_PURGE_COUNT, MAX_SLOWMODE_SECONDS, MIN_PURGE_COUNT,
+    SEND_MESSAGES_BIT,
+};
+#[cfg(feature = "db")]
+pub use channel_moderation_store::{
+    ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore, DB_POOL_MAX_DEFAULT,
+    STATEMENT_TIMEOUT_MS,
 };
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use community::{
@@ -120,6 +139,15 @@ pub use leveling_store::{
     replace_role_rewards as replace_leveling_role_rewards, role_rewards as leveling_role_rewards,
     LevelingStoreError,
 };
+pub use lfg::{
+    adjudicate_signup, close_reply, created_reply, iso_millis_utc, leave_reply, lfg_content,
+    lfg_custom_id, lfg_nonce, lfg_select_options, normalize_starts_at, parse_lfg_select,
+    parse_role_spec, require_manage_events as lfg_require_manage_events, role_fill, signup_reply,
+    spec_roles, valid_role_key, validate_title, LfgPermissionError, LfgPost, LfgRole, LfgRoleSpec,
+    LfgSelectAction, LfgSelectOption, LfgSignup, LfgStatus, RoleSpecError, SignupOutcome,
+    StartsAtError, TitleError, LFG_LEAVE_VALUE, LFG_SELECT_PREFIX, MAX_LFG_ROLES,
+    MAX_MESSAGE_CHARS, MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
+};
 pub use moderation::{
     assert_moderation_allowed, moderation_commands, moderation_target_protection,
     require_moderation_reason, ModerationAction, ModerationActor, ModerationGateError,
@@ -159,6 +187,13 @@ pub use raid::{
     RaidAlert, RaidConfigError, RaidTuning, RaidWatch, RecordedJoinRisk, StaffAlertMessage,
     DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS, DEFAULT_RAID_COOLDOWN_SECONDS,
     DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
+};
+pub use router::{
+    ComponentHandler, ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter,
+    RouterGates, RouterRefusal, SlashContext, SlashOutcome, SurfaceFlags,
+    ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY, GUILD_RESTRICTED_REPLY, LFG_PREFIX,
+    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
+    SCORECARD_DISABLED_REPLY, SELF_ROLE_PREFIX, TICKET_CLAIM_ID, TICKET_CLOSE_ID, TICKET_OPEN_ID,
 };
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,

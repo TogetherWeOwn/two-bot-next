@@ -8,10 +8,15 @@
 pub mod adapter;
 pub mod automod;
 pub mod intents;
+pub mod interactions;
 pub mod pipeline;
 
 pub use adapter::event_to_core;
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
+pub use interactions::{
+    command_to_twilight, publish_commands, refusal_response, response_for_slash, route_interaction,
+    RoutedInteraction,
+};
 pub use pipeline::{
     build_cache, ChannelClassifier, InviteSource, MemPipeline, NoClassification, NoInvites,
     Pipeline, PipelineSnapshots, ScriptedInvites,

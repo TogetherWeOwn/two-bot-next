@@ -22,10 +22,11 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
+      TWO_LFG_TESTDB_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
     services:
       agent-testdb:
-        image: postgres:17
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: agent_test
@@ -38,7 +39,7 @@ jobs:
           --health-cmd "pg_isready -U agent_test -d agent_test"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -94,6 +95,10 @@ jobs:
       - name: cargo test (docs)
         run: cargo test --workspace --doc --features two-bot-core/db --locked
 
+      - name: LFG store regressions (CI service container only)
+        run: >-
+          cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
+
       - name: leveling Postgres parity tests
         env:
           TWO_LEVELING_TEST_CI: '1'
@@ -106,6 +111,17 @@ jobs:
 
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
+
+      - name: channel moderation store clippy
+        run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
+
+      # TWO_TEST_DATABASE_URL is scoped to this step only: the workspace suite
+      # above runs exactly as on main (RSVP store tests skip without it), and
+      # only this slice's tests activate their test-container guard here.
+      - name: channel moderation domain and store tests
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
+        run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
 
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
