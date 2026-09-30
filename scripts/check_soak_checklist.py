@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Offline parity/checklist coverage and rendered-document guard (stdlib only)."""
+
+import argparse
+from collections import Counter
+import json
+from pathlib import Path
+import re
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_ROW = (7, ("Config / env catalogue",))
+
+
+def parity_rows(markdown):
+    """Read Map tables in §§1–8; exclude only wholly DROP-mapped rows."""
+    section = None
+    headers = None
+    rows = []
+    seen_sections = set()
+    for line in markdown.splitlines():
+        heading = re.match(r"^## (\d+)\. ", line)
+        if heading:
+            section = int(heading[1])
+            headers = None
+            if 1 <= section <= 8:
+                seen_sections.add(section)
+            continue
+        if section not in range(1, 9):
+            continue
+        if not line.strip().startswith("|"):
+            headers = None
+            continue
+        # Escaped pipes are cell content, not table boundaries.
+        cells = tuple(c.strip().replace(r"\|", "|") for c in
+                      re.split(r"(?<!\\)\|", line.strip())[1:-1])
+        if all(re.fullmatch(r":?-+:?", c) for c in cells):
+            continue
+        if headers is None:
+            if not cells or cells[-1] != "Map":
+                raise ValueError(f"§{section}: parity table must end in Map")
+            headers = cells
+            continue
+        if len(cells) != len(headers):
+            raise ValueError(f"§{section}: malformed table row: {cells}")
+        mapping = cells[-1].replace("*", "").strip()
+        if not mapping:
+            raise ValueError(f"§{section}: unmapped row: {cells}")
+        if not re.match(r"^DROP\b", mapping):
+            rows.append((section, cells[:-1]))
+    if seen_sections != set(range(1, 9)):
+        raise ValueError("Expected all parity sections 1–8")
+    # §7 is a prose catalogue, not a table. Still require explicit coverage.
+    config = re.search(r"^## 7\. .*?\n(.*?)(?=^## 8\.)", markdown, re.M | re.S)
+    if not config or not all(word in config[1] for word in ("env_only", "cold", "hot")):
+        raise ValueError("§7 must describe env_only/cold/hot config classes")
+    rows.append(CONFIG_ROW)
+    counts = Counter(section for section, _ in rows)
+    if set(counts) != set(range(1, 9)):
+        raise ValueError("Every parity section must have mapped coverage")
+    if len(rows) != len(set(rows)):
+        raise ValueError("Duplicate parity source rows")
+    return rows
+
+
+def validate(markdown, checklist):
+    expected = set(parity_rows(markdown))
+    if checklist.get("schema_version") != 1:
+        raise ValueError("Unsupported checklist schema_version")
+    entries = checklist.get("entries", [])
+    actual = []
+    ids = []
+    for entry in entries:
+        ids.append(entry["id"])
+        source = entry["parity"]
+        key = (source["section"], tuple(source["row"]))
+        actual.append(key)
+        if entry["status"] not in ("automated", "manual", "waived"):
+            raise ValueError(f"{entry['id']}: invalid status")
+        for field in ("id", "action", "expected", "evidence"):
+            if not isinstance(entry.get(field), str) or not entry[field].strip():
+                raise ValueError(f"{entry.get('id')}: missing {field}")
+        if entry["status"] == "waived" and not entry.get("reason", "").strip():
+            raise ValueError(f"{entry['id']}: waiver requires reason")
+        if entry["status"] == "automated" and not entry.get("verification", "").strip():
+            raise ValueError(f"{entry['id']}: automated requires verification")
+        # Voice-sensitive rows are cross-links, never a second voice procedure.
+        voice = any("voice" in c.lower() for c in key[1])
+        voice = voice or (key[0] == 3 and "ShardResume" in key[1][0])
+        if voice and "TOG-10119" not in entry.get("reference", ""):
+            raise ValueError(f"{entry['id']}: voice coverage must reference TOG-10119")
+    if len(ids) != len(set(ids)) or len(actual) != len(set(actual)):
+        raise ValueError("Duplicate checklist IDs or parity rows")
+    missing = expected - set(actual)
+    stale = set(actual) - expected
+    if missing or stale:
+        raise ValueError(f"Coverage mismatch: missing={sorted(missing)!r}; stale={sorted(stale)!r}")
+    return Counter(section for section, _ in expected)
+
+
+def render(checklist):
+    lines = ["# Parity soak checklist", "", "<!-- Generated from soak-checklist.json by scripts/check_soak_checklist.py --render. -->", ""]
+    lines += checklist["instructions"] + [""]
+    for section in range(1, 9):
+        lines += [f"## {section}. {checklist['sections'][str(section)]}", ""]
+        for entry in checklist["entries"]:
+            if entry["parity"]["section"] != section:
+                continue
+            label = " — ".join(entry["parity"]["row"][:2])
+            lines += [f"### {entry['id']}: {label}", "",
+                      f"- **Method:** `{entry['status']}` (not an execution verdict).",
+                      f"- **Action:** {entry['action']}",
+                      f"- **Expected:** {entry['expected']}",
+                      f"- **Evidence:** {entry['evidence']}"]
+            for field in ("verification", "reason", "reference"):
+                if entry.get(field):
+                    lines.append(f"- **{field.title()}:** {entry[field]}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--render", action="store_true", help="Print the generated Markdown")
+    args = parser.parse_args()
+    checklist = json.loads((ROOT / "docs/soak-checklist.json").read_text())
+    try:
+        counts = validate((ROOT / "docs/parity.md").read_text(), checklist)
+        output = render(checklist)
+        if args.render:
+            print(output, end="")
+        else:
+            if (ROOT / "docs/soak-checklist.md").read_text() != output:
+                raise ValueError("Markdown drift: regenerate with --render")
+            print(f"PASS: {sum(counts.values())}/{sum(counts.values())} non-DROP rows; "
+                  + ", ".join(f"§{s}={counts[s]}" for s in sorted(counts)))
+    except (ValueError, KeyError, TypeError) as error:
+        parser.exit(1, f"FAIL: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
