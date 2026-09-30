@@ -24,11 +24,12 @@ jobs:
       CARGO_TERM_COLOR: always
     services:
       agent-testdb:
-        image: postgres:17-alpine
+        image: postgres:17
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: two_bot_test_tog10090_ci
           # Ephemeral CI service only; tests explicitly use an empty password.
+          # The default postgres database also serves settings' unique schemas.
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 127.0.0.1:5432:5432
@@ -90,6 +91,9 @@ jobs:
 
       - name: cargo test (docs)
         run: cargo test --workspace --doc --features two-bot-core/db --locked
+
+      - name: settings database regressions (CI service only)
+        run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
