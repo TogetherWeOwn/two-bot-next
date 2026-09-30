@@ -1,8 +1,8 @@
 //! Fenced self-role event leases and shared exclusive-panel lanes.
 //!
-//! Ports legacy `src/store/selfRoleStore.ts` at d5d11793. Callers supply the
-//! current UTC time on each operation (a deterministic test seam), and must
-//! force-fetch member state after acquiring a lane. Recovery reuses persisted
+//! Ports legacy `src/store/selfRoleStore.ts` at d5d11793. Lease time comes from
+//! PostgreSQL's wall clock after acquiring the connection and relevant locks.
+//! Callers must force-fetch member state after acquiring a lane. Recovery reuses persisted
 //! intent, not a recalculated button toggle. A panel claim is keyed by
 //! guild/member/panel, not event, so distinct events serialize across workers.
 //!
@@ -15,6 +15,11 @@
 //! Unique-index arbitration uses PostgreSQL ON CONFLICT:
 //! https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
 
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc,
+};
+
 use sqlx::{PgConnection, PgPool};
 use time::{Duration, OffsetDateTime};
 use two_bot_core::self_roles::{
@@ -22,7 +27,9 @@ use two_bot_core::self_roles::{
     SELF_ROLE_CLAIM_LEASE_MS,
 };
 
-/// Persist observed effects separately from attempted/compensated effects.
+/// Observed (added/removed) and unresolved fields describe the latest snapshot.
+/// Attempted/compensated fields are cumulative historical evidence: checkpoint
+/// and settlement atomically retain prior IDs even across lease recovery.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditEffects {
     pub added_role_ids: Vec<String>,
@@ -36,6 +43,20 @@ pub struct AuditEffects {
 }
 
 impl AuditEffects {
+    // The recovery SELECT constructs exactly eight fields in this order.
+    fn decoded(fields: &[String]) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            added_role_ids: serde_json::from_str(&fields[0])?,
+            removed_role_ids: serde_json::from_str(&fields[1])?,
+            attempted_added_role_ids: serde_json::from_str(&fields[2])?,
+            attempted_removed_role_ids: serde_json::from_str(&fields[3])?,
+            compensated_added_role_ids: serde_json::from_str(&fields[4])?,
+            compensated_removed_role_ids: serde_json::from_str(&fields[5])?,
+            unresolved_added_role_ids: serde_json::from_str(&fields[6])?,
+            unresolved_removed_role_ids: serde_json::from_str(&fields[7])?,
+        })
+    }
+
     fn encoded(&self) -> [String; 8] {
         [
             &self.added_role_ids,
@@ -80,6 +101,9 @@ pub struct EventClaim {
     pub token: String,
     pub generation: i32,
     pub recovered: bool,
+    /// Persisted effect snapshot at acquisition; attempts/compensations remain
+    /// cumulative in storage while observed/unresolved fields are replaceable.
+    pub effects: AuditEffects,
     pub desired_role_ids: Vec<String>,
     pub pre_mutation_role_ids: Vec<String>,
     pub renew_after_ms: u64,
@@ -139,6 +163,7 @@ pub enum StoreError {
 pub struct SelfRoleStore {
     pool: PgPool,
     lease_ms: u64,
+    test_clock_ms: Option<Arc<AtomicI64>>,
 }
 
 impl SelfRoleStore {
@@ -147,6 +172,7 @@ impl SelfRoleStore {
         Self {
             pool,
             lease_ms: SELF_ROLE_CLAIM_LEASE_MS,
+            test_clock_ms: None,
         }
     }
 
@@ -154,7 +180,38 @@ impl SelfRoleStore {
         if lease_ms == 0 || lease_ms > i64::MAX as u64 {
             return Err(StoreError::InvalidLease);
         }
-        Ok(Self { pool, lease_ms })
+        Ok(Self {
+            pool,
+            lease_ms,
+            test_clock_ms: None,
+        })
+    }
+
+    /// Explicit deterministic fixture clock, in Unix milliseconds. Never use
+    /// this constructor for a runtime store; `new`/`with_lease` use database time.
+    #[doc(hidden)]
+    pub fn with_test_clock(
+        pool: PgPool,
+        lease_ms: u64,
+        clock_ms: Arc<AtomicI64>,
+    ) -> Result<Self, StoreError> {
+        let mut store = Self::with_lease(pool, lease_ms)?;
+        store.test_clock_ms = Some(clock_ms);
+        Ok(store)
+    }
+
+    async fn now(&self, conn: &mut PgConnection) -> Result<OffsetDateTime, StoreError> {
+        if let Some(clock) = &self.test_clock_ms {
+            return OffsetDateTime::from_unix_timestamp_nanos(
+                i128::from(clock.load(Ordering::SeqCst)) * 1_000_000,
+            )
+            .map_err(|_| StoreError::InvalidLease);
+        }
+        // NOT now()/CURRENT_TIMESTAMP/statement_timestamp(): those predate waits.
+        let (now,): (OffsetDateTime,) = sqlx::query_as("SELECT clock_timestamp()")
+            .fetch_one(conn)
+            .await?;
+        Ok(now)
     }
 
     fn expiry(&self, now: OffsetDateTime) -> Result<OffsetDateTime, StoreError> {
@@ -163,13 +220,10 @@ impl SelfRoleStore {
     }
 
     /// Insert-first deduplication, then generation-fenced expired recovery.
-    pub async fn claim_audit(
-        &self,
-        row: &SelfRoleAudit,
-        now: OffsetDateTime,
-    ) -> Result<Option<EventClaim>, StoreError> {
-        let expires = self.expiry(now)?;
+    pub async fn claim_audit(&self, row: &SelfRoleAudit) -> Result<Option<EventClaim>, StoreError> {
         let mut tx = self.pool.begin().await?;
+        let now = self.now(&mut tx).await?;
+        let expires = self.expiry(now)?;
         let created = now
             .to_offset(time::UtcOffset::UTC)
             .format(&time::format_description::well_known::Rfc3339)
@@ -213,21 +267,27 @@ impl SelfRoleStore {
                 token,
                 generation: 1,
                 recovered: false,
+                effects: row.effects.clone(),
                 desired_role_ids: row.desired_role_ids.clone(),
                 pre_mutation_role_ids: row.pre_mutation_role_ids.clone(),
                 renew_after_ms: self_role_renew_after_ms(self.lease_ms),
             })
         } else {
-            let prior: Option<(i32, String, String)> = sqlx::query_as(
-                "SELECT claim_generation, desired_role_ids, pre_mutation_role_ids
-                 FROM self_role_audit WHERE event_id=$1 AND outcome='processing'
-                 AND processing_expires_at <= $2 FOR UPDATE",
+            type RecoveryRow = (i32, String, String, OffsetDateTime, Vec<String>);
+            let prior: Option<RecoveryRow> = sqlx::query_as(
+                "SELECT claim_generation, desired_role_ids, pre_mutation_role_ids,
+                 processing_expires_at, ARRAY[added_role_ids,removed_role_ids,
+                 attempted_added_role_ids,attempted_removed_role_ids,
+                 compensated_added_role_ids,compensated_removed_role_ids,
+                 unresolved_added_role_ids,unresolved_removed_role_ids]
+                 FROM self_role_audit WHERE event_id=$1 AND outcome='processing' FOR UPDATE",
             )
             .bind(&row.event_id)
-            .bind(now)
             .fetch_optional(&mut *tx)
             .await?;
-            if let Some((generation, desired, before)) = prior {
+            let now = self.now(&mut tx).await?;
+            if let Some((generation, desired, before, _, effects)) = prior.filter(|p| p.3 <= now) {
+                let effects = AuditEffects::decoded(&effects)?;
                 let next = generation
                     .checked_add(1)
                     .ok_or(StoreError::GenerationExhausted)?;
@@ -241,7 +301,7 @@ impl SelfRoleStore {
                 )
                 .bind(&row.event_id)
                 .bind(next)
-                .bind(expires)
+                .bind(self.expiry(now)?)
                 .fetch_one(&mut *tx)
                 .await?;
                 Some(EventClaim {
@@ -249,6 +309,7 @@ impl SelfRoleStore {
                     token,
                     generation: next,
                     recovered: true,
+                    effects,
                     desired_role_ids,
                     pre_mutation_role_ids,
                     renew_after_ms: self_role_renew_after_ms(self.lease_ms),
@@ -257,15 +318,24 @@ impl SelfRoleStore {
                 None
             }
         };
+        if let Some(claim) = &claim {
+            // INSERT may have waited on a conflicting uncommitted row. Grant a
+            // fresh lease only once this transaction owns the row.
+            let expires = self.expiry(self.now(&mut tx).await?)?;
+            sqlx::query("UPDATE self_role_audit SET processing_expires_at=$2 WHERE event_id=$1")
+                .bind(&claim.event_id)
+                .bind(expires)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(claim)
     }
 
-    pub async fn owns_claim(
-        &self,
-        claim: &EventClaim,
-        now: OffsetDateTime,
-    ) -> Result<bool, StoreError> {
+    pub async fn owns_claim(&self, claim: &EventClaim) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
         let (owned,): (bool,) = sqlx::query_as(
             "SELECT EXISTS(SELECT 1 FROM self_role_audit WHERE event_id=$1
              AND claim_token=$2 AND claim_generation=$3 AND outcome='processing'
@@ -275,17 +345,17 @@ impl SelfRoleStore {
         .bind(&claim.token)
         .bind(claim.generation)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(owned)
     }
 
-    pub async fn renew_claim(
-        &self,
-        claim: &EventClaim,
-        now: OffsetDateTime,
-    ) -> Result<bool, StoreError> {
-        Ok(sqlx::query(
+    pub async fn renew_claim(&self, claim: &EventClaim) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
+        let changed = sqlx::query(
             "UPDATE self_role_audit SET processing_expires_at=$5 WHERE event_id=$1
              AND claim_token=$2 AND claim_generation=$3 AND outcome='processing'
              AND processing_expires_at > $4",
@@ -295,10 +365,12 @@ impl SelfRoleStore {
         .bind(claim.generation)
         .bind(now)
         .bind(self.expiry(now)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Try once; the executor owns bounded retry/backoff. Only a lane winner
@@ -307,10 +379,9 @@ impl SelfRoleStore {
         &self,
         key: &PanelKey,
         event: Option<(&str, &str)>,
-        now: OffsetDateTime,
     ) -> Result<PanelClaimResult, StoreError> {
-        let expires = self.expiry(now)?;
         let mut tx = self.pool.begin().await?;
+        let expires = self.expiry(self.now(&mut tx).await?)?;
         let event_id = event.map(|(id, _)| id);
         let event_order = event.map(|(_, order)| order);
         let inserted: Option<(String,)> = sqlx::query_as(
@@ -361,7 +432,7 @@ impl SelfRoleStore {
                 tx.commit().await?;
                 return Ok(PanelClaimResult::Superseded(target));
             }
-            if expiry > now {
+            if expiry > self.now(&mut tx).await? {
                 tx.commit().await?;
                 return Ok(PanelClaimResult::Busy);
             }
@@ -386,7 +457,7 @@ impl SelfRoleStore {
                 "UPDATE self_role_audit SET outcome='rejected',code='superseded_by_later_event',
                  reason='a later exclusive-panel event was accepted',processing_expires_at=NULL
                  WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3 AND event_id<>$4
-                 AND event_order<$5 AND outcome='processing'",
+                 AND event_order COLLATE \"C\" < $5 COLLATE \"C\" AND outcome='processing'",
             )
             .bind(&key.guild_id)
             .bind(&key.member_id)
@@ -396,6 +467,12 @@ impl SelfRoleStore {
             .execute(&mut *tx)
             .await?;
         }
+        // Superseding audits can also wait for locks. Start the winning lease
+        // only after all admission work, while we still own the panel row.
+        let expires = self.expiry(self.now(&mut tx).await?)?;
+        sqlx::query("UPDATE self_role_panel_claims SET processing_expires_at=$4 WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3")
+            .bind(&key.guild_id).bind(&key.member_id).bind(&key.panel_id)
+            .bind(expires).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(PanelClaimResult::Acquired(PanelClaim {
             key: key.clone(),
@@ -406,11 +483,10 @@ impl SelfRoleStore {
         }))
     }
 
-    pub async fn owns_panel_claim(
-        &self,
-        claim: &PanelClaim,
-        now: OffsetDateTime,
-    ) -> Result<bool, StoreError> {
+    pub async fn owns_panel_claim(&self, claim: &PanelClaim) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
         let (owned,): (bool,) = sqlx::query_as(
             "SELECT EXISTS(SELECT 1 FROM self_role_panel_claims WHERE guild_id=$1
              AND member_id=$2 AND panel_id=$3 AND claim_token=$4 AND claim_generation=$5
@@ -422,17 +498,17 @@ impl SelfRoleStore {
         .bind(&claim.token)
         .bind(claim.generation)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(owned)
     }
 
-    pub async fn renew_panel_claim(
-        &self,
-        claim: &PanelClaim,
-        now: OffsetDateTime,
-    ) -> Result<bool, StoreError> {
-        Ok(sqlx::query(
+    pub async fn renew_panel_claim(&self, claim: &PanelClaim) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
+        let changed = sqlx::query(
             "UPDATE self_role_panel_claims SET processing_expires_at=$7 WHERE guild_id=$1
              AND member_id=$2 AND panel_id=$3 AND claim_token=$4 AND claim_generation=$5
              AND processing_expires_at > $6",
@@ -444,19 +520,20 @@ impl SelfRoleStore {
         .bind(claim.generation)
         .bind(now)
         .bind(self.expiry(now)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Retain the committed target and chronology; stale releases are no-ops.
-    pub async fn release_panel_claim(
-        &self,
-        claim: &PanelClaim,
-        now: OffsetDateTime,
-    ) -> Result<bool, StoreError> {
-        Ok(sqlx::query(
+    pub async fn release_panel_claim(&self, claim: &PanelClaim) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
+        let changed = sqlx::query(
             "UPDATE self_role_panel_claims SET processing_expires_at=$6 WHERE guild_id=$1
              AND member_id=$2 AND panel_id=$3 AND claim_token=$4 AND claim_generation=$5",
         )
@@ -466,10 +543,12 @@ impl SelfRoleStore {
         .bind(&claim.token)
         .bind(claim.generation)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Seed a previously uninitialized lane from freshly fetched member state.
@@ -477,10 +556,12 @@ impl SelfRoleStore {
         &self,
         claim: &mut PanelClaim,
         option: Option<&str>,
-        now: OffsetDateTime,
     ) -> Result<bool, StoreError> {
-        let mut conn = self.pool.acquire().await?;
-        let changed = set_panel_option(&mut conn, claim, option, now).await?;
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
+        let changed = set_panel_option(&mut tx, claim, option, now).await?;
+        tx.commit().await?;
         if changed {
             claim.target.option_key = option.map(str::to_owned);
             claim.target.committed = true;
@@ -497,8 +578,14 @@ impl SelfRoleStore {
     ) -> Result<bool, StoreError> {
         let mut query = sqlx::query(
             "UPDATE self_role_audit SET added_role_ids=$1,removed_role_ids=$2,
-             attempted_added_role_ids=$3,attempted_removed_role_ids=$4,
-             compensated_added_role_ids=$5,compensated_removed_role_ids=$6,
+             attempted_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM jsonb_array_elements_text(attempted_added_role_ids::jsonb || $3::jsonb)),
+             attempted_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM jsonb_array_elements_text(attempted_removed_role_ids::jsonb || $4::jsonb)),
+             compensated_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM jsonb_array_elements_text(compensated_added_role_ids::jsonb || $5::jsonb)),
+             compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
              unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8
              WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11 AND outcome='processing'",
         );
@@ -534,7 +621,6 @@ impl SelfRoleStore {
         claim: &EventClaim,
         panel: &mut PanelClaim,
         option: Option<&str>,
-        now: OffsetDateTime,
     ) -> Result<bool, StoreError> {
         if row.guild_id != panel.key.guild_id
             || row.member_id != panel.key.member_id
@@ -543,6 +629,11 @@ impl SelfRoleStore {
             return Err(StoreError::WrongPanel);
         }
         let mut tx = self.pool.begin().await?;
+        // Match lane admission's panel -> audit lock order. Check panel expiry
+        // only after BOTH locks; settlement must not wait after authorization.
+        lock_panel(&mut tx, panel).await?;
+        lock_event(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
         if !set_panel_option(&mut tx, panel, option, now).await? {
             tx.rollback().await?;
             return Ok(false);
@@ -560,6 +651,22 @@ fn ids_json(ids: &Vec<String>) -> String {
     serde_json::to_string(ids).expect("role-id array serializes")
 }
 
+async fn lock_event(conn: &mut PgConnection, claim: &EventClaim) -> Result<(), StoreError> {
+    sqlx::query("SELECT event_id FROM self_role_audit WHERE event_id=$1 FOR UPDATE")
+        .bind(&claim.event_id)
+        .fetch_optional(conn)
+        .await?;
+    Ok(())
+}
+
+async fn lock_panel(conn: &mut PgConnection, claim: &PanelClaim) -> Result<(), StoreError> {
+    sqlx::query("SELECT panel_id FROM self_role_panel_claims WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3 FOR UPDATE")
+        .bind(&claim.key.guild_id).bind(&claim.key.member_id).bind(&claim.key.panel_id)
+        .fetch_optional(conn).await?;
+    Ok(())
+}
+
+// Call only with the panel row locked and time sampled after all needed locks.
 async fn set_panel_option(
     conn: &mut PgConnection,
     claim: &PanelClaim,
@@ -595,8 +702,14 @@ async fn finish_audit(
     let mut query = sqlx::query(
         "UPDATE self_role_audit SET option_key=$1,role_id=$2,source=$3,operation=$4,
          outcome=$5,code=$6,reason=$7,added_role_ids=$8,removed_role_ids=$9,
-         attempted_added_role_ids=$10,attempted_removed_role_ids=$11,
-         compensated_added_role_ids=$12,compensated_removed_role_ids=$13,
+         attempted_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(attempted_added_role_ids::jsonb || $10::jsonb)),
+         attempted_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(attempted_removed_role_ids::jsonb || $11::jsonb)),
+         compensated_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(compensated_added_role_ids::jsonb || $12::jsonb)),
+         compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $13::jsonb)),
          unresolved_added_role_ids=$14,unresolved_removed_role_ids=$15,processing_expires_at=NULL
          WHERE event_id=$16 AND claim_token=$17 AND claim_generation=$18 AND outcome='processing'
          AND guild_id=$19 AND member_id=$20 AND panel_id=$21 AND source_id=$22",

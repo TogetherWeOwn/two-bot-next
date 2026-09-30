@@ -27,21 +27,33 @@ it does **not** enable live Discord dispatch.
 2. Resolve configured roles/channels and revalidate live permission masks and
    hierarchy before mutation. Component input is untrusted. Reaction partials
    need fetches through the shared REST seam, not a private HTTP client.
-3. Claim the interaction ID once. Reactions have no delivery ID: use a new
-   event ID per delivery and converge by planning against freshly fetched
-   member state. Explicit add/remove duplicate plans are no-ops.
+3. Claim the interaction ID once. Reactions have no delivery ID: use a globally
+   unique event ID per delivery and converge by planning against freshly fetched
+   member state. Preserve its original timestamp and generated order on retries;
+   the full event ID breaks same-millisecond ties across workers. SQL supersession
+   uses the same byte ordering as Rust. Explicit add/remove duplicate plans are no-ops.
 4. For an exclusive panel, acquire the shared guild/member/panel lane before
    fetching/planning. `Busy` is a retryable result; `Superseded` conveys **no
    ownership**. The executor supplies bounded retry/backoff, not the store.
-5. Recover persisted desired/pre-mutation snapshots instead of recalculating
-   an old toggle. Renew both leases at the returned `renew_after_ms` interval;
-   expired leases cannot renew. Supply fresh UTC time for every store call.
+5. Recover persisted desired/pre-mutation snapshots and `EventClaim.effects`
+   instead of recalculating an old toggle or discarding checkpointed evidence.
+   Renew both leases at the returned `renew_after_ms` interval; expired leases
+   cannot renew. Store APIs do not accept caller timestamps: production uses
+   PostgreSQL `clock_timestamp()` after pool acquisition and all relevant row
+   locks, not transaction/statement-start time. Atomic settlement locks the panel
+   then the audit before checking expiry. Only deterministic fixtures use the
+   explicitly named `with_test_clock` constructor.
 6. Use singular role mutations, removals before additions, retaining unrelated
    roles. Check ownership before **and after** each REST call. Storage fencing
    alone cannot cancel a remote request that outlives its lease.
-7. Persist attempted/observed/compensated/unresolved effects truthfully. On
-   ambiguous REST failure, reconcile to the persisted pre-mutation state; an
-   exclusive stale worker repairs only the last **committed** panel target.
+7. Persist attempted/observed/compensated/unresolved effects truthfully.
+   Attempted and compensated role IDs are cumulative historical evidence;
+   checkpoint and settlement atomically union them with stored IDs. Observed
+   added/removed and unresolved IDs are the latest snapshot and may be cleared
+   after reconciliation. Recovery returns all eight arrays; it never infers
+   historical effects from desired roles. On ambiguous REST failure, reconcile
+   to the persisted pre-mutation state; an exclusive stale worker repairs only
+   the last **committed** panel target.
 8. Publish successful audit and panel target atomically using
    `finish_audit_and_set_panel_option`. A stale audit rolls back the target;
    a stale panel publishes nothing. Release retains chronology/commitment.

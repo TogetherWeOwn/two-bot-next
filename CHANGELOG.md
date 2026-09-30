@@ -8,8 +8,11 @@
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and
   exclusive-panel leases support renewal, expiry recovery, immutable mutation
-  intent, fencing, and atomic audit/target settlement. The isolated Postgres
-  lease regression test runs in CI and gates the required `check` job.
+  intent, fencing, and atomic audit/target settlement. Lease checks use database
+  wall time after lock waits; recovery preserves cumulative attempted/compensated
+  evidence. Generated events have cross-worker tie-breakers, and controls enforce
+  UTF-16 and Discord size limits. The isolated Postgres lease regression test
+  runs in CI and gates the required `check` job.
   Runtime router/REST wiring remains deferred; this does not enable Discord
   role mutations.
 

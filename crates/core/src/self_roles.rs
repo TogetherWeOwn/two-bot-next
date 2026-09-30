@@ -38,7 +38,6 @@
 //! module carries no guild id.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Claim-lease duration (legacy `SELF_ROLE_CLAIM_LEASE_MS` = 5 minutes).
 pub const SELF_ROLE_CLAIM_LEASE_MS: u64 = 5 * 60 * 1000;
@@ -362,6 +361,8 @@ pub fn plan_select_delta(
         SettledOutcome::Assigned
     } else if !remove_role_ids.is_empty() {
         SettledOutcome::Removed
+    } else if desired.is_empty() {
+        SettledOutcome::AlreadyAbsent
     } else {
         SettledOutcome::AlreadyHeld
     };
@@ -993,7 +994,15 @@ fn parse_panel(
             .as_object()
             .ok_or_else(|| SelfRoleConfigError::new(format!("{oat} must be an object")))?;
         let key = short_key(get(o, &oat, "key")?, &format!("{oat}.key"))?;
-        let label = capped_text(get(o, &oat, "label")?, &format!("{oat}.label"), 100)?;
+        if mode == PanelMode::Button
+            && self_role_custom_id(&id, Some(&key)).encode_utf16().count() > 100
+        {
+            return Err(SelfRoleConfigError::new(format!(
+                "{oat}.key combined with {at}.id exceeds Discord's 100-character custom id limit"
+            )));
+        }
+        let label_max = if mode == PanelMode::Button { 80 } else { 100 };
+        let label = capped_text(get(o, &oat, "label")?, &format!("{oat}.label"), label_max)?;
         let role_id = snowflake(get(o, &oat, "roleId")?, &format!("{oat}.roleId"))?;
         let permissions =
             permission_mask(get(o, &oat, "permissions")?, &format!("{oat}.permissions"))?;
@@ -1069,13 +1078,14 @@ fn get_opt<'a>(
     obj.get(key)
 }
 
+// Match legacy JavaScript string.length: astral characters use two UTF-16 units.
 fn capped_text(
     value: &serde_json::Value,
     at: &str,
     max: usize,
 ) -> Result<String, SelfRoleConfigError> {
     match value.as_str() {
-        Some(s) if !s.trim().is_empty() && s.chars().count() <= max => Ok(s.to_owned()),
+        Some(s) if !s.trim().is_empty() && s.encode_utf16().count() <= max => Ok(s.to_owned()),
         _ => Err(SelfRoleConfigError::new(format!(
             "{at} must be a non-empty string no longer than {max} characters"
         ))),
@@ -1315,8 +1325,10 @@ pub fn self_role_claim_owned(expires_at_ms: u64, now_ms: u64) -> bool {
 }
 
 /// Total order for exclusive-panel events: snowflake dispatches sort by
-/// `(timestamp, id)`; generated ids sort by `(wall clock, sequence)`
-/// (legacy `eventOrderFor`).
+/// `(timestamp, id)`; generated ids sort by `(event timestamp, event id)`.
+/// Reuse the original `now_ms` timestamp on retries. The full generated id
+/// is a collision-free tie-breaker across workers, with no local sequence;
+/// at the same timestamp, snowflakes sort before generated ids.
 #[must_use]
 pub fn event_order_for_event_id(event_id: &str, now_ms: u64) -> String {
     if is_snowflake(event_id) {
@@ -1324,9 +1336,7 @@ pub fn event_order_for_event_id(event_id: &str, now_ms: u64) -> String {
         let timestamp = (snowflake >> 22) + DISCORD_EPOCH_MS;
         return format!("{:013}:{event_id:0>20}", timestamp.min(9_999_999_999_999));
     }
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) % 1_000_000;
-    format!("{now_ms:013}:{sequence:020}")
+    format!("{now_ms:013}:generated:{event_id}")
 }
 
 /// Derive the order of a stored event id when the row predates explicit
@@ -1537,6 +1547,30 @@ mod tests {
         )
         .is_err());
         assert!(plan_select_delta(&panel, &held(&[]), &["999999999999999999".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn select_noops_distinguish_empty_and_already_held_targets() {
+        let mut panel = panel();
+        panel.mode = PanelMode::Select;
+        // Empty desired and held panel sets are a deselect-all no-op,
+        // including when unrelated roles are held.
+        for roles in [held(&[]), held(&[ROLE_C])] {
+            let plan = plan_select_delta(&panel, &roles, &[]).expect("plans");
+            assert_eq!(
+                (plan.operation, plan.outcome),
+                (RoleOperation::Remove, SettledOutcome::AlreadyAbsent)
+            );
+            assert!(plan.add_role_ids.is_empty() && plan.remove_role_ids.is_empty());
+            assert_eq!((plan.option_key, plan.role_id), (None, None));
+        }
+        // Nonempty desired roles already held still audit as already-held.
+        let plan = plan_select_delta(&panel, &held(&[ROLE_A, ROLE_C]), &[ROLE_A.to_owned()])
+            .expect("plans");
+        assert_eq!(plan.outcome, SettledOutcome::AlreadyHeld);
+        assert!(plan.add_role_ids.is_empty() && plan.remove_role_ids.is_empty());
+        assert_eq!(plan.option_key.as_deref(), Some("chess"));
+        assert_eq!(plan.role_id.as_deref(), Some(ROLE_A));
     }
 
     #[test]
@@ -1853,6 +1887,79 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_rejects_oversized_composed_button_ids() {
+        let id = "p".repeat(60);
+        let key = "k".repeat(25);
+        assert_eq!(
+            self_role_custom_id(&id, Some(&key)).encode_utf16().count(),
+            100
+        );
+        let mut raw = serde_json::json!([{
+            "id": id,
+            "channelId": GUILD,
+            "messageId": MSG,
+            "mode": "button",
+            "options": [{
+                "key": key, "label": "Chess",
+                "roleId": ROLE_A, "permissions": "0", "emoji": "♟️",
+            }],
+        }]);
+        assert!(parse_self_role_panels(&raw.to_string()).is_ok());
+        let key = "k".repeat(26);
+        assert_eq!(
+            self_role_custom_id(&id, Some(&key)).encode_utf16().count(),
+            101
+        );
+        raw[0]["options"][0]["key"] = serde_json::json!(key);
+        let err = parse_self_role_panels(&raw.to_string()).expect_err("oversized custom id");
+        assert!(
+            err.message().contains("100-character custom id limit"),
+            "{err}"
+        );
+        // Selects use only the panel id; reaction options have no custom id.
+        for mode in ["select", "reaction"] {
+            raw[0]["mode"] = serde_json::json!(mode);
+            assert!(parse_self_role_panels(&raw.to_string()).is_ok(), "{mode}");
+        }
+    }
+
+    #[test]
+    fn catalogue_labels_use_surface_specific_utf16_limits() {
+        let mut raw = serde_json::json!([{
+            "id": "games",
+            "channelId": GUILD,
+            "messageId": MSG,
+            "mode": "button",
+            "options": [{
+                "key": "chess", "label": "Chess",
+                "roleId": ROLE_A, "permissions": "0",
+            }],
+        }]);
+        for (mode, max) in [("button", 80), ("select", 100)] {
+            raw[0]["mode"] = serde_json::json!(mode);
+            for label in ["a".repeat(max), "🎲".repeat(max / 2)] {
+                assert_eq!(label.encode_utf16().count(), max);
+                raw[0]["options"][0]["label"] = serde_json::json!(label);
+                assert!(parse_self_role_panels(&raw.to_string()).is_ok(), "{mode}");
+                raw[0]["options"][0]["label"] = serde_json::json!(format!("{label}a"));
+                let err = parse_self_role_panels(&raw.to_string()).expect_err("oversized label");
+                assert!(err.message().contains("options[0].label"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn capped_text_counts_utf16_units_at_astral_boundaries() {
+        let text = "🎲".repeat(50);
+        let value = serde_json::json!(text);
+        assert_eq!(capped_text(&value, "text", 100).expect("100 units"), text);
+        assert!(optional_text(Some(&value), "text", 100).is_ok());
+        let value = serde_json::json!(format!("{text}a"));
+        assert!(capped_text(&value, "text", 100).is_err());
+        assert!(optional_text(Some(&value), "text", 100).is_err());
+    }
+
+    #[test]
     fn gates_default_off_and_read_env() {
         let gates = SelfRoleGates::from_map(&HashMap::new()).expect("defaults");
         assert!(gates.panels.is_empty() && !gates.dry_run);
@@ -1891,14 +1998,51 @@ mod tests {
         assert!(self_role_claim_owned(200, 100));
         assert!(!self_role_claim_owned(100, 100));
         assert!(!self_role_claim_owned(50, 100));
-        // Snowflake orders sort by (timestamp, id); generated ids by clock+seq.
+        // Snowflake orders sort by (timestamp, id), ignoring the supplied clock.
         let order = event_order_for_event_id("100000000000000000", 0);
         assert_eq!(order, "1443912257910:00100000000000000000", "{order}");
-        assert!(event_order_from_snowflake("100000000000000000").is_some());
+        assert_eq!(
+            event_order_for_event_id("100000000000000000", 1_700_000_000_000),
+            order
+        );
+        assert_eq!(
+            event_order_from_snowflake("100000000000000000"),
+            Some(order)
+        );
         assert_eq!(event_order_from_snowflake("reaction:abc"), None);
-        let first = event_order_for_event_id("reaction:abc", 1_700_000_000_000);
-        let second = event_order_for_event_id("reaction:abc", 1_700_000_000_000);
+    }
+
+    #[test]
+    fn generated_event_order_is_unique_and_stable_across_workers() {
+        let timestamp = 1_700_000_000_000;
+        let first = std::thread::spawn(move || {
+            event_order_for_event_id("reaction:worker-a:0001", timestamp)
+        })
+        .join()
+        .expect("first worker");
+        let second = std::thread::spawn(move || {
+            event_order_for_event_id("reaction:worker-b:0001", timestamp)
+        })
+        .join()
+        .expect("second worker");
+        assert_eq!(first, "1700000000000:generated:reaction:worker-a:0001");
+        assert_eq!(second, "1700000000000:generated:reaction:worker-b:0001");
         assert_ne!(first, second);
+        assert!(first < second);
+        // Replaying after another worker's event must not change the order.
+        assert_eq!(
+            event_order_for_event_id("reaction:worker-a:0001", timestamp),
+            first
+        );
+        assert_eq!(
+            event_order_for_event_id("reaction:worker-b:0001", timestamp),
+            second
+        );
+        assert!(first < event_order_for_event_id("reaction:worker-a:0001", timestamp + 1));
+        // The generated namespace cannot collide with a snowflake at the same millisecond.
+        let snowflake = event_order_for_event_id("100000000000000000", 0);
+        let generated = event_order_for_event_id("reaction:abc", 1_443_912_257_910);
+        assert!(snowflake < generated);
     }
 
     #[test]
