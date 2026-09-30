@@ -39,9 +39,9 @@ Verified against TogetherWeOwn/two-bot at
 - [`src/audit/service.ts`](https://github.com/TogetherWeOwn/two-bot/blob/b0a26a5e3882dd0784d208079f309893e2ede7e8/src/audit/service.ts)
 
 Legacy `rota_notice` is intentionally excluded: `record()` refuses it before
-store/claim/delivery. Metadata keys may render in sorted order rather than JS
-insertion order. Timestamp parsing accepts Discord's RFC-3339 instants with an
-explicit zone, not JS Date.parse's loose date strings. Malformed non-scalar
+store/claim/delivery. The workspace's `serde_json` preserve_order feature keeps
+mirror metadata in insertion order. Timestamp parsing accepts Discord's RFC-3339
+instants with an explicit zone, not JS Date.parse's loose date strings. Malformed non-scalar
 counts are not interpreted as numbers. Unicode truncation respects the legacy
 UTF-16 budget but does not split Unicode scalars.
 
