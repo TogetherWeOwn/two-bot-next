@@ -192,6 +192,13 @@ impl AutomodRuntime {
         self.config.dry_run
     }
 
+    /// The shared maintenance tick can expire idle authors without receiving
+    /// another message. This does not inspect content or create any effects.
+    pub fn expire_repeat_history(&mut self, now_ms: u64) {
+        self.repeats
+            .expire(now_ms, self.config.policy.repeated_message_window_seconds);
+    }
+
     /// Call only after winning the durable delivery claim. Retries must replay
     /// the stored outcome, not observe the repeat tracker or award the funnel.
     pub fn inspect(&mut self, delivery: &MessageDelivery) -> Inspection {

@@ -1,4 +1,8 @@
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use twilight_model::{
     channel::Message,
     gateway::{
@@ -11,8 +15,98 @@ use two_bot_core::automod_runtime::{
     AutomodRuntime, AutomodScope, DeliveryKey, FunnelDisposition, Inspection, MessageDeliveryKind,
     STAGING_GUILD_ID,
 };
-use two_bot_core::{AutomodConfig, AutomodFilter};
+use two_bot_core::{
+    AutomodConfig, AutomodFilter, FactsSink, LevelOutcome, LevelingHook, MemStore, MemberJoinFact,
+    MessageFact, RulesAcceptedFact, VoiceEndedFact, VoiceStartedFact,
+};
 use two_bot_discord::automod::{event_to_automod, with_fetched_message};
+use two_bot_discord::{NoClassification, NoInvites, Pipeline};
+
+#[derive(Clone, Default)]
+struct MessageCalls(Arc<AtomicUsize>);
+
+impl FactsSink for MessageCalls {
+    fn record_member_join(&self, _: MemberJoinFact<'_>) {}
+    fn record_rules_accepted(&self, _: RulesAcceptedFact<'_>) {}
+    fn record_message(&self, _: MessageFact<'_>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn record_voice_started(&self, _: VoiceStartedFact<'_>) -> Option<String> {
+        None
+    }
+    fn record_voice_ended(&self, _: VoiceEndedFact<'_>) {}
+}
+
+impl LevelingHook for MessageCalls {
+    fn award_message(&self, _: u64, _: u64, _: &str, _: u64) -> LevelOutcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        LevelOutcome {
+            leveled_up: false,
+            level: 0,
+        }
+    }
+    fn award_voice(&self, _: u64, _: u64, _: u64, _: &str, _: u64) -> LevelOutcome {
+        LevelOutcome {
+            leveled_up: false,
+            level: 0,
+        }
+    }
+}
+
+#[test]
+fn shared_pipeline_captures_rejection_without_awards_and_skips_replay_and_edit() {
+    let facts = MessageCalls::default();
+    let xp = MessageCalls::default();
+    let store = MemStore::new();
+    let pipeline = Pipeline::new(
+        store,
+        Some(xp.clone()),
+        Some(facts.clone()),
+        NoInvites,
+        NoClassification,
+    );
+    let store = pipeline.handlers().store();
+    let mut runtime = runtime();
+    let mut msg = message();
+    msg.content = "blocked".into();
+    let event = Event::MessageCreate(Box::new(MessageCreate(msg.clone())));
+    let delivery = event_to_automod(&event, 1_790_726_400_000).unwrap();
+    let Inspection::Matched(matched) = runtime.inspect(&delivery) else {
+        panic!("expected match")
+    };
+    pipeline.handle_with_message_disposition(&event, matched.funnel);
+    let guild = msg.guild_id.unwrap().get();
+    let author = msg.author.id.get();
+    assert_eq!(facts.0.load(Ordering::SeqCst), 1);
+    assert_eq!(xp.0.load(Ordering::SeqCst), 0);
+    assert!(store.rows().is_empty());
+    assert!(store.activity(guild, author).is_none());
+    // InFlight/Replayed claims are cache-only; do not inspect or dispatch twice.
+    pipeline.handle_with_message_disposition(&event, FunnelDisposition::None);
+    assert_eq!(facts.0.load(Ordering::SeqCst), 1);
+    // A different, clean create follows the ordinary funnel exactly once.
+    msg.id = Id::new(msg.id.get() + 1);
+    msg.content = "clean".into();
+    let event = Event::MessageCreate(Box::new(MessageCreate(msg.clone())));
+    let delivery = event_to_automod(&event, 1_790_726_401_000).unwrap();
+    let Inspection::Accepted(disposition) = runtime.inspect(&delivery) else {
+        panic!("expected accept")
+    };
+    pipeline.handle_with_message_disposition(&event, disposition);
+    assert_eq!(facts.0.load(Ordering::SeqCst), 2);
+    assert_eq!(xp.0.load(Ordering::SeqCst), 1);
+    assert_eq!(store.rows().len(), 1);
+    assert!(store.activity(guild, author).is_some());
+    pipeline.handle_with_message_disposition(&event, FunnelDisposition::None);
+    // Even an incorrectly supplied Accept on an edit cannot enter on_message.
+    pipeline.handle_with_message_disposition(
+        &Event::MessageUpdate(Box::new(MessageUpdate(msg))),
+        FunnelDisposition::Accept,
+    );
+    assert_eq!(facts.0.load(Ordering::SeqCst), 2);
+    assert_eq!(xp.0.load(Ordering::SeqCst), 1);
+    assert_eq!(store.rows().len(), 1);
+}
 
 fn message() -> Message {
     serde_json::from_value(serde_json::json!({

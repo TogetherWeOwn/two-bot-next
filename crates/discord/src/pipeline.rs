@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
 use twilight_model::gateway::event::Event;
 use twilight_model::util::Timestamp;
+use two_bot_core::automod_runtime::FunnelDisposition;
 use two_bot_core::{
     ChannelClass, ExpectedJoins, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput,
     InviteSnapshotStore, InviteState, InviteTracker, JoinInput, LevelingHook, MessageInput,
@@ -324,6 +325,15 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
     /// where the transition matters (member pending, voice channel), updates
     /// the cache, then calls the framework-free handlers.
     pub fn handle(&self, event: &Event) {
+        self.handle_with_message_disposition(event, FunnelDisposition::Accept);
+    }
+
+    /// Shared async orchestration supplies the result after durable claim and
+    /// inspection. `None` keeps cache handling but skips duplicate/pending
+    /// creates; `CaptureOnly` records facts without XP/activity/milestones.
+    /// Updates never award the funnel, regardless of this disposition. Call
+    /// this instead of `handle`, not in addition to it.
+    pub fn handle_with_message_disposition(&self, event: &Event, disposition: FunnelDisposition) {
         match event {
             // Fresh session after (re-)identify: first connect starts empty
             // (no-op); a reconnect's open state is unproven and dropped.
@@ -443,11 +453,13 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                     is_staff_automation: false,
                     channel_id,
                     channel_class: self.classifier.classify(channel_id),
-                    capture_only: false,
+                    capture_only: disposition == FunnelDisposition::CaptureOnly,
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
                 };
                 self.cache.update(event);
-                self.handlers.on_message(input);
+                if disposition != FunnelDisposition::None {
+                    self.handlers.on_message(input);
+                }
             }
             Event::VoiceStateUpdate(update) => {
                 let Some(guild_id) = update.guild_id.map(|g| g.get()) else {

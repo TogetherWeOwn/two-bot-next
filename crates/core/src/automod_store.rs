@@ -42,6 +42,7 @@ pub struct StoredOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum CompletionKind {
     Accepted,
+    AlreadyProcessed,
     DryRun,
     Protected,
     Deleted,

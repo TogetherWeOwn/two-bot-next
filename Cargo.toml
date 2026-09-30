@@ -35,9 +35,6 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # (sqlx 0.9: `mod macros` is `#[cfg(feature = "macros")]`, so `migrate`
 # alone does not export the macro). TOG-9882 cutover migrations embed via
 # `sqlx::migrate!`.
-# NFKC normalization for the automod bad-word matcher (already in the locked
-# tree via idna/twilight; S4 slice 4 promotes it to a direct dependency).
-unicode-normalization = "0.1"
 sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
     "runtime-tokio",
