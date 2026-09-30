@@ -5,6 +5,7 @@ mod common;
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
+use twilight_model::channel::message::AllowedMentions;
 use twilight_model::http::interaction::{
     InteractionResponse, InteractionResponseData, InteractionResponseType,
 };
@@ -14,12 +15,12 @@ use two_bot_discord::{ActionExecutor, ChannelCall};
 const INJECTION: &str = "@everyone @here <@&123> <@456>";
 
 fn assert_safe(body: &Value) {
-    assert_eq!(
-        body["allowed_mentions"],
-        json!({
-            "parse": [], "roles": [], "users": [], "replied_user": false,
-        })
-    );
+    // Twilight omits empty roles/users and false replied_user when serializing.
+    // Require the explicit parse policy and assert every effective field instead.
+    assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    let mentions: AllowedMentions =
+        serde_json::from_value(body["allowed_mentions"].clone()).unwrap();
+    assert_eq!(mentions, AllowedMentions::default());
     if let Some(text) = body["content"].as_str() {
         assert!(text_len(text) <= CONTENT_LIMIT);
         assert!(!text.contains("@everyone"));
