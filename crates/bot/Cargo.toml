@@ -17,6 +17,10 @@ two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
 two-bot-discord = { version = "0.2.0", path = "../discord" }
 two-bot-cutover = { version = "0.2.0", path = "../cutover" }
 futures-util = { workspace = true }
+# Relay/audit ids: 16 CSPRNG bytes hex-encoded (same shape as core's
+# internal_actions nonces).
+hex = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 axum = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
