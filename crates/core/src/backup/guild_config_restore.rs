@@ -217,27 +217,56 @@ pub fn plan_restore(
     let snapshot_roles = &snapshot_role_list;
     let snapshot_channels = &snapshot_channel_list;
 
-    // Managed roles that already exist keep their Discord ids.
-    let current_role_ids: Vec<&str> = current_roles.iter().map(|r| str_field(r, "id")).collect();
-    for role in snapshot_roles.iter().filter(|r| {
-        r.get("managed").and_then(Value::as_bool).unwrap_or(false)
-            && current_role_ids.contains(&str_field(r, "id"))
-    }) {
-        role_ids.insert(
-            str_field(role, "id").to_owned(),
-            str_field(role, "id").to_owned(),
-        );
+    // Reserve ALL surviving compatible identities before any name fallback,
+    // including identities processed later (names/parents may have drifted).
+    for role in snapshot_roles {
+        if current_roles.iter().any(|actual| {
+            str_field(actual, "id") == str_field(role, "id")
+                && is_managed(actual) == is_managed(role)
+        }) {
+            role_ids.insert(
+                str_field(role, "id").to_owned(),
+                str_field(role, "id").to_owned(),
+            );
+        }
+    }
+    for channel in snapshot_channels {
+        if current_channels.iter().any(|actual| {
+            str_field(actual, "id") == str_field(channel, "id")
+                && actual.get("type") == channel.get("type")
+        }) {
+            channel_ids.insert(
+                str_field(channel, "id").to_owned(),
+                str_field(channel, "id").to_owned(),
+            );
+        }
     }
     let snapshot_roles_by_id: BTreeMap<&str, &Map<String, Value>> = snapshot_roles
         .iter()
         .map(|r| (str_field(r, "id"), r))
         .collect();
 
-    let current_roles_by_name: BTreeMap<&str, &Map<String, Value>> = current_roles
+    // @everyone is editable, but must never be created or positioned.
+    // PATCH permissions: https://docs.discord.com/developers/resources/guild#modify-guild-role
+    if let Some(everyone) = snapshot_roles
         .iter()
-        .filter(|r| !r.get("managed").and_then(Value::as_bool).unwrap_or(false))
-        .map(|r| (str_field(r, "name"), r))
-        .collect();
+        .find(|r| str_field(r, "id") == snapshot_guild)
+    {
+        let actual = current_roles
+            .iter()
+            .find(|r| str_field(r, "id") == current_guild)
+            .ok_or_else(|| fail("Target guild has no @everyone role.".to_owned()))?;
+        if everyone.get("permissions") != actual.get("permissions") {
+            role_ops.push(RestoreOperation {
+                label: "patch role @everyone".to_owned(),
+                method: "PATCH".to_owned(),
+                path: RestorePath::Literal(format!("/guilds/{current_guild_owned}/roles/{current_guild_owned}")),
+                body: serde_json::json!({"permissions": everyone.get("permissions").cloned().unwrap_or(Value::Null)}),
+                capture_id: None,
+            });
+            counts.roles += 1;
+        }
+    }
     let mut source_roles: Vec<&Map<String, Value>> = snapshot_roles
         .iter()
         .filter(|r| {
@@ -246,10 +275,30 @@ pub fn plan_restore(
         })
         .collect();
     source_roles.sort_by_key(|r| r.get("position").and_then(Value::as_i64).unwrap_or(0));
-    let mut role_positions_differ = false;
+    let mut role_positions = Vec::new();
     for role in &source_roles {
         let name = str_field(role, "name");
-        let Some(actual) = current_roles_by_name.get(name) else {
+        let source_id = str_field(role, "id");
+        let actual = if let Some(id) = role_ids.get(source_id) {
+            current_roles.iter().find(|r| str_field(r, "id") == id)
+        } else {
+            let candidates: Vec<_> = current_roles
+                .iter()
+                .filter(|r| {
+                    !is_managed(r)
+                        && str_field(r, "id") != current_guild
+                        && str_field(r, "name") == name
+                })
+                .collect();
+            unique_unclaimed(&candidates, &role_ids, &format!("role {name}"))?
+        };
+        if actual.is_none() || actual.is_some_and(|r| role.get("position") != r.get("position")) {
+            role_positions.push(serde_json::json!({
+                "id": {"restoreReference": "role", "sourceId": source_id},
+                "position": role.get("position").cloned().unwrap_or(Value::Null),
+            }));
+        }
+        let Some(actual) = actual else {
             role_ops.push(RestoreOperation {
                 label: format!("create role {name}"),
                 method: "POST".to_owned(),
@@ -258,16 +307,12 @@ pub fn plan_restore(
                 capture_id: Some(("role".to_owned(), str_field(role, "id").to_owned())),
             });
             counts.roles += 1;
-            role_positions_differ = true;
             continue;
         };
         role_ids.insert(
             str_field(role, "id").to_owned(),
             str_field(actual, "id").to_owned(),
         );
-        role_positions_differ = role_positions_differ
-            || role.get("position").and_then(Value::as_i64)
-                != actual.get("position").and_then(Value::as_i64);
         if !same(&role_body(role), &role_body(actual)) {
             role_ops.push(RestoreOperation {
                 label: format!("patch role {name}"),
@@ -282,33 +327,18 @@ pub fn plan_restore(
             counts.roles += 1;
         }
     }
-    if role_positions_differ {
+    if !role_positions.is_empty() {
         role_position_ops.push(RestoreOperation {
             label: "restore role positions".to_owned(),
             method: "PATCH".to_owned(),
             path: RestorePath::Literal(format!("/guilds/{current_guild_owned}/roles")),
-            body: Value::Array(
-                source_roles
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "id": {"restoreReference": "role", "sourceId": str_field(r, "id")},
-                            "position": r.get("position").cloned().unwrap_or(Value::Null),
-                        })
-                    })
-                    .collect(),
-            ),
+            body: Value::Array(role_positions),
             capture_id: None,
         });
         counts.roles += 1;
     }
 
     // Categories first (channels need their parents).
-    let current_categories: BTreeMap<&str, &Map<String, Value>> = current_channels
-        .iter()
-        .filter(|c| c.get("type").and_then(Value::as_i64) == Some(4))
-        .map(|c| (str_field(c, "name"), c))
-        .collect();
     let mut channel_positions_differ = false;
     let mut source_channel_positions: Vec<Value> = Vec::new();
     let mut source_categories: Vec<&Map<String, Value>> = snapshot_channels
@@ -318,7 +348,7 @@ pub fn plan_restore(
     source_categories.sort_by_key(|c| c.get("position").and_then(Value::as_i64).unwrap_or(0));
     for category in &source_categories {
         let name = str_field(category, "name");
-        let actual = current_categories.get(name).copied();
+        let actual = existing_candidate(category, None, &current_channels, None, &channel_ids)?;
         if let Some(actual) = actual {
             channel_ids.insert(
                 str_field(category, "id").to_owned(),
@@ -327,6 +357,18 @@ pub fn plan_restore(
             channel_positions_differ = channel_positions_differ
                 || category.get("position").and_then(Value::as_i64)
                     != actual.get("position").and_then(Value::as_i64);
+            if category.get("name") != actual.get("name") {
+                // Categories support name/position/overwrites, not parent_id.
+                // https://docs.discord.com/developers/resources/channel#modify-channel
+                category_ops.push(RestoreOperation {
+                    label: format!("patch category {name}"),
+                    method: "PATCH".to_owned(),
+                    path: RestorePath::Channel(str_field(category, "id").to_owned()),
+                    body: serde_json::json!({"name": name}),
+                    capture_id: None,
+                });
+                counts.channels += 1;
+            }
         } else {
             category_ops.push(RestoreOperation {
                 label: format!("create category {name}"),
@@ -348,34 +390,7 @@ pub fn plan_restore(
         }));
 
         let expected = overwrites_of(category);
-        let known_expected: Vec<Value> = expected
-            .iter()
-            .map(|o| {
-                let mut v = overwrite_value(o, snapshot_guild);
-                if o.overwrite_type == 0 {
-                    let known = if o.id == snapshot_guild {
-                        current_guild_owned.clone()
-                    } else {
-                        role_ids.get(&o.id).cloned().unwrap_or_else(|| o.id.clone())
-                    };
-                    v["id"] = Value::String(known);
-                }
-                v
-            })
-            .collect();
-        let actual_ows: Vec<Value> = actual
-            .map(overwrites_of)
-            .unwrap_or_default()
-            .iter()
-            .map(|o| overwrite_value(o, &current_guild_owned))
-            .collect();
-        let has_unresolved = expected.iter().any(|o| {
-            o.overwrite_type == 0 && o.id != snapshot_guild && !role_ids.contains_key(&o.id)
-        });
-        if (actual.is_none() && !expected.is_empty())
-            || has_unresolved
-            || !same(&Value::Array(known_expected), &Value::Array(actual_ows))
-        {
+        if overwrites_differ(&expected, actual, &role_ids) {
             for o in &expected {
                 if o.overwrite_type == 0
                     && o.id != snapshot_guild
@@ -417,6 +432,7 @@ pub fn plan_restore(
             parent,
             &current_channels,
             actual_parent_id.as_deref(),
+            &channel_ids,
         )?;
         let target_parent = parent.map(|p| {
             serde_json::json!({"restoreReference": "channel", "sourceId": str_field(p, "id")})
@@ -467,65 +483,16 @@ pub fn plan_restore(
             counts.channels += 1;
             channel_positions_differ = true;
         }
-        // A genuine parent move goes out as its own per-channel PATCH: the
-        // bulk position PATCH must not carry parent_id for unchanged parents
-        // (live Discord rejects the batch with 40009 otherwise). A null
-        // actualParentId means the parent is itself being created, whose
-        // create already carries the parent — no move op.
-        if let Some(actual) = actual {
-            let live_parent = actual.get("parent_id").and_then(Value::as_str);
-            if parent.is_some()
-                && actual_parent_id.is_some()
-                && actual_parent_id.as_deref() != live_parent
-            {
-                channel_ops.push(RestoreOperation {
-                    label: format!("move channel {name}"),
-                    method: "PATCH".to_owned(),
-                    path: RestorePath::Channel(str_field(channel, "id").to_owned()),
-                    body: serde_json::json!({
-                        "parent_id": parent.map(|p| {
-                            serde_json::json!({"restoreReference": "channel", "sourceId": str_field(p, "id")})
-                        }).unwrap_or(Value::Null),
-                    }),
-                    capture_id: None,
-                });
-                counts.channels += 1;
-            }
-        }
+        // Parent moves (including moves to root/new categories) are already
+        // carried by the per-channel core PATCH above. Never put parent_id in
+        // the bulk position PATCH: Discord rejects unchanged-parent batches.
         source_channel_positions.push(serde_json::json!({
             "id": {"restoreReference": "channel", "sourceId": str_field(channel, "id")},
             "position": channel.get("position").cloned().unwrap_or(Value::Null),
         }));
 
         let expected = overwrites_of(channel);
-        let known_expected: Vec<Value> = expected
-            .iter()
-            .map(|o| {
-                let mut v = overwrite_value(o, snapshot_guild);
-                if o.overwrite_type == 0 {
-                    let known = if o.id == snapshot_guild {
-                        current_guild_owned.clone()
-                    } else {
-                        role_ids.get(&o.id).cloned().unwrap_or_else(|| o.id.clone())
-                    };
-                    v["id"] = Value::String(known);
-                }
-                v
-            })
-            .collect();
-        let actual_ows: Vec<Value> = actual
-            .map(overwrites_of)
-            .unwrap_or_default()
-            .iter()
-            .map(|o| overwrite_value(o, &current_guild_owned))
-            .collect();
-        let has_created_ref = expected.iter().any(|o| {
-            o.overwrite_type == 0 && o.id != snapshot_guild && !role_ids.contains_key(&o.id)
-        });
-        if (actual.is_none() && !expected.is_empty())
-            || has_created_ref
-            || !same(&Value::Array(known_expected), &Value::Array(actual_ows))
-        {
+        if overwrites_differ(&expected, actual, &role_ids) {
             for o in &expected {
                 if o.overwrite_type == 0
                     && o.id != snapshot_guild
@@ -836,7 +803,7 @@ pub fn plan_restore(
     operations.extend(emoji_ops);
     counts.operations = operations.len() as u64;
 
-    Ok(RestorePlan {
+    let plan = RestorePlan {
         counts,
         known_ids: RestoreIdMaps {
             roles: role_ids,
@@ -846,7 +813,37 @@ pub fn plan_restore(
         overwrite_roles,
         overwrite_targets,
         operations,
-    })
+    };
+    let available = validate_ordered_dependencies(&plan)?;
+    validate_snapshot_dependencies(snapshot, &available)?;
+    Ok(plan)
+}
+
+fn is_managed(resource: &Map<String, Value>) -> bool {
+    resource
+        .get("managed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn unique_unclaimed<'a>(
+    candidates: &[&'a Map<String, Value>],
+    known: &BTreeMap<String, String>,
+    target: &str,
+) -> Result<Option<&'a Map<String, Value>>, RestorePlanError> {
+    if candidates.len() > 1 {
+        return Err(RestorePlanError(format!(
+            "Target has multiple {target} candidates; restore is ambiguous."
+        )));
+    }
+    if let Some(candidate) = candidates.first() {
+        if known.values().any(|id| id == str_field(candidate, "id")) {
+            return Err(RestorePlanError(format!(
+                "Target {target} is already claimed by another source; restore would not be injective."
+            )));
+        }
+    }
+    Ok(candidates.first().copied())
 }
 
 fn existing_candidate<'a>(
@@ -854,43 +851,37 @@ fn existing_candidate<'a>(
     parent: Option<&Map<String, Value>>,
     current: &'a [Map<String, Value>],
     actual_parent_id: Option<&str>,
+    known: &BTreeMap<String, String>,
 ) -> Result<Option<&'a Map<String, Value>>, RestorePlanError> {
     let channel_type = channel.get("type").and_then(Value::as_i64);
+    // Identity wins even with duplicate/swapped names or moved parents.
+    if let Some(id) = known.get(str_field(channel, "id")) {
+        return Ok(current.iter().find(|c| str_field(c, "id") == id));
+    }
+    if parent.is_some() && actual_parent_id.is_none() {
+        return Ok(None);
+    }
     let name = str_field(channel, "name");
-    let candidates: Vec<&Map<String, Value>> = current
+    let candidates: Vec<_> = current
         .iter()
         .filter(|c| {
             c.get("type").and_then(Value::as_i64) == channel_type && str_field(c, "name") == name
         })
         .collect();
-    let exact: Vec<&&Map<String, Value>> = candidates
+    let exact: Vec<_> = candidates
         .iter()
+        .copied()
         .filter(|c| c.get("parent_id").and_then(Value::as_str) == actual_parent_id)
         .collect();
-    if exact.len() > 1 || (exact.is_empty() && candidates.len() > 1) {
-        let parent_name = parent
-            .map(|p| str_field(p, "name"))
-            .unwrap_or("the guild root");
-        return Err(RestorePlanError(format!(
-            "Target has multiple {name} channels in {parent_name}; restore is ambiguous."
-        )));
-    }
-    if let Some(found) = exact.first() {
-        return Ok(Some(*found));
-    }
-    // A Discord id is never reused, so a live channel carrying the snapshot
-    // id IS the snapshot channel even when its name drifted (a rename).
-    // Checked after the ambiguity throw so genuine duplicates still refuse.
-    if let Some(by_id) = current.iter().find(|c| {
-        str_field(c, "id") == str_field(channel, "id")
-            && c.get("type").and_then(Value::as_i64) == channel_type
-    }) {
-        return Ok(Some(by_id));
-    }
-    if parent.is_some() && actual_parent_id.is_none() {
-        return Ok(None);
-    }
-    Ok(candidates.first().copied())
+    unique_unclaimed(
+        if exact.is_empty() {
+            &candidates
+        } else {
+            &exact
+        },
+        known,
+        &format!("channel {name}"),
+    )
 }
 
 fn emoji_image(emoji: &Map<String, Value>) -> Result<String, RestorePlanError> {
@@ -933,12 +924,166 @@ fn emoji_image(emoji: &Map<String, Value>) -> Result<String, RestorePlanError> {
     Ok(image.to_owned())
 }
 
+fn literal_overwrite(o: &GuildOverwrite) -> Value {
+    serde_json::json!({"id": o.id, "type": o.overwrite_type, "allow": o.allow, "deny": o.deny})
+}
+
+fn normalized_overwrites(overwrites: &[GuildOverwrite]) -> Value {
+    let mut values: Vec<_> = overwrites.iter().map(literal_overwrite).collect();
+    values.sort_by_key(super::guild_config::stable);
+    Value::Array(values)
+}
+
 fn same_overwrites(left: &[GuildOverwrite], right: &[GuildOverwrite]) -> bool {
-    let mut l: Vec<Value> = left.iter().map(|o| overwrite_value(o, "")).collect();
-    let mut r: Vec<Value> = right.iter().map(|o| overwrite_value(o, "")).collect();
-    l.sort_by_key(super::guild_config::stable);
-    r.sort_by_key(super::guild_config::stable);
-    same(&Value::Array(l), &Value::Array(r))
+    same(&normalized_overwrites(left), &normalized_overwrites(right))
+}
+
+fn overwrites_differ(
+    expected: &[GuildOverwrite],
+    actual: Option<&Map<String, Value>>,
+    roles: &BTreeMap<String, String>,
+) -> bool {
+    let mut mapped = Vec::new();
+    for overwrite in expected {
+        let mut overwrite = overwrite.clone();
+        if overwrite.overwrite_type == 0 {
+            let Some(id) = roles.get(&overwrite.id) else {
+                // This role must be created earlier; placeholders belong only
+                // in operations, never in the literal-live-ID comparison.
+                return true;
+            };
+            overwrite.id.clone_from(id);
+        }
+        mapped.push(overwrite);
+    }
+    !same_overwrites(&mapped, &actual.map(overwrites_of).unwrap_or_default())
+}
+
+// Replay the complete operation graph without writes. Symbolic IDs become
+// available only AFTER a supported create, so forward references also refuse.
+fn validate_ordered_dependencies(plan: &RestorePlan) -> Result<RestoreIdMaps, RestorePlanError> {
+    let mut available = plan.known_ids.clone();
+    for op in &plan.operations {
+        resolve_path(&op.path, &available.channels)?;
+        resolve_value(&op.body, &available.roles, &available.channels)?;
+        if let Some((resource, source)) = &op.capture_id {
+            let (table, collection) = match resource.as_str() {
+                "role" => (&mut available.roles, "roles"),
+                "channel" => (&mut available.channels, "channels"),
+                "emoji" => (&mut available.emojis, "emojis"),
+                _ => {
+                    return Err(RestorePlanError(format!(
+                        "Unsupported restore create resource {resource}."
+                    )));
+                }
+            };
+            let supported_path = match &op.path {
+                RestorePath::Literal(path) => {
+                    let parts: Vec<_> = path.split('/').collect();
+                    matches!(parts.as_slice(), ["", "guilds", guild, endpoint] if !guild.is_empty() && *endpoint == collection)
+                }
+                RestorePath::Channel(_) => false,
+            };
+            if op.method != "POST"
+                || !supported_path
+                || source.is_empty()
+                || table.contains_key(source)
+            {
+                return Err(RestorePlanError(format!(
+                    "Invalid or duplicate restore create for {resource} {source}."
+                )));
+            }
+            table.insert(source.clone(), source.clone());
+        }
+    }
+    Ok(available)
+}
+
+// Check even references in unchanged or managed resources, not just emitted
+// operations: a matching literal string is not proof the dependency exists.
+fn validate_snapshot_dependencies(
+    snapshot: &Map<String, Value>,
+    available: &RestoreIdMaps,
+) -> Result<(), RestorePlanError> {
+    let roles = snapshot_roles(snapshot);
+    let channels = snapshot_channels(snapshot);
+    let require_role = |id: &str| -> Result<(), RestorePlanError> {
+        if !roles.iter().any(|r| str_field(r, "id") == id) {
+            return Err(RestorePlanError(format!(
+                "Snapshot references unknown role {id}."
+            )));
+        }
+        if !available.roles.contains_key(id) {
+            return Err(RestorePlanError(format!(
+                "Restore dependency role {id} cannot be restored (missing managed role)."
+            )));
+        }
+        Ok(())
+    };
+    let require_channel = |id: &str| -> Result<(), RestorePlanError> {
+        if !channels.iter().any(|c| str_field(c, "id") == id) {
+            return Err(RestorePlanError(format!(
+                "Snapshot references unknown channel {id}."
+            )));
+        }
+        if !available.channels.contains_key(id) {
+            return Err(RestorePlanError(format!(
+                "Restore dependency channel {id} cannot be restored."
+            )));
+        }
+        Ok(())
+    };
+    for role in roles.iter().filter(|r| is_managed(r)) {
+        require_role(str_field(role, "id"))?;
+    }
+    for channel in &channels {
+        if let Some(id) = channel.get("parent_id").and_then(Value::as_str) {
+            require_channel(id)?;
+            if !channels.iter().any(|c| {
+                str_field(c, "id") == id && c.get("type").and_then(Value::as_i64) == Some(4)
+            }) {
+                return Err(RestorePlanError(format!(
+                    "Snapshot parent channel {id} is not a category."
+                )));
+            }
+        }
+        for overwrite in overwrites_of(channel) {
+            if overwrite.overwrite_type == 0 {
+                require_role(&overwrite.id)?;
+            }
+        }
+    }
+    for field in GUILD_CONFIG_FIELDS
+        .iter()
+        .filter(|f| f.ends_with("_channel_id"))
+    {
+        if let Some(id) = snapshot
+            .get("guild")
+            .and_then(|g| g.get(*field))
+            .and_then(Value::as_str)
+        {
+            require_channel(id)?;
+        }
+    }
+    for emoji in snapshot
+        .get("emojis")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for id in emoji
+            .get("roles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let id = id.as_str().ok_or_else(|| {
+                RestorePlanError("Snapshot emoji has a non-string role reference.".to_owned())
+            })?;
+            require_role(id)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve `{"restoreReference","sourceId"}` placeholders against created ids.
@@ -955,10 +1100,21 @@ pub fn resolve_value(
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         Value::Object(map) => {
-            if let (Some(Value::String(resource)), Some(Value::String(source))) =
-                (map.get("restoreReference"), map.get("sourceId"))
-            {
-                let table = if resource == "role" { roles } else { channels };
+            if map.contains_key("restoreReference") || map.contains_key("sourceId") {
+                let (Some(Value::String(resource)), Some(Value::String(source))) =
+                    (map.get("restoreReference"), map.get("sourceId"))
+                else {
+                    return Err(RestorePlanError("Malformed restore reference.".to_owned()));
+                };
+                let table = match resource.as_str() {
+                    "role" => roles,
+                    "channel" => channels,
+                    _ => {
+                        return Err(RestorePlanError(format!(
+                            "Unsupported restore reference resource {resource}."
+                        )));
+                    }
+                };
                 return table
                     .get(source)
                     .cloned()
@@ -1004,6 +1160,8 @@ pub async fn apply_restore_plan(
     api: &mut super::guild_config_api::GuildConfigDiscordApi,
     plan: &RestorePlan,
 ) -> Result<RestoreIdMaps, RestorePlanError> {
+    // Plans are public/mutable: defend the write boundary as well as planning.
+    validate_ordered_dependencies(plan)?;
     let mut roles = plan.known_ids.roles.clone();
     let mut channels = plan.known_ids.channels.clone();
     let mut emojis = plan.known_ids.emojis.clone();
@@ -1242,6 +1400,8 @@ mod tests {
         // the restore target is ambiguous and the plan is refused.
         let mut live = snapshot();
         live.remove("integrity");
+        live["channels"].as_array_mut().unwrap()[1]["id"] =
+            Value::String("ch1-replacement".to_owned());
         let mut dup = live["channels"].as_array().unwrap()[1].clone();
         dup["id"] = Value::String("ch1-dup".to_owned());
         live["channels"].as_array_mut().unwrap().push(dup);

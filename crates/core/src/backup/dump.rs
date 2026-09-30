@@ -28,8 +28,8 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 
 use super::dump_file::{
-    cell_input, finish_gzip, inspect, is_dump_table, new_encoder, write_line, DumpContents,
-    DumpError, DumpManifest, DumpTableInfo, DUMP_TABLES, DUMP_VERSION,
+    cell_input, inspect, is_dump_table, DumpContents, DumpError, DumpManifest, DumpTableInfo,
+    DumpWriter, DUMP_TABLES, DUMP_VERSION,
 };
 use super::guild_config::unix_now_iso;
 
@@ -191,11 +191,8 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         schema_migrations: migrations.into_iter().map(|(id,)| id).collect(),
     };
 
-    let mut enc = new_encoder();
-    write_line(
-        &mut enc,
-        &serde_json::to_value(&manifest).expect("manifest serialises"),
-    )?;
+    let mut writer = DumpWriter::new(out_path)?;
+    writer.write_line(&serde_json::to_value(&manifest).expect("manifest serialises"))?;
 
     let mut rows: u64 = 0;
     for table in &manifest.tables {
@@ -229,8 +226,7 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
                     })?;
                     data.insert(col.clone(), raw.map(Value::String).unwrap_or(Value::Null));
                 }
-                write_line(
-                    &mut enc,
+                writer.write_line(
                     &serde_json::json!({"kind": "row", "table": table.name, "data": data}),
                 )?;
                 rows += 1;
@@ -240,9 +236,10 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
     }
     tx.commit().await?;
 
-    write_line(&mut enc, &serde_json::json!({"kind": "end", "rows": rows}))?;
-    let bytes = finish_gzip(enc)?;
-    std::fs::write(out_path, bytes).map_err(DumpError::from)?;
+    writer.write_line(&serde_json::json!({"kind": "end", "rows": rows}))?;
+    // Only a finished, synced archive accepted by restore's reader becomes a
+    // final backup. Errors return before CLI retention or upload can run.
+    writer.publish()?;
     Ok(manifest)
 }
 

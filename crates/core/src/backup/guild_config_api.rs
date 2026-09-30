@@ -12,6 +12,7 @@
 //! how the restore path is rehearsed without touching Discord.
 
 use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use super::guild_config_restore::RestorePlan;
@@ -183,8 +184,9 @@ impl GuildConfigDiscordApi {
     /// Restore permission preflight: the bot must hold the Discord
     /// permissions the plan needs (Manage Guild / Channels / Roles /
     /// Guild Expressions as applicable), sit above overwritten roles, and
-    /// own every permission bit the desired overwrites grant. Administrator
-    /// bypasses the checks, as on Discord.
+    /// own every permission bit the desired overwrites grant. The supplied
+    /// capture must be LIVE authority, not the saved snapshot. Administrator
+    /// bypasses permission-bit/overwrite checks, but not role hierarchy.
     pub async fn assert_restore_permissions(
         &self,
         snapshot: &Map<String, Value>,
@@ -280,36 +282,132 @@ impl GuildConfigDiscordApi {
                 .filter_map(|r| r.get("position").and_then(Value::as_i64))
                 .max()
                 .unwrap_or(-1);
-            let targets: Vec<&Value> = if plan.counts.roles > 0 {
-                roles
-                    .iter()
-                    .filter(|r| {
-                        !r.get("managed").and_then(Value::as_bool).unwrap_or(false)
-                            && r.get("id").and_then(Value::as_str) != Some(self.guild_id.as_str())
-                    })
-                    .collect()
-            } else {
-                // Overwrite-only plans: resolve role details from the snapshot.
-                plan.overwrite_roles
-                    .iter()
-                    .filter_map(|t| {
-                        roles
-                            .iter()
-                            .find(|r| r.get("id").and_then(Value::as_str) == Some(t.0.as_str()))
-                    })
-                    .collect()
-            };
-            let blocked: Vec<String> = targets
+            // Administrator does not bypass role hierarchy. Check only IDs
+            // actually patched/positioned/overwritten, using LIVE positions.
+            // https://docs.discord.com/developers/topics/permissions#role-hierarchy
+            let role_path = format!("/guilds/{}/roles", self.guild_id);
+            let mut target_ids = BTreeSet::new();
+            let mut planned_positions = Vec::new();
+            let created_names: BTreeMap<_, _> = plan
+                .operations
                 .iter()
-                .filter(|r| r.get("position").and_then(Value::as_i64).unwrap_or(0) >= bot_position)
-                .map(|r| {
-                    format!(
-                        "{} ({})",
-                        r.get("name").and_then(Value::as_str).unwrap_or("?"),
-                        r.get("position").and_then(Value::as_i64).unwrap_or(0)
-                    )
+                .filter_map(|op| {
+                    let (resource, source) = op.capture_id.as_ref()?;
+                    (resource == "role").then(|| {
+                        (
+                            source.as_str(),
+                            op.body
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or(source),
+                        )
+                    })
                 })
                 .collect();
+            for op in &plan.operations {
+                let super::guild_config_restore::RestorePath::Literal(path) = &op.path else {
+                    continue;
+                };
+                if op.method != "PATCH" {
+                    continue;
+                }
+                if let Some(id) = path.strip_prefix(&format!("{role_path}/")) {
+                    target_ids.insert(id.to_owned());
+                } else if path == &role_path {
+                    for entry in op.body.as_array().into_iter().flatten() {
+                        let source = entry
+                            .get("id")
+                            .and_then(|id| {
+                                id.as_str()
+                                    .or_else(|| id.get("sourceId").and_then(Value::as_str))
+                            })
+                            .unwrap_or("");
+                        let id = if entry.get("id").is_some_and(Value::is_string) {
+                            // Literal operation IDs are already live IDs.
+                            source
+                        } else {
+                            plan.known_ids
+                                .roles
+                                .get(source)
+                                .map(String::as_str)
+                                .unwrap_or(source)
+                        };
+                        if roles
+                            .iter()
+                            .any(|r| r.get("id").and_then(Value::as_str) == Some(id))
+                        {
+                            target_ids.insert(id.to_owned());
+                        }
+                        if let Some(position) = entry.get("position").and_then(Value::as_i64) {
+                            let name = roles
+                                .iter()
+                                .find(|r| r.get("id").and_then(Value::as_str) == Some(id))
+                                .and_then(|r| r.get("name"))
+                                .and_then(Value::as_str)
+                                .or_else(|| created_names.get(source).copied())
+                                .unwrap_or(source);
+                            planned_positions.push((name.to_owned(), position));
+                        }
+                    }
+                }
+            }
+            for target in &plan.overwrite_targets {
+                for overwrite in &target.desired_overwrites {
+                    if overwrite.overwrite_type == 0
+                        && roles.iter().any(|r| {
+                            r.get("id").and_then(Value::as_str) == Some(overwrite.id.as_str())
+                        })
+                    {
+                        target_ids.insert(overwrite.id.clone());
+                    }
+                }
+                // A full overwrite-set replacement also removes old role
+                // entries. Those live IDs are targets even when absent from
+                // the saved desired set.
+                if let Some(channel) = target.current_id.as_deref().and_then(|id| {
+                    snapshot
+                        .get("channels")
+                        .and_then(Value::as_array)?
+                        .iter()
+                        .find(|c| c.get("id").and_then(Value::as_str) == Some(id))
+                }) {
+                    for overwrite in channel
+                        .get("permission_overwrites")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if overwrite.get("type").and_then(Value::as_i64) == Some(0) {
+                            if let Some(id) = overwrite.get("id").and_then(Value::as_str) {
+                                target_ids.insert(id.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            let mut blocked = Vec::new();
+            for id in target_ids.iter().filter(|id| id.as_str() != self.guild_id) {
+                let role = roles
+                    .iter()
+                    .find(|r| r.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                    .ok_or_else(|| {
+                        GuildConfigApiError::Discord(format!(
+                            "Restore hierarchy target role {id} is absent from the live guild."
+                        ))
+                    })?;
+                let position = role.get("position").and_then(Value::as_i64).unwrap_or(0);
+                if position >= bot_position {
+                    blocked.push(format!(
+                        "{} ({position})",
+                        role.get("name").and_then(Value::as_str).unwrap_or(id)
+                    ));
+                }
+            }
+            for (name, position) in planned_positions {
+                if position >= bot_position {
+                    blocked.push(format!("{name} (planned position {position})"));
+                }
+            }
             if !blocked.is_empty() {
                 return Err(GuildConfigApiError::Discord(format!(
                     "Restore hierarchy preflight failed: Owen role position {bot_position} is not above overwrite target {}.",

@@ -65,6 +65,15 @@ async fn test_url() -> Option<String> {
         "agent_test",
         "tests only use the test principal"
     );
+    assert_eq!(parsed.port().unwrap_or(5432), 5432, "test DB port only");
+    assert!(
+        parsed.password().unwrap_or("").is_empty(),
+        "empty test password only"
+    );
+    assert!(
+        parsed.query().is_none(),
+        "no query-string credential or host overrides"
+    );
     assert!(
         parsed
             .path()
@@ -240,10 +249,10 @@ async fn dump_inspect_restore_round_trip() {
     seed(&pool).await;
     let before = snapshot_all(&pool).await;
 
-    let scratch = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
-        .or_else(|| std::env::var_os("PAPERCLIP_SCRATCH_DIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let scratch = PathBuf::from(
+        std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+            .expect("database tests require run-owned PAPERCLIP_RUN_SCRATCH_DIR"),
+    );
     let dir = scratch.join(format!("two-bot-backup-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let dump_path: PathBuf = dir.join("two-funnel-test.ndjson.gz");
@@ -305,6 +314,71 @@ async fn dump_inspect_restore_round_trip() {
     .await
     .unwrap();
     assert!(next.0 > 3, "sequence resumed past the restored max id");
+
+    // TOG-9970: the live writer must refuse a source transcript just past its
+    // reader's real line budget, without publishing or replacing any archive.
+    use two_bot_core::backup::dump_file::MAX_DUMP_LINE_BYTES;
+    let valid_bytes = std::fs::read(&dump_path).unwrap();
+    // Derive the real row envelope from PostgreSQL text output, including JSON
+    // escaping and the newline. A source body alone is not the line length.
+    let (ticket_id, guild_id, created_at, blob): (String, String, String, String) =
+        sqlx::query_as("SELECT ticket_id, guild_id, created_at::text, blob::text FROM ticket_transcripts WHERE ticket_id = 't1'")
+            .fetch_one(&pool).await.unwrap();
+    let empty_row = serde_json::json!({"kind":"row", "table":"ticket_transcripts", "data": {
+        "ticket_id":ticket_id, "guild_id":guild_id, "created_at":created_at, "body":"", "blob":blob
+    }});
+    let body_at_cap =
+        MAX_DUMP_LINE_BYTES as usize - serde_json::to_vec(&empty_row).unwrap().len() - 1;
+    sqlx::query("UPDATE ticket_transcripts SET body = $1 WHERE ticket_id = 't1'")
+        .bind("x".repeat(body_at_cap))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let boundary_path = dir.join("two-funnel-line-boundary.ndjson.gz");
+    two_bot_core::backup::dump::dump(&pool, &boundary_path)
+        .await
+        .expect("exact real line cap");
+    let boundary = two_bot_core::backup::dump_file::inspect(&boundary_path).unwrap();
+    assert_eq!(
+        boundary.buffers["ticket_transcripts"][0]["body"]
+            .as_str()
+            .unwrap()
+            .len(),
+        body_at_cap
+    );
+    // One byte beyond the complete-row cap must be refused, not merely the
+    // review's much larger transcript beyond the standalone-body cap.
+    sqlx::query("UPDATE ticket_transcripts SET body = $1 WHERE ticket_id = 't1'")
+        .bind("x".repeat(body_at_cap + 1))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let oversize_path = dir.join("two-funnel-oversize.ndjson.gz");
+    for destination in [&oversize_path, &dump_path] {
+        let err = two_bot_core::backup::dump::dump(&pool, destination)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("decoded line exceeds"), "{err}");
+        assert!(
+            !oversize_path.exists(),
+            "oversized source must not be published"
+        );
+        assert_eq!(
+            std::fs::read(&dump_path).unwrap(),
+            valid_bytes,
+            "prior recovery point survives"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "failed temporary is removed"
+        );
+    }
+    two_bot_core::backup::dump_file::inspect(&dump_path).unwrap();
+    sqlx::query("UPDATE ticket_transcripts SET body = NULL WHERE ticket_id = 't1'")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Optional migration ledger must not abort the repeatable-read transaction.
     sqlx::query("DROP TABLE schema_migrations")

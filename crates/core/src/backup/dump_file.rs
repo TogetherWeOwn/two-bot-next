@@ -113,16 +113,42 @@ pub const MAX_DUMP_RETAINED_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct InspectLimits {
+    compressed: u64,
     decoded: u64,
     line: u64,
     retained: u64,
 }
 
 const INSPECT_LIMITS: InspectLimits = InspectLimits {
+    compressed: MAX_DUMP_BYTES,
     decoded: MAX_DUMP_BYTES,
     line: MAX_DUMP_LINE_BYTES,
     retained: MAX_DUMP_RETAINED_BYTES,
 };
+
+// Both paths count the newline, not just the JSON payload. Check before
+// growing a buffer or handing another line to the compressor.
+fn account_decoded(
+    decoded: &mut u64,
+    line_len: u64,
+    added: u64,
+    limits: InspectLimits,
+) -> Result<(), DumpError> {
+    if added > limits.line.saturating_sub(line_len) {
+        return Err(refuse(format!(
+            "dump decoded line exceeds {}-byte cap",
+            limits.line
+        )));
+    }
+    if added > limits.decoded.saturating_sub(*decoded) {
+        return Err(refuse(format!(
+            "dump decoded content exceeds {}-byte cap",
+            limits.decoded
+        )));
+    }
+    *decoded += added;
+    Ok(())
+}
 
 fn read_capped_line(
     reader: &mut impl BufRead,
@@ -139,22 +165,10 @@ fn read_capped_line(
             .iter()
             .position(|b| *b == b'\n')
             .map_or(bytes.len(), |i| i + 1);
-        if line.len() as u64 + n as u64 > limits.line {
-            return Err(refuse(format!(
-                "dump decoded line exceeds {}-byte cap",
-                limits.line
-            )));
-        }
-        if *decoded + n as u64 > limits.decoded {
-            return Err(refuse(format!(
-                "dump decoded content exceeds {}-byte cap",
-                limits.decoded
-            )));
-        }
+        account_decoded(decoded, line.len() as u64, n as u64, limits)?;
         let complete = bytes[n - 1] == b'\n';
         line.extend_from_slice(&bytes[..n]);
         reader.consume(n);
-        *decoded += n as u64;
         if complete {
             return Ok(Some(line));
         }
@@ -236,6 +250,215 @@ pub fn write_line(enc: &mut GzEncoder<Vec<u8>>, value: &Value) -> Result<(), Dum
 /// Finish a gzip stream and return the compressed bytes.
 pub fn finish_gzip(enc: GzEncoder<Vec<u8>>) -> Result<Vec<u8>, DumpError> {
     enc.finish().map_err(|e| DumpError::Gzip(e.to_string()))
+}
+
+// Unlike the fixture helpers above, the live writer is bounded while encoding
+// and never writes under a backup filename until the exact reader accepts it.
+#[cfg(any(feature = "db", test))]
+struct CappedWrite<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+    what: &'static str,
+}
+
+#[cfg(any(feature = "db", test))]
+impl<W: Write> Write for CappedWrite<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > self.limit.saturating_sub(self.written) {
+            return Err(std::io::Error::other(format!(
+                "dump {} exceeds {}-byte cap",
+                self.what, self.limit
+            )));
+        }
+        let n = self.inner.write(bytes)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(any(feature = "db", test))]
+struct TemporaryDump(std::path::PathBuf);
+
+#[cfg(any(feature = "db", test))]
+impl Drop for TemporaryDump {
+    fn drop(&mut self) {
+        // Error/cancellation unwinding removes only our exclusively-created
+        // temporary. A killed process can leave a .tmp, never a backup candidate.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Bounded, unpublished live archive. Dropping it never publishes a prefix.
+#[cfg(any(feature = "db", test))]
+pub(crate) struct DumpWriter {
+    enc: GzEncoder<CappedWrite<std::fs::File>>,
+    temporary: TemporaryDump,
+    destination: std::path::PathBuf,
+    decoded: u64,
+    retained: u64,
+    limits: InspectLimits,
+}
+
+#[cfg(any(feature = "db", test))]
+impl DumpWriter {
+    pub(crate) fn new(destination: &Path) -> Result<Self, DumpError> {
+        Self::with_limits(destination, INSPECT_LIMITS)
+    }
+
+    fn with_limits(destination: &Path, limits: InspectLimits) -> Result<Self, DumpError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        loop {
+            // Neither retention's two-funnel-*.ndjson.gz predicate nor the
+            // restore drill's glob can match this name. Same directory = same FS.
+            let path = parent.join(format!(
+                ".dump-writing-{}-{stamp}-{}.tmp",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            // Exclusive creation also refuses symlinks (including dangling ones).
+            // https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            };
+            return Ok(Self {
+                enc: GzEncoder::new(
+                    CappedWrite {
+                        inner: file,
+                        written: 0,
+                        limit: limits.compressed,
+                        what: "compressed content",
+                    },
+                    Compression::new(9),
+                ),
+                temporary: TemporaryDump(path),
+                destination: destination.to_owned(),
+                decoded: 0,
+                retained: 0,
+                limits,
+            });
+        }
+    }
+
+    pub(crate) fn write_line(&mut self, value: &Value) -> Result<(), DumpError> {
+        // Bound JSON escaping before allocation (a source cell can expand on
+        // serialization). Reserve room for the newline in the same line cap.
+        let mut line = CappedWrite {
+            inner: Vec::new(),
+            written: 0,
+            limit: self.limits.line,
+            what: "decoded line",
+        };
+        serde_json::to_writer(&mut line, value)
+            .map_err(|e| refuse(format!("cannot serialise dump line: {e}")))?;
+        line.write_all(b"\n")?;
+        account_decoded(&mut self.decoded, 0, line.written, self.limits)?;
+        // The reader budgets allocated capacities, not just string lengths.
+        // Parse the actual bytes so writer/reader accounting sees the same
+        // capacities, rather than capacities inherited from database values.
+        let parsed: Value = serde_json::from_slice(&line.inner)
+            .map_err(|e| refuse(format!("cannot parse encoded dump line: {e}")))?;
+        if matches!(
+            parsed.get("kind").and_then(Value::as_str),
+            Some("manifest" | "row")
+        ) {
+            retain_within_cap(&mut self.retained, &parsed, self.limits.retained)?;
+        }
+        self.enc.write_all(&line.inner)?;
+        Ok(())
+    }
+
+    pub(crate) fn publish(self) -> Result<(), DumpError> {
+        let Self {
+            enc,
+            temporary,
+            destination,
+            limits,
+            ..
+        } = self;
+        // finish includes the gzip trailer and propagates short/failed writes.
+        // https://docs.rs/flate2/1.1.10/flate2/write/struct.GzEncoder.html#method.finish
+        let mut output = enc.finish()?;
+        output.flush()?;
+        // Drop alone ignores close-time errors; sync before validation/rename.
+        // https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all
+        output.inner.sync_all()?;
+        drop(output);
+        // The full structural/count/gzip validation is exactly restore's reader,
+        // not merely the writer's expectation of what it emitted.
+        drop(inspect_with_limits(&temporary.0, limits)?);
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let directory = std::fs::File::open(parent)?;
+        rename_no_replace(&temporary.0, &destination)?;
+        // File fsync does not persist the renamed directory entry. Require
+        // that durability too before CLI retention can remove recovery points.
+        // https://man7.org/linux/man-pages/man2/fsync.2.html
+        directory.sync_all()?;
+        Ok(())
+    }
+}
+
+// std::fs::rename replaces existing destinations on Unix. Use Linux's atomic
+// no-replace rename instead: even racing publishers cannot destroy a good dump.
+// https://man7.org/linux/man-pages/man2/rename.2.html (RENAME_NOREPLACE)
+#[cfg(all(any(feature = "db", test), target_os = "linux"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn renameat2(
+            oldfd: i32,
+            old: *const std::ffi::c_char,
+            newfd: i32,
+            new: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    let path = |p: &Path| {
+        CString::new(p.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let source = path(source)?;
+    let destination = path(destination)?;
+    // Linux UAPI: AT_FDCWD=-100; RENAME_NOREPLACE=1. CString pointers remain
+    // alive through the call; this function neither reads nor owns Rust memory.
+    let result = unsafe { renameat2(-100, source.as_ptr(), -100, destination.as_ptr(), 1) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(any(feature = "db", test), not(target_os = "linux")))]
+fn rename_no_replace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    // Fail closed, rather than fall back to an overwrite-prone check + rename.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace dump publication requires Linux renameat2",
+    ))
 }
 
 /// A row line, with the table name already gated.
@@ -403,13 +626,20 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
 
 /// Read and validate a dump file from disk.
 pub fn inspect(path: &Path) -> Result<DumpContents, DumpError> {
+    inspect_with_limits(path, INSPECT_LIMITS)
+}
+
+fn inspect_with_limits(path: &Path, limits: InspectLimits) -> Result<DumpContents, DumpError> {
     let file = std::fs::File::open(path)?;
-    ensure_within_size_cap(
-        file.metadata()?.len(),
-        &format!("dump file {}", path.display()),
-    )?;
+    let len = file.metadata()?.len();
+    if len > limits.compressed {
+        return Err(refuse(format!(
+            "dump file {} is {len} bytes, past the {}-byte dump cap; refusing rather than buffering it",
+            path.display(), limits.compressed
+        )));
+    }
     // Also bound reads if a file grows after the metadata check.
-    inspect_reader(file.take(MAX_DUMP_BYTES), INSPECT_LIMITS)
+    inspect_reader(file.take(limits.compressed), limits)
 }
 
 fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
@@ -546,6 +776,182 @@ mod tests {
             serde_json::json!({"kind":"row","table":"events","data":{"id":"1","guild_id":"g"}}),
             serde_json::json!({"kind":"end","rows":1}),
         ]
+    }
+
+    fn publication_dir(label: &str) -> std::path::PathBuf {
+        let scratch = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = scratch.join(format!(
+            "dump-publication-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn write_archive(path: &Path, objs: &[Value], limits: InspectLimits) -> Result<(), DumpError> {
+        let mut writer = DumpWriter::with_limits(path, limits)?;
+        for obj in objs {
+            writer.write_line(obj)?;
+        }
+        writer.publish()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn live_writer_reader_boundaries_for_every_budget() {
+        let mut objs = good_dump();
+        objs[1]["data"]["guild_id"] = Value::String("x".repeat(4096));
+        objs[0]["tables"][0]["count"] = serde_json::json!(2);
+        objs.insert(2, objs[1].clone());
+        objs[3]["rows"] = serde_json::json!(2);
+        let lines: Vec<Vec<u8>> = objs
+            .iter()
+            .map(|obj| {
+                let mut line = serde_json::to_vec(obj).unwrap();
+                line.push(b'\n');
+                line
+            })
+            .collect();
+        let exact = InspectLimits {
+            compressed: gzip_lines(&objs).len() as u64,
+            decoded: lines.iter().map(|l| l.len() as u64).sum(),
+            line: lines.iter().map(|l| l.len() as u64).max().unwrap(),
+            retained: lines[..lines.len() - 1]
+                .iter()
+                .map(|l| retained_weight(&serde_json::from_slice(l).unwrap()))
+                .sum(),
+        };
+        let dir = publication_dir("budgets");
+        let good = dir.join("two-funnel-good.ndjson.gz");
+        write_archive(&good, &objs, exact).expect("at every cap is readable and publishable");
+        inspect_with_limits(&good, exact).unwrap();
+        inspect(&good).unwrap();
+        let saved = std::fs::read(&good).unwrap();
+        for (label, limits, message) in [
+            (
+                "compressed",
+                InspectLimits {
+                    compressed: exact.compressed - 1,
+                    ..INSPECT_LIMITS
+                },
+                "compressed content",
+            ),
+            (
+                "decoded",
+                InspectLimits {
+                    decoded: exact.decoded - 1,
+                    ..INSPECT_LIMITS
+                },
+                "decoded content",
+            ),
+            (
+                "line",
+                InspectLimits {
+                    line: exact.line - 1,
+                    ..INSPECT_LIMITS
+                },
+                "decoded line",
+            ),
+            (
+                "retained",
+                InspectLimits {
+                    retained: exact.retained - 1,
+                    ..INSPECT_LIMITS
+                },
+                "retained data",
+            ),
+        ] {
+            inspect_with_limits(&good, limits)
+                .expect_err("reader refuses the same one-byte budget excess");
+            // A budget error must neither create a new backup nor overwrite an
+            // existing valid destination. Every temporary is cleaned on refusal.
+            let absent = dir.join(format!("two-funnel-{label}.ndjson.gz"));
+            for destination in [&absent, &good] {
+                let err = write_archive(destination, &objs, limits).unwrap_err();
+                assert!(err.to_string().contains(message), "{label}: {err}");
+                assert!(!absent.exists());
+                assert_eq!(std::fs::read(&good).unwrap(), saved);
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn live_writer_validates_counts_before_publication_and_never_clobbers() {
+        let dir = publication_dir("validation");
+        let path = dir.join("two-funnel-good.ndjson.gz");
+        let mut invalid = good_dump();
+        invalid[2]["rows"] = serde_json::json!(2);
+        let err = write_archive(&path, &invalid, INSPECT_LIMITS).unwrap_err();
+        assert!(err.to_string().contains("dump declares 2 rows"), "{err}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        write_archive(&path, &good_dump(), INSPECT_LIMITS).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let err = write_archive(&path, &good_dump(), INSPECT_LIMITS).unwrap_err();
+        assert!(
+            matches!(err, DumpError::Io(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        inspect(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn abandoned_live_writer_is_not_a_backup_and_cleans_up() {
+        let dir = publication_dir("abandoned");
+        let path = dir.join("two-funnel-abandoned.ndjson.gz");
+        {
+            let mut writer = DumpWriter::new(&path).unwrap();
+            writer.write_line(&good_dump()[0]).unwrap();
+            let temporary = std::fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .file_name();
+            let name = temporary.to_string_lossy();
+            assert!(!name.starts_with("two-funnel-"));
+            assert!(!name.ends_with(".ndjson.gz"));
+            assert!(!path.exists());
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn capped_output_retries_short_writes_and_propagates_failure() {
+        struct ShortWriter(Vec<u8>);
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0.len() == 3 {
+                    return Err(std::io::Error::other("injected disk failure"));
+                }
+                self.0.push(bytes[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = CappedWrite {
+            inner: ShortWriter(Vec::new()),
+            written: 0,
+            limit: 10,
+            what: "test",
+        };
+        let err = out.write_all(b"abcdef").unwrap_err();
+        assert!(err.to_string().contains("injected disk failure"));
+        assert_eq!(out.written, 3);
+        assert_eq!(out.inner.0, b"abc");
     }
 
     #[test]
@@ -753,9 +1159,7 @@ mod tests {
     fn inspect_refuses_an_oversize_file_from_metadata_without_reading_it() {
         // Sparse file: the length is metadata, no bytes are allocated, and
         // `inspect` refuses from the metadata before `fs::read` runs.
-        let dir =
-            std::env::temp_dir().join(format!("two-bot-backup-cap-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = publication_dir("reader-metadata");
         let path = dir.join("oversize.ndjson.gz");
         std::fs::File::create(&path)
             .unwrap()

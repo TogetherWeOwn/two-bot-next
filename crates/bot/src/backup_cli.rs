@@ -1153,7 +1153,10 @@ mod tests {
         let next = dir.0.join("two-funnel-next.ndjson.gz");
         std::fs::write(&next, b"next archive").unwrap();
         assert_eq!(prune_backups(&dir.0, 1).unwrap().len(), 1);
-        assert_eq!(usize::from(published.exists()) + usize::from(next.exists()), 1);
+        assert_eq!(
+            usize::from(published.exists()) + usize::from(next.exists()),
+            1
+        );
         for name in interrupted {
             assert_eq!(std::fs::read(dir.0.join(name)).unwrap(), b"partial output");
         }

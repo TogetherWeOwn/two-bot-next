@@ -32,6 +32,15 @@ Input is streamed with separate caps: 1 GiB compressed **and decoded**,
 8 MiB per decoded line/cell envelope, and 256 MiB of conservatively accounted
 retained data (keys plus per-value overhead). Highly compressible input is
 refused before unbounded line-buffer growth, not just by compressed metadata.
+These budgets also define the writer's supported output: a dump that the same
+build cannot inspect is not eligible for successful publication, retention or
+upload. Complete output is validated under a unique non-backup temporary name,
+flushed/fsynced, then atomically renamed without replacing an existing archive;
+the parent directory is fsynced before reporting success. Publication requires
+Linux/filesystem support for `renameat2(RENAME_NOREPLACE)` and fails closed if
+unsupported. A failed write or validation leaves existing published recovery
+points untouched; a crash may leave a temporary file, but retention and drill
+selectors ignore it.
 
 All 22 bot-owned tables are dumped (see `DUMP_TABLES` in
 `crates/core/src/backup/dump_file.rs`); the website's tables are not ours.
@@ -97,6 +106,12 @@ directory permits the deliberate `DISCORD_STAGING_BOT_TOKEN` fallback. Empty,
 invalid or unreadable credentials refuse without substitution or token logging.
 Restore preflight uses the **live capture**, not saved permissions/hierarchy;
 removed authority refuses before writes, and newly granted authority is honored.
+Surviving role/channel/category IDs take precedence over names, preserving role
+membership and channel history through renames. Name fallback must be unique
+and unclaimed. Plans compare literal-ID overwrite sets without order sensitivity,
+repair editable `@everyone` permissions, and validate all resource dependencies
+before apply. Hierarchy checks target only planned edits, not unrelated higher
+roles; missing managed resources cannot silently become unresolved late writes.
 
 Restore: `two-bot guild-config-restore --snapshot FILE` plans (prints
 `WOULD …`); add `--confirm-staging-guild --apply` to write, `--evidence
@@ -162,6 +177,35 @@ cutover plan and gates separately; these examples are scratch-only.
   transport tests pass with alphabetic SignedHeaders required by the verifier.
 - Test connections are confined to agent-testdb and loopback HTTP; no production
   or staging service, usable Discord token or off-box bucket was exercised.
+
+### Second CHANGES verification — 2026-09-30
+
+- Clean integrated-tree `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` and
+  `cargo test --workspace --locked` pass after preserving current main's
+  configuration, voice and gateway integrations. The unrelated dirty manifest
+  is excluded from this archived-tree check. Optional database harnesses skip
+  without a URL; their default result is not database execution evidence.
+- 27 guild-config regressions cover duplicate/renamed role identities, swapped
+  channels, renamed categories, parent moves, editable `@everyone`, actual-target
+  hierarchy checks, unchanged/reordered overwrite sets and zero-write dependency
+  refusals, including public/mutated plans. Discord execution is loopback-only.
+- Writer/reader tests accept exact boundaries and refuse one-byte excess for all
+  four budgets using reduced caps on the same production accounting paths.
+  Full 1 GiB compressed/decoded and 256 MiB retained boundaries were not
+  materialized. Real database coverage separately accepts an exact 8 MiB
+  complete decoded line (including envelope/newline) and refuses one byte more.
+- Separately built the integrated bot, set `TWO_BOT_TEST_BACKUP_BIN` to it, and
+  ran the `backup_roundtrip` and `backup_dump_publication` tests with `db` on
+  dedicated agent-testdb `two_next_backup_publication_f2561193_final`: both pass.
+  The actual CLI child alone receives `RLIMIT_FSIZE=500`; returned EFBIG cleans
+  its temporary, while SIGXFSZ leaves only an ignored temporary. Previous valid
+  archives survive; failure neither prunes nor uploads; the shipped drill
+  selector ignores partial output and a successful retry retains correctly.
+- Scratch databases were dropped and verified absent. No parent/global process
+  limits, production/staging resources, usable Discord credentials or off-box
+  buckets were used. Physical power-loss durability and real Discord behavior
+  remain outside this test evidence.
 
 ## S6 hook (Founding Engineer)
 
