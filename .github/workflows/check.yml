@@ -117,6 +117,9 @@ jobs:
       - name: onboarding prompt store regressions (CI service only)
         run: cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
 
+      - name: onboarding shared runtime acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
+
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 

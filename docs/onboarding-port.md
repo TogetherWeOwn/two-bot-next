@@ -98,11 +98,37 @@ single-attempt mutations, not a private client; empty components are omitted on
 posts so the anchor welcome attaches nothing. Role mutations use the shared
 110 ms pacing lane and preserve unrelated roles.
 
-The gateway runtime, settings refresh, live permission resolution and combined
-Postgres/REST concurrency proof remain unfinished at this checkpoint. The
-`onboarding_wire` test proves the actual HTTP shapes of the shared operations,
-not their registration or deployment. Do not enable this checkpoint as a live
-onboarding flow or claim runtime parity yet.
+The gateway now captures member state before S3 updates/removes it: ungated
+joins, cached pending true-to-false transitions, and session goodbye joined-at.
+A missing cached member does not establish a gate transition. S3 remains the
+only writer of membership funnel facts. Asynchronous, bounded feature workers
+call the shared component router and executor without blocking shard polling.
+
+Each relevant event reads a consistent settings snapshot. Hot stored overrides
+win; deletion restores deployment defaults. Mode and guild identity remain
+immutable deployment fields. Effective channel access is resolved from fresh
+guild/member/role reads and channel overwrites, in Discord overwrite order.
+Foreign guilds, DMs, malformed evidence and unpostable destinations fail closed.
+Game role changes are serialized per member and routing reads fresh roles after
+all changes; unavailable fallback hubs are never linked.
+
+Combined `onboarding_tests` exercise these adapters through actual mock HTTP
+requests and isolated agent-testdb schemas, including two independent pools for
+concurrent PromptGuard delivery. They prove mode/dry-run welcomes, accepted-send
+markers, rejected-send retry, role matching, post-grant routing, roleless session
+routing, hot settings, anchor attachments, empty goodbye mentions, pre-update
+capture, and single-owned S3 facts. They do not prove deployment or crash-safe
+gateway feature delivery.
+
+**Remaining before readiness:** feature jobs currently start after the gateway
+checkpoint commits, and exist only in memory. A process restart can therefore
+lose an already-checkpointed welcome/goodbye/interaction; replay is suppressed
+by S3's sequence fence. Worker failures also need an explicit delivery
+resumption policy. Resolve and test that checkpoint-to-worker gap before
+removing the draft gate. Also verify full gateway/shard integration, deferred
+error replies, and the anchor marker/routing-record transaction boundary.
+Do not enable this checkpoint as a live onboarding flow or claim runtime parity
+yet.
 
 Framework references:
 
@@ -118,6 +144,8 @@ cargo test -p two-bot-core --locked
 cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
+cargo test -p two-bot-discord --test onboarding_wire --locked
+cargo test -p two-bot --locked onboarding_ -- --include-ignored
 ```
 
 The DB proof is opt-in and hardwired to

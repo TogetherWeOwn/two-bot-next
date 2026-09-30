@@ -12,6 +12,8 @@ mod gateway_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 mod onboarding;
+#[cfg(test)]
+mod onboarding_tests;
 mod server;
 
 use std::sync::Arc;
