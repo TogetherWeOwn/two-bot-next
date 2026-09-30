@@ -430,3 +430,41 @@ pub fn delivery_action(claim: DeliveryClaim, posted_this_poll: usize) -> Deliver
         DeliveryClaim::Fresh => DeliveryAction::Send,
     }
 }
+
+/// Injectable-clock equivalent of the legacy immediate tick + non-overlapping
+/// interval. The adapter obtains seconds from FeatureGates::feed_poll_seconds,
+/// and always calls finish after a pass, including a failed one.
+#[derive(Debug, Clone)]
+pub struct FeedPollSchedule {
+    interval_ms: i64,
+    next_ms: i64,
+    running: bool,
+}
+
+impl FeedPollSchedule {
+    pub fn new(seconds: u64) -> Result<Self, crate::feature_commands::GateError> {
+        if !(60..=86400).contains(&seconds) {
+            return Err(crate::feature_commands::GateError::InvalidFeedPoll(
+                seconds.to_string(),
+            ));
+        }
+        Ok(Self {
+            interval_ms: seconds as i64 * 1000,
+            next_ms: i64::MIN,
+            running: false,
+        })
+    }
+
+    pub fn begin(&mut self, now_ms: i64) -> bool {
+        if self.running || now_ms < self.next_ms {
+            return false;
+        }
+        self.running = true;
+        self.next_ms = now_ms.saturating_add(self.interval_ms);
+        true
+    }
+
+    pub fn finish(&mut self) {
+        self.running = false;
+    }
+}
