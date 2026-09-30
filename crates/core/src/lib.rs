@@ -73,6 +73,7 @@ pub mod sticky;
 pub mod voice;
 pub mod voice_config;
 pub mod voice_ownership;
+pub mod voice_rooms;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
@@ -265,6 +266,15 @@ pub use voice::{
     known_voice_durations, parse_voice_end_metadata, resolve_voice_end, summarize_voice_durations,
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
+};
+pub use voice_rooms::{
+    category_full_message, decide_room_join, decide_room_leave, fail_backoff_ms,
+    parse_retry_after_ms, reconcile, voice_commands, ActionQueue, CreatorChannel,
+    CreatorSettingsError, FailedAction, MemRoomStore, NewRoomSpec, PermissionSource,
+    ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction, RoomJoinDecision,
+    RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore, SeenChannel,
+    VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT,
+    QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
