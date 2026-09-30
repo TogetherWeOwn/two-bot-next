@@ -4,6 +4,11 @@
 
 ### Added
 
+- Add durable operational audit rows, fenced delivery claims, accepted-message recovery, quarantine and a persistent delivery halt to the sqlx core store. Reserve audit migrations 0340–0349 and run isolated Postgres regressions in CI; Discord service/runtime activation remains a follow-up. Every owner mutation takes the audit row lock before evaluating token, generation and the current lease, and preflight-only failures park rows out of queue discovery for a 60 s backoff without counting a POST attempt. Deferral and failure releases stamp a fairness yield fixing queue position at release time, so expired backoffs rotate past repeatedly failing rows while aged retries keep position ahead of later arrivals instead of being starved by continued fresh rows, and a lock-free eligibility precheck keeps ineligible claims from waiting on a row lock while holding the shared halt guard.
+- Port the website-to-bot internal-actions auth core (HMAC-SHA256 rotation-aware signing, skew + nonce replay guard, post-verify token buckets, 19-verb allowlist with env flags, settings catalog guard, bind guard, `authorize` pipeline) as framework-free domain logic. HTTP route, durable stores, and Discord execution remain follow-up slices.
+- Framework-free LFG role parsing, future start-time validation, signup capacity decisions, select-menu data, permission checks, and message rendering.
+- PostgreSQL LFG persistence and migration `0170`, preserving legacy table and column names; guild-fenced post writes and serialized capacity/close transactions.
+- LFG regression tests against an isolated PostgreSQL CI service. Runtime command/component registration and Discord side effects remain dependent on the S4 interaction-router and REST-executor slices.
 - Port leveling XP awards and per-source cooldowns to a transactional sqlx store over the imported tables, with legacy rank/leaderboard replies, idempotent reward-role plans and isolated Postgres parity tests. Router, REST and async gateway wiring remain follow-up integration work.
 - Presence probe, weekly community scorecard, and inactivity flagging as framework-free domain logic with feature-gated Postgres stores and migrations 0310–0311, verified against a golden scorecard from the legacy build: hourly presence series with 24 h bot-floor re-list and the reopen trigger, Monday 06:15 UTC closed-week runs with fail-closed coverage, and an hourly read-only quiet-member sweep that never messages.
 - Port join-burst detection, join-risk scoring and mention-suppressed staff alert proposals to the Rust domain core, with occurrence/processing clock boundaries and mock acceptance. No gateway, durable store, alert delivery or anti-nuke activation is added.
@@ -25,6 +30,7 @@
 
 ### Fixed
 
+- Match legacy ECMAScript whitespace trimming for LFG roles, slot numbers, and titles, including BOM and NEL edge cases.
 - Detect settings changes with a commit-ordered transactional revision instead of a sequence maximum, including deletes and late commits with lower row versions.
 - Serialize settings reads, writes, and audits, including concurrent inserts into absent keys; load cache rows and revision from one consistent database snapshot.
 - Refuse environment-only and unknown settings through the cache getter as well as environment snapshots.

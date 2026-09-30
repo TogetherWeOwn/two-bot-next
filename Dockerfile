@@ -19,7 +19,8 @@ COPY crates/discord/Cargo.toml crates/discord/
 COPY crates/bot/Cargo.toml crates/bot/
 COPY crates/cutover/Cargo.toml crates/cutover/
 COPY crates/store/Cargo.toml crates/store/
-RUN mkdir -p crates/core/src crates/discord/src crates/bot/src crates/cutover/src crates/store/src \
+RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutover/src crates/store/src \
+    && echo '' > src/lib.rs \
     && echo 'fn main(){}' > crates/bot/src/main.rs \
     && echo '' > crates/core/src/lib.rs \
     && echo '' > crates/discord/src/lib.rs \

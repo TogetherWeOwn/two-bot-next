@@ -1,10 +1,11 @@
 //! two-bot-next container entrypoint.
 //!
 //! Serves liveness (`/health`) and readiness (`/readyz`) and runs the gateway
-//! shard supervisor (S3). Without `DISCORD_TOKEN` the shard stays parked and
-//! `/readyz` reports `gateway: down` (HTTP 503) — the Container boots healthy
-//! on staging config either way.
+//! shard supervisor (S3). Without `DISCORD_TOKEN`, `DATABASE_URL`, or a nonzero
+//! `GUILD_ID` the shard stays parked and `/readyz` reports `gateway: down`
+//! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
+mod backup_cli;
 mod dispatch;
 mod gateway;
 #[cfg(test)]
@@ -35,6 +36,20 @@ async fn main() {
         std::process::exit(healthcheck().await);
     }
 
+    // Operator CLI (TOG-9881): backup/restore + sealed guild-config snapshot.
+    // No subcommand falls through to the gateway path below. sqlx is linked
+    // (core `db` feature) so these paths can open Postgres directly.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if !cli_args.is_empty() && cli_args[0] != "--help" && cli_args[0] != "-h" {
+        let code = backup_cli::dispatch(&cli_args).await;
+        // 100 = not a backup subcommand: fall through to serve.
+        if code != 100 {
+            std::process::exit(code);
+        }
+    } else if !cli_args.is_empty() {
+        print_backup_help_and_exit().await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -47,13 +62,15 @@ async fn main() {
         Config {
             discord_token: None,
             database_url: None,
-            listen_addr: "0.0.0.0:8080".to_owned(),
+            // Gateway config errors must not move the listener away from
+            // the Worker probes and Docker healthcheck's configured address.
+            listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
             guild_id: None,
         }
     });
 
     let gateway = Arc::new(RwLock::new(GatewayState::new(&config)));
-    let store = match config.database_url.as_deref() {
+    let store = match gateway_prerequisites(&config).ok().map(|(_, url, _)| url) {
         Some(url) => match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             two_bot_store::Store::connect(url, false),
@@ -74,8 +91,8 @@ async fn main() {
     };
 
     let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
-    let gateway_task = if let Some(token) = config.discord_token.clone().filter(|t| !t.is_empty()) {
-        let guild_id = config.guild_id;
+    let gateway_task = if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
+        let token = token.to_owned();
         let state = Arc::clone(&gateway);
         Some(tokio::spawn(async move {
             let result: Result<(), sqlx::Error> = async {
@@ -85,9 +102,6 @@ async fn main() {
                     )
                 })?;
                 let pool = db.pool().clone();
-                let guild_id = guild_id.filter(|id| *id != 0).ok_or_else(|| {
-                    sqlx::Error::InvalidArgument("GUILD_ID required for gateway checkpoint".into())
-                })?;
                 tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     sqlx::migrate!("../cutover/migrations").run(&pool),
@@ -129,9 +143,11 @@ async fn main() {
             result
         }))
     } else {
+        *gateway.write().await = GatewayState::Unconfigured;
         info!(
+            missing = gateway_prerequisites(&config).unwrap_err(),
             status = ?ComponentStatus::Down,
-            "no discord token; gateway parked, /readyz reports down"
+            "gateway prerequisites missing; gateway parked, /readyz reports down"
         );
         None
     };
@@ -145,6 +161,29 @@ async fn main() {
         tracing::error!(error = %err, "container service failed");
         std::process::exit(1);
     }
+}
+
+/// `--help` covers both the gateway server and the backup CLI.
+async fn print_backup_help_and_exit() -> ! {
+    let code = backup_cli::dispatch(&["--help".to_owned()]).await;
+    std::process::exit(code);
+}
+
+/// Validate before spawning: missing bindings park the gateway, whereas a
+/// configured task's failures remain fatal. Errors contain binding names only.
+fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static str> {
+    let token = config
+        .discord_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .ok_or("DISCORD_TOKEN")?;
+    let url = config
+        .database_url
+        .as_deref()
+        .filter(|url| !url.is_empty())
+        .ok_or("DATABASE_URL")?;
+    let guild_id = config.guild_id.filter(|id| *id != 0).ok_or("GUILD_ID")?;
+    Ok((token, url, guild_id))
 }
 
 /// A configured gateway is essential: never leave a health-only zombie after

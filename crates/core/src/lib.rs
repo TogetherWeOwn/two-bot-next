@@ -6,7 +6,10 @@
 //! or by future transports. Slices S3+ build on these seams.
 
 pub mod audit;
+#[cfg(feature = "db")]
+pub mod audit_store;
 pub mod automod;
+pub mod backup;
 pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
@@ -29,10 +32,14 @@ pub mod health;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
+pub mod internal_actions;
 pub mod invites;
 pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
+pub mod lfg;
+#[cfg(feature = "db")]
+pub mod lfg_store;
 pub mod mac;
 pub mod moderation;
 pub mod onboarding;
@@ -119,6 +126,21 @@ pub use inactivity::{
     select_inactive, should_flag, FlaggedMember, InactivityCandidate, InactivityOutcome,
     INACTIVITY_EVENT_SOURCE, INACTIVITY_EVENT_TYPE, INACTIVITY_SWEEP_INTERVAL_MS,
 };
+pub use internal_actions::{
+    assert_allowed, assert_private_bind, auth_failure, authorize, body_hash, build_channel_keys,
+    build_key_map, build_role_keys, canonical_string, check_setting_value_size, is_private_address,
+    new_request_id, normalise_bind_host, parse_keys, require_field_str, require_reason,
+    require_settings_key, require_snowflake, require_timestamp, sign, signatures_match, utf16_len,
+    valid_idempotency_key, valid_nonce_format, validate_announcement, validate_event_input,
+    validate_guild_add_member, validate_idempotency_key, validate_moderation_numbers,
+    validate_role_assign, within_skew, ActionError, AuthDecision, AuthHeaders, BindError,
+    BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace, InternalFlags, KeyMapError,
+    KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets, ACTIONS_PATH, ADD_MEMBER_BUCKET,
+    AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET, IMPLEMENTED_ACTIONS, MAX_BODY_BYTES,
+    MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS, MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN,
+    MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN, MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY,
+    NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS, REQUEST_ID_LEN, SKEW_SECONDS,
+};
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
     summarize_attribution_split, AttributionCategory, AttributionSplit, DowntimeWindow,
@@ -132,6 +154,15 @@ pub use leveling_store::{
     leaderboard as leveling_leaderboard, profile as leveling_profile,
     replace_role_rewards as replace_leveling_role_rewards, role_rewards as leveling_role_rewards,
     LevelingStoreError,
+};
+pub use lfg::{
+    adjudicate_signup, close_reply, created_reply, iso_millis_utc, leave_reply, lfg_content,
+    lfg_custom_id, lfg_nonce, lfg_select_options, normalize_starts_at, parse_lfg_select,
+    parse_role_spec, require_manage_events as lfg_require_manage_events, role_fill, signup_reply,
+    spec_roles, valid_role_key, validate_title, LfgPermissionError, LfgPost, LfgRole, LfgRoleSpec,
+    LfgSelectAction, LfgSelectOption, LfgSignup, LfgStatus, RoleSpecError, SignupOutcome,
+    StartsAtError, TitleError, LFG_LEAVE_VALUE, LFG_SELECT_PREFIX, MAX_LFG_ROLES,
+    MAX_OPTION_LABEL_CHARS, MAX_ROLE_SLOTS, MAX_TITLE_CHARS,
 };
 pub use moderation::{
     assert_moderation_allowed, moderation_commands, moderation_target_protection,
