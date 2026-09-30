@@ -368,7 +368,16 @@ async function migrationGrowthOverflowLifecycle() {
       postReleaseCount++;
     }
   }
-  assert.equal(bootstrapCount, 18, 'Retain all existing bootstrap lifecycle cases');
-  assert.equal(postReleaseCount, 18, 'Exercise the actual next native release for every generated snapshot');
+  for (const file of [
+    'src/lib.rs', 'crates/core/src/lib.rs', 'crates/discord/src/lib.rs',
+    'crates/bot/src/main.rs', 'crates/cutover/src/lib.rs', 'crates/store/src/lib.rs',
+    'wrangler/src/index.ts',
+  ]) {
+    assert(scopes.includes(file), `Retain release lifecycle coverage for ${file}`);
+  }
+  // Two tag modes for root, every member, worker, and three change types.
+  const expectedLifecycleCount = 2 * (members.length + 5);
+  assert.equal(bootstrapCount, expectedLifecycleCount, 'Exercise every bootstrap lifecycle case');
+  assert.equal(postReleaseCount, expectedLifecycleCount, 'Exercise the actual next native release for every generated snapshot');
   console.log(`PASS ${bootstrapCount} bootstrap + ${postReleaseCount} generated post-release native lifecycles; 5 migration guards; 8 overflow guards; 4 snapshot guards; 1 overflow lifecycle`);
 })().catch(error => { console.error(error.stack); process.exitCode = 1; });
