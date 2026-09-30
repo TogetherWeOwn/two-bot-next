@@ -376,6 +376,30 @@ async fn invalid_configuration_and_nonloopback_seams_fail_before_rest() {
 }
 
 #[tokio::test]
+async fn live_checks_without_admission_authority_refuse_before_rest() {
+    let mock = mock(vec![]).await;
+    let output = cli(&mock, &["--json"], &[("DISCORD_PREFLIGHT_API_BASE", "")]).await;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("TWO_DATABASE_URL"));
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn preflight_429_is_one_attempt_and_stops_the_check_sequence() {
+    let mock = mock(vec![ScriptedResponse::json(
+        429,
+        json!({"retry_after":0.001,"global":true}),
+    )])
+    .await;
+    let output = cli(&mock, &["--json"], &[]).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("HTTP 429"));
+    assert_eq!(mock.requests().len(), 1);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn help_and_invalid_arguments_need_no_credentials_or_network() {
     let mock = mock(vec![]).await;
     let output = cli(&mock, &["--help"], &[("DISCORD_TOKEN", "")]).await;

@@ -74,8 +74,14 @@ until the durable hold allows it.
   so they do not compete with each other. CDN emoji reads and S3 requests do not
   use a bot credential and are not put in this lane.
 
-Loopback fixture constructors are not an operational bypass: all shipped runtime
-and CLI bootstraps inject admission even when given a loopback proxy. Do not
+- **Preflight (added to main during this change):** live checks require the same
+  `TWO_DATABASE_URL`, construct the shared gate and use the raw transport without
+  Twilight retries. The explicit validated loopback-only fixture can run without
+  a database; if an authority is supplied but unavailable, it is never bypassed.
+
+Loopback fixture constructors are not an operational bypass: sticky, cutover and
+backup bootstraps inject admission even when given a loopback proxy, and preflight
+without authority can reach only its explicitly validated loopback fixture. Do not
 activate an old ungoverned binary, legacy bot, or external same-token client
 alongside this runtime. Cutover to these guarded versions retains the existing
 owner-approved activation/deployment boundary; this code cannot police arbitrary
