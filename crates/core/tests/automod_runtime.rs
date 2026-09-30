@@ -387,3 +387,36 @@ fn attachment_blocklist_and_exemptions_apply_in_runtime() {
         Inspection::Accepted(FunnelDisposition::Accept)
     );
 }
+
+#[test]
+fn delayed_create_batch_keeps_repeat_history_on_message_clock() {
+    // Resumed gateway batch: three identical creates at 0/10/20 s, all
+    // received at 60 s. The sweep must run on the message clock, so the
+    // third create still matches RepeatedMessage like the timely control.
+    let mut delayed = runtime(true);
+    let mut outcomes = Vec::new();
+    for (id, at_ms) in [("1", 0), ("2", 10_000), ("3", 20_000)] {
+        let mut msg = delivery(MessageDeliveryKind::Create, "same");
+        msg.message_id = id.into();
+        let snapshot = msg.snapshot.as_mut().unwrap();
+        snapshot.message_id = id.into();
+        snapshot.observed_timestamp_ms = at_ms;
+        outcomes.push(delayed.inspect(&msg));
+    }
+    assert_eq!(outcomes[0], Inspection::Accepted(FunnelDisposition::Accept));
+    assert_eq!(outcomes[1], Inspection::Accepted(FunnelDisposition::Accept));
+    assert!(
+        matches!(&outcomes[2], Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage)
+    );
+    // The maintenance tick only expires idle authors; it never sweeps ahead
+    // of the newest observed message, so a later idle sweep keeps the repeat.
+    delayed.expire_repeat_history(1_000_000_000);
+    let mut late = delivery(MessageDeliveryKind::Create, "same");
+    late.message_id = "4".into();
+    let snapshot = late.snapshot.as_mut().unwrap();
+    snapshot.message_id = "4".into();
+    snapshot.observed_timestamp_ms = 25_000;
+    assert!(
+        matches!(delayed.inspect(&late), Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage)
+    );
+}

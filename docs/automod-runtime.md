@@ -20,6 +20,11 @@ No legacy or production service is changed.
    without member roles, and every update, requires authoritative enrichment.
    Fetch the exact channel/message and resolve that author's guild roles; pass
    them to `with_fetched_message`. Failed lookups are **not** empty roles/content.
+   Route a MESSAGE_UPDATE dispatch's raw `d` object through
+   `PartialEdit::from_dispatch` + `partial_edit_delivery` **before**
+   `twilight_gateway::parse`: minimal edits omit the fields a full Twilight
+   `Message` requires and fail decoding upstream of enrichment. The delivery
+   carries no snapshot, so `inspect` returns `FetchMessage` for it.
 2. Build `DeliveryKey::from_delivery`. Its SHA-256 fingerprint excludes receipt
    time; creates key on message identity, edits on stable revision/facts. Text
    is not persisted. Acquire `AutomodStore::claim` **before** `inspect` changes
@@ -57,7 +62,10 @@ No legacy or production service is changed.
    once-per-message when modes change. Do not replay ingestion just because an
    enforcing claim is new.
 9. Invoke `expire_repeat_history(now_ms)` from the shared maintenance tick.
-   Inspection also sweeps inactive authors. No private ticker is introduced.
+   Inspection also sweeps inactive authors. Both run on the message clock:
+   delayed/resumed batches never erase the repeat history they still need,
+   and an idle tick never sweeps ahead of the newest observation. No private
+   ticker is introduced.
 
 The caller must serialize repeat-history observations in gateway order. Do not
 hold a synchronous pipeline mutex across an await. Target policy/activation
@@ -66,10 +74,14 @@ from `TWO_AUTOMOD_ENFORCE` itself.
 
 ## Persistence and recovery
 
-Apply migrations `0220` and `0221` via the existing cutover migration runner.
+Apply migrations `0220`–`0222` via the existing cutover migration runner.
 The legacy table/column names remain unchanged. Delivery claims are separate
 from the legacy processed-message ledger. Claim capabilities fence stale
 completions and safe reacquisition; keep them internal and do not log them.
+Migration `0222` records the counted phase on the claim atomically with the
+ledger commit: a counted claim survives `release_unmutated` as reconciliation
+evidence, and a retry replays it (`InFlight`) instead of acquiring a fresh
+claim that would plan `AlreadyProcessed` with no effects.
 
 There is deliberately no expiring mutation lease. A crash/timeout after the
 mutation fence leaves an in-flight claim requiring recorded reconciliation,

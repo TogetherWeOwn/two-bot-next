@@ -215,3 +215,45 @@ fn mock_attachment_is_blocked_and_reply_without_ping_is_not_mention_spam() {
         matches!(runtime().inspect(&delivery), Inspection::Matched(m) if m.filter == AutomodFilter::AttachmentType)
     );
 }
+
+#[test]
+fn raw_partial_edit_reaches_fetch_and_enrichment_without_full_decode() {
+    use two_bot_discord::automod::{partial_edit_delivery, PartialEdit};
+    // Minimal Discord MESSAGE_UPDATE: IDs + changed content, no author,
+    // attachments or timestamps. Full-message decoding fails before any
+    // enrichment seam could run.
+    let payload = serde_json::json!({
+        "op": 0, "s": 1, "t": "MESSAGE_UPDATE", "d": {
+            "id": "333333333333333333", "channel_id": "222222222222222222",
+            "guild_id": STAGING_GUILD_ID, "content": "blocked",
+            "edited_timestamp": "2026-09-30T00:00:01.000000+00:00"
+        }
+    })
+    .to_string();
+    assert!(
+        twilight_gateway::parse(payload.clone(), twilight_gateway::EventTypeFlags::all()).is_err(),
+        "minimal edit unexpectedly survives full-message decoding"
+    );
+    let dispatch: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let edit = PartialEdit::from_dispatch(&dispatch["d"]).unwrap();
+    assert_eq!(edit.message_id, "333333333333333333");
+    assert_eq!(edit.guild_id.as_deref(), Some(STAGING_GUILD_ID));
+    let delivery = partial_edit_delivery(&edit, 1_790_726_401_000);
+    assert_eq!(delivery.kind, MessageDeliveryKind::Update);
+    assert!(delivery.snapshot.is_none());
+    assert!(delivery.edited_timestamp_ms.is_some());
+    assert!(matches!(
+        runtime().inspect(&delivery),
+        Inspection::FetchMessage { .. }
+    ));
+    // Missing IDs reject the dispatch instead of defaulting to empty strings.
+    assert!(PartialEdit::from_dispatch(&serde_json::json!({"channel_id": "1"})).is_none());
+    assert!(PartialEdit::from_dispatch(&serde_json::json!({"id": "1"})).is_none());
+    // Authoritative enrichment completes the same delivery like any fetch.
+    let mut msg = message();
+    msg.content = "blocked".into();
+    let complete = with_fetched_message(&delivery, &msg, &["555555555555555555".into()]).unwrap();
+    assert!(
+        matches!(runtime().inspect(&complete), Inspection::Matched(m) if m.funnel == FunnelDisposition::None)
+    );
+}

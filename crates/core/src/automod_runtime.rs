@@ -175,6 +175,10 @@ pub struct AutomodRuntime {
     config: AutomodConfig,
     scope: AutomodScope,
     repeats: RepeatTracker,
+    /// Newest message-clock observation. The maintenance tick never expires
+    /// repeat history against a wall clock ahead of it, so a resumed batch
+    /// of delayed creates keeps the history it still needs.
+    newest_observation_ms: Option<u64>,
 }
 
 impl AutomodRuntime {
@@ -184,6 +188,7 @@ impl AutomodRuntime {
             config,
             scope,
             repeats: RepeatTracker::default(),
+            newest_observation_ms: None,
         }
     }
 
@@ -195,6 +200,10 @@ impl AutomodRuntime {
     /// The shared maintenance tick can expire idle authors without receiving
     /// another message. This does not inspect content or create any effects.
     pub fn expire_repeat_history(&mut self, now_ms: u64) {
+        let now_ms = match self.newest_observation_ms {
+            Some(newest) if now_ms > newest => newest,
+            _ => now_ms,
+        };
         self.repeats
             .expire(now_ms, self.config.policy.repeated_message_window_seconds);
     }
@@ -232,10 +241,23 @@ impl AutomodRuntime {
         if delivery.kind == MessageDeliveryKind::Update {
             message.observed_timestamp_ms = delivery.observed_timestamp_ms;
         }
+        // Sweep on the same clock observations use: a delayed/resumed batch of
+        // creates must not erase the repeat history it still needs. The shared
+        // maintenance tick only expires idle authors between dispatches.
         self.repeats.expire(
-            delivery.observed_timestamp_ms,
+            message.observed_timestamp_ms,
             self.config.policy.repeated_message_window_seconds,
         );
+        // Delay-ordered dispatches carry their own clock: only advance the
+        // newest observation, never step it back for an older message.
+        if delivery.kind == MessageDeliveryKind::Create {
+            self.newest_observation_ms = Some(
+                self.newest_observation_ms
+                    .map_or(message.observed_timestamp_ms, |newest| {
+                        newest.max(message.observed_timestamp_ms)
+                    }),
+            );
+        }
         let Some(filter) = match_automod(&message, &self.config.policy, &mut self.repeats) else {
             return Inspection::Accepted(delivery.kind.funnel(false));
         };

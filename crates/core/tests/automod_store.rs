@@ -82,6 +82,12 @@ async fn durable_claims_ledger_concurrency_and_recovery() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0222_automod_counted_claim.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
     let store = AutomodStore::new(pool.clone());
     let at = "2026-09-30T00:00:00.000Z";
 
@@ -214,19 +220,58 @@ async fn durable_claims_ledger_concurrency_and_recovery() {
     ));
     assert!(!store.release_unmutated(&new).await.unwrap());
 
+    // A counted claim survives safe release: no REST effect or mutation fence
+    // ran, but the ledger already holds this delivery. The retry replays the
+    // retained claim instead of acquiring a fresh one that plans
+    // AlreadyProcessed with no effects.
+    let counted_key = key("counted", "revision", false);
+    let counted = acquire(&store, &counted_key).await;
+    let counted_record = store
+        .record_violation(&counted, &subject("counted"), AutomodFilter::BadWords, at)
+        .await
+        .unwrap();
+    assert!(counted_record.inserted);
+    assert!(
+        !store.release_unmutated(&counted).await.unwrap(),
+        "counted ledger row keeps its claim for reconciliation"
+    );
+    assert!(matches!(
+        store.claim(&counted_key).await.unwrap(),
+        ClaimResult::InFlight
+    ));
+    assert!(store.mark_mutation_started(&counted).await.unwrap());
+    let counted_receipt = StoredOutcome {
+        matched: true,
+        deleted: true,
+        outcome: CompletionKind::Deleted,
+    };
+    assert!(store.complete(&counted, &counted_receipt).await.unwrap());
+    assert!(matches!(
+        store.claim(&counted_key).await.unwrap(),
+        ClaimResult::Replayed(r) if r == counted_receipt
+    ));
+    // Counting twice on the same retained claim is refused: the ledger commit
+    // and the counted fence are one transaction.
+    assert!(store
+        .record_violation(&counted, &subject("counted"), AutomodFilter::BadWords, at)
+        .await
+        .is_err());
+
     // IDs/reason codes only: neither legacy table has message content columns.
+    // Four processed messages: one/two/three plus the counted-reconciliation
+    // message above, all from the same author.
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM automod_processed_messages")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(count, 4);
     let (count,): (i32,) = sqlx::query_as(
         "SELECT violation_count FROM automod_violations WHERE user_id = '444444444444444444'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(count, 4);
     let (text_columns,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema()
          AND column_name IN ('content', 'message_content', 'matched_excerpt')",

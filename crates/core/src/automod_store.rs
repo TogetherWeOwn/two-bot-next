@@ -144,13 +144,17 @@ impl AutomodStore {
         Ok(affected == 1)
     }
 
-    /// Resolver/DB failures before mutation can be retried. After marking any
-    /// mutation started, retain the claim even if a later followup was rejected.
+    /// Resolver/DB failures before mutation can be retried — but only before
+    /// counting. Once the violation ledger holds this delivery, the claim is
+    /// reconciliation evidence: keep it even if no Discord mutation started,
+    /// so a retry never degrades to a silent AlreadyProcessed. After marking
+    /// any mutation started, retain the claim even if a later followup was
+    /// rejected.
     pub async fn release_unmutated(&self, claim: &DeliveryClaim) -> Result<bool, sqlx::Error> {
         let affected = sqlx::query(
             "DELETE FROM automod_delivery_claims
              WHERE claim_token = $1 AND guild_id = $2 AND message_id = $3
-               AND mutation_started = FALSE AND result_json IS NULL",
+               AND mutation_started = FALSE AND counted = FALSE AND result_json IS NULL",
         )
         .bind(&claim.token)
         .bind(&claim.key.guild_id)
@@ -180,8 +184,9 @@ impl AutomodStore {
             ));
         }
         let mut tx = self.pool.begin().await?;
-        let active: Option<(bool, bool)> = sqlx::query_as(
-            "SELECT mutation_started, result_json IS NOT NULL FROM automod_delivery_claims
+        let active: Option<(bool, bool, bool)> = sqlx::query_as(
+            "SELECT mutation_started, counted, result_json IS NOT NULL
+             FROM automod_delivery_claims
              WHERE claim_token = $1 AND guild_id = $2 AND message_id = $3 FOR UPDATE",
         )
         .bind(&claim.token)
@@ -189,7 +194,7 @@ impl AutomodStore {
         .bind(&subject.message_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if active != Some((false, false)) {
+        if active != Some((false, false, false)) {
             return Err(sqlx::Error::InvalidArgument(
                 "violation requires an active unmutated claim".into(),
             ));
@@ -229,6 +234,17 @@ impl AutomodStore {
         } else {
             existing_count(&mut tx, subject).await?
         };
+        // Counting and the counted fence commit together: no crash window lets
+        // a counted ledger row outlive an uncounted (releasable) claim.
+        sqlx::query(
+            "UPDATE automod_delivery_claims SET counted = TRUE
+             WHERE claim_token = $1 AND guild_id = $2 AND message_id = $3",
+        )
+        .bind(&claim.token)
+        .bind(&subject.guild_id)
+        .bind(&subject.message_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(ViolationRecord {
             count: count as u64,
