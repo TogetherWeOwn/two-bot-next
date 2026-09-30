@@ -72,10 +72,13 @@ impl Config {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn defaults_without_env() {
+        let _guard = ENV_LOCK.lock().expect("test environment lock");
         for key in ["DISCORD_TOKEN", "DATABASE_URL", "LISTEN_ADDR", "GUILD_ID"] {
-            // SAFETY: single-threaded test process; no concurrent readers.
+            // SAFETY: environment tests serialize mutations under ENV_LOCK.
             unsafe { env::remove_var(key) };
         }
         let cfg = Config::from_env().expect("defaults must parse");
@@ -87,7 +90,8 @@ mod tests {
 
     #[test]
     fn invalid_guild_id_rejected() {
-        // SAFETY: single-threaded test process; no concurrent readers.
+        let _guard = ENV_LOCK.lock().expect("test environment lock");
+        // SAFETY: environment tests serialize mutations under ENV_LOCK.
         unsafe { env::set_var("GUILD_ID", "not-a-snowflake") };
         let err = Config::from_env().expect_err("non-numeric guild must fail");
         assert!(matches!(
