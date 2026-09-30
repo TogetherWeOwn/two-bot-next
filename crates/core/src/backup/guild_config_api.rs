@@ -70,8 +70,8 @@ pub fn checked_base(
 /// Discord REST/CDN client for one guild. Counts writes for restore evidence.
 #[derive(Debug)]
 pub struct GuildConfigDiscordApi {
-    pub api_base: String,
-    pub cdn_base: String,
+    pub api_base: Secret<String>,
+    pub cdn_base: Secret<String>,
     pub token: Secret<String>,
     pub application_id: String,
     pub guild_id: String,
@@ -88,16 +88,16 @@ impl GuildConfigDiscordApi {
         guild_id: String,
     ) -> Result<Self, GuildConfigApiError> {
         Ok(Self {
-            api_base: checked_base(
+            api_base: Secret::new(checked_base(
                 api_base,
                 "GUILD_CONFIG_API_BASE",
                 "https://discord.com/api/v10",
-            )?,
-            cdn_base: checked_base(
+            )?),
+            cdn_base: Secret::new(checked_base(
                 cdn_base,
                 "GUILD_CONFIG_CDN_BASE",
                 "https://cdn.discordapp.com",
-            )?,
+            )?),
             token: Secret::new(token),
             application_id,
             guild_id,
@@ -121,7 +121,7 @@ impl GuildConfigDiscordApi {
         path: &str,
         body: Option<Value>,
     ) -> Result<(u16, Option<Value>), GuildConfigApiError> {
-        let url = format!("{}{}", self.api_base, path);
+        let url = format!("{}{}", self.api_base.expose(), path);
         let method = method
             .parse::<HttpMethod>()
             .map_err(|_| GuildConfigApiError::Discord(format!("bad method {method:?}")))?;
@@ -551,7 +551,7 @@ impl GuildConfigDiscordApi {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let extension = if animated { "gif" } else { "png" };
-        let url = format!("{}/emojis/{id}.{extension}", self.cdn_base);
+        let url = format!("{}/emojis/{id}.{extension}", self.cdn_base.expose());
         let res = http::get(&url, vec![], 30).await?;
         if res.status.as_u16() != 200 {
             return Err(GuildConfigApiError::Discord(format!(
@@ -656,9 +656,9 @@ impl GuildConfigDiscordApi {
     ) -> Result<Option<Value>, GuildConfigApiError> {
         let (status, response) = self.request_json(method, path, Some(body)).await?;
         if !(200..300).contains(&status) {
+            // Remote JSON can echo Authorization, even on a normal refusal.
             return Err(GuildConfigApiError::Discord(format!(
-                "Discord write {method} {path} failed: HTTP {status} {}",
-                response.map(|b| b.to_string()).unwrap_or_default()
+                "Discord write failed: HTTP {status}."
             )));
         }
         self.writes += 1;
@@ -745,8 +745,8 @@ mod tests {
         let api =
             GuildConfigDiscordApi::new(None, None, "t".to_owned(), "a".to_owned(), "g".to_owned())
                 .unwrap();
-        assert_eq!(api.api_base, "https://discord.com/api/v10");
-        assert_eq!(api.cdn_base, "https://cdn.discordapp.com");
+        assert_eq!(api.api_base.expose(), "https://discord.com/api/v10");
+        assert_eq!(api.cdn_base.expose(), "https://cdn.discordapp.com");
         GuildConfigDiscordApi::new(
             Some("http://127.0.0.1:9"),
             Some("http://localhost:9"),

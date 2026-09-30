@@ -86,6 +86,8 @@ impl ChannelModerationStore {
                 "only Postgres is supported".to_owned(),
             ));
         }
+        crate::database_url::validate(url)
+            .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
         let mut options = PgConnectOptions::from_str(url)
             .map_err(|_| sqlx::Error::InvalidArgument("invalid database URL".to_owned()))?;
         options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);

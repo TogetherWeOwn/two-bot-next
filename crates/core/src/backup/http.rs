@@ -102,23 +102,32 @@ impl HttpResponse {
 /// eat the host's RAM (PR #11 review).
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-fn check_url(url: &str) -> Result<(), HttpError> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    if let Some(rest) = url.strip_prefix("http://") {
-        let host = rest.split(['/', ':']).next().unwrap_or("");
-        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-            return Ok(());
-        }
-        return Err(HttpError::ClearText {
-            url: Secret::new(url.to_owned()),
-        });
-    }
-    Err(HttpError::InvalidUrl {
+fn check_url(url: &str) -> Result<http::Uri, HttpError> {
+    let invalid = || HttpError::InvalidUrl {
         url: Secret::new(url.to_owned()),
-        reason: Secret::new("must start with https:// or http://".to_owned()),
-    })
+        reason: Secret::new("invalid HTTP URL or embedded userinfo".to_owned()),
+    };
+    let uri: http::Uri = url.parse().map_err(|_| invalid())?;
+    let authority = uri.authority().ok_or_else(invalid)?;
+    // Hyper's DEBUG pool key includes the full authority. Reject userinfo
+    // before building the client, not after a dependency has logged it.
+    if authority.as_str().contains('@') {
+        return Err(invalid());
+    }
+    match uri.scheme_str() {
+        Some("https") => Ok(uri),
+        Some("http") => {
+            let host = uri.host().unwrap_or("").trim_matches(['[', ']']);
+            if matches!(host, "localhost" | "127.0.0.1" | "::1") {
+                Ok(uri)
+            } else {
+                Err(HttpError::ClearText {
+                    url: Secret::new(url.to_owned()),
+                })
+            }
+        }
+        _ => Err(invalid()),
+    }
 }
 
 /// One HTTP request. `headers` are `(name, value)` pairs; `body` is sent
@@ -130,7 +139,7 @@ pub async fn request(
     body: Option<Vec<u8>>,
     timeout_secs: u64,
 ) -> Result<HttpResponse, HttpError> {
-    check_url(url)?;
+    let uri = check_url(url)?;
 
     let https = HttpsConnectorBuilder::new()
         .with_webpki_roots()
@@ -139,7 +148,7 @@ pub async fn request(
         .build();
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
 
-    let mut builder = Request::builder().method(method).uri(url);
+    let mut builder = Request::builder().method(method).uri(uri);
     for (name, value) in &headers {
         builder = builder.header(name, value);
     }

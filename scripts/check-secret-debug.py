@@ -20,7 +20,7 @@ SENSITIVE = re.compile(
     r"(?:^|_)(?:token|secret|password|credential|credentials)(?:_|$)"
     r"|^(?:database_url|webhook_url|access_key_id|secret_access_key)$"
 )
-RAW = re.compile(r"\bString\b|\bu8\b")
+RAW = re.compile(r"\b(?:String|str|u8)\b")
 # Public one-way correlation hashes, NOT credentials. Exceptions are exact,
 # audited type.field pairs, never a wildcard path or generic token exemption.
 EXCEPTIONS = {
@@ -69,6 +69,11 @@ class GuardTests(unittest.TestCase):
             for kind in ["struct", "enum"]:
                 code = f"#[derive(Clone, Debug)]\npub {kind} Fixture {{ {field}, }}"
                 self.assertEqual(len(violations(code)), 1, code)
+
+    def test_borrowed_strings_fail(self):
+        for field in ["token: &'a str", "secret: &str", "password: Option<&'a str>", "webhook_url: Vec<&str>"]:
+            code = f"#[derive(Debug)] struct Credentials<'a> {{ {field}, }}"
+            self.assertEqual(len(violations(code)), 1, code)
 
     def test_multiline_derive_and_extra_attributes_fail(self):
         self.assertTrue(violations('#[derive(\n Debug,\n Clone\n)]\n#[serde(default)]\npub(crate) struct Fixture { pub discord_token: String, }'))

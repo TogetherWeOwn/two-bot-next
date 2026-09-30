@@ -615,12 +615,9 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
                 );
                 return 1;
             }
-            println!(
-                "backup-upload-s3: stored {}/{} etag={}",
-                target.bucket,
-                key,
-                res.header("etag").unwrap_or("(none)")
-            );
+            // Even successful response headers can echo signed credentials.
+            // The destination is ours; the remote ETag is not a safe log field.
+            println!("backup-upload-s3: stored {}/{}", target.bucket, key);
             0
         }
         Err(err) => {

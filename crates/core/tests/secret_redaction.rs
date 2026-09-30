@@ -1,5 +1,8 @@
 //! Synthetic credential regressions; no live service or environment access.
 use std::fmt::Debug;
+
+#[path = "support/tracing_capture.rs"]
+mod tracing_capture;
 use two_bot_core::{
     backup::{
         guild_config_api::{checked_base, GuildConfigDiscordApi},
@@ -216,4 +219,187 @@ async fn real_http_refusal_redacts_webhook_before_network_access() {
         .unwrap_err();
     assert_redacted(&error, &[url, "fixture-webhook-token"]);
     assert!(!error.to_string().contains("fixture-webhook-token"));
+}
+
+#[test]
+fn accepted_guild_config_overrides_redact_private_paths_and_queries() {
+    let base = "http://localhost:9000/private/fixture-base-secret?key=fixture-query-secret";
+    let api = GuildConfigDiscordApi::new(
+        Some(base),
+        Some(base),
+        "fixture-bot-token".to_owned(),
+        "1".to_owned(),
+        "2".to_owned(),
+    )
+    .unwrap();
+    let secrets = [
+        base,
+        "fixture-base-secret",
+        "fixture-query-secret",
+        "fixture-bot-token",
+    ];
+    assert_redacted(&api, &secrets);
+    assert_redacted(&api.api_base, &secrets);
+    assert_redacted(&api.cdn_base, &secrets);
+}
+
+#[tokio::test]
+async fn rejected_guild_write_does_not_echo_authorization_or_remote_json() {
+    use axum::{extract::Request, http::StatusCode, routing::post, Json, Router};
+    let app = Router::new().route(
+        "/write",
+        post(|request: Request| async move {
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "authorization": request.headers()["authorization"].to_str().unwrap(),
+                    "message": "fixture-remote-json-secret"
+                })),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut api = GuildConfigDiscordApi::new(
+        Some(&base),
+        None,
+        "fixture-write-bot-secret".to_owned(),
+        "1".to_owned(),
+        "2".to_owned(),
+    )
+    .unwrap();
+    let error = api
+        .write("POST", "/write", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    server.abort();
+    assert_eq!(api.writes, 0);
+    assert_redacted(
+        &error,
+        &["fixture-write-bot-secret", "fixture-remote-json-secret"],
+    );
+    let shown = error.to_string();
+    assert!(shown.contains("HTTP 403"));
+    assert!(!shown.contains("fixture-write-bot-secret"));
+    assert!(!shown.contains("fixture-remote-json-secret"));
+}
+
+#[test]
+fn http_rejects_userinfo_before_hyper_can_log_it() {
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://fixture-uri-user:fixture-uri-password@{}/webhook",
+                listener.local_addr().unwrap()
+            );
+            let error = two_bot_core::backup::http::get(&url, vec![], 1)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, HttpError::InvalidUrl { .. }));
+            assert_redacted(&error, &["fixture-uri-user", "fixture-uri-password"]);
+            // No request may reach the listener, not even one with userinfo stripped.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+            tracing::debug!("capture remains active");
+        });
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    assert!(!text.contains("fixture-uri-user"));
+    assert!(!text.contains("fixture-uri-password"));
+}
+
+#[test]
+fn successful_http_debug_logs_hide_webhook_path_query_and_authorization() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/api/webhooks/1/fixture-path-secret?key=fixture-query-secret",
+                listener.local_addr().unwrap()
+            );
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+                // Keep alive until the request future completes and returns to its pool.
+                let _ = socket.read(&mut buf).await;
+            });
+            let response = two_bot_core::backup::http::get(
+                &url,
+                vec![(
+                    "authorization".to_owned(),
+                    "fixture-header-secret".to_owned(),
+                )],
+                1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status, http::StatusCode::OK);
+            tokio::task::yield_now().await;
+            server.abort();
+            tracing::debug!("capture remains active");
+        });
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    for secret in [
+        "fixture-path-secret",
+        "fixture-query-secret",
+        "fixture-header-secret",
+    ] {
+        assert!(!text.contains(secret));
+    }
+}
+
+#[cfg(feature = "db")]
+#[test]
+fn channel_store_rejects_unknown_query_secrets_without_sqlx_warning() {
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let error = two_bot_core::ChannelModerationStore::connect(
+                "postgres://fixture-user:fixture-password@agent-testdb/db?api_key=fixture-query-secret&sslmode=invalid",
+                1,
+            )
+            .await
+            .unwrap_err();
+            assert_redacted(&error, &["fixture-user", "fixture-password", "fixture-query-secret"]);
+            assert!(!error.to_string().contains("fixture-query-secret"));
+            tracing::warn!("capture remains active");
+        });
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    assert!(!text.contains("fixture-query-secret"));
+    assert!(!text.contains("ignoring unrecognized connect parameter"));
 }

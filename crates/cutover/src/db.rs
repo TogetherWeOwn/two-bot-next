@@ -37,6 +37,8 @@ pub async fn connect(
                 .to_owned(),
         ));
     }
+    two_bot_core::database_url::validate(url)
+        .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
     let mut options = PgConnectOptions::from_str(url)
         .map_err(|_| sqlx::Error::InvalidArgument("invalid database URL".to_owned()))?;
     // Statement timeout rides the connection options (server-side setting

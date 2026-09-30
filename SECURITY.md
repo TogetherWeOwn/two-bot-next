@@ -31,8 +31,14 @@ No production webhook client currently exists; new webhook URLs must use
 
 Do not print raw sqlx connection errors, parser errors, task panics, or remote
 HTTP bodies. They can echo credentials. Database connection failures expose
-bounded constant messages; HTTP errors protect URLs/reasons/details and response
-Debug shows only status/lengths. Truncation alone is not redaction. Do not enable
+bounded constant messages. Unsupported database URL query keys are rejected
+before the pinned SQLx parser can WARN-log their values; re-audit the allowlist
+in `database_url.rs` on SQLx upgrades. HTTP errors protect URLs/reasons/details,
+response Debug shows only status/lengths, and rejected Discord writes expose
+only status/context, not remote JSON. Successful S3 uploads never log remote
+ETags. Transport URLs and Discord proxy overrides reject userinfo before Hyper
+can DEBUG-log an authority/pool key; proxy overrides accept origins only, not
+paths or queries. Truncation alone is not redaction. Do not enable
 dependency TRACE logging of request payloads or format wire bodies/headers,
 `PgConnectOptions`, or explicitly exposed values.
 

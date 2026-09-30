@@ -22,6 +22,7 @@ pub mod community_snapshots;
 pub mod community_store;
 pub mod config;
 pub mod containment;
+pub mod database_url;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
