@@ -319,14 +319,16 @@ async fn onboarding_runtime_failed_send_retry_and_concurrent_process_guards() {
         );
         assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 1);
         assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
-        let transactions: Vec<String> = sqlx::query_scalar(
-            "SELECT xmin::text FROM events WHERE member_id = '44'",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .unwrap();
+        let transactions: Vec<String> =
+            sqlx::query_scalar("SELECT xmin::text FROM events WHERE member_id = '44'")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
         assert_eq!(transactions.len(), 2);
-        assert_eq!(transactions[0], transactions[1], "anchor rows commit together");
+        assert_eq!(
+            transactions[0], transactions[1],
+            "anchor rows commit together"
+        );
         first.handle(welcome(44), NOW + 2).await.unwrap();
         assert_eq!(posts(&mock).len(), 2);
         second_pool.close().await;
@@ -445,7 +447,10 @@ async fn onboarding_runtime_failed_role_writes_record_nothing() {
         assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
         let requests = mock.requests();
         assert_eq!(
-            requests.iter().filter(|request| request.method == "PATCH").count(),
+            requests
+                .iter()
+                .filter(|request| request.method == "PATCH")
+                .count(),
             1,
             "role failure is handled once and is terminal after the error edit",
         );
@@ -640,12 +645,18 @@ async fn assert_picker_failure(db: &TestSchema, mock: &MockRest, reply_count: us
     let replies = replies(mock);
     assert_eq!(replies.len(), reply_count);
     let reply = replies.last().unwrap();
-    assert_eq!(reply.path, "/api/v10/webhooks/111/mock-callback/messages/@original");
+    assert_eq!(
+        reply.path,
+        "/api/v10/webhooks/111/mock-callback/messages/@original"
+    );
     assert!(reply.header("authorization").is_none());
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
     assert!(body["content"].as_str().unwrap().contains("couldn't"));
     assert!(!body["content"].as_str().unwrap().contains("Done."));
-    assert_eq!(body["allowed_mentions"], json!({"parse":[],"users":[],"roles":[],"replied_user":false}));
+    assert_eq!(
+        body["allowed_mentions"],
+        json!({"parse":[],"users":[],"roles":[],"replied_user":false})
+    );
     assert!(posts(mock).is_empty());
 }
 
@@ -654,8 +665,12 @@ async fn assert_picker_failure(db: &TestSchema, mock: &MockRest, reply_count: us
 async fn onboarding_runtime_anchor_route_insert_failure_rolls_back_prompt() {
     let db = TestSchema::new().await;
     let result = std::panic::AssertUnwindSafe(async {
-        sqlx::query("ALTER TABLE events ADD CONSTRAINT reject_route CHECK (event_type <> 'channel_routed')")
-            .execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "ALTER TABLE events ADD CONSTRAINT reject_route CHECK (event_type <> 'channel_routed')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
         let runtime = runtime(&db.pool, &mock, &vars("anchor", false));
         assert!(runtime.handle(welcome(44), NOW).await.is_err());
@@ -663,10 +678,14 @@ async fn onboarding_runtime_anchor_route_insert_failure_rolls_back_prompt() {
         assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 0);
         assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
         let guard = two_bot_core::onboarding_store::begin_prompt(&db.pool, "22", "44")
-            .await.unwrap().expect("route failure did not consume the marker or lock");
+            .await
+            .unwrap()
+            .expect("route failure did not consume the marker or lock");
         drop(guard);
         sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_route")
-            .execute(&db.pool).await.unwrap();
+            .execute(&db.pool)
+            .await
+            .unwrap();
         // Discord and Postgres are not one transaction: the unrecorded send is
         // eligible for retry, but a committed retry must suppress redelivery.
         runtime.handle(welcome(44), NOW + 1).await.unwrap();
@@ -674,9 +693,13 @@ async fn onboarding_runtime_anchor_route_insert_failure_rolls_back_prompt() {
         assert_eq!(posts(&mock).len(), 2);
         assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 1);
         assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
-    }).catch_unwind().await;
+    })
+    .catch_unwind()
+    .await;
     db.close().await;
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[tokio::test]
@@ -695,21 +718,32 @@ async fn onboarding_runtime_member_read_failures_finish_the_defer_without_succes
             }));
             let mock = discord(Arc::clone(&state)).await;
             runtime(&db.pool, &mock, &vars(mode, false))
-                .handle(component(custom_id, &[key]), NOW).await.unwrap();
+                .handle(component(custom_id, &[key]), NOW)
+                .await
+                .unwrap();
             assert_picker_failure(&db, &mock, 1).await;
             assert_eq!(state.lock().unwrap().member_reads, failed_read);
-            let role_calls = mock.requests().iter()
+            let role_calls = mock
+                .requests()
+                .iter()
                 .filter(|request| matches!(request.method.as_str(), "PUT" | "DELETE"))
                 .count();
             assert_eq!(role_calls, usize::from(failed_read == 2));
             if failed_read == 2 {
                 let body: Value = serde_json::from_slice(&replies(&mock)[0].body).unwrap();
-                assert!(body["content"].as_str().unwrap().contains("may already have changed"));
+                assert!(body["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("may already have changed"));
             }
         }
-    }).catch_unwind().await;
+    })
+    .catch_unwind()
+    .await;
     db.close().await;
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[tokio::test]
@@ -748,7 +782,9 @@ async fn onboarding_runtime_picker_insert_and_commit_failures_are_atomic_and_ter
         }
     }).catch_unwind().await;
     db.close().await;
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[tokio::test]
@@ -760,27 +796,47 @@ async fn onboarding_runtime_picker_begin_and_lock_failures_finish_the_defer() {
         let mock = discord(Arc::new(Mutex::new(DiscordState {
             close_pool_on_callback: Some(runtime_pool.clone()),
             ..Default::default()
-        }))).await;
+        })))
+        .await;
         runtime(&runtime_pool, &mock, &vars("legacy", false))
-            .handle(component(GAME_SELECT_ID, &["shooters"]), NOW).await.unwrap();
-        assert!(runtime_pool.is_closed(), "DB begin fails only after the callback");
+            .handle(component(GAME_SELECT_ID, &["shooters"]), NOW)
+            .await
+            .unwrap();
+        assert!(
+            runtime_pool.is_closed(),
+            "DB begin fails only after the callback"
+        );
         assert_picker_failure(&db, &mock, 1).await;
 
         let runtime_pool = TestSchema::pool_with_lock_timeout(&db.schema, "100ms").await;
         let mut held = db.pool.begin().await.unwrap();
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind("22:44:game_picker").execute(&mut *held).await.unwrap();
+            .bind("22:44:game_picker")
+            .execute(&mut *held)
+            .await
+            .unwrap();
         let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
         runtime(&runtime_pool, &mock, &vars("legacy", false))
-            .handle(component(GAME_SELECT_ID, &["shooters"]), NOW).await.unwrap();
+            .handle(component(GAME_SELECT_ID, &["shooters"]), NOW)
+            .await
+            .unwrap();
         assert_picker_failure(&db, &mock, 1).await;
-        assert!(!mock.requests().iter().any(|request| request.method == "GET"),
-            "lock failure precedes all member/role REST reads");
+        assert!(
+            !mock
+                .requests()
+                .iter()
+                .any(|request| request.method == "GET"),
+            "lock failure precedes all member/role REST reads"
+        );
         held.rollback().await.unwrap();
         runtime_pool.close().await;
-    }).catch_unwind().await;
+    })
+    .catch_unwind()
+    .await;
     db.close().await;
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[tokio::test]
@@ -797,17 +853,26 @@ async fn onboarding_runtime_reply_failures_roll_back_success_and_attempt_one_err
                     reject_next_reply: true,
                     reject_replies,
                     ..Default::default()
-                }))).await;
+                })))
+                .await;
                 let result = runtime(&db.pool, &mock, &vars(mode, false))
-                    .handle(component(custom_id, &[key]), NOW).await;
-                assert_eq!(result.is_err(), reject_replies,
-                    "only an undelivered error reply remains retryable");
+                    .handle(component(custom_id, &[key]), NOW)
+                    .await;
+                assert_eq!(
+                    result.is_err(),
+                    reject_replies,
+                    "only an undelivered error reply remains retryable"
+                );
                 assert_picker_failure(&db, &mock, 2).await;
             }
         }
-    }).catch_unwind().await;
+    })
+    .catch_unwind()
+    .await;
     db.close().await;
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[tokio::test]
@@ -820,16 +885,26 @@ async fn onboarding_runtime_uncertain_callback_edits_without_replaying_roles() {
                 reject_callback: true,
                 reject_replies,
                 ..Default::default()
-            }))).await;
+            })))
+            .await;
             let result = runtime(&db.pool, &mock, &vars("legacy", false))
-                .handle(component(GAME_SELECT_ID, &["shooters"]), NOW).await;
+                .handle(component(GAME_SELECT_ID, &["shooters"]), NOW)
+                .await;
             assert_eq!(result.is_err(), reject_replies);
             assert_picker_failure(&db, &mock, 1).await;
-            assert_eq!(mock.requests().len(), 2, "callback failure never replays role work");
+            assert_eq!(
+                mock.requests().len(),
+                2,
+                "callback failure never replays role work"
+            );
         }
-    }).catch_unwind().await;
+    })
+    .catch_unwind()
+    .await;
     db.close().await;
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[tokio::test]
@@ -841,16 +916,24 @@ async fn onboarding_runtime_deferred_error_reply_is_bounded() {
             reject_member_read: Some(1),
             reply_delay: Duration::from_secs(8),
             ..Default::default()
-        }))).await;
+        })))
+        .await;
         let runtime = runtime(&db.pool, &mock, &vars("session", false));
-        let result = tokio::time::timeout(Duration::from_secs(7),
-            runtime.handle(component(SESSION_SELECT_ID, &["find-players"]), NOW))
-            .await.expect("error reply must not hold the worker indefinitely");
+        let result = tokio::time::timeout(
+            Duration::from_secs(7),
+            runtime.handle(component(SESSION_SELECT_ID, &["find-players"]), NOW),
+        )
+        .await
+        .expect("error reply must not hold the worker indefinitely");
         assert!(result.is_err(), "undelivered failure reply is retryable");
         assert_picker_failure(&db, &mock, 1).await;
-    }).catch_unwind().await;
+    })
+    .catch_unwind()
+    .await;
     db.close().await;
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[tokio::test]

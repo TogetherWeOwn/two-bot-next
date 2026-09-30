@@ -180,8 +180,14 @@ pub async fn run_shard(
     sticky: Option<Arc<crate::sticky_runtime::StickyRuntime>>,
 ) -> Result<(), sqlx::Error> {
     let result = run_loop(
-        &mut shard, &pipeline, &state, &store, onboarding.as_ref(), sticky.as_ref(),
-    ).await;
+        &mut shard,
+        &pipeline,
+        &state,
+        &store,
+        onboarding.as_ref(),
+        sticky.as_ref(),
+    )
+    .await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -236,7 +242,10 @@ async fn run_loop(
                         // Keep an interruption receipt, not a guessed role replay.
                         checkpoint_io(state, deadline, store.finish_onboarding_job(saved.id, true))
                             .await?;
-                        warn!(job_id = saved.id, "onboarding interaction interrupted; member must reselect");
+                        warn!(
+                            job_id = saved.id,
+                            "onboarding interaction interrupted; member must reselect"
+                        );
                     }
                 } else {
                     queue_dirty = false;

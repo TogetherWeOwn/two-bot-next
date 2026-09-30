@@ -121,19 +121,21 @@ impl GatewaySessionStore {
                     "onboarding durable queue capacity exceeded; checkpoint unchanged".into(),
                 ));
             }
-            Some(sqlx::query_scalar::<_, i64>(
-                "INSERT INTO gateway_onboarding_jobs
+            Some(
+                sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO gateway_onboarding_jobs
                  (guild_id, shard_id, session_id, seq, occurred_at_ms, payload)
                  VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                )
+                .bind(&self.guild_id)
+                .bind(self.shard_id)
+                .bind(&session.session_id)
+                .bind(sequence)
+                .bind(job.occurred_at_ms)
+                .bind(job.payload)
+                .fetch_one(&mut *tx)
+                .await?,
             )
-            .bind(&self.guild_id)
-            .bind(self.shard_id)
-            .bind(&session.session_id)
-            .bind(sequence)
-            .bind(job.occurred_at_ms)
-            .bind(job.payload)
-            .fetch_one(&mut *tx)
-            .await?)
         } else {
             None
         };
@@ -206,7 +208,8 @@ impl GatewaySessionStore {
         .await?;
         if failed {
             return Err(sqlx::Error::InvalidArgument(
-                "onboarding delivery attempt limit reached; recovery requires corrected cause".into(),
+                "onboarding delivery attempt limit reached; recovery requires corrected cause"
+                    .into(),
             ));
         }
         Ok(())
@@ -233,7 +236,11 @@ impl GatewaySessionStore {
 
     /// Retain only a delivery receipt on terminal outcomes. In particular, a
     /// token-free interrupted-interaction receipt is not a successful reply.
-    pub async fn finish_onboarding_job(&self, id: i64, interrupted: bool) -> Result<(), sqlx::Error> {
+    pub async fn finish_onboarding_job(
+        &self,
+        id: i64,
+        interrupted: bool,
+    ) -> Result<(), sqlx::Error> {
         let result = sqlx::query(
             "UPDATE gateway_onboarding_jobs SET state = $4, payload = NULL
              WHERE id = $1 AND guild_id = $2 AND shard_id = $3 AND state = 'running'",
@@ -241,7 +248,11 @@ impl GatewaySessionStore {
         .bind(id)
         .bind(&self.guild_id)
         .bind(self.shard_id)
-        .bind(if interrupted { "interrupted" } else { "completed" })
+        .bind(if interrupted {
+            "interrupted"
+        } else {
+            "completed"
+        })
         .execute(&self.pool)
         .await?;
         if result.rows_affected() != 1 {

@@ -480,7 +480,11 @@ impl OnboardingRuntime {
         .await
         .unwrap_or(Err(RuntimeError::Discord));
         if let Err(error) = result {
-            tracing::warn!(?error, ?handler, "onboarding picker failed; attempting deferred error reply");
+            tracing::warn!(
+                ?error,
+                ?handler,
+                "onboarding picker failed; attempting deferred error reply"
+            );
             let content = if matches!(error, RuntimeError::Role) {
                 PICKER_ROLE_FAILURE_REPLY
             } else if handler == ComponentHandler::GamePicker {
@@ -536,7 +540,10 @@ impl OnboardingRuntime {
                 .await
                 .map_err(|_| RuntimeError::Store)?;
                 self.reply(interaction, &outcome.reply).await?;
-                transaction.commit().await.map_err(|_| RuntimeError::Store)?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|_| RuntimeError::Store)?;
             } else {
                 self.reply(interaction, &outcome.reply).await?;
             }

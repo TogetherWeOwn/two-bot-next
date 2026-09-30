@@ -219,7 +219,9 @@ async fn spawn_onboarding(db: &TestDb, mock: &MockRest, url: &str, mode: &str) -
     let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
     let shard = Shard::with_config(
         ShardId::ONE,
-        ConfigBuilder::from(config).proxy_url(url.to_owned()).build(),
+        ConfigBuilder::from(config)
+            .proxy_url(url.to_owned())
+            .build(),
     );
     // Both the runtime and cache are newly constructed, not reused at restart.
     let pipeline = Arc::new(build_pipeline(db.store.milestones().await.unwrap()));
@@ -267,7 +269,9 @@ fn component(seq: u64, id: &str, token: &str) -> Value {
 fn posts(mock: &MockRest) -> Vec<RestRequest> {
     mock.requests()
         .into_iter()
-        .filter(|request| request.method == "POST" && request.path.starts_with("/api/v10/channels/"))
+        .filter(|request| {
+            request.method == "POST" && request.path.starts_with("/api/v10/channels/")
+        })
         .collect()
 }
 
@@ -378,7 +382,12 @@ async fn welcome_restart(pending: bool) {
         let (seq, replay) = if pending {
             wait_receipt(&db, 2, "completed").await;
             assert!(mock.requests().is_empty(), "pending joins do not prompt");
-            assert!(runner.pipeline.cache().member(Id::new(2222), Id::new(77)).unwrap().pending());
+            assert!(runner
+                .pipeline
+                .cache()
+                .member(Id::new(2222), Id::new(77))
+                .unwrap()
+                .pending());
             let update = gate_clear(3, &joined_at);
             first.send(update.clone()).await;
             (3, update)
@@ -393,16 +402,30 @@ async fn welcome_restart(pending: bool) {
         assert_eq!(saved.1, 1);
         let payload = saved.2.as_deref().unwrap();
         match OnboardingJob::recover(payload).unwrap().unwrap() {
-            OnboardingJob::Welcome { guild_id, member_id, pending: captured_pending, trigger, roles, .. } => {
+            OnboardingJob::Welcome {
+                guild_id,
+                member_id,
+                pending: captured_pending,
+                trigger,
+                roles,
+                ..
+            } => {
                 assert_eq!((guild_id, member_id, captured_pending), (2222, 77, false));
                 assert_eq!(roles, vec![GAME_PICKS[0].role_id.to_owned()]);
-                assert!(matches!((pending, trigger),
-                    (true, MembershipTrigger::GateCleared) |
-                    (false, MembershipTrigger::Joined { pending: false })));
+                assert!(matches!(
+                    (pending, trigger),
+                    (true, MembershipTrigger::GateCleared)
+                        | (false, MembershipTrigger::Joined { pending: false })
+                ));
             }
             _ => panic!("expected captured welcome"),
         }
-        assert!(!runner.pipeline.cache().member(Id::new(2222), Id::new(77)).unwrap().pending());
+        assert!(!runner
+            .pipeline
+            .cache()
+            .member(Id::new(2222), Id::new(77))
+            .unwrap()
+            .pending());
         assert_eq!(event_count(&db, "member_join").await, 1);
         assert_eq!(event_count(&db, "gate_cleared").await, 1);
         runner.stop().await;
@@ -412,7 +435,14 @@ async fn welcome_restart(pending: bool) {
         let mut second = gateway(true).await;
         repoint_resume(&db, &second.mock).await;
         let runner = spawn_onboarding(&db, &mock, &second.mock.url, "legacy").await;
-        assert!(runner.pipeline.cache().member(Id::new(2222), Id::new(77)).is_none(), "cold cache has no transition evidence");
+        assert!(
+            runner
+                .pipeline
+                .cache()
+                .member(Id::new(2222), Id::new(77))
+                .is_none(),
+            "cold cache has no transition evidence"
+        );
         let auth = second.mock.authentication().await;
         assert_eq!(auth["op"], 6);
         assert_eq!(auth["d"]["session_id"], SESSION);
@@ -422,29 +452,56 @@ async fn welcome_restart(pending: bool) {
         wait_sequence(&db.store, seq + 1).await;
         let delivered = wait_receipt(&db, seq as i64, "completed").await;
         assert_eq!(delivered.1, 2, "running work was recovered once");
-        assert!(delivered.2.is_none(), "terminal rows retain no member payload");
-        assert_eq!(delivered.3, saved.3, "original occurrence time survives restart");
+        assert!(
+            delivered.2.is_none(),
+            "terminal rows retain no member payload"
+        );
+        assert_eq!(
+            delivered.3, saved.3,
+            "original occurrence time survives restart"
+        );
         let messages = posts(&mock);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].path, "/api/v10/channels/12/messages");
         let body: Value = serde_json::from_slice(&messages[0].body).unwrap();
         let menu = &body["components"][0]["components"][0];
         assert_eq!(menu["custom_id"], GAME_SELECT_ID);
-        assert_eq!(menu["options"][0]["default"], true, "captured roles survive a cold cache");
-        assert_eq!(body["allowed_mentions"], json!({"parse":[],"users":["77"],"roles":[],"replied_user":false}));
+        assert_eq!(
+            menu["options"][0]["default"], true,
+            "captured roles survive a cold cache"
+        );
+        assert_eq!(
+            body["allowed_mentions"],
+            json!({"parse":[],"users":["77"],"roles":[],"replied_user":false})
+        );
         assert_eq!(event_count(&db, EVENT_ONBOARDING_PROMPTED).await, 1);
         assert_eq!(event_count(&db, "member_join").await, 1);
         assert_eq!(event_count(&db, "gate_cleared").await, 1);
-        assert_eq!(count_jobs(&db).await, if pending { 2 } else { 1 }, "same-sequence replay creates no new job");
-        assert!(runner.pipeline.cache().member(Id::new(2222), Id::new(77)).is_none(), "fenced dispatch never repopulates the cold cache");
+        assert_eq!(
+            count_jobs(&db).await,
+            if pending { 2 } else { 1 },
+            "same-sequence replay creates no new job"
+        );
+        assert!(
+            runner
+                .pipeline
+                .cache()
+                .member(Id::new(2222), Id::new(77))
+                .is_none(),
+            "fenced dispatch never repopulates the cold cache"
+        );
         let prompted_at: i64 = sqlx::query_scalar(
             "SELECT floor(extract(epoch FROM occurred_at) * 1000)::bigint FROM events
              WHERE event_type = 'onboarding_prompted'",
-        ).fetch_one(&db.pool).await.unwrap();
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
         assert_eq!(prompted_at, saved.3);
         assert!(!runner.task.is_finished());
         runner.stop().await;
-    }).await;
+    })
+    .await;
     cleanup(db, Some(mock), result).await;
 }
 
@@ -484,13 +541,31 @@ async fn onboarding_gateway_session_goodbye_restart_keeps_captured_joined_at() {
         wait_request(&mock, "GET", "/api/v10/guilds/2222").await;
         let captured = receipt(&db, 3).await;
         assert_eq!((captured.0.as_str(), captured.1), ("running", 1));
-        match OnboardingJob::recover(captured.2.as_deref().unwrap()).unwrap().unwrap() {
-            OnboardingJob::Goodbye { guild_id, username: name, bot, joined_at_ms } => {
-                assert_eq!((guild_id, name.as_str(), bot, joined_at_ms), (2222, username, false, Some(joined_ms)));
+        match OnboardingJob::recover(captured.2.as_deref().unwrap())
+            .unwrap()
+            .unwrap()
+        {
+            OnboardingJob::Goodbye {
+                guild_id,
+                username: name,
+                bot,
+                joined_at_ms,
+            } => {
+                assert_eq!(
+                    (guild_id, name.as_str(), bot, joined_at_ms),
+                    (2222, username, false, Some(joined_ms))
+                );
             }
             _ => panic!("expected captured goodbye"),
         }
-        assert!(runner.pipeline.cache().member(Id::new(2222), Id::new(77)).is_none(), "pipeline already removed the member");
+        assert!(
+            runner
+                .pipeline
+                .cache()
+                .member(Id::new(2222), Id::new(77))
+                .is_none(),
+            "pipeline already removed the member"
+        );
         assert!(posts(&mock).is_empty());
         assert_eq!(event_count(&db, "member_leave").await, 1);
         runner.stop().await;
@@ -500,7 +575,11 @@ async fn onboarding_gateway_session_goodbye_restart_keeps_captured_joined_at() {
         let mut second = gateway(true).await;
         repoint_resume(&db, &second.mock).await;
         let runner = spawn_onboarding(&db, &mock, &second.mock.url, "session").await;
-        assert!(runner.pipeline.cache().member(Id::new(2222), Id::new(77)).is_none());
+        assert!(runner
+            .pipeline
+            .cache()
+            .member(Id::new(2222), Id::new(77))
+            .is_none());
         let auth = second.mock.authentication().await;
         assert_eq!(auth["op"], 6);
         assert_eq!(auth["d"]["seq"], 3);
@@ -518,15 +597,22 @@ async fn onboarding_gateway_session_goodbye_restart_keeps_captured_joined_at() {
         let days = days_in_guild(Some(joined_ms), Some(captured.3));
         assert_eq!(days, Some(2));
         assert_eq!(body["content"], goodbye_text(username, days));
-        assert_eq!(body["allowed_mentions"], json!({"parse":[],"users":[],"roles":[],"replied_user":false}));
+        assert_eq!(
+            body["allowed_mentions"],
+            json!({"parse":[],"users":[],"roles":[],"replied_user":false})
+        );
         assert_eq!(event_count(&db, "member_join").await, 1);
         assert_eq!(event_count(&db, "member_leave").await, 1);
         assert_eq!(count_jobs(&db).await, 2);
         assert_eq!(event_count(&db, EVENT_GAME_ROLES_SELECTED).await, 0);
-        assert!(!mock.requests().iter().any(|request| matches!(request.method.as_str(), "PUT" | "DELETE")));
+        assert!(!mock
+            .requests()
+            .iter()
+            .any(|request| matches!(request.method.as_str(), "PUT" | "DELETE")));
         assert!(!runner.task.is_finished());
         runner.stop().await;
-    }).await;
+    })
+    .await;
     cleanup(db, Some(mock), result).await;
 }
 
@@ -543,14 +629,25 @@ async fn onboarding_gateway_interrupted_callback_is_token_free_and_requires_rese
         let old_click = component(2, "3333", "interrupted-mock-token");
         first.send(old_click.clone()).await;
         wait_sequence(&db.store, 2).await;
-        let callback = wait_request(&mock, "POST", "/api/v10/interactions/3333/interrupted-mock-token/callback").await;
+        let callback = wait_request(
+            &mock,
+            "POST",
+            "/api/v10/interactions/3333/interrupted-mock-token/callback",
+        )
+        .await;
         let defer: Value = serde_json::from_slice(&callback.body).unwrap();
         assert_eq!(defer["type"], 5);
-        assert_eq!(defer["data"]["flags"], 64, "the live in-memory callback was attempted");
+        assert_eq!(
+            defer["data"]["flags"], 64,
+            "the live in-memory callback was attempted"
+        );
         let saved = receipt(&db, 2).await;
         assert_eq!((saved.0.as_str(), saved.1), ("running", 1));
         let payload = saved.2.as_deref().unwrap();
-        assert_eq!(serde_json::from_str::<Value>(payload).unwrap(), json!({"interrupted_interaction":"3333"}));
+        assert_eq!(
+            serde_json::from_str::<Value>(payload).unwrap(),
+            json!({"interrupted_interaction":"3333"})
+        );
         assert!(!payload.contains("interrupted-mock-token"));
         assert!(!payload.contains(TOKEN));
         assert!(OnboardingJob::recover(payload).unwrap().is_none());
@@ -572,7 +669,11 @@ async fn onboarding_gateway_interrupted_callback_is_token_free_and_requires_rese
         let interrupted = wait_receipt(&db, 2, "interrupted").await;
         assert_eq!(interrupted.1, 2);
         assert!(interrupted.2.is_none());
-        assert_eq!(mock.requests().len(), 1, "restart never uses the old token, edits, or mutates roles");
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "restart never uses the old token, edits, or mutates roles"
+        );
         assert_eq!(event_count(&db, EVENT_CHANNEL_ROUTED).await, 0);
         assert_eq!(count_jobs(&db).await, 1, "replayed click is fenced");
 
@@ -581,22 +682,43 @@ async fn onboarding_gateway_interrupted_callback_is_token_free_and_requires_rese
         let completed = wait_receipt(&db, 4, "completed").await;
         assert_eq!(completed.1, 1);
         assert!(completed.2.is_none());
-        wait_request(&mock, "POST", "/api/v10/interactions/3334/fresh-mock-token/callback").await;
-        let reply = wait_request(&mock, "PATCH", "/api/v10/webhooks/1111/fresh-mock-token/messages/@original").await;
+        wait_request(
+            &mock,
+            "POST",
+            "/api/v10/interactions/3334/fresh-mock-token/callback",
+        )
+        .await;
+        let reply = wait_request(
+            &mock,
+            "PATCH",
+            "/api/v10/webhooks/1111/fresh-mock-token/messages/@original",
+        )
+        .await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert!(body["content"].as_str().unwrap().contains("10"));
         assert!(reply.header("authorization").is_none());
-        assert_eq!(event_count(&db, EVENT_CHANNEL_ROUTED).await, 1, "only a fresh member submission succeeds");
+        assert_eq!(
+            event_count(&db, EVENT_CHANNEL_ROUTED).await,
+            1,
+            "only a fresh member submission succeeds"
+        );
         assert_eq!(event_count(&db, EVENT_GAME_ROLES_SELECTED).await, 0);
-        let source: String = sqlx::query_scalar("SELECT source FROM events WHERE event_type = 'channel_routed'")
-            .fetch_one(&db.pool).await.unwrap();
+        let source: String =
+            sqlx::query_scalar("SELECT source FROM events WHERE event_type = 'channel_routed'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
         assert_eq!(source, "session-picker");
         assert_eq!(count_jobs(&db).await, 2);
         assert!(posts(&mock).is_empty());
-        assert!(!mock.requests().iter().any(|request| matches!(request.method.as_str(), "PUT" | "DELETE")));
+        assert!(!mock
+            .requests()
+            .iter()
+            .any(|request| matches!(request.method.as_str(), "PUT" | "DELETE")));
         assert!(!runner.task.is_finished());
         runner.stop().await;
-    }).await;
+    })
+    .await;
     cleanup(db, Some(mock), result).await;
 }
 
@@ -609,7 +731,9 @@ fn durable_welcome() -> GatewayJob {
             pending: false,
             trigger: MembershipTrigger::GateCleared,
             roles: vec![GAME_PICKS[0].role_id.to_owned()],
-        }.durable_payload().unwrap(),
+        }
+        .durable_payload()
+        .unwrap(),
         occurred_at_ms: RECEIPT_AT,
     }
 }
@@ -619,71 +743,139 @@ fn durable_welcome() -> GatewayJob {
 async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_32() {
     let db = TestDb::new().await;
     let result = bounded(async {
-        db.store.commit_dispatch(&checkpoint(SESSION, 1, "ws://mock"), FunnelBatch::default()).await.unwrap();
+        db.store
+            .commit_dispatch(&checkpoint(SESSION, 1, "ws://mock"), FunnelBatch::default())
+            .await
+            .unwrap();
         let mut bad = event(EventType::FirstMessage, "2026-09-29T12:00:00.000Z");
         bad.occurred_at = "not-a-timestamp".into();
-        assert!(db.store.commit_dispatch_with_job(
-            &checkpoint(SESSION, 2, "ws://mock"),
-            FunnelBatch { events: vec![bad], ..Default::default() },
-            Some(durable_welcome()),
-        ).await.is_err());
+        assert!(db
+            .store
+            .commit_dispatch_with_job(
+                &checkpoint(SESSION, 2, "ws://mock"),
+                FunnelBatch {
+                    events: vec![bad],
+                    ..Default::default()
+                },
+                Some(durable_welcome()),
+            )
+            .await
+            .is_err());
         assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
         assert_eq!(db.count().await, 0);
-        assert_eq!(count_jobs(&db).await, 0, "job insertion rolls back with the funnel/checkpoint");
+        assert_eq!(
+            count_jobs(&db).await,
+            0,
+            "job insertion rolls back with the funnel/checkpoint"
+        );
 
-        let (action, id) = db.store.commit_dispatch_with_job(
-            &checkpoint(SESSION, 2, "ws://mock"),
-            FunnelBatch { events: vec![event(EventType::FirstMessage, "2026-09-29T12:00:00.000Z")], ..Default::default() },
-            Some(durable_welcome()),
-        ).await.unwrap();
+        let (action, id) = db
+            .store
+            .commit_dispatch_with_job(
+                &checkpoint(SESSION, 2, "ws://mock"),
+                FunnelBatch {
+                    events: vec![event(EventType::FirstMessage, "2026-09-29T12:00:00.000Z")],
+                    ..Default::default()
+                },
+                Some(durable_welcome()),
+            )
+            .await
+            .unwrap();
         assert_eq!(action, DispatchAction::Apply);
         let id = id.unwrap();
         let saved = receipt(&db, 2).await;
-        assert_eq!((saved.0.as_str(), saved.1, saved.3), ("pending", 0, RECEIPT_AT));
+        assert_eq!(
+            (saved.0.as_str(), saved.1, saved.3),
+            ("pending", 0, RECEIPT_AT)
+        );
         assert_eq!(saved.2.as_deref(), Some(durable_welcome().payload.as_str()));
         let transactions: Vec<String> = sqlx::query_scalar(
             "SELECT xmin::text FROM gateway_sessions UNION ALL
              SELECT xmin::text FROM gateway_onboarding_jobs UNION ALL
              SELECT xmin::text FROM events",
-        ).fetch_all(&db.pool).await.unwrap();
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
         assert_eq!(transactions.len(), 3);
-        assert!(transactions.iter().all(|value| value == &transactions[0]), "checkpoint, facts and job commit together");
+        assert!(
+            transactions.iter().all(|value| value == &transactions[0]),
+            "checkpoint, facts and job commit together"
+        );
         for seq in [2, 1] {
-            let result = db.store.commit_dispatch_with_job(
-                &checkpoint(SESSION, seq, "ws://mock"), FunnelBatch::default(), Some(durable_welcome()),
-            ).await.unwrap();
+            let result = db
+                .store
+                .commit_dispatch_with_job(
+                    &checkpoint(SESSION, seq, "ws://mock"),
+                    FunnelBatch::default(),
+                    Some(durable_welcome()),
+                )
+                .await
+                .unwrap();
             assert_eq!(result, (DispatchAction::Duplicate, None));
         }
         assert_eq!(db.count().await, 1);
         assert_eq!(count_jobs(&db).await, 1);
         for seq in 3..=33 {
-            assert_eq!(db.store.commit_dispatch_with_job(
-                &checkpoint(SESSION, seq, "ws://mock"), FunnelBatch::default(), Some(durable_welcome()),
-            ).await.unwrap().0, DispatchAction::Apply);
+            assert_eq!(
+                db.store
+                    .commit_dispatch_with_job(
+                        &checkpoint(SESSION, seq, "ws://mock"),
+                        FunnelBatch::default(),
+                        Some(durable_welcome()),
+                    )
+                    .await
+                    .unwrap()
+                    .0,
+                DispatchAction::Apply
+            );
         }
         let claimed = db.store.claim_onboarding_job().await.unwrap().unwrap();
         assert_eq!(claimed.id, id);
         assert_eq!(claimed.payload, durable_welcome().payload);
         assert_eq!(claimed.occurred_at_ms, RECEIPT_AT);
         assert_eq!(count_jobs(&db).await, 32);
-        assert!(db.store.commit_dispatch_with_job(
-            &checkpoint(SESSION, 34, "ws://mock"),
-            FunnelBatch { events: vec![event(EventType::SecondMessage, "2026-09-29T12:00:01.000Z")], ..Default::default() },
-            Some(durable_welcome()),
-        ).await.is_err(), "running jobs also occupy the 32-slot bound");
+        assert!(
+            db.store
+                .commit_dispatch_with_job(
+                    &checkpoint(SESSION, 34, "ws://mock"),
+                    FunnelBatch {
+                        events: vec![event(EventType::SecondMessage, "2026-09-29T12:00:01.000Z")],
+                        ..Default::default()
+                    },
+                    Some(durable_welcome()),
+                )
+                .await
+                .is_err(),
+            "running jobs also occupy the 32-slot bound"
+        );
         assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 33);
         assert_eq!(db.count().await, 1);
         assert_eq!(count_jobs(&db).await, 32);
         db.store.finish_onboarding_job(id, false).await.unwrap();
         assert!(receipt(&db, 2).await.2.is_none());
-        assert!(db.store.finish_onboarding_job(id, false).await.is_err(), "a receipt can finish only a running job");
-        let result = db.store.commit_dispatch_with_job(
-            &checkpoint(SESSION, 34, "ws://mock"), FunnelBatch::default(), Some(durable_welcome()),
-        ).await.unwrap();
-        assert_eq!(result.0, DispatchAction::Apply, "terminal receipts release capacity");
+        assert!(
+            db.store.finish_onboarding_job(id, false).await.is_err(),
+            "a receipt can finish only a running job"
+        );
+        let result = db
+            .store
+            .commit_dispatch_with_job(
+                &checkpoint(SESSION, 34, "ws://mock"),
+                FunnelBatch::default(),
+                Some(durable_welcome()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.0,
+            DispatchAction::Apply,
+            "terminal receipts release capacity"
+        );
         assert!(result.1.is_some());
         assert_eq!(count_jobs(&db).await, 33);
-    }).await;
+    })
+    .await;
     cleanup(db, None, result).await;
 }
 
@@ -692,12 +884,21 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
 async fn onboarding_gateway_outbox_recovery_stops_after_three_claims() {
     let db = TestDb::new().await;
     let result = bounded(async {
-        let (_, id) = db.store.commit_dispatch_with_job(
-            &checkpoint(SESSION, 1, "ws://mock"), FunnelBatch::default(), Some(durable_welcome()),
-        ).await.unwrap();
+        let (_, id) = db
+            .store
+            .commit_dispatch_with_job(
+                &checkpoint(SESSION, 1, "ws://mock"),
+                FunnelBatch::default(),
+                Some(durable_welcome()),
+            )
+            .await
+            .unwrap();
         let id = id.unwrap();
         db.store.recover_onboarding_jobs().await.unwrap();
-        assert_eq!((receipt(&db, 1).await.0, receipt(&db, 1).await.1), ("pending".into(), 0));
+        assert_eq!(
+            (receipt(&db, 1).await.0, receipt(&db, 1).await.1),
+            ("pending".into(), 0)
+        );
         for attempt in 1..=3 {
             let job = db.store.claim_onboarding_job().await.unwrap().unwrap();
             assert_eq!(job.id, id);
@@ -706,24 +907,37 @@ async fn onboarding_gateway_outbox_recovery_stops_after_three_claims() {
             let row = receipt(&db, 1).await;
             assert_eq!((row.0.as_str(), row.1), ("running", attempt));
             assert!(row.2.is_some());
-            assert!(db.store.claim_onboarding_job().await.unwrap().is_none(), "running jobs cannot be claimed twice");
+            assert!(
+                db.store.claim_onboarding_job().await.unwrap().is_none(),
+                "running jobs cannot be claimed twice"
+            );
             let recovered = db.store.recover_onboarding_jobs().await;
             let row = receipt(&db, 1).await;
             if attempt < 3 {
                 recovered.unwrap();
                 assert_eq!((row.0.as_str(), row.1), ("pending", attempt));
             } else {
-                assert!(recovered.is_err(), "attempt-limit failure stops boot instead of silently losing work");
+                assert!(
+                    recovered.is_err(),
+                    "attempt-limit failure stops boot instead of silently losing work"
+                );
                 assert_eq!((row.0.as_str(), row.1), ("failed", 3));
-                assert!(row.2.is_some(), "failed work retains diagnostic/recovery data");
+                assert!(
+                    row.2.is_some(),
+                    "failed work retains diagnostic/recovery data"
+                );
             }
         }
         assert!(db.store.claim_onboarding_job().await.unwrap().is_none());
-        assert!(db.store.recover_onboarding_jobs().await.is_err(), "failure remains visible on later boots");
+        assert!(
+            db.store.recover_onboarding_jobs().await.is_err(),
+            "failure remains visible on later boots"
+        );
         assert!(db.store.finish_onboarding_job(id, false).await.is_err());
         assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
         assert_eq!(db.count().await, 0);
         assert_eq!(count_jobs(&db).await, 1);
-    }).await;
+    })
+    .await;
     cleanup(db, None, result).await;
 }
