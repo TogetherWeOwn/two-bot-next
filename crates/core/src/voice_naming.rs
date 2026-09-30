@@ -148,7 +148,8 @@ pub enum NumberStyle {
     Hash,
     /// `$#`, `$0#`, `$00#`, … → bare or zero-padded to `width` digits.
     Bare { width: usize },
-    /// `+#` → Roman numeral.
+    /// `+#` → Roman numeral; above 3999, parentheses multiply by 1000
+    /// (`4000` → `(IV)`). Nested parentheses keep all u32 values compact.
     Roman,
 }
 
@@ -175,8 +176,10 @@ pub enum Choice {
 /// A V6 conditional or styling node, carried opaquely through V5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Extension {
-    /// `{{...}}`: full source including the braces.
-    Conditional { source: String },
+    /// `{{...}}`: full source including the braces, plus a syntax-only body
+    /// for reserving random positions even when the conditional is skipped.
+    /// Condition and branch semantics remain the extension policy's job.
+    Conditional { source: String, body: Template },
     /// `""modes:body""`: full source plus the split modes and body.
     Styled {
         source: String,
@@ -275,6 +278,9 @@ pub struct RoomContext {
 pub trait ExtensionPolicy: Sized {
     /// Evaluate a `{{...}}` node; `source` is the full node text.
     /// Recursive evaluation uses the same session, without finalizing names.
+    /// All syntax in the conditional reserves random positions, including
+    /// inactive branches. Use `evaluation.evaluate_selected_branch` for a
+    /// branch's own stable offset within the conditional.
     fn conditional(&self, source: &str, evaluation: &mut Evaluation<'_, Self>) -> String;
     /// Evaluate a `""modes:body""` node. Call `evaluation.evaluate(body)` once
     /// before styling: it substitutes tokens but does not trim, truncate or
@@ -316,6 +322,13 @@ impl<'a, E: ExtensionPolicy> Evaluation<'a, E> {
     /// bodies and extension callbacks share stable random-choice positions.
     pub fn evaluate(&mut self, template: &Template) -> String {
         render_segments(&template.0, self)
+    }
+
+    /// Evaluate one branch in source order, reserving random slots in all
+    /// other branches. Conditional policies can use this for stable picks
+    /// inside either the yes or no body as the condition changes.
+    pub fn evaluate_selected_branch(&mut self, branches: &[Template], selected: usize) -> String {
+        render_selected_branch(branches.iter(), selected, self)
     }
 }
 
@@ -672,8 +685,16 @@ fn parse_conditional(cursor: &mut Cursor, outer_depth: usize) -> Option<Segment>
             cursor.pos += 1;
             depth -= 1;
             if depth == 0 {
+                let mut body_cursor = Cursor::new(&cursor.src[start + 2..cursor.pos - 2]);
+                let body = Template(parse_segments(
+                    &mut body_cursor,
+                    Stops::NONE,
+                    outer_depth + 1,
+                ));
+                cursor.depth_exceeded |= body_cursor.depth_exceeded;
                 return Some(Segment::Extension(Extension::Conditional {
                     source: cursor.src[start..cursor.pos].to_string(),
+                    body,
                 }));
             }
         }
@@ -754,8 +775,12 @@ fn display_template(segments: &[Segment]) -> String {
                 };
                 out.push_str("<<");
                 out.push_str(&display_template(&singular.0));
-                out.push(sep);
-                out.push_str(&display_template(&plural.0));
+                // Separator-free member plurals parse to the same empty
+                // plural body. Do not grow them past the source-size bound.
+                if *counter != PluralCounter::Members || !plural.0.is_empty() {
+                    out.push(sep);
+                    out.push_str(&display_template(&plural.0));
+                }
                 out.push_str(">>");
             }
             Segment::Choice(Choice::Options(options)) => {
@@ -770,7 +795,7 @@ fn display_template(segments: &[Segment]) -> String {
                 out.push_str("]]");
             }
             Segment::Resting { source, .. } => out.push_str(source),
-            Segment::Extension(Extension::Conditional { source })
+            Segment::Extension(Extension::Conditional { source, .. })
             | Segment::Extension(Extension::Styled { source, .. }) => out.push_str(source),
         }
     }
@@ -906,8 +931,10 @@ fn render_segments<E: ExtensionPolicy>(
                     out.push_str(&evaluation.evaluate(resting));
                 }
             }
-            Segment::Extension(Extension::Conditional { source }) => {
+            Segment::Extension(Extension::Conditional { source, body }) => {
+                let end = evaluation.dice_index + random_choice_count(body);
                 out.push_str(&ext.conditional(source, evaluation));
+                evaluation.dice_index = end;
             }
             Segment::Extension(Extension::Styled {
                 source,
@@ -940,7 +967,8 @@ fn random_choice_count(template: &Template) -> u64 {
             Segment::Resting {
                 resting, in_use, ..
             } => random_choice_count(resting) + in_use.as_ref().map_or(0, random_choice_count),
-            Segment::Extension(Extension::Styled { body, .. }) => random_choice_count(body),
+            Segment::Extension(Extension::Conditional { body, .. })
+            | Segment::Extension(Extension::Styled { body, .. }) => random_choice_count(body),
             _ => 0,
         })
         .sum()
@@ -1067,9 +1095,21 @@ fn civil_parts(timestamp: i64, offset_minutes: i32) -> (usize, usize, u32) {
 }
 
 /// `1` → `I`, `4` → `IV`, `2026` → `MMXXVI`; `0` renders as `N`.
+/// Above 3999, parentheses multiply their contents by 1000 (and may nest).
+/// Each recursion reduces the number by 1000; u32 needs at most four groups.
+/// This keeps conversion bounded without truncating before extension styling.
 fn roman(n: u32) -> String {
     if n == 0 {
         return "N".to_string();
+    }
+    if n >= 4000 {
+        let thousands = roman(n / 1000);
+        let remainder = n % 1000;
+        return if remainder == 0 {
+            format!("({thousands})")
+        } else {
+            format!("({thousands}){}", roman(remainder))
+        };
     }
     const TABLE: [(u32, &str); 13] = [
         (1000, "M"),
@@ -1430,6 +1470,163 @@ mod tests {
             "3 players"
         );
         assert_eq!(render_str(tokens, &c), "|5|ready|map|");
+    }
+
+    struct LiveExtensions;
+
+    impl ExtensionPolicy for LiveExtensions {
+        fn conditional(&self, source: &str, evaluation: &mut Evaluation<'_, Self>) -> String {
+            let body = source
+                .strip_prefix("{{LIVE ?? ")
+                .unwrap()
+                .strip_suffix("}}")
+                .unwrap();
+            let (yes, no) = body.rsplit_once(" // ").unwrap();
+            evaluation.evaluate(&parse(if evaluation.context().live_count > 0 {
+                yes
+            } else {
+                no
+            }))
+        }
+
+        fn styled(
+            &self,
+            _modes: &str,
+            body: &Template,
+            _source: &str,
+            evaluation: &mut Evaluation<'_, Self>,
+        ) -> String {
+            evaluation.evaluate(body)
+        }
+    }
+
+    #[test]
+    fn conditional_slots_are_reserved_in_active_and_skipped_bodies() {
+        for input in [
+            "<<{{LIVE ?? [[a/b]] // offline}}/many>> · [[x/y/z]]",
+            "__{{LIVE ?? [[a/b]] // offline}}/many__ · [[x/y/z]]",
+            "{{LIVE ?? [[a/b]] // offline}} · [[x/y/z]]",
+            "<<{{LIVE ?? {{LIVE ?? [[a/b]] // offline}} // offline}}/many>> · [[x/y/z]]",
+            "<<{{LIVE ?? \"\"identity:[[a/b]]\"\" // offline}}/many>> · [[x/y/z]]",
+        ] {
+            let template = parse(input);
+            for seed in 0..100 {
+                let mut c = ctx();
+                c.seed = seed;
+                let mut trailing = None;
+                for members in [0, 1, 2] {
+                    for live in [0, 1] {
+                        c.member_count = members;
+                        c.live_count = live;
+                        let name = render(&template, &c, &LiveExtensions);
+                        let pick = name.rsplit(" · ").next().unwrap().to_string();
+                        if let Some(expected) = &trailing {
+                            assert_eq!(&pick, expected, "seed {seed}, {input}");
+                        }
+                        trailing = Some(pick);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extension_branch_helper_preserves_selected_offsets_and_following_slots() {
+        let branches = [parse("[[a/b]] · [[c/d]]"), parse("[[x/y]]")];
+        for seed in 0..100 {
+            let c = RoomContext { seed, ..ctx() };
+            let mut all = Evaluation::new(&c, &PassthroughExtensions);
+            let expected = [all.evaluate(&branches[0]), all.evaluate(&branches[1])];
+            let next = all.evaluate(&parse("[[e/f/g]]"));
+            for (selected, expected) in expected.iter().enumerate() {
+                let mut evaluation = Evaluation::new(&c, &PassthroughExtensions);
+                assert_eq!(
+                    evaluation.evaluate_selected_branch(&branches, selected),
+                    *expected
+                );
+                assert_eq!(evaluation.evaluate(&parse("[[e/f/g]]")), next);
+            }
+        }
+        // The reservation body inherits outer depth, including mixed syntax.
+        let input = format!(
+            "{}{{{{LIVE ?? [[a/b]] // offline}}}}{}",
+            "<<".repeat(MAX_TEMPLATE_DEPTH - 1),
+            ">>".repeat(MAX_TEMPLATE_DEPTH - 1)
+        );
+        assert_eq!(parse(&input), Template(vec![Segment::Text(input)]));
+    }
+
+    #[test]
+    fn display_round_trips_without_growing_at_the_source_limit() {
+        for (prefix, suffix) in [
+            ("<<", ">>"),
+            ("<<<<", ">>>>"),
+            ("<<", "/>>"),
+            ("<<", "\\>>"),
+            ("<<", "|>>"),
+            ("[[<<", ">>/other]]"),
+            ("__<<", ">>/busy__"),
+            ("\"\"identity:<<", ">>\"\""),
+        ] {
+            for bytes in [MAX_TEMPLATE_BYTES - 1, MAX_TEMPLATE_BYTES] {
+                let input = format!(
+                    "{prefix}{}{suffix}",
+                    "x".repeat(bytes - prefix.len() - suffix.len())
+                );
+                let template = parse(&input);
+                let text = template.to_string();
+                assert!(text.len() <= input.len(), "{prefix}, {suffix}");
+                let reparsed = parse(&text);
+                assert_eq!(template, reparsed);
+                for members in [0, 1, 4] {
+                    let mut c = ctx();
+                    c.member_count = members;
+                    assert_eq!(
+                        render(&template, &c, &PassthroughExtensions),
+                        render(&reparsed, &c, &PassthroughExtensions)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn roman_expansion_is_compact_without_premature_finalization() {
+        for (n, expected) in [
+            (0, "N"),
+            (3999, "MMMCMXCIX"),
+            (4000, "(IV)"),
+            (4001, "(IV)I"),
+            (1_000_000, "(M)"),
+            (u32::MAX, "(((IV)CCXCIV)CMLXVII)CCXCV"),
+        ] {
+            let numeral = roman(n);
+            // On the old implementation this safely fails after one ~4 MiB
+            // conversion, before the full 2,048-token boundary case is run.
+            assert!(
+                numeral.len() <= 64,
+                "Roman numeral grew to {} bytes",
+                numeral.len()
+            );
+            assert_eq!(numeral, expected);
+        }
+        let c = RoomContext {
+            room_number: u32::MAX,
+            ..ctx()
+        };
+        let input = "+#".repeat(MAX_TEMPLATE_BYTES / 2);
+        let expected = roman(c.room_number).repeat(MAX_TEMPLATE_BYTES / 2);
+        let unfinalized = Evaluation::new(&c, &PassthroughExtensions).evaluate(&parse(&input));
+        assert_eq!(unfinalized, expected);
+        assert!(unfinalized.len() <= 64 * (MAX_TEMPLATE_BYTES / 2));
+        assert_eq!(
+            render_str(&input, &c),
+            truncate_chars(&expected, MAX_NAME_LEN)
+        );
+        assert_eq!(
+            render(&parse("\"\"owner:+#\"\""), &c, &TestExtensions),
+            format!("Ava:{}", roman(c.room_number))
+        );
     }
 
     #[test]
