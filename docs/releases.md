@@ -47,19 +47,24 @@ NODE_PATH="$RELEASE_TEST_DEPS/node_modules" node scripts/test-release.cjs
 ```
 
 Set `RELEASE_TEST_DEPS` to a disposable dependency directory (in agent runs,
-use a directory under `PAPERCLIP_RUN_SCRATCH_DIR`). The fixture covers tagged
-and untagged seeds, features in the root/four crates/Worker, breaking changes,
-fixes (including security-only commits), Common Changelog headings, the card
-footer, synchronized manifest and lock updates, and exactly one componentless
-release candidate. `security` entries appear under Fixed and advance the patch.
+use a directory under `PAPERCLIP_RUN_SCRATCH_DIR`). The immutable bootstrap
+changelog fixture is separate from the live `CHANGELOG.md`, which automation
+changes after release. The fixture covers tagged and untagged seeds, features
+in the root/four crates/Worker, breaking changes, fixes (including security-only
+commits), Common Changelog headings, the card footer, synchronized manifest and
+lock updates, and exactly one componentless release candidate. Each generated
+snapshot, including every manifest/dependency/lock update and the migrated
+changelog, then feeds a second native release to verify the post-release state.
+`security` entries appear under Fixed and advance the patch.
 Before dispatching checks, `scripts/migrate-release-notes.cjs` consumes the
 native updater's first-release bootstrap tail: it merges the existing RSVP
 Added/Fixed notes into the generated version section and the release PR body,
 removing the duplicate title and Unreleased section. The PR body matters because
-release-please uses it, not the changelog file, for GitHub Release notes. Once
-that bootstrap tail is gone the migration is a no-op; unexpected layouts fail
-closed. The lifecycle fixture asserts each historical note in both outputs and
-the resulting release payload, with one title and no stranded Unreleased notes.
+release-please uses it, not the changelog file, for GitHub Release notes. The
+changelog and body are reconciled independently, so retries recover if only one
+side was updated. Once they agree the reconciliation is a no-op; unexpected
+layouts fail closed. The lifecycle fixture asserts each historical note in both
+outputs and the resulting release payload, with one title and no stranded notes.
 Cargo CI still validates compilation and the real release flow still validates
 GitHub writes.
 
@@ -69,6 +74,31 @@ rejection. `python3 scripts/test-docker-deps.py` recreates the manifest/stub
 layer from the actual Dockerfile and verifies all five package targets. Add
 `--cargo` to run that layer's `cargo fetch --locked` (as Rust CI does). These
 fixtures do not contact a database; full Docker builds remain a deployment gate.
+
+## Retry-safe PR reconciliation
+
+`scripts/release-pr-state.cjs` selects only an open, same-repository, main-base
+root release PR labeled `autorelease: pending`. A compare API merge-base check
+proves whether that branch already includes the main snapshot. If so, the
+pinned action's [`skip-github-pull-request` input](https://github.com/googleapis/release-please-action/blob/45996ed1f6d02564a971a2fa1b5860e934307cf7/action.yml)
+skips only PR regeneration, avoiding body-comparison resets of migrated notes.
+Release publication stays enabled. A new main snapshot enables native PR
+regeneration; a closed/merged PR also leaves publication and creation enabled.
+
+Selection after the action queries GitHub, rather than relying on `prs_created`:
+a native no-op or prior migration failure must still reconcile the existing PR
+and dispatch its checks. The workflow pushes a changelog diff only when needed,
+then PATCHes a body diff independently via the supported REST API. A successful
+push followed by a failed PATCH therefore repairs only the body on retry.
+Unchanged reconciliation makes no commit, push or body-PATCH calls. Checks may
+be dispatched again on an explicit rerun; they still target the existing head.
+
+`python3 scripts/test-release-retry.py` runs the workflow's actual reconciliation
+shell and state CLI using complete disposable local Git repositories and a
+fail-closed GitHub mock. It covers native-output-free recovery, failures before
+PATCH, failed push, failed PATCH after push, one-sided migration, unchanged-main
+no-op, new-main regeneration and foreign-head rejection. It never uses a token,
+contacts GitHub or accesses a database, and runs in Worker CI.
 
 ## Required-check dispatch
 

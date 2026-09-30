@@ -1,23 +1,9 @@
 name: release
 
-# release-please (TOG-9865, TOG-10035): CHANGELOG.md + SemVer tags + GitHub
-# Releases from Conventional Commits on main. Single `.` rust package
-# (release-please-config.json + .release-please-manifest.json): the workspace
-# root is a real, non-published release-metadata library, tagged as flat
-# `vX.Y.Z`. The native Rust strategy synchronizes all four member versions,
-# intra-workspace dependency requirements, and Cargo.lock with the root.
-# A root strategy includes changes anywhere in the repo in the changelog.
-# Stay 0.x until production cutover; 1.0.0 = cutover.
-#
-# Required-checks fix: PRs opened with GITHUB_TOKEN trigger no workflows, so
-# the required `check` / `worker check` / `gitleaks` / `pr-lint` would never
-# run on the release PR and it could never merge. The dispatch job below calls
-# `gh workflow run` (workflow_dispatch IS allowed from GITHUB_TOKEN) for
-# check / secret-scan on the release branch, plus the pr-lint dispatch path
-# that validates the open PR via the API. The check runs land on the PR head
-# SHA, which is what required checks match on. No App key or PAT in Actions
-# secrets.
-
+# release-please (TOG-9865, TOG-10035): one root rust release strategy,
+# synchronized workspace versions, Common Changelog and flat vX.Y.Z tags.
+# Stay 0.x until production cutover. No App keys or PATs in Actions.
+# GITHUB_TOKEN-created PRs need explicit required-check workflow dispatch.
 on:
   push:
     branches: [main]
@@ -35,50 +21,73 @@ concurrency:
 jobs:
   release-please:
     name: release-please
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      prs_created: ${{ steps.release.outputs.prs_created }}
-      pr: ${{ steps.release.outputs.pr }}
+      pr_available: ${{ steps.select.outputs.pr_available }}
+      pr: ${{ steps.select.outputs.pr }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Inspect existing release PR
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/release-pr-state.cjs plan
+
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          # Keep publication enabled. Only skip PR regeneration when its branch
+          # already includes this main snapshot, including our migrated notes.
+          skip-github-pull-request: ${{ steps.plan.outputs.reuse_pr == 'true' }}
 
-      # The first native changelog update leaves legacy Unreleased notes behind.
-      # Migrate them into both the versioned file and the PR body (the latter is
-      # the source of GitHub Release notes), before dispatching exact-head CI.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.release.outputs.prs_created == 'true'
-        with:
-          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
-      - name: Preserve bootstrap release notes
-        if: steps.release.outputs.prs_created == 'true'
+      # Query independently of prs_created: a failed migration can leave an
+      # unchanged native PR, so action outputs alone cannot drive recovery.
+      - name: Select open release PR
+        id: select
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ fromJSON(steps.release.outputs.pr).number }}
+        run: node scripts/release-pr-state.cjs select
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.select.outputs.pr_available == 'true'
+        with:
+          ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
+      - name: Preserve bootstrap release notes
+        if: steps.select.outputs.pr_available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ fromJSON(steps.select.outputs.pr).number }}
         run: |
           set -euo pipefail
           BODY_FILE="$RUNNER_TEMP/release-pr-body.md"
-          gh pr view "$PR_NUMBER" --json body --jq .body > "$BODY_FILE"
+          gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq .body > "$BODY_FILE"
+          cp "$BODY_FILE" "$BODY_FILE.before"
           node scripts/migrate-release-notes.cjs CHANGELOG.md "$BODY_FILE"
           if ! git diff --quiet -- CHANGELOG.md; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add CHANGELOG.md
-            python3 -c 'import json, pathlib, sys; print(json.dumps({"body": pathlib.Path(sys.argv[1]).read_text()}))' "$BODY_FILE" > "$BODY_FILE.json"
-            gh api --method PATCH "repos/$GH_REPO/pulls/$PR_NUMBER" --input "$BODY_FILE.json" --silent
             git commit -m 'chore(release): preserve bootstrap release notes' -m 'Co-Authored-By: Paperclip <noreply@paperclip.ing>'
             git push origin HEAD
+          fi
+          # Body reconciliation is independent of the file diff: a retry after
+          # a successful push but failed PATCH must still repair Release notes.
+          if ! cmp -s "$BODY_FILE.before" "$BODY_FILE"; then
+            python3 -c 'import json, pathlib, sys; print(json.dumps({"body": pathlib.Path(sys.argv[1]).read_text()}))' "$BODY_FILE" > "$BODY_FILE.json"
+            gh api --method PATCH "repos/$GH_REPO/pulls/$PR_NUMBER" --input "$BODY_FILE.json" --silent
           fi
 
   dispatch-checks:
     name: dispatch-checks
     needs: release-please
-    if: needs.release-please.outputs.prs_created == 'true'
+    if: needs.release-please.outputs.pr_available == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
