@@ -6,15 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = { workspace = true }
-hmac = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
-time = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = { workspace = true }
@@ -24,11 +25,10 @@ url = { workspace = true }
 # Database access lives behind the `db` feature so unit tests for pure
 # domain logic never need a Postgres driver or a live database.
 sqlx = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
 
 [features]
 default = []
-db = ["dep:sqlx", "dep:rand"]
+db = ["dep:sqlx"]
 
 [dev-dependencies]
 rand = { workspace = true }

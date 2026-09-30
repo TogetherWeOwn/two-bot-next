@@ -1,5 +1,7 @@
 # two-bot-next
 
+[![Release](https://img.shields.io/github/v/release/TogetherWeOwn/two-bot-next)](https://github.com/TogetherWeOwn/two-bot-next/releases)
+
 The Together We Own Discord bot (Owen), rewritten in Rust to run in a single always-on
 Cloudflare Container. It replaces [two-bot](https://github.com/TogetherWeOwn/two-bot)
 (TypeScript/discord.js), which is now in maintenance mode: fixes only, no new features.
