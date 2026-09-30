@@ -105,6 +105,20 @@ pub fn intents_from_env() -> Intents {
     gateway_intents(message_content)
 }
 
+struct ReceivedDispatch {
+    event: Event,
+    observed_at: String,
+}
+
+impl ReceivedDispatch {
+    fn new(event: Event) -> Self {
+        Self {
+            event,
+            observed_at: two_bot_core::now_iso(),
+        }
+    }
+}
+
 /// Poll the shard independently of one ordered, bounded dispatch worker.
 /// Parse errors are skipped; overload/store failure requires process restart.
 pub async fn run_shard<S, L, F, I, C, P>(
@@ -128,10 +142,11 @@ where
             while let Some(item) = shard.next_event(EventTypeFlags::all()).await {
                 match item {
                     Ok(event) => {
-                        if matches!(event, Event::Ready(_)) {
+                        let dispatch = ReceivedDispatch::new(event);
+                        if matches!(dispatch.event, Event::Ready(_)) {
                             *state.write().await = GatewayState::Connected;
                         }
-                        return Some((event, shard));
+                        return Some((dispatch, shard));
                     }
                     Err(source) => {
                         warn!(error = ?source, "gateway dispatch failed; skipping event");
@@ -144,7 +159,7 @@ where
     let result = crate::dispatch::dispatch_ordered(
         events,
         crate::dispatch::DISPATCH_BACKLOG,
-        move |event| pipeline.handle(&event),
+        move |dispatch| pipeline.handle_at(&dispatch.event, &dispatch.observed_at),
     )
     .await;
     *state.write().await = GatewayState::Armed;
@@ -274,6 +289,103 @@ mod tests {
         ensure_crypto_provider();
         let shard = build_shard("token".to_owned(), Intents::empty(), None);
         assert_eq!(session_snapshot(&shard), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_voice_gate_and_leave_use_receipt_time() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use twilight_model::gateway::payload::incoming::{
+            MemberRemove, MemberUpdate, VoiceStateUpdate,
+        };
+        use two_bot_core::EventType;
+        use two_bot_discord::MemPipeline;
+
+        let user: twilight_model::user::User = serde_json::from_value(serde_json::json!({
+            "id": "123", "username": "fixture", "discriminator": "0001", "avatar": null
+        }))
+        .unwrap();
+        let gate = Event::MemberUpdate(Box::new(
+            serde_json::from_value::<MemberUpdate>(serde_json::json!({
+                "guild_id": "456", "user": user, "roles": [], "pending": false
+            }))
+            .unwrap(),
+        ));
+        let voice = |channel: Option<&str>| {
+            Event::VoiceStateUpdate(Box::new(
+                serde_json::from_value::<VoiceStateUpdate>(serde_json::json!({
+                    "guild_id": "456", "user_id": "123", "channel_id": channel,
+                    "session_id": "fixture", "deaf": false, "mute": false,
+                    "self_deaf": false, "self_mute": false, "self_video": false,
+                    "suppress": false
+                }))
+                .unwrap(),
+            ))
+        };
+        let leave = Event::MemberRemove(MemberRemove {
+            guild_id: twilight_model::id::Id::new(456),
+            user,
+        });
+        let events = vec![Event::Resumed, gate, voice(Some("789")), voice(None), leave];
+        let pipeline = Arc::new(MemPipeline::for_replay());
+        let worker_pipeline = Arc::clone(&pipeline);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let stamps = Arc::clone(&observed);
+        let stream = futures_util::stream::unfold(
+            (0, events.into_iter(), Some(start)),
+            move |(n, mut events, mut start)| {
+                let release = release.clone();
+                let stamps = Arc::clone(&stamps);
+                async move {
+                    if n == 1 {
+                        start.take().unwrap().await.unwrap();
+                    }
+                    if n == 3 {
+                        tokio::time::sleep(Duration::from_millis(1300)).await;
+                    }
+                    let Some(event) = events.next() else {
+                        release.send(()).unwrap();
+                        return None;
+                    };
+                    let dispatch = ReceivedDispatch::new(event);
+                    stamps.lock().unwrap().push(dispatch.observed_at.clone());
+                    Some((dispatch, (n + 1, events, start)))
+                }
+            },
+        );
+        let mut started = Some(started);
+        let result = crate::dispatch::dispatch_ordered(stream, 8, move |dispatch| {
+            if matches!(dispatch.event, Event::Resumed) {
+                started.take().unwrap().send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            worker_pipeline.handle_at(&dispatch.event, &dispatch.observed_at);
+        })
+        .await;
+        assert_eq!(result, Ok(()));
+        let stamps = observed.lock().unwrap();
+        let rows = pipeline.handlers().store().rows();
+        for (kind, index) in [
+            (EventType::GateCleared, 1),
+            (EventType::VoiceSessionStart, 2),
+            (EventType::VoiceSessionEnd, 3),
+            (EventType::MemberLeave, 4),
+        ] {
+            let row = rows.iter().find(|row| row.event_type == kind).unwrap();
+            assert_eq!(row.occurred_at, stamps[index], "{kind:?} lost receipt time");
+        }
+        let end = rows
+            .iter()
+            .find(|row| row.event_type == EventType::VoiceSessionEnd)
+            .unwrap();
+        assert!(
+            end.metadata.as_ref().unwrap()["durationSeconds"]
+                .as_f64()
+                .unwrap()
+                >= 1.0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -356,6 +356,12 @@ impl<
     /// where the transition matters (member pending, voice channel), updates
     /// the cache, then calls the framework-free handlers.
     pub fn handle(&self, event: &Event) {
+        self.handle_at(event, &two_bot_core::now_iso());
+    }
+
+    /// Drive a received event after queueing without changing its occurrence
+    /// time. Payload timestamps win; timestamp-less transitions use receipt time.
+    pub fn handle_at(&self, event: &Event, observed_at: &str) {
         match event {
             // Fresh session after (re-)identify: first connect starts empty
             // (no-op); a reconnect's open state is unproven and dropped.
@@ -404,6 +410,7 @@ impl<
                     "{guild_id}:{member_id}:{}",
                     joined_at.as_deref().unwrap_or("observed")
                 );
+                let occurred_at = Some(joined_at.unwrap_or_else(|| observed_at.to_owned()));
                 let is_bot = add.user.bot;
                 self.cache.update(event);
                 self.handlers.on_join(JoinInput {
@@ -411,7 +418,7 @@ impl<
                     member_id,
                     is_bot,
                     source,
-                    occurred_at: joined_at.clone(),
+                    occurred_at: occurred_at.clone(),
                     inviter_id,
                     source_event_id: Some(source_event_id),
                 });
@@ -423,7 +430,7 @@ impl<
                         guild_id,
                         member_id,
                         is_bot,
-                        occurred_at: joined_at,
+                        occurred_at,
                         source: None,
                     });
                 }
@@ -448,7 +455,7 @@ impl<
                         guild_id,
                         member_id,
                         is_bot,
-                        occurred_at: None,
+                        occurred_at: Some(observed_at.to_owned()),
                         source: None,
                     });
                 }
@@ -458,8 +465,12 @@ impl<
                 let member_id = remove.user.id.get();
                 let is_bot = remove.user.bot;
                 self.cache.update(event);
-                self.handlers
-                    .on_leave(guild_id, member_id, None, Some(is_bot));
+                self.handlers.on_leave(
+                    guild_id,
+                    member_id,
+                    Some(observed_at.to_owned()),
+                    Some(is_bot),
+                );
             }
             Event::MessageCreate(msg) => {
                 let Some(guild_id) = msg.guild_id.map(|g| g.get()) else {
@@ -509,7 +520,7 @@ impl<
                 // as one instant, not a gap.
                 let chain = self.voice_chains.lock_for(guild_id, member_id);
                 let _guard = chain.lock().expect("voice chain");
-                let at = two_bot_core::now_iso();
+                let at = observed_at.to_owned();
                 if let Some(old) = old_channel {
                     self.handlers.on_voice_leave(VoiceInput {
                         guild_id,

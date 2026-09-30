@@ -5,8 +5,9 @@ use tokio::sync::mpsc;
 
 pub const DISPATCH_BACKLOG: usize = 64;
 
-/// A full backlog or dead worker is fatal, not permission to drop a dispatch.
-/// The caller must terminate the process so its supervisor can restart it.
+/// A full backlog stops reception, retains the overflow dispatch, and drains
+/// received work before returning a fatal error for supervisor restart.
+/// A dead worker is fatal too; restart alone cannot replay uncommitted work.
 pub async fn dispatch_ordered<T, S, F>(
     stream: S,
     capacity: usize,
@@ -24,7 +25,7 @@ where
         }
     });
     futures_util::pin_mut!(stream);
-    loop {
+    let result = loop {
         tokio::select! {
             result = &mut worker => {
                 return match result {
@@ -33,16 +34,29 @@ where
                 };
             }
             item = stream.next() => {
-                let Some(event) = item else { break };
-                tx.try_send(event).map_err(|err| match err {
-                    mpsc::error::TrySendError::Full(_) => "dispatch backlog full",
-                    mpsc::error::TrySendError::Closed(_) => "dispatch worker unavailable",
-                })?;
+                let Some(event) = item else { break Ok(()) };
+                match tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        // Stop reading, but retain this already-received tail.
+                        // Memory stays bounded to the queue + one overflow item.
+                        let sent = tx.send(event).await;
+                        break Err(if sent.is_ok() {
+                            "dispatch backlog full"
+                        } else {
+                            "dispatch worker unavailable"
+                        });
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        break Err("dispatch worker unavailable");
+                    }
+                }
             }
         }
-    }
+    };
     drop(tx);
-    worker.await.map_err(|_| "dispatch worker failed")
+    worker.await.map_err(|_| "dispatch worker failed")?;
+    result
 }
 
 #[cfg(test)]
@@ -95,14 +109,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn overload_is_fatal_not_backpressure_on_reception() {
+    async fn overload_drains_accepted_and_overflow_dispatches_before_fatal_return() {
         let (release, wait) = std::sync::mpsc::channel();
-        let result = dispatch_ordered(futures_util::stream::iter(0..128), 1, move |_| {
-            let _ = wait.recv_timeout(Duration::from_secs(2));
-        })
-        .await;
-        let _ = release.send(());
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (overflow, received) = tokio::sync::oneshot::channel();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let rows = Arc::clone(&observed);
+        let stream = futures_util::stream::unfold(
+            (0, Some(start), Some(overflow)),
+            |(n, mut start, mut overflow)| async move {
+                if n == 1 {
+                    start.take().unwrap().await.unwrap();
+                }
+                if n == 2 {
+                    overflow.take().unwrap().send(()).unwrap();
+                }
+                assert!(n < 3, "reception must stop at overflow");
+                Some((n, (n + 1, start, overflow)))
+            },
+        );
+        let mut started = Some(started);
+        let task = tokio::spawn(dispatch_ordered(stream, 1, move |n| {
+            if n == 0 {
+                started.take().unwrap().send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            rows.lock().unwrap().push(n);
+        }));
+        received.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let exited_before_commit = task.is_finished();
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!exited_before_commit, "fatal return detached pending work");
         assert_eq!(result, Err("dispatch backlog full"));
+        assert_eq!(*observed.lock().unwrap(), vec![0, 1, 2]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
