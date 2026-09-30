@@ -738,6 +738,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2171,9 +2172,13 @@ name = "two-bot"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "rustls",
+ "serde",
  "serde_json",
+ "sqlx",
  "tokio",
+ "tokio-websockets",
  "tower",
  "tower-http",
  "tracing",
@@ -2181,6 +2186,7 @@ dependencies = [
  "twilight-cache-inmemory",
  "twilight-gateway",
  "two-bot-core",
+ "two-bot-cutover",
  "two-bot-discord",
 ]
 
@@ -2188,11 +2194,27 @@ dependencies = [
 name = "two-bot-core"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64",
+ "bytes",
+ "flate2",
+ "futures-util",
+ "hex",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rand",
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
+ "subtle",
  "thiserror",
+ "time",
  "tokio",
  "tracing",
  "unicode-normalization",
@@ -2211,6 +2233,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "twilight-http",
  "twilight-model",
  "two-bot-core",
@@ -2220,10 +2243,17 @@ dependencies = [
 name = "two-bot-discord"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "rustls",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-websockets",
  "tracing",
@@ -2233,6 +2263,10 @@ dependencies = [
  "twilight-model",
  "two-bot-core",
 ]
+
+[[package]]
+name = "two-bot-next"
+version = "0.1.0"
 
 [[package]]
 name = "typenum"

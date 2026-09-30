@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly TWO Staging Discord configuration backup (two-bot-next)
+
+[Timer]
+OnCalendar=*-*-* 04:31:00 UTC
+Persistent=true
+RandomizedDelaySec=10m
+Unit=two-bot-next-guild-config-backup.service
+
+[Install]
+WantedBy=timers.target

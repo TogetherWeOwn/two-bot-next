@@ -355,14 +355,15 @@ pub enum ReasonError {
 }
 
 /// Validate the mandatory audit reason: trimmed, non-empty, at most 512
-/// characters (legacy `requireModerationReason`; counted in code points —
-/// identical to legacy UTF-16 units for BMP text).
+/// characters (legacy `requireModerationReason`, whose JS `length` counts
+/// UTF-16 code units — so an astral character costs 2, not the 1 that
+/// `chars().count()` would count).
 pub fn require_moderation_reason(value: &str) -> Result<String, ReasonError> {
     let reason = value.trim();
     if reason.is_empty() {
         return Err(ReasonError::Empty);
     }
-    if reason.chars().count() > 512 {
+    if reason.encode_utf16().count() > 512 {
         return Err(ReasonError::TooLong);
     }
     Ok(reason.to_owned())
@@ -694,6 +695,18 @@ mod tests {
             Err(ReasonError::TooLong)
         );
         assert!(require_moderation_reason(&"x".repeat(512)).is_ok());
+        // Legacy JS `length` counts UTF-16 units: 256 astral characters are
+        // exactly 512 units (accepted), 257 are 514 (refused). BMP text is
+        // unchanged — é is 1 unit either way.
+        assert!(require_moderation_reason(&"\u{1F600}".repeat(256)).is_ok());
+        assert_eq!(
+            require_moderation_reason(&"\u{1F600}".repeat(257)),
+            Err(ReasonError::TooLong)
+        );
+        assert_eq!(
+            require_moderation_reason(&"\u{1F600}".repeat(300)),
+            Err(ReasonError::TooLong)
+        );
     }
 
     #[test]
