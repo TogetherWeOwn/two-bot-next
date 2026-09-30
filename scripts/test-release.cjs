@@ -187,6 +187,42 @@ assert(!nextBody.includes('- historical repair'), 'Later release must not repeat
 assert(!nextBody.includes('- historical caveat'), 'Later release must not repeat bootstrap Notes');
 console.log('PASS 6 bootstrap migration guards: layout, history, section, ambiguous body, notes tail, subsequent release');
 
+// Live 0.3.0 regression: contributors add Unreleased above published 0.2.0,
+// and the pinned native updater keeps that prefix above its generated entry.
+const unreleasedNotes = '### Added\n\n- pending sticky runtime\n\n### Notes\n\n- pending caveat';
+const pendingSnapshot = firstRelease.changelog.replace('# Changelog\n\n', `# Changelog\n\n## Unreleased\n\n${unreleasedNotes}\n\n`);
+const pendingChangelog = new Changelog({version: Version.parse('0.3.0'), changelogEntry: nextBody}).updateContent(pendingSnapshot);
+assert(pendingChangelog.startsWith('# Changelog\n\n## Unreleased\n'), 'Native updater must reproduce the live prefix layout');
+const pendingBody = `:robot: release\n---\n\n${nextBody}\n\n---\nRefs: TOG-9865\n`;
+const pendingRelease = migrateReleaseNotes(pendingChangelog, pendingBody);
+const publishedHistory = firstRelease.changelog.slice('# Changelog\n\n'.length);
+assert(pendingRelease.changelog.endsWith(publishedHistory), 'Published history must remain byte-for-byte intact');
+assert(!/^## Unreleased$/m.test(pendingRelease.changelog));
+for (const note of ['- pending sticky runtime', '- pending caveat']) {
+  assert.equal(pendingRelease.changelog.split(note).length - 1, 1);
+  assert.equal(pendingRelease.body.split(note).length - 1, 1);
+}
+assert(!pendingRelease.body.includes('- historical repair'), 'Latest PR must not repeat published notes');
+assert(!pendingRelease.body.includes('- historical caveat'), 'Latest PR must not repeat the bootstrap Notes tail');
+assert(pendingRelease.body.startsWith(':robot: release\n---\n\n'));
+assert(pendingRelease.body.endsWith('\n\n---\nRefs: TOG-9865\n'));
+assert.deepEqual(migrateReleaseNotes(pendingRelease.changelog, pendingRelease.body), pendingRelease, 'Prefix migration must be idempotent');
+assert.deepEqual(migrateReleaseNotes(pendingRelease.changelog, pendingBody), pendingRelease, 'Retry after changelog push repairs only the body');
+assert.deepEqual(migrateReleaseNotes(pendingChangelog, pendingRelease.body), pendingRelease, 'Already migrated body still repairs the changelog');
+const afterPendingBody = '## 0.4.0\n\n### Added\n\n* future feature';
+const afterPendingChangelog = new Changelog({version: Version.parse('0.4.0'), changelogEntry: afterPendingBody}).updateContent(pendingRelease.changelog);
+assert.deepEqual(migrateReleaseNotes(afterPendingChangelog, afterPendingBody), {changelog: afterPendingChangelog, body: afterPendingBody});
+assert(afterPendingChangelog.endsWith(pendingRelease.changelog.slice('# Changelog\n\n'.length)));
+assert(!afterPendingBody.includes('- pending sticky runtime'), 'Following release must not repeat the consumed Unreleased notes');
+const emptyPending = pendingChangelog.replace(`${unreleasedNotes}\n\n`, '');
+assert.deepEqual(migrateReleaseNotes(emptyPending, pendingBody), {changelog: nextChangelog, body: pendingBody}, 'Empty Unreleased prefix is consumed without inventing notes');
+assert.throws(() => migrateReleaseNotes('# Changelog\n\n## Unreleased\n', pendingBody), /Missing versioned/);
+assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n- pending', '## Unreleased\n\n### Added\n\n- pending'), pendingBody), /Duplicate unreleased/);
+assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n- pending', '### Unknown\n\n- pending'), pendingBody), /Unsupported/);
+assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n- pending', '- pending'), pendingBody), /Unsectioned/);
+assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n- pending', '## Changelog\n\n### Added\n\n- pending'), pendingBody), /historical release/);
+console.log('PASS post-release Unreleased prefix: native layout, history, body/footer, partial retries, next release, empty prefix, 5 fail-closed guards');
+
 // Overflow link parsing retains the exact native single-line contract.
 const overflowUrl = `https://github.com/fixture/two-bot-next/blob/${NATIVE_NOTES_BRANCH}/release-notes.md`;
 const overflowBody = `${NATIVE_OVERFLOW_SENTENCE} ${overflowUrl}`;
