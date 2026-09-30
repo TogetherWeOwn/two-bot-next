@@ -306,11 +306,13 @@ impl HyperTransport {
         let url = self.url(request.path());
         let mut builder = hyper::Request::builder().method(method).uri(url);
         if let Some(headers) = builder.headers_mut() {
-            headers.insert(
-                hyper::header::AUTHORIZATION,
-                hyper::header::HeaderValue::from_str(&self.token)
-                    .map_err(|e| format!("bad token header: {e}"))?,
-            );
+            if request.use_authorization_token() {
+                headers.insert(
+                    hyper::header::AUTHORIZATION,
+                    hyper::header::HeaderValue::from_str(&self.token)
+                        .map_err(|e| format!("bad token header: {e}"))?,
+                );
+            }
             if let Some(bytes) = request.body() {
                 headers.insert(
                     hyper::header::CONTENT_LENGTH,
@@ -1096,6 +1098,142 @@ impl ActionExecutor {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned())
+    }
+
+    // Twilight omits empty roles/users lists when serializing AllowedMentions.
+    // Onboarding's wire contract requires all three lists explicitly present.
+    // Keep the validated builder's method/path/auth (notably webhook auth=false).
+    fn explicit_mentions(
+        req: Request,
+        mentions: &AllowedMentions,
+    ) -> Result<Request, DiscordError> {
+        let mut body: serde_json::Value = serde_json::from_slice(req.body().unwrap_or_default())
+            .map_err(|_| DiscordError::Rejected("invalid message body".into()))?;
+        body["allowed_mentions"] = serde_json::json!({
+            "parse": mentions.parse,
+            "users": mentions.users,
+            "roles": mentions.roles,
+            "replied_user": mentions.replied_user,
+        });
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|_| DiscordError::Rejected("invalid mention policy".into()))?;
+        let mut builder =
+            twilight_http::request::RequestBuilder::raw(req.method(), req.path().to_owned())
+                .body(bytes)
+                .use_authorization_token(req.use_authorization_token());
+        if let Some(headers) = req.headers() {
+            builder = builder.headers(
+                headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        builder
+            .build()
+            .map_err(|_| DiscordError::Rejected("invalid message request".into()))
+    }
+
+    /// Post a component-bearing message through the shared bounded transport.
+    /// Empty components are omitted (anchor welcomes must attach nothing).
+    /// No automatic retry: send-then-record callers must not hide ambiguity.
+    /// Source: https://docs.rs/twilight-http/0.17.1/twilight_http/request/channel/message/struct.CreateMessage.html
+    pub async fn post_channel_message(
+        &self,
+        channel_id: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+        mentions: &AllowedMentions,
+    ) -> Result<String, DiscordError> {
+        if utf16_len(content) > MAX_MESSAGE_CHARS {
+            return Err(DiscordError::Rejected(
+                "message exceeds UTF-16 ceiling".into(),
+            ));
+        }
+        let mut builder = self
+            .inner
+            .factory
+            .create_message(snowflake(channel_id)?)
+            .content(content)
+            .allowed_mentions(Some(mentions));
+        if !components.is_empty() {
+            builder = builder.components(components);
+        }
+        let req = Self::explicit_mentions(Self::request_of(builder)?, mentions)?;
+        let response = self.call_once(req, &[200, 201]).await?.unwrap_or_default();
+        Ok(response
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned())
+    }
+
+    /// Add or remove one member role, preserving all unrelated roles. The
+    /// shared lane owns pacing; mutations are bounded and never auto-retried.
+    pub async fn set_member_role(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        role_id: &str,
+        present: bool,
+        reason: &str,
+    ) -> Result<(), DiscordError> {
+        let guild = snowflake(guild_id)?;
+        let member = snowflake(member_id)?;
+        let role = snowflake(role_id)?;
+        let req = if present {
+            Self::request_of(
+                self.inner
+                    .factory
+                    .add_guild_member_role(guild, member, role)
+                    .reason(reason),
+            )?
+        } else {
+            Self::request_of(
+                self.inner
+                    .factory
+                    .remove_guild_member_role(guild, member, role)
+                    .reason(reason),
+            )?
+        };
+        self.pace(false).await;
+        self.call_once(req, &[200, 204]).await?;
+        Ok(())
+    }
+
+    /// Complete a deferred interaction without publishing a second channel
+    /// message. The original callback decides ephemerality; edits retain it.
+    /// Source: https://docs.rs/twilight-http/0.17.1/twilight_http/client/struct.InteractionClient.html#method.update_response
+    pub async fn edit_interaction_response(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        if utf16_len(content) > MAX_MESSAGE_CHARS {
+            return Err(DiscordError::Rejected(
+                "message exceeds UTF-16 ceiling".into(),
+            ));
+        }
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("invalid application id".into()))?;
+        let mentions = AllowedMentions {
+            parse: vec![],
+            replied_user: false,
+            roles: vec![],
+            users: vec![],
+        };
+        let interaction = self.inner.factory.interaction(application);
+        let req = Self::request_of(
+            interaction
+                .update_response(interaction_token)
+                .content(Some(content))
+                .components(Some(components))
+                .allowed_mentions(Some(&mentions)),
+        )?;
+        let req = Self::explicit_mentions(req, &mentions)?;
+        self.call_once(req, &[200, 204]).await?;
+        Ok(())
     }
 
     /// Carry out one [`ChannelCall`].

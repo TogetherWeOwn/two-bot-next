@@ -77,6 +77,40 @@ The prompt guard prevents normal concurrent/redelivered successful sends; it is
 Postgres commit**. That cross-system ambiguity is inherited from legacy's
 send-then-record ordering. Do not record a failed send as success to hide it.
 
+## Runtime wiring checkpoint
+
+The shared S4 router and executor are merged. The runtime follow-up uses
+`route_interaction` and its existing `ComponentHandler::GamePicker` /
+`SessionPicker` outcomes; the router's `InteractionHandler` trait identifies
+slash owners, not async component callbacks. No separate custom-ID dispatcher
+will be added.
+
+`onboarding_config` reads only deployment routing fields, rejects malformed
+snowflakes, and never falls back to a production guild or channel. Session
+requires its per-guild destinations; anchor requires its configured channel.
+The selected mode remains explicit (the domain/store slice's intentional
+three-mode switch), not inferred from the anchor-channel setting.
+
+`onboarding_messages` builds Twilight 0.17.1 menus and explicit mention policies.
+The shared `ActionExecutor` now supports component-bearing channel posts,
+single-role add/remove, and original deferred-response edits. These are bounded,
+single-attempt mutations, not a private client; empty components are omitted on
+posts so the anchor welcome attaches nothing. Role mutations use the shared
+110 ms pacing lane and preserve unrelated roles.
+
+The gateway runtime, settings refresh, live permission resolution and combined
+Postgres/REST concurrency proof remain unfinished at this checkpoint. The
+`onboarding_wire` test proves the actual HTTP shapes of the shared operations,
+not their registration or deployment. Do not enable this checkpoint as a live
+onboarding flow or claim runtime parity yet.
+
+Framework references:
+
+- https://docs.rs/twilight-http/0.17.1/twilight_http/request/channel/message/struct.CreateMessage.html
+- https://docs.rs/twilight-http/0.17.1/twilight_http/client/struct.InteractionClient.html#method.update_response
+- https://docs.rs/twilight-model/0.17.1/twilight_model/channel/message/component/struct.SelectMenu.html
+- https://docs.discord.com/developers/topics/permissions (live permission resolver contract)
+
 ## Verification
 
 ```sh

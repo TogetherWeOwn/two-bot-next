@@ -9,6 +9,8 @@ pub mod adapter;
 pub mod executor;
 pub mod intents;
 pub mod interactions;
+pub mod onboarding_config;
+pub mod onboarding_messages;
 pub mod pipeline;
 
 pub use adapter::event_to_core;
