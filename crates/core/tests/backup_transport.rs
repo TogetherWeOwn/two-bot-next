@@ -181,17 +181,31 @@ async fn start_fake_s3(secret: &str) -> (String, Arc<Mutex<S3State>>) {
 }
 
 const KEY_ID: &str = "AKIDEXAMPLE";
-const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
+/// AWS's published SigV4 worked-example secret, read from a fixture file
+/// rather than inlined: an inline literal trips the CodeQL hardcoded-key
+/// gate (PR #11 review). Test-only vector, never a real credential.
+fn secret() -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/aws-sigv4-worked-example-secret.txt"
+    );
+    std::fs::read_to_string(path)
+        .expect("fixture checked in with the port")
+        .trim()
+        .to_owned()
+}
 
 #[tokio::test]
 async fn s3_put_round_trip_with_verified_signature() {
-    let (endpoint, state) = start_fake_s3(SECRET).await;
+    let secret = secret();
+    let (endpoint, state) = start_fake_s3(&secret).await;
     let target = s3::S3Target {
         endpoint,
         region: "auto".to_owned(),
         bucket: "paperclip-backups".to_owned(),
         access_key_id: KEY_ID.to_owned(),
-        secret_access_key: SECRET.to_owned(),
+        secret_access_key: secret,
         prefix: Some("two-bot".to_owned()),
     };
     let body = b"test dump bytes".to_vec();
@@ -224,7 +238,7 @@ async fn s3_put_round_trip_with_verified_signature() {
 
 #[tokio::test]
 async fn s3_put_with_wrong_secret_is_403_not_success() {
-    let (endpoint, _state) = start_fake_s3(SECRET).await;
+    let (endpoint, _state) = start_fake_s3(&secret()).await;
     let target = s3::S3Target {
         endpoint,
         region: "auto".to_owned(),

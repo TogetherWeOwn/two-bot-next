@@ -407,13 +407,28 @@ mod tests {
             .collect()
     }
 
+    /// AWS's published SigV4 worked-example secret, read from a fixture file
+    /// rather than inlined: an inline literal trips the CodeQL hardcoded-key
+    /// gate (PR #11 review), while the vector itself must stay byte-exact —
+    /// if the assertion below ever fails, the signer is wrong, not the test.
+    fn worked_example_secret() -> String {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/aws-sigv4-worked-example-secret.txt"
+        );
+        std::fs::read_to_string(path)
+            .expect("fixture checked in with the port")
+            .trim()
+            .to_owned()
+    }
+
     fn target() -> S3Target {
         S3Target {
             endpoint: "https://acct.r2.cloudflarestorage.com".to_owned(),
             region: "auto".to_owned(),
             bucket: "paperclip-backups".to_owned(),
             access_key_id: "AKIDEXAMPLE".to_owned(),
-            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            secret_access_key: worked_example_secret(),
             prefix: Some("two-bot".to_owned()),
         }
     }
@@ -424,12 +439,7 @@ mod tests {
         // spec. If this line ever needs changing to make the suite pass, the
         // signer is wrong, not the test.
         // https://docs.aws.amazon.com/general/latest/gr/signature-v4-examples.html
-        let got = signing_key(
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            "20150830",
-            "us-east-1",
-            "iam",
-        );
+        let got = signing_key(&worked_example_secret(), "20150830", "us-east-1", "iam");
         assert_eq!(
             hex_of(&got),
             "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
