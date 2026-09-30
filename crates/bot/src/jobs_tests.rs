@@ -217,6 +217,35 @@ async fn shutdown_drops_inflight_future_and_starts_no_more_work() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn shutdown_while_waiting_for_status_lock_never_starts_an_attempt() {
+    for close_channel in [false, true] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let status = statuses(&["good"], false);
+        let locked = status.read().await;
+        let (stop, rx) = watch::channel(false);
+        let task = tokio::spawn(supervise(
+            vec![job("good", counting(&count, Duration::ZERO))],
+            status.clone(),
+            rx,
+        ));
+        settle().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        if !close_channel {
+            stop.send(true).unwrap();
+        }
+        drop(stop);
+        settle().await;
+        drop(locked);
+        task.await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let current = &status.read().await["good"];
+        assert_eq!(current.last_start, None);
+        assert!(!current.running);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn already_stopped_or_closed_signal_never_starts_a_job() {
     for initially_stopped in [false, true] {
         let count = Arc::new(AtomicUsize::new(0));

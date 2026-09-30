@@ -21,6 +21,13 @@ The release profile uses unwinding (not `panic=abort`) for the same guarantee
 in the deployed binary. Jobs must remain asynchronous/cooperative; this is not
 a preemption mechanism for blocking code.
 
+Counter and rank also share one observation/publication lane: it is held from
+raid-history and roster reads through the database commit because both ticks
+write the denominator. A delayed rank tick cannot overwrite a newer counter
+roster. Waiting for this lane consumes the attempt's timeout; cancellation
+releases it. Scheduled events remain independent. Publication timestamps reuse
+core `now_iso`, the fixed `YYYY-MM-DDTHH:mm:ss.sssZ` website contract.
+
 The jobs park when `DISCORD_TOKEN`, `DATABASE_URL` or nonzero `GUILD_ID` is
 missing. They share a paced REST executor and a lazily initialized pool; the
 existing cutover migrations and `web_v1` contract are applied before the first
@@ -43,7 +50,11 @@ classes are fixed identifiers, not SQL errors, REST bodies or panic payloads.
 Job failures **never** change the HTTP readiness code; the gateway remains the
 essential readiness gate. SIGTERM/SIGINT broadcasts cancellation before HTTP
 drains; shutdown aborts and joins in-flight attempts and starts no more work.
-An HTTP bind failure or gateway termination also signals cancellation.
+An HTTP bind failure or gateway termination also signals cancellation. Gateway
+termination waits for HTTP shutdown and the job supervisor's abort-and-join
+cleanup before returning the restart error; the HTTP-first path aborts and joins
+the gateway. Cancellation remains sticky even before the HTTP future's first
+poll, and a job awaiting the status lock cannot schedule a post-stop attempt.
 
 Cadences cannot be overridden in a deployed binary. Test builds alone accept
 positive `TWO_TEST_COUNTER_INTERVAL_MS`, `TWO_TEST_RANK_INTERVAL_MS`, and

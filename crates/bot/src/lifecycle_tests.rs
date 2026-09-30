@@ -1,10 +1,16 @@
-//! Essential gateway termination must cancel HTTP, not leave healthy zombies.
-use std::{sync::Arc, time::Duration};
+//! Essential gateway termination must drain HTTP and join jobs before returning.
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
-    sync::{oneshot, RwLock},
+    sync::{oneshot, watch, Notify, RwLock},
 };
 
 use two_bot_core::Config;
@@ -56,9 +62,19 @@ async fn stops_http(termination: Termination) {
         }
     });
     let state = Arc::new(RwLock::new(GatewayState::Armed));
-    let service = tokio::spawn(supervise_gateway(task, async move {
-        axum::serve(listener, server::router(state).into_make_service()).await
-    }));
+    let (shutdown, stop) = watch::channel(false);
+    let (cleanup_started, cleanup_observed) = oneshot::channel();
+    let (finish_cleanup, cleanup_gate) = oneshot::channel();
+    let http = async move {
+        axum::serve(listener, server::router(state).into_make_service())
+            .with_graceful_shutdown(async move {
+                server::shutdown_requested(stop).await;
+                cleanup_started.send(()).unwrap();
+                cleanup_gate.await.unwrap();
+            })
+            .await
+    };
+    let mut service = tokio::spawn(supervise_gateway(task, http, shutdown));
 
     let mut socket = TcpStream::connect(addr).await.unwrap();
     socket
@@ -72,6 +88,17 @@ async fn stops_http(termination: Termination) {
         .unwrap();
     assert!(response.starts_with(b"HTTP/1.0 200"));
     sender.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), cleanup_observed)
+        .await
+        .expect("gateway completion must request HTTP cleanup")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut service)
+            .await
+            .is_err(),
+        "gateway failure must wait for gated HTTP cleanup"
+    );
+    finish_cleanup.send(()).unwrap();
     let error = tokio::time::timeout(Duration::from_secs(2), service)
         .await
         .unwrap()
@@ -102,11 +129,162 @@ async fn gateway_panic_stops_health_service() {
     stops_http(Termination::Panic).await;
 }
 
+struct Dropped(Arc<AtomicBool>);
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 #[tokio::test]
-async fn http_shutdown_aborts_gateway_task() {
-    let task = tokio::spawn(std::future::pending::<Result<(), sqlx::Error>>());
+async fn http_shutdown_aborts_and_joins_gateway_before_returning() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = Dropped(dropped.clone());
+    let (started, started_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _guard = guard;
+        started.send(()).unwrap();
+        std::future::pending::<Result<(), sqlx::Error>>().await
+    });
+    started_rx.await.unwrap();
     let abort = task.abort_handle();
-    supervise_gateway(task, async { Ok(()) }).await.unwrap();
+    let (shutdown, _) = watch::channel(false);
+    supervise_gateway(task, async { Ok(()) }, shutdown)
+        .await
+        .unwrap();
+    assert!(abort.is_finished(), "gateway abort must be joined");
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn completed_gateway_requests_sticky_stop_before_first_http_poll() {
+    let task = tokio::spawn(async { Ok(()) });
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    // No receiver exists when supervise_gateway publishes cancellation.
+    let (shutdown, receiver) = watch::channel(false);
+    drop(receiver);
+    let http_shutdown = shutdown.clone();
+    let http = async move {
+        assert!(*http_shutdown.borrow(), "stop must precede first HTTP poll");
+        server::shutdown_requested(http_shutdown.subscribe()).await;
+        Ok(())
+    };
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervise_gateway(task, http, shutdown),
+    )
+    .await
+    .expect("late subscriber must observe the sticky stop")
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "gateway task stopped; container restart required"
+    );
+}
+
+#[tokio::test]
+async fn http_server_observes_stop_before_first_poll() {
+    let (shutdown, _) = watch::channel(false);
+    shutdown.send_replace(true);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        server::serve(
+            "127.0.0.1:0",
+            Arc::new(RwLock::new(GatewayState::Armed)),
+            crate::jobs::statuses(&[], true),
+            shutdown,
+        ),
+    )
+    .await
+    .expect("already stopped server must finish without an OS signal")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn closed_stop_channel_requests_shutdown() {
+    let (shutdown, receiver) = watch::channel(false);
+    drop(shutdown);
+    tokio::time::timeout(Duration::from_secs(2), server::shutdown_requested(receiver))
+        .await
+        .expect("closed stop channel must not wait for an OS signal");
+}
+
+#[tokio::test(start_paused = true)]
+async fn gateway_failure_joins_pending_website_job_before_returning() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let job = crate::jobs::Job {
+        name: "pending",
+        cadence: Duration::from_secs(1),
+        startup_jitter: Duration::ZERO,
+        timeout: Duration::from_secs(300),
+        action: Arc::new({
+            let dropped = dropped.clone();
+            let starts = starts.clone();
+            let started = started.clone();
+            move || {
+                let guard = Dropped(dropped.clone());
+                let starts = starts.clone();
+                let started = started.clone();
+                Box::pin(async move {
+                    let _guard = guard;
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    std::future::pending().await
+                })
+            }
+        }),
+    };
+    let status = crate::jobs::statuses(&["pending"], false);
+    let (shutdown, receiver) = watch::channel(false);
+    let (fail, fail_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        fail_rx.await.unwrap();
+        Err(sqlx::Error::InvalidArgument("not for logs".into()))
+    });
+    let http =
+        crate::website_jobs::serve_jobs(vec![job], status.clone(), shutdown.clone(), async move {
+            server::shutdown_requested(receiver).await;
+            Ok(())
+        });
+    let mut service = tokio::spawn(supervise_gateway(task, http, shutdown));
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("production job supervisor must start the pending action");
+    assert!(status.read().await["pending"].running);
+    // Gate the real supervisor's final status update after action cancellation.
+    // Broadcasting alone is insufficient: the service must also join cleanup.
+    let status_gate = status.write().await;
+    fail.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut service)
+            .await
+            .is_err(),
+        "service must await the job supervisor's gated cleanup"
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "pending action must be cancelled"
+    );
+    drop(status_gate);
+    let error = tokio::time::timeout(Duration::from_secs(2), service)
+        .await
+        .expect("pending action must be cancelled and joined")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "gateway task stopped; container restart required"
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "action must be dropped before return"
+    );
+    assert!(!status.read().await["pending"].running);
+    tokio::time::advance(Duration::from_secs(60)).await;
     tokio::task::yield_now().await;
-    assert!(abort.is_finished());
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "no later website ticks");
 }

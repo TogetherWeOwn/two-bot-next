@@ -111,11 +111,16 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         .unwrap();
     apply_web_contract(&pool).await.unwrap();
     let guild = "2222";
+    let observation = Arc::new(Mutex::new(()));
 
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let rest = executor(&mock);
-    run_once(Kind::Rank, &pool, &rest, guild).await.unwrap();
-    run_once(Kind::Counter, &pool, &rest, guild).await.unwrap();
+    run_once(Kind::Rank, &pool, &rest, guild, &observation)
+        .await
+        .unwrap();
+    run_once(Kind::Counter, &pool, &rest, guild, &observation)
+        .await
+        .unwrap();
     assert!(
         mock.requests().is_empty(),
         "ungrounded raid history skips before REST"
@@ -141,7 +146,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         vec![
             ScriptedResponse::json(200, members.clone()),
             ScriptedResponse::json(200, members),
-            ScriptedResponse::json(200, roles),
+            ScriptedResponse::json(200, roles.clone()),
             ScriptedResponse::json(200, json!([event()])),
             ScriptedResponse::json(200, json!({"not":"an array"})),
             ScriptedResponse::json(200, json!([event(), {"id":"bad"}])),
@@ -160,6 +165,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     {
         let pool = pool.clone();
         let rest = rest.clone();
+        let observation = observation.clone();
         let status = jobs::statuses(&[name], false);
         let (stop, rx) = watch::channel(false);
         let task = tokio::spawn(jobs::supervise(
@@ -171,7 +177,10 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
                 action: Arc::new(move || {
                     let pool = pool.clone();
                     let rest = rest.clone();
-                    Box::pin(async move { run_once(kind, &pool, &rest, "2222").await })
+                    let observation = observation.clone();
+                    Box::pin(
+                        async move { run_once(kind, &pool, &rest, "2222", &observation).await },
+                    )
                 }),
             }],
             status.clone(),
@@ -217,7 +226,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     }
     for _ in 0..3 {
         assert_eq!(
-            run_once(Kind::Events, &pool, &rest, guild).await,
+            run_once(Kind::Events, &pool, &rest, guild, &observation).await,
             Err(ErrorClass::Rest)
         );
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduled_events")
@@ -226,7 +235,9 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
             .unwrap();
         assert_eq!(rows, 1, "failed/malformed reads preserve mirror");
     }
-    run_once(Kind::Events, &pool, &rest, guild).await.unwrap();
+    run_once(Kind::Events, &pool, &rest, guild, &observation)
+        .await
+        .unwrap();
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduled_events")
         .fetch_one(&pool)
         .await
@@ -234,6 +245,23 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     assert_eq!(rows, 0, "valid empty response clears mirror");
     assert_eq!(mock.requests().len(), 8);
     mock.shutdown().await;
+    for query in [
+        "SELECT human_member_count_at FROM guild_counters WHERE guild_id=$1",
+        "SELECT human_member_count_at FROM counter_snapshots WHERE guild_id=$1",
+        "SELECT snapshot_at FROM rank_snapshots WHERE guild_id=$1",
+        "SELECT updated_at FROM member_ranks WHERE guild_id=$1",
+    ] {
+        let timestamps: Vec<String> = sqlx::query_scalar(query)
+            .bind(guild)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(!timestamps.is_empty());
+        for timestamp in timestamps {
+            assert_iso_millis(&timestamp);
+        }
+    }
+    concurrent_publications_keep_newest_counter(&pool, roles).await;
     pool.close().await;
     // Same generated hex-only identifiers as the CREATE above.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
@@ -243,4 +271,90 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     .await
     .unwrap();
     admin.close().await;
+}
+
+fn assert_iso_millis(timestamp: &str) {
+    assert_eq!(timestamp.len(), 24, "{timestamp}");
+    assert_eq!(timestamp.as_bytes()[19], b'.');
+    assert!(timestamp.as_bytes()[20..23].iter().all(u8::is_ascii_digit));
+    assert!(timestamp.ends_with('Z'));
+    assert!(two_bot_core::parse_iso_millis(timestamp).is_some());
+}
+
+async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value) {
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!([member(1000, false, &["11"])])),
+            ScriptedResponse::json(200, roles).delayed(Duration::from_secs(2)),
+            ScriptedResponse::json(200, json!([event()])),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    member(1000, false, &["11"]),
+                    member(1001, false, &[]),
+                    member(1003, false, &[]),
+                ]),
+            ),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let observation = Arc::new(Mutex::new(()));
+    let rank = {
+        let pool = pool.clone();
+        let rest = executor(&mock);
+        let observation = observation.clone();
+        tokio::spawn(async move { run_once(Kind::Rank, &pool, &rest, "2222", &observation).await })
+    };
+    // Rank has observed its old roster and is stalled on the role response.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while mock.requests().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut counter = {
+        let pool = pool.clone();
+        let rest = executor(&mock);
+        let observation = observation.clone();
+        tokio::spawn(
+            async move { run_once(Kind::Counter, &pool, &rest, "2222", &observation).await },
+        )
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut counter)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "counter must wait before observing"
+    );
+    // Independent events still publish while the shared denominator lane is busy.
+    run_once(Kind::Events, pool, &executor(&mock), "2222", &observation)
+        .await
+        .unwrap();
+    assert!(!rank.is_finished());
+    let updated_at: String =
+        sqlx::query_scalar("SELECT updated_at FROM scheduled_events WHERE guild_id='2222'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_iso_millis(&updated_at);
+    rank.await.unwrap().unwrap();
+    counter.await.unwrap().unwrap();
+    for query in [
+        "SELECT human_member_count FROM guild_counters WHERE guild_id='2222'",
+        "SELECT human_member_count FROM counter_snapshots WHERE guild_id='2222'",
+    ] {
+        let count: i32 = sqlx::query_scalar(query).fetch_one(pool).await.unwrap();
+        assert_eq!(
+            count, 3,
+            "the newest roster must win in both counter tables"
+        );
+    }
+    assert_eq!(mock.requests().len(), 4);
+    mock.shutdown().await;
 }

@@ -126,7 +126,13 @@ async fn run_job(job: Job, status: SharedStatus, mut shutdown: watch::Receiver<b
             }
             deadline = interval.tick() => {
                 if active.is_some() || completed_at.is_some_and(|end| deadline < end) { continue; }
-                let mut statuses = status.write().await;
+                let mut statuses = tokio::select! {
+                    biased;
+                    _ = stopped(&mut shutdown) => break,
+                    statuses = status.write() => statuses,
+                };
+                // Cancellation may have arrived while the lock became available.
+                if *shutdown.borrow() || shutdown.has_changed().is_err() { break; }
                 let current = statuses.get_mut(job.name).expect("registered job");
                 current.last_start = Some(timestamp());
                 current.running = true;

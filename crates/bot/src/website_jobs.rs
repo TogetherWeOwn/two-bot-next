@@ -4,12 +4,12 @@ use std::{sync::Arc, time::Duration};
 
 use serde_json::Value;
 use sqlx::PgPool;
-use tokio::sync::{watch, OnceCell};
+use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
     apply_web_contract, build_community_snapshot, build_counter_reading, match_rank_roles,
-    normalize_events, read_raid_windows, replace_events, write_counter, write_rank_snapshot,
-    Config, RawScheduledEvent, RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
-    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    normalize_events, now_iso, read_raid_windows, replace_events, write_counter,
+    write_rank_snapshot, Config, RawScheduledEvent, RosterMember, WebsiteStoreError,
+    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::ActionExecutor;
 
@@ -59,6 +59,7 @@ struct Context {
     pool: OnceCell<PgPool>,
     rest: ActionExecutor,
     guild: String,
+    observation: Mutex<()>,
 }
 
 impl Context {
@@ -82,17 +83,19 @@ impl Context {
     }
 }
 
-/// A drop also broadcasts cancellation if the essential gateway cancels HTTP.
+/// Fallback cancellation if the HTTP owner is dropped before graceful cleanup.
 struct Shutdown(watch::Sender<bool>);
 impl Drop for Shutdown {
     fn drop(&mut self) {
-        let _ = self.0.send(true);
+        self.0.send_replace(true);
     }
 }
 
-pub async fn serve(config: &Config, gateway: server::SharedState) -> std::io::Result<()> {
-    let (sender, receiver) = watch::channel(false);
-    let shutdown = Shutdown(sender);
+pub async fn serve(
+    config: &Config,
+    gateway: server::SharedState,
+    shutdown: watch::Sender<bool>,
+) -> std::io::Result<()> {
     let mut registered = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
         match ActionExecutor::with_proxy(token.to_owned(), std::env::var("DISCORD_API_BASE").ok()) {
@@ -102,6 +105,7 @@ pub async fn serve(config: &Config, gateway: server::SharedState) -> std::io::Re
                     pool: OnceCell::new(),
                     rest,
                     guild: guild.to_string(),
+                    observation: Mutex::new(()),
                 });
                 for (name, kind) in NAMES
                     .into_iter()
@@ -121,8 +125,14 @@ pub async fn serve(config: &Config, gateway: server::SharedState) -> std::io::Re
                         action: Arc::new(move || {
                             let context = context.clone();
                             Box::pin(async move {
-                                run_once(kind, context.pool().await?, &context.rest, &context.guild)
-                                    .await
+                                run_once(
+                                    kind,
+                                    context.pool().await?,
+                                    &context.rest,
+                                    &context.guild,
+                                    &context.observation,
+                                )
+                                .await
                             })
                         }),
                     });
@@ -134,17 +144,28 @@ pub async fn serve(config: &Config, gateway: server::SharedState) -> std::io::Re
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
     let status = jobs::statuses(&NAMES, registered.is_empty());
-    let supervisor = tokio::spawn(jobs::supervise(registered, status.clone(), receiver));
-    let result = server::serve(&config.listen_addr, gateway, status, shutdown.0.clone()).await;
-    let _ = shutdown.0.send(true);
-    let _ = supervisor.await;
-    result
+    let http = server::serve(
+        &config.listen_addr,
+        gateway,
+        status.clone(),
+        shutdown.clone(),
+    );
+    serve_jobs(registered, status, shutdown, http).await
 }
 
-fn observed_at() -> Result<String, ErrorClass> {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|_| ErrorClass::Configuration)
+/// Own the production spawn/cancel/join path independently of job registration.
+pub(crate) async fn serve_jobs(
+    registered: Vec<Job>,
+    status: jobs::SharedStatus,
+    shutdown: watch::Sender<bool>,
+    http: impl std::future::Future<Output = std::io::Result<()>>,
+) -> std::io::Result<()> {
+    let shutdown = Shutdown(shutdown);
+    let supervisor = tokio::spawn(jobs::supervise(registered, status, shutdown.0.subscribe()));
+    let result = http.await;
+    shutdown.0.send_replace(true);
+    let _ = supervisor.await;
+    result
 }
 
 async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, ErrorClass> {
@@ -230,6 +251,7 @@ pub async fn run_once(
     pool: &PgPool,
     rest: &ActionExecutor,
     guild: &str,
+    observation: &Mutex<()>,
 ) -> Result<(), ErrorClass> {
     if matches!(kind, Kind::Events) {
         let response = get(
@@ -244,10 +266,14 @@ pub async fn run_once(
             .map(raw_event)
             .collect::<Result<Vec<_>, _>>()?;
         let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
-        return replace_events(pool, guild, &observed_at()?, &events)
+        return replace_events(pool, guild, &now_iso(), &events)
             .await
             .map_err(|_| ErrorClass::Database);
     }
+    // Both kinds publish the denominator. Hold one shared lane from the first
+    // observation through commit so a slow rank tick cannot overwrite a newer
+    // counter roster. Events use independent tables and do not take this lock.
+    let _observation = observation.lock().await;
     let Some(windows) = read_raid_windows(pool, guild)
         .await
         .map_err(|_| ErrorClass::Database)?
@@ -267,7 +293,7 @@ pub async fn run_once(
         let reading = build_counter_reading(&members, &windows).ok_or(ErrorClass::Rest)?;
         let count =
             i32::try_from(reading.human_member_count).map_err(|_| ErrorClass::Configuration)?;
-        return write_counter(pool, guild, &observed_at()?, count)
+        return write_counter(pool, guild, &now_iso(), count)
             .await
             .map_err(|_| ErrorClass::Database);
     }
@@ -284,7 +310,7 @@ pub async fn run_once(
         .collect::<Result<Vec<_>, ErrorClass>>()?;
     let ladder = match_rank_roles(&roles).ok_or(ErrorClass::Configuration)?;
     let snapshot = build_community_snapshot(&members, &ladder, &windows).ok_or(ErrorClass::Rest)?;
-    write_rank_snapshot(pool, guild, &observed_at()?, &snapshot)
+    write_rank_snapshot(pool, guild, &now_iso(), &snapshot)
         .await
         .map_err(|error| match error {
             WebsiteStoreError::Invariant { .. } => ErrorClass::Configuration,

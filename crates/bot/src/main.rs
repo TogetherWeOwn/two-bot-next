@@ -117,9 +117,10 @@ async fn main() {
         }
     };
 
-    let http = serve(&config, state);
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    let http = serve(&config, state, shutdown.clone());
     let result = match gateway_task {
-        Some(task) => supervise_gateway(task, http).await,
+        Some(task) => supervise_gateway(task, http, shutdown).await,
         None => http.await,
     };
     if let Err(err) = result {
@@ -158,15 +159,24 @@ fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static 
 async fn supervise_gateway(
     mut task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
     http: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<()> {
+    tokio::pin!(http);
     tokio::select! {
         biased;
         // Never expose task/SQL errors: they may contain connection secrets.
-        _ = &mut task => Err(std::io::Error::other(
-            "gateway task stopped; container restart required",
-        )),
-        result = http => {
+        _ = &mut task => {
+            // Sticky even if HTTP has not subscribed yet. Keep polling HTTP so
+            // its job supervisor can cancel and join every active action.
+            shutdown.send_replace(true);
+            let _ = http.await;
+            Err(std::io::Error::other(
+                "gateway task stopped; container restart required",
+            ))
+        },
+        result = &mut http => {
             task.abort();
+            let _ = task.await;
             result
         }
     }

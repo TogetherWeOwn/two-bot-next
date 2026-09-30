@@ -69,7 +69,7 @@ async fn readyz(
     )
 }
 
-/// Serve until SIGTERM/SIGINT, notifying jobs before HTTP starts draining.
+/// Serve until externally stopped or SIGTERM/SIGINT, notifying jobs before draining.
 pub async fn serve(
     addr: &str,
     state: SharedState,
@@ -80,10 +80,26 @@ pub async fn serve(
     tracing::info!(addr, "listening");
     axum::serve(listener, router_with_jobs(state, jobs).into_make_service())
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            let _ = shutdown.send(true);
+            tokio::select! {
+                biased;
+                _ = shutdown_requested(shutdown.subscribe()) => {},
+                _ = shutdown_signal() => {},
+            }
+            shutdown.send_replace(true);
         })
         .await
+}
+
+/// Observe sticky cancellation, including a stop sent before subscribing or closure.
+pub(crate) async fn shutdown_requested(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn shutdown_signal() {
