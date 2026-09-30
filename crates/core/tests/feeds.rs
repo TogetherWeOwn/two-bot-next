@@ -689,6 +689,124 @@ fn legacy_parser_emulation_matches_identity_corpus() {
 }
 
 #[test]
+fn xml_resource_bombs_are_rejected_in_subprocess() {
+    if std::env::var_os("TWO_FEED_XML_RESOURCE_PROBE").is_some() {
+        let deep = format!(
+            "<rss><channel><item>{}<guid>one</guid>{}</item></channel></rss>",
+            "<x>".repeat(50_000),
+            "</x>".repeat(50_000)
+        );
+        let attributes: String = (0..170_000).map(|i| format!(" a{i}=\"v\"")).collect();
+        let wide = format!("<rss><channel><item{attributes}/></channel></rss>");
+        for xml in [deep, wide] {
+            assert!(xml.len() < MAX_FEED_BYTES);
+            assert!(matches!(parse_xml_feed(&xml), Err(FeedError::InvalidXml)));
+        }
+        return;
+    }
+    // A stack overflow aborts, rather than unwinds. Keep the adversarial
+    // fixtures in a child using the ordinary test-thread stack and bound
+    // its lifetime so a quadratic-parser regression cannot hang the suite.
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "xml_resource_bombs_are_rejected_in_subprocess"])
+        .env("TWO_FEED_XML_RESOURCE_PROBE", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("XML resource rejection exceeded the subprocess deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "XML probe failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn xml_depth_and_attribute_limits_are_independent_of_body_and_nodes() {
+    let depth_xml = |depth: usize| {
+        format!(
+            "<rss>{}{}</rss>",
+            "<x>".repeat(depth - 1),
+            "</x>".repeat(depth - 1)
+        )
+    };
+    assert!(parse_xml_feed(&depth_xml(64)).is_ok());
+    assert!(matches!(
+        parse_xml_feed(&depth_xml(65)),
+        Err(FeedError::InvalidXml)
+    ));
+    // Self-closing elements also occupy a depth level.
+    let xml = format!("<rss>{}<x/>{}</rss>", "<x>".repeat(63), "</x>".repeat(63));
+    assert!(matches!(parse_xml_feed(&xml), Err(FeedError::InvalidXml)));
+    let attributes =
+        |count: usize| -> String { (0..count).map(|i| format!(" a{i}=\"v\"")).collect() };
+    assert!(parse_xml_feed(&format!("<rss{}/>", attributes(64))).is_ok());
+    assert!(matches!(
+        parse_xml_feed(&format!("<rss{}/>", attributes(65))),
+        Err(FeedError::InvalidXml)
+    ));
+    // Namespace declarations count too, including those that roxmltree
+    // drops from the ordinary attribute collection.
+    let namespaces: String = (0..65)
+        .map(|i| format!(" xmlns:n{i}=\"urn:n{i}\""))
+        .collect();
+    assert!(matches!(
+        parse_xml_feed(&format!("<rss{namespaces}/>")),
+        Err(FeedError::InvalidXml)
+    ));
+    let tag = format!("<x{}/>", attributes(64));
+    assert!(parse_xml_feed(&format!("<rss>{}</rss>", tag.repeat(64))).is_ok());
+    assert!(matches!(
+        parse_xml_feed(&format!("<rss>{}</rss>", tag.repeat(65))),
+        Err(FeedError::InvalidXml)
+    ));
+    // Markup in opaque spans and quoted values is not real nesting or
+    // attributes. A quote-aware, delimiter-aware scan must not false-reject.
+    let xml = format!("<?pi {}?><rss note='{}'><channel><item><guid><![CDATA[{}]]><!--{}--></guid><link>https://example.org/p</link></item></channel></rss>", "<x a=\"v\">".repeat(100), " > a=\"v\"".repeat(100), "<x a=\"v\">".repeat(100), "<x a=\"v\">".repeat(100));
+    assert_eq!(parse_xml_feed(&xml).unwrap().len(), 1);
+    for xml in [
+        "<rss><!--",
+        "<rss><![CDATA[",
+        "<rss><?pi",
+        "<rss a=\"unterminated>",
+        "</rss><rss/>",
+    ] {
+        assert!(matches!(parse_xml_feed(xml), Err(FeedError::InvalidXml)));
+    }
+}
+
+#[test]
+fn feed_container_projection_matches_legacy_records() {
+    let item = "<item><guid>one</guid><link>https://example.org/p</link></item>";
+    for xml in [
+        format!("<rss channel=\"ignored\"><channel>{item}</channel></rss>"),
+        format!("<rss><channel item=\"ignored\">{item}</channel></rss>"),
+        format!("<rss><channel>{item}</channel><channel>{item}</channel></rss>"),
+        "<feed entry=\"ignored\"><entry><id>one</id><link href=\"https://example.org/p\"/></entry></feed>".into(),
+        format!("<rss channel=\"\"><channel>{item}</channel></rss>"),
+        format!("<rss><channel item=\"\">{item}</channel></rss>"),
+        "<feed entry=\"\"><entry><id>one</id><link href=\"https://example.org/p\"/></entry></feed>".into(),
+    ] {
+        assert!(parse_xml_feed(&xml).unwrap().is_empty(), "xml: {xml}");
+    }
+    let xml = format!("<rss><channel>{item}{item}</channel></rss>");
+    assert_eq!(parse_xml_feed(&xml).unwrap().len(), 2);
+    let xml = "<feed><entry><id>one</id><link href=\"https://example.org/p\"/></entry><entry><id>two</id><link href=\"https://example.org/q\"/></entry></feed>";
+    assert_eq!(parse_xml_feed(xml).unwrap().len(), 2);
+}
+
+#[test]
 fn rejects_xml_entities_malformed_size_and_item_explosion() {
     for xml in ["<rss>", "<html/>",
         "<!DOCTYPE rss [<!ENTITY secret SYSTEM 'file:///etc/passwd'>]><rss><channel><item><title>&secret;</title></item></channel></rss>",

@@ -207,10 +207,82 @@ pub fn feed_removed_text(removed: bool) -> &'static str {
     }
 }
 
+const MAX_XML_DEPTH: usize = 64;
+const MAX_XML_ELEMENT_ATTRIBUTES: usize = 64;
+const MAX_XML_TOTAL_ATTRIBUTES: usize = 4096;
+
+/// roxmltree's tokenizer recurses per element and its duplicate-attribute
+/// checks are quadratic per tag. Byte/node ceilings alone do not bound either
+/// path. This allocation-free, iterative preflight runs BEFORE construction;
+/// roxmltree still validates XML syntax, names, namespaces and matching tags.
+fn bound_xml_resources(xml: &str) -> Result<(), FeedError> {
+    let mut depth = 0usize;
+    let mut total_attributes = 0usize;
+    let mut offset = 0usize;
+    while let Some(relative) = xml[offset..].find('<') {
+        let start = offset + relative;
+        let rest = &xml[start..];
+        let opaque = if rest.starts_with("<!--") {
+            Some((4, "-->"))
+        } else if rest.starts_with("<![CDATA[") {
+            Some((9, "]]>"))
+        } else if rest.starts_with("<?") {
+            Some((2, "?>"))
+        } else {
+            None
+        };
+        if let Some((prefix_len, terminator)) = opaque {
+            let end = rest[prefix_len..]
+                .find(terminator)
+                .ok_or(FeedError::InvalidXml)?;
+            offset = start + prefix_len + end + terminator.len();
+            continue;
+        }
+        // Reject DTDs before any parser work, including internal subsets.
+        if rest.starts_with("<!") {
+            return Err(FeedError::InvalidXml);
+        }
+        let end = open_tag_end(rest);
+        let tag = &rest[..end];
+        if !tag.ends_with('>') {
+            return Err(FeedError::InvalidXml);
+        }
+        if tag.starts_with("</") {
+            depth = depth.checked_sub(1).ok_or(FeedError::InvalidXml)?;
+        } else {
+            // A self-closing element also occupies a level while parsing.
+            if depth >= MAX_XML_DEPTH {
+                return Err(FeedError::InvalidXml);
+            }
+            let name_end = tag
+                .find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+                .ok_or(FeedError::InvalidXml)?;
+            let mut attributes = 0usize;
+            if !scan_attributes(&tag[name_end..], &mut |_, _| {
+                attributes += 1;
+                total_attributes += 1;
+                attributes <= MAX_XML_ELEMENT_ATTRIBUTES
+                    && total_attributes <= MAX_XML_TOTAL_ATTRIBUTES
+            }) {
+                return Err(FeedError::InvalidXml);
+            }
+            if !tag.ends_with("/>") {
+                depth += 1;
+            }
+        }
+        offset = start + end;
+    }
+    if depth != 0 {
+        return Err(FeedError::InvalidXml);
+    }
+    Ok(())
+}
+
 pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
     if xml.len() > MAX_FEED_BYTES {
         return Err(FetchError::TooLarge.into());
     }
+    bound_xml_resources(xml)?;
     let doc = Document::parse_with_options(
         xml,
         ParsingOptions {
@@ -224,17 +296,33 @@ pub fn parse_xml_feed(xml: &str) -> Result<Vec<FeedItem>, FeedError> {
     // Qualified root name: legacy looks up `parsed.rss`/`parsed.feed`, so a
     // prefixed root is not a feed at all rather than a local-name match.
     let entries: Vec<_> = match raw_tag_name(xml, root) {
-        "rss" => root
-            .children()
-            .find(|node| named(xml, *node, "channel"))
-            .into_iter()
-            .flat_map(|channel| channel.children())
-            .filter(|node| named(xml, *node, "item"))
-            .collect(),
-        "feed" => root
-            .children()
-            .filter(|node| named(xml, *node, "entry"))
-            .collect(),
+        "rss" => {
+            // Legacy requires channel to be a single record. An attribute
+            // shadows its children; repeated channels project to an array,
+            // not a record. Item/entry arrays, in contrast, are supported.
+            if raw_attribute(xml, root, "channel").is_some() {
+                return Ok(Vec::new());
+            }
+            let mut channels = root.children().filter(|node| named(xml, *node, "channel"));
+            let Some(channel) = channels.next() else {
+                return Ok(Vec::new());
+            };
+            if channels.next().is_some() || raw_attribute(xml, channel, "item").is_some() {
+                return Ok(Vec::new());
+            }
+            channel
+                .children()
+                .filter(|node| named(xml, *node, "item"))
+                .collect()
+        }
+        "feed" => {
+            if raw_attribute(xml, root, "entry").is_some() {
+                return Ok(Vec::new());
+            }
+            root.children()
+                .filter(|node| named(xml, *node, "entry"))
+                .collect()
+        }
         _ => return Err(FeedError::InvalidXml),
     };
     if entries.len() > MAX_FEED_ITEMS {

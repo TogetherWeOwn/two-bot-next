@@ -19,7 +19,15 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
   20–32-character channel ID and expands it into the videos Atom URL.
 - RSS item/guid and Atom entry/id parsing, alternate-link preference, title,
   published/pubDate/updated fields, 200-item ceiling. No external entity resolver;
-  DTD disabled, XML node count bounded. UTF-8 fixtures cover all three kinds.
+  DTD disabled, XML node count bounded. An iterative, allocation-free preflight
+  rejects depth above 64 (including self-closing elements), more than 64
+  attributes on one element, or more than 4,096 attributes in the document
+  **before** roxmltree constructs it. Namespace declarations count as attributes;
+  comments, CDATA and processing instructions are opaque. These limits protect
+  synchronous parser stack/CPU independently of the byte/node/item ceilings,
+  which an async deadline alone cannot do. UTF-8 fixtures cover all three kinds.
+  Container attributes shadow child fields; repeated RSS channels are not a
+  single channel record, while repeated items/entries remain supported.
 - Exact User-Agent: `Owen/1.0 (+https://two.gg)`. Decompressed byte ceiling:
   `2_000_000`. Per-feed deadline: 15 seconds, across DNS/redirects/body parsing.
 - `TWO_ANNOUNCEMENTS` stays default-off. Existing `FeatureGates` reads
