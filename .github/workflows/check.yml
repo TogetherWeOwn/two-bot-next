@@ -49,6 +49,9 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: offline build-cache safety regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -136,6 +139,9 @@ jobs:
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
+      - name: Sticky runtime acceptance tests (CI service only)
+        run: cargo test -p two-bot --locked sticky_runtime_tests -- --ignored --test-threads=1
+
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
       - name: cargo-deny
@@ -175,6 +181,35 @@ jobs:
           cargo test -p two-bot-core --features db --locked --lib presence_store
           cargo test -p two-bot-core --features db --locked --lib inactivity_store
 
+  feeds-db:
+    name: feeds db check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+    services:
+      agent-testdb:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Map test-container-only hostname on runner
+        run: printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
+      - run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
+      - run: cargo test -p two-bot-core --features db --test feeds --locked
+      - run: cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
+
   worker:
     name: worker check
     runs-on: ubuntu-latest
@@ -200,6 +235,8 @@ jobs:
         run: |
           python3 scripts/check-env-bindings.py wrangler.toml
           python3 scripts/test-env-bindings.py
+      - name: Verify frozen legacy registry export preconditions
+        run: node --test ../scripts/test-export-legacy-registry.mjs
       - name: Verify PR lint event and dispatch paths
         run: python3 ../scripts/test-pr-lint.py
       - name: Verify release reconciliation retries
