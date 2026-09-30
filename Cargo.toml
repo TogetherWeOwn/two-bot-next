@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover"]
-default-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover"]
+members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
+default-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
 
 [workspace.package]
 edition = "2021"

@@ -1,0 +1,26 @@
+[package]
+name = "two-bot-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# S6 runtime store (TOG-9811): sqlx Postgres pool, checksum migration runner
+# (bot range 0001-0999; feature slices use 0100-0339 inside this directory),
+# funnel + invite-snapshot persistence behind the core sync seams, and the
+# `web_v1` read-only contract views.
+#
+# Intra-workspace path dep carries an explicit version (still resolved via
+# path): cargo-deny `wildcards = "deny"` rejects version-less deps.
+
+[dependencies]
+two-bot-core = { version = "0.1.0", path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
