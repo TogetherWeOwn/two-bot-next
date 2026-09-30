@@ -96,6 +96,18 @@ pub struct ScheduledEvent {
     pub status: EventStatus,
 }
 
+/// Synchronous per-row mirror seam for internal event actions. A successful
+/// action must await this write; the poller's whole-guild replacement is not a
+/// substitute because it would erase unrelated rows.
+pub trait ScheduledEventMirror: Send + Sync {
+    fn upsert(
+        &self,
+        guild_id: &str,
+        observed_at: &str,
+        event: &ScheduledEvent,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
 /// Why a poll tick recorded nothing (legacy `ScheduledEventsResult.reason`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduledEventsSkip {

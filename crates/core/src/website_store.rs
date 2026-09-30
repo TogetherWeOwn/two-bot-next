@@ -304,6 +304,49 @@ pub async fn replace_events(
     tx.commit().await
 }
 
+/// Internal event action write: refresh exactly one row before acknowledging
+/// the action. Unlike the poller's whole-guild swap, unrelated events survive.
+pub async fn upsert_event(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    observed_at: &str,
+    event: &ScheduledEvent,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO scheduled_events
+           (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (guild_id, event_id) DO UPDATE SET
+           name = EXCLUDED.name, starts_at = EXCLUDED.starts_at,
+           channel_id = EXCLUDED.channel_id, description = EXCLUDED.description,
+           status = EXCLUDED.status, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(guild_id)
+    .bind(&event.id)
+    .bind(&event.name)
+    .bind(&event.starts_at)
+    .bind(&event.channel_id)
+    .bind(&event.description)
+    .bind(event.status.as_str())
+    .bind(observed_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+impl crate::scheduled_events::ScheduledEventMirror for Pool<Postgres> {
+    async fn upsert(
+        &self,
+        guild_id: &str,
+        observed_at: &str,
+        event: &ScheduledEvent,
+    ) -> Result<(), String> {
+        upsert_event(self, guild_id, observed_at, event)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Apply the `web_v1` contract views (legacy `applyWebContract`: the SQL file
 /// is the contract, this only runs it). Idempotent — everything in the file
 /// is `CREATE OR REPLACE` / `IF NOT EXISTS` — so the boot path can run it on
