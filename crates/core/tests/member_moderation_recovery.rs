@@ -77,19 +77,33 @@ async fn permanent_ban_supersedes_expiry_but_rejected_ban_preserves_it() {
 
 #[tokio::test]
 async fn generated_expiry_reason_is_bounded_and_unicode_safe() {
-    for text in ["x", "🦀"] {
+    // Reasons are bounded by 512 UTF-16 units (JS-length parity): 512 BMP
+    // chars, or 256 astral chars at 2 units each, are the valid maxima.
+    for (text, repeats) in [("x", 512), ("🦀", 256)] {
         let discord = MockMemberDiscord::new();
         let store = MemMemberStore::new();
         let svc =
             MemberModerationService::new(discord, store.clone(), policy(), || 1_700_000_000_000);
         let mut req = execution(ModerationAction::TempBan, "long-reason");
-        req.reason = text.repeat(512);
+        req.reason = text.repeat(repeats);
         svc.execute(&req).await.expect("valid max reason");
         let jobs = store.claim_due_unbans(GUILD, DUE, 1).await.expect("expiry");
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].reason.chars().count(), 512);
+        assert!(jobs[0].reason.chars().count() <= 512);
         assert!(jobs[0].reason.starts_with("Temporary ban expired: "));
         assert!(jobs[0].reason.ends_with(text));
+    }
+    // The BMP maximum fills the 512-char expiry budget exactly.
+    {
+        let discord = MockMemberDiscord::new();
+        let store = MemMemberStore::new();
+        let svc =
+            MemberModerationService::new(discord, store.clone(), policy(), || 1_700_000_000_000);
+        let mut req = execution(ModerationAction::TempBan, "long-reason");
+        req.reason = "x".repeat(512);
+        svc.execute(&req).await.expect("valid max reason");
+        let jobs = store.claim_due_unbans(GUILD, DUE, 1).await.expect("expiry");
+        assert_eq!(jobs[0].reason.chars().count(), 512);
     }
 }
 

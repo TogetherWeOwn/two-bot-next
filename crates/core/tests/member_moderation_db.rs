@@ -786,7 +786,7 @@ async fn postgres_permanent_ban_supersession_and_failed_confirmation_fence() {
             .confirm_ban("guild", user, request, NOW)
             .await
             .expect_err("confirmation rollback");
-        assert_eq!(error.0, "postgres moderation ledger: 23514");
+        assert_eq!(error.message, "postgres moderation ledger: 23514");
         assert_eq!(ban_state(&pool, request).await, "prepared");
     }
     assert_eq!(unban_state(&pool, "pending-expiry").await, "pending");

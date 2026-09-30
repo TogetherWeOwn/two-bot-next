@@ -230,13 +230,44 @@ pub trait MemberDiscord: Send + Sync {
 /// Opaque store failure (the sqlx implementation maps `sqlx::Error` here so
 /// core unit tests never need a Postgres driver).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("moderation store error: {0}")]
-pub struct StoreError(pub String);
+#[error("moderation store error: {message}")]
+pub struct StoreError {
+    pub message: String,
+    /// True only when the failing operation provably persisted nothing for
+    /// this request: a rolled-back staging transaction, or a writeless fence
+    /// refusal. The idempotency key is then safe to release for a real second
+    /// attempt. Ambiguous commits, post-dispatch failures and conflicting
+    /// durable rows stay fenced (`false`).
+    rolled_back: bool,
+}
 
 impl StoreError {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            rolled_back: false,
+        }
+    }
+
+    /// A failure whose transaction rolled back before any durable write for
+    /// this request (or that wrote nothing at all): safe to retry, never
+    /// fenced. Callers must use this only when no mutation could have
+    /// persisted — never for ambiguous commits or post-dispatch failures.
+    #[must_use]
+    pub fn rolled_back(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            rolled_back: true,
+        }
+    }
+
+    /// True only for failures that prove no mutation happened, so the claim
+    /// is safe to release and the staged state safe to retry (the storage
+    /// mirror of [`DiscordError::is_safe_pre_mutation`]).
+    #[must_use]
+    pub fn is_safe_pre_mutation(&self) -> bool {
+        self.rolled_back
     }
 }
 
@@ -281,6 +312,28 @@ pub struct UnbanJob {
     pub guild_id: String,
     pub user_id: String,
     pub reason: String,
+}
+
+/// Authoritative outcome for an uncertain dispatched unban (reconciliation
+/// evidence comes from outside this crate — the runtime operator workflow —
+/// never from age or from whether the member currently appears banned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnbanResolution {
+    /// The dispatched DELETE provably landed: close the job as done.
+    Completed,
+    /// The dispatched DELETE provably cannot land: supersede the job so new
+    /// bans for the member may proceed.
+    Void,
+}
+
+impl UnbanResolution {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Void => "void",
+        }
+    }
 }
 
 /// Persistence seam for the member slice (legacy `ModerationStore`,
@@ -429,6 +482,21 @@ pub trait MemberModerationStore: Send + Sync {
         &self,
         request_id: &str,
         claim_token: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Close an uncertain dispatched unban with an authoritative outcome
+    /// (`completed`: the DELETE provably landed; `void`: it provably cannot
+    /// land). Only `running` jobs resolve; a lost or already closed claim
+    /// errors so a double resolution surfaces instead of vanishing. The
+    /// evidence must name the exact guild/member/request; this method never
+    /// guesses from age or current remote state. Staging and confirmation
+    /// refuse while any `running` row exists for the member, so this is the
+    /// only path that lifts the fence.
+    fn resolve_uncertain_unban(
+        &self,
+        request_id: &str,
+        claim_token: &str,
+        resolution: UnbanResolution,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Give a safely-failed claim back as `pending` for the next sweep
@@ -755,9 +823,20 @@ where
         let outcome = match self.carry_out(exec, validated).await {
             Ok(outcome) => outcome,
             Err(err) => {
-                if matches!(&err, MemberError::Discord(d) if d.is_safe_pre_mutation()) {
-                    // Provably no mutation happened: give the key back so a
-                    // retry is a real second attempt, not a cached error.
+                let safe_pre_mutation = match &err {
+                    // Discord refused before mutating: provably nothing
+                    // happened, so the key is safe to give back.
+                    MemberError::Discord(d) => d.is_safe_pre_mutation(),
+                    // Storage rolled back before any durable write for this
+                    // request (or wrote nothing): equally safe to retry.
+                    MemberError::Store(s) => s.is_safe_pre_mutation(),
+                    _ => false,
+                };
+                if safe_pre_mutation {
+                    // A real second attempt, not a cached error. Release
+                    // failures are ignored: the claim row is `in_flight`
+                    // either way, so a retry stays `InFlight`, never a
+                    // duplicate mutation.
                     let _ = self
                         .store
                         .release(&exec.guild_id, &exec.idempotency_key)
@@ -767,6 +846,23 @@ where
             }
         };
 
+        // Discord accepted the action: persist the observed-success audit
+        // FIRST, independently of the completion write. If completion fails
+        // afterward the claim stays uncertain (correct), but the audit of a
+        // successful destructive action already exists. The audit write is
+        // idempotent on `request_id`, so a retry never duplicates it — and a
+        // retry stays `InFlight`, never a second Discord call.
+        if let Err(err) = self
+            .store
+            .record_audit(&self.audit_row(exec, validated, outcome))
+            .await
+        {
+            tracing::error!(
+                request_id = exec.request_id.as_str(),
+                error = err.message.as_str(),
+                "moderation_audit_failed"
+            );
+        }
         self.store
             .complete(
                 &exec.guild_id,
@@ -776,20 +872,6 @@ where
                 &format_iso_millis((self.now)()),
             )
             .await?;
-        // Discord already accepted the action: audit loss is serious and
-        // logged, but failing here would invite a duplicate mutation on
-        // retry (legacy `moderation_audit_failed`).
-        if let Err(err) = self
-            .store
-            .record_audit(&self.audit_row(exec, validated, outcome))
-            .await
-        {
-            tracing::error!(
-                request_id = exec.request_id.as_str(),
-                error = err.0.as_str(),
-                "moderation_audit_failed"
-            );
-        }
         Ok(MemberResult {
             outcome,
             replayed: false,
@@ -995,7 +1077,7 @@ where
         {
             tracing::error!(
                 request_id = job.request_id.as_str(),
-                error = err.0.as_str(),
+                error = err.message.as_str(),
                 "moderation_unban_audit_failed"
             );
         }
@@ -1079,11 +1161,29 @@ struct MemInner {
 }
 
 impl MemInner {
+    // F1: a `running` schedule holds a dispatched unban whose remote DELETE
+    // may still land. Refuse fresh staging until authoritative resolution
+    // clears the fence — a late DELETE must never remove a new ban.
+    fn refuse_running_unban(&self, guild: &str, user: &str) -> Result<(), StoreError> {
+        if self.unbans.values().any(|row| {
+            row.guild_id == guild && row.user_id == user && row.state == UnbanState::Running
+        }) {
+            return Err(StoreError::new(
+                "member has an uncertain dispatched unban; resolve it before banning",
+            ));
+        }
+        Ok(())
+    }
+
     fn stage_ban(&mut self, guild: &str, user: &str, request: &str) -> Result<(), StoreError> {
+        self.refuse_running_unban(guild, user)?;
         if self.bans.get(request).is_some_and(|row| {
             row.state != BanState::Rejected || row.guild_id != guild || row.user_id != user
         }) {
-            return Err(StoreError::new("ban request id is already in use"));
+            // The competing non-rejected intent survives; nothing was
+            // written for this request, so a retry under a fresh key is
+            // safe — but never under this same conflicting key.
+            return Err(StoreError::rolled_back("ban request id is already in use"));
         }
         self.ban_sequence += 1;
         self.bans.insert(
@@ -1369,10 +1469,13 @@ impl MemberModerationStore for MemMemberStore {
         created_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
+        inner.refuse_running_unban(guild_id, user_id)?;
         if inner.unbans.get(request_id).is_some_and(|row| {
             row.state != UnbanState::Cancelled || row.guild_id != guild_id || row.user_id != user_id
         }) {
-            return Err(StoreError::new("unban request id is already in use"));
+            return Err(StoreError::rolled_back(
+                "unban request id is already in use",
+            ));
         }
         inner.stage_ban(guild_id, user_id, request_id)?;
         inner.unbans.insert(
@@ -1571,6 +1674,30 @@ impl MemberModerationStore for MemMemberStore {
         }
         Ok(())
     }
+
+    async fn resolve_uncertain_unban(
+        &self,
+        request_id: &str,
+        claim_token: &str,
+        resolution: UnbanResolution,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        match inner.unbans.get_mut(request_id) {
+            Some(row)
+                if row.state == UnbanState::Running
+                    && row.claim_token.as_deref() == Some(claim_token) =>
+            {
+                row.state = match resolution {
+                    UnbanResolution::Completed => UnbanState::Done,
+                    UnbanResolution::Void => UnbanState::Superseded,
+                };
+                row.completed_at = Some("resolved".to_owned());
+                row.claim_token = None;
+                Ok(())
+            }
+            _ => Err(StoreError::new("lost uncertain scheduled-unban claim")),
+        }
+    }
 }
 
 /// Scripted [`MemberDiscord`] double: records every call, optionally fails
@@ -1733,6 +1860,16 @@ mod tests {
     }
 
     fn execution(action: ModerationAction) -> MemberExecution {
+        execution_with_id(
+            action,
+            &format!(
+                "req-{}",
+                action.action_name().trim_start_matches("moderation.")
+            ),
+        )
+    }
+
+    fn execution_with_id(action: ModerationAction, request_id: &str) -> MemberExecution {
         MemberExecution {
             action,
             guild_id: GUILD.to_owned(),
@@ -1744,16 +1881,13 @@ mod tests {
                 ModerationAction::TempBan | ModerationAction::Timeout => Some(3600),
                 _ => None,
             },
-            request_id: format!(
-                "req-{}",
-                action.action_name().trim_start_matches("moderation.")
-            ),
-            idempotency_key: format!(
-                "key-{}",
-                action.action_name().trim_start_matches("moderation.")
-            ),
+            request_id: request_id.to_owned(),
+            idempotency_key: request_id.to_owned(),
         }
     }
+
+    const NOW: &str = "2023-11-14T22:13:20.000Z";
+    const DUE: &str = "2023-11-14T23:13:20.000Z";
 
     fn service(
         discord: MockMemberDiscord,
@@ -2427,5 +2561,456 @@ mod tests {
             svc.store.unban_state("req-tempban-4"),
             Some("pending".to_owned())
         );
+    }
+
+    // F1: an uncertain dispatched unban fences fresh bans for the same
+    // member until authoritative resolution lands. A `void` resolution (the
+    // DELETE provably never landed) lifts the fence; the late effect can no
+    // longer remove the new ban.
+    //
+    // The fence lives in the ledger row (`running`), not in the claim
+    // handle: claiming the job without completing it leaves the member
+    // fenced exactly as a timed-out dispatch would. No sweep task is
+    // spawned — a sweep dispatches inside the member queue, so a concurrent
+    // fresh ban would queue behind it rather than reach the fence; queue
+    // serialization itself is covered by
+    // `permanent_ban_waits_for_the_same_members_live_unban`.
+    #[tokio::test]
+    async fn uncertain_unban_fences_fresh_bans_until_resolved() {
+        for action in [ModerationAction::Ban, ModerationAction::TempBan] {
+            let discord = MockMemberDiscord::new();
+            let store = MemMemberStore::new();
+            let svc = service(discord.clone(), store.clone());
+            svc.execute(&execution_with_id(ModerationAction::TempBan, "old"))
+                .await
+                .expect("old tempban");
+            // Baseline: the staged tempban itself dispatched exactly one ban.
+            let bans_before = discord.call_count("ban");
+            // The fixed clock pins `now` at stage time, so the 3600 s expiry
+            // is in the future. Backdate it so the claim finds the job due
+            // (same pattern as `sweep_requeues_safely_failed_unbans`).
+            {
+                let mut inner = store.inner.lock().expect("lock");
+                let row = inner.unbans.get_mut("old").expect("staged");
+                row.execute_at = NOW.to_owned();
+            }
+            // Dispatch the DELETE and leave it uncertain: the job is now
+            // `running` in the ledger with its claim token in hand.
+            let job = store
+                .claim_due_unbans(GUILD, NOW, 25)
+                .await
+                .expect("claim")
+                .pop()
+                .expect("due job");
+            assert_eq!(job.request_id, "old");
+            // Fresh ban while the DELETE is uncertain: must refuse, and must
+            // not reach Discord at all.
+            let fresh = execution_with_id(action, "new-ban");
+            let err = svc.execute(&fresh).await.expect_err("fenced");
+            assert!(
+                matches!(err, MemberError::Store(_)),
+                "uncertain unban must fence fresh bans, got {err:?}"
+            );
+            assert_eq!(discord.call_count("ban"), bans_before);
+            // The fence refusal is not safe-pre-mutation: the fenced key
+            // stays `in_flight`, so a same-key retry is `InFlight`, never a
+            // duplicate Discord mutation.
+            assert!(matches!(
+                svc.execute(&fresh).await.expect_err("still fenced"),
+                MemberError::InFlight
+            ));
+            assert_eq!(discord.call_count("ban"), bans_before);
+            // Authoritative evidence that the DELETE provably never landed:
+            // a void resolution lifts the fence and a new ban proceeds.
+            store
+                .resolve_uncertain_unban(&job.request_id, &job.claim_token, UnbanResolution::Void)
+                .await
+                .expect("authoritative void");
+            svc.execute(&execution_with_id(action, "new-ban-2"))
+                .await
+                .expect("ban after void");
+            // The void resolution lifted the fence: one ban for `old`, one
+            // for `new-ban-2`, and no unban was ever dispatched.
+            assert_eq!(discord.call_count("ban"), bans_before + 1);
+            assert_eq!(discord.call_count("unban"), 0);
+        }
+    }
+
+    // F1 (store level): staging refuses while a `running` row exists even
+    // when the caller never observed the job — the fence lives in the
+    // ledger, not in the claim handle.
+    #[tokio::test]
+    async fn staging_refuses_while_a_running_row_exists() {
+        let store = MemMemberStore::new();
+        store
+            .stage_unban(GUILD, TARGET_ID, NOW, "expiry", "old", NOW)
+            .await
+            .expect("stage");
+        store
+            .confirm_ban(GUILD, TARGET_ID, "old", NOW)
+            .await
+            .expect("accepted");
+        let job = store
+            .claim_due_unbans(GUILD, NOW, 25)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("job");
+        // A fresh ban intent refuses; nothing is staged for it.
+        assert!(
+            store
+                .stage_ban(GUILD, TARGET_ID, "new", NOW)
+                .await
+                .is_err()
+        );
+        // `completed` resolution closes the old job; the fence lifts and the
+        // same staging succeeds without a new request id.
+        store
+            .resolve_uncertain_unban(
+                &job.request_id,
+                &job.claim_token,
+                UnbanResolution::Completed,
+            )
+            .await
+            .expect("authoritative completion");
+        assert_eq!(store.unban_state("old").as_deref(), Some("done"));
+        store
+            .stage_ban(GUILD, TARGET_ID, "new", NOW)
+            .await
+            .expect("fence lifted");
+        // Double resolution surfaces instead of vanishing.
+        assert!(
+            store
+                .resolve_uncertain_unban(
+                    &job.request_id,
+                    &job.claim_token,
+                    UnbanResolution::Completed
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    /// Store double that fails selected writes once, to exercise service
+    /// behavior under storage faults the memory double cannot produce.
+    #[derive(Clone)]
+    struct FaultyStore {
+        inner: MemMemberStore,
+        fail_complete_once: Arc<std::sync::atomic::AtomicBool>,
+        fail_stage_once: Arc<std::sync::atomic::AtomicBool>,
+        fail_audit_once: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FaultyStore {
+        fn wrap(inner: MemMemberStore) -> Self {
+            use std::sync::atomic::AtomicBool;
+            Self {
+                inner,
+                fail_complete_once: Arc::new(AtomicBool::new(false)),
+                fail_stage_once: Arc::new(AtomicBool::new(false)),
+                fail_audit_once: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_once(flag: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+            flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn arm_complete(&self) {
+            self.fail_complete_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn arm_stage(&self) {
+            self.fail_stage_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn arm_audit(&self) {
+            self.fail_audit_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl MemberModerationStore for FaultyStore {
+        async fn serialize_member<T, F, Fut>(&self, guild_id: &str, user_id: &str, run: F) -> T
+        where
+            F: FnOnce() -> Fut + Send,
+            Fut: Future<Output = T> + Send,
+        {
+            self.inner.serialize_member(guild_id, user_id, run).await
+        }
+
+        async fn claim(
+            &self,
+            guild_id: &str,
+            idempotency_key: &str,
+            action: &str,
+            request_hash: &str,
+            claimed_at: &str,
+        ) -> Result<ClaimState, StoreError> {
+            self.inner
+                .claim(guild_id, idempotency_key, action, request_hash, claimed_at)
+                .await
+        }
+
+        async fn complete(
+            &self,
+            guild_id: &str,
+            idempotency_key: &str,
+            outcome: &str,
+            result_json: &str,
+            completed_at: &str,
+        ) -> Result<(), StoreError> {
+            if Self::fail_once(&self.fail_complete_once) {
+                return Err(StoreError::new("injected completion failure"));
+            }
+            self.inner
+                .complete(guild_id, idempotency_key, outcome, result_json, completed_at)
+                .await
+        }
+
+        async fn release(
+            &self,
+            guild_id: &str,
+            idempotency_key: &str,
+        ) -> Result<(), StoreError> {
+            self.inner.release(guild_id, idempotency_key).await
+        }
+
+        async fn record_audit(&self, row: &AuditRow) -> Result<(), StoreError> {
+            if Self::fail_once(&self.fail_audit_once) {
+                return Err(StoreError::new("injected audit failure"));
+            }
+            self.inner.record_audit(row).await
+        }
+
+        async fn add_warning(
+            &self,
+            warning_id: &str,
+            guild_id: &str,
+            user_id: &str,
+            actor_id: &str,
+            reason: &str,
+            request_id: &str,
+            created_at: &str,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .add_warning(
+                    warning_id,
+                    guild_id,
+                    user_id,
+                    actor_id,
+                    reason,
+                    request_id,
+                    created_at,
+                )
+                .await
+        }
+
+        async fn stage_ban(
+            &self,
+            guild_id: &str,
+            user_id: &str,
+            request_id: &str,
+            created_at: &str,
+        ) -> Result<(), StoreError> {
+            if Self::fail_once(&self.fail_stage_once) {
+                // A rolled-back staging transaction: nothing persisted, so a
+                // retry is provably safe.
+                return Err(StoreError::rolled_back("injected stage rollback"));
+            }
+            self.inner
+                .stage_ban(guild_id, user_id, request_id, created_at)
+                .await
+        }
+
+        async fn confirm_ban(
+            &self,
+            guild_id: &str,
+            user_id: &str,
+            request_id: &str,
+            completed_at: &str,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .confirm_ban(guild_id, user_id, request_id, completed_at)
+                .await
+        }
+
+        async fn stage_unban(
+            &self,
+            guild_id: &str,
+            user_id: &str,
+            execute_at: &str,
+            reason: &str,
+            request_id: &str,
+            created_at: &str,
+        ) -> Result<(), StoreError> {
+            if Self::fail_once(&self.fail_stage_once) {
+                return Err(StoreError::rolled_back("injected stage rollback"));
+            }
+            self.inner
+                .stage_unban(
+                    guild_id,
+                    user_id,
+                    execute_at,
+                    reason,
+                    request_id,
+                    created_at,
+                )
+                .await
+        }
+
+        async fn activate_staged_unban(
+            &self,
+            guild_id: &str,
+            user_id: &str,
+            request_id: &str,
+            completed_at: &str,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .activate_staged_unban(guild_id, user_id, request_id, completed_at)
+                .await
+        }
+
+        async fn reject_ban(
+            &self,
+            guild_id: &str,
+            user_id: &str,
+            request_id: &str,
+            completed_at: &str,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .reject_ban(guild_id, user_id, request_id, completed_at)
+                .await
+        }
+
+        async fn claim_due_unbans(
+            &self,
+            guild_id: &str,
+            now: &str,
+            limit: i64,
+        ) -> Result<Vec<UnbanJob>, StoreError> {
+            self.inner.claim_due_unbans(guild_id, now, limit).await
+        }
+
+        async fn owns_unban_claim(
+            &self,
+            request_id: &str,
+            claim_token: &str,
+        ) -> Result<bool, StoreError> {
+            self.inner.owns_unban_claim(request_id, claim_token).await
+        }
+
+        async fn complete_unban(
+            &self,
+            request_id: &str,
+            claim_token: &str,
+        ) -> Result<(), StoreError> {
+            self.inner.complete_unban(request_id, claim_token).await
+        }
+
+        async fn resolve_uncertain_unban(
+            &self,
+            request_id: &str,
+            claim_token: &str,
+            resolution: UnbanResolution,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .resolve_uncertain_unban(request_id, claim_token, resolution)
+                .await
+        }
+
+        async fn requeue_unban(
+            &self,
+            request_id: &str,
+            claim_token: &str,
+        ) -> Result<(), StoreError> {
+            self.inner.requeue_unban(request_id, claim_token).await
+        }
+    }
+
+    // F3: a completion failure after Discord acceptance must still leave the
+    // audit row behind. The claim stays uncertain (retry is `InFlight`, never
+    // a second Discord call), but the audit of the successful kick exists.
+    #[tokio::test]
+    async fn accepted_kick_is_audited_when_completion_fails() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        store.arm_complete();
+        let err = svc
+            .execute(&execution(ModerationAction::Kick))
+            .await
+            .expect_err("completion fails");
+        assert!(matches!(err, MemberError::Store(_)));
+        // The kick landed exactly once, and its audit row exists despite the
+        // completion failure.
+        assert_eq!(discord.call_count("kick"), 1);
+        assert_eq!(store.inner.audits().len(), 1);
+        assert_eq!(store.inner.audits()[0].outcome, "kicked");
+        // Retry stays uncertain — never a duplicate mutation, never a second
+        // audit row.
+        assert_eq!(
+            svc.execute(&execution(ModerationAction::Kick)).await,
+            Err(MemberError::InFlight)
+        );
+        assert_eq!(discord.call_count("kick"), 1);
+        assert_eq!(store.inner.audits().len(), 1);
+    }
+
+    // F3 (audit path unchanged): audit loss alone never fails an accepted
+    // action, and the completion still lands so the retry replays.
+    #[tokio::test]
+    async fn audit_loss_alone_still_completes_and_replays() {
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+
+        store.arm_audit();
+        let res = svc
+            .execute(&execution(ModerationAction::Kick))
+            .await
+            .expect("audit loss is logged, not fatal");
+        assert!(!res.replayed);
+        assert!(store.inner.audits().is_empty());
+        let replay = svc
+            .execute(&execution(ModerationAction::Kick))
+            .await
+            .expect("replay");
+        assert!(replay.replayed);
+        assert_eq!(discord.call_count("kick"), 1);
+    }
+
+    // F4: a rolled-back pre-dispatch staging failure releases the key, so the
+    // same request retries as a real second attempt — no intent, no schedule,
+    // no Discord call left behind.
+    #[tokio::test]
+    async fn rolled_back_stage_failure_allows_retry() {
+        for action in [ModerationAction::Ban, ModerationAction::TempBan] {
+            let discord = MockMemberDiscord::new();
+            let store = FaultyStore::wrap(MemMemberStore::new());
+            let svc =
+                MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+                    1_700_000_000_000
+                });
+
+            store.arm_stage();
+            let err = svc
+                .execute(&execution(action))
+                .await
+                .expect_err("stage fails");
+            assert!(matches!(err, MemberError::Store(_)));
+            assert_eq!(discord.call_count("ban"), 0);
+            // Same request retries cleanly: no intent, no schedule, no fence.
+            let res = svc.execute(&execution(action)).await.expect("retry");
+            assert!(!res.replayed);
+            assert_eq!(discord.call_count("ban"), 1);
+        }
     }
 }

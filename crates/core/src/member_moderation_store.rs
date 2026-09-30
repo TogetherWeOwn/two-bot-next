@@ -11,6 +11,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::member_moderation::{
     AuditRow, ClaimState, MemberModerationStore, MemberQueues, StoreError, UnbanJob,
+    UnbanResolution,
 };
 
 #[derive(Clone)]
@@ -66,10 +67,12 @@ impl PgMemberModerationStore {
         .bind(now)
         .execute(&mut **tx)
         .await
-        .map_err(db_error)?
+        .map_err(rolled_back_error)?
         .rows_affected();
         if changed != 1 {
-            return Err(StoreError::new("ban request id is already in use"));
+            // The competing non-rejected intent survives; the failed insert
+            // wrote nothing for this request. Rolled back either way.
+            return Err(StoreError::rolled_back(REQUEST_ID_IN_USE));
         }
         Ok(())
     }
@@ -111,6 +114,57 @@ impl PgMemberModerationStore {
         }
         Ok(())
     }
+
+    // F1: a member with a `running` schedule holds a dispatched unban whose
+    // remote DELETE may still land. Staging a fresh ban while that
+    // uncertainty is unresolved would let the late DELETE remove the new
+    // ban, so every staging path refuses until authoritative
+    // `resolve_uncertain_unban` evidence clears the fence. SQLSTATE-only
+    // error: no row contents reach the message.
+    async fn refuse_running_unban_fence(
+        executor: impl sqlx::Executor<'_, Database = Postgres>,
+        guild: &str,
+        user: &str,
+    ) -> Result<(), StoreError> {
+        let running: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM moderation_scheduled_unbans AS job
+               WHERE job.guild_id = $1 AND job.user_id = $2 AND job.state = 'running'
+             )",
+        )
+        .bind(guild)
+        .bind(user)
+        .fetch_one(executor)
+        .await
+        .map_err(db_error)?;
+        if running {
+            return Err(StoreError::new(
+                "member has an uncertain dispatched unban; resolve it before banning",
+            ));
+        }
+        Ok(())
+    }
+}
+
+// The request id is already owned by a durable non-rejected intent: the
+// request itself is fenced, never safe to retry under the same key.
+const REQUEST_ID_IN_USE: &str = "ban request id is already in use";
+const UNBAN_REQUEST_ID_IN_USE: &str = "unban request id is already in use";
+
+// Never log SQL parameter values or database DETAIL (which can contain a
+// moderator's reason). The SQLSTATE is enough to diagnose a ledger failure.
+fn rolled_back_error(error: sqlx::Error) -> StoreError {
+    let classification = match &error {
+        sqlx::Error::Database(db) => db
+            .code()
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|| "database".into()),
+        sqlx::Error::PoolTimedOut => "pool_timeout".into(),
+        sqlx::Error::PoolClosed => "pool_closed".into(),
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) => "connection".into(),
+        _ => "query".into(),
+    };
+    StoreError::rolled_back(format!("postgres moderation ledger: {classification}"))
 }
 
 // Never log SQL parameter values or database DETAIL (which can contain a
@@ -289,6 +343,14 @@ impl MemberModerationStore for PgMemberModerationStore {
     ) -> Result<(), StoreError> {
         self.ensure_guild(guild)?;
         let mut tx = self.pool.begin().await.map_err(db_error)?;
+        Self::refuse_running_unban_fence(&mut *tx, &self.guild_id, user).await?;
+        // A fresh intent that survives the fence must itself fence; every
+        // staging path owns the member queue, so the check-then-insert is
+        // atomic against this store's consumers. Every `prepare` failure
+        // happens before any write for this request (the fence-only
+        // refusal writes nothing; the insert either conflicts with a live
+        // row or fails the statement), so the whole transaction rolls back
+        // mutation-free and the error already carries that provenance.
         self.prepare(&mut tx, guild, user, request, now).await?;
         tx.commit().await.map_err(db_error)
     }
@@ -356,6 +418,9 @@ impl MemberModerationStore for PgMemberModerationStore {
     ) -> Result<(), StoreError> {
         self.ensure_guild(guild)?;
         let mut tx = self.pool.begin().await.map_err(db_error)?;
+        Self::refuse_running_unban_fence(&mut *tx, &self.guild_id, user).await?;
+        // As in `stage_ban`: `prepare` failures precede any write for this
+        // request, so the rolled-back transaction stays mutation-free.
         self.prepare(&mut tx, guild, user, request, now).await?;
         let changed = sqlx::query(
             "INSERT INTO moderation_scheduled_unbans
@@ -376,10 +441,10 @@ impl MemberModerationStore for PgMemberModerationStore {
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(db_error)?
+        .map_err(rolled_back_error)?
         .rows_affected();
         if changed != 1 {
-            return Err(StoreError::new("unban request id is already in use"));
+            return Err(StoreError::rolled_back(UNBAN_REQUEST_ID_IN_USE));
         }
         tx.commit().await.map_err(db_error)
     }
@@ -563,6 +628,39 @@ impl MemberModerationStore for PgMemberModerationStore {
         .execute(&self.pool)
         .await
         .map_err(db_error)?;
+        Ok(())
+    }
+
+    async fn resolve_uncertain_unban(
+        &self,
+        request: &str,
+        token: &str,
+        resolution: UnbanResolution,
+    ) -> Result<(), StoreError> {
+        // Authoritative close of an uncertain dispatched unban. Only a
+        // `running` row with the exact claim token resolves; anything else
+        // errors so a lost, stolen or double-resolved claim surfaces.
+        // `completed`: the DELETE provably landed, job done. `void`: it
+        // provably cannot land, so the job is superseded — clearing the
+        // staging fence without inventing an unban that never happened.
+        let state = resolution.as_str();
+        let changed = sqlx::query(
+            "UPDATE moderation_scheduled_unbans SET state =
+               CASE WHEN $3 = 'completed' THEN 'done' ELSE 'superseded' END,
+               completed_at = NOW(), claim_token = NULL
+             WHERE request_id = $1 AND state = 'running' AND claim_token = $2 AND guild_id = $4",
+        )
+        .bind(request)
+        .bind(token)
+        .bind(state)
+        .bind(&self.guild_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_error)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StoreError::new("lost uncertain scheduled-unban claim"));
+        }
         Ok(())
     }
 }
