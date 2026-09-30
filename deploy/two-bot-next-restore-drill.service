@@ -1,0 +1,57 @@
+# Monthly restore drill, paired with two-bot-next-restore-drill.timer.
+#
+#   sudo cp deploy/two-bot-next-restore-drill.{service,timer} /etc/systemd/system/
+#   sudo systemctl enable --now two-bot-next-restore-drill.timer
+#   sudo systemctl start two-bot-next-restore-drill      # run one now
+#
+# Restores the newest backup into the scratch database and checks the row
+# counts against the dump's own manifest. It exists because a backup nobody
+# has restored is a hypothesis, not a backup - and the way that fails is
+# silent: the nightly job goes green for six months and the file turns out
+# to be unreadable on the day it matters.
+#
+# This unit fails loudly. A red drill means the backups are not real, and it
+# is better to find that out on the 1st of the month than during an outage.
+#
+# TWO_RESTORE_URL must point at the SCRATCH database, never production. It is
+# a separate variable from TWO_DATABASE_URL for exactly that reason - see the
+# note in crates/bot/src/backup_cli.rs.
+
+[Unit]
+Description=Prove the two-bot-next backups can actually be restored
+After=two-bot-next-backup.service
+
+[Service]
+Type=oneshot
+User=twobot
+Group=twobot
+WorkingDirectory=/opt/two-bot-next
+
+# TWO_RESTORE_URL=postgres://.../two_scratch
+EnvironmentFile=/etc/two-bot-next/backup.env
+
+# Newest backup in the directory. `set -o pipefail` so an empty directory fails
+# the unit rather than running a restore against an empty path.
+ExecStart=/usr/bin/bash -o pipefail -c '\
+  latest=$(ls -1t /var/backups/two-bot-next/two-funnel-*.ndjson.gz | head -1); \
+  echo "drill: restoring $latest into the scratch database"; \
+  exec /opt/two-bot-next/two-bot restore "$latest" --force'
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=two-bot-next-restore-drill
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
