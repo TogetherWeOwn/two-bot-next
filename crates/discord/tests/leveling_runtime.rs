@@ -153,11 +153,11 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
         .collect();
     assert_eq!(
         body[0]["data"]["content"],
-        rank_text("Global name", 0, 1, 0, 0)
+        rank_text("Global name", 0, None, 0, 0)
     );
     assert_eq!(
         body[1]["data"]["content"],
-        rank_text("username", 0, 1, 0, 0)
+        rank_text("username", 0, None, 0, 0)
     );
     assert_eq!(body[0]["data"]["flags"], 64);
     assert_eq!(body[2]["data"]["content"], "No XP has been earned yet.");

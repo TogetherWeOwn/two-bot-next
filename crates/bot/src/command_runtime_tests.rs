@@ -1233,7 +1233,7 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
         assert_eq!(reply["data"]["flags"], 64, "rank is ephemeral");
         assert_eq!(
             reply["data"]["content"],
-            two_bot_core::leveling::rank_text(name, 0, 1, 0, 0)
+            two_bot_core::leveling::rank_text(name, 0, None, 0, 0)
         );
     }
     assert_eq!(replies[2]["data"]["content"], "No XP has been earned yet.");

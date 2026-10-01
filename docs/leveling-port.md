@@ -22,8 +22,10 @@ and [`discord.ts`](https://github.com/TogetherWeOwn/two-bot/blob/d5d11793/src/le
   `9_007_199_254_740_991`; a rejected award does not consume its cooldown.
 - `/rank [member]`: ephemeral; display name is `globalName ?? username`. XP,
   progress, span and remaining XP are grouped with commas; level, rank and
-  member count are not grouped. Missing members read zero XP and rank below
-  members holding XP. XP ties use stored member IDs ascending.
+  member count are not grouped. Missing members read zero XP. Unlike the frozen
+  legacy behavior, the current store renders a missing XP row as
+  `Rank **Unranked** (no XP recorded)`; an existing zero-XP row retains a numeric
+  rank. XP ties use stored member IDs ascending.
 - `/leaderboard`: public top 10, mention parsing suppressed; empty text is
   `No XP has been earned yet.`. The store supports a limit clamped to 1–25.
   Legacy has no offset/cursor paging or page components; none are invented here.
@@ -116,7 +118,7 @@ python3 scripts/cargo_cache.py run -- test -p two-bot --locked command_runtime_t
 
 Controller compilation must use the bounded cache wrapper; a missing/refused pool
 is not permission to compile directly. Hosted CI uses its ephemeral Cargo cache.
-The store command executes all 13 leveling tests (none are ignored); the runtime
+The store command executes all 15 leveling tests (none are ignored); the runtime
 command explicitly activates the six ignored integration proofs. Both use the shared
 `two-bot-testsupport` fixture, which connects only to `agent-testdb:5432`, uses the
 passwordless `agent_test` principal, and creates a unique migrated database per
