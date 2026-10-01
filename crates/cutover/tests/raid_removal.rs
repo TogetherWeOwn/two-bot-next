@@ -402,6 +402,81 @@ async fn stalled_delete_body_exhausts_budget_and_audit_failure_stops_next_target
 }
 
 #[tokio::test]
+async fn timed_out_delete_then_new_protection_is_failed_and_aborted_without_another_delete() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut requests = vec![];
+        for (expected, status, body) in safety(A, json!([])) {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let first = read_request(&mut stream).await;
+            assert_eq!(first, expected);
+            requests.push(first);
+            respond(&mut stream, status, &body).await;
+        }
+        let (mut uncertain, _) = listener.accept().await.unwrap();
+        let first = read_request(&mut uncertain).await;
+        assert_eq!(first, format!("DELETE /api/v10/guilds/{G}/members/{A}"));
+        requests.push(first);
+        // Leave the first DELETE in flight across the deadline and fresh reads.
+        for (expected, status, body) in safety(A, json!(["100000000000000060"])) {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let first = read_request(&mut stream).await;
+            assert_eq!(first, expected);
+            requests.push(first);
+            respond(&mut stream, status, &body).await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_err(),
+            "must abort before a second DELETE or next target"
+        );
+        drop(uncertain);
+        requests
+    });
+    let ex = ActionExecutor::with_proxy("offline-fixture-token".into(), Some(base)).unwrap();
+    let empty = HashSet::new();
+    let ids = vec![A.into(), B.into()];
+    let mut records = vec![];
+    let summary = tokio::time::timeout(
+        Duration::from_secs(12),
+        remove_accounts(
+            RemovalRun {
+                guild: G,
+                ids: &ids,
+                mode: RemovalMode::Execute,
+                reason: "reviewed",
+                run_id: "test",
+                done: &empty,
+                protected: &empty,
+            },
+            Some(&ex),
+            |r| {
+                records.push(r.clone());
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .expect("one deadline and fresh protection reads must be bounded")
+    .unwrap();
+    let requests = task.await.unwrap();
+    assert!(summary.aborted);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.reached, 1);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].outcome, RemovalOutcome::Failed);
+    assert_eq!(records[0].attempts, 1);
+    assert_eq!(records[0].status, None);
+    assert_eq!(
+        requests.iter().filter(|p| p.starts_with("DELETE")).count(),
+        1
+    );
+    assert!(requests.iter().all(|p| !p.ends_with(B)));
+}
+
+#[tokio::test]
 async fn stalled_safety_headers_and_body_time_out_audit_and_abort_without_delete() {
     use two_bot_discord::executor::MODERATION_TIMEOUT_MS;
     for partial_body in [false, true] {
@@ -626,6 +701,85 @@ fn file_audit_is_durable_locked_and_terminal_ever_scoped_by_guild() {
     assert!(audit.done.contains(A));
     drop(audit);
     std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn special_audit_files_refuse_before_token_access_and_relative_regular_files_work() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!(
+            "raid-special-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("ids"), A).unwrap();
+    let fifo = root.join("fifo");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: c_path is NUL-terminated and lives through this local fixture call.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    for path in [fifo.as_path(), std::path::Path::new("/dev/null")] {
+        assert!(FileAudit::open(path, G)
+            .err()
+            .unwrap()
+            .contains("regular file"));
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_raid-remove"))
+            .current_dir(&root)
+            .args([
+                "--guild",
+                G,
+                "--ids-from",
+                "ids",
+                "--audit",
+                path.to_str().unwrap(),
+                "--execute",
+                "--expect",
+                "1",
+                "--reason",
+                "reviewed",
+            ])
+            .env_remove("DISCORD_TOKEN")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains("audit must be a regular file"), "{err}");
+        assert!(
+            !err.contains("DISCORD_TOKEN"),
+            "must refuse before executor construction"
+        );
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_raid-remove"))
+        .current_dir(&root)
+        .args([
+            "--guild",
+            G,
+            "--ids-from",
+            "ids",
+            "--audit",
+            "relative.jsonl",
+        ])
+        .env_remove("DISCORD_TOKEN")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let audit = FileAudit::open(&root.join("relative.jsonl"), G).unwrap();
+    assert!(audit.done.is_empty());
+    drop(audit);
+    std::fs::remove_file(root.join("relative.jsonl")).unwrap();
+    std::fs::remove_file(root.join("ids")).unwrap();
+    std::fs::remove_file(fifo).unwrap();
+    std::fs::remove_dir(root).unwrap();
 }
 
 #[test]

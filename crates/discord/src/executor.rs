@@ -377,6 +377,16 @@ impl HyperTransport {
     }
 }
 
+/// Prior DELETE attempts supplied to a paced kick's safety guard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KickAttemptState {
+    /// Number of DELETE attempts already made, excluding the pending send.
+    pub attempts: u32,
+    /// A prior timeout or transport failure may have applied a mutation.
+    /// Sticky across retries: a later 429/5xx does not resolve that uncertainty.
+    pub mutation_uncertain: bool,
+}
+
 /// The S4 REST executor: paced lane + moderation lane over one transport.
 #[derive(Debug, Clone)]
 pub struct ActionExecutor {
@@ -664,8 +674,10 @@ impl ActionExecutor {
     }
 
     /// Reauthorize after pacing and before every DELETE, including retries.
-    /// The callback receives the number of DELETE attempts already made. A
-    /// refusal returns to the caller for auditing without another mutation.
+    /// The callback receives prior attempts and any pending mutation uncertainty
+    /// so a refusal can be audited as failed rather than cleanly protected.
+    /// The kick lane stays reserved through authorization and the bounded
+    /// exchange, with no additional pacing wait after the final safety read.
     pub async fn kick_paced_guarded<F, Fut, E>(
         &self,
         guild_id: &str,
@@ -674,7 +686,7 @@ impl ActionExecutor {
         mut authorize: F,
     ) -> Result<KickResult, E>
     where
-        F: FnMut(u32) -> Fut,
+        F: FnMut(KickAttemptState) -> Fut,
         Fut: std::future::Future<Output = Result<(), E>>,
     {
         let path_guild = guild_id.to_owned();
@@ -691,8 +703,9 @@ impl ActionExecutor {
             }
         };
         let mut attempts: u32 = 0;
+        let mut mutation_uncertain = false;
         loop {
-            self.pace(true).await;
+            let mut lane = self.paced_lane(true).await;
             let request = match self.kick_request(&path_guild, &path_user, &reason) {
                 Ok(r) => r,
                 Err(detail) => {
@@ -704,17 +717,25 @@ impl ActionExecutor {
                     })
                 }
             };
-            authorize(attempts).await?;
+            authorize(KickAttemptState {
+                attempts,
+                mutation_uncertain,
+            })
+            .await?;
             attempts += 1;
             // A deadline covers both headers and body, not just connection
             // setup. A timeout is ambiguous: retry only after fresh safety
             // authorization, and report failure if the bounded budget runs out.
+            *lane = std::time::Instant::now();
             let exchange = tokio::time::timeout(self.inner.moderation_timeout, self.send(&request))
                 .await
                 .unwrap_or_else(|_| Err("DELETE timed out; mutation may have applied".into()));
+            // Backoff belongs to this caller, not the shared kick reservation.
+            drop(lane);
             let res = match exchange {
                 Ok(r) => r,
                 Err(detail) => {
+                    mutation_uncertain = true;
                     if attempts > MAX_HTTP_TRIES - 1 {
                         return Ok(KickResult {
                             outcome: KickOutcome::Failed,

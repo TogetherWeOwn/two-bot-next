@@ -208,14 +208,31 @@ pub struct FileAudit {
 }
 impl FileAudit {
     pub fn open(path: &Path, guild: &str) -> Result<Self, String> {
+        Self::open_with_sync(path, guild, File::sync_all)
+    }
+
+    fn open_with_sync(
+        path: &Path,
+        guild: &str,
+        mut sync: impl FnMut(&File) -> std::io::Result<()>,
+    ) -> Result<Self, String> {
+        if !cfg!(unix) {
+            return Err("audit directory durability unsupported on this platform".into());
+        }
         let mut opts = OpenOptions::new();
         opts.read(true).append(true).create(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            // Nonblocking open also prevents a FIFO/device from hanging before
+            // the descriptor-level regular-file check can reject it.
+            opts.mode(0o600).custom_flags(libc::O_NONBLOCK);
         }
         let mut file = opts.open(path).map_err(|_| "cannot open audit file")?;
+        let metadata = file.metadata().map_err(|_| "cannot inspect audit file")?;
+        if !metadata.is_file() {
+            return Err("audit must be a regular file".into());
+        }
         file.try_lock()
             .map_err(|_| "audit lock unavailable; inspect concurrent run")?;
         let mut text = String::new();
@@ -240,6 +257,25 @@ impl FileAudit {
                 done.insert(r.member_id);
             }
         }
+        // Resolve relative paths and symlink aliases to the actual parent.
+        // Establish the pathname as well as file data before any executor exists.
+        let resolved = path
+            .canonicalize()
+            .map_err(|_| "cannot resolve audit file")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let current = resolved
+                .metadata()
+                .map_err(|_| "cannot inspect audit pathname")?;
+            if (current.dev(), current.ino()) != (metadata.dev(), metadata.ino()) {
+                return Err("audit pathname changed during initialization".into());
+            }
+        }
+        let parent = resolved.parent().ok_or("audit parent directory missing")?;
+        let directory = File::open(parent).map_err(|_| "cannot open audit parent directory")?;
+        sync(&file).map_err(|_| "audit initialization file fsync failed")?;
+        sync(&directory).map_err(|_| "audit initialization directory fsync failed")?;
         Ok(Self { file, done })
     }
     pub fn append(&mut self, record: &RemovalRecord) -> Result<(), String> {
@@ -406,11 +442,11 @@ pub async fn remove_accounts(
         } else {
             let ex = executor.unwrap();
             let result = ex
-                .kick_paced_guarded(run.guild, id, run.reason, |attempts| async move {
+                .kick_paced_guarded(run.guild, id, run.reason, |attempt| async move {
                     match target_state(ex, run.guild, id, run.protected).await {
                         Ok(TargetState::Eligible) => Ok(()),
-                        Ok(state) => Err((Some(state), attempts)),
-                        Err(_) => Err((None, attempts)),
+                        Ok(state) => Err((Some(state), attempt)),
+                        Err(_) => Err((None, attempt)),
                     }
                 })
                 .await;
@@ -426,13 +462,17 @@ pub async fn remove_accounts(
                     };
                     (outcome, result.status, result.attempts)
                 }
-                Err((Some(TargetState::Missing), attempts)) => {
-                    (RemovalOutcome::AlreadyGone, Some(404), attempts)
+                Err((Some(TargetState::Missing), attempt)) => {
+                    (RemovalOutcome::AlreadyGone, Some(404), attempt.attempts)
                 }
-                Err((Some(_), attempts)) => (RemovalOutcome::Protected, None, attempts),
-                Err((None, attempts)) => {
+                Err((Some(_), attempt)) if !attempt.mutation_uncertain => {
+                    (RemovalOutcome::Protected, None, attempt.attempts)
+                }
+                Err((_, attempt)) => {
+                    // Keep the new protection, but an earlier unavailable DELETE
+                    // can still apply. Do not report that refusal as a clean run.
                     stop = true;
-                    (RemovalOutcome::Failed, None, attempts)
+                    (RemovalOutcome::Failed, None, attempt.attempts)
                 }
             }
         };
@@ -493,6 +533,44 @@ mod tests {
         }
         assert!(parse_targets("[123456789012345678]", &rows[0].guild_id).is_err());
     }
+    #[cfg(unix)]
+    #[test]
+    fn audit_initialization_syncs_file_then_directory_and_fails_closed() {
+        let root = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = root.join(format!(
+            "raid-init-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for fail_at in [Some(0), Some(1), None] {
+            let mut order = vec![];
+            let result = FileAudit::open_with_sync(&path, "100000000000000010", |file| {
+                let metadata = file.metadata()?;
+                order.push((metadata.is_file(), metadata.is_dir()));
+                if fail_at == Some(order.len() - 1) {
+                    return Err(std::io::Error::other("injected fsync failure"));
+                }
+                file.sync_all()
+            });
+            assert_eq!(order[0], (true, false));
+            if fail_at != Some(0) {
+                assert_eq!(order[1], (false, true));
+            }
+            match fail_at {
+                Some(0) => assert!(result.err().unwrap().contains("file fsync failed")),
+                Some(1) => assert!(result.err().unwrap().contains("directory fsync failed")),
+                None => drop(result.unwrap()),
+                _ => unreachable!(),
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[tokio::test]
     async fn dry_run_has_no_executor_and_audits_before_advancing() {
         let ids = vec!["100000000000000001".into(), "100000000000000002".into()];
