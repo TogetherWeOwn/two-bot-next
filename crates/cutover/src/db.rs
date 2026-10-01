@@ -445,19 +445,21 @@ pub fn normalize_role_rewards(
             .filter(|level| *level > 0)
             .ok_or_else(|| {
                 ReplaceRewardsError::Invalid(format!(
-                    "reward level must be between 1 and {}", i32::MAX
+                    "reward level must be between 1 and {}",
+                    i32::MAX
                 ))
             })?;
         if !crate::is_snowflake(&r.role_id) {
             return Err(ReplaceRewardsError::Invalid(format!(
-                "invalid Discord role id: {}", r.role_id
+                "invalid Discord role id: {}",
+                r.role_id
             )));
         }
         normalized.insert(level, r.role_id.as_str());
     }
     let mut roles = HashSet::new();
     for role_id in normalized.values() {
-        if !roles.insert(*role_id) {
+        if !roles.insert(role_id.trim_start_matches('0')) {
             return Err(ReplaceRewardsError::Invalid(format!(
                 "duplicate Discord role id in reward ladder: {role_id}"
             )));
@@ -486,17 +488,29 @@ mod reward_tests {
     const ROLE_B: &str = "90000000000000003";
 
     fn reward(level: u64, role_id: &str) -> LevelRoleReward {
-        LevelRoleReward { level, role_id: role_id.to_owned() }
+        LevelRoleReward {
+            level,
+            role_id: role_id.to_owned(),
+        }
     }
 
     fn invalid(rewards: &[LevelRoleReward]) {
-        assert!(matches!(normalize_role_rewards(rewards), Err(ReplaceRewardsError::Invalid(_))));
+        assert!(matches!(
+            normalize_role_rewards(rewards),
+            Err(ReplaceRewardsError::Invalid(_))
+        ));
     }
 
     #[test]
     fn reward_levels_match_positive_int4_storage() {
         let rewards = [reward(1, ROLE_A), reward(i32::MAX as u64, ROLE_B)];
-        assert_eq!(normalize_role_rewards(&rewards).unwrap().into_iter().collect::<Vec<_>>(), vec![(1, ROLE_A), (i32::MAX, ROLE_B)]);
+        assert_eq!(
+            normalize_role_rewards(&rewards)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![(1, ROLE_A), (i32::MAX, ROLE_B)]
+        );
         for level in [0, i32::MAX as u64 + 1, i64::MAX as u64, u64::MAX] {
             invalid(&[reward(level, ROLE_A)]);
         }
@@ -505,55 +519,106 @@ mod reward_tests {
     }
 
     #[test]
+    fn reward_role_uniqueness_ignores_leading_zero_aliases() {
+        invalid(&[reward(1, ROLE_A), reward(2, "090000000000000002")]);
+    }
+
+    #[test]
     fn reward_role_uniqueness_is_checked_after_last_level_wins() {
         let rewards = [reward(2, ROLE_A), reward(1, ROLE_A), reward(1, ROLE_B)];
-        assert_eq!(normalize_role_rewards(&rewards).unwrap().into_iter().collect::<Vec<_>>(), vec![(1, ROLE_B), (2, ROLE_A)]);
+        assert_eq!(
+            normalize_role_rewards(&rewards)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![(1, ROLE_B), (2, ROLE_A)]
+        );
         assert!(normalize_role_rewards(&[]).unwrap().is_empty());
-        assert_eq!(normalize_role_rewards(&[reward(1, ROLE_A), reward(1, ROLE_A)]).unwrap().len(), 1);
+        assert_eq!(
+            normalize_role_rewards(&[reward(1, ROLE_A), reward(1, ROLE_A)])
+                .unwrap()
+                .len(),
+            1
+        );
         invalid(&[reward(1, ROLE_A), reward(2, ROLE_B), reward(2, ROLE_A)]);
     }
 
     #[tokio::test]
     async fn invalid_rewards_do_not_acquire_a_connection() {
         let pool = PgPoolOptions::new().connect_lazy_with(
-            PgConnectOptions::new().host("agent-testdb").username("agent_test").password("")
+            PgConnectOptions::new()
+                .host("agent-testdb")
+                .username("agent_test")
+                .password(""),
         );
         pool.close().await;
         let db = CutoverDb { pool };
-        for rewards in [vec![reward(u64::MAX, ROLE_A)], vec![reward(1, ROLE_A), reward(2, ROLE_A)]] {
-            assert!(matches!(replace_role_rewards(&db, "g1", &rewards).await, Err(ReplaceRewardsError::Invalid(_))));
+        for rewards in [
+            vec![reward(u64::MAX, ROLE_A)],
+            vec![reward(1, ROLE_A), reward(2, ROLE_A)],
+        ] {
+            assert!(matches!(
+                replace_role_rewards(&db, "g1", &rewards).await,
+                Err(ReplaceRewardsError::Invalid(_))
+            ));
         }
-        assert!(matches!(replace_role_rewards(&db, "g1", &[]).await, Err(ReplaceRewardsError::Db(sqlx::Error::PoolClosed))));
+        assert!(matches!(
+            replace_role_rewards(&db, "g1", &[]).await,
+            Err(ReplaceRewardsError::Db(sqlx::Error::PoolClosed))
+        ));
     }
 
     #[tokio::test]
     #[ignore = "requires agent-testdb or the CI Postgres service"]
-    async fn reward_replacement_preserves_ladder_on_invalid_input() -> Result<(), Box<dyn std::error::Error>> {
+    async fn reward_replacement_preserves_ladder_on_invalid_input(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // No inherited app URL or credentials; only the disposable test service.
         let host = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
             "127.0.0.1"
         } else {
             "agent-testdb"
         };
-        let options = PgConnectOptions::new().host(host).port(5432)
-            .username("agent_test").password("").database("postgres").ssl_mode(PgSslMode::Disable);
-        let admin = PgPoolOptions::new().max_connections(1)
-            .acquire_timeout(Duration::from_secs(5)).connect_with(options.clone()).await?;
-        let schema = format!("reward_test_{}_{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos());
-        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await?;
+        let options = PgConnectOptions::new()
+            .host(host)
+            .port(5432)
+            .username("agent_test")
+            .password("")
+            .database("postgres")
+            .ssl_mode(PgSslMode::Disable);
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(options.clone())
+            .await?;
+        let schema = format!(
+            "reward_test_{}_{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await?;
         let path = schema.clone();
-        let pool = PgPoolOptions::new().max_connections(2)
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
             .acquire_timeout(Duration::from_secs(5))
             .after_connect(move |conn, _| {
                 let path = path.clone();
                 Box::pin(async move {
-                    sqlx::query("SELECT set_config('search_path', $1, false)").bind(path).execute(conn).await?;
+                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                        .bind(path)
+                        .execute(conn)
+                        .await?;
                     Ok(())
                 })
-            }).connect_with(options).await?;
+            })
+            .connect_with(options)
+            .await?;
         let db = CutoverDb { pool };
         let result = async {
-            sqlx::raw_sql(include_str!("../migrations/0002_leveling.sql")).execute(db.pool()).await?;
+            sqlx::raw_sql(include_str!("../migrations/0002_leveling.sql"))
+                .execute(db.pool())
+                .await?;
             let original = vec![reward(5, ROLE_A)];
             replace_role_rewards(&db, "g1", &original).await?;
             replace_role_rewards(&db, "g2", &original).await?;
@@ -561,20 +626,33 @@ mod reward_tests {
                 vec![reward(i32::MAX as u64 + 1, ROLE_B)],
                 vec![reward(1, ROLE_A), reward(2, ROLE_A)],
             ] {
-                assert!(matches!(replace_role_rewards(&db, "g1", &rewards).await, Err(ReplaceRewardsError::Invalid(_))));
+                assert!(matches!(
+                    replace_role_rewards(&db, "g1", &rewards).await,
+                    Err(ReplaceRewardsError::Invalid(_))
+                ));
                 assert_eq!(role_rewards(&db, "g1").await?, original);
             }
-            let replacement = vec![reward(1, ROLE_A), reward(i32::MAX as u64, ROLE_A), reward(1, ROLE_B)];
+            let replacement = vec![
+                reward(1, ROLE_A),
+                reward(i32::MAX as u64, ROLE_A),
+                reward(1, ROLE_B),
+            ];
             replace_role_rewards(&db, "g1", &replacement).await?;
-            assert_eq!(role_rewards(&db, "g1").await?, vec![reward(1, ROLE_B), reward(i32::MAX as u64, ROLE_A)]);
+            assert_eq!(
+                role_rewards(&db, "g1").await?,
+                vec![reward(1, ROLE_B), reward(i32::MAX as u64, ROLE_A)]
+            );
             assert_eq!(role_rewards(&db, "g2").await?, original);
             replace_role_rewards(&db, "g1", &[]).await?;
             assert!(role_rewards(&db, "g1").await?.is_empty());
             Ok::<_, Box<dyn std::error::Error>>(())
-        }.await;
+        }
+        .await;
         db.close().await;
         // Only this generated schema is disposable; preserve all shared data.
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await?;
         admin.close().await;
         result
     }

@@ -16,9 +16,18 @@ fn run(args: &[&str]) -> Output {
 fn invalid_replacements_fail_before_database_configuration() {
     for (spec, diagnostic) in [
         ("0:90000000000000002", "Usage:"),
-        ("2147483648:90000000000000002", "reward level must be between"),
-        ("18446744073709551615:90000000000000002", "reward level must be between"),
-        ("1:90000000000000002,2:90000000000000002", "duplicate Discord role id"),
+        (
+            "2147483648:90000000000000002",
+            "reward level must be between",
+        ),
+        (
+            "18446744073709551615:90000000000000002",
+            "reward level must be between",
+        ),
+        (
+            "1:90000000000000002,2:90000000000000002",
+            "duplicate Discord role id",
+        ),
         ("no:90000000000000002", "Usage:"),
         ("1:bad", "Usage:"),
         ("1:90000000000000002:extra", "Usage:"),
@@ -50,7 +59,10 @@ fn valid_replacements_reach_database_configuration() {
         let output = run(&["--guild", GUILD, "--set", spec]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(2), "{spec}: {stderr}");
-        assert!(stderr.contains("TWO_DATABASE_URL is required"), "{spec}: {stderr}");
+        assert!(
+            stderr.contains("TWO_DATABASE_URL is required"),
+            "{spec}: {stderr}"
+        );
     }
     let output = run(&["--guild", GUILD]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("TWO_DATABASE_URL is required"));
