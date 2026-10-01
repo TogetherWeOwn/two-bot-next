@@ -323,7 +323,8 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
     run_once(Kind::Events, pool, &rest, "2222", &observation, &shutdown)
         .await
         .unwrap();
-    let rows: Vec<(String, Option<String>, Option<String>, String, String)> = sqlx::query_as(
+    type EventRow = (String, Option<String>, Option<String>, String, String);
+    let rows: Vec<EventRow> = sqlx::query_as(
         "SELECT event_id, channel_id, description, starts_at, updated_at FROM scheduled_events WHERE guild_id='2222' ORDER BY event_id"
     ).fetch_all(pool).await.unwrap();
     assert_eq!(rows.len(), 16);
@@ -421,10 +422,7 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
         ),
         (Kind::Events, vec![ScriptedResponse::status(403)], 1),
     ] {
-        let mut script = script;
-        let last = script.pop().unwrap().delayed(Duration::from_millis(300));
-        script.push(last);
-        let mock = MockRest::start(script, ScriptedResponse::status(403)).await;
+        let (mock, gate) = MockRest::start_gated(script, ScriptedResponse::status(403)).await;
         let (stop, shutdown) = watch::channel(false);
         let mut attempt = {
             let pool = pool.clone();
@@ -434,22 +432,23 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
                 run_once(kind, &pool, &rest, "2222", &observation, &shutdown).await
             })
         };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while mock.requests().len() < expected_requests {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .unwrap();
-        stop.send_replace(true);
-        stop.send_replace(true);
-        tokio::time::timeout(Duration::from_millis(150), &mut attempt)
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_for_request())
             .await
-            .unwrap()
+            .expect("the final fetch must reach the response gate");
+        assert_eq!(mock.requests().len(), expected_requests);
+        assert!(!attempt.is_finished(), "the response is still withheld");
+        stop.send_replace(true);
+        stop.send_replace(true);
+        // Shutdown must complete while REST is gated, independently of scheduler speed.
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), &mut attempt).await;
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_for_completion())
+            .await
+            .expect("the released mock handler must finish");
+        cancelled
+            .expect("shutdown must cancel the fetch before its response is released")
             .unwrap()
             .unwrap();
-        // Let the bounded mock response finish; it must not publish or start more reads.
-        tokio::time::sleep(Duration::from_millis(350)).await;
         assert_eq!(mock.requests().len(), expected_requests);
         assert_eq!(
             mirror(pool).await,
