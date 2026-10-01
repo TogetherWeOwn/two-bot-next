@@ -48,6 +48,7 @@ pub mod inactivity_store;
 #[cfg(feature = "db")]
 pub mod internal_action_store;
 pub mod internal_actions;
+pub mod internal_settings;
 pub mod invites;
 pub mod leveling;
 #[cfg(feature = "db")]
@@ -76,6 +77,7 @@ pub use secret::Secret;
 pub mod self_roles;
 pub mod settings;
 pub mod sticky;
+pub mod tickets;
 pub mod voice;
 pub mod voice_config;
 pub mod voice_ownership;
