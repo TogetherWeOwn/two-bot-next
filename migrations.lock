@@ -21,6 +21,10 @@
       "sha256": "0b326330725f301066f24f3c5ffaadb7db020e326ac89095afe28d2a968fe766",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0130_custom_commands.sql": {
+      "sha256": "805f43fcdad3c5d401ef9e975e49d59dd4fe01b18eed2de742d1952b76c20e96",
+      "justification": "Register custom-command persistence and shared automation audit for TOG-10080; existing branch SQL unchanged."
+    },
     "crates/cutover/migrations/0150_sticky_messages.sql": {
       "sha256": "17d867f772c9f37325c50be959d9f184958e1a632eb47a000ac9ec13b9c30f57",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
