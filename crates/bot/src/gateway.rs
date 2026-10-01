@@ -12,13 +12,14 @@
 //! stop the runner rather than checkpointing ahead of uncommitted effects.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
-mod ingress;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use crate::onboarding::OnboardingJob;
 
+use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, ShardId};
@@ -26,10 +27,10 @@ use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{
     boot_action, dispatch_action, invalidates_session, BootAction, DispatchAction, GatewaySession,
 };
-use two_bot_core::{ComponentStatus, Config, FunnelEvent};
+use two_bot_core::{ComponentStatus, Config, InviteState, NoopFacts, NoopLeveling, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
 use two_bot_discord::{
-    gateway_intents, needs_message_content, NoClassification, NoInvites, Pipeline,
+    gateway_intents, needs_message_content, InviteSource, NoClassification, Pipeline,
 };
 
 /// Install the process-wide rustls crypto provider (ring) unless one is set.
@@ -53,6 +54,8 @@ pub enum GatewayState {
     /// Shard connected and identified (constructed by the supervisor,
     /// exercised by the /readyz test).
     Connected,
+    /// Reception has stopped; effects are draining before process restart.
+    Draining,
 }
 
 impl GatewayState {
@@ -71,6 +74,7 @@ impl GatewayState {
             Self::Unconfigured => ComponentStatus::Down,
             Self::Armed => ComponentStatus::Starting,
             Self::Connected => ComponentStatus::Ready,
+            Self::Draining => ComponentStatus::Down,
         }
     }
 }
@@ -108,20 +112,31 @@ pub fn intents_from_env() -> Intents {
     gateway_intents(message_content)
 }
 
-pub type GatewayPipeline = Pipeline<GatewayFunnelBuffer>;
+pub type GatewayPipeline<I = two_bot_discord::NoInvites> = Pipeline<
+    GatewayFunnelBuffer,
+    NoopLeveling,
+    NoopFacts,
+    I,
+    NoClassification,
+    GatewayFunnelBuffer,
+>;
 
 pub async fn load_boot_session(
     store: &GatewaySessionStore,
 ) -> Result<Option<GatewaySession>, sqlx::Error> {
-    let saved = store.load().await?;
-    match boot_action(saved.as_ref(), two_bot_core::funnel::now_millis_for_test()) {
-        BootAction::Resume => Ok(saved),
-        BootAction::DiscardAndIdentify => {
-            store.clear().await?;
-            Ok(None)
+    tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+        let saved = store.load().await?;
+        match boot_action(saved.as_ref(), two_bot_core::funnel::now_millis_for_test()) {
+            BootAction::Resume => Ok(saved),
+            BootAction::DiscardAndIdentify => {
+                store.clear().await?;
+                Ok(None)
+            }
+            BootAction::Identify => Ok(None),
         }
-        BootAction::Identify => Ok(None),
-    }
+    })
+    .await
+    .map_err(|_| sqlx::Error::InvalidArgument("gateway boot deadline exceeded".into()))?
 }
 
 // Partition the existing five-connection gateway subsystem budget. These must
@@ -131,6 +146,8 @@ pub const FEATURE_POOL_MAX: u32 = two_bot_cutover::DB_POOL_MAX_DEFAULT - GATEWAY
 // Admission is independent of the 32-row durable queue. Leave feature capacity
 // for settings and shared commands; do not claim more jobs while these workers run.
 const ONBOARDING_WORKER_LIMIT: usize = 2;
+// Bound detached initial ACKs started at reception.
+const ACK_LIMIT: usize = 32;
 
 const CHECKPOINT_IO_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -140,8 +157,10 @@ struct LiveInteraction {
     generation: u64,
 }
 
+type LiveInteractions = Arc<std::sync::Mutex<HashMap<i64, LiveInteraction>>>;
+
 async fn generation_changed(generation: &AtomicU64, expected: u64) {
-    while generation.load(Ordering::SeqCst) == expected {
+    while generation.load(Ordering::Acquire) == expected {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
@@ -151,20 +170,17 @@ struct Header {
     op: u8,
     s: Option<u64>,
 }
-
 #[derive(serde::Deserialize)]
 struct HelloPacket {
     d: Hello,
 }
-
 #[derive(serde::Deserialize)]
 struct Hello {
     heartbeat_interval: u64,
 }
 
-/// Bound the entire SQL operation (pool acquire through COMMIT), not each query.
-/// Retain the quarter-heartbeat SQL budget even with independent ingress.
-/// A transport invalidation during SQL must not restore stale readiness.
+/// Client-side bound from pool acquisition through COMMIT, including stalled
+/// responses on an acquired connection. Never restore readiness during drain.
 /// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
@@ -172,288 +188,432 @@ async fn checkpoint_io<T>(
     deadline: std::time::Duration,
     operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, sqlx::Error> {
-    let started_generation = generation.load(Ordering::SeqCst);
-    let previous = {
+    let (previous, observed_generation) = {
         let mut state = state.write().await;
         let previous = *state;
-        *state = GatewayState::Armed;
-        previous
+        if previous != GatewayState::Draining {
+            *state = GatewayState::Armed;
+        }
+        (previous, generation.load(Ordering::Acquire))
     };
     let result = tokio::time::timeout(deadline, operation)
         .await
         .map_err(|_| sqlx::Error::InvalidArgument("gateway checkpoint deadline exceeded".into()))?;
     if result.is_ok() {
         let mut state = state.write().await;
-        if generation.load(Ordering::SeqCst) == started_generation {
+        if *state != GatewayState::Draining
+            && generation.load(Ordering::Acquire) == observed_generation
+        {
             *state = previous;
         }
     }
     result
 }
 
-/// Drive raw packets so even dispatches not mapped by Twilight have a durable
-/// sequence. Twilight itself still owns transport, heartbeat and opcode-9
-/// fallback. Source: <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html>
+async fn transport_disconnected(state: &RwLock<GatewayState>, generation: &AtomicU64) {
+    // Share the lock with checkpoint restoration and READY publication so a
+    // disconnect cannot land between their generation check and state write.
+    let mut state = state.write().await;
+    generation.fetch_add(1, Ordering::AcqRel);
+    if *state != GatewayState::Draining {
+        *state = GatewayState::Armed;
+    }
+}
+
+struct ReceivedDispatch {
+    event: Event,
+    observed_at: String,
+}
+#[cfg(test)]
+impl ReceivedDispatch {
+    fn new(event: Event) -> Self {
+        Self {
+            event,
+            observed_at: two_bot_core::now_iso(),
+        }
+    }
+}
+
+enum ReceivedWork {
+    Clear(std::time::Duration),
+    Dispatch {
+        dispatch: Option<Box<ReceivedDispatch>>,
+        checkpoint: GatewaySession,
+        deadline: std::time::Duration,
+        generation: u64,
+        acknowledgement: Option<tokio::sync::oneshot::Receiver<bool>>,
+    },
+    Failed,
+}
+
+/// Raw packets retain unmapped dispatch sequences too. Poll transport separately
+/// from the serial effects/checkpoint writer. Metadata may advance in reception;
+/// only the worker's successful transaction advances the durable replay cursor.
+/// Twilight owns transport, heartbeat and opcode-9 fallback.
+/// Source: <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html>
 ///
-/// `runtime` is the shared command runtime (TOG-11020; S4 sticky slice was
-/// TOG-10309): `dispatch` spawns detached work. Independent ingress drives
-/// Twilight and initial onboarding ACKs while the ordered owner captures and
-/// commits dispatches; command REST work never blocks either owner.
-pub async fn run_shard(
-    mut shard: Shard,
-    pipeline: Arc<GatewayPipeline>,
+/// The shared command runtime dispatches detached work at reception (after the
+/// replay guard), so slash acknowledgements do not queue behind slow funnel I/O.
+/// It never awaits REST/store work on the transport polling path. Shutdown ends
+/// reception cooperatively so the bounded writer remains supervised through drain.
+pub async fn run_shard<I: InviteSource + 'static>(
+    shard: Shard,
+    pipeline: Arc<GatewayPipeline<I>>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
     onboarding: Option<Arc<crate::onboarding::OnboardingRuntime>>,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
-    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
-    let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
-    let (sender, mut packets) = tokio::sync::mpsc::channel(ingress::CAPACITY);
-    let (saved, checkpoint) = tokio::sync::watch::channel(None);
     let generation = Arc::new(AtomicU64::new(0));
-    // Both futures are cancellation-owned by the essential runner. SQL never
-    // prevents ingress polling; failure drops ACK/feature JoinSets together.
-    let work = async {
-        tokio::try_join!(
-            ingress::run(
-                &mut shard,
-                &state,
-                &generation,
-                onboarding.as_ref(),
-                sender,
-                checkpoint,
-            ),
-            run_loop(
-                &mut packets,
-                &pipeline,
-                &state,
-                &store,
-                onboarding.as_ref(),
-                runtime.as_ref(),
-                (&generation, saved),
-            ),
-        )
-        .map(|_| ())
-    };
-    let result = tokio::select! {
-        biased;
-        _ = async {
-            match shutdown {
-                Some(receiver) => crate::server::shutdown_requested(receiver).await,
-                None => std::future::pending().await,
+    let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;
+    // Tickets run beside reception and are cancelled/joined before return.
+    let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
+    let receive_generation = Arc::clone(&generation);
+    let receive_state = Arc::clone(&state);
+    let receive_onboarding = onboarding.clone();
+    let in_flight_acks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let events = futures_util::stream::unfold(
+        (
+            shard,
+            saved,
+            CHECKPOINT_IO_MAX,
+            crate::gateway_metrics::Observer::default(),
+        ),
+        move |(mut shard, mut received, mut deadline, mut observer)| {
+            let state = Arc::clone(&receive_state);
+            let generation = Arc::clone(&receive_generation);
+            let runtime = runtime.clone();
+            let onboarding = receive_onboarding.clone();
+            let in_flight_acks = Arc::clone(&in_flight_acks);
+            async move {
+                // Failure is emitted to the ordered worker, never skipped past.
+                let work: Result<Option<ReceivedWork>, sqlx::Error> = async {
+                    while let Some(item) = shard.next().await {
+                        let received_at = tokio::time::Instant::now();
+                        let message = match item {
+                            Ok(message) => message,
+                            Err(error) if matches!(error.kind(), twilight_gateway::error::ReceiveMessageErrorType::Reconnect) => {
+                                transport_disconnected(&state, &generation).await;
+                                warn!("gateway reconnect failed; Twilight will retry");
+                                continue;
+                            }
+                            Err(_) => return Err(sqlx::Error::InvalidArgument("gateway receive failed".into())),
+                        };
+                        observer.observe(&message, &shard);
+                        let Message::Text(text) = message else {
+                            transport_disconnected(&state, &generation).await;
+                            let rejected = matches!(message, Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009));
+                            let clear = rejected || shard.session().is_none();
+                            if rejected { shard = Shard::with_config(shard.id(), shard.config().clone()); }
+                            if clear { received = None; return Ok(Some(ReceivedWork::Clear(deadline))); }
+                            continue;
+                        };
+                        let observed_at = two_bot_core::now_iso();
+                        let header: Header = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway header".into()))?;
+                        if header.op == 10 {
+                            let hello: HelloPacket = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
+                            if hello.d.heartbeat_interval == 0 { return Err(sqlx::Error::InvalidArgument("zero heartbeat interval".into())); }
+                            deadline = CHECKPOINT_IO_MAX.min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
+                        }
+                        if header.op == 9 {
+                            let packet: serde_json::Value = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway session packet".into()))?;
+                            let resumable = packet["d"].as_bool().ok_or_else(|| sqlx::Error::InvalidArgument("invalid gateway session flag".into()))?;
+                            transport_disconnected(&state, &generation).await;
+                            if invalidates_session(resumable) { received = None; return Ok(Some(ReceivedWork::Clear(deadline))); }
+                        }
+                        if header.op != 0 { continue; }
+                        let sequence = header.s.ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing sequence".into()))?;
+                        let session = session_snapshot(&shard).ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing session".into()))?;
+                        let resume_url = shard.resume_url().or_else(|| received.as_ref().filter(|saved| saved.session_id == session.id()).map(|saved| saved.resume_url.as_str()))
+                            .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
+                        let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
+                        if dispatch_action(received.as_ref(), &checkpoint.session_id, sequence) == DispatchAction::Duplicate { continue; }
+                        let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| sqlx::Error::InvalidArgument("gateway dispatch parse failed".into()))?;
+                        received = Some(checkpoint.clone());
+                        let dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at }));
+                        // Detached command ingress must not wait behind the
+                        // serial funnel writer's REST/SQL latency. Main's
+                        // command claims remain independent of this checkpoint.
+                        if let (Some(runtime), Some(dispatch)) = (runtime.as_ref(), dispatch.as_ref()) {
+                            runtime.dispatch(&dispatch.event);
+                        }
+                        // The only onboarding effect at reception is a bounded
+                        // initial ACK via the shared executor; the memory-only
+                        // ticket is consumed after the ordered COMMIT.
+                        let acknowledgement = match (onboarding.as_ref(), dispatch.as_deref()) {
+                            (Some(runtime), Some(ReceivedDispatch { event: Event::InteractionCreate(interaction), .. }))
+                                if runtime.accepts_interaction(&interaction.0) =>
+                            {
+                                if in_flight_acks.fetch_add(1, Ordering::AcqRel) >= ACK_LIMIT {
+                                    in_flight_acks.fetch_sub(1, Ordering::AcqRel);
+                                    return Err(sqlx::Error::InvalidArgument("gateway ingress capacity exhausted".into()));
+                                }
+                                let (send, receive) = tokio::sync::oneshot::channel();
+                                let runtime = Arc::clone(runtime);
+                                let interaction = interaction.0.clone();
+                                let in_flight = Arc::clone(&in_flight_acks);
+                                tokio::spawn(async move {
+                                    let confirmed = runtime.acknowledge(&interaction, received_at).await;
+                                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                                    let _ = send.send(confirmed);
+                                });
+                                Some(receive)
+                            }
+                            _ => None,
+                        };
+                        return Ok(Some(ReceivedWork::Dispatch { dispatch, checkpoint, deadline, generation: generation.load(std::sync::atomic::Ordering::Acquire), acknowledgement }));
+                    }
+                    Ok(None)
+                }.await;
+                match work {
+                    Ok(Some(work)) => Some((work, (shard, received, deadline, observer))),
+                    Ok(None) => None,
+                    Err(_) => Some((ReceivedWork::Failed, (shard, received, deadline, observer))),
+                }
             }
-        } => Ok(()),
-        result = work => result,
+        },
+    );
+    info!(shard = ?ShardId::ONE, "gateway shard loop started");
+    let handle = tokio::runtime::Handle::current();
+    let worker_state = Arc::clone(&state);
+    let stop_state = Arc::clone(&state);
+    let live_interactions: LiveInteractions = Arc::default();
+    let queue_signal = Arc::new(tokio::sync::Notify::new());
+    let writer_live = Arc::clone(&live_interactions);
+    let writer_signal = Arc::clone(&queue_signal);
+    let writer_onboarding = onboarding.clone();
+    let queue_worker = onboarding.clone().map(|runtime| {
+        onboarding_queue(
+            runtime,
+            store.clone(),
+            Arc::clone(&state),
+            Arc::clone(&generation),
+            Arc::clone(&live_interactions),
+            Arc::clone(&queue_signal),
+        )
+    });
+    let dispatch = crate::dispatch::dispatch_bounded(
+        // Ending reception is cooperative: dispatch_bounded keeps supervising
+        // and draining its blocking writer instead of being aborted/dropped.
+        events.take_until(shutdown),
+        crate::dispatch::DISPATCH_BACKLOG,
+        move |work| match work {
+            ReceivedWork::Clear(deadline) => handle
+                .block_on(checkpoint_io(
+                    &worker_state,
+                    &generation,
+                    deadline,
+                    store.clear(),
+                ))
+                .unwrap_or_else(|_| panic!("gateway clear failed")),
+            ReceivedWork::Failed => panic!("gateway receive failed; checkpoint unchanged"),
+            ReceivedWork::Dispatch {
+                dispatch,
+                checkpoint,
+                deadline,
+                generation: observed_generation,
+                acknowledgement,
+            } => {
+                let timer = crate::gateway_metrics::DispatchTimer::start();
+                let mut connected = false;
+                let mut onboarding_job = None;
+                if let Some(dispatch) = dispatch {
+                    connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed);
+                    // Capture member state before the cache pipeline mutates it.
+                    onboarding_job = writer_onboarding
+                        .as_ref()
+                        .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
+                    pipeline.handle_at(&dispatch.event, &dispatch.observed_at);
+                }
+                let durable_job = onboarding_job
+                    .as_ref()
+                    .map(|job| {
+                        job.durable_payload().map(|payload| GatewayJob {
+                            payload,
+                            occurred_at_ms: checkpoint.updated_at_ms,
+                        })
+                    })
+                    .transpose()
+                    .unwrap_or_else(|_| panic!("invalid onboarding job"));
+                let (_, job_id) = handle
+                    .block_on(checkpoint_io(
+                        &worker_state,
+                        &generation,
+                        deadline,
+                        store.commit_dispatch_with_job(
+                            &checkpoint,
+                            pipeline.handlers().store().take_batch(),
+                            durable_job,
+                        ),
+                    ))
+                    .unwrap_or_else(|_| panic!("gateway checkpoint failed"));
+                timer.committed();
+                if let Some(id) = job_id {
+                    if let Some(OnboardingJob::Interaction(interaction)) = onboarding_job {
+                        let ticket = acknowledgement.unwrap_or_else(|| {
+                            panic!("onboarding interaction missing ingress ticket")
+                        });
+                        writer_live
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(
+                                id,
+                                LiveInteraction {
+                                    interaction,
+                                    ticket,
+                                    generation: observed_generation,
+                                },
+                            );
+                    }
+                    writer_signal.notify_one();
+                }
+                if connected {
+                    let mut state = handle.block_on(worker_state.write());
+                    if *state != GatewayState::Draining
+                        && generation.load(Ordering::Acquire) == observed_generation
+                    {
+                        *state = GatewayState::Connected;
+                        info!(
+                            sequence = checkpoint.sequence,
+                            "gateway ready; checkpoint committed"
+                        );
+                    }
+                }
+            }
+        },
+        move || async move {
+            *stop_state.write().await = GatewayState::Draining;
+        },
+        crate::dispatch::DISPATCH_IO_MAX,
+        crate::dispatch::DISPATCH_DRAIN_MAX,
+    );
+    let result: Result<(), sqlx::Error> = match queue_worker {
+        // The durable queue worker only returns on a fatal error; fail the
+        // runner (Draining) and drop reception/writer with it.
+        Some(queue_worker) => tokio::select! {
+            result = dispatch => {
+                result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()))
+            }
+            result = queue_worker => {
+                *state.write().await = GatewayState::Draining;
+                result
+            }
+        },
+        None => dispatch
+            .await
+            .map_err(|reason| sqlx::Error::InvalidArgument(reason.into())),
     };
-    *state.write().await = GatewayState::Armed;
+    // Reception does not restart in this runner. Keep Draining sticky through
+    // both successful shutdown and fatal exit, including any remaining writer.
     if let Some(tickets) = tickets {
         tickets.shutdown().await;
     }
     result
 }
 
-async fn run_loop(
-    packets: &mut tokio::sync::mpsc::Receiver<ingress::Packet>,
-    pipeline: &GatewayPipeline,
-    state: &RwLock<GatewayState>,
-    store: &GatewaySessionStore,
-    onboarding: Option<&Arc<crate::onboarding::OnboardingRuntime>>,
-    runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
-    progress: (
-        &Arc<AtomicU64>,
-        tokio::sync::watch::Sender<Option<GatewaySession>>,
-    ),
+/// Durable onboarding job worker: claims committed jobs, runs them through the
+/// shared executor with bounded concurrency and records completion. Returns
+/// only on a fatal error (the runner then fails closed).
+async fn onboarding_queue(
+    runtime: Arc<crate::onboarding::OnboardingRuntime>,
+    store: GatewaySessionStore,
+    state: Arc<RwLock<GatewayState>>,
+    generation: Arc<AtomicU64>,
+    live_interactions: LiveInteractions,
+    signal: Arc<tokio::sync::Notify>,
 ) -> Result<(), sqlx::Error> {
-    let (generation, saved_checkpoint) = progress;
-    let mut deadline = CHECKPOINT_IO_MAX;
-    let mut committed = checkpoint_io(state, generation, deadline, store.load()).await?;
-    saved_checkpoint.send_replace(committed.clone());
-    info!(shard = ?ShardId::ONE, "gateway shard loop started");
+    let deadline = CHECKPOINT_IO_MAX;
     let mut feature_jobs = tokio::task::JoinSet::new();
-    let mut live_interactions: HashMap<i64, LiveInteraction> = HashMap::new();
     let mut queue_dirty = true;
     let mut queue_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     queue_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    if onboarding.is_some() {
-        checkpoint_io(state, generation, deadline, store.recover_onboarding_jobs()).await?;
-    }
+    checkpoint_io(
+        &state,
+        &generation,
+        deadline,
+        store.recover_onboarding_jobs(),
+    )
+    .await?;
     loop {
-        if let Some(runtime) = onboarding {
-            // Claim only available worker slots and drain packets between
-            // claims; independent ingress continues polling Twilight.
-            if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT {
-                if let Some(saved) =
-                    checkpoint_io(state, generation, deadline, store.claim_onboarding_job()).await?
-                {
-                    let live = live_interactions.remove(&saved.id);
-                    let job = if let Some(live) = &live {
-                        Some(OnboardingJob::Interaction(live.interaction.clone()))
-                    } else {
-                        OnboardingJob::recover(&saved.payload).map_err(|_| {
-                            sqlx::Error::InvalidArgument("invalid durable onboarding job".into())
-                        })?
-                    };
-                    if let Some(job) = job {
-                        let runtime = Arc::clone(runtime);
-                        let generation = Arc::clone(generation);
-                        feature_jobs.spawn(async move {
-                            let interrupted =
-                                tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                                    if let Some(live) = live {
-                                        // Invalidation cancels even settings/selection waits;
-                                        // staged SQL rolls back and credentials are not replayed.
-                                        tokio::select! {
-                                            biased;
-                                            _ = generation_changed(&generation, live.generation) => return Ok(true),
-                                            result = async {
-                                                if live.ticket.await.unwrap_or(false) {
-                                                    runtime.handle_acknowledged(&live.interaction, saved.occurred_at_ms).await
-                                                } else {
-                                                    runtime.unconfirmed_interaction(&live.interaction).await
-                                                }
-                                            } => result?,
-                                        }
-                                    } else {
-                                        runtime.handle(job, saved.occurred_at_ms).await?;
-                                    }
-                                    Ok::<_, crate::onboarding::RuntimeError>(false)
-                                })
-                                .await
-                                .map_err(|_| crate::onboarding::RuntimeError::Discord)??;
-                            Ok::<_, crate::onboarding::RuntimeError>((saved.id, interrupted))
-                        });
-                    } else {
-                        // Callback credentials never survive a process boundary.
-                        // Keep an interruption receipt, not a guessed role replay.
-                        checkpoint_io(
-                            state,
-                            generation,
-                            deadline,
-                            store.finish_onboarding_job(saved.id, true),
-                        )
-                        .await?;
-                        warn!(
-                            job_id = saved.id,
-                            "onboarding interaction interrupted; member must reselect"
-                        );
-                    }
+        // Claim only available worker slots; reception keeps polling Twilight.
+        if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT {
+            if let Some(saved) =
+                checkpoint_io(&state, &generation, deadline, store.claim_onboarding_job()).await?
+            {
+                let live = live_interactions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&saved.id);
+                let job = if let Some(live) = &live {
+                    Some(OnboardingJob::Interaction(live.interaction.clone()))
                 } else {
-                    queue_dirty = false;
+                    OnboardingJob::recover(&saved.payload).map_err(|_| {
+                        sqlx::Error::InvalidArgument("invalid durable onboarding job".into())
+                    })?
+                };
+                if let Some(job) = job {
+                    let runtime = Arc::clone(&runtime);
+                    let generation = Arc::clone(&generation);
+                    feature_jobs.spawn(async move {
+                        let interrupted =
+                            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                                if let Some(live) = live {
+                                    // Invalidation cancels even settings/selection waits;
+                                    // staged SQL rolls back and credentials are not replayed.
+                                    tokio::select! {
+                                        biased;
+                                        _ = generation_changed(&generation, live.generation) => return Ok(true),
+                                        result = async {
+                                            if live.ticket.await.unwrap_or(false) {
+                                                runtime.handle_acknowledged(&live.interaction, saved.occurred_at_ms).await
+                                            } else {
+                                                runtime.unconfirmed_interaction(&live.interaction).await
+                                            }
+                                        } => result?,
+                                    }
+                                } else {
+                                    runtime.handle(job, saved.occurred_at_ms).await?;
+                                }
+                                Ok::<_, crate::onboarding::RuntimeError>(false)
+                            })
+                            .await
+                            .map_err(|_| crate::onboarding::RuntimeError::Discord)??;
+                        Ok::<_, crate::onboarding::RuntimeError>((saved.id, interrupted))
+                    });
+                } else {
+                    // Callback credentials never survive a process boundary.
+                    // Keep an interruption receipt, not a guessed role replay.
+                    checkpoint_io(
+                        &state,
+                        &generation,
+                        deadline,
+                        store.finish_onboarding_job(saved.id, true),
+                    )
+                    .await?;
+                    warn!(
+                        job_id = saved.id,
+                        "onboarding interaction interrupted; member must reselect"
+                    );
                 }
+            } else {
+                queue_dirty = false;
             }
         }
-        let item = tokio::select! {
-            item = packets.recv() => item,
-            _ = queue_tick.tick(), if onboarding.is_some() && queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT => {
-                continue;
-            },
+        tokio::select! {
+            _ = signal.notified() => queue_dirty = true,
+            _ = queue_tick.tick(), if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT => {}
             result = feature_jobs.join_next(), if !feature_jobs.is_empty() => {
                 let Some(Ok(Ok((id, interrupted)))) = result else {
                     return Err(sqlx::Error::InvalidArgument(
                         "onboarding worker failed; durable job retained for bounded restart recovery".into(),
                     ));
                 };
-                checkpoint_io(state, generation, deadline, store.finish_onboarding_job(id, interrupted)).await?;
+                checkpoint_io(&state, &generation, deadline, store.finish_onboarding_job(id, interrupted)).await?;
                 queue_dirty = true;
-                continue;
-            }
-        };
-        let Some(item) = item else {
-            break;
-        };
-        let (event, checkpoint, received_generation, acknowledgement) = match item {
-            ingress::Packet::Hello(budget) => {
-                deadline = budget;
-                continue;
-            }
-            ingress::Packet::Invalidate { clear } => {
-                if clear {
-                    checkpoint_io(state, generation, deadline, store.clear()).await?;
-                    committed = None;
-                    saved_checkpoint.send_replace(None);
-                }
-                continue;
-            }
-            ingress::Packet::Dispatch {
-                event,
-                checkpoint,
-                generation,
-                acknowledgement,
-            } => (event, checkpoint, generation, acknowledgement),
-        };
-        let sequence = checkpoint.sequence;
-        if dispatch_action(committed.as_ref(), &checkpoint.session_id, sequence)
-            == DispatchAction::Duplicate
-        {
-            continue;
-        }
-        let timer = crate::gateway_metrics::DispatchTimer::start();
-        let mut connected = false;
-        let mut onboarding_job = None;
-        if let Some(event) = event {
-            connected = matches!(*event, Event::Ready(_) | Event::Resumed);
-            onboarding_job = onboarding.and_then(|runtime| runtime.capture(&event, pipeline));
-            pipeline.handle(&event);
-            // Detached dispatch only: command REST work must not stall the
-            // ordered pipeline/checkpoint owner.
-            if let Some(runtime) = runtime {
-                runtime.dispatch(&event);
-            }
-        }
-        let durable_job = onboarding_job
-            .as_ref()
-            .map(|job| {
-                job.durable_payload()
-                    .map(|payload| GatewayJob {
-                        payload,
-                        occurred_at_ms: checkpoint.updated_at_ms,
-                    })
-                    .map_err(|_| sqlx::Error::InvalidArgument("invalid onboarding job".into()))
-            })
-            .transpose()?;
-        let (_, job_id) = checkpoint_io(
-            state,
-            generation,
-            deadline,
-            store.commit_dispatch_with_job(
-                &checkpoint,
-                pipeline.handlers().store().take_batch(),
-                durable_job,
-            ),
-        )
-        .await?;
-        timer.committed();
-        committed = Some(checkpoint);
-        saved_checkpoint.send_replace(committed.clone());
-        if let Some(id) = job_id {
-            if let Some(OnboardingJob::Interaction(interaction)) = onboarding_job {
-                let ticket = acknowledgement.ok_or_else(|| {
-                    sqlx::Error::InvalidArgument(
-                        "onboarding interaction missing ingress ticket".into(),
-                    )
-                })?;
-                live_interactions.insert(
-                    id,
-                    LiveInteraction {
-                        interaction,
-                        ticket,
-                        generation: received_generation,
-                    },
-                );
-            }
-            queue_dirty = true;
-        }
-        if connected {
-            let mut state = state.write().await;
-            if generation.load(Ordering::SeqCst) == received_generation {
-                *state = GatewayState::Connected;
-                info!(sequence, "gateway ready; checkpoint committed");
             }
         }
     }
-    warn!("gateway shard stream ended; supervisor reports down until restart");
-    Ok(())
 }
 
 /// Build the supervisor's shard: single-shard deployment (one guild, ADR
@@ -503,15 +663,89 @@ pub fn build_shard_config(
     builder.build()
 }
 
+/// REST invite counters. A failed or incomplete read keeps the persisted
+/// baseline; it must never look like a successful empty guild listing.
+pub struct HttpInvites {
+    client: twilight_http::Client,
+    handle: tokio::runtime::Handle,
+}
+
+impl InviteSource for HttpInvites {
+    fn current(&self, guild_id: Snowflake) -> Option<Vec<InviteState>> {
+        tokio::task::block_in_place(|| {
+            self.handle.block_on(async {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let invites = self
+                        .client
+                        .guild_invites(twilight_model::id::Id::new(guild_id))
+                        .await
+                        .ok()?
+                        .model()
+                        .await
+                        .ok()?;
+                    invites
+                        .into_iter()
+                        .map(|i| {
+                            Some(InviteState {
+                                code: i.code,
+                                uses: i.uses?,
+                                inviter_id: i.inviter.map(|u| u.id.get()),
+                                channel_id: i.channel.map(|c| c.id.get()),
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .await
+                .ok()
+                .flatten();
+                if result.is_none() {
+                    warn!(
+                        guild_id,
+                        "invite counter read unavailable; retaining snapshot"
+                    );
+                }
+                result
+            })
+        })
+    }
+}
+
+#[cfg(test)]
 #[must_use]
-pub fn build_pipeline(milestones: Vec<FunnelEvent>) -> GatewayPipeline {
-    Pipeline::new(
-        GatewayFunnelBuffer::from_milestones(milestones),
-        None,
-        None,
-        NoInvites,
+pub fn build_pipeline(milestones: Vec<two_bot_core::FunnelEvent>) -> GatewayPipeline {
+    let buffer = GatewayFunnelBuffer::from_milestones(milestones);
+    Pipeline::with_snapshots(
+        buffer.clone(),
+        Some(NoopLeveling),
+        Some(NoopFacts),
+        two_bot_discord::NoInvites,
         NoClassification,
+        buffer,
     )
+}
+
+pub async fn build_persistent_pipeline(
+    store: &GatewaySessionStore,
+    guild_id: Snowflake,
+    token: String,
+) -> Result<GatewayPipeline<HttpInvites>, sqlx::Error> {
+    tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+        let buffer = GatewayFunnelBuffer::from_milestones(store.milestones().await?);
+        buffer.seed_snapshots(guild_id, store.invite_snapshots().await?);
+        Ok(Pipeline::with_snapshots(
+            buffer.clone(),
+            Some(NoopLeveling),
+            Some(NoopFacts),
+            HttpInvites {
+                client: twilight_http::Client::new(token),
+                handle: tokio::runtime::Handle::current(),
+            },
+            NoClassification,
+            buffer,
+        ))
+    })
+    .await
+    .map_err(|_| sqlx::Error::InvalidArgument("gateway baseline deadline exceeded".into()))?
 }
 
 #[cfg(test)]
@@ -599,15 +833,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_io_cannot_restore_an_invalidated_transport_generation() {
+    async fn checkpoint_completion_cannot_overwrite_a_transport_disconnect() {
         let state = RwLock::new(GatewayState::Connected);
         let generation = AtomicU64::new(0);
         checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
-            generation.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(*state.read().await, GatewayState::Armed);
+            transport_disconnected(&state, &generation).await;
             Ok(())
         })
         .await
         .unwrap();
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert_eq!(*state.read().await, GatewayState::Armed);
+        assert_ne!(state.read().await.status(), ComponentStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn transport_disconnect_cannot_clear_draining() {
+        let state = RwLock::new(GatewayState::Draining);
+        transport_disconnected(&state, &AtomicU64::new(0)).await;
+        assert_eq!(*state.read().await, GatewayState::Draining);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_completion_cannot_restore_readiness_after_reception_stops() {
+        let state = RwLock::new(GatewayState::Connected);
+        checkpoint_io(&state, &AtomicU64::new(0), CHECKPOINT_IO_MAX, async {
+            *state.write().await = GatewayState::Draining;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(*state.read().await, GatewayState::Draining);
+        assert_eq!(state.read().await.status(), ComponentStatus::Down);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_timeout_cancels_never_completing_client_operation() {
+        struct Cancelled(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Cancelled {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Cancelled(Arc::clone(&cancelled));
+        let state = RwLock::new(GatewayState::Connected);
+        let result = checkpoint_io(
+            &state,
+            &AtomicU64::new(0),
+            std::time::Duration::from_millis(10),
+            async move {
+                let _guard = guard;
+                std::future::pending::<Result<(), sqlx::Error>>().await
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(*state.read().await, GatewayState::Armed);
     }
 
@@ -616,5 +899,147 @@ mod tests {
         ensure_crypto_provider();
         let shard = build_shard("token".to_owned(), Intents::empty(), None, None);
         assert_eq!(session_snapshot(&shard), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_voice_gate_and_leave_use_receipt_time() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use twilight_model::gateway::payload::incoming::{
+            MemberRemove, MemberUpdate, VoiceStateUpdate,
+        };
+        use two_bot_core::EventType;
+        use two_bot_discord::MemPipeline;
+
+        let user: twilight_model::user::User = serde_json::from_value(serde_json::json!({
+            "id": "123", "username": "fixture", "discriminator": "0001", "avatar": null
+        }))
+        .unwrap();
+        let gate = Event::MemberUpdate(Box::new(
+            serde_json::from_value::<MemberUpdate>(serde_json::json!({
+                "guild_id": "456", "user": user, "roles": [], "pending": false
+            }))
+            .unwrap(),
+        ));
+        let voice = |channel: Option<&str>| {
+            Event::VoiceStateUpdate(Box::new(
+                serde_json::from_value::<VoiceStateUpdate>(serde_json::json!({
+                    "guild_id": "456", "user_id": "123", "channel_id": channel,
+                    "session_id": "fixture", "deaf": false, "mute": false,
+                    "self_deaf": false, "self_mute": false, "self_video": false,
+                    "suppress": false
+                }))
+                .unwrap(),
+            ))
+        };
+        let leave = Event::MemberRemove(MemberRemove {
+            guild_id: twilight_model::id::Id::new(456),
+            user,
+        });
+        let events = vec![Event::Resumed, gate, voice(Some("789")), voice(None), leave];
+        let pipeline = Arc::new(MemPipeline::for_replay());
+        let worker_pipeline = Arc::clone(&pipeline);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let stamps = Arc::clone(&observed);
+        let stream = futures_util::stream::unfold(
+            (0, events.into_iter(), Some(start)),
+            move |(n, mut events, mut start)| {
+                let release = release.clone();
+                let stamps = Arc::clone(&stamps);
+                async move {
+                    if n == 1 {
+                        start.take().unwrap().await.unwrap();
+                    }
+                    if n == 3 {
+                        tokio::time::sleep(Duration::from_millis(1300)).await;
+                    }
+                    let Some(event) = events.next() else {
+                        release.send(()).unwrap();
+                        return None;
+                    };
+                    let dispatch = ReceivedDispatch::new(event);
+                    stamps.lock().unwrap().push(dispatch.observed_at.clone());
+                    Some((dispatch, (n + 1, events, start)))
+                }
+            },
+        );
+        let mut started = Some(started);
+        let result = crate::dispatch::dispatch_ordered(stream, 8, move |dispatch| {
+            if matches!(dispatch.event, Event::Resumed) {
+                started.take().unwrap().send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            worker_pipeline.handle_at(&dispatch.event, &dispatch.observed_at);
+        })
+        .await;
+        assert_eq!(result, Ok(()));
+        let stamps = observed.lock().unwrap();
+        let rows = pipeline.handlers().store().rows();
+        for (kind, index) in [
+            (EventType::GateCleared, 1),
+            (EventType::VoiceSessionStart, 2),
+            (EventType::VoiceSessionEnd, 3),
+            (EventType::MemberLeave, 4),
+        ] {
+            let row = rows.iter().find(|row| row.event_type == kind).unwrap();
+            assert_eq!(row.occurred_at, stamps[index], "{kind:?} lost receipt time");
+        }
+        let end = rows
+            .iter()
+            .find(|row| row.event_type == EventType::VoiceSessionEnd)
+            .unwrap();
+        assert!(
+            end.metadata.as_ref().unwrap()["durationSeconds"]
+                .as_f64()
+                .unwrap()
+                >= 1.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_invite_double_distinguishes_missing_counters_from_empty_listing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        ensure_crypto_provider();
+        for (status, body, expected_len) in [
+            (
+                200,
+                r#"[{"type":0,"code":"fixture","channel":null,"uses":7}]"#,
+                Some(1),
+            ),
+            (200, r#"[{"type":0,"code":"fixture","channel":null}]"#, None),
+            (200, "[]", Some(0)),
+            (403, r#"{"message":"fixture denied","code":50013}"#, None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let host = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                assert!(String::from_utf8_lossy(&request).contains("/guilds/123/invites"));
+                let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let source = HttpInvites {
+                client: twilight_http::Client::builder()
+                    .token("fixture".to_owned())
+                    .proxy(host, true)
+                    .build(),
+                handle: tokio::runtime::Handle::current(),
+            };
+            let result = source.current(123);
+            assert_eq!(result.as_ref().map(Vec::len), expected_len);
+            if expected_len == Some(1) {
+                assert_eq!(result.unwrap()[0].uses, 7);
+            }
+            server.await.unwrap();
+        }
     }
 }

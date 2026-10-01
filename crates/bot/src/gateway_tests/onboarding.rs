@@ -339,7 +339,7 @@ async fn spawn_onboarding_with_store(
         store.clone(),
         Some(runtime),
         None,
-        None,
+        std::future::pending(),
     ));
     Runner {
         task,

@@ -185,7 +185,11 @@ impl OnboardingRuntime {
             .ok_or(RuntimeError::Config)
     }
 
-    pub fn capture(&self, event: &Event, pipeline: &GatewayPipeline) -> Option<OnboardingJob> {
+    pub fn capture<I: two_bot_discord::InviteSource>(
+        &self,
+        event: &Event,
+        pipeline: &GatewayPipeline<I>,
+    ) -> Option<OnboardingJob> {
         match event {
             Event::MemberAdd(member) if member.guild_id.get() == self.guild_id => {
                 Some(OnboardingJob::Welcome {

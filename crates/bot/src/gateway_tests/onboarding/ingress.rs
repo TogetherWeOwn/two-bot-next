@@ -181,15 +181,17 @@ async fn onboarding_gateway_ingress_overflow_fails_closed_and_cancels_pending_ch
         let lock = lock_gateway(&db).await;
         ws.send(leave(2)).await;
         wait_unready(&runner).await;
-        for seq in 3..=35 {
+        // One more than the bounded writer backlog (DISPATCH_BACKLOG) plus the
+        // dispatch the writer already holds.
+        for seq in 3..=(3 + crate::dispatch::DISPATCH_BACKLOG as u64 + 1) {
             ws.send(resumed(seq)).await;
         }
         let error = (&mut runner.task)
             .await
             .expect("owner must not panic")
             .expect_err("finite ingress must fail closed");
-        assert!(error.to_string().contains("ingress capacity"));
-        assert_eq!(*runner.state.read().await, GatewayState::Armed);
+        assert!(error.to_string().contains("dispatch"));
+        assert_ne!(*runner.state.read().await, GatewayState::Connected);
         lock.rollback().await.unwrap();
         assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
         assert_eq!(

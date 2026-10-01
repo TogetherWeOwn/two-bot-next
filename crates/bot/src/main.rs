@@ -11,6 +11,7 @@ mod command_runtime;
 mod command_runtime_tests;
 mod community_jobs;
 mod database_roles_cli;
+mod dispatch;
 mod gateway;
 mod gateway_metrics;
 #[cfg(test)]
@@ -38,8 +39,10 @@ use tracing::info;
 use two_bot_core::{ComponentStatus, Config};
 
 use gateway::{
-    build_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard, GatewayState,
+    build_persistent_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard,
+    GatewayState,
 };
+use server::SharedState;
 use website_jobs::serve;
 
 #[tokio::main]
@@ -88,7 +91,7 @@ async fn main() {
         }
     });
 
-    let state = Arc::new(RwLock::new(GatewayState::new(&config)));
+    let gateway = Arc::new(RwLock::new(GatewayState::new(&config)));
     let listener = server::bind(&config.listen_addr)
         .await
         .unwrap_or_else(|err| {
@@ -111,108 +114,128 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let (shutdown, _) = tokio::sync::watch::channel(false);
-    let gateway_task = match gateway_prerequisites(&config) {
-        Ok((token, url, guild_id)) => {
-            let token = token.to_owned();
-            let url = url.to_owned();
-            let state = Arc::clone(&state);
-            let gateway_shutdown = shutdown.subscribe();
-            Some(tokio::spawn(async move {
-                let result: Result<(), sqlx::Error> = async {
-                    // Runtime is DML-only; the operator migrates before startup.
-                    let gateway_db =
-                        two_bot_cutover::connect(&url, gateway::GATEWAY_POOL_MAX, true).await?;
-                    let db =
-                        two_bot_cutover::connect(&url, gateway::FEATURE_POOL_MAX, true).await?;
-                    metrics_http::register_pool(db.pool().clone());
-                    let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
-                        gateway_db.pool().clone(),
-                        guild_id.to_string(),
-                        0,
-                    );
-                    let saved = gateway::load_boot_session(&store).await?;
-                    let pipeline = Arc::new(build_pipeline(store.milestones().await?));
-                    // Onboarding identity probe must honor the mock REST seam
-                    // (`DISCORD_API_BASE`), mirroring the command runtime: the
-                    // alive acceptance serves `/users/@me` on loopback.
-                    let proxy = std::env::var("DISCORD_API_BASE")
-                        .ok()
-                        .filter(|value| !value.is_empty());
-                    let executor =
-                        two_bot_discord::ActionExecutor::with_proxy(token.clone(), proxy).map_err(
-                            |_| {
-                                sqlx::Error::InvalidArgument(
-                                    "Discord executor initialization failed".into(),
-                                )
-                            },
-                        )?;
-                    let onboarding = Arc::new(
-                        onboarding::OnboardingRuntime::from_env(
-                            db.pool().clone(),
-                            executor,
-                            guild_id,
+    let store = match gateway_prerequisites(&config).ok().map(|(_, url, _)| url) {
+        Some(url) => match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            // Runtime is DML-only; the operator applies both store and gateway
+            // migrations and the web contract before startup.
+            two_bot_store::Store::connect(url, true),
+        )
+        .await
+        {
+            Ok(Ok(store)) => {
+                metrics_http::register_pool(store.pool().clone());
+                Some(store)
+            }
+            _ => {
+                tracing::error!("database initialization failed; exiting for supervisor restart");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let state = SharedState {
+        gateway: Arc::clone(&gateway),
+        database: store.as_ref().map(|s| s.pool().clone()),
+    };
+
+    let (shutdown, stopping) = tokio::sync::watch::channel(false);
+    let gateway_task = if let Ok((token, url, guild_id)) = gateway_prerequisites(&config) {
+        let token = token.to_owned();
+        let url = url.to_owned();
+        let state = Arc::clone(&gateway);
+        Some(tokio::spawn(async move {
+            let result: Result<(), sqlx::Error> = async {
+                let db = store.ok_or_else(|| {
+                    sqlx::Error::InvalidArgument(
+                        "DATABASE_URL required for gateway checkpoint".into(),
+                    )
+                })?;
+                // Feature work (onboarding, shared commands) holds connections
+                // across Discord I/O: keep the ordered checkpoint writer on its
+                // own single-connection pool so it can never be starved.
+                let gateway_db =
+                    two_bot_cutover::connect(&url, gateway::GATEWAY_POOL_MAX, true).await?;
+                let pool = db.pool().clone();
+                let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
+                    gateway_db.pool().clone(),
+                    guild_id.to_string(),
+                    0,
+                );
+                let saved = gateway::load_boot_session(&store).await?;
+                let pipeline =
+                    Arc::new(build_persistent_pipeline(&store, guild_id, token.clone()).await?);
+                // Onboarding identity probe must honor the mock REST seam
+                // (`DISCORD_API_BASE`), mirroring the command runtime: the
+                // alive acceptance serves `/users/@me` on loopback.
+                let proxy = std::env::var("DISCORD_API_BASE")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                let executor = two_bot_discord::ActionExecutor::with_proxy(token.clone(), proxy)
+                    .map_err(|_| {
+                        sqlx::Error::InvalidArgument(
+                            "Discord executor initialization failed".into(),
                         )
+                    })?;
+                let onboarding = Arc::new(
+                    onboarding::OnboardingRuntime::from_env(pool.clone(), executor, guild_id)
                         .await
                         .map_err(|_| {
                             sqlx::Error::InvalidArgument("onboarding initialization failed".into())
                         })?,
-                    );
-                    // Shared command runtime (TOG-11020; S4 sticky slice was
-                    // TOG-10309): ONE router + REST executor + sqlx stores
-                    // over the feature pool. `None` on bad env gates — the shard
-                    // still boots without the command surface.
-                    let runtime = command_runtime::CommandRuntime::from_env(
-                        db.pool().clone(),
-                        &token,
-                        guild_id,
-                    );
-                    let shard = build_shard(
-                        token,
-                        intents_from_env(),
-                        saved.as_ref(),
-                        gateway_url.as_deref(),
-                    );
-                    info!(
-                        resume = saved.is_some(),
-                        "durable gateway initialized; shard connecting"
-                    );
-                    run_shard(
-                        shard,
-                        pipeline,
-                        Arc::clone(&state),
-                        store,
-                        Some(onboarding),
-                        runtime,
-                        Some(gateway_shutdown),
-                    )
-                    .await
+                );
+                // ONE router + REST executor + sqlx stores over the feature pool.
+                // Bad command env gates still park only the command surface.
+                let runtime = command_runtime::CommandRuntime::from_env(pool, &token, guild_id);
+                let shard = build_shard(
+                    token,
+                    intents_from_env(),
+                    saved.as_ref(),
+                    gateway_url.as_deref(),
+                );
+                info!(
+                    resume = saved.is_some(),
+                    "durable gateway initialized; shard connecting"
+                );
+                run_shard(
+                    shard,
+                    pipeline,
+                    Arc::clone(&state),
+                    store,
+                    Some(onboarding),
+                    runtime,
+                    async move {
+                        server::shutdown_requested(stopping).await;
+                    },
+                )
+                .await
+            }
+            .await;
+            if result.is_err() {
+                // Do not print sqlx errors: configuration errors may contain a URL.
+                tracing::error!(
+                    "durable gateway failed; checkpoint unchanged, readiness unavailable"
+                );
+                let mut state = state.write().await;
+                if *state != GatewayState::Draining {
+                    *state = GatewayState::Armed;
                 }
-                .await;
-                if result.is_err() {
-                    // Do not print sqlx errors: configuration errors may contain a URL.
-                    tracing::error!(
-                        "durable gateway failed; checkpoint unchanged, readiness unavailable"
-                    );
-                    *state.write().await = GatewayState::Armed;
-                }
-                result
-            }))
-        }
-        Err(missing) => {
-            *state.write().await = GatewayState::Unconfigured;
-            info!(
-                missing,
-                status = ?ComponentStatus::Down,
-                "gateway prerequisites missing; gateway parked, /readyz reports down"
-            );
-            None
-        }
+            }
+            result
+        }))
+    } else {
+        *gateway.write().await = GatewayState::Unconfigured;
+        info!(
+            missing = gateway_prerequisites(&config).unwrap_err(),
+            status = ?ComponentStatus::Down,
+            "gateway prerequisites missing; gateway parked, /readyz reports down"
+        );
+        None
     };
 
     let http = serve(&config, listener, state, shutdown.clone());
     let result = match gateway_task {
-        Some(task) => supervise_gateway(task, http, shutdown).await,
+        Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
     };
     if let Err(err) = result {
@@ -252,37 +275,69 @@ fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static 
 /// nonzero so the Container supervisor can restart from the committed checkpoint.
 /// Source: <https://docs.rs/tokio/1/tokio/macro.select.html#cancellation-safety>
 async fn supervise_gateway(
-    mut task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
+    task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
     http: impl std::future::Future<Output = std::io::Result<()>>,
+    state: Arc<RwLock<GatewayState>>,
     shutdown: tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<()> {
-    tokio::pin!(http);
-    tokio::select! {
+    supervise_gateway_bounded(
+        task,
+        http,
+        state,
+        shutdown,
+        dispatch::DISPATCH_DRAIN_MAX + std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+async fn supervise_gateway_bounded(
+    mut task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
+    http: impl std::future::Future<Output = std::io::Result<()>>,
+    state: Arc<RwLock<GatewayState>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    shutdown_max: std::time::Duration,
+) -> std::io::Result<()> {
+    let stopping = shutdown.subscribe();
+    futures_util::pin_mut!(http);
+    let (http_result, gateway_stopped) = tokio::select! {
         biased;
+        _ = server::shutdown_requested(stopping) => (None, false),
+        // Check the essential task before the first HTTP poll: cancellation
+        // must be sticky even if the HTTP/job owner has not subscribed yet.
         // Never expose task/SQL errors: they may contain connection secrets.
-        _ = &mut task => {
-            if *shutdown.borrow() {
-                return http.await;
+        _ = &mut task => (None, true),
+        result = &mut http => (Some(result), false),
+    };
+    *state.write().await = GatewayState::Draining;
+    shutdown.send_replace(true);
+    // Retain the gateway JoinHandle through HTTP/job cleanup, never abort its
+    // non-cancellable blocking writer. Poll both drains so neither failure can
+    // skip the other's cleanup. A fatal deadline returns Err; main exits rather
+    // than waiting for Tokio to shut down a detached blocking writer.
+    tokio::time::timeout(shutdown_max, async {
+        let drain_http = async {
+            match http_result {
+                Some(result) => result,
+                None => http.await,
             }
-            // Sticky even if HTTP has not subscribed yet. Keep polling HTTP so
-            // its job supervisor can cancel and join every active action.
-            shutdown.send_replace(true);
-            let _ = http.await;
-            Err(std::io::Error::other(
+        };
+        if gateway_stopped {
+            // The handle was already consumed by select; do not poll it twice.
+            let _ = drain_http.await;
+            return Err(std::io::Error::other(
                 "gateway task stopped; container restart required",
-            ))
-        },
-        result = &mut http => {
-            shutdown.send_replace(true);
-            // Let the shard cancel and join its ticket scope first. A stuck
-            // initializer still cannot hold container shutdown indefinitely.
-            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await.is_err() {
-                task.abort();
-                let _ = task.await;
-            }
-            result
+            ));
         }
-    }
+        let (gateway_result, http_result) = tokio::join!(&mut task, drain_http);
+        match gateway_result {
+            Ok(Ok(())) => http_result,
+            _ => Err(std::io::Error::other(
+                "gateway drain failed; restart required",
+            )),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err(std::io::Error::other("service shutdown deadline exceeded")))
 }
 
 /// Probe /health over plain HTTP using only tokio (no client dependency).
