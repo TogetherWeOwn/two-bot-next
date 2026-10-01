@@ -2361,6 +2361,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "thiserror",
  "tokio",
  "tokio-websockets",
@@ -2371,6 +2372,7 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "two-bot-core",
+ "two-bot-testsupport",
 ]
 
 [[package]]
