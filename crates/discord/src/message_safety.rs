@@ -83,17 +83,42 @@ pub(crate) fn sanitize_message(body: &mut Value) {
     }
 }
 
+/// Create-only guard: updates may clear content and deferred callbacks have no
+/// message yet. Embeds have already been pruned by `sanitize_message`.
+pub(crate) fn validate_create(body: &Value) -> Result<(), DiscordError> {
+    let has_text = body
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(text::has_message_text);
+    let has_payload = ["embeds", "attachments", "components"].iter().any(|key| {
+        body.get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.is_empty())
+    }) || body.get("poll").is_some_and(Value::is_object);
+    if has_text || has_payload {
+        Ok(())
+    } else {
+        Err(DiscordError::Rejected(
+            "message has no sendable payload after sanitization".to_owned(),
+        ))
+    }
+}
+
 fn nonempty(value: &Value, key: &str) -> bool {
     value
         .get(key)
         .and_then(Value::as_str)
-        .is_some_and(|text| !text.is_empty())
+        .is_some_and(text::has_message_text)
 }
 
 fn bound_text(value: &mut Value, key: &str, limit: usize, remaining: &mut usize) {
     if let Some(field) = value.get_mut(key) {
         if let Some(raw) = field.as_str() {
-            let bounded = text::truncate(&text::neutralize_mentions(raw), limit.min(*remaining));
+            let mut bounded =
+                text::truncate(&text::neutralize_mentions(raw), limit.min(*remaining));
+            if !text::has_message_text(&bounded) {
+                bounded.clear();
+            }
             *remaining -= text::text_len(&bounded);
             *field = Value::String(bounded);
         }
@@ -113,6 +138,9 @@ pub(crate) fn interaction_response(
                 value["data"] = json!({});
             }
             sanitize_message(&mut value["data"]);
+            if response.kind == InteractionResponseType::ChannelMessageWithSource {
+                validate_create(&value["data"])?;
+            }
             let mut safe: InteractionResponse = serde_json::from_value(value)
                 .map_err(|e| DiscordError::Rejected(format!("decode safe response: {e}")))?;
             // Attachment.file is #[serde(skip)]: keep the actual upload bytes,
@@ -172,6 +200,33 @@ mod tests {
             .unwrap()
             .allowed_mentions
             .is_some());
+    }
+
+    #[test]
+    fn attachment_only_creates_keep_uploads_and_other_payloads_are_accepted() {
+        use twilight_model::http::{attachment::Attachment, interaction::InteractionResponseData};
+        let attachment =
+            Attachment::from_bytes("fixture.txt".to_owned(), b"upload only".to_vec(), 0);
+        let response = InteractionResponse {
+            kind: InteractionResponseType::ChannelMessageWithSource,
+            data: Some(InteractionResponseData {
+                attachments: Some(vec![attachment.clone()]),
+                ..Default::default()
+            }),
+        };
+        let safe = interaction_response(&response).unwrap();
+        assert_eq!(safe.data.unwrap().attachments, Some(vec![attachment]));
+        for body in [
+            json!({"components": [{"type": 1, "components": [{"type": 2, "style": 1, "label": "button", "custom_id": "fixture"}]}]}),
+            json!({"poll": {"question": {"text": "fixture"}}}),
+        ] {
+            assert!(validate_create(&body).is_ok());
+        }
+        assert!(interaction_response(&InteractionResponse {
+            kind: InteractionResponseType::ChannelMessageWithSource,
+            data: None,
+        })
+        .is_err());
     }
 
     #[test]

@@ -172,6 +172,9 @@ impl AnnouncementExecutor {
         let content = two_bot_core::message_safety::content(
             body["body"].as_str().expect("core validated body"),
         );
+        if !two_bot_core::message_safety::has_message_text(&content) {
+            return ExecutionOutcome::NoEffect(Refusal::Malformed);
+        }
         let mentions = AllowedMentions::default();
         let request = match self
             .twilight

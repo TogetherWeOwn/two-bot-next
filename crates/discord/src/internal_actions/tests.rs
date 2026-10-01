@@ -180,7 +180,7 @@ async fn run_once(executor: &AnnouncementExecutor, body: &Map<String, Value>) ->
 async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
-    let text = "news é 🦀 @everyone @here <@&123456789012345678> <@123456789012345678>";
+    let text = "news é 🦀 می\u{200c}روم @eve\u{200c}ryone @here <@&123456789012345678> <@123456789012345678>";
     let mut body = announcement(text);
     body.insert("channel_id".to_owned(), json!("999999999999999999"));
     body.insert(
@@ -211,7 +211,7 @@ async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
     assert_eq!(
         requests[0].body,
         json!({
-            "content": "news é 🦀 @\u{200b}everyone @\u{200b}here <@&123456789012345678> <@123456789012345678>",
+            "content": "news é 🦀 می\u{200c}روم @\u{200b}everyone @\u{200b}here <@&123456789012345678> <@123456789012345678>",
             "allowed_mentions": {"parse": []}
         })
     );
@@ -247,6 +247,9 @@ async fn refuses_bad_inputs_missing_mapping_and_every_other_core_verb_without_ht
         json!({}),
         json!({"channel_key": "ann"}),
         json!({"channel_key": "ann", "body": ""}),
+        json!({"channel_key": "ann", "body": "\u{200b}"}),
+        json!({"channel_key": "ann", "body": "\u{200c}"}),
+        json!({"channel_key": "ann", "body": "\u{feff}"}),
         json!({"channel_key": 123, "body": "ok"}),
         json!({"channel_key": "ann", "body": 123}),
         json!({"channel_key": "ann", "body": "a".repeat(2001)}),

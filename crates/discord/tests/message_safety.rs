@@ -10,7 +10,7 @@ use twilight_model::http::interaction::{
     InteractionResponse, InteractionResponseData, InteractionResponseType,
 };
 use two_bot_core::message_safety::{content, render_template, text_len, CONTENT_LIMIT};
-use two_bot_discord::{ActionExecutor, ChannelCall};
+use two_bot_discord::{ActionExecutor, ChannelCall, DiscordError};
 
 const INJECTION: &str = "@everyone @here <@&123> <@456>";
 
@@ -172,6 +172,128 @@ async fn original_response_edits_bound_text_after_neutralization() {
     assert_safe(&body);
     assert_eq!(body["content"], "😀".repeat(995) + "@\u{200b}everyone");
     assert_eq!(text_len(body["content"].as_str().unwrap()), CONTENT_LIMIT);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn unsendable_creates_are_rejected_after_rendering_without_http() {
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "99"}))).await;
+    let exec = ActionExecutor::with_proxy("fixture-token".to_owned(), Some(mock.origin())).unwrap();
+    for text in [
+        "",
+        "\u{200b}",
+        "\u{200c}",
+        "\u{feff}",
+        " \u{200b}\u{200c}\u{feff}\n",
+    ] {
+        for body in [
+            text.to_owned(),
+            render_template("{body}", &[("body", text)]),
+        ] {
+            assert!(two_bot_core::validate_body(&body).is_err());
+            assert!(matches!(
+                exec.post_message("4444", &body, None).await,
+                Err(DiscordError::Rejected(_))
+            ));
+            let call = ChannelCall::PostMessage {
+                channel_id: "4444".to_owned(),
+                content: body.clone(),
+                nonce: Some("oa_fixture".to_owned()),
+            };
+            assert!(matches!(
+                exec.execute_channel(&call).await,
+                Err(DiscordError::Rejected(_))
+            ));
+            let response = InteractionResponse {
+                kind: InteractionResponseType::ChannelMessageWithSource,
+                data: Some(InteractionResponseData {
+                    content: Some(body),
+                    ..Default::default()
+                }),
+            };
+            assert!(matches!(
+                exec.answer_interaction(5555, "fixture-interaction-token", &response)
+                    .await,
+                Err(DiscordError::Rejected(_))
+            ));
+        }
+    }
+    // Validate the effective payload, not the visible suffix truncated away.
+    let response: InteractionResponse = serde_json::from_value(json!({
+        "type": 4, "data": {"content": "\u{200b}".repeat(1999) + "😀", "embeds": [{"type": "rich", "description": "\u{feff}"}]},
+    })).unwrap();
+    assert!(matches!(
+        exec.answer_interaction(5555, "fixture-interaction-token", &response)
+            .await,
+        Err(DiscordError::Rejected(_))
+    ));
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn embeds_deferred_callbacks_and_clearing_edits_remain_valid() {
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "99"}))).await;
+    let exec = ActionExecutor::with_proxy("fixture-token".to_owned(), Some(mock.origin())).unwrap();
+    for value in [
+        json!({"type": 4, "data": {"embeds": [{"type": "rich", "description": "embed only"}]}}),
+        json!({"type": 5}),
+        json!({"type": 7, "data": {"content": "", "embeds": []}}),
+    ] {
+        let response: InteractionResponse = serde_json::from_value(value).unwrap();
+        exec.answer_interaction(5555, "fixture-interaction-token", &response)
+            .await
+            .unwrap();
+    }
+    exec.edit_interaction_response(5555, "fixture-interaction-token", "")
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    for request in &requests {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_safe(if body.get("type").is_some() {
+            &body["data"]
+        } else {
+            &body
+        });
+    }
+    let cleared: Value = serde_json::from_slice(&requests[3].body).unwrap();
+    assert_eq!(cleared["content"], "");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn meaningful_unicode_is_preserved_at_create_and_edit_boundaries() {
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "99"}))).await;
+    let exec = ActionExecutor::with_proxy("fixture-token".to_owned(), Some(mock.origin())).unwrap();
+    let text = "می\u{200c}روم 👩\u{200d}💻 @eve\u{200c}ryone @he\u{feff}re";
+    exec.post_message("4444", text, None).await.unwrap();
+    exec.edit_interaction_response(5555, "fixture-interaction-token", text)
+        .await
+        .unwrap();
+    let response: InteractionResponse = serde_json::from_value(json!({
+        "type": 4, "data": {"content": text, "embeds": [{"type": "rich", "description": text}]},
+    }))
+    .unwrap();
+    exec.answer_interaction(5555, "fixture-interaction-token", &response)
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    for request in requests {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let data = if body.get("type").is_some() {
+            &body["data"]
+        } else {
+            &body
+        };
+        assert_safe(data);
+        assert_eq!(
+            data["content"],
+            "می\u{200c}روم 👩\u{200d}💻 @\u{200b}everyone @\u{200b}here"
+        );
+    }
     mock.shutdown().await;
 }
 

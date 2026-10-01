@@ -31,24 +31,53 @@ pub fn truncate(text: &str, limit: usize) -> String {
         .collect()
 }
 
-/// Neutralize mass mentions in user-authored renderings. Strip invisible
-/// separators first so they cannot disguise a mention or accumulate on replay.
+/// Neutralize mass mentions, normalizing invisible separators only inside a
+/// matched mention. Preserve other Unicode (including meaningful non-joiners).
 /// Role/user mentions are kept readable: the REST boundary disables their parsing.
 pub fn neutralize_mentions(text: &str) -> String {
-    let mut visible = String::new();
-    for ch in text.chars() {
-        if matches!(ch, '\u{200b}' | '\u{200c}' | '\u{feff}') {
-            // Preserve our separator, including at a truncated mention's edge.
-            if ch == '\u{200b}' && visible.ends_with('@') {
-                visible.push(ch);
+    let mut safe = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('@') {
+        safe.push_str(&rest[..start]);
+        safe.push('@');
+        rest = &rest[start + 1..];
+        for mention in ["everyone", "here"] {
+            if let Some(end) = mention_end(rest, mention) {
+                safe.push('\u{200b}');
+                safe.push_str(mention);
+                rest = &rest[end..];
+                break;
             }
-        } else {
-            visible.push(ch);
         }
     }
-    visible
-        .replace("@everyone", "@\u{200b}everyone")
-        .replace("@here", "@\u{200b}here")
+    safe.push_str(rest);
+    safe
+}
+
+fn mention_end(text: &str, mention: &str) -> Option<usize> {
+    let mut chars = text
+        .char_indices()
+        .filter(|(_, ch)| !invisible_separator(*ch));
+    let mut end = 0;
+    for expected in mention.chars() {
+        let (index, ch) = chars.next()?;
+        if ch != expected {
+            return None;
+        }
+        end = index + ch.len_utf8();
+    }
+    Some(end)
+}
+
+fn invisible_separator(ch: char) -> bool {
+    matches!(ch, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}')
+}
+
+/// A standalone invisible/whitespace-only body cannot carry a text message.
+/// Test the effective, bounded rendering; do not remove joiners from real text.
+pub fn has_message_text(text: &str) -> bool {
+    text.chars()
+        .any(|ch| !ch.is_whitespace() && !invisible_separator(ch))
 }
 
 pub fn content(text: &str) -> String {
@@ -90,6 +119,33 @@ mod tests {
         assert!(!safe.contains("@here"));
         assert!(safe.contains("<@&123>"));
         assert_eq!(content(&safe), safe);
+    }
+
+    #[test]
+    fn nonmention_unicode_is_preserved_and_obfuscated_mentions_are_neutralized() {
+        for text in [
+            "می\u{200c}روم",
+            "👩\u{200d}💻",
+            "line\u{200b}break",
+            "\u{feff}text",
+            "@user\u{200c}name",
+        ] {
+            assert_eq!(content(text), text);
+        }
+        for separator in ['\u{200b}', '\u{200c}', '\u{200d}', '\u{feff}'] {
+            for mention in ["everyone", "here"] {
+                let disguised = format!(
+                    "@{separator}{}",
+                    mention
+                        .chars()
+                        .map(|ch| format!("{ch}{separator}"))
+                        .collect::<String>()
+                );
+                let expected = format!("@\u{200b}{mention}{separator}");
+                assert_eq!(content(&disguised), expected);
+                assert_eq!(content(&expected), expected);
+            }
+        }
     }
 
     #[test]
