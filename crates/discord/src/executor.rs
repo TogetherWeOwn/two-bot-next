@@ -328,8 +328,10 @@ impl HyperTransport {
         )
     }
 
-    async fn send_request(&self, request: &Request) -> Result<RawResponse, String> {
-        use http_body_util::BodyExt as _;
+    async fn send_request_headers(
+        &self,
+        request: &Request,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, String> {
         let method: http::Method = request
             .method()
             .name()
@@ -382,8 +384,14 @@ impl HyperTransport {
             .request(hyper_req)
             .await
             .map_err(|e| format!("transport: {e}"))?;
+        attempt.finish(Some(response.status().as_u16()));
+        Ok(response)
+    }
+
+    async fn send_request(&self, request: &Request) -> Result<RawResponse, String> {
+        use http_body_util::BodyExt as _;
+        let response = self.send_request_headers(request).await?;
         let status = response.status().as_u16();
-        attempt.finish(Some(status));
         let retry_after_header = response
             .headers()
             .get("retry-after")
@@ -526,6 +534,19 @@ impl ActionExecutor {
     async fn send(&self, request: &Request) -> Result<RawResponse, String> {
         self.count();
         self.inner.transport.send_request(request).await
+    }
+
+    /// Singular role mutations use status only. A truncated/stalled provider
+    /// body must not erase headers already received or invent an unknown send.
+    async fn send_status(&self, request: &Request) -> Result<u16, String> {
+        self.count();
+        Ok(self
+            .inner
+            .transport
+            .send_request_headers(request)
+            .await?
+            .status()
+            .as_u16())
     }
 
     /// Build a twilight [`Request`] from a builder without sending (keeps

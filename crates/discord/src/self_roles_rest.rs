@@ -132,10 +132,14 @@ fn mask(value: &str) -> Result<u64, SelfRoleRestError> {
 }
 
 fn status(response: &RawResponse) -> Result<(), SelfRoleRestError> {
-    match response.status {
+    status_code(response.status)
+}
+
+fn status_code(code: u16) -> Result<(), SelfRoleRestError> {
+    match code {
         200..=299 => Ok(()),
         429 => Err(SelfRoleRestError::RateLimited),
-        400..=499 => Err(SelfRoleRestError::Rejected(response.status)),
+        400..=499 => Err(SelfRoleRestError::Rejected(code)),
         _ => Err(SelfRoleRestError::Ambiguous),
     }
 }
@@ -351,13 +355,13 @@ impl ActionExecutor {
         *lane = std::time::Instant::now();
         let (result, response_received) = match tokio::time::timeout(
             Duration::from_millis(MODERATION_TIMEOUT_MS),
-            self.send(&request),
+            self.send_status(&request),
         )
         .await
         {
-            Ok(Ok(response)) if response.status == 204 => (Ok(()), true),
-            Ok(Ok(response)) => (
-                status(&response).and(Err(SelfRoleRestError::Ambiguous)),
+            Ok(Ok(204)) => (Ok(()), true),
+            Ok(Ok(code)) => (
+                status_code(code).and(Err(SelfRoleRestError::Ambiguous)),
                 true,
             ),
             _ => (Err(SelfRoleRestError::Ambiguous), false),

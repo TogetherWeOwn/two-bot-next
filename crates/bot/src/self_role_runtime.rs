@@ -454,7 +454,8 @@ impl SelfRoleRuntime {
     ) -> Result<(), RuntimeError> {
         let compensating = repair.is_some() || prepared.event.compensating;
         let prior_pending = prepared.event.exchange_pending;
-        let mut attempted = prepared.audit.effects.clone();
+        let prior_effects = prepared.audit.effects.clone();
+        let mut attempted = prior_effects.clone();
         mark_attempt(&mut attempted, role, add);
         let journaled = AtomicBool::new(false);
         // Journal AFTER pacing; fence again after the database wait. A crash
@@ -490,13 +491,13 @@ impl SelfRoleRuntime {
                 if journaled.load(Ordering::SeqCst) {
                     // The shared step returns Err only BEFORE send. Retain send
                     // intent history but do not invent remote uncertainty here.
-                    clear_unresolved(&mut attempted, role, add);
-                    if prior_pending {
-                        attempted.unresolved_added_role_ids =
-                            prepared.audit.effects.unresolved_added_role_ids.clone();
-                        attempted.unresolved_removed_role_ids =
-                            prepared.audit.effects.unresolved_removed_role_ids.clone();
-                    }
+                    resolve_attempt(
+                        &mut attempted,
+                        &prepared.audit.effects,
+                        prior_pending,
+                        role,
+                        add,
+                    );
                     prepared.audit.effects = attempted;
                     self.record_evidence(
                         &prepared.event,
@@ -518,6 +519,13 @@ impl SelfRoleRuntime {
         prepared.event.exchange_pending = prior_pending || !exchange.response_received;
         match exchange.result {
             Ok(()) => {
+                resolve_attempt(
+                    &mut prepared.audit.effects,
+                    &prior_effects,
+                    prior_pending,
+                    role,
+                    add,
+                );
                 if add {
                     prepared.snapshot.member_role_ids.insert(role.into());
                 } else {
@@ -535,8 +543,13 @@ impl SelfRoleRuntime {
                 }
             }
             Err(SelfRoleRestError::Ambiguous) => {} // retain unresolved intent
-            Err(_) if !prior_pending => clear_unresolved(&mut prepared.audit.effects, role, add),
-            Err(_) => {}
+            Err(_) => resolve_attempt(
+                &mut prepared.audit.effects,
+                &prior_effects,
+                prior_pending,
+                role,
+                add,
+            ),
         }
         if exchange.owned_after && exchange.result.is_err() && repair.is_none() {
             prepared.event.compensating = true;
@@ -1006,7 +1019,8 @@ impl SelfRoleRuntime {
         add: bool,
     ) -> Result<(), RuntimeError> {
         let prior_pending = owner.pending;
-        let mut attempted = owner.effects.clone();
+        let prior_effects = owner.effects.clone();
+        let mut attempted = prior_effects.clone();
         mark_attempt(&mut attempted, role, add);
         let journaled = AtomicBool::new(false);
         let exchange = self
@@ -1044,13 +1058,7 @@ impl SelfRoleRuntime {
                 if journaled.load(Ordering::SeqCst) {
                     // Shared Err means definite no-send. It resolves only this
                     // repair attempt, never inherited/earlier unknown work.
-                    clear_unresolved(&mut attempted, role, add);
-                    if prior_pending {
-                        attempted.unresolved_added_role_ids =
-                            owner.effects.unresolved_added_role_ids.clone();
-                        attempted.unresolved_removed_role_ids =
-                            owner.effects.unresolved_removed_role_ids.clone();
-                    }
+                    resolve_attempt(&mut attempted, &prior_effects, prior_pending, role, add);
                     owner.effects = attempted;
                     store_io(self.store.record_superseded_repair(
                         &owner.claim,
@@ -1070,6 +1078,7 @@ impl SelfRoleRuntime {
         owner.pending = prior_pending || !exchange.response_received;
         match exchange.result {
             Ok(()) => {
+                resolve_attempt(&mut owner.effects, &prior_effects, prior_pending, role, add);
                 if add {
                     snapshot.member_role_ids.insert(role.into());
                 } else {
@@ -1086,8 +1095,7 @@ impl SelfRoleRuntime {
                 );
             }
             Err(SelfRoleRestError::Ambiguous) => {}
-            Err(_) if !prior_pending => clear_unresolved(&mut owner.effects, role, add),
-            Err(_) => {}
+            Err(_) => resolve_attempt(&mut owner.effects, &prior_effects, prior_pending, role, add),
         }
         if !store_io(self.store.record_superseded_repair(
             &owner.claim,
@@ -1549,6 +1557,34 @@ fn clear_unresolved(effects: &mut AuditEffects, role: &str, add: bool) {
         &mut effects.unresolved_removed_role_ids
     };
     unresolved.retain(|id| id != role);
+}
+
+/// A definite response/no-send resolves this attempt, not an older send of
+/// the same role in the same direction. Pending in the opposite direction or
+/// for another role is unrelated evidence and must survive unchanged.
+fn resolve_attempt(
+    effects: &mut AuditEffects,
+    prior: &AuditEffects,
+    prior_pending: bool,
+    role: &str,
+    add: bool,
+) {
+    clear_unresolved(effects, role, add);
+    let inherited = if add {
+        &prior.unresolved_added_role_ids
+    } else {
+        &prior.unresolved_removed_role_ids
+    };
+    if prior_pending && inherited.iter().any(|id| id == role) {
+        push_role(
+            if add {
+                &mut effects.unresolved_added_role_ids
+            } else {
+                &mut effects.unresolved_removed_role_ids
+            },
+            role,
+        );
+    }
 }
 
 /// Evidence is the net state of ATTEMPTED panel roles versus immutable before,

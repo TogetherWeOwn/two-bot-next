@@ -138,6 +138,46 @@ fn surface_plans_preserve_option_explicit_remove_and_unrelated_roles() {
     assert!(selection.plan(&panel, &held).is_err());
 }
 
+#[test]
+fn definite_attempt_evidence_preserves_only_prior_same_direction_uncertainty() {
+    for add in [false, true] {
+        for pending in [false, true] {
+            for same_direction in [false, true] {
+                for opposite_direction in [false, true] {
+                    let mut prior = AuditEffects {
+                        added_role_ids: vec![OTHER.into()],
+                        removed_role_ids: vec![OLD_ROLE.into()],
+                        attempted_added_role_ids: vec![OTHER.into()],
+                        attempted_removed_role_ids: vec![OLD_ROLE.into()],
+                        compensated_added_role_ids: vec![OLD_ROLE.into()],
+                        compensated_removed_role_ids: vec![OTHER.into()],
+                        unresolved_added_role_ids: vec![OTHER.into()],
+                        unresolved_removed_role_ids: vec![OLD_ROLE.into()],
+                    };
+                    if same_direction {
+                        mark_attempt(&mut prior, NEW_ROLE, add);
+                    }
+                    if opposite_direction {
+                        mark_attempt(&mut prior, NEW_ROLE, !add);
+                    }
+                    let mut effects = prior.clone();
+                    mark_attempt(&mut effects, NEW_ROLE, add);
+                    let mut expected = effects.clone();
+                    if !(pending && same_direction) {
+                        clear_unresolved(&mut expected, NEW_ROLE, add);
+                    }
+                    resolve_attempt(&mut effects, &prior, pending, NEW_ROLE, add);
+                    assert_eq!(effects, expected, "add={add}, pending={pending}");
+                    // Repeating definite evidence is idempotent. History, net
+                    // effects and opposite-direction uncertainty remain intact.
+                    resolve_attempt(&mut effects, &prior, pending, NEW_ROLE, add);
+                    assert_eq!(effects, expected);
+                }
+            }
+        }
+    }
+}
+
 /// Only agent-testdb, a generated schema, and a loopback Discord double. No env
 /// URLs, actual credentials, guilds, worker, staging or production resources.
 #[tokio::test]
@@ -764,10 +804,10 @@ async fn terminal_restart_preserves_inherited_pending(pool: &PgPool) -> TestResu
             Err(RuntimeError::PendingExchange)
         ));
         let effects = terminal_evidence(pool, &audit, true, false).await?;
-        assert!(effects.unresolved_added_role_ids.contains(&OLD_ROLE.into()));
-        if converged {
-            assert_eq!(effects.unresolved_added_role_ids, [OLD_ROLE]);
-        }
+        // Fresh acknowledged DELETE/PUT responses are not unknown just because
+        // the original process still has an unresolved addition of OLD_ROLE.
+        assert_eq!(effects.unresolved_added_role_ids, [OLD_ROLE]);
+        assert!(effects.unresolved_removed_role_ids.is_empty());
         assert!(effects.attempted_added_role_ids.contains(&OLD_ROLE.into()));
         if !converged {
             assert_eq!(effects.compensated_removed_role_ids, [OLD_ROLE]);
@@ -892,19 +932,41 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
 }
 
 async fn terminal_partial_repair_exchange_outcomes(pool: &PgPool) -> TestResult {
-    for case in ["forbidden", "rate-limited", "server-error", "timeout"] {
+    for case in [
+        "forbidden",
+        "rate-limited",
+        "server-error",
+        "timeout",
+        "truncated-forbidden",
+        "stalled-forbidden",
+        "truncated-rate-limited",
+        "stalled-rate-limited",
+        "truncated-server-error",
+        "stalled-server-error",
+    ] {
         let clock = Arc::new(AtomicI64::new(NOW));
         let mut panel = panel(PanelMode::Select);
         panel.id = format!("terminal-partial-{case}");
         let pending = case == "timeout";
-        let failure = match case {
-            "forbidden" => ScriptedResponse::status(403),
+        let outcome = case
+            .strip_prefix("truncated-")
+            .or_else(|| case.strip_prefix("stalled-"))
+            .unwrap_or(case);
+        let failure = match outcome {
+            "forbidden" => ScriptedResponse::json(403, json!({"message":"provider-secret"})),
             "rate-limited" => ScriptedResponse::rate_limited(0.1, "0.1"),
-            "server-error" => ScriptedResponse::status(500),
+            "server-error" => ScriptedResponse::json(500, json!({"message":"provider-secret"})),
             "timeout" => ScriptedResponse::status(204).delayed(Duration::from_secs(6)),
             _ => unreachable!(),
         };
-        let expected = match case {
+        let failure = if case.starts_with("truncated-") {
+            failure.truncated_body()
+        } else if case.starts_with("stalled-") {
+            failure.delayed_body(Duration::from_secs(6))
+        } else {
+            failure
+        };
+        let expected = match outcome {
             "forbidden" => SelfRoleRestError::Rejected(403),
             "rate-limited" => SelfRoleRestError::RateLimited,
             _ => SelfRoleRestError::Ambiguous,
@@ -932,7 +994,7 @@ async fn terminal_partial_repair_exchange_outcomes(pool: &PgPool) -> TestResult 
         assert!(effects.attempted_added_role_ids.contains(&NEW_ROLE.into()));
         assert_eq!(
             effects.unresolved_added_role_ids.contains(&NEW_ROLE.into()),
-            matches!(case, "server-error" | "timeout")
+            matches!(outcome, "server-error" | "timeout")
         );
         assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
         let calls = mock.requests();
@@ -2199,13 +2261,30 @@ async fn dry_run_refuses_recovered_mutation(pool: &PgPool) -> TestResult {
 }
 
 async fn execution_and_compensation(pool: &PgPool) -> TestResult {
-    for status in [204, 403, 503] {
+    for (status, body_fault) in [
+        (204, "none"),
+        (403, "none"),
+        (503, "none"),
+        (403, "truncated"),
+        (403, "stalled"),
+        (503, "truncated"),
+        (503, "stalled"),
+    ] {
         let clock = Arc::new(AtomicI64::new(NOW));
         let mut script = snapshot(&[OLD_ROLE, OTHER]); // prepare
         script.extend(snapshot(&[OLD_ROLE, OTHER])); // before DELETE
         script.push(ScriptedResponse::status(204));
         script.extend(snapshot(&[OTHER])); // before PUT
-        script.push(ScriptedResponse::status(status));
+        let response = if status == 204 {
+            ScriptedResponse::status(status)
+        } else {
+            ScriptedResponse::json(status, json!({"message":"provider-secret"}))
+        };
+        script.push(match body_fault {
+            "truncated" => response.truncated_body(),
+            "stalled" => response.delayed_body(Duration::from_secs(6)),
+            _ => response,
+        });
         if status == 204 {
             script.extend(snapshot(&[NEW_ROLE, OTHER])); // final observed target
             script.extend(snapshot(&[NEW_ROLE, OTHER])); // settlement revalidation
@@ -2224,9 +2303,9 @@ async fn execution_and_compensation(pool: &PgPool) -> TestResult {
         let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
         let runtime = runtime(pool, &clock, &mock);
         let mut panel = panel(PanelMode::Select);
-        panel.id = format!("execution-{status}");
+        panel.id = format!("execution-{status}-{body_fault}");
         let request = request(
-            &format!("execution-{status}"),
+            &format!("execution-{status}-{body_fault}"),
             Selection::Select {
                 option_keys: vec!["new".into()],
             },
@@ -2243,6 +2322,10 @@ async fn execution_and_compensation(pool: &PgPool) -> TestResult {
         );
         assert_eq!(prepared.event.desired_role_ids, [NEW_ROLE]);
         assert_eq!(prepared.event.pre_mutation_role_ids, [OLD_ROLE]);
+        assert!(
+            !prepared.event.exchange_pending,
+            "received status is not a lost response"
+        );
         assert!(prepared.snapshot.member_role_ids.contains(OTHER));
         assert!(prepared
             .audit

@@ -278,6 +278,68 @@ async fn rejected_rate_limited_and_uncertain_exchanges_do_not_retry_or_leak_bodi
 }
 
 #[tokio::test]
+async fn received_status_survives_truncated_or_stalled_body_and_lost_ownership() {
+    for (code, error) in [
+        (403, SelfRoleRestError::Rejected(403)),
+        (429, SelfRoleRestError::RateLimited),
+        (503, SelfRoleRestError::Ambiguous),
+        (302, SelfRoleRestError::Ambiguous),
+        (200, SelfRoleRestError::Ambiguous),
+    ] {
+        for stalled in [false, true] {
+            for add in [false, true] {
+                for owned_after in [false, true] {
+                    let response =
+                        ScriptedResponse::json(code, json!({"message":"provider-secret"}));
+                    let response = if stalled {
+                        response.delayed_body(Duration::from_secs(6))
+                    } else {
+                        response.truncated_body()
+                    };
+                    let mock = MockRest::start(vec![response], ScriptedResponse::status(204)).await;
+                    let checks = AtomicUsize::new(0);
+                    let exchange = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        executor(&mock).self_role_step(GUILD, USER, ROLE, add, || async {
+                            Ok(checks.fetch_add(1, Ordering::SeqCst) < 2 || owned_after)
+                        }),
+                    )
+                    .await
+                    .expect("mutation status must not wait for the provider body")
+                    .unwrap();
+                    assert_eq!(exchange.result, Err(error));
+                    assert_eq!(exchange.owned_after, owned_after);
+                    assert!(exchange.response_received);
+                    assert_eq!(checks.load(Ordering::SeqCst), 3);
+                    assert!(!format!("{exchange:?}").contains("provider-secret"));
+                    let calls = mock.requests();
+                    assert_eq!(calls.len(), 1, "no retry after received headers");
+                    assert_eq!(calls[0].method, if add { "PUT" } else { "DELETE" });
+                    mock.shutdown().await;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn member_snapshot_still_requires_a_complete_response_body() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!({"user":{"id":USER},"roles":[]})).truncated_body()],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    assert!(matches!(
+        executor(&mock)
+            .fetch_self_role_snapshot(GUILD, USER, BOT)
+            .await,
+        Err(SelfRoleRestError::Ambiguous)
+    ));
+    assert_eq!(mock.requests().len(), 1);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn lost_post_call_ownership_retains_accepted_effect() {
     let checks = AtomicUsize::new(0);
     let mock = MockRest::start(

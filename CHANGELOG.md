@@ -44,7 +44,11 @@
   supersession into terminal discovery before prepared ownership, using a fresh
   post-lock event fence and stored scope/chronology checks. Preserve all intent,
   pending and compensation evidence without REST or winner publication; add
-  early-supersession runtime/store and lock-wait source fixtures.
+  early-supersession runtime/store and lock-wait source fixtures. Preserve singular
+  role-response status before unused provider-body reads can fail or stall, while
+  requiring complete snapshot bodies. Resolve definite new role/direction evidence
+  without erasing older unknown sends or mislabeling unrelated acknowledged work;
+  add partial-body, ownership-loss and inherited-evidence source regressions.
   Production boot remains disabled until approved shared boot configuration,
   unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,

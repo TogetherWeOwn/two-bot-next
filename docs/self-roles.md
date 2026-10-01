@@ -121,7 +121,11 @@ follow-up. Its first checkpoint adds `executor::self_roles` on the existing
   after pacing and again after the call. No automatic retry can escape those
   checks. A `RoleExchange` retains accepted/ambiguous effects even when the
   post-call check loses ownership or fails. Only Discord's documented 204 is
-  accepted for a role mutation; other 2xx/3xx are uncertain.
+  accepted for a role mutation; other 2xx/3xx are uncertain. Singular mutation
+  status is captured from received headers on the same transport without reading
+  the unused provider body: a stalled/truncated error body cannot invent a lost
+  response. Member/policy reads still require complete bodies; no status retry is
+  added. Received 5xx remains ambiguous as to effect, not an unknown in-flight send.
 
 The next checkpoint adds `crates/bot/src/self_role_runtime.rs` admission and
 planning on the same executor:
@@ -187,6 +191,11 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   audit columns after upgrade). Journaling sets it before send. Only a received
   response or a definite no-send path may clear that exchange's flag; a later
   acknowledged compensation cannot clear an earlier interrupted exchange.
+  Definite new attempts resolve only their own role/direction evidence, preserving
+  older same-direction uncertainty and unrelated/opposite-direction evidence.
+  Both processing and terminal steps apply this rule before observation; an older
+  pending send must not cause a fresh acknowledged or rejected attempt on another
+  role/direction to be mislabeled as unresolved.
   Recovery retains pending state, switches to rollback, and preserves unresolved
   evidence even when a read looks restored. Pending audits cannot settle or
   publish success. Generation transfer refuses old workers' flag/effect writes.
