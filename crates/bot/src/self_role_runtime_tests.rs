@@ -204,6 +204,8 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    durable_processing_recovery_without_redelivery(pool).await?;
+    shared_reaction_dispatch_and_disabled_gate(pool).await?;
     shared_component_orchestration(pool).await?;
     dry_run_audits_without_mutation_or_target_publication(pool).await?;
     execution_and_compensation(pool).await?;
@@ -243,6 +245,345 @@ fn effect_snapshots_do_not_invent_unattempted_changes_or_erase_history() {
     // Differences on other roles do not become this event's observed effects.
     observe_effects(&mut effects, &[OTHER.into()], &held);
     assert!(!effects.added_role_ids.contains(&OLD_ROLE.into()));
+}
+
+async fn durable_processing_recovery_without_redelivery(pool: &PgPool) -> TestResult {
+    use crate::self_role_handlers::SelfRoleService;
+    use two_bot_core::self_roles::SelfRoleGates;
+
+    for case in [
+        "target",
+        "empty",
+        "pending",
+        "dry-pending",
+        "compensating",
+        "uninitialized",
+        "uninitialized-pending",
+        "uninitialized-effects",
+    ] {
+        let uninitialized = case.starts_with("uninitialized");
+        let inconsistent = uninitialized && case != "uninitialized";
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let pending = case == "pending" || case == "dry-pending";
+        let dry_run = case == "dry-pending";
+        let empty = case == "empty";
+        let compensating = case == "compensating";
+        let mut script = if uninitialized {
+            vec![ScriptedResponse::status(500)]
+        } else {
+            snapshot(&[OLD_ROLE, OTHER])
+        };
+        if !uninitialized {
+            let held = if compensating {
+                vec![OTHER]
+            } else {
+                vec![OLD_ROLE, OTHER]
+            };
+            script.extend(snapshot(&held)); // newly claimed admission
+            if !dry_run {
+                script.extend(snapshot(&held)); // execution revalidation
+                if !pending {
+                    script.push(ScriptedResponse::status(204)); // remove old, or restore old
+                    if !empty && !compensating {
+                        script.extend(snapshot(&[OTHER]));
+                        script.push(ScriptedResponse::status(204)); // add new
+                    }
+                    let final_held = if empty {
+                        vec![OTHER]
+                    } else if compensating {
+                        vec![OLD_ROLE, OTHER]
+                    } else {
+                        vec![NEW_ROLE, OTHER]
+                    };
+                    script.extend(snapshot(&final_held));
+                    script.extend(snapshot(&final_held)); // final settlement
+                }
+            }
+        }
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let mut panel = panel(if empty {
+            PanelMode::Select
+        } else {
+            PanelMode::Button
+        });
+        panel.id = format!("durable-recovery-{case}");
+        let request = request(
+            &panel.id,
+            if empty {
+                Selection::Select {
+                    option_keys: vec![],
+                }
+            } else {
+                Selection::Button {
+                    option_key: "new".into(),
+                }
+            },
+        );
+        let admission = feature.prepare(&request, &panel).await;
+        if uninitialized {
+            assert!(admission.is_err());
+            if inconsistent {
+                // Inconsistent durable evidence must not become a terminal
+                // rejection merely because initialization is absent.
+                sqlx::query("UPDATE self_role_audit SET exchange_pending=$2,added_role_ids=$3 WHERE event_id=$1")
+                    .bind(&request.event_id)
+                    .bind(case == "uninitialized-pending")
+                    .bind(if case == "uninitialized-effects" { serde_json::to_string(&[NEW_ROLE])? } else { "[]".into() })
+                    .execute(pool).await?;
+            }
+        } else {
+            let prepared = ready(admission.unwrap());
+            if pending || compensating {
+                let mut effects = AuditEffects::default();
+                if pending {
+                    mark_attempt(&mut effects, NEW_ROLE, true);
+                } else {
+                    mark_attempt(&mut effects, OLD_ROLE, false);
+                    push_role(&mut effects.removed_role_ids, OLD_ROLE);
+                    clear_unresolved(&mut effects, OLD_ROLE, false);
+                }
+                assert!(
+                    feature
+                        .store
+                        .checkpoint_exchange(&prepared.event, &effects, compensating, Some(pending))
+                        .await?
+                );
+            }
+            drop(prepared); // crash; original request is never re-delivered
+        }
+        clock.store(NOW + 500, Ordering::SeqCst);
+        let service = SelfRoleService::new(
+            feature,
+            SelfRoleGates {
+                panels: vec![panel.clone()],
+                dry_run,
+            },
+            &[GUILD.to_owned()].into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(service.recover_once().await.unwrap(), 1);
+        assert_eq!(service.recover_once().await.unwrap(), 0); // terminal or renewed expiry
+        let row: (String, Option<String>, bool, String, String, i32) = sqlx::query_as(
+            "SELECT outcome,code,exchange_pending,desired_role_ids,unresolved_added_role_ids,claim_generation
+             FROM self_role_audit WHERE event_id=$1",
+        ).bind(&request.event_id).fetch_one(pool).await?;
+        assert_eq!(row.5, 2);
+        if pending {
+            assert_eq!(row.0, "processing");
+            assert!(row.2);
+            assert_eq!(serde_json::from_str::<Vec<String>>(&row.4)?, [NEW_ROLE]);
+        } else if uninitialized {
+            assert_eq!(
+                row.0,
+                if inconsistent {
+                    "processing"
+                } else {
+                    "rejected"
+                }
+            );
+            assert_eq!(
+                row.1.as_deref(),
+                if inconsistent {
+                    None
+                } else {
+                    Some("interrupted_before_intent")
+                }
+            );
+            assert_eq!(row.2, case == "uninitialized-pending");
+            if case == "uninitialized-effects" {
+                let (evidence,): (String,) =
+                    sqlx::query_as("SELECT added_role_ids FROM self_role_audit WHERE event_id=$1")
+                        .bind(&request.event_id)
+                        .fetch_one(pool)
+                        .await?;
+                assert_eq!(serde_json::from_str::<Vec<String>>(&evidence)?, [NEW_ROLE]);
+            }
+            assert_eq!(mock.requests().len(), 1); // no recovery REST calls
+        } else {
+            assert_eq!(
+                row.0,
+                if compensating {
+                    "rejected"
+                } else if empty {
+                    "removed"
+                } else {
+                    "switched"
+                }
+            );
+            assert_eq!(
+                row.1.as_deref(),
+                if compensating {
+                    Some("compensated")
+                } else {
+                    None
+                }
+            );
+            assert!(!row.2);
+        }
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&row.3)?,
+            if empty || uninitialized {
+                vec![]
+            } else {
+                vec![NEW_ROLE.to_owned()]
+            }
+        );
+        let calls = mock.requests();
+        let mutations: Vec<_> = calls.iter().filter(|r| r.method != "GET").collect();
+        if pending || uninitialized {
+            assert!(mutations.is_empty());
+        } else if empty {
+            assert_eq!(mutations.len(), 1);
+            assert_eq!(mutations[0].method, "DELETE");
+        } else if compensating {
+            assert_eq!(mutations.len(), 1);
+            assert_eq!(mutations[0].method, "PUT");
+            assert!(mutations[0].path.ends_with(OLD_ROLE));
+        } else {
+            assert_eq!(mutations.len(), 2);
+            assert_eq!(
+                (&*mutations[0].method, &*mutations[1].method),
+                ("DELETE", "PUT")
+            );
+        }
+        assert!(mutations.iter().all(|r| !r.path.ends_with(OTHER)));
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn shared_reaction_dispatch_and_disabled_gate(pool: &PgPool) -> TestResult {
+    use crate::{
+        command_runtime::CommandRuntime,
+        self_role_handlers::{tests::reaction, SelfRoleService},
+    };
+    use twilight_gateway::Event;
+    use twilight_model::gateway::payload::incoming::{ReactionAdd, ReactionRemove};
+    use two_bot_core::self_roles::SelfRoleGates;
+    use two_bot_core::{InteractionRouter, RouterGates};
+
+    for enabled in [false, true] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut script = vec![];
+        if enabled {
+            for (held, after, mutation) in [
+                (vec![OTHER], vec![NEW_ROLE, OTHER], Some(204)),
+                (vec![NEW_ROLE, OTHER], vec![NEW_ROLE, OTHER], None),
+                (vec![NEW_ROLE, OTHER], vec![OTHER], Some(204)),
+                (vec![OTHER], vec![OTHER], None),
+            ] {
+                script.push(ScriptedResponse::json(
+                    200,
+                    json!({"id":MESSAGE,"channel_id":CHANNEL}),
+                ));
+                script.extend(snapshot(&held)); // fetched partial + admission
+                script.extend(snapshot(&held)); // execution
+                if let Some(status) = mutation {
+                    script.push(ScriptedResponse::status(status));
+                    script.extend(snapshot(&after)); // convergence
+                }
+                script.extend(snapshot(&after)); // settlement
+            }
+        }
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let executor = feature.executor.clone();
+        let mut panel = panel(PanelMode::Reaction);
+        panel.id = format!("gateway-reaction-{enabled}");
+        let service = Arc::new(
+            SelfRoleService::new(
+                feature,
+                SelfRoleGates {
+                    panels: vec![panel.clone()],
+                    dry_run: false,
+                },
+                &[GUILD.to_owned()].into_iter().collect(),
+            )
+            .unwrap(),
+        );
+        let router = InteractionRouter::new(RouterGates {
+            configured_guild: Some(GUILD.parse()?),
+            scorecard: false,
+            automations: false,
+            announcements: false,
+            moderation: false,
+            tickets: false,
+            self_roles: enabled,
+            onboarding_picker: false,
+            session_picker: false,
+        });
+        let command = CommandRuntime::new_with_self_roles(
+            pool.clone(),
+            executor,
+            router,
+            GUILD.parse()?,
+            false,
+            service,
+        );
+        let expected = ["assigned", "already_held", "removed", "already_absent"];
+        let mut ids = HashSet::new();
+        for (i, expected_outcome) in expected.into_iter().enumerate() {
+            let partial = reaction(); // no cached member on either delivery
+            let event = if i < 2 {
+                Event::ReactionAdd(Box::new(ReactionAdd(partial)))
+            } else {
+                Event::ReactionRemove(Box::new(ReactionRemove(partial)))
+            };
+            command.dispatch(&event);
+            if enabled {
+                // Only a bounded fixture wait for detached dispatch; no CI polling.
+                let rows = tokio::time::timeout(Duration::from_secs(8), async {
+                    loop {
+                        let rows: Vec<(String, String)> = sqlx::query_as(
+                            "SELECT event_id,outcome FROM self_role_audit WHERE panel_id=$1 ORDER BY event_order COLLATE \"C\"",
+                        ).bind(&panel.id).fetch_all(pool).await?;
+                        if rows.len() == i + 1 && rows.iter().all(|r| r.1 != "processing") {
+                            return Ok::<_, sqlx::Error>(rows);
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await??;
+                let latest = rows.last().unwrap();
+                assert_eq!(latest.1, expected_outcome);
+                assert!(ids.insert(latest.0.clone()));
+            }
+        }
+        let calls = mock.requests();
+        if enabled {
+            assert_eq!(ids.len(), 4);
+            let mutations: Vec<_> = calls.iter().filter(|r| r.method != "GET").collect();
+            assert_eq!(mutations.len(), 2); // duplicate add/remove are true no-ops
+            assert_eq!(
+                (&*mutations[0].method, &*mutations[1].method),
+                ("PUT", "DELETE")
+            );
+            assert!(mutations
+                .iter()
+                .all(|r| r.path.ends_with(NEW_ROLE) && r.body.is_empty()));
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|r| r.path.ends_with(&format!("/messages/{MESSAGE}")))
+                    .count(),
+                4
+            );
+            let (target, committed): (Option<String>, bool) = sqlx::query_as(
+                "SELECT latest_option_key,target_committed FROM self_role_panel_claims WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3",
+            ).bind(GUILD).bind(USER).bind(&panel.id).fetch_one(pool).await?;
+            assert!(target.is_none() && committed);
+        } else {
+            assert!(calls.is_empty());
+            let (count,): (i64,) =
+                sqlx::query_as("SELECT count(*) FROM self_role_audit WHERE panel_id=$1")
+                    .bind(&panel.id)
+                    .fetch_one(pool)
+                    .await?;
+            assert_eq!(count, 0);
+        }
+        mock.shutdown().await;
+    }
+    Ok(())
 }
 
 async fn shared_component_orchestration(pool: &PgPool) -> TestResult {

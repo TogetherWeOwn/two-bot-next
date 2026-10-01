@@ -22,9 +22,13 @@
   Add injectable shared component/reaction dispatch with source and input-type
   validation, ephemeral defer-before-admission and final-settlement-only success
   replies. Add fenced dry-run audits without role mutations or simulated target
-  publication, plus input and orchestration regressions. Production boot remains
-  disabled until approved staging configuration, unresolved-work continuation
-  and compiled acceptance are complete.
+  publication, plus input and orchestration regressions. Add bounded configured-
+  source discovery and generation-fenced recovery of expired processing audits
+  without gateway redelivery, preserving initialized empty targets and unresolved
+  evidence. Gate reaction dispatch through the shared router and add actual
+  partial/duplicate add/remove fixtures. Production boot remains disabled until
+  shared recovery supervision, terminal stale repair, approved staging configuration,
+  unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

@@ -1,7 +1,10 @@
 //! Self-role input/orchestration owned by the shared command runtime.
 //! Boot injection remains parked until unresolved-work acceptance is complete.
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use tracing::warn;
 use twilight_model::{
@@ -52,6 +55,7 @@ pub(crate) struct SelfRoleService {
     runtime: SelfRoleRuntime,
     panels: Vec<SelfRolePanel>,
     dry_run: bool,
+    recovery_cursor: AtomicUsize,
 }
 
 impl SelfRoleService {
@@ -73,6 +77,7 @@ impl SelfRoleService {
             runtime,
             panels: gates.panels,
             dry_run: gates.dry_run,
+            recovery_cursor: AtomicUsize::new(0),
         })
     }
 
@@ -200,26 +205,65 @@ impl SelfRoleService {
         if !self.panels.contains(&input.panel) {
             return SelfRoleResult::Ignored;
         }
-        let mut prepared = match self.runtime.prepare(&input.request, &input.panel).await {
+        self.handle_admission(
+            self.runtime.prepare(&input.request, &input.panel).await,
+            &input.panel,
+            &input.request.event_id,
+        )
+        .await
+    }
+
+    /// One bounded processing-audit sweep; scheduling/terminal stale repair must
+    /// be attached to the shared shutdown supervisor before boot activation.
+    /// Renewed expiry supplies durable backoff even if this process restarts.
+    pub async fn recover_once(&self) -> Result<usize, RuntimeError> {
+        let mut considered = 0;
+        let start = self.recovery_cursor.fetch_add(1, Ordering::Relaxed) % self.panels.len();
+        for offset in 0..self.panels.len() {
+            let panel = &self.panels[(start + offset) % self.panels.len()];
+            let candidates = self
+                .runtime
+                .recovery_candidates(panel, (32 - considered).min(4))
+                .await?;
+            for candidate in candidates {
+                considered += 1;
+                let admission = self.runtime.recover(&candidate, panel).await;
+                self.handle_admission(admission, panel, &candidate.event_id)
+                    .await;
+            }
+            if considered == 32 {
+                break;
+            }
+        }
+        Ok(considered)
+    }
+
+    async fn handle_admission(
+        &self,
+        admission: Result<Admission, RuntimeError>,
+        panel: &SelfRolePanel,
+        event_id: &str,
+    ) -> SelfRoleResult {
+        let mut prepared = match admission {
             Ok(Admission::Ready(prepared)) => prepared,
             Ok(Admission::Duplicate) => return SelfRoleResult::Duplicate,
             Ok(Admission::Ignored) => return SelfRoleResult::Ignored,
             Ok(Admission::Rejected(_)) => return SelfRoleResult::Rejected,
             Err(error) => {
-                warn!(?error, event_id = %input.request.event_id, "self-role admission unresolved");
+                warn!(?error, event_id = %event_id, "self-role admission unresolved");
                 return SelfRoleResult::Pending;
             }
         };
         let result = if self.dry_run {
             self.runtime
-                .settle_dry_run(&mut prepared, &input.panel)
+                .settle_dry_run(&mut prepared, panel)
                 .await
                 .map(|()| SelfRoleResult::DryRun)
         } else {
-            match self.runtime.execute(&mut prepared, &input.panel).await {
+            match self.runtime.execute(&mut prepared, panel).await {
                 Ok(execution) => self
                     .runtime
-                    .settle(&mut prepared, &input.panel, execution)
+                    .settle(&mut prepared, panel, execution)
                     .await
                     .map(SelfRoleResult::Settled),
                 Err(error) => Err(error),
@@ -232,19 +276,15 @@ impl SelfRoleService {
                 // No repair of an old target becomes success for the old event.
                 if !self.dry_run
                     && matches!(&error, RuntimeError::Stale)
-                    && input.panel.exclusive
+                    && panel.exclusive
                     && (!prepared.audit.effects.attempted_added_role_ids.is_empty()
                         || !prepared.audit.effects.attempted_removed_role_ids.is_empty())
                 {
-                    if let Err(repair) = self
-                        .runtime
-                        .reconcile_stale(&mut prepared, &input.panel)
-                        .await
-                    {
-                        warn!(?repair, event_id = %input.request.event_id, "self-role stale repair unresolved");
+                    if let Err(repair) = self.runtime.reconcile_stale(&mut prepared, panel).await {
+                        warn!(?repair, event_id = %event_id, "self-role stale repair unresolved");
                     }
                 }
-                warn!(?error, event_id = %input.request.event_id, "self-role execution unresolved");
+                warn!(?error, event_id = %event_id, "self-role execution unresolved");
                 self.runtime.park(&mut prepared).await;
                 SelfRoleResult::Pending
             }

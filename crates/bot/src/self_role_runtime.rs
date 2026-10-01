@@ -15,12 +15,12 @@ use std::{
 };
 
 use two_bot_core::self_roles::{
-    plan_select_delta, plan_self_role_change, PanelMode, PlanRejection, RoleOperation,
-    SelfRolePanel, SelfRolePlan, SettledOutcome,
+    event_order_from_snowflake, plan_select_delta, plan_self_role_change, PanelMode, PlanRejection,
+    RoleOperation, SelfRolePanel, SelfRolePlan, SettledOutcome,
 };
 use two_bot_cutover::self_role_store::{
-    AuditEffects, EventClaim, PanelClaim, PanelClaimResult, PanelKey, SelfRoleAudit, SelfRoleStore,
-    StoreError,
+    AuditEffects, EventClaim, PanelClaim, PanelClaimResult, PanelKey, RecoverableAudit,
+    SelfRoleAudit, SelfRoleStore, StoreError,
 };
 use two_bot_discord::{
     executor::self_roles::{SelfRoleRestError, SelfRoleSnapshot},
@@ -806,7 +806,7 @@ impl SelfRoleRuntime {
         {
             return Ok(Admission::Ignored);
         }
-        let mut audit = SelfRoleAudit {
+        let audit = SelfRoleAudit {
             event_id: request.event_id.clone(),
             event_order: Some(request.event_order.clone()),
             guild_id: request.guild_id.clone(),
@@ -830,8 +830,93 @@ impl SelfRoleRuntime {
             desired_role_ids: vec![],
             pre_mutation_role_ids: vec![],
         };
+        self.prepare_audit(audit, panel, Some(request.selection.clone()))
+            .await
+    }
+
+    /// Recovery is driven by durable discovery, not a retained gateway payload.
+    /// Discovery grants no ownership: the claim reloads intent/effects and rotates
+    /// the generation before reconstructing a surface against immutable intent.
+    pub async fn recover(
+        &self,
+        candidate: &RecoverableAudit,
+        panel: &SelfRolePanel,
+    ) -> Result<Admission, RuntimeError> {
+        if candidate.guild_id != self.guild_id
+            || candidate.panel_id != panel.id
+            || candidate.source_id != panel.message_id
+            || candidate.source != panel.mode
+        {
+            return Ok(Admission::Ignored);
+        }
+        let audit = SelfRoleAudit {
+            event_id: candidate.event_id.clone(),
+            event_order: candidate.event_order.clone(),
+            guild_id: candidate.guild_id.clone(),
+            panel_id: candidate.panel_id.clone(),
+            member_id: candidate.member_id.clone(),
+            source_id: candidate.source_id.clone(),
+            option_key: candidate.option_key.clone(),
+            role_id: candidate.role_id.clone(),
+            source: candidate.source,
+            operation: candidate.operation,
+            outcome: SettledOutcome::Rejected,
+            code: None,
+            reason: None,
+            effects: AuditEffects::default(),
+            desired_role_ids: vec![],
+            pre_mutation_role_ids: vec![],
+        };
+        self.prepare_audit(audit, panel, None).await
+    }
+
+    pub async fn recovery_candidates(
+        &self,
+        panel: &SelfRolePanel,
+        limit: usize,
+    ) -> Result<Vec<RecoverableAudit>, RuntimeError> {
+        store_io(self.store.recoverable_audits(
+            &self.guild_id,
+            &panel.id,
+            &panel.message_id,
+            panel.mode,
+            limit,
+        ))
+        .await
+    }
+
+    async fn prepare_audit(
+        &self,
+        mut audit: SelfRoleAudit,
+        panel: &SelfRolePanel,
+        selection: Option<Selection>,
+    ) -> Result<Admission, RuntimeError> {
         let Some(mut event) = store_io(self.store.claim_pending_audit(&audit)).await? else {
             return Ok(Admission::Duplicate);
+        };
+        let selection = match selection {
+            Some(selection) => selection,
+            None if !event.intent_initialized => {
+                // The original multi-select input was not durably initialized.
+                // Reject before REST, rather than inventing an empty selection.
+                return self
+                    .reject(audit, &event, None, "interrupted_before_intent")
+                    .await;
+            }
+            None => recovery_selection(&audit, &event, panel)?,
+        };
+        let request = SelfRoleRequest {
+            event_id: audit.event_id.clone(),
+            event_order: audit
+                .event_order
+                .clone()
+                .or_else(|| event_order_from_snowflake(&audit.event_id))
+                .ok_or(RuntimeError::InvalidSnapshot)?,
+            guild_id: audit.guild_id.clone(),
+            member_id: audit.member_id.clone(),
+            channel_id: panel.channel_id.clone(),
+            message_id: audit.source_id.clone(),
+            selection,
         };
         let lost = Arc::new(AtomicBool::new(false));
         let event_keeper =
@@ -878,7 +963,7 @@ impl SelfRoleRuntime {
         // All failure paths below release their lane. Infrastructure/stale errors
         // leave the processing audit recoverable rather than falsely settled.
         let result = self
-            .prepare_owned(request, panel, &mut audit, &mut event, &mut lane)
+            .prepare_owned(&request, panel, &mut audit, &mut event, &mut lane)
             .await;
         let PreparedPlans {
             snapshot,
@@ -1031,11 +1116,7 @@ impl SelfRoleRuntime {
         lane: Option<&PanelClaim>,
         code: &'static str,
     ) -> Result<Admission, RuntimeError> {
-        if event.intent_initialized
-            && (event.exchange_pending
-                || event.compensating
-                || !event.effects.attempted_added_role_ids.is_empty()
-                || !event.effects.attempted_removed_role_ids.is_empty())
+        if event.exchange_pending || event.compensating || event.effects != AuditEffects::default()
         {
             // Policy/refusal during recovery cannot silently settle unfinished
             // mutation or discard its pending remote work.
@@ -1058,6 +1139,62 @@ impl SelfRoleRuntime {
         result?;
         Ok(Admission::Rejected(code))
     }
+}
+
+fn recovery_selection(
+    audit: &SelfRoleAudit,
+    event: &EventClaim,
+    panel: &SelfRolePanel,
+) -> Result<Selection, RuntimeError> {
+    if !event.intent_initialized || audit.source != panel.mode {
+        return Err(RuntimeError::InvalidSnapshot);
+    }
+    let offered: Vec<_> = panel.options.iter().map(|o| &o.role_id).collect();
+    if [&event.desired_role_ids, &event.pre_mutation_role_ids]
+        .iter()
+        .any(|ids| ids.iter().any(|id| !offered.contains(&id)))
+    {
+        return Err(RuntimeError::InvalidSnapshot);
+    }
+    if audit.source == PanelMode::Select {
+        // Initialized empty is meaningful. Before initialization, recovery must
+        // refuse rather than interpreting the default arrays as empty input.
+        let option_keys = event
+            .desired_role_ids
+            .iter()
+            .map(|id| {
+                panel
+                    .options
+                    .iter()
+                    .find(|o| &o.role_id == id)
+                    .map(|o| o.key.clone())
+                    .ok_or(RuntimeError::InvalidSnapshot)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Selection::Select { option_keys });
+    }
+    let key = audit
+        .option_key
+        .as_ref()
+        .ok_or(RuntimeError::InvalidSnapshot)?;
+    let option = panel
+        .options
+        .iter()
+        .find(|o| &o.key == key)
+        .ok_or(RuntimeError::InvalidSnapshot)?;
+    if audit.role_id.as_ref() != Some(&option.role_id) {
+        return Err(RuntimeError::InvalidSnapshot);
+    }
+    Ok(match audit.source {
+        PanelMode::Button => Selection::Button {
+            option_key: key.clone(),
+        },
+        PanelMode::Reaction => Selection::Reaction {
+            option_key: key.clone(),
+            remove: audit.operation == RoleOperation::Remove,
+        },
+        PanelMode::Select => unreachable!(),
+    })
 }
 
 fn push_role(ids: &mut Vec<String>, role: &str) {

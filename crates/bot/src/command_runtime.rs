@@ -261,6 +261,9 @@ impl CommandRuntime {
     }
 
     fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) {
+        if !self.router.gates().self_roles {
+            return;
+        }
         let Some(service) = self.self_roles.as_ref().cloned() else {
             return;
         };

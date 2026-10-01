@@ -191,6 +191,101 @@ async fn compensation_phase_recovery(pool: &PgPool) -> TestResult {
     Ok(())
 }
 
+async fn recovery_discovery_scope_limits_and_claim_race(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    let mut a = row("discovery-a", "discovery-order-a");
+    a.panel_id = "discovery".into();
+    let mut b = a.clone();
+    b.event_id = "discovery-b".into();
+    b.event_order = Some("discovery-order-b".into());
+    let original = store.claim_audit(&a).await?.unwrap();
+    store.claim_audit(&b).await?.unwrap();
+    for scope in ["guild", "panel", "message", "source", "terminal"] {
+        let mut excluded = a.clone();
+        excluded.event_id = format!("discovery-excluded-{scope}");
+        match scope {
+            "guild" => excluded.guild_id = "other-guild".into(),
+            "panel" => excluded.panel_id = "other-panel".into(),
+            "message" => excluded.source_id = "other-message".into(),
+            "source" => excluded.source = PanelMode::Reaction,
+            _ => {}
+        }
+        let claim = store.claim_audit(&excluded).await?.unwrap();
+        if scope == "terminal" {
+            store.finish_audit(&excluded, &claim).await?;
+        }
+    }
+    assert!(store
+        .recoverable_audits(&a.guild_id, &a.panel_id, &a.source_id, a.source, 32)
+        .await?
+        .is_empty());
+    clock.store(TEST_NOW_MS + 300, Ordering::SeqCst); // equality is expired
+    let hints = store
+        .recoverable_audits(&a.guild_id, &a.panel_id, &a.source_id, a.source, 32)
+        .await?;
+    assert_eq!(
+        hints
+            .iter()
+            .map(|r| r.event_id.as_str())
+            .collect::<Vec<_>>(),
+        ["discovery-a", "discovery-b"]
+    );
+    assert_eq!(hints[0].event_order, a.event_order);
+    assert_eq!(hints[0].option_key, a.option_key);
+    assert_eq!(hints[0].operation, a.operation);
+    assert!(store
+        .recoverable_audits(&a.guild_id, &a.panel_id, &a.source_id, a.source, 0)
+        .await?
+        .is_empty());
+    let one = store
+        .recoverable_audits(&a.guild_id, &a.panel_id, &a.source_id, a.source, 1)
+        .await?;
+    assert_eq!(one.len(), 1);
+    // Two sweepers seeing the same hint still have exactly one fenced owner.
+    let (first, second) = tokio::join!(store.claim_audit(&a), store.claim_audit(&a));
+    let (first, second) = (first?, second?);
+    assert_eq!(
+        usize::from(first.is_some()) + usize::from(second.is_some()),
+        1
+    );
+    let owner = first.or(second).unwrap();
+    assert_eq!(owner.generation, original.generation + 1);
+    assert!(!store.owns_claim(&original).await?);
+    let remaining = store
+        .recoverable_audits(&a.guild_id, &a.panel_id, &a.source_id, a.source, 32)
+        .await?;
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|r| r.event_id.as_str())
+            .collect::<Vec<_>>(),
+        ["discovery-b"]
+    );
+    store.finish_audit(&a, &owner).await?;
+
+    for i in 0..36 {
+        let mut capped = a.clone();
+        capped.event_id = format!("discovery-cap-{i:02}");
+        capped.panel_id = "discovery-cap".into();
+        store.claim_audit(&capped).await?.unwrap();
+    }
+    clock.store(TEST_NOW_MS + 600, Ordering::SeqCst);
+    let capped = store
+        .recoverable_audits(
+            &a.guild_id,
+            "discovery-cap",
+            &a.source_id,
+            a.source,
+            usize::MAX,
+        )
+        .await?;
+    assert_eq!(capped.len(), 32);
+    assert_eq!(capped.first().unwrap().event_id, "discovery-cap-00");
+    assert_eq!(capped.last().unwrap().event_id, "discovery-cap-31");
+    Ok(())
+}
+
 async fn exercise(pool: &PgPool) -> TestResult {
     let migration = include_str!("../migrations/0200_self_roles.sql");
     sqlx::raw_sql(migration).execute(pool).await?;
@@ -218,6 +313,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    recovery_discovery_scope_limits_and_claim_race(pool).await?;
     pending_intent_initialization(pool).await?;
     compensation_phase_recovery(pool).await?;
     pending_exchange_and_live_settlement(pool).await?;

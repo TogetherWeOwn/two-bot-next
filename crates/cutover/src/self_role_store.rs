@@ -95,6 +95,23 @@ pub struct SelfRoleAudit {
     pub pre_mutation_role_ids: Vec<String>,
 }
 
+/// Discovery metadata only: this carries no lease or mutation authority.
+/// Reacquisition must recheck processing state/expiry and load the immutable
+/// intent/effects under the audit lock, not use a discovery-time snapshot.
+#[derive(Debug, Clone)]
+pub struct RecoverableAudit {
+    pub event_id: String,
+    pub event_order: Option<String>,
+    pub guild_id: String,
+    pub panel_id: String,
+    pub member_id: String,
+    pub source_id: String,
+    pub option_key: Option<String>,
+    pub role_id: Option<String>,
+    pub source: PanelMode,
+    pub operation: RoleOperation,
+}
+
 /// Opaque fencing identity plus original intent returned by recovery.
 ///
 /// The fencing token authorizes SQL fencing comparisons but must never reach
@@ -173,6 +190,8 @@ pub enum StoreError {
     InvalidLease,
     #[error("claim generation exhausted")]
     GenerationExhausted,
+    #[error("invalid persisted self-role audit metadata")]
+    InvalidAudit,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +252,71 @@ impl SelfRoleStore {
     fn expiry(&self, now: OffsetDateTime) -> Result<OffsetDateTime, StoreError> {
         now.checked_add(Duration::milliseconds(self.lease_ms as i64))
             .ok_or(StoreError::InvalidLease)
+    }
+
+    /// Bounded, configured-source discovery. The result is a hint, never a claim;
+    /// concurrent sweepers still arbitrate through `claim_pending_audit`.
+    /// Oldest lease expiry first lets a newly recovered row yield to others.
+    pub async fn recoverable_audits(
+        &self,
+        guild_id: &str,
+        panel_id: &str,
+        source_id: &str,
+        source: PanelMode,
+        limit: usize,
+    ) -> Result<Vec<RecoverableAudit>, StoreError> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let mut conn = self.pool.acquire().await?;
+        let now = self.now(&mut conn).await?;
+        type DiscoveryRow = (
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        );
+        let rows: Vec<DiscoveryRow> = sqlx::query_as(
+            "SELECT event_id,event_order,guild_id,panel_id,member_id,source_id,
+             option_key,role_id,operation FROM self_role_audit
+             WHERE outcome='processing' AND guild_id=$1 AND panel_id=$2
+             AND source_id=$3 AND source=$4 AND processing_expires_at <= $5
+             ORDER BY processing_expires_at,event_id COLLATE \"C\" LIMIT $6",
+        )
+        .bind(guild_id)
+        .bind(panel_id)
+        .bind(source_id)
+        .bind(source.as_str())
+        .bind(now)
+        .bind(limit.min(32) as i64)
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RecoverableAudit {
+                    event_id: row.0,
+                    event_order: row.1,
+                    guild_id: row.2,
+                    panel_id: row.3,
+                    member_id: row.4,
+                    source_id: row.5,
+                    option_key: row.6,
+                    role_id: row.7,
+                    source,
+                    operation: match row.8.as_str() {
+                        "add" => RoleOperation::Add,
+                        "remove" => RoleOperation::Remove,
+                        "replace" => RoleOperation::Replace,
+                        _ => return Err(StoreError::InvalidAudit),
+                    },
+                })
+            })
+            .collect()
     }
 
     /// Insert-first deduplication with an already computed immutable intent.

@@ -220,8 +220,25 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   are unfinished.
 - Added unit input tests and isolated mock/Postgres orchestration regressions
   cover shared select replacement, duplicate delivery, dry-run, failed defer,
-  disabled routing and recovered-mutation dry-run refusal. These are source
-  coverage, not passed acceptance; reaction gateway acceptance remains unfinished.
+  disabled routing and recovered-mutation dry-run refusal. Reaction dispatch now
+  respects the shared router gate; its fixture exercises partial add/remove and
+  repeated explicit add/remove as no-ops through the actual gateway hooks. These
+  are source coverage, not passed Rust acceptance.
+- Expired processing audits can be discovered without retaining or redelivering
+  gateway input. Discovery is scoped to configured guild/panel/message/source,
+  ordered by expiry then a stable event-ID tie-breaker, and capped at 32 rows.
+  It grants no authority or snapshot: the existing claim lock reloads immutable
+  intent/effects and rotates the generation. A service pass considers at most
+  32 rows, four per panel, rotating its starting panel; renewed expiry supplies
+  durable backoff. Initialized empty select targets remain meaningful, while
+  interrupted uninitialized intent rejects without REST. Inconsistent pending or
+  effect evidence stays processing even when initialization is absent.
+- Added isolated discovery/race/limit and recovery-without-redelivery fixtures
+  cover selected/empty targets, compensation, dry-run/pending refusal and
+  uninitialized evidence preservation. The sweep is not yet registered with the
+  shared shutdown supervisor. Terminal superseded audits and their committed-
+  target repair are not covered by processing discovery; these remain activation
+  blockers.
 
 Interrupted remote work stays explicitly unresolved; its durable continuation/
 reconciliation lifecycle must be wired before activation, not silently cleared
