@@ -449,8 +449,10 @@ async fn exercise_superseded_evidence(pool: &PgPool) -> TestResult {
             .await?,
     );
     // Attempt history recorded before supersession survives.
-    let mut pre = AuditEffects::default();
-    pre.attempted_added_role_ids = vec!["role-a".to_owned()];
+    let pre = AuditEffects {
+        attempted_added_role_ids: vec!["role-a".to_owned()],
+        ..Default::default()
+    };
     assert!(store.update_audit_effects(&old_event, &pre).await?);
     // An event-generation transfer rejects the former worker's evidence.
     clock.store(TEST_NOW_MS + 500, Ordering::SeqCst);
@@ -485,10 +487,12 @@ async fn exercise_superseded_evidence(pool: &PgPool) -> TestResult {
     // Late result/compensation evidence records under the still-current
     // token/generation; the rejection stays terminal and authorizes neither
     // settlement nor panel-target publication.
-    let mut late = AuditEffects::default();
-    late.added_role_ids = vec!["role-a".to_owned()];
-    late.compensated_added_role_ids = vec!["role-b".to_owned()];
-    late.unresolved_removed_role_ids = vec!["role-c".to_owned()];
+    let late = AuditEffects {
+        added_role_ids: vec!["role-a".to_owned()],
+        compensated_added_role_ids: vec!["role-b".to_owned()],
+        unresolved_removed_role_ids: vec!["role-c".to_owned()],
+        ..Default::default()
+    };
     assert!(store.record_superseded_effects(&current, &late).await?);
     let (outcome, code): (String, Option<String>) = sqlx::query_as(
         "SELECT outcome,code FROM self_role_audit WHERE event_id='superseded-evidence-old'",
