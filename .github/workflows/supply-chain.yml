@@ -31,7 +31,9 @@ jobs:
           path: source
           persist-credentials: false
       - name: Verify supply-chain fixtures
-        run: python3 scripts/test-supply-chain.py
+        run: |
+          python3 scripts/test-supply-chain.py
+          python3 scripts/test-runtime-image-evidence.py
       - name: Set up BuildKit
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Build runtime image (no registry push)
@@ -112,6 +114,11 @@ jobs:
           format: json
           output: sbom/image-vulnerabilities.json
           exit-code: '1'
+      - name: Collect exact-image applicability evidence
+        if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
+        run: |
+          python3 scripts/runtime-image-evidence.py "$IMAGE" sbom
+          (cd sbom && sha256sum runtime-image-evidence.json > runtime-image-evidence.sha256)
       - name: Retain SBOMs and findings even when the gate fails
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

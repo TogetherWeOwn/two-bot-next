@@ -19,11 +19,43 @@ Actions artifact for 14 days, including on a vulnerability failure.
 
 `.trivyignore.yaml` starts empty. Fix dependencies or upgrade base-image digests
 before proposing an exception. Each narrowly scoped YAML vulnerability entry
-must have `id`, `paths`, `statement` with reason and review evidence, and
-`expired_at` (at most 30 days). A Code Reviewer must approve the exact SHA;
+must have `id`, an effective scope selector supported by the pinned scanner,
+`statement` with reason and review evidence, and `expired_at` (at most 30 days).
+A package/version/architecture in a statement is not selector enforcement;
+OS findings without a package path cannot be scoped by inventing a file path.
+Verify the approved scope and expiry with positive and negative selector tests
+before activating an exception. A Code Reviewer must approve the exact SHA;
 security exceptions also need CISO agreement. Do not ignore a whole severity,
 a whole ecosystem or every unfixed finding. An expired exception restores the
 gate. New findings must be triaged on the same PR, never bypassed to get green.
+
+## Exact-image applicability evidence
+
+After the vulnerability gates, including when either fails, CI runs
+`scripts/runtime-image-evidence.py` against the immutable image ID recorded with
+the BOMs. The `supply-chain` artifact additionally retains
+`runtime-image-evidence.json` and its separate SHA-256 checksum. These diagnostic
+files are not release assets and do not affect ignore selectors or waive findings.
+
+The report records image architecture, declared runtime user and entrypoint,
+installed package versions/architectures and file lists, selected utility/module
+presence, Perl build width, ELF/linkage probes, SUID/SGID files, capability-tool
+output and mount configuration. Each fixed probe runs in its own named container
+with a read-only filesystem, no network, no mounts or passed secrets, all
+capabilities dropped and no-new-privileges. Inspection uses container root for
+file visibility, not to exercise privileged operations or the bot entrypoint.
+Each probe has a 20-second client timeout, CPU/memory/PID limits and removal of
+only its own container even on timeout. The enclosing job retains its 40-minute
+bound. Docker inspection does not record image environment values.
+
+Nonzero exits, unavailable tools and timeouts are retained explicitly; they are
+not absence proof. For example, missing `getcap` leaves capabilities unresolved.
+Module absence and linkage observations still need package/CVE-specific analysis
+and source/caller evidence. CI kernel, mounts and inspection privileges do not
+prove production kernel, namespace restrictions or exploit reachability. Keep
+all unresolved gates red; pursue supported Bookworm fixes or compatible removal
+of unnecessary packages before requesting a new disposition on the existing
+security-decision thread.
 
 ## Release and dry-run
 
@@ -77,6 +109,7 @@ Offline regressions (no Cargo compile, Docker daemon or database access):
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-supply-chain.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-runtime-image-evidence.py
 python3 scripts/test-docker-deps.py
 python3 scripts/test-release-retry.py
 ```
