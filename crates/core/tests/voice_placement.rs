@@ -391,7 +391,7 @@ proptest! {
                 let id = index as u64 + 1;
                 let kind = if id == 1 {
                     CategoryEntryKind::Creator
-                } else if id < 20 && id % 2 == 0 {
+                } else if id < 20 && id.is_multiple_of(2) {
                     CategoryEntryKind::Room
                 } else {
                     CategoryEntryKind::Other
