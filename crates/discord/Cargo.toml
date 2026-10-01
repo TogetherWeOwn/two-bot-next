@@ -31,6 +31,8 @@ twilight-model = { workspace = true }
 
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
+anyhow = { workspace = true }
+two-bot-cutover = { version = "0.2.0", path = "../cutover" }
 sqlx = { workspace = true }
 two-bot-testsupport = { path = "../testsupport", version = "0.2.0" }
 futures-util = { workspace = true, features = ["sink"] }

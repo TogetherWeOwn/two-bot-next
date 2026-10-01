@@ -1,0 +1,80 @@
+name: pipeline benchmark
+
+# Evidence job, deliberately not a required PR check. No nightly exists yet.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/pipeline-benchmark.yml'
+      - 'crates/discord/examples/pipeline_bench.rs'
+      - 'scripts/*pipeline_bench*'
+      - 'docs/pipeline-benchmark-baseline.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-benchmark-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: two_bot_test_pipeline_bench
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d two_bot_test_pipeline_bench"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_pipeline_bench
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-pipeline-bench-${{ hashFiles('Cargo.lock') }}
+      - name: Disposable database hostname
+        run: printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
+      - name: Comparator regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench.py' -v
+      - name: Benchmark fixture and guard regressions (hosted runner only)
+        run: |
+          cargo test -p two-bot-discord --example pipeline_bench --locked
+          cargo test -p two-bot-testsupport --lib --locked
+      - name: Build benchmark (hosted runner only)
+        run: cargo build -p two-bot-discord --example pipeline_bench --locked
+      - name: Measure bounded synthetic pipeline
+        run: |
+          timeout 240s target/debug/examples/pipeline_bench > pipeline-benchmark.json
+          python3 -m json.tool pipeline-benchmark.json
+      - name: Compare committed baseline
+        # The first evidence run bootstraps the measured baseline; no invented numbers.
+        if: hashFiles('docs/pipeline-benchmark-baseline.json') != ''
+        run: python3 scripts/compare_pipeline_bench.py pipeline-benchmark.json
+      - name: Upload measurement and revision
+        if: always()
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: printf '%s\n' "$HEAD_SHA" > pipeline-benchmark-revision.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: pipeline-benchmark
+          path: |
+            pipeline-benchmark.json
+            pipeline-benchmark-revision.txt
+          retention-days: 14
