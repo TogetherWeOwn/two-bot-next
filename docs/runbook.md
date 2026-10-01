@@ -48,7 +48,7 @@ They are HTTP observations, **not database probes or test authorization**.
 | Observation | Meaning / next action |
 |---|---|
 | `/health` 200, `{"status":"ok"}` | The process can answer HTTP. Not proof of Discord, database, feature services, or end-to-end delivery. |
-| `/readyz` 200, `{"components":[["process","ready"],["gateway","ready"]]}` | READY/RESUMED dispatch has committed. Only these two components are currently wired. |
+| `/readyz` 200, components include `process=ready`, `gateway=ready` | READY/RESUMED dispatch has committed. These are the two status-gating components; the `jobs` object is informational and can report failures even while ready. |
 | `/readyz` 503, gateway `down` | Missing gateway prerequisites; service is parked. Check binding **names**, not values. |
 | `/readyz` 503, gateway `starting` | Connecting/reconnecting or bounded checkpoint I/O. Compare duration with logs; persistent 503 is not healthy operation. |
 | Neither route answers / 500 / HTTP 1101 | Inspect Worker bindings and container startup. Named environments must repeat all Container/DO/exports wiring; do not bypass readiness. |
@@ -67,8 +67,9 @@ It probes local `/health` and exits 0 for HTTP 200, 1 otherwise. This is **not**
 a readiness check. The Worker routes these two paths to singleton `two-bot`;
 other paths serve the invite redirect, not a bot admin API. The redirect's
 `/healthz` can return 200 without starting the bot; **never use it as gateway
-health**. `/metrics`, internal-action endpoints and `/voice/ownership/health`
-are not wired bot endpoints.
+health**. The binary exposes private `/metrics`, but the Worker and DO do not
+proxy it; use only an already-authorized internal scrape, never a public route.
+Internal-action endpoints and `/voice/ownership/health` are not wired bot endpoints.
 
 Source: [`server.rs`](../crates/bot/src/server.rs),
 [`health.rs`](../crates/core/src/health.rs),
@@ -130,10 +131,12 @@ not evidence of the measured RSS budget. See [staging soak](staging-soak.md).
   to `main`, and also allows manual dispatch, but currently accepts a 503
   readiness response as a scaffold-era gate. **Workflow green is not gateway
   ready**: require your own first `/readyz` 200 observation and feature evidence.
-- A routine redeploy never applies database migrations at startup: the gateway
-  runs DML-only, so the operator applies pending migrations first, then
-  redeploys. This is not permission to perform manual SQL, restore, or
-  migration tests on staging/production databases.
+- Gateway startup connects DML-only and does not migrate. **The lazy periodic
+  jobs path currently requests migrations and web-contract DDL**; do not infer
+  the whole runtime is DML-only. Confirm schema compatibility with its owner
+  before redeploying; a DML-only login may leave jobs failing `database` while
+  gateway-ready. This does not authorize extra grants, manual SQL, restores,
+  migrations or migration tests on staging/production.
 
 ```bash
 npm --prefix wrangler run deployments -- list --env staging
@@ -242,10 +245,14 @@ Source: [`gateway.rs`](../crates/bot/src/gateway.rs),
 ## Containment, kill switches and feature flags
 
 **Do not confuse a ported core contract with an active control.** The current
-binary runs the gateway/cache/funnel pipeline. It does not start audit delivery,
-automod sanction workers, moderation/slash-command handlers, internal-action
-HTTP, or the settings poller. The Worker does not forward the feature vars.
-There is no binary audit-halt command or hot-reload/admin endpoint to recommend.
+binary includes gateway/cache/funnel, the shared command runtime (sticky/feed
+slices), and supervised website/community jobs subject to their startup gates.
+It does not start audit delivery, automod sanction workers, moderation action
+handlers, internal-action HTTP or the settings poller. The Worker does not
+forward the feature vars. There is no binary audit-halt command, persistent
+Worker pause or hot-reload/admin endpoint to recommend. See the
+[incident playbooks](#incident-playbooks) for the actual degradation and stop
+boundaries; registry entries do not prove all command slices execute.
 
 For unexpected writes: first identify the actual writer (legacy bot, next image,
 other automation). Preserve evidence and use the authorized deployment/containment
@@ -258,9 +265,9 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store exists, delivery service/operator endpoint not wired. No supported command in this binary. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
 | Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Matcher/config only, no runtime enforcement. Setting enforce does not activate sanctions. `TWO_AUTOMOD=1` **does** request MESSAGE_CONTENT intent for direct binary execution. |
 | Moderation | Exact `TWO_MODERATION=1`; enabled config requires `TWO_OWEN_USER_ID`; protected-role policy applies. | No running moderation command handler. No config toggle demonstrated as an emergency stop. |
-| Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Library gates; no command publishing/job service wired. |
+| Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | These action slices are library gates; shared registry publishing and periodic jobs exist, but do not make these gates operational containment. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Core only; session/anchor roles and dry-run are not active runtime switches. |
-| Community scorecard | `TWO_COMMUNITY_SCORECARD=1`; recommendations on unless `TWO_COMMUNITY_RECOMMENDATIONS=0`. | Core/store present; no scorecard scheduler wired. |
+| Community scorecard | `TWO_COMMUNITY_SCORECARD=1`; recommendations on unless `TWO_COMMUNITY_RECOMMENDATIONS=0`. | Conditional supervised scheduler is wired; weekly attempt is consumed before DB work. Worker does not forward these flags; no hot stop switch is demonstrated. |
 | Internal actions | Moderation requires `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; other verbs have allow flags. | Durable replay store/executor ports do not create an HTTP listener or authorize writes. |
 | Settings hot reload | Typed catalogue/store with env-only secret/moderation keys. | Poller/runtime rebuilding remains follow-up; no promise of changes applying without restart. |
 
@@ -344,13 +351,321 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 |---|---|
 | Token missing / invalid | Missing `DISCORD_TOKEN` parks the gateway. A present rejected token can produce generic gateway failure rather than a dedicated invalid-token log. Confirm the expected secret **name/environment** with its provisioner; stop on rejection. Do not use legacy `DISCORD_BOT_TOKEN` as an automatic replacement or rotate credentials in this procedure. |
 | Missing Discord intents | GUILD_MEMBERS is always requested. MESSAGE_CONTENT is conditional on automod or all three ticket identifiers. Check the intended bot's Developer Portal intent grants and runtime configuration through the authorized actor; no speculative privilege expansion or token switch. There is no separate intents health component. |
-| DB unreachable / migrations fail | `DATABASE_URL` is required for the configured gateway. Connect/migration/hydration/checkpoint failure exits the process; underlying SQL error is intentionally withheld from runtime logs. Observe the container failure and existing DB-service incident evidence; do not run SQL/probes/tests against staging or production. Fix the named binding/network/schema dependency through its owner, not another credential. |
+| DB unreachable / migrations fail | `DATABASE_URL` is required. Gateway connect/hydration/checkpoint failure can exit the process; its SQL error is withheld. The separate lazy jobs path requests migrations/DDL and can fail `database` while ready stays green. Follow the [Neon/Hyperdrive playbook](#neon-or-hyperdrive-outage); fix the named dependency through its owner, not another credential, SQL probe or widened grant. |
 | HTTP 200 health but persistent 503 ready | Listener works, gateway does not. Read `gateway` state and startup logs. Never soften readiness or count the scaffold-era deploy gate as recovery. |
 | Reconnect / RESUME refused | Follow [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery); 4007/4009 force fresh IDENTIFY. Preserve the durable checkpoint, don't hand-edit sequence or start another shard. |
-| Discord REST 429 / suspected breaker | The legacy shared global/route 429 breaker is absent; current gateway binary also has no wired REST action executor to reset. The ported executor honors retry-after (body then header, fallback 1 s, +250 ms, cap 60 s). Moderation uses one timed attempt; paced kick/publishing have bounded attempts, but paced GET 429 retries are not count-bounded. Do not claim every REST request has five retries, hammer Discord, replay uncertain moderation writes, or invent a breaker-reset command. Identify the real writer and use its verified containment. See [`executor.rs`](../crates/discord/src/executor.rs). |
+| Discord REST 429 / suspected breaker | Command/jobs REST executors are wired, but no shared token-wide admission governor/breaker is active. Per-executor pacing is not global containment; sticky/interaction sends use single unpaced attempts and later sticky activity can retry. See the [Discord playbook](#discord-gateway-or-api-outage) for retry/admission boundaries; do not hammer Discord, replay uncertain writes or invent a reset command. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |
 | Worker restored but Rust regression remains | Worker-version rollback did not prove image rollback. Inspect the active image and use a schema-compatible full redeploy of the known-good pair. |
 | Backup/drill red | Preserve valid archives; inspect exit status, verifier line, table counts and off-box receipt. Rehearse only on a prepared test database. No automatic promotion to a production restore. |
+
+## Incident playbooks
+
+Source contracts checked at `8af9b23be40935b97cf29512be3aa45a8b368858`;
+re-check the affected deployment if its revision differs. This is not proof of
+a staging/production deployment or live recovery.
+
+Use these procedures for the **affected, verified environment** only. They do
+not authorize production deployment, a DB restore, an outage injection, or any
+credential change. Record UTC, incident reference, last good observation,
+reviewed Git SHA, Worker version and running image before acting. Do not collect
+raw tokens, DB URLs, request headers, gateway session IDs or member payloads.
+An access denial is a stop condition, not evidence of a provider outage: report
+the principal, operation, non-secret target and error to the engineering manager;
+never change credentials or bypass the gate.
+
+A dry-run walkthrough is non-disruptive: observe the authorized staging
+baseline, walk the hypothetical outage branches below, and record what evidence
+would permit recovery. Do not actually disconnect Discord, change a Neon/
+Hyperdrive binding, delete a checkpoint, send a moderation action, or stop the
+staging container. [Tabletop evidence](incident-tabletop-2026-10-01.md) separates
+local source rehearsal, actual staging observations and unfinished acceptance.
+A denied observation or successful offline test is not a completed staging drill.
+
+### Discord gateway or API outage
+
+**Detection.** Compare `/health` with the `gateway` component of `/readyz`.
+Gateway reconnect symptoms and REST send failures are different incidents:
+gateway-ready does not prove REST delivery, and HTTP liveness does not prove
+either. Use literal `gateway reconnect failed; Twilight will retry`,
+`durable gateway initialized; shard connecting` (`resume`) and
+`gateway ready; checkpoint committed` (`sequence`). Worker
+`two-bot /readyz unhealthy: <status>` is a readiness observation, not a Discord
+cause. Do not infer a Discord outage from a Worker error or 403 alone.
+
+Existing **private** metrics are `two_bot_gateway_reconnects_total`,
+`two_bot_gateway_resumes_total`, `two_bot_gateway_latency_seconds` and
+`two_bot_rest_requests_total{route,result}` (`429`, `5xx`, `transport` distinguish
+REST symptoms). Use an existing authorized internal scrape, not the public
+Worker: [metrics exposure](metrics.md) documents that `/metrics` is not proxied.
+Counters reset on process replacement; reconnects count subsequent HELLOs, not
+failed dials; RESUMED is counted **before** its durable commit; latency can be
+`NaN`. None is a gateway-ready/admission gauge or a breaker-reset control.
+
+**First five minutes.**
+
+1. Confirm environment, singleton `two-bot`, affected guild and deployment
+   provenance. Save status/body of both health routes using [health checks](#is-it-alive).
+   Capture the first failing time and last ready time, not just a screenshot of
+   a current green response.
+2. Correlate reconnect/send evidence with
+   [Discord status](https://discordstatus.com/). Classify gateway transport,
+   REST 429/5xx/timeout, rejected authentication, missing intents, or local
+   regression separately. A rejected credential follows the token/provisioner
+   path, not a retry with another token.
+3. Let Twilight handle transport reconnection. On startup a valid checkpoint
+   at most 15 minutes old permits attempted RESUME; invalid/expired state uses
+   IDENTIFY. Codes 4007/4009 and non-resumable invalid session clear state in
+   code and force fresh identification. Do not force either mode, delete a
+   checkpoint, edit a sequence, start a second shard, or loop manual restarts.
+4. Determine which actual runtime is sending REST requests. Do not assume a
+   library cooldown or unmerged admission governor is active protection. Stop
+   operator-initiated send/replay work; preserve ambiguous outcomes rather than
+   repeating moderation, announcement or role writes.
+
+Current send admission is **per executor**, not shared per token: command and
+job executors are separate; clones share only their executor's pacing state.
+The paced floor is 110 ms (kick floor 350 ms). Sticky message POST and interaction
+callback/edit use single five-second attempts without that pacing path; a sticky
+POST failure releases its claim so later message activity can try again.
+Registry publication has at most five sends for repeated 429/5xx. Paced job GET
+429 retries do not consume the attempt count and rely on the outer job deadline.
+There is no wired token-wide cooldown/queue/breaker to reset or rely on for
+containment. Internal announcement cooldown receipts are a library contract,
+not active admission. Preserve uncertainty rather than promising no later retry.
+
+**Containment.** Keep the durable checkpoint and event evidence intact. Respect
+server retry-after and the executor's bounded delay rather than increasing
+traffic during a 429. No manual breaker reset, request burst, second identity,
+or credential substitution. If a local regression is proven, use only the
+schema-compatible reviewed [rollback procedure](#redeploy-and-rollback).
+A provider outage alone is not a reason to redeploy. If bot-wide isolation is
+necessary, use the Worker-side containment prerequisite in the
+[token playbook](#suspected-bot-token-compromise-containment-only); a one-time
+process stop is not a persistent pause.
+
+**Recovery verification.** Require actual `/health` 200 and `/readyz` 200 with
+`process` and `gateway` ready after committed READY/RESUMED. `resume=true` alone
+is an attempt, not success. Record the first ready UTC and outage/reconnect gap;
+confirm one session/instance and no continuing reconnect/fatal failures over a
+bounded observation window (at least two configured keepalive intervals).
+Only under separately authorized staging E2E, perform one known feature journey
+and verify its effect; do not create a live-guild test message or moderation
+write as a health probe. REST recovery needs evidence of completed delivery,
+not only gateway readiness. Preserve unknown send outcomes for reconciliation;
+do not bulk-replay them. No claim that caches, open voice durations or all
+missed events are restored by RESUME/IDENTIFY.
+
+**Post-incident record.** Save affected surface, onset/last good/first ready UTC,
+version/image/SHA, gateway mode (attempted RESUME versus verified recovery or
+fresh IDENTIFY), close/status codes if available, provider incident link,
+redacted evidence, admission/retry decisions, uncertain effects, lost-event/
+voice-duration limitations, verification and follow-up owner. Separate observed
+facts from inferred cause and from the hypothetical tabletop.
+
+Source: [gateway and durable recovery](gateway-recovery.md),
+[`gateway.rs:195–319`](../crates/bot/src/gateway.rs),
+[`gateway_metrics.rs:19–68`](../crates/bot/src/gateway_metrics.rs),
+[`metrics.rs:196–253`](../crates/core/src/metrics.rs),
+[`command_runtime.rs:461–474`](../crates/bot/src/command_runtime.rs),
+[`executor.rs:490–568,820–851,1347–1429`](../crates/discord/src/executor.rs),
+[Discord connection lifecycle](https://docs.discord.com/developers/events/gateway#connections).
+
+### Neon or Hyperdrive outage
+
+**Detection.** Gateway Postgres uses the forwarded `DATABASE_URL` directly.
+Hyperdrive `REDIRECT_DB` is a separate declared redirect binding, **not** the
+Rust connection path. At this source revision, the Worker constructs its
+`RedirectStore` with an `undefined` connector: it serves the configured snapshot
+and silently drops non-live click records even if the Hyperdrive binding exists.
+Do not diagnose lost attribution as a new Hyperdrive outage when live persistence
+was never wired, or claim a working redirect proves either DB is healthy.
+
+Use literal `durable gateway failed; checkpoint unchanged, readiness unavailable`
+(no underlying SQL error), `periodic job failed` (`job`, `error_class=database`),
+and `sticky lookup failed; skipping activity` /
+`sticky claim failed; skipping activity` (`error`, redact before sharing).
+The informational
+`jobs` readiness object records `last_error_class`, `consecutive_failures` and
+`last_success` (epoch **milliseconds**); job failures do not change the HTTP
+ready status. Existing private metrics
+`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"}` (epoch
+**seconds**) and `two_bot_db_pool_configured`, `two_bot_db_pool_connections`,
+`two_bot_db_pool_idle_connections`, `two_bot_db_pool_max_connections` are hints,
+not DB connectivity probes. The gauges sample only the gateway pool, not the
+lazy job pool; the six periodic jobs do not populate that success metric.
+Use only existing authorized [internal metrics](metrics.md); never proxy them
+publicly. There is no DB-ready component or DB-error metric. Preserve actual
+health/readiness and sanitized evidence, not URLs or unredacted SQL errors.
+
+**First five minutes.**
+
+1. Identify the affected staging dependency from approved non-secret deployment
+   metadata: [staging configuration](staging-soak.md#provisioning-operator-once)
+   records dedicated `two_bot` DB/role on Neon staging, separate from the web's
+   `two`/`two_app`. Never derive a replacement URL from another application's
+   secrets. The deployed binding must be confirmed, not merely assumed from
+   this configuration document.
+2. Save both bot health responses and available sanitized startup/checkpoint
+   logs. Check [Neon status](https://neonstatus.com/) and
+   [Cloudflare status](https://www.cloudflarestatus.com/) alongside the actual
+   dependency owner's evidence. Missing schema/grants, rejected credentials,
+   startup failure and provider unavailability require different repairs.
+3. Treat inability to persist gateway events/checkpoints as unsafe operation,
+   not a license to continue on in-memory state or skip a transaction. Keep
+   stored state intact. Gateway-ready does not prove every feature store is
+   available; pause manual/operator writes and investigate the specific writer.
+4. Check the **deployed** redirect wiring before treating Hyperdrive as an
+   active dependency. Current source is snapshot-only: no live lookup/write
+   occurs, so there is no Hyperdrive recovery to test through this Worker yet.
+   If a later reviewed deployment wires a live connector, distinguish lookup
+   fallback from failed click attribution using that revision's evidence.
+   Do not call redirect `/healthz` proof of gateway recovery or manufacture a
+   campaign click to exercise a production DB.
+
+**Containment.** The dependency owner repairs the existing target/network/
+schema/binding through their authorized procedure. No extra grant, credential
+substitution, URL swap, migration, checkpoint deletion, DB reset or restart
+storm. If configured gateway persistence fails, allow its fail-closed termination
+rather than softening readiness or launching another writer. Do not claim all
+command effects are transactional or rolled back merely because a checkpoint
+failed. Worker HTTP, fallback redirects and bot persistence have separate
+failure boundaries. Startup DB/checkpoint/milestone load failure prevents the
+essential gateway task from starting; persistence failure in its running loop
+ends that task and supervision exits the process. There is no durable offline
+spool. Sticky lookup/claim DB failures skip reposting; sticky/feed command
+failures produce failure replies. Command tasks are detached **before** the
+checkpoint commits, so not every Discord effect belongs to that transaction.
+
+Periodic `counter`, `rank`, `scheduled_events` and conditionally registered
+`presence_probe`, `community_scorecard`, `inactivity` jobs can instead fail
+`database` while gateway readiness stays green. Ordinary job failure is recorded
+and cadence continues, but the scorecard consumes its weekly attempt before
+DB work, so do not promise an immediate same-week retry. **Gateway connect is
+DML-only, but the lazy jobs connection currently requests migrations and the
+web contract DDL.** A DML-only login may therefore leave jobs failing even with
+a ready gateway. Route this schema/grant discrepancy to the dependency/runtime
+owner; this runbook does not authorize widening grants or executing migrations.
+
+Retain the last verified off-box archive and its receipt; an outage is not proof
+of corruption. The v3 [backup contract](backup.md) covers the **22 allowlisted
+bot tables**, including funnel/projections, not the whole evolving runtime DB.
+[`DUMP_TABLES:44–67`](../crates/core/src/backup/dump_file.rs) does not include
+`gateway_sessions` or website tables. It is not a full Neon, Discord or
+Hyperdrive configuration restore.
+Never restore over the affected DB as a connectivity fix. File-only archive
+verification and a prepared **agent-testdb** restore rehearsal are available in
+[backup/restore](#backup-restore-and-drill-commands); no staging/production restore
+or new backup destination is authorized. A real data-loss recovery needs its
+separate decision, schema-compatible target, known archive age/counts and
+recorded RPO/RTO, not a guess at the newest filename.
+
+**Recovery verification.** Have the dependency owner confirm the intended
+binding/target and repair receipt without exposing credentials. Then observe
+health 200, ready 200 with actual component breakdown and no continuing fatal
+persistence failures over at least two keepalive intervals. A separately
+authorized staging journey must confirm the affected feature's persisted
+outcome; readiness alone is insufficient. For this snapshot-only redirect,
+record the unwired live-attribution boundary rather than claiming Hyperdrive
+recovery. A later live connector requires its own lookup/attribution evidence.
+Do not use a SQL test, migration or destructive restore as the verification step.
+
+**Post-incident record.** Save the affected direct-DB/Hyperdrive surface,
+non-secret environment/branch/binding identity, safe log fields, last committed/
+first recovered evidence when available, deployment provenance, provider link,
+actual degraded/refused behavior, uncertain external effects and attribution
+loss. Record whether backups were only preserved, file-verified, or restored
+under a separate approval; include data gap/RPO/RTO only when evidenced. Name
+repair and follow-up owners. Do not declare full recovery from `/health` alone.
+
+Source: [`gateway.rs:140–161,302–319`](../crates/bot/src/gateway.rs),
+[`gateway_session.rs:61–177`](../crates/cutover/src/gateway_session.rs),
+[`website_jobs.rs:69–86`](../crates/bot/src/website_jobs.rs),
+[`jobs.rs:90–145`](../crates/bot/src/jobs.rs),
+[`server.rs:38–72`](../crates/bot/src/server.rs),
+[`metrics.rs:254–291`](../crates/core/src/metrics.rs),
+[`Worker routing:52–65,84–90`](../wrangler/src/index.ts),
+[`redirect-store.ts:84–107`](../wrangler/src/redirect-store.ts), [backup contract](backup.md).
+
+### Suspected bot-token compromise: containment only
+
+**Detection.** A report of token exposure or unexpected actions by the bot
+identity is sufficient to start triage; do not paste the leaked value or test it.
+Credential rejection may cause generic
+`durable gateway failed; checkpoint unchanged, readiness unavailable`, not a
+dedicated compromise signal. `gateway prerequisites missing; gateway parked,
+/readyz reports down` (`missing`, `status`) describes a newly parked runtime,
+not revocation or stopping an older process. Existing private
+`two_bot_rest_requests_total{route,result="4xx"}` can corroborate rejections but
+does not distinguish 401/403 or prove compromise; there is **no invalid-token or
+compromise counter**. Health/readiness, that metric and reconnect counts cannot
+prove a token has not been copied. Preserve sanitized deployment/guild audit
+references and available lifecycle evidence, not raw credential-containing logs.
+Worker `two-bot container stopped` and container `SIGTERM received; draining`
+are useful stop observations, but neither proves absence of revival.
+
+**First five minutes.**
+
+1. Open an incident and record the affected bot application/guild/environment,
+   suspected exposure time, source of the report and deployment identity with
+   **names/IDs only**. Notify the engineering manager and security responder;
+   route owner-reserved credential work through the CEO's consolidated path.
+2. Stop agent/operator deploys, manual sends and replay activity using this
+   identity. Do not start another process, borrow the legacy/staging token,
+   fetch a token to compare it, or try the suspected credential against Discord.
+3. Request authorized **Worker-side containment** of singleton `two-bot`:
+   suppress probe forwarding/auto-start and all pending/rescheduled keepalive
+   calls, then signal the bound Container through the pinned SDK `stop()`.
+   This is an operator execution prerequisite, **not a shipped public command**.
+   Do not expose an unauthenticated stop endpoint or use `destroy()` to delete
+   incident state.
+4. Have the **owner/authorized credential custodian**, not an agent, revoke the
+   compromised bot token in the [Discord Developer Portal](https://discord.com/developers/applications).
+   Discord's Bot-page **Reset Token** invalidates the old token and issues a
+   replacement: the entire action is owner-only credential rotation, not an
+   agent-executed revocation workaround. Do not copy the old or replacement
+   token into a ticket, argument, log, PR, chat or archive.
+
+**Containment boundary / current control gap.** The pinned Container SDK has an
+inherited one-shot `stop()` method, but this Worker has **no authenticated HTTP
+stop route or persistent incident-pause control**. `onStop` logs only; keepalive
+and health/readiness `containerFetch` calls can start the container again.
+`KEEPALIVE_SECONDS=0` falls back to 60 seconds; it is not an off switch. Therefore
+neither a process kill, a single `stop()`, an audit-library halt nor disabling a
+health monitor proves containment. The authorized Worker/platform operator must
+provide a verified maintenance/stop execution path that suppresses **both**
+start sources before stopping. If unavailable, record containment as **blocked**
+and escalate the exact missing control to the engineering manager; do not
+invent a CLI/RPC endpoint or implement an unreviewed emergency deployment here.
+Owner revocation is still necessary: stopping our container does not stop
+someone else using a copied token.
+
+**Containment verification, not restart.** Using authorized platform evidence,
+confirm the affected singleton is stopped, pending/rescheduled keepalive and
+probe auto-start are suppressed, and no old-identity process is running. Avoid
+polling the old Worker `/health` or `/readyz` routes while contained: those probes
+can revive the container. Observe logs/platform state over at least two previous
+keepalive intervals and record the stop time and no-revival evidence. Obtain the
+owner's names-only revocation receipt; do **not** authenticate with the old token
+as a test. If either control cannot be verified, containment remains incomplete.
+
+**Recovery handoff / post-incident record.** This playbook ends with verified
+containment and custodian handoff, **not automatic restart**. The owner performs
+rotation and approved secret provisioning; agents must not create, delete,
+rotate, export or install a replacement credential. Restart needs its separate
+reviewed deployment, security/access gate, known-good version/image pair and
+staging verification. Record exposure/containment/revocation times, non-secret
+identity/surfaces, affected actions and uncertain damage, preserved redacted
+evidence, actual Worker-stop/no-revival receipt, any missing controls, and the
+security/owner recovery handoff. Never interpret silence as rotation approval.
+
+Source: [`Worker lifecycle/routing:104–160,173–175`](../wrangler/src/index.ts),
+[`main.rs:151–180,193–199`](../crates/bot/src/main.rs),
+[`metrics.rs:239–253`](../crates/core/src/metrics.rs),
+[`server.rs:119–121`](../crates/bot/src/server.rs),
+[`pinned SDK package`](../wrangler/package-lock.json),
+[Container lifecycle hooks and methods](https://developers.cloudflare.com/containers/api/container-class/),
+[secret inventory](#secret-inventory-names-only).
 
 ## Secret inventory: names only
 
@@ -386,7 +701,7 @@ into this Rust binary without an implemented dispatch path.
 | Backup/restore, off-box storage, timers | Ported CLI/unit templates; [backup.md](backup.md). Only test-container rehearsals authorized here; no assertion timers are installed. |
 | Guild-config snapshot/restore/seal/drift | Ported staging-guarded CLI; not permission to run a real restore or use a live token. |
 | Operational audit kill switch/MAC reasons | Core/store port exists; delivery/operator control not wired. No fake SQL/CLI replacement. |
-| Automod, moderation, feature toggles | Core policy ports exist; runtime command/job execution and env forwarding are absent. Documented boundaries above, not operational enforcement. |
+| Automod, moderation, feature toggles | Core policy ports exist; shared sticky/feed command runtime and supervised jobs are now wired, but these moderation action slices and Worker flag forwarding are absent. Documented boundaries above, not operational enforcement. |
 | Health/REST rate limits/429 breaker | Liveness/readiness and executor retry contracts documented. Legacy shared global/route breaker is absent, not a library-only port; no reset endpoint. Legacy writer must use its own runbook. |
 | Attribution/scorecard/plan/onboarding/automation reports | Legacy read-only reporting CLIs intentionally dropped by parity decision; core calculations/store presence does not add operator commands. |
 | Staging provision/verify/reset and Discord e2e harness | Legacy tooling intentionally dropped; next uses local fixtures/agent-testdb and its own soak evidence. Never reset live/staging databases for tests. |

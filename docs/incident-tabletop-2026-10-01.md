@@ -44,13 +44,27 @@ metric samples. They exercise the decision sequence without provider calls.
 | Discord reconnect warning, liveness 200, gateway starting | Establish environment and provider incident; retain checkpoint; let Twilight reconnect; no second shard, manual checkpoint deletion, burst retry, or replay of uncertain REST writes. | Ready 200 after committed READY/RESUMED; timestamped gap and a separately authorized staging feature journey. `resume=true` alone is insufficient. |
 | Discord 4007/4009 or non-resumable invalid session | Accept code-owned fresh IDENTIFY; do not force RESUME or manufacture a checkpoint. | Ready 200 and singleton session; record IDENTIFY and any event/voice-duration gap rather than claiming complete replay. |
 | Neon unavailable at startup or checkpoint commit | Fatal configured gateway failure is not safe offline operation. Retain state/backups; no credential substitution, DB reset, migration, restore, or restart storm. Distinguish direct gateway DB from redirect Hyperdrive. | Correct staging binding/dependency restored by its owner, health/ready 200, no fatal persistence failure, and authorized staging feature evidence. No independent DB-ready component exists. |
-| Hyperdrive redirect lookup/write failure only | Separate invite redirect degradation from gateway persistence; fallback may still redirect without attribution. Do not route the gateway to an invented alternative DB. | Configured redirect lookup/delivery evidence separate from gateway readiness; no synthetic click campaign or production DB probe. |
+| Reported Hyperdrive redirect outage | Check wiring first: current Worker passes an undefined live connector, uses snapshot lookup and drops non-live attribution. It cannot demonstrate a Hyperdrive outage or recovery. Do not route the direct-DB gateway to an invented alternative target. | Deployed wiring provenance and explicit snapshot-only limitation; a future live connector needs its own evidence. No synthetic campaign click or DB probe. |
 | Actual staging 403/1010 above | Stop before outage diagnosis: no underlying gateway, DB, or recovery observation exists. Preserve denial and reuse staging repair/evidence route. | Authorized staging response with provenance; do not turn access refusal into a Discord/Neon diagnosis. |
 
 Token containment was reviewed against source, **not executed**. A one-shot
 inherited Container `stop()` is not a persistent pause: keepalive and probe
 requests can restart it. The playbook must state the missing Worker-side
 maintenance gate and owner-only credential action, not invent a public stop URL.
+
+## Offline verification
+
+- `npm --prefix wrangler ci --include=dev`: installed pinned Wrangler 4.143.1
+  and Container SDK 0.3.7; 0 audit vulnerabilities.
+- `npm --prefix wrangler test`: **86 passed, 0 failed**, including Worker
+  auto-start fixtures, local runbook/tabletop file and heading link checks,
+  existing command/help guards, and incident metric/literal-log source checks.
+- The initial new checks caught a token-heading anchor mismatch and a line-split
+  log literal; both were corrected before the final passing run.
+- `git diff --check`: passed. No Cargo compilation or DB integration test was
+  needed for this docs/offline-test change; no Cargo target was created.
+- Link checks resolve repository files and Markdown anchors offline. They do not
+  prove external URL availability, deployed commands or operational authority.
 
 ## Remaining staging acceptance
 
