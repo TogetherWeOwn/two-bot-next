@@ -238,11 +238,6 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
         Self { store }
     }
 
-    /// Seed a created invite without discarding unrelated live codes.
-    pub fn seed(&self, guild_id: Snowflake, state: InviteState) {
-        self.store.store_all(guild_id, &[state]);
-    }
-
     /// Replace the stored snapshot; return the codes that grew. New codes are
     /// stored but never count as growth live (only the window path,
     /// [`invite_growth`], credits those).
@@ -265,6 +260,12 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
         let live: HashSet<String> = current.iter().map(|s| s.code.clone()).collect();
         self.store.delete_missing(guild_id, &live);
         grew
+    }
+
+    /// Seed a newly created code without treating it as a complete guild
+    /// listing. Pruning belongs only to a successful full snapshot.
+    pub fn seed(&self, guild_id: Snowflake, state: InviteState) {
+        self.store.store_all(guild_id, &[state]);
     }
 
     /// Attribution string for a join, given the codes that grew.
