@@ -161,22 +161,42 @@ async fn checkpoint_io<T>(
     result
 }
 
+type RsvpAcknowledgement = tokio::task::JoinHandle<
+    Result<two_bot_discord::rsvp::PreparedRsvp, two_bot_discord::DiscordError>,
+>;
+
+async fn complete_acknowledgement(
+    runtime: &two_bot_discord::interactions::InteractionRuntime,
+    acknowledgement: RsvpAcknowledgement,
+) {
+    let result = match acknowledgement.await {
+        Ok(Ok(prepared)) => runtime.complete(prepared).await,
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(two_bot_discord::DiscordError::Rejected(
+            "interaction acknowledgement task failed".into(),
+        )),
+    };
+    if result.is_err() {
+        // Do not retry committed effects after an uncertain reply, or log
+        // errors containing interaction tokens. Failed defers cannot write.
+        warn!("interaction response failed; not replaying command");
+    }
+}
+
 struct BufferedPacket {
     message: Result<Message, twilight_gateway::error::ReceiveMessageError>,
     session: Option<Session>,
     resume_url: Option<String>,
-    acknowledgement: Option<
-        tokio::task::JoinHandle<
-            Result<two_bot_discord::rsvp::PreparedRsvp, two_bot_discord::DiscordError>,
-        >,
-    >,
+    acknowledgement: Option<RsvpAcknowledgement>,
+    interaction_dispatched: bool,
 }
 
 impl BufferedPacket {
     fn capture(
         shard: &Shard,
         message: Result<Message, twilight_gateway::error::ReceiveMessageError>,
-        runtime: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
+        interactions: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
+        runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
         committed: Option<&GatewaySession>,
     ) -> Self {
         let mut packet = Self {
@@ -184,19 +204,19 @@ impl BufferedPacket {
             session: session_snapshot(shard),
             resume_url: shard.resume_url().map(str::to_owned),
             acknowledgement: None,
+            interaction_dispatched: false,
         };
-        packet.prepare(runtime, committed);
+        packet.prepare(interactions, runtime, committed);
         packet
     }
 
     fn prepare(
         &mut self,
-        runtime: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
+        interactions: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
+        runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
         committed: Option<&GatewaySession>,
     ) {
-        let (Some(runtime), Ok(Message::Text(text)), Some(session)) =
-            (runtime, &self.message, &self.session)
-        else {
+        let (Ok(Message::Text(text)), Some(session)) = (&self.message, &self.session) else {
             return;
         };
         let Ok(header) = serde_json::from_str::<Header>(text) else {
@@ -211,7 +231,18 @@ impl BufferedPacket {
         if let Ok(Some(parsed)) =
             twilight_gateway::parse(text.clone(), EventTypeFlags::INTERACTION_CREATE)
         {
-            if let Event::InteractionCreate(interaction) = Event::from(parsed) {
+            let event = Event::from(parsed);
+            if let Some(runtime) = runtime {
+                // Sticky/feed work remains detached, but must start at receipt:
+                // an earlier ordered RSVP must not consume its callback window.
+                if interactions.is_some() {
+                    runtime.dispatch_remaining(&event);
+                } else {
+                    runtime.dispatch(&event);
+                }
+                self.interaction_dispatched = true;
+            }
+            if let (Some(runtime), Event::InteractionCreate(interaction)) = (interactions, event) {
                 let runtime = Arc::clone(runtime);
                 self.acknowledgement =
                     Some(tokio::spawn(
@@ -324,179 +355,202 @@ async fn run_loop(
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
     let mut pending = std::collections::VecDeque::new();
-    info!(shard = ?ShardId::ONE, "gateway shard loop started");
-    loop {
-        let packet = match pending.pop_front() {
-            Some(packet) => packet,
-            None => match shard.next().await {
-                Some(item) => {
-                    BufferedPacket::capture(shard, item, interactions, committed.as_ref())
+    let mut active_acknowledgement = None;
+    let result = async {
+        info!(shard = ?ShardId::ONE, "gateway shard loop started");
+        loop {
+            let packet = match pending.pop_front() {
+                Some(packet) => packet,
+                None => match shard.next().await {
+                    Some(item) => BufferedPacket::capture(
+                        shard,
+                        item,
+                        interactions,
+                        runtime,
+                        committed.as_ref(),
+                    ),
+                    None => break,
+                },
+            };
+            active_acknowledgement = packet.acknowledgement;
+            let message = match packet.message {
+                Ok(message) => message,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        twilight_gateway::error::ReceiveMessageErrorType::Reconnect
+                    ) =>
+                {
+                    *state.write().await = GatewayState::Armed;
+                    warn!("gateway reconnect failed; Twilight will retry");
+                    continue;
                 }
-                None => break,
-            },
-        };
-        let message = match packet.message {
-            Ok(message) => message,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    twilight_gateway::error::ReceiveMessageErrorType::Reconnect
-                ) =>
-            {
+                Err(_) => {
+                    return Err(sqlx::Error::InvalidArgument(
+                        "gateway receive failed; checkpoint unchanged".into(),
+                    ))
+                }
+            };
+            observer.observe(&message, shard);
+            let Message::Text(text) = message else {
                 *state.write().await = GatewayState::Armed;
-                warn!("gateway reconnect failed; Twilight will retry");
+                // Twilight 0.17.1 retains its session on gateway-initiated closes.
+                // Discord requires a new session for these two reconnectable codes.
+                // Source: https://docs.discord.com/developers/topics/opcodes-and-status-codes#gateway-gateway-close-event-codes
+                let rejected = matches!(
+                    message,
+                    Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009)
+                );
+                if rejected || packet.session.is_none() {
+                    checkpoint_io(state, deadline, store.clear()).await?;
+                    committed = None;
+                }
+                if rejected {
+                    // Shard construction consumed the config's saved session/URL,
+                    // so this fresh shard IDENTIFYs while retaining intents/queue.
+                    *shard = Shard::with_config(shard.id(), shard.config().clone());
+                }
+                continue;
+            };
+            let header: Header = serde_json::from_str(&text)
+                .map_err(|_| sqlx::Error::InvalidArgument("invalid gateway header".into()))?;
+            if header.op == 10 {
+                let hello: HelloPacket = serde_json::from_str(&text)
+                    .map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
+                if hello.d.heartbeat_interval == 0 {
+                    return Err(sqlx::Error::InvalidArgument(
+                        "zero heartbeat interval".into(),
+                    ));
+                }
+                deadline = CHECKPOINT_IO_MAX
+                    .min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
+            }
+            if header.op == 9 {
+                let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+                    sqlx::Error::InvalidArgument("invalid gateway session packet".into())
+                })?;
+                let resumable = value["d"].as_bool().ok_or_else(|| {
+                    sqlx::Error::InvalidArgument("invalid gateway session flag".into())
+                })?;
+                *state.write().await = GatewayState::Armed;
+                if invalidates_session(resumable) {
+                    checkpoint_io(state, deadline, store.clear()).await?;
+                    committed = None;
+                }
+            }
+            if header.op != 0 {
                 continue;
             }
-            Err(_) => {
-                return Err(sqlx::Error::InvalidArgument(
-                    "gateway receive failed; checkpoint unchanged".into(),
-                ))
+            let sequence = header
+                .s
+                .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing sequence".into()))?;
+            let session = packet
+                .session
+                .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing session".into()))?;
+            // Twilight drops resume_url on a failed connect, but retains the session
+            // and may successfully RESUME at its bootstrap endpoint. RESUMED carries
+            // no new URL: retain READY's committed URL only for this same session.
+            let resume_url = packet
+                .resume_url
+                .as_deref()
+                .or_else(|| {
+                    committed
+                        .as_ref()
+                        .filter(|saved| saved.session_id == session.id())
+                        .map(|saved| saved.resume_url.as_str())
+                })
+                .ok_or_else(|| {
+                    sqlx::Error::InvalidArgument("dispatch missing resume URL".into())
+                })?;
+            let checkpoint = GatewaySession {
+                session_id: session.id().to_owned(),
+                sequence,
+                resume_url: resume_url.to_owned(),
+                updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+            };
+            if dispatch_action(committed.as_ref(), &checkpoint.session_id, sequence)
+                == DispatchAction::Duplicate
+            {
+                continue;
             }
-        };
-        observer.observe(&message, shard);
-        let Message::Text(text) = message else {
-            *state.write().await = GatewayState::Armed;
-            // Twilight 0.17.1 retains its session on gateway-initiated closes.
-            // Discord requires a new session for these two reconnectable codes.
-            // Source: https://docs.discord.com/developers/topics/opcodes-and-status-codes#gateway-gateway-close-event-codes
-            let rejected = matches!(
-                message,
-                Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009)
-            );
-            if rejected || packet.session.is_none() {
-                checkpoint_io(state, deadline, store.clear()).await?;
-                committed = None;
-            }
-            if rejected {
-                // Shard construction consumed the config's saved session/URL,
-                // so this fresh shard IDENTIFYs while retaining intents/queue.
-                *shard = Shard::with_config(shard.id(), shard.config().clone());
-            }
-            continue;
-        };
-        let header: Header = serde_json::from_str(&text)
-            .map_err(|_| sqlx::Error::InvalidArgument("invalid gateway header".into()))?;
-        if header.op == 10 {
-            let hello: HelloPacket = serde_json::from_str(&text)
-                .map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
-            if hello.d.heartbeat_interval == 0 {
-                return Err(sqlx::Error::InvalidArgument(
-                    "zero heartbeat interval".into(),
-                ));
-            }
-            deadline = CHECKPOINT_IO_MAX
-                .min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
-        }
-        if header.op == 9 {
-            let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
-                sqlx::Error::InvalidArgument("invalid gateway session packet".into())
+            let timer = crate::gateway_metrics::DispatchTimer::start();
+            let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| {
+                sqlx::Error::InvalidArgument(
+                    "gateway dispatch parse failed; checkpoint unchanged".into(),
+                )
             })?;
-            let resumable = value["d"].as_bool().ok_or_else(|| {
-                sqlx::Error::InvalidArgument("invalid gateway session flag".into())
-            })?;
-            *state.write().await = GatewayState::Armed;
-            if invalidates_session(resumable) {
-                checkpoint_io(state, deadline, store.clear()).await?;
-                committed = None;
-            }
-        }
-        if header.op != 0 {
-            continue;
-        }
-        let sequence = header
-            .s
-            .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing sequence".into()))?;
-        let session = packet
-            .session
-            .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing session".into()))?;
-        // Twilight drops resume_url on a failed connect, but retains the session
-        // and may successfully RESUME at its bootstrap endpoint. RESUMED carries
-        // no new URL: retain READY's committed URL only for this same session.
-        let resume_url = packet
-            .resume_url
-            .as_deref()
-            .or_else(|| {
-                committed
-                    .as_ref()
-                    .filter(|saved| saved.session_id == session.id())
-                    .map(|saved| saved.resume_url.as_str())
-            })
-            .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
-        let checkpoint = GatewaySession {
-            session_id: session.id().to_owned(),
-            sequence,
-            resume_url: resume_url.to_owned(),
-            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
-        };
-        if dispatch_action(committed.as_ref(), &checkpoint.session_id, sequence)
-            == DispatchAction::Duplicate
-        {
-            continue;
-        }
-        let timer = crate::gateway_metrics::DispatchTimer::start();
-        let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| {
-            sqlx::Error::InvalidArgument(
-                "gateway dispatch parse failed; checkpoint unchanged".into(),
-            )
-        })?;
-        let mut connected = false;
-        if let Some(parsed) = parsed {
-            let event = Event::from(parsed);
-            connected = matches!(event, Event::Ready(_) | Event::Resumed);
-            pipeline.handle(&event);
-            // Detached dispatch only for slices not owned by ordered RSVP.
-            if let Some(runtime) = runtime {
-                if interactions.is_some() {
-                    runtime.dispatch_remaining(&event);
-                } else {
-                    runtime.dispatch(&event);
+            let mut connected = false;
+            if let Some(parsed) = parsed {
+                let event = Event::from(parsed);
+                connected = matches!(event, Event::Ready(_) | Event::Resumed);
+                pipeline.handle(&event);
+                // Detached dispatch only for slices not owned by ordered RSVP.
+                if let Some(runtime) = runtime.filter(|_| !packet.interaction_dispatched) {
+                    if interactions.is_some() {
+                        runtime.dispatch_remaining(&event);
+                    } else {
+                        runtime.dispatch(&event);
+                    }
                 }
-            }
-            if let Some(runtime) = interactions {
-                if let Some(acknowledgement) = packet.acknowledgement {
-                    let operation = async {
-                        let result = match acknowledgement.await {
-                            Ok(Ok(prepared)) => runtime.complete(prepared).await,
-                            Ok(Err(error)) => Err(error),
-                            Err(_) => Err(two_bot_discord::DiscordError::Rejected(
-                                "interaction acknowledgement task failed".into(),
-                            )),
+                if let Some(rsvp_runtime) = interactions {
+                    if let Some(acknowledgement) = active_acknowledgement.take() {
+                        let operation = async {
+                            complete_acknowledgement(rsvp_runtime, acknowledgement).await;
+                            Ok(())
                         };
-                        if result.is_err() {
-                            // Do not retry committed effects after an uncertain
-                            // reply, or log errors containing interaction tokens.
-                            warn!("interaction response failed; not replaying command");
-                        }
-                        Ok(())
-                    };
-                    poll_while(
-                        shard,
-                        &mut pending,
-                        |shard, item| {
-                            BufferedPacket::capture(shard, item, interactions, committed.as_ref())
-                        },
-                        BufferedPacket::is_boundary,
-                        operation,
-                    )
-                    .await?;
+                        poll_while(
+                            shard,
+                            &mut pending,
+                            |shard, item| {
+                                BufferedPacket::capture(
+                                    shard,
+                                    item,
+                                    interactions,
+                                    runtime,
+                                    committed.as_ref(),
+                                )
+                            },
+                            BufferedPacket::is_boundary,
+                            operation,
+                        )
+                        .await?;
+                    }
                 }
             }
+            checkpoint_io(
+                state,
+                deadline,
+                store.commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
+            )
+            .await?;
+            timer.committed();
+            committed = Some(checkpoint);
+            if connected {
+                *state.write().await = GatewayState::Connected;
+                info!(sequence, "gateway ready; checkpoint committed");
+            }
         }
-        checkpoint_io(
-            state,
-            deadline,
-            store.commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
-        )
-        .await?;
-        timer.committed();
-        committed = Some(checkpoint);
-        if connected {
-            *state.write().await = GatewayState::Connected;
-            info!(sequence, "gateway ready; checkpoint committed");
+        warn!("gateway shard stream ended; supervisor reports down until restart");
+        Ok(())
+    }
+    .await;
+    // A callback is an external effect: fail closed on the checkpoint error,
+    // but stop admission and finish already-accepted commands before returning.
+    // Do not advance the failed checkpoint or run buffered funnel dispatches.
+    if result.is_err() {
+        *state.write().await = GatewayState::Armed;
+        if let Some(runtime) = interactions {
+            if let Some(acknowledgement) = active_acknowledgement {
+                complete_acknowledgement(runtime, acknowledgement).await;
+            }
+            for packet in pending {
+                if let Some(acknowledgement) = packet.acknowledgement {
+                    complete_acknowledgement(runtime, acknowledgement).await;
+                }
+            }
         }
     }
-    warn!("gateway shard stream ended; supervisor reports down until restart");
-    Ok(())
+    result
 }
 
 /// Build the supervisor's shard: single-shard deployment (one guild, ADR
@@ -694,6 +748,7 @@ mod tests {
                 session: None,
                 resume_url: None,
                 acknowledgement: None,
+                interaction_dispatched: false,
             }
             .is_boundary());
         }
@@ -702,6 +757,7 @@ mod tests {
             session: None,
             resume_url: None,
             acknowledgement: None,
+            interaction_dispatched: false,
         }
         .is_boundary());
         assert!(!BufferedPacket {
@@ -709,6 +765,7 @@ mod tests {
             session: None,
             resume_url: None,
             acknowledgement: None,
+            interaction_dispatched: false,
         }
         .is_boundary());
     }

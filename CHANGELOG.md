@@ -27,6 +27,7 @@
 
 ### Fixed
 
+- Start shared sticky/feed interaction dispatch at receipt even while ordered RSVP I/O is pending; never dispatch the same buffered interaction twice. On checkpoint failure or timeout, stop admission and drain already-acknowledged RSVP work before returning the error, without advancing the failed checkpoint or applying queued funnel packets. Reuse the shared mock module under strict clippy and add mixed-command and checkpoint-failure regressions.
 - Keep the real-binary lifecycle acceptance mock's shared REST registry endpoint separate from its gateway WebSocket listener, and verify full command publication on initial and persisted-session boots alongside website-job traffic.
 - Answer published but unwired commands ephemerally instead of timing out, preserving the existing router refusals and complete registry. Synchronize the registry on resumed process startup as well as Ready, without blocking gateway polling.
 - Preserve one RSVP acknowledgement owner when composing the ordered RSVP path with the shared sticky/feed command runtime; the latter must not send fallback replies for RSVP or redundantly publish a registry already synchronized at boot.

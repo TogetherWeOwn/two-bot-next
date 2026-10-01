@@ -3,10 +3,7 @@ use super::*;
 use two_bot_core::{ClassifierConfig, InteractionRouter, RouterGates};
 use two_bot_discord::{interactions::InteractionRuntime, ActionExecutor};
 
-#[allow(dead_code)]
-#[path = "../../../discord/tests/common/mod.rs"]
-mod common;
-use common::{MockRest, ScriptedResponse};
+use crate::discord_test_common::{MockRest, ScriptedResponse};
 
 const EVENT: &str = "1546451670500642999";
 
@@ -24,19 +21,23 @@ fn interaction(sequence: u64, status: &str) -> Value {
     }})
 }
 
+fn gates() -> RouterGates {
+    RouterGates {
+        configured_guild: Some(GUILD.parse().unwrap()),
+        announcements: true,
+        scorecard: true,
+        automations: true,
+        moderation: false,
+        tickets: false,
+        self_roles: false,
+        onboarding_picker: false,
+        session_picker: false,
+    }
+}
+
 fn runtime(db: &TestDb, rest: &MockRest) -> Arc<InteractionRuntime> {
     Arc::new(InteractionRuntime {
-        router: InteractionRouter::new(RouterGates {
-            configured_guild: Some(GUILD.parse().unwrap()),
-            announcements: true,
-            scorecard: true,
-            automations: false,
-            moderation: false,
-            tickets: false,
-            self_roles: false,
-            onboarding_picker: false,
-            session_picker: false,
-        }),
+        router: InteractionRouter::new(gates()),
         pool: db.pool.clone(),
         executor: ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap(),
         classifier: ClassifierConfig::default(),
@@ -54,8 +55,54 @@ async fn spawn(db: &TestDb, url: &str, rest: &MockRest) -> JoinHandle<Result<(),
         Arc::new(RwLock::new(GatewayState::Armed)),
         db.store.clone(),
         Some(runtime(db, rest)),
-        None,
+        Some(crate::command_runtime::CommandRuntime::new(
+            db.pool.clone(),
+            ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap(),
+            crate::command_runtime::router_with_commands(gates()),
+            GUILD.parse().unwrap(),
+            true,
+        )),
     ))
+}
+
+async fn connect(
+    db: &TestDb,
+    rest: &MockRest,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    tokio_websockets::WebSocketStream<tokio::net::TcpStream>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let runner = spawn(db, &url, rest).await;
+    let (socket, _) = listener.accept().await.unwrap();
+    let (_, mut ws) = ServerBuilder::new().accept(socket).await.unwrap();
+    ws.send(Message::text(
+        json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    // Accept IDENTIFY, answering any jittered initial heartbeat.
+    loop {
+        let message = ws.next().await.unwrap().unwrap();
+        if !message.is_text() {
+            continue;
+        }
+        let packet: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
+        if packet["op"] == 2 {
+            break;
+        }
+        if packet["op"] == 1 {
+            ws.send(Message::text("{\"op\":11,\"d\":null}".to_owned()))
+                .await
+                .unwrap();
+        }
+    }
+    ws.send(Message::text(ready(&url, "rsvp-session").to_string()))
+        .await
+        .unwrap();
+    wait_sequence(&db.store, 1).await;
+    (runner, ws)
 }
 
 async fn wait_requests(rest: &MockRest, count: usize) {
@@ -68,7 +115,13 @@ async fn wait_requests(rest: &MockRest, count: usize) {
     .expect("REST request deadline");
 }
 
-async fn queued_commands(slow_database: bool) {
+#[derive(Clone, Copy)]
+enum CheckpointFailure {
+    Rejected,
+    Timeout,
+}
+
+async fn queued_commands(slow_database: bool, checkpoint_failure: Option<CheckpointFailure>) {
     let db = TestDb::new().await;
     let mut lock = if slow_database {
         let mut tx = db.pool.begin().await.unwrap();
@@ -99,35 +152,7 @@ async fn queued_commands(slow_database: bool) {
         ScriptedResponse::status(500),
     )
     .await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
-    let runner = spawn(&db, &url, &rest).await;
-    let (socket, _) = listener.accept().await.unwrap();
-    let (_, mut ws) = ServerBuilder::new().accept(socket).await.unwrap();
-    ws.send(Message::text(
-        json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
-    ))
-    .await
-    .unwrap();
-    // Accept IDENTIFY, answering any jittered initial heartbeat.
-    loop {
-        let message = ws.next().await.unwrap().unwrap();
-        if !message.is_text() {
-            continue;
-        }
-        let packet: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
-        if packet["op"] == 2 {
-            break;
-        }
-        if packet["op"] == 1 {
-            ws.send(Message::text("{\"op\":11,\"d\":null}".to_owned()))
-                .await
-                .unwrap();
-        }
-    }
-    ws.send(Message::text(ready(&url, "rsvp-session").to_string()))
-        .await
-        .unwrap();
+    let (runner, mut ws) = connect(&db, &rest).await;
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
@@ -160,6 +185,28 @@ async fn queued_commands(slow_database: bool) {
             .unwrap(),
         0
     );
+    match checkpoint_failure {
+        Some(CheckpointFailure::Rejected) => {
+            sqlx::raw_sql(
+                "CREATE FUNCTION reject_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN RAISE EXCEPTION 'fixture checkpoint failure'; END; $$;
+                 CREATE TRIGGER reject_checkpoint BEFORE INSERT OR UPDATE ON gateway_sessions
+                 FOR EACH ROW EXECUTE FUNCTION reject_checkpoint();",
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        Some(CheckpointFailure::Timeout) => {
+            let mut tx = db.pool.begin().await.unwrap();
+            sqlx::query("LOCK TABLE gateway_sessions IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            lock = Some(tx);
+        }
+        None => {}
+    }
     if slow_database {
         // Cross the old cancellation deadline with an acknowledged, uncommitted
         // SQL write. Keep the websocket alive until the deliberate lock releases.
@@ -181,7 +228,29 @@ async fn queued_commands(slow_database: bool) {
         }
         lock.take().unwrap().rollback().await.unwrap();
     }
-    wait_sequence(&db.store, 68).await;
+    let runner = if checkpoint_failure.is_some() {
+        // The runner must finish both accepted commands, then return the original
+        // checkpoint error. It may not checkpoint later funnel packets.
+        let error = tokio::time::timeout(Duration::from_secs(15), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        let message = match checkpoint_failure.unwrap() {
+            CheckpointFailure::Rejected => "fixture checkpoint failure",
+            CheckpointFailure::Timeout => "checkpoint deadline exceeded",
+        };
+        assert!(error.to_string().contains(message));
+        if let Some(tx) = lock.take() {
+            tx.rollback().await.unwrap();
+        }
+        assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
+        assert_eq!(db.count().await, 0);
+        None
+    } else {
+        wait_sequence(&db.store, 68).await;
+        Some(runner)
+    };
     let status: String = sqlx::query_scalar("SELECT status FROM event_rsvps")
         .fetch_one(&db.pool)
         .await
@@ -203,15 +272,17 @@ async fn queued_commands(slow_database: bool) {
             content
         );
     }
-    // Replayed committed dispatches must not send duplicate callbacks or effects.
-    ws.send(Message::text(interaction(3, "going").to_string()))
-        .await
-        .unwrap();
-    ws.send(Message::text(leave(69).to_string())).await.unwrap();
-    wait_sequence(&db.store, 69).await;
-    assert_eq!(rest.requests().len(), 8);
-    runner.abort();
-    let _ = runner.await;
+    if let Some(runner) = runner {
+        // Replayed committed dispatches must not send duplicate callbacks or effects.
+        ws.send(Message::text(interaction(3, "going").to_string()))
+            .await
+            .unwrap();
+        ws.send(Message::text(leave(69).to_string())).await.unwrap();
+        wait_sequence(&db.store, 69).await;
+        assert_eq!(rest.requests().len(), 8);
+        runner.abort();
+        let _ = runner.await;
+    }
     drop(ws);
     rest.shutdown().await;
     db.close().await;
@@ -220,13 +291,107 @@ async fn queued_commands(slow_database: bool) {
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn queued_rsvp_is_deferred_within_three_seconds_and_drains_on_overflow() {
-    queued_commands(false).await;
+    queued_commands(false, None).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn acknowledged_rsvp_survives_feature_deadline_and_backlog() {
-    queued_commands(true).await;
+    queued_commands(true, None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn acknowledged_queue_drains_before_checkpoint_error_returns() {
+    queued_commands(false, Some(CheckpointFailure::Rejected)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn acknowledged_queue_drains_before_checkpoint_timeout_returns() {
+    queued_commands(false, Some(CheckpointFailure::Timeout)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
+    let db = TestDb::new().await;
+    let rest = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id":"1111"})),
+            ScriptedResponse::status(200),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}))
+                .delayed(Duration::from_millis(3200)),
+        ],
+        ScriptedResponse::status(200),
+    )
+    .await;
+    let (runner, mut ws) = connect(&db, &rest).await;
+    ws.send(Message::text(interaction(2, "going").to_string()))
+        .await
+        .unwrap();
+    wait_requests(&rest, 4).await;
+    let delivered = std::time::Instant::now();
+    let commands: Vec<_> = [(3, "sticky"), (4, "feed-remove")]
+        .into_iter()
+        .map(|(sequence, name)| {
+            let mut packet = interaction(sequence, "going");
+            packet["d"]["member"]["permissions"] = json!("32");
+            packet["d"]["data"]["name"] = json!(name);
+            packet["d"]["data"]["options"] = json!([]);
+            packet
+        })
+        .collect();
+    // These validation replies need no store mutation, but still use the same
+    // defer/edit envelope as real sticky/feed effects. No channel is supplied.
+    for command in &commands {
+        ws.send(Message::text(command.to_string())).await.unwrap();
+    }
+    wait_requests(&rest, 8).await;
+    let requests = rest.requests();
+    for sequence in [3, 4] {
+        let suffix = format!("/interactions/{sequence}/mock-rsvp-{sequence}/callback");
+        let callbacks: Vec<_> = requests
+            .iter()
+            .filter(|request| request.path.ends_with(&suffix))
+            .collect();
+        assert_eq!(callbacks.len(), 1);
+        assert!(callbacks[0].received_at.duration_since(delivered) < Duration::from_secs(3));
+        let body: Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+        assert_eq!(body["type"], 5);
+        assert_eq!(body["data"]["flags"], 64);
+        let suffix = format!("/webhooks/1111/mock-rsvp-{sequence}/messages/@original");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "PATCH" && request.path.ends_with(&suffix))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
+    ws.send(Message::text(leave(5).to_string())).await.unwrap();
+    wait_sequence(&db.store, 5).await;
+    assert_eq!(rest.requests().len(), 9); // No second dispatch at queue consumption.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    for command in &commands {
+        ws.send(Message::text(command.to_string())).await.unwrap();
+    }
+    ws.send(Message::text(leave(6).to_string())).await.unwrap();
+    wait_sequence(&db.store, 6).await;
+    assert_eq!(rest.requests().len(), 9);
+    runner.abort();
+    let _ = runner.await;
+    drop(ws);
+    rest.shutdown().await;
+    db.close().await;
 }
 
 #[tokio::test]
