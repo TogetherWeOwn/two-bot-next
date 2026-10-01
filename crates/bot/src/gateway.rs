@@ -140,7 +140,7 @@ struct Hello {
 /// Bound the entire SQL operation (pool acquire through COMMIT), not each query.
 /// Twilight only drives heartbeats while polled, so use at most a quarter of
 /// HELLO's interval and fail closed instead of waiting through missed heartbeats.
-/// Source: https://docs.rs/tokio/1/tokio/time/fn.timeout.html
+/// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
     deadline: std::time::Duration,
@@ -280,7 +280,7 @@ where
 
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
-/// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
+/// fallback. Source: <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html>
 ///
 /// Shared sticky/feed dispatch stays detached. RSVP effects are awaited in
 /// dispatch order with bounded read-ahead in `poll_while`; Twilight drives
