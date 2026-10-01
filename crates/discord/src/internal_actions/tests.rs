@@ -1,12 +1,22 @@
 use super::*;
-use crate::test_clock::{wall_clock_timeout, ClockHold};
+use crate::test_clock::{
+    advance, mark_progress, stall_watchdog, stall_watchdog_on, ClockHold, STALL_GRACE,
+};
 use serde_json::json;
-use std::{io, sync::Mutex};
+use std::{
+    io,
+    sync::{atomic::AtomicU64, Mutex},
+};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     task::JoinHandle,
 };
+
+/// Private counter: this fixture must stall-detect without borrowing progress
+/// from concurrently running sibling fixtures.
+static ISOLATED_PROGRESS: AtomicU64 = AtomicU64::new(0);
 
 const CHANNEL: &str = "333333333333333333";
 const MESSAGE: &str = "444444444444444444";
@@ -63,7 +73,7 @@ struct MockDiscord {
 
 impl MockDiscord {
     async fn start(reply: Reply) -> Self {
-        wall_clock_timeout(Duration::from_secs(2), Self::start_inner(reply))
+        stall_watchdog(STALL_GRACE, Self::start_inner(reply))
             .await
             .expect("mock setup must finish without advancing Tokio time")
     }
@@ -125,6 +135,7 @@ impl MockDiscord {
                         .unwrap(),
                 });
                 received.notify_one();
+                mark_progress();
                 if reply.disconnect {
                     continue;
                 }
@@ -147,6 +158,7 @@ impl MockDiscord {
                 let _ = socket.write_all(&reply.body.as_bytes()[..end]).await;
             }
         });
+        mark_progress();
         Self {
             origin,
             requests,
@@ -204,9 +216,10 @@ async fn run_action(
     action: &str,
     body: &Map<String, Value>,
 ) -> ExecutionOutcome {
-    wall_clock_timeout(Duration::from_secs(2), async {
+    stall_watchdog(STALL_GRACE, async {
         let start = tokio::time::Instant::now();
         let outcome = executor.execute(action, body).await;
+        mark_progress();
         assert_eq!(
             start.elapsed(),
             Duration::ZERO,
@@ -223,7 +236,7 @@ async fn run_until_timeout(
     executor: &AnnouncementExecutor,
     body: &Map<String, Value>,
 ) -> ExecutionOutcome {
-    wall_clock_timeout(Duration::from_secs(2), async {
+    stall_watchdog(STALL_GRACE, async {
         let ready = if mock.stall_response {
             &mock.request_received
         } else {
@@ -235,11 +248,12 @@ async fn run_until_timeout(
             outcome = &mut pending => panic!("stalled request finished before its deadline: {outcome:?}"),
             () = ready.notified() => {}
         }
+        mark_progress();
         // Cross the deadline only after request/client-header acquisition.
         let tick = Duration::from_millis(1);
-        tokio::time::advance(executor.timeout - tick).await;
+        advance(executor.timeout - tick).await;
         assert!(futures_util::poll!(&mut pending).is_pending());
-        tokio::time::advance(tick + tick).await;
+        advance(tick + tick).await;
         pending.await
     })
     .await
@@ -252,7 +266,7 @@ async fn watchdog_cancels_never_ready_barriers_and_hidden_timers_and_releases_ho
         let mock = MockDiscord::start(Reply::success()).await;
         let released = mock.clock_released.clone();
         let start = tokio::time::Instant::now();
-        let result = wall_clock_timeout(Duration::from_millis(20), async move {
+        let result = stall_watchdog_on(&ISOLATED_PROGRESS, Duration::from_millis(20), async move {
             let _mock = mock;
             if hidden_timer {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -264,10 +278,10 @@ async fn watchdog_cancels_never_ready_barriers_and_hidden_timers_and_releases_ho
         .await;
         assert_eq!(
             result,
-            Err("frozen-clock fixture exceeded wall-clock watchdog")
+            Err("frozen-clock fixture made no progress before the watchdog")
         );
         assert_eq!(start.elapsed(), Duration::ZERO);
-        wall_clock_timeout(Duration::from_secs(2), released.notified())
+        stall_watchdog(STALL_GRACE, released.notified())
             .await
             .expect("cancelled fixture must release its blocking clock hold");
     }

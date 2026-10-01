@@ -15,7 +15,7 @@ use two_bot_core::audit::delivery_nonce;
 use two_bot_core::audit_mirror::AuditMirror;
 
 use crate::executor::{ActionExecutor, PacingAdmission, PacingLane, PACE_INTERVAL_MS};
-use crate::test_clock::{wall_clock_timeout, ClockHold};
+use crate::test_clock::{advance, mark_progress, stall_watchdog, ClockHold, STALL_GRACE};
 
 const CHANNEL: &str = "4444";
 
@@ -28,6 +28,7 @@ fn shared_admission(admissions: &mut mpsc::UnboundedReceiver<PacingAdmission>) -
         .try_recv()
         .expect("completed call committed admission");
     assert_eq!(admission.lane, PacingLane::Shared);
+    mark_progress();
     admission.at
 }
 
@@ -40,13 +41,14 @@ fn no_admission(admissions: &mut mpsc::UnboundedReceiver<PacingAdmission>) {
 
 #[tokio::test(start_paused = true)]
 async fn mirror_posts_share_the_executor_read_pacing_lane_despite_delayed_observation() {
-    wall_clock_timeout(Duration::from_secs(2), async {
+    stall_watchdog(STALL_GRACE, async {
         let _clock = ClockHold::start().await;
         let (mock, gate) = MockRest::start_with_first_receipt_gate(
             vec![ScriptedResponse::json(200, serde_json::json!([]))],
             ScriptedResponse::json(200, serde_json::json!({"id": "640"})),
         )
         .await;
+        mark_progress();
         let (exec, mut admissions) = executor_for(&mock);
         let nonce = delivery_nonce(&mock.origin());
         let start = Instant::now();
@@ -60,9 +62,10 @@ async fn mirror_posts_share_the_executor_read_pacing_lane_despite_delayed_observ
         assert_eq!(first, start);
         assert!(mock.requests().is_empty());
         // Admission was at t0, but the observer intentionally sees it at t100.
-        tokio::time::advance(Duration::from_millis(100)).await;
+        advance(Duration::from_millis(100)).await;
         gate.release.send(()).unwrap();
         history.await.unwrap();
+        mark_progress();
         assert_eq!(Instant::now(), first + Duration::from_millis(100));
 
         let mut stamps = vec![first];
@@ -76,14 +79,14 @@ async fn mirror_posts_share_the_executor_read_pacing_lane_despite_delayed_observ
             });
             tokio::pin!(post);
             assert!(futures_util::poll!(&mut post).is_pending());
-            tokio::time::advance(last + Duration::from_millis(109) - Instant::now()).await;
+            advance(last + Duration::from_millis(109) - Instant::now()).await;
             assert!(futures_util::poll!(&mut post).is_pending());
             assert!(
                 !authorized.load(Ordering::SeqCst),
                 "authorization must follow the pacing floor"
             );
             no_admission(&mut admissions);
-            tokio::time::advance(Duration::from_millis(2)).await;
+            advance(Duration::from_millis(2)).await;
             assert_eq!(post.await, Ok(Ok("640".to_owned())));
             let at = shared_admission(&mut admissions);
             assert_eq!(Instant::now(), at, "socket I/O advanced virtual time");
@@ -120,13 +123,14 @@ async fn mirror_posts_share_the_executor_read_pacing_lane_despite_delayed_observ
 
 #[tokio::test(start_paused = true)]
 async fn checked_post_authorizes_after_pacing_and_refusal_sends_nothing() {
-    wall_clock_timeout(Duration::from_secs(2), async {
+    stall_watchdog(STALL_GRACE, async {
         let _clock = ClockHold::start().await;
         let mock = MockRest::start(
             vec![ScriptedResponse::json(200, serde_json::json!([]))],
             ScriptedResponse::json(200, serde_json::json!({"id": "640"})),
         )
         .await;
+        mark_progress();
         let (exec, mut admissions) = executor_for(&mock);
         let nonce = delivery_nonce(&mock.origin());
         exec.channel_history(CHANNEL, None, 100).await.unwrap();
@@ -138,11 +142,11 @@ async fn checked_post_authorizes_after_pacing_and_refusal_sends_nothing() {
         });
         tokio::pin!(refused);
         assert!(futures_util::poll!(&mut refused).is_pending());
-        tokio::time::advance(Duration::from_millis(109)).await;
+        advance(Duration::from_millis(109)).await;
         assert!(futures_util::poll!(&mut refused).is_pending());
         assert!(!authorized.load(Ordering::SeqCst));
         no_admission(&mut admissions);
-        tokio::time::advance(Duration::from_millis(2)).await;
+        advance(Duration::from_millis(2)).await;
         assert_eq!(refused.await, Err("claim lost while waiting"));
         assert!(authorized.load(Ordering::SeqCst));
         no_admission(&mut admissions);
@@ -175,7 +179,7 @@ async fn checked_post_authorizes_after_pacing_and_refusal_sends_nothing() {
 
 #[tokio::test(start_paused = true)]
 async fn slow_authorization_cannot_be_overtaken_by_another_mirror_post_or_read() {
-    wall_clock_timeout(Duration::from_secs(2), async {
+    stall_watchdog(STALL_GRACE, async {
         let _clock = ClockHold::start().await;
         let mock = MockRest::start(
             vec![
@@ -186,6 +190,7 @@ async fn slow_authorization_cannot_be_overtaken_by_another_mirror_post_or_read()
             ScriptedResponse::status(500),
         )
         .await;
+        mark_progress();
         let (exec, mut admissions) = executor_for(&mock);
         let other = exec.clone();
         let nonce = delivery_nonce(&mock.origin());
@@ -208,7 +213,7 @@ async fn slow_authorization_cannot_be_overtaken_by_another_mirror_post_or_read()
         tokio::pin!(second, history);
         assert!(futures_util::poll!(&mut second).is_pending());
         assert!(futures_util::poll!(&mut history).is_pending());
-        tokio::time::advance(Duration::from_millis(150)).await;
+        advance(Duration::from_millis(150)).await;
         assert!(futures_util::poll!(&mut first).is_pending());
         assert!(futures_util::poll!(&mut second).is_pending());
         assert!(futures_util::poll!(&mut history).is_pending());
@@ -219,11 +224,11 @@ async fn slow_authorization_cannot_be_overtaken_by_another_mirror_post_or_read()
         let first_at = shared_admission(&mut admissions);
         assert_eq!(first_at, start + Duration::from_millis(150));
         assert!(futures_util::poll!(&mut second).is_pending());
-        tokio::time::advance(Duration::from_millis(109)).await;
+        advance(Duration::from_millis(109)).await;
         assert!(futures_util::poll!(&mut second).is_pending());
         assert!(futures_util::poll!(&mut history).is_pending());
         no_admission(&mut admissions);
-        tokio::time::advance(Duration::from_millis(2)).await;
+        advance(Duration::from_millis(2)).await;
         assert_eq!(second.await, Ok("641".to_owned()));
         let second_at = shared_admission(&mut admissions);
         assert_eq!(
@@ -231,11 +236,12 @@ async fn slow_authorization_cannot_be_overtaken_by_another_mirror_post_or_read()
             Duration::from_millis(111)
         );
         assert!(futures_util::poll!(&mut history).is_pending());
-        tokio::time::advance(Duration::from_millis(109)).await;
+        advance(Duration::from_millis(109)).await;
         assert!(futures_util::poll!(&mut history).is_pending());
         no_admission(&mut admissions);
-        tokio::time::advance(Duration::from_millis(2)).await;
+        advance(Duration::from_millis(2)).await;
         history.await.unwrap();
+        mark_progress();
         let read_at = shared_admission(&mut admissions);
         assert_eq!(
             read_at.duration_since(second_at),
