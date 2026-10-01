@@ -18,6 +18,10 @@ const KEY: &str = "TWO_RAID_JOIN_THRESHOLD";
 const OTHER_KEY: &str = "TWO_RAID_WINDOW_SECONDS";
 const CAS_MIN: i64 = -9_007_199_254_740_991;
 
+// Process-wide counter so concurrent tests in one harness never share a
+// schema even when SystemTime nanos repeat within the same process.
+static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn assert_cas_token(token: i64) {
     assert!(
         (CAS_MIN..=-1).contains(&token),
@@ -27,14 +31,12 @@ fn assert_cas_token(token: i64) {
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type AuditRow = (Option<Value>, Option<Value>);
-static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
-
 fn schema_name_at(nanos: u128) -> String {
     format!(
         "settings_test_{}_{}_{}",
         std::process::id(),
-        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
-        nanos
+        nanos,
+        SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed)
     )
 }
 
@@ -91,7 +93,7 @@ impl TestDb {
             .connect_with(options.clone())
             .await?;
         let schema = schema_name_at(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos());
-        // Identifier is a constant prefix plus numeric process/sequence/time IDs only.
+        // Identifier is a constant prefix plus numeric process/time/sequence IDs only.
         QueryBuilder::<Postgres>::new("CREATE SCHEMA ")
             .push(&schema)
             .build()
