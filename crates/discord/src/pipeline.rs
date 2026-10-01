@@ -66,13 +66,13 @@ pub trait InviteSource: Send + Sync {
     fn current(&self, guild_id: Snowflake) -> Option<Vec<InviteState>>;
 }
 
-/// No invites visible (default; joins attribute `unknown`/`vanity`).
+/// Invite fetching unavailable (default; joins attribute `unknown`/`vanity`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoInvites;
 
 impl InviteSource for NoInvites {
     fn current(&self, _guild_id: Snowflake) -> Option<Vec<InviteState>> {
-        Some(Vec::new())
+        None
     }
 }
 
@@ -200,10 +200,11 @@ pub struct Pipeline<
     F = two_bot_core::NoopFacts,
     I = NoInvites,
     C = NoClassification,
+    P = PipelineSnapshots,
 > {
     cache: InMemoryCache,
     handlers: FunnelHandlers<S, L, F>,
-    invites: InviteTracker<PipelineSnapshots>,
+    invites: InviteTracker<P>,
     invite_source: I,
     expected_joins: Mutex<ExpectedJoins>,
     classifier: C,
@@ -212,7 +213,7 @@ pub struct Pipeline<
     vanity_guilds: Mutex<HashSet<Snowflake>>,
 }
 
-impl<S, L, F, I, C> std::fmt::Debug for Pipeline<S, L, F, I, C> {
+impl<S, L, F, I, C, P> std::fmt::Debug for Pipeline<S, L, F, I, C, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pipeline").finish_non_exhaustive()
     }
@@ -221,7 +222,7 @@ impl<S, L, F, I, C> std::fmt::Debug for Pipeline<S, L, F, I, C> {
 impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelClassifier>
     Pipeline<S, L, F, I, C>
 {
-    /// Build a pipeline over the given seams.
+    /// Build a pipeline over the given seams with in-memory snapshots.
     pub fn new(
         store: S,
         leveling: Option<L>,
@@ -229,12 +230,41 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
         invite_source: I,
         classifier: C,
     ) -> Self {
+        Self::with_snapshots(
+            store,
+            leveling,
+            facts,
+            invite_source,
+            classifier,
+            PipelineSnapshots::new(),
+        )
+    }
+}
+
+impl<
+        S: FunnelStore,
+        L: LevelingHook,
+        F: FactsSink,
+        I: InviteSource,
+        C: ChannelClassifier,
+        P: InviteSnapshotStore,
+    > Pipeline<S, L, F, I, C, P>
+{
+    /// Build over an explicit snapshot store (Postgres at runtime).
+    pub fn with_snapshots(
+        store: S,
+        leveling: Option<L>,
+        facts: Option<F>,
+        invite_source: I,
+        classifier: C,
+        snapshots: P,
+    ) -> Self {
         Self {
             cache: InMemoryCache::builder()
                 .resource_types(cache_resource_types())
                 .build(),
             handlers: FunnelHandlers::new(store, leveling, facts),
-            invites: InviteTracker::new(PipelineSnapshots::new()),
+            invites: InviteTracker::new(snapshots),
             invite_source,
             expected_joins: Mutex::new(ExpectedJoins::new()),
             classifier,
@@ -284,30 +314,41 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
     /// handler: per-guild baseline so the first join's growth diff measures
     /// against witnessed counters, not an empty table).
     pub fn prime_invite_snapshot(&self, guild_id: Snowflake) -> Vec<String> {
-        self.snapshot_invites(guild_id)
+        self.snapshot_invites(guild_id, &two_bot_core::now_iso())
     }
 
     /// Snapshot invite counters for a guild; returns the codes that grew.
     /// A failed read (`None`) keeps the old snapshot and returns empty, so
     /// the join still records with source `unknown`.
-    fn snapshot_invites(&self, guild_id: Snowflake) -> Vec<String> {
+    fn snapshot_invites(&self, guild_id: Snowflake, observed_at: &str) -> Vec<String> {
         match self.invite_source.current(guild_id) {
-            Some(current) => self.invites.diff_and_store(guild_id, &current),
+            Some(current) => {
+                let grew = self.invites.diff_and_store(guild_id, &current);
+                self.handlers.store().stage_invite_snapshot(
+                    two_bot_core::gateway_funnel::InviteSnapshotWrite {
+                        guild_id,
+                        states: current,
+                        observed_at: observed_at.to_owned(),
+                        replace_all: true,
+                    },
+                );
+                grew
+            }
             None => Vec::new(),
         }
     }
 
-    /// Seed one fresh code at its current uses (0 live): creates the baseline
-    /// the next join's growth diff measures against, instead of treating the
-    /// whole counter as new.
-    fn seed_invite_code(&self, guild_id: Snowflake, code: &str) {
-        let baseline = vec![InviteState {
-            code: code.to_owned(),
-            uses: 0,
-            inviter_id: None,
-            channel_id: None,
-        }];
-        self.invites.diff_and_store(guild_id, &baseline);
+    /// A newly created code is an upsert, not a full REST snapshot.
+    fn seed_invite_code(&self, guild_id: Snowflake, state: InviteState, observed_at: &str) {
+        self.invites.seed(guild_id, state.clone());
+        self.handlers.store().stage_invite_snapshot(
+            two_bot_core::gateway_funnel::InviteSnapshotWrite {
+                guild_id,
+                states: vec![state],
+                observed_at: observed_at.to_owned(),
+                replace_all: false,
+            },
+        );
     }
 
     /// Drop open voice sessions on (re)connect. Both recovery paths (TOG-6123):
@@ -324,6 +365,12 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
     /// where the transition matters (member pending, voice channel), updates
     /// the cache, then calls the framework-free handlers.
     pub fn handle(&self, event: &Event) {
+        self.handle_at(event, &two_bot_core::now_iso());
+    }
+
+    /// Drive a received event after queueing without changing its occurrence
+    /// time. Payload timestamps win; timestamp-less transitions use receipt time.
+    pub fn handle_at(&self, event: &Event, observed_at: &str) {
         match event {
             // Fresh session after (re-)identify: first connect starts empty
             // (no-op); a reconnect's open state is unproven and dropped.
@@ -339,7 +386,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                 {
                     let gid = guild.id.get();
                     self.set_guild_vanity(gid, guild.vanity_url_code.is_some());
-                    self.snapshot_invites(gid);
+                    self.snapshot_invites(gid, observed_at);
                 }
                 self.cache.update(event);
             }
@@ -348,7 +395,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                 let member_id = add.user.id.get();
                 // Snapshot regardless of arrival path so counters stay current
                 // for the next organic join.
-                let grew = self.snapshot_invites(guild_id);
+                let grew = self.snapshot_invites(guild_id, observed_at);
                 // The web path's expected join beats the invite diff: a code
                 // that grew in the same window belongs to some other join.
                 let expected = self
@@ -367,11 +414,12 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                 } else {
                     None
                 };
-                let joined_at = add.member.joined_at.map(legacy_stamp);
-                let source_event_id = format!(
-                    "{guild_id}:{member_id}:{}",
-                    joined_at.as_deref().unwrap_or("observed")
-                );
+                let joined_at = add
+                    .member
+                    .joined_at
+                    .map_or_else(|| observed_at.to_owned(), legacy_stamp);
+                let source_event_id = format!("{guild_id}:{member_id}:{joined_at}");
+                let occurred_at = Some(joined_at);
                 let is_bot = add.user.bot;
                 self.cache.update(event);
                 self.handlers.on_join(JoinInput {
@@ -379,7 +427,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                     member_id,
                     is_bot,
                     source,
-                    occurred_at: joined_at.clone(),
+                    occurred_at: occurred_at.clone(),
                     inviter_id,
                     source_event_id: Some(source_event_id),
                 });
@@ -391,7 +439,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                         guild_id,
                         member_id,
                         is_bot,
-                        occurred_at: joined_at,
+                        occurred_at,
                         source: None,
                     });
                 }
@@ -416,7 +464,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                         guild_id,
                         member_id,
                         is_bot,
-                        occurred_at: None,
+                        occurred_at: Some(observed_at.to_owned()),
                         source: None,
                     });
                 }
@@ -426,8 +474,12 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                 let member_id = remove.user.id.get();
                 let is_bot = remove.user.bot;
                 self.cache.update(event);
-                self.handlers
-                    .on_leave(guild_id, member_id, None, Some(is_bot));
+                self.handlers.on_leave(
+                    guild_id,
+                    member_id,
+                    Some(observed_at.to_owned()),
+                    Some(is_bot),
+                );
             }
             Event::MessageCreate(msg) => {
                 let Some(guild_id) = msg.guild_id.map(|g| g.get()) else {
@@ -477,7 +529,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                 // as one instant, not a gap.
                 let chain = self.voice_chains.lock_for(guild_id, member_id);
                 let _guard = chain.lock().expect("voice chain");
-                let at = two_bot_core::now_iso();
+                let at = observed_at.to_owned();
                 if let Some(old) = old_channel {
                     self.handlers.on_voice_leave(VoiceInput {
                         guild_id,
@@ -498,7 +550,16 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                 }
             }
             Event::InviteCreate(invite) => {
-                self.seed_invite_code(invite.guild_id.get(), &invite.code);
+                self.seed_invite_code(
+                    invite.guild_id.get(),
+                    InviteState {
+                        code: invite.code.clone(),
+                        uses: u64::from(invite.uses),
+                        inviter_id: invite.inviter.as_ref().map(|user| user.id.get()),
+                        channel_id: Some(invite.channel_id.get()),
+                    },
+                    observed_at,
+                );
                 self.cache.update(event);
             }
             // Connection lifecycle and S4/S5 surfaces: no funnel row.

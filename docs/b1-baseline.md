@@ -93,6 +93,71 @@ traffic for >30 min, assert no `onActivityExpired` fires and no RESUME gap
 appears. A live-network scratch deploy was not possible from this sandbox
 (no wrangler, no outbound CF API writes attempted — read-only verify only).
 
+## Rust runtime image PR gate
+
+The independent `container smoke` job in `.github/workflows/check.yml` builds
+this repository's Dockerfile on hosted `linux/amd64`, loads it into local Docker,
+and uses BuildKit's `gha` cache. It never pushes an image or receives deployment
+credentials. It also runs on `main` and workflow dispatch (including release
+check dispatches). The existing required `check` job is unchanged.
+
+`scripts/container-smoke.py` prints both sizes in bytes and MiB to the log and
+job summary and fails above these calibrated ceilings:
+
+| Artifact | Definition | Measured | Maximum | Headroom |
+|---|---|---|---|---|
+| Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 11 MiB / 11,534,336 bytes | 3.99 MiB / 56.9% |
+
+Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
+at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
+25% image growth rounded up to the next 8 MiB, and roughly 40% binary growth
+rounded up to the next MiB. Base-image/toolchain changes must remeasure and
+justify any future budget increase. Docker is not available in the controller
+workspace; offline fixture sizes are not measurements.
+
+The hosted parked-mode contract passed, including SIGTERM exit 0 in 0.095 s.
+Manual log verification confirmed both deliberate one-byte-budget invocations
+failed with the corresponding `exceeds size budget` error and that the CI
+negative-test step passed. This exercises real measured artifacts, not mocks.
+
+The smoke test starts the image with **no token, guild or database bindings**, a
+256 MiB memory cap, and only a random loopback host port. It checks `/health` 200
+with `status: ok`, `/readyz` 503 with process ready/gateway down, PID 1's non-root
+UIDs, built-in `--healthcheck` exit 0 and Docker health status. A separate
+no-network probe-only container must exit 1. SIGTERM must exit 0 within 10 s,
+without OOM or a hidden SIGKILL fallback; the stopped container is inspected
+before cleanup. This is a parked-mode contract, **not** evidence of real-guild
+RSS or approval to change the B1 `basic` verdict above. Runtime RAM, image bytes
+and executable bytes are different budgets.
+
+Reproduce on an authorized Docker-capable development machine (not the
+controller host):
+
+```sh
+docker buildx build --load --platform linux/amd64 -t two-bot:ci .
+python3 scripts/container-smoke.py two-bot:ci
+# Deliberate breakage: each invocation must fail with "exceeds size budget".
+python3 scripts/container-smoke.py two-bot:ci --image-max-bytes 1
+python3 scripts/container-smoke.py two-bot:ci --binary-max-bytes 1
+```
+
+The CI job exercises those two deliberately broken budgets against the real
+image and fails if either violation is accepted. Offline Python fixtures also
+cover missing binary, root runtime, unhealthy/false-ready endpoints, broken
+healthcheck, OOM, shutdown exit/timeout failures, startup transport retries
+(early-close loopback peer), redirect rejection (live `/readyz` 302 → `/other`
+503 full-contract test), and named/capped auxiliary-container cleanup under
+injected Docker-client timeouts:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
+```
+
+Proposed branch protection: require **`container smoke`** alongside `check`,
+`pr-lint` and `gitleaks` after the first green PR. This PR does not change
+repository rules or production/staging deployments.
+
 ## Reproduce
 
 Driver: `/tmp/tog9694/soak.mjs` (kept on the run host, not committed — it

@@ -31,7 +31,7 @@
 //! community classifier (S5; check-in carries the minimal bot/human rule
 //! until it lands), and Discord delivery (router/executor slices).
 
-use super::commands::PERM_MANAGE_EVENTS;
+use super::commands::{OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS};
 
 /// An RSVP response (legacy `RsvpStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -195,6 +195,10 @@ pub enum CheckinError {
     MissingManageEvents,
     #[error("event occurrence must not be empty.")]
     EmptyOccurrence,
+    // Literal bound (matches the `ReasonError::TooLong` precedent): the
+    // boundary test below pins it against `OCCURRENCE_ID_MAX_CHARS`.
+    #[error("\"event occurrence\" is longer than 128 characters")]
+    OccurrenceTooLong,
 }
 
 /// Server-side `ManageEvents` gate for host check-in (parity §1 #12: the
@@ -211,11 +215,17 @@ pub fn require_manage_events(permissions: u64) -> Result<(), CheckinError> {
 
 /// Validate a host check-in occurrence id (legacy trims the
 /// `event-occurrence` option; an empty id records nothing addressable, so it
-/// is refused instead).
+/// is refused instead). Overlong ids are refused before any record operation:
+/// the recorded/duplicate replies interpolate the whole id, so an unbounded
+/// id could make the acknowledgement unsendable after recording. The length
+/// counts UTF-16 units (legacy JS `length` semantics — astral counts 2) and
+/// matches the `max_length` the command shape advertises.
 pub fn validate_occurrence_id(value: &str) -> Result<String, CheckinError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         Err(CheckinError::EmptyOccurrence)
+    } else if trimmed.encode_utf16().count() > OCCURRENCE_ID_MAX_CHARS {
+        Err(CheckinError::OccurrenceTooLong)
     } else {
         Ok(trimmed.to_owned())
     }
@@ -379,6 +389,37 @@ impl RsvpAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn property_rsvp_parsers_match_exact_wire_contract(
+            text in proptest::collection::vec(any::<char>(), 0..128)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            let expected_id = (17..=20).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
+            prop_assert_eq!(validate_event_id(&text).is_ok(), expected_id);
+            if let Ok(id) = validate_event_id(&text) {
+                prop_assert_eq!(validate_event_id(&id), Ok(id));
+            }
+            let expected_status = ["going", "interested", "declined"].contains(&text.as_str());
+            prop_assert_eq!(RsvpStatus::parse(&text).is_ok(), expected_status);
+        }
+
+        #[test]
+        fn property_rsvp_values_round_trip(
+            digits in "[0-9]{0,23}",
+            status in prop::sample::select(RsvpStatus::ALL.to_vec()),
+        ) {
+            prop_assert_eq!(validate_event_id(&digits).is_ok(), (17..=20).contains(&digits.len()));
+            if (17..=20).contains(&digits.len()) {
+                prop_assert_eq!(validate_event_id(&digits), Ok(digits));
+            }
+            prop_assert_eq!(RsvpStatus::parse(&status.to_string()), Ok(status));
+        }
+    }
     use crate::commands::merge_commands;
     use crate::feature_commands::feature_commands;
     use crate::moderation::moderation_commands;
@@ -538,6 +579,62 @@ mod tests {
             validate_occurrence_id(""),
             Err(CheckinError::EmptyOccurrence)
         );
+    }
+
+    #[test]
+    fn occurrence_id_refuses_overlong_ids_before_recording() {
+        use crate::message_safety::CONTENT_LIMIT;
+        // Inclusive edge accepts; the adjacent outsider refuses.
+        let at_bound = "x".repeat(OCCURRENCE_ID_MAX_CHARS);
+        assert_eq!(validate_occurrence_id(&at_bound), Ok(at_bound.clone()));
+        assert_eq!(
+            validate_occurrence_id(&"x".repeat(OCCURRENCE_ID_MAX_CHARS + 1)),
+            Err(CheckinError::OccurrenceTooLong)
+        );
+        // Trimmed length governs: padding around an at-bound id accepts.
+        assert_eq!(
+            validate_occurrence_id(&format!("  {at_bound}  ")),
+            Ok(at_bound.clone())
+        );
+        // Whitespace that trims to empty refuses as empty, not too-long.
+        assert_eq!(
+            validate_occurrence_id(&" ".repeat(OCCURRENCE_ID_MAX_CHARS + 10)),
+            Err(CheckinError::EmptyOccurrence)
+        );
+        // Error text names the bound without echoing the oversized id.
+        let oversized = "y".repeat(OCCURRENCE_ID_MAX_CHARS + 1);
+        let err = validate_occurrence_id(&oversized).expect_err("overlong refuses");
+        let text = err.to_string();
+        assert!(!text.contains(&oversized));
+        assert!(
+            text.contains(&OCCURRENCE_ID_MAX_CHARS.to_string()),
+            "literal error bound tracks the shared const"
+        );
+        // Astral boundary (legacy JS `length` counts UTF-16 units): 64 emoji
+        // are 128 units and accept; 65 emoji are 130 units and refuse.
+        let astral_at = "\u{1F600}".repeat(64);
+        assert_eq!(astral_at.encode_utf16().count(), OCCURRENCE_ID_MAX_CHARS);
+        assert_eq!(validate_occurrence_id(&astral_at), Ok(astral_at.clone()));
+        assert_eq!(
+            validate_occurrence_id(&"\u{1F600}".repeat(65)),
+            Err(CheckinError::OccurrenceTooLong)
+        );
+        // Accepted recorded/duplicate replies fit the Discord content limit,
+        // even with the longest member id and a bound-sized occurrence.
+        for member in ["1".to_owned(), "9".repeat(20)] {
+            for reply in [
+                checkin_recorded_text(&member, &at_bound),
+                checkin_duplicate_text(&member, &at_bound),
+                checkin_recorded_text(&member, &astral_at),
+                checkin_duplicate_text(&member, &astral_at),
+            ] {
+                assert!(
+                    reply.encode_utf16().count() <= CONTENT_LIMIT,
+                    "reply fits: {}",
+                    reply.encode_utf16().count()
+                );
+            }
+        }
     }
 
     #[test]

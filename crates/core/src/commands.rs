@@ -23,6 +23,41 @@ use serde::{Deserialize, Serialize};
 /// `DISCORD_GUILD_COMMAND_LIMIT`).
 pub const GUILD_COMMAND_LIMIT: usize = 100;
 
+// ---------------------------------------------------------------------------
+// Moderation / automation runtime bounds (parity §1 + docs/property-tests.md).
+//
+// Builders advertise these minima (tempban/timeout deliberately expose no
+// `max_value` per legacy parity); the runtime validators in
+// `crate::moderation` enforce the maxima. Schedule and sticky builders expose
+// both ends because Discord itself clamps those options. Centralised here so
+// builders, validators and tests share one source of truth.
+// ---------------------------------------------------------------------------
+
+/// Shared floor for `tempban`/`timeout` `duration_seconds` (builders + runtime).
+pub const TEMPBAN_DURATION_MIN_SECONDS: i64 = 60;
+/// Runtime ceiling for `tempban` `duration_seconds`: 365 days (parity §1).
+pub const TEMPBAN_DURATION_MAX_SECONDS: i64 = 365 * 24 * 60 * 60;
+/// Shared floor for `timeout` `duration_seconds` (builders + runtime).
+pub const TIMEOUT_DURATION_MIN_SECONDS: i64 = 60;
+/// Runtime ceiling for `timeout` `duration_seconds`: 28 days (Discord ceiling).
+pub const TIMEOUT_DURATION_MAX_SECONDS: i64 = 28 * 24 * 60 * 60;
+/// `/schedule` `in-minutes` window: fire 1 minute to 365 days out.
+pub const SCHEDULE_IN_MINUTES_MIN: i64 = 1;
+pub const SCHEDULE_IN_MINUTES_MAX: i64 = 525_600;
+/// `/schedule` `every-minutes` recurrence: 60-minute minimum, same ceiling.
+pub const SCHEDULE_EVERY_MINUTES_MIN: i64 = 60;
+pub const SCHEDULE_EVERY_MINUTES_MAX: i64 = 525_600;
+/// `/sticky` `debounce` quiet window in seconds (default 5, legacy `?? 5`).
+pub const STICKY_DEBOUNCE_MIN_SECONDS: i64 = 1;
+pub const STICKY_DEBOUNCE_MAX_SECONDS: i64 = 300;
+pub const STICKY_DEBOUNCE_DEFAULT_SECONDS: i64 = 5;
+/// `/attendance` `event-occurrence` bound (UTF-16 units, legacy JS `length`
+/// semantics — astral counts 2). Worst-case duplicate reply is 64 framing +
+/// 20 snowflake member + 128 = 212 units, ~10x under Discord's 2000 content
+/// limit. Builders advertise it via `max_length`; `crate::rsvp` refuses
+/// longer IDs before any record operation.
+pub const OCCURRENCE_ID_MAX_CHARS: usize = 128;
+
 /// Discord application-command option types (API integers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -256,6 +291,122 @@ pub enum RegistryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn property_option_builders_preserve_wire_values(
+            name in "[a-z_-]{1,32}",
+            description in proptest::collection::vec(any::<char>(), 0..100)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            min in any::<i64>(), max in any::<i64>(), length in any::<u32>(),
+        ) {
+            let option = CommandOption::new(&name, &description, CommandOptionType::Integer)
+                .required().int_range(min, max).max_length(length);
+            // Assert the built fields against the constructor inputs first: a
+            // serde round trip alone compares two copies of the already-built
+            // value and would still pass if a builder dropped, clamped or
+            // truncated a bound.
+            prop_assert_eq!(&option.name, &name);
+            prop_assert_eq!(&option.description, &description);
+            prop_assert_eq!(option.kind, CommandOptionType::Integer.as_u8());
+            prop_assert_eq!(option.required, Some(true));
+            prop_assert_eq!(option.min_value, Some(min));
+            prop_assert_eq!(option.max_value, Some(max));
+            prop_assert_eq!(option.max_length, Some(length));
+            let wire = serde_json::to_vec(&option).unwrap();
+            let decoded: CommandOption = serde_json::from_slice(&wire).unwrap();
+            prop_assert_eq!(&decoded, &option);
+            prop_assert_eq!(decoded.min_value, Some(min));
+            prop_assert_eq!(decoded.max_value, Some(max));
+            prop_assert_eq!(decoded.max_length, Some(length));
+            let lower_only = CommandOption::new(&name, &description, CommandOptionType::Integer).min_value(min);
+            prop_assert_eq!(lower_only.min_value, Some(min));
+            prop_assert_eq!(lower_only.max_value, None);
+        }
+
+        #[test]
+        fn property_published_numeric_options_match_parity_section_one(value in any::<i64>()) {
+            let definitions = crate::moderation::moderation_commands().into_iter()
+                .chain(crate::feature_commands::automation_commands()).collect::<Vec<_>>();
+            for (command, option, min, max, required) in [
+                ("tempban", "duration_seconds", 60, None, true),
+                ("timeout", "duration_seconds", 60, None, true),
+                ("purge", "count", 1, Some(100), true),
+                ("slowmode", "seconds", 0, Some(21_600), true),
+                ("schedule", "in-minutes", 1, Some(525_600), false),
+                ("schedule", "every-minutes", 60, Some(525_600), false),
+                ("sticky", "debounce", 1, Some(300), false),
+            ] {
+                let definition = definitions.iter().find(|d| d.name == command).unwrap();
+                let published = definition.options.iter().find(|o| o.name == option).unwrap();
+                prop_assert_eq!(published.kind, CommandOptionType::Integer.as_u8());
+                prop_assert_eq!(published.required, required.then_some(true));
+                prop_assert_eq!(published.min_value, Some(min));
+                prop_assert_eq!(published.max_value, max);
+                // Duration builders deliberately have no max; runtime validators
+                // enforce the separate Discord/service caps in internal_actions.
+                for n in [min - 1, min, max.unwrap_or(i64::MAX), value] {
+                    let advertised = published.min_value.is_none_or(|lower| n >= lower)
+                        && published.max_value.is_none_or(|upper| n <= upper);
+                    prop_assert_eq!(advertised, n >= min && max.is_none_or(|upper| n <= upper));
+                }
+            }
+            for definition in crate::moderation::moderation_commands() {
+                let reason = definition.options.iter().find(|o| o.name == "reason").unwrap();
+                prop_assert_eq!(reason.required, Some(true));
+                prop_assert_eq!(reason.max_length, Some(512));
+                prop_assert!(!definition.dm_permission);
+            }
+        }
+
+        #[test]
+        fn property_registry_merge_is_first_wins_and_respects_the_ceiling(
+            builtin_count in 0usize..=102,
+            custom in proptest::collection::vec((
+                prop_oneof![Just("rank".to_owned()), Just("leaderboard".to_owned()), "[a-z]{1,6}"],
+                any::<bool>(),
+                "[a-z]{1,8}",
+            ), 0..=110),
+        ) {
+            let builtins = (0..builtin_count).map(|i| CommandDefinition::new(&format!("builtin-{i}"), "first"))
+                .collect::<Vec<_>>();
+            let duplicates = builtins.iter().map(|d| CommandDefinition::new(&d.name, "shadowed")).collect::<Vec<_>>();
+            let mut custom = custom.into_iter().map(|(name, enabled, payload)| CustomCommand {
+                name, description: payload, enabled,
+            }).collect::<Vec<_>>();
+            // Forced enabled duplicate pair with distinct payloads. The name
+            // (9 chars) cannot collide with builtins (`builtin-{i}`), core
+            // commands or the `[a-z]{1,6}` generator arm, so the first-wins
+            // distinction is always exercised below the ceiling instead of
+            // relying on a random collision. Identical descriptions would let
+            // a last-wins payload replacement pass the oracle.
+            custom.push(CustomCommand { name: "zzpropdup".to_owned(), description: "first-payload".to_owned(), enabled: true });
+            custom.push(CustomCommand { name: "zzpropdup".to_owned(), description: "second-payload".to_owned(), enabled: true });
+            let mut expected = core_commands().into_iter().chain(builtins.iter().cloned()).collect::<Vec<_>>();
+            for cmd in &custom {
+                if cmd.enabled && !expected.iter().any(|d| d.name == cmd.name) {
+                    expected.push(CommandDefinition::new(&cmd.name, &cmd.description));
+                }
+            }
+            let actual = merge_commands(&[builtins, duplicates], &custom);
+            if builtin_count + 2 > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 2)));
+            } else if expected.len() > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
+            } else {
+                // Explicit first-wins pin on the forced pair: a last-wins
+                // implementation would surface "second-payload" here.
+                if let Ok(ref merged) = actual {
+                    let pinned = merged.iter().find(|d| d.name == "zzpropdup").unwrap();
+                    prop_assert_eq!(&pinned.description, "first-payload");
+                }
+                prop_assert_eq!(actual, Ok(expected));
+            }
+        }
+    }
 
     #[test]
     fn core_commands_match_legacy_names() {

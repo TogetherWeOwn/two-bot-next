@@ -1,5 +1,5 @@
 //! Exercise the real entrypoint and TCP listener with synthetic configuration.
-//! Invalid gateway config must park the shard without moving the HTTP listener.
+//! Missing gateway prerequisites park; configured database failures exit safely.
 
 use std::{
     io::{Read, Write},
@@ -119,6 +119,95 @@ fn configured_gateway_initialization_failure_exits_nonzero() {
     }
 }
 
+#[test]
+fn configured_database_initialization_failure_exits_nonzero_without_logging_url() {
+    for url in [
+        "not-postgres://fixture-secret",
+        "postgresql://[fixture-secret",
+    ] {
+        let mut child = command("127.0.0.1:0")
+            .env("DISCORD_TOKEN", "INVALID")
+            .env("GUILD_ID", "123")
+            .env("DATABASE_URL", url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("configured DB failure parked instead of exiting");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(logs.contains("database initialization failed"));
+        assert!(!logs.contains("fixture-secret"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_gateway_override_exits_without_logging_its_value() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    let override_url = OsString::from_vec(b"ws://127.0.0.1:1/synthetic-secret-\xff".to_vec());
+    let mut bot = Bot(command("127.0.0.1:0")
+        .env("DISCORD_TOKEN", "INVALID")
+        .env("DATABASE_URL", "synthetic-database-must-not-connect")
+        .env("GUILD_ID", "123")
+        .env("DISCORD_GATEWAY_URL", override_url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start test bot"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = bot.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "invalid gateway override stayed alive"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut logs = String::new();
+    bot.0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    bot.0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "child logs: {logs}");
+    assert!(
+        logs.contains("DISCORD_GATEWAY_URL must be valid UTF-8"),
+        "child logs: {logs}"
+    );
+    assert!(
+        !logs.contains("synthetic-secret"),
+        "override value leaked: {logs}"
+    );
+    assert!(
+        !logs.contains("durable gateway"),
+        "gateway initialized before rejection: {logs}"
+    );
+}
+
 fn assert_parked_gateway(vars: &[(&str, &str)]) {
     // Reserve a non-default local port; no deployed service is contacted.
     let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
@@ -154,8 +243,18 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
     let report: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(
         report["components"],
-        serde_json::json!([["process", "ready"], ["gateway", "down"]])
+        serde_json::json!([
+            ["process", "ready"],
+            ["gateway", "down"],
+            ["database", "down"]
+        ])
     );
+
+    for name in ["counter", "rank", "scheduled_events"] {
+        assert_eq!(report["jobs"][name]["parked"], true);
+        assert_eq!(report["jobs"][name]["running"], false);
+        assert_eq!(report["jobs"][name]["last_start"], serde_json::Value::Null);
+    }
 
     let mut probe = Bot(command(&listen_addr).arg("--healthcheck").spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(5);

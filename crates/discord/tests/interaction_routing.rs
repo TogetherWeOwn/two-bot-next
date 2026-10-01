@@ -216,6 +216,162 @@ impl InteractionHandler for Stub {
     }
 }
 
+// The tracing callsite cache is shared even with thread-local subscribers.
+// Serialize both denial-emitting tests so an unsubscribed thread cannot race
+// the audit subscriber when the permission-denial callsite is first registered.
+static PERMISSION_AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Capture structured security events without a global subscriber or a store.
+type PermissionAuditFields = std::collections::BTreeMap<String, String>;
+
+#[derive(Clone, Default)]
+struct PermissionAudit(std::sync::Arc<std::sync::Mutex<Vec<PermissionAuditFields>>>);
+
+impl tracing::Subscriber for PermissionAudit {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        #[derive(Default)]
+        struct Fields(std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        fields
+            .0
+            .insert("target".to_owned(), event.metadata().target().to_owned());
+        self.0.lock().unwrap().push(fields.0);
+    }
+}
+
+#[test]
+fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited() {
+    use twilight_model::channel::message::MessageFlags;
+    use two_bot_core::command_permissions::{CommandSurface, COMMAND_PERMISSIONS};
+
+    let _permission_audit_guard = PERMISSION_AUDIT_LOCK.lock().unwrap();
+    let router = InteractionRouter::new(all_on());
+    let audit = PermissionAudit::default();
+    let restricted: Vec<_> = COMMAND_PERMISSIONS
+        .iter()
+        .filter(|row| row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0)
+        .collect();
+    assert_eq!(restricted.len(), 23);
+    tracing::subscriber::with_default(audit.clone(), || {
+        for row in &restricted {
+            for permissions in [None, Some(0), Some(!row.required_permissions)] {
+                // Discord delivered a real ApplicationCommand despite the picker
+                // defaults; bot permissions must not authorize the invoker.
+                let mut interaction = slash(row.command, permissions);
+                interaction.app_permissions = Some(Permissions::all());
+                let RoutedInteraction::Slash { outcome, .. } =
+                    route_interaction(&router, &interaction, Some(true))
+                else {
+                    panic!("expected slash refusal for {}", row.command);
+                };
+                let SlashOutcome::Refuse { refusal } = outcome else {
+                    panic!(
+                        "unauthorized invocation returned a handler for {}",
+                        row.command
+                    );
+                };
+                let response = response_for_slash(&outcome).expect("router owes a refusal reply");
+                let data = response.data.unwrap();
+                assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+                assert_eq!(data.content, Some(refusal.message()));
+            }
+            let allowed = slash(row.command, Some(row.required_permissions));
+            assert!(matches!(
+                route_interaction(&router, &allowed, None),
+                RoutedInteraction::Slash {
+                    outcome: SlashOutcome::Handled { .. },
+                    ..
+                }
+            ));
+        }
+    });
+    let events = audit.0.lock().unwrap();
+    assert_eq!(events.len(), restricted.len() * 3);
+    for (row, events) in restricted.iter().zip(events.chunks_exact(3)) {
+        for event in events {
+            assert_eq!(event["message"], "command_permission_denied");
+            assert_eq!(event["target"], "two_bot_core::command_permissions");
+            assert_eq!(event["command"], row.command);
+            assert_eq!(
+                event["required_permissions"],
+                row.required_permissions.to_string()
+            );
+            assert_eq!(event["guild_id"], format!("Some({GUILD_ID})"));
+            // Exact metadata allowlist excludes tokens, options and user text.
+            assert_eq!(
+                event.keys().map(String::as_str).collect::<Vec<_>>(),
+                vec![
+                    "actor_permissions",
+                    "command",
+                    "guild_id",
+                    "message",
+                    "required_permissions",
+                    "target"
+                ]
+            );
+            assert!(!format!("{event:?}").contains("routing-test-token"));
+        }
+        assert_eq!(events[0]["actor_permissions"], "None");
+        assert_eq!(events[1]["actor_permissions"], "Some(0)");
+    }
+}
+
+#[test]
+fn twilight_publication_permissions_equal_the_runtime_matrix() {
+    use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
+
+    assert_eq!(COMMAND_PERMISSIONS.len(), 30);
+    let router = InteractionRouter::new(all_on());
+    let defs = router.publish_set(&[]).unwrap();
+    let commands = publish_commands(&defs);
+    assert_eq!(commands.len(), 27);
+    for command in commands {
+        let row = command_permission(&command.name).unwrap();
+        assert_eq!(
+            command
+                .default_member_permissions
+                .map(|p| p.bits())
+                .unwrap_or(0),
+            row.required_permissions,
+            "{}",
+            command.name
+        );
+        let wire = serde_json::to_value(&command).unwrap();
+        if row.required_permissions == 0 {
+            assert!(wire
+                .get("default_member_permissions")
+                .is_none_or(serde_json::Value::is_null));
+        } else {
+            assert_eq!(
+                wire["default_member_permissions"],
+                row.required_permissions.to_string()
+            );
+        }
+    }
+}
+
 fn slash_outcome(router: &InteractionRouter, name: &str) -> SlashOutcome {
     let interaction = slash(name, Some(u64::MAX));
     match route_interaction(router, &interaction, None) {
@@ -306,6 +462,7 @@ fn rsvp_attendance_namespacing_holds_on_the_wire() {
 
 #[test]
 fn disabled_and_ungated_wire_interactions_take_the_refusal_path() {
+    let _permission_audit_guard = PERMISSION_AUDIT_LOCK.lock().unwrap();
     let off = InteractionRouter::new(RouterGates {
         scorecard: false,
         automations: false,

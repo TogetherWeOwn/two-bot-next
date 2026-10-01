@@ -1,7 +1,8 @@
 //! Opt-in database + gateway tests. Never inherit the runtime DATABASE_URL.
 //! Only agent-testdb or CI's loopback service, as agent_test, is accepted.
 
-use std::str::FromStr;
+#[path = "../tests/common/database_guard.rs"]
+mod database_guard;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{json, Value};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
@@ -27,6 +28,8 @@ use crate::gateway::{
 };
 
 mod deadline;
+mod member_journey;
+mod persistent;
 mod recovery;
 
 const GUILD: &str = "2222";
@@ -42,15 +45,7 @@ struct TestDb {
 impl TestDb {
     async fn new() -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let url = std::env::var("TWO_GATEWAY_TEST_DATABASE_URL")
-            .expect("set the dedicated test URL; runtime DATABASE_URL is never used");
-        let options = PgConnectOptions::from_str(&url).expect("test URL");
-        assert!(matches!(
-            options.get_host(),
-            "agent-testdb" | "localhost" | "127.0.0.1"
-        ));
-        assert_eq!(options.get_username(), "agent_test");
-        assert_eq!(options.get_database(), Some("agent_test"));
+        let options = database_guard::test_options();
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(options.clone())
@@ -95,9 +90,9 @@ impl TestDb {
             .schema
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {}_web_v1 CASCADE; DROP SCHEMA {} CASCADE",
+            self.schema, self.schema
         )))
         .execute(&self.admin)
         .await
@@ -375,6 +370,17 @@ async fn spawn_runner(
     JoinHandle<Result<(), sqlx::Error>>,
     Arc<RwLock<GatewayState>>,
 ) {
+    spawn_runner_until_shutdown(db, url, std::future::pending()).await
+}
+
+async fn spawn_runner_until_shutdown(
+    db: &TestDb,
+    url: &str,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    Arc<RwLock<GatewayState>>,
+) {
     ensure_crypto_provider();
     let saved = load_boot_session(&db.store)
         .await
@@ -388,8 +394,81 @@ async fn spawn_runner(
         db.store.milestones().await.expect("milestones"),
     ));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
-    let task = tokio::spawn(run_shard(shard, pipeline, state.clone(), db.store.clone()));
+    let task = tokio::spawn(run_shard(
+        shard,
+        pipeline,
+        state.clone(),
+        db.store.clone(),
+        None,
+        shutdown,
+    ));
     (task, state)
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn http_shutdown_stops_the_real_gateway_runner_and_preserves_checkpoint() {
+    let db = TestDb::new().await;
+    let mut mock = MockGateway::new(false, false).await;
+    let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
+    let (runner, state) = spawn_runner_until_shutdown(&db, &mock.url, async move {
+        stopping.wait_for(|stopping| *stopping).await.unwrap();
+    })
+    .await;
+    assert_eq!(mock.authentication().await["op"], 2);
+    wait_sequence(&db.store, 2).await;
+    assert_eq!(*state.read().await, GatewayState::Connected);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::supervise_gateway(runner, async { Ok(()) }, state.clone(), shutdown),
+    )
+    .await
+    .expect("production runner must receive shutdown and join its writer")
+    .unwrap();
+    assert_eq!(*state.read().await, GatewayState::Draining);
+    assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 2);
+    assert_eq!(db.count().await, 1);
+    mock.task.abort();
+    let _ = mock.task.await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn pending_readyz_request_observes_drain_after_database_acquisition() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt as _;
+
+    let db = TestDb::new().await;
+    let gateway = Arc::new(RwLock::new(GatewayState::Connected));
+    let app = crate::server::router(crate::server::SharedState {
+        gateway: gateway.clone(),
+        database: Some(db.pool.clone()),
+    });
+    // Hold every connection so the real ping waits in pool acquisition.
+    let mut held = Vec::new();
+    for _ in 0..db.pool.options().get_max_connections() {
+        held.push(db.pool.acquire().await.unwrap());
+    }
+    let response = app.oneshot(
+        Request::builder()
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    futures_util::pin_mut!(response);
+    assert!(futures_util::poll!(&mut response).is_pending());
+    *gateway.write().await = GatewayState::Draining;
+    drop(held);
+    let response = tokio::time::timeout(Duration::from_secs(2), response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    db.close().await;
 }
 
 #[tokio::test]

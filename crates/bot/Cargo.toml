@@ -15,10 +15,16 @@ path = "src/main.rs"
 [dependencies]
 two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
 two-bot-discord = { version = "0.2.0", path = "../discord" }
+two-bot-store = { version = "0.2.0", path = "../store" }
 two-bot-cutover = { version = "0.2.0", path = "../cutover" }
-futures-util = { workspace = true }
+# Relay/audit ids: 16 CSPRNG bytes hex-encoded (same shape as core's
+# internal_actions nonces).
+hex = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
+time = { workspace = true }
 axum = { workspace = true }
+futures-util = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
 # exactly one provider feature enabled. Declared here (not on a lib) so the
 # release binary and `cargo test` share the same provider.
@@ -32,6 +38,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
+twilight-http = { workspace = true }
+twilight-model = { workspace = true }
 
 [dev-dependencies]
+two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }
