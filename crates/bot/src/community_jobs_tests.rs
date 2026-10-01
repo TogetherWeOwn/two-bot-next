@@ -5,11 +5,7 @@ use two_bot_testsupport::TestDatabase;
 
 use super::*;
 
-#[allow(dead_code)]
-#[path = "../../discord/tests/common/mod.rs"]
-mod common;
-
-use common::{MockRest, ScriptedResponse};
+use crate::discord_test_common::{MockRest, ScriptedResponse};
 
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
@@ -104,7 +100,7 @@ async fn scorecard_attempt_is_once_per_monday_per_process() {
     // dedupes the row (asserted in the integration test below).
     let restarted = fresh_state(enabled_gates(), 14);
     assert_eq!(
-        consume_attempt(&restarted, monday + 3_600_000)
+        consume_attempt(&restarted, monday + 1_800_000)
             .await
             .as_deref(),
         Some("2026-09-28")
@@ -116,8 +112,29 @@ async fn scorecard_attempt_is_once_per_monday_per_process() {
         Some("2026-10-05"),
         "the next Monday is a fresh key"
     );
+    let last_minute = fresh_state(enabled_gates(), 14);
+    assert_eq!(
+        consume_attempt(
+            &last_minute,
+            parse_iso_millis("2026-09-28T06:59:59.999Z").unwrap()
+        )
+        .await
+        .as_deref(),
+        Some("2026-09-28"),
+        "06:59:59.999 is still inside the window"
+    );
     // Outside the window nothing is consumed.
     let fresh = fresh_state(enabled_gates(), 14);
+    assert_eq!(
+        consume_attempt(
+            &fresh,
+            parse_iso_millis("2026-09-28T07:00:00.000Z").unwrap()
+        )
+        .await,
+        None,
+        "07:00 is outside the window"
+    );
+    assert!(fresh.last_attempted_week.lock().await.is_none());
     assert_eq!(
         consume_attempt(&fresh, monday - 1_000).await,
         None,

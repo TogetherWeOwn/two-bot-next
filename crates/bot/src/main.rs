@@ -8,6 +8,10 @@
 mod backup_cli;
 mod community_jobs;
 mod database_roles_cli;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../discord/tests/common/mod.rs"]
+mod discord_test_common;
 mod gateway;
 mod gateway_metrics;
 #[cfg(test)]
