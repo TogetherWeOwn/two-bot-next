@@ -310,11 +310,11 @@ impl ActionExecutor {
         for snapshot in &roles {
             numeric_id(&snapshot.id).map_err(|_| unreadable())?;
             if !ids.insert(snapshot.id.as_str()) {
-                return Err(unreadable());
+                return Err(unreadable().into());
             }
         }
         if !ids.contains(guild_id) || bot_roles.iter().any(|id| !ids.contains(id.as_str())) {
-            return Err(unreadable());
+            return Err(unreadable().into());
         }
         let target = roles
             .iter()
