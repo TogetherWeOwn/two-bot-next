@@ -66,11 +66,13 @@ pub fn with_http_context(router: axum::Router) -> axum::Router {
     // https://docs.rs/axum/0.8.9/axum/middleware/fn.from_fn.html
     let span = tracing::Span::current();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    router.layer(axum::middleware::from_fn(move |request: Request, next: Next| {
-        next.run(request)
-            .instrument(span.clone())
-            .with_subscriber(dispatch.clone())
-    }))
+    router.layer(axum::middleware::from_fn(
+        move |request: Request, next: Next| {
+            next.run(request)
+                .instrument(span.clone())
+                .with_subscriber(dispatch.clone())
+        },
+    ))
 }
 
 pub fn run_span() -> tracing::Span {
@@ -124,12 +126,13 @@ where
         .log_internal_errors(false)
         .with_writer(writer);
     match format {
-        LogFormat::Json => Box::new(tracing_subscriber::registry().with(
-            layer.json().event_format(JsonEvent).with_filter(filter),
-        )),
-        LogFormat::Pretty => Box::new(
-            tracing_subscriber::registry().with(layer.pretty().with_filter(filter)),
+        LogFormat::Json => Box::new(
+            tracing_subscriber::registry()
+                .with(layer.json().event_format(JsonEvent).with_filter(filter)),
         ),
+        LogFormat::Pretty => {
+            Box::new(tracing_subscriber::registry().with(layer.pretty().with_filter(filter)))
+        }
     }
 }
 
@@ -401,14 +404,21 @@ mod tests {
         ] {
             let capture = Capture::default();
             tracing::subscriber::with_default(
-                subscriber(LogFormat::Json, filter(rust_log, Some(level)), capture.clone()),
+                subscriber(
+                    LogFormat::Json,
+                    filter(rust_log, Some(level)),
+                    capture.clone(),
+                ),
                 || {
                     let run = run_span().entered();
                     assert!(run.id().is_some());
                     let gateway = gateway_span(456).entered();
                     let interaction = tracing::info_span!(
-                        "interaction", interaction_id = "123", guild_id = "456"
-                    ).entered();
+                        "interaction",
+                        interaction_id = "123",
+                        guild_id = "456"
+                    )
+                    .entered();
                     tracing::info!(msg = "ready");
                     tracing::warn!(msg = "shard_closed");
                     tracing::error!(msg = "gateway_failed");
@@ -418,7 +428,11 @@ mod tests {
                 },
             );
             let lines = capture.lines();
-            assert_eq!(lines.len(), expected, "RUST_LOG={rust_log:?} LOG_LEVEL={level}");
+            assert_eq!(
+                lines.len(),
+                expected,
+                "RUST_LOG={rust_log:?} LOG_LEVEL={level}"
+            );
             for line in lines {
                 assert!(line["run_id"].as_str().is_some_and(|id| !id.is_empty()));
                 assert_eq!(line["guild_id"], "456");
@@ -440,7 +454,11 @@ mod tests {
                 1,
                 true,
             )
-            .with_subscriber(subscriber(LogFormat::Json, filter(None, None), capture.clone()))
+            .with_subscriber(subscriber(
+                LogFormat::Json,
+                filter(None, None),
+                capture.clone(),
+            ))
             .await;
             match result.unwrap_err() {
                 sqlx::Error::InvalidArgument(message) => {
@@ -449,7 +467,10 @@ mod tests {
                 _ => panic!("DSN was not rejected before connection"),
             }
         }
-        assert!(capture.text().is_empty(), "parser must not log rejected DSNs");
+        assert!(
+            capture.text().is_empty(),
+            "parser must not log rejected DSNs"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -460,7 +481,9 @@ mod tests {
         for level in ["debug", "warn", "error"] {
             let capture = Capture::default();
             let dispatch = tracing::Dispatch::new(subscriber(
-                LogFormat::Json, filter(None, Some(level)), capture.clone(),
+                LogFormat::Json,
+                filter(None, Some(level)),
+                capture.clone(),
             ));
             let run = tracing::dispatcher::with_default(&dispatch, run_span);
             let run_id = tracing::dispatcher::with_default(&dispatch, || {
@@ -477,8 +500,13 @@ mod tests {
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(
                 crate::server::serve_with_shutdown(
-                    listener, state, crate::jobs::statuses(&[], true), shutdown,
-                    async { let _ = stopped.await; },
+                    listener,
+                    state,
+                    crate::jobs::statuses(&[], true),
+                    shutdown,
+                    async {
+                        let _ = stopped.await;
+                    },
                 )
                 .instrument(run)
                 .with_subscriber(dispatch),
@@ -491,24 +519,35 @@ mod tests {
                     ).as_bytes()).await.unwrap();
                     let mut response = Vec::new();
                     stream.read_to_end(&mut response).await.unwrap();
-                    assert!(String::from_utf8(response).unwrap().starts_with(
-                        &format!("HTTP/1.1 {status}")
-                    ));
+                    assert!(String::from_utf8(response)
+                        .unwrap()
+                        .starts_with(&format!("HTTP/1.1 {status}")));
                 }
             };
-            let requests_result = tokio::time::timeout(std::time::Duration::from_secs(3), requests).await;
+            let requests_result =
+                tokio::time::timeout(std::time::Duration::from_secs(3), requests).await;
             stop.send(()).unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(3), server)
-                .await.unwrap().unwrap().unwrap();
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             requests_result.unwrap();
             let lines = capture.lines();
-            let http: Vec<_> = lines.iter().filter(|line| {
-                line["target"].as_str().is_some_and(|target| target.starts_with("tower_http::trace"))
-            }).collect();
+            let http: Vec<_> = lines
+                .iter()
+                .filter(|line| {
+                    line["target"]
+                        .as_str()
+                        .is_some_and(|target| target.starts_with("tower_http::trace"))
+                })
+                .collect();
             assert!(!http.is_empty(), "no request/failure logs at {level}");
             assert!(http.iter().any(|line| line["level"] == "error"));
             if level == "debug" {
-                assert!(http.iter().any(|line| line["message"] == "started processing request"));
+                assert!(http
+                    .iter()
+                    .any(|line| line["message"] == "started processing request"));
                 assert!(http.iter().any(|line| line["status"] == 200));
             }
             for line in http {
