@@ -204,11 +204,13 @@ async fn community_ticks_write_rows_and_stay_gated() {
     .unwrap();
     let requests = mock.requests();
     assert_eq!(requests.len(), 3, "counts, one member listing, counts");
-    assert!(
-        requests[1].path.contains("/members?limit=1000"),
-        "{}",
-        requests[1].path
-    );
+    let (path, query) = requests[1].path.split_once('?').expect("roster query");
+    assert_eq!(path, "/api/v10/guilds/3333/members");
+    let params: HashMap<_, _> = query
+        .split('&')
+        .map(|pair| pair.split_once('=').expect("query parameter"))
+        .collect();
+    assert_eq!(params, HashMap::from([("after", "0"), ("limit", "1000")]));
     drop(requests);
     let rows: Vec<(i32, Option<i32>)> = sqlx::query_as(
         "SELECT approximate_presence_count, bot_floor FROM presence_probe
