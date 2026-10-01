@@ -259,23 +259,34 @@ mod tests {
             .map_err(|reason| sqlx::Error::InvalidArgument(reason.into()))
         });
         start.await.unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(
+            crate::gateway::GatewayState::Connected,
+        ));
+        let (shutdown, stopping) = watch::channel(false);
+        let (http_stopped, mut http_stop) = tokio::sync::oneshot::channel();
+        let http = async move {
+            crate::server::shutdown_requested(stopping).await;
+            http_stopped.send(()).unwrap();
+            Ok(())
+        };
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            crate::supervise_gateway(
-                worker,
-                std::future::pending(),
-                Arc::new(tokio::sync::RwLock::new(
-                    crate::gateway::GatewayState::Connected,
-                )),
-                watch::channel(false).0,
-            ),
+            crate::supervise_gateway(worker, http, Arc::clone(&state), shutdown),
         )
         .await;
         let stopped = stop.try_recv();
+        let http_stopped = http_stop.try_recv();
+        let final_state = *state.read().await;
         release.send(()).unwrap();
         assert!(stopped.is_ok(), "readiness stop must precede fatal return");
         assert!(
-            result.unwrap().is_err(),
+            http_stopped.is_ok(),
+            "HTTP cleanup must observe shutdown before fatal return"
+        );
+        assert_eq!(final_state, crate::gateway::GatewayState::Draining);
+        assert_eq!(
+            result.unwrap().unwrap_err().to_string(),
+            "gateway task stopped; container restart required",
             "supervisor must terminate without releasing the handler"
         );
     }
