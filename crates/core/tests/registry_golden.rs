@@ -72,6 +72,7 @@ fn diff_detects_each_kind_of_unlisted_drift_including_exception_bodies() {
         ("rsvp", "/options/1/choices/0/value", json!("maybe")),
         ("feed-add", "/options/0/choices/0/name", json!("Atom")),
         ("attendance", "/default_member_permissions", json!("32")),
+        ("attendance", "/options/0/max_length", json!(129)),
         ("rsvp-attendance", "/options/0/name", json!("event")),
         ("rsvp-attendance", "/name", json!("attendance")),
         ("leaderboard", "/description", json!("Changed copy")),
