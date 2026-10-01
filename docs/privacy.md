@@ -76,7 +76,7 @@ this CLI.
    approved operator database identity with the required read/delete/lock rights
    and receipt-insert access. The command uses only `TWO_DATABASE_URL`; it never
    falls back to another credential or applies migrations. Provision migration
-   `0400_member_erasure_audit.sql` through the normal reviewed migration process.
+   `0410_member_erasure_audit.sql` through the normal reviewed migration process.
 2. Pause the guild's ingestion, command/internal-action workers and replay queues
    through the existing operational procedure. Erasure is not a suppression or
    opt-out tombstone: live activity/backfills/replays can recreate data after
