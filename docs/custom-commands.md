@@ -46,6 +46,15 @@ execution after the ordinary pipeline and before checkpoint COMMIT. READY and
 RESUMED both synchronize the complete gated registry. Cold RESUME uses the shared
 executor's fresh guild-name read until the gateway cache supplies a name.
 
+The gateway injects main's shared `CommandRuntime`: sticky, feeds and custom
+commands use the same `Arc<InteractionRouter>`, pool and cloned `ActionExecutor`
+(including its proxy and pacing state). Custom-command ownership is checked before
+builtin fallback, so acknowledged custom interactions never receive a second
+unavailable reply. Only the custom service's serialized, DB-backed full-set
+publisher runs on READY/RESUMED; no builtin-only publication can erase custom rows.
+The combined mock gateway fixture checks registry coexistence and single replies
+for custom, management, feed and sticky commands. It is added, not locally run.
+
 The ordinary message pipeline still has **no automod inspection service**. Prefix
 execution therefore requires an explicit `TWO_AUTOMOD=0`, in addition to both
 custom-command gates. Missing, malformed, or enabled automod configuration yields

@@ -24,6 +24,7 @@ import { Container } from "@cloudflare/containers";
 import {
   TokenBuckets,
   handleRedirect,
+  isReservedInternal,
   type Campaign,
   type RedirectClick,
 } from "./redirect.ts";
@@ -186,6 +187,13 @@ export default {
     if (url.pathname === "/health" || url.pathname === "/readyz") {
       const container = env.TWO_BOT.getByName(SINGLETON_NAME);
       return container.fetch(request);
+    }
+
+    // Metrics are container-internal, never a public proxy or invite campaign.
+    // Canonicalized like the campaign lookup so /METRICS, /%6detrics,
+    // //metrics and /metrics/* cannot become a campaign redirect.
+    if (isReservedInternal(url.pathname)) {
+      return new Response("not found", { status: 404 });
     }
 
     // B3: everything else is a go.two.gg tracked link. Clicks record after

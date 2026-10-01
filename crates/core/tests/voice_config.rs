@@ -1,6 +1,69 @@
 use std::collections::BTreeMap;
 
+use proptest::prelude::*;
 use serde_json::{json, Value};
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn property_voice_import_never_panics_and_accepted_documents_round_trip(
+        raw in proptest::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let (_, inventory) = fixture();
+        if let Ok(config) = import_configuration(&raw, &inventory) {
+            let exported = export_configuration(&config, &inventory).unwrap();
+            prop_assert_eq!(import_configuration(&exported, &inventory).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn property_voice_codec_preserves_template_source_and_optional_fields(
+        template in proptest::collection::vec(any::<char>(), 0..128)
+            .prop_map(|chars| chars.into_iter().collect::<String>()),
+        status in proptest::option::of(proptest::collection::vec(any::<char>(), 0..128)
+            .prop_map(|chars| chars.into_iter().collect::<String>())),
+        flags in any::<[bool; 6]>(),
+        limit in 0u16..=99,
+        first_number in 1u32..=u32::MAX,
+        below in any::<bool>(),
+        logging in any::<bool>(),
+    ) {
+        let (mut config, inventory) = fixture();
+        // The codec retains source; malformed template syntax is the compiler's
+        // concern. Include both placeholder delimiters and arbitrary Unicode.
+        config.creators[0].name_template = format!("@@owner@@ [[{template}]] {{username}} ##");
+        config.creators[0].status_template = status.clone();
+        config.creators[0].default_limit = limit;
+        config.creators[0].first_number = first_number;
+        config.creators[0].position = if below { two_bot_core::voice_config::RoomPosition::Below }
+            else { two_bot_core::voice_config::RoomPosition::Above };
+        config.creators[0].always_private = flags[0];
+        config.creators[0].text_channels = flags[1];
+        config.creators[0].group_by_category = flags[2];
+        config.settings.creation_enabled = flags[3];
+        config.settings.unique_names = flags[4];
+        config.settings.count_members_without_activity = flags[5];
+        config.templates[0].name_template = template;
+        config.templates[0].status_template = status;
+        if !logging { config.logging = None; }
+        let wire = export_configuration(&config, &inventory).unwrap();
+        let decoded = import_configuration(&wire, &inventory).unwrap();
+        prop_assert_eq!(&decoded, &config);
+        prop_assert_eq!(export_configuration(&decoded, &inventory).unwrap(), wire);
+    }
+
+    #[test]
+    fn property_voice_creator_bounds_are_exact(limit in 0u16..=101, first_number in 0u32..=10) {
+        let (mut config, inventory) = fixture();
+        config.creators[0].default_limit = limit;
+        config.creators[0].first_number = first_number;
+        let accepted = limit <= 99 && first_number > 0;
+        prop_assert_eq!(export_configuration(&config, &inventory).is_ok(), accepted);
+        let unvalidated = serde_json::to_vec(&config).unwrap();
+        prop_assert_eq!(import_configuration(&unvalidated, &inventory).is_ok(), accepted);
+    }
+}
 use two_bot_core::voice_config::{
     export_configuration, import_configuration, validate_configuration, ChannelKind,
     ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration,

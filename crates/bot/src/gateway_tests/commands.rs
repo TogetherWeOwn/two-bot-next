@@ -37,7 +37,7 @@ async fn bootstrap(
     db: &TestDb,
     rest: &MockRest,
     vars: &HashMap<String, String>,
-) -> GatewayCommands {
+) -> Arc<crate::command_runtime::CommandRuntime> {
     let config = GatewayCommandConfig::from_map(2222, vars).expect("command config");
     let executor = ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap();
     let commands = tokio::time::timeout(
@@ -304,6 +304,77 @@ async fn ready_routes_custom_slash_and_accepted_prefix_before_checkpoint() {
     .unwrap();
     assert_eq!(fact, ("failed".into(), "delivery_failed".into()));
     assert_eq!(rest.requests().len(), 7);
+    runner.abort();
+    let _ = runner.await;
+    gateway.stop().await;
+    rest.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_replies() {
+    let db = TestDb::new().await;
+    seed(&db).await;
+    let mut script = bootstrap_responses();
+    script.push(ScriptedResponse::json(200, json!([])));
+    for _ in 0..4 {
+        script.push(ScriptedResponse::status(204));
+        script.push(ScriptedResponse::json(200, json!({})));
+    }
+    let rest = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let mut config = vars(Some("0"));
+    config.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
+    let runtime = bootstrap(&db, &rest, &config).await;
+    let mut gateway = CommandGateway::start(45000).await;
+    let (runner, state) = spawn_runner_with_commands(&db, &gateway.url, Some(runtime)).await;
+    assert_eq!(gateway.authentication().await["op"], 2);
+    gateway.send(ready(&gateway.url, "combined-session")).await;
+    wait_sequence(&db.store, 1).await;
+    assert_registry(&rest);
+    let registry: Vec<Value> = serde_json::from_slice(&rest.requests()[2].body).unwrap();
+    for name in [
+        "sticky",
+        "sticky-remove",
+        "feed-add",
+        "feed-remove",
+        "feed-list",
+    ] {
+        assert!(registry.iter().any(|command| command["name"] == name));
+    }
+    for (index, name) in ["faq", "command-list", "feed-list", "sticky-remove"]
+        .into_iter()
+        .enumerate()
+    {
+        let sequence = index as u64 + 2;
+        let id = index as u64 + 60;
+        let mut interaction = slash(sequence, id);
+        interaction["d"]["data"]["name"] = json!(name);
+        interaction["d"]["member"]["permissions"] = json!("32");
+        gateway.send(interaction).await;
+        wait_sequence(&db.store, sequence).await;
+        let requests = rest.requests();
+        let callback = format!("/interactions/{id}/custom-command-fixture/callback");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.path.ends_with(&callback))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests.iter().filter(|r| r.method == "PATCH").count(),
+            index + 1
+        );
+        let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        assert_ne!(
+            body["content"],
+            "This command is not available in this build yet."
+        );
+    }
+    wait_connected(&state).await;
+    assert_registry(&rest); // No competing builtin-only publisher erased faq.
+    assert_eq!(rest.requests().len(), 11);
     runner.abort();
     let _ = runner.await;
     gateway.stop().await;

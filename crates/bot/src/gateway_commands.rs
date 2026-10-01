@@ -74,10 +74,28 @@ pub struct GatewayCommands {
 }
 
 impl GatewayCommands {
+    #[cfg(test)]
     pub async fn bootstrap(
         pool: PgPool,
         executor: ActionExecutor,
         config: GatewayCommandConfig,
+    ) -> Result<Arc<crate::command_runtime::CommandRuntime>, sqlx::Error> {
+        let runtime = crate::command_runtime::CommandRuntime::new(
+            pool,
+            executor,
+            crate::command_runtime::CommandRuntime::build_router(config.gates),
+            config.gates.configured_guild.ok_or_else(config_error)?,
+            config.gates.automations,
+        );
+        runtime.initialize_custom_commands(config).await?;
+        Ok(runtime)
+    }
+
+    pub(crate) async fn bootstrap_with_router(
+        pool: PgPool,
+        executor: ActionExecutor,
+        config: GatewayCommandConfig,
+        router: Arc<InteractionRouter>,
     ) -> Result<Self, sqlx::Error> {
         let guild_id = config
             .gates
@@ -90,9 +108,7 @@ impl GatewayCommands {
         let bootstrap_guild_name = executor.guild_name(guild_id.get()).await.map_err(|_| {
             sqlx::Error::InvalidArgument("gateway guild context unavailable".into())
         })?;
-        let mut router = InteractionRouter::new(config.gates);
-        CustomCommandRuntime::register(&mut router);
-        let runtime = CustomCommandRuntime::new(pool, Arc::new(router), executor, application_id);
+        let runtime = CustomCommandRuntime::new(pool, router, executor, application_id);
         Ok(Self {
             runtime,
             application_id,
@@ -111,7 +127,7 @@ impl GatewayCommands {
         &self,
         event: &Event,
         cache: &InMemoryCache,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<bool, sqlx::Error> {
         if let Event::Ready(ready) = event {
             if ready.application.id.get() != self.application_id {
                 return Err(sqlx::Error::InvalidArgument(
@@ -125,7 +141,7 @@ impl GatewayCommands {
             self.runtime.sync_registry().await.map_err(|_| {
                 sqlx::Error::InvalidArgument("gateway registry synchronization failed".into())
             })?;
-            return Ok(());
+            return Ok(true);
         }
         // Own the name before awaiting: never hold a cache shard lock over I/O.
         // https://docs.rs/twilight-cache-inmemory/0.17.1/twilight_cache_inmemory/struct.InMemoryCache.html#method.guild
@@ -134,11 +150,11 @@ impl GatewayCommands {
             .map(|guild| guild.name().to_owned());
         let guild_name = guild_name.as_deref().unwrap_or(&self.bootstrap_guild_name);
         let result = match event {
-            Event::InteractionCreate(interaction) => self
-                .runtime
-                .handle_interaction(interaction, Some(guild_name))
-                .await
-                .map(|_| ()),
+            Event::InteractionCreate(interaction) => {
+                self.runtime
+                    .handle_interaction(interaction, Some(guild_name))
+                    .await
+            }
             Event::MessageCreate(message) => self
                 .runtime
                 .handle_message(
@@ -148,15 +164,18 @@ impl GatewayCommands {
                     Some(guild_name),
                 )
                 .await
-                .map(|_| ()),
-            _ => return Ok(()),
+                .map(|_| true),
+            _ => return Ok(false),
         };
-        if let Err(error) = result {
-            // CustomCommandError contains fixed codes only, never tokens,
-            // message content, SQL values, or raw transport response bodies.
-            tracing::warn!(error = %error, "custom-command dispatch finished without confirmed success");
+        match result {
+            Ok(handled) => Ok(handled),
+            Err(error) => {
+                // Acknowledged/uncertain operations must never fall through to
+                // another handler or replay. Errors contain fixed codes only.
+                tracing::warn!(error = %error, "custom-command dispatch finished without confirmed success");
+                Ok(true)
+            }
         }
-        Ok(())
     }
 }
 
