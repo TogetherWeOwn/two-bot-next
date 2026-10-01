@@ -74,7 +74,12 @@ fn shared_pipeline_captures_rejection_without_awards_and_skips_replay_and_edit()
     let Inspection::Matched(matched) = runtime.inspect(&delivery) else {
         panic!("expected match")
     };
-    pipeline.handle_with_message_disposition(&event, matched.funnel);
+    // Main's replay clock and automod's capture-only seam share one dispatch.
+    pipeline.handle_at_with_message_disposition(
+        &event,
+        "2026-09-30T00:00:01.000Z",
+        matched.funnel,
+    );
     let guild = msg.guild_id.unwrap().get();
     let author = msg.author.id.get();
     assert_eq!(facts.0.load(Ordering::SeqCst), 1);
