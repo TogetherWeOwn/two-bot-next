@@ -167,18 +167,19 @@ async fn checkpoint_io<T>(
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
 /// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
 ///
-/// `sticky` is the S4 sticky runtime (TOG-10309): `dispatch` spawns detached
-/// work so this loop never awaits a REST call or store write — twilight only
-/// drives heartbeats while the shard is polled. `voice` is the V1 voice sink
-/// (TOG-10093): `handle` feeds actor inboxes (never blocking) against the
-/// post-update cache; `None` unless `TWO_VOICE=1` with token + database
-/// configured (see [`build_voice_runtime`]).
+/// `runtime` is the shared command runtime (TOG-11020; S4 sticky slice was
+/// TOG-10309): `dispatch` spawns detached work so this loop never awaits a
+/// REST call or store write — twilight only drives heartbeats while the
+/// shard is polled. `voice` is the V1 voice sink (TOG-10093): `handle` feeds
+/// actor inboxes against the post-update cache without blocking; `None`
+/// unless `TWO_VOICE=1` with token + database configured (see
+/// [`build_voice_runtime`]).
 pub async fn run_shard(
     mut shard: Shard,
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
-    sticky: Option<Arc<crate::sticky_runtime::StickyRuntime>>,
+    runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
     voice: Option<Arc<dyn VoiceEventSink>>,
 ) -> Result<(), sqlx::Error> {
     let result = run_loop(
@@ -186,7 +187,7 @@ pub async fn run_shard(
         &pipeline,
         &state,
         &store,
-        sticky.as_ref(),
+        runtime.as_ref(),
         voice.as_ref(),
     )
     .await;
@@ -211,7 +212,7 @@ async fn run_loop(
     pipeline: &GatewayPipeline,
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
-    sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
+    runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
     voice: Option<&Arc<dyn VoiceEventSink>>,
 ) -> Result<(), sqlx::Error> {
     let _voice_connection = VoiceConnectionGuard(voice);
@@ -340,9 +341,9 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
-            // Detached dispatch only: awaiting sticky work inline would stall
+            // Detached dispatch only: awaiting command work inline would stall
             // heartbeat polling (see `run_shard` docs).
-            if let Some(runtime) = sticky {
+            if let Some(runtime) = runtime {
                 runtime.dispatch(&event);
             }
             // Voice sink after the cache update: snapshots are complete,
@@ -458,14 +459,24 @@ pub async fn build_voice_runtime(
     if !voice_enabled {
         return None;
     }
-    let token = match config.discord_token.clone().filter(|t| !t.is_empty()) {
+    let token = match config
+        .discord_token
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
+        .filter(|token| !token.is_empty())
+    {
         Some(token) => token,
         None => {
             warn!("TWO_VOICE=1 but no discord token; voice rooms disabled");
             return None;
         }
     };
-    let database_url = match config.database_url.clone().filter(|u| !u.is_empty()) {
+    let database_url = match config
+        .database_url
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
+        .filter(|url| !url.is_empty())
+    {
         Some(url) => url,
         None => {
             warn!("TWO_VOICE=1 but no database URL; voice rooms disabled");
@@ -474,14 +485,14 @@ pub async fn build_voice_runtime(
     };
     // Migrations belong to the operator's migrator role, never the DML-only
     // runtime credential. Voice consumes the already-migrated schema.
-    let db = match connect(&database_url, DB_POOL_MAX_DEFAULT, true).await {
+    let db = match connect(database_url, DB_POOL_MAX_DEFAULT, true).await {
         Ok(db) => db,
-        Err(err) => {
-            warn!(error = %err, "voice database unavailable; voice rooms disabled");
+        Err(_) => {
+            warn!("voice database unavailable; voice rooms disabled");
             return None;
         }
     };
-    match build_production_runtime(&token, db.pool().clone()) {
+    match build_production_runtime(token, db.pool().clone()) {
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             Some(Arc::new(runtime))
@@ -520,7 +531,7 @@ mod tests {
 
     fn configured() -> Config {
         Config {
-            discord_token: Some("token".to_owned()),
+            discord_token: Some(two_bot_core::Secret::new("token".to_owned())),
             database_url: None,
             listen_addr: "0.0.0.0:8080".to_owned(),
             guild_id: None,
@@ -585,8 +596,8 @@ mod tests {
 
     fn voice_config(token: Option<&str>, database_url: Option<&str>) -> Config {
         Config {
-            discord_token: token.map(str::to_owned),
-            database_url: database_url.map(str::to_owned),
+            discord_token: token.map(|value| two_bot_core::Secret::new(value.to_owned())),
+            database_url: database_url.map(|value| two_bot_core::Secret::new(value.to_owned())),
             listen_addr: "0.0.0.0:8080".to_owned(),
             guild_id: None,
         }
@@ -612,8 +623,43 @@ mod tests {
 
     #[tokio::test]
     async fn voice_runtime_off_on_bad_database_url() {
-        // Fails at URL validation: no socket is ever opened.
-        let config = voice_config(Some("token"), Some("not-a-database-url"));
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // Fails at URL validation: no socket is ever opened. Diagnostics must
+        // remain useful without exposing the rejected credential-bearing value.
+        let url = "fixture-invalid-scheme://fixture-user:fixture-db-password@agent-testdb/db";
+        let config = voice_config(Some("fixture-discord-token"), Some(url));
         assert!(build_voice_runtime(&config, true).await.is_none());
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("voice database unavailable; voice rooms disabled"));
+        for secret in [
+            url,
+            "fixture-user",
+            "fixture-db-password",
+            "fixture-invalid-scheme",
+            "fixture-discord-token",
+        ] {
+            assert!(!output.contains(secret));
+        }
     }
 }

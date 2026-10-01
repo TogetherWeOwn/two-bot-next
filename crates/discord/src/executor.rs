@@ -176,11 +176,21 @@ pub enum ChannelCall {
 
 /// One observed HTTP exchange: status plus parsed bodies the retry policy
 /// needs. The executor owns this transport so 429/5xx accounting is exact.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RawResponse {
     pub status: u16,
     pub retry_after_header: Option<String>,
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for RawResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawResponse")
+            .field("status", &self.status)
+            .field("body_bytes", &self.body.len())
+            .field("has_retry_after", &self.retry_after_header.is_some())
+            .finish()
+    }
 }
 
 impl RawResponse {
@@ -223,15 +233,25 @@ pub trait RawSender: Send + Sync {
 /// (`twilight-http/src/client/connector.rs` with `rustls-platform-verifier`):
 /// platform-verifier TLS over `https_or_http` so plain-HTTP mock targets
 /// still connect, http1+http2 enabled.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HyperTransport {
     inner: HyperClient<
         hyper_rustls::HttpsConnector<HttpConnector>,
         http_body_util::Full<bytes::Bytes>,
     >,
     scheme_http: bool,
-    host: String,
-    token: String,
+    host: two_bot_core::Secret<String>,
+    token: two_bot_core::Secret<String>,
+}
+
+impl std::fmt::Debug for HyperTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HyperTransport")
+            .field("scheme_http", &self.scheme_http)
+            .field("host", &self.host)
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HyperTransport {
@@ -263,6 +283,11 @@ impl HyperTransport {
         if host.is_empty() {
             return Err("empty Discord API host".to_owned());
         }
+        // Both Hyper's pool key and Twilight's proxy Debug contain this
+        // authority. No userinfo, path or query may enter either client.
+        if host.contains(['@', '/', '?', '#']) || host.parse::<http::uri::Authority>().is_err() {
+            return Err("Discord API override must be an origin without userinfo".to_owned());
+        }
         // The raw transport must send what twilight's builder sends:
         // `ClientBuilder` prefixes a bare token with `Bot `.
         let token = if token.starts_with("Bot ") {
@@ -289,8 +314,8 @@ impl HyperTransport {
         Ok(Self {
             inner,
             scheme_http,
-            host,
-            token,
+            host: two_bot_core::Secret::new(host),
+            token: two_bot_core::Secret::new(token),
         })
     }
 
@@ -298,7 +323,7 @@ impl HyperTransport {
         let scheme = if self.scheme_http { "http" } else { "https" };
         format!(
             "{scheme}://{}/api/v{}/{path}",
-            self.host,
+            self.host.expose(),
             twilight_http::API_VERSION
         )
     }
@@ -315,7 +340,7 @@ impl HyperTransport {
         if let Some(headers) = builder.headers_mut() {
             headers.insert(
                 hyper::header::AUTHORIZATION,
-                hyper::header::HeaderValue::from_str(&self.token)
+                hyper::header::HeaderValue::from_str(self.token.expose())
                     .map_err(|e| format!("bad token header: {e}"))?,
             );
             if let Some(bytes) = request.body() {
@@ -383,7 +408,6 @@ pub struct ActionExecutor {
     inner: Arc<ExecutorInner>,
 }
 
-#[derive(Debug)]
 struct ExecutorInner {
     transport: HyperTransport,
     /// Twilight client kept as the request factory (builders + audit
@@ -396,6 +420,20 @@ struct ExecutorInner {
     pace_last_at: tokio::sync::Mutex<std::time::Instant>,
     kick_last_at: tokio::sync::Mutex<std::time::Instant>,
     requests: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Debug for ExecutorInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutorInner")
+            .field("transport", &self.transport)
+            // Twilight retains the proxy origin and credentials internally.
+            .field("factory", &"[REDACTED]")
+            .field("pace_interval", &self.pace_interval)
+            .field("kick_interval", &self.kick_interval)
+            .field("moderation_timeout", &self.moderation_timeout)
+            .field("requests", &self.requests)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ActionExecutor {
@@ -412,16 +450,10 @@ impl ActionExecutor {
             .token(token)
             .ratelimiter(None)
             .timeout(Duration::from_millis(MODERATION_TIMEOUT_MS));
-        if let Some(url) = proxy_url {
-            let host = url
-                .trim_start_matches("http://")
-                .trim_start_matches("https://")
-                .trim_end_matches('/')
-                .to_owned();
-            let use_http = url.starts_with("http://")
-                || url.starts_with("127.")
-                || url.starts_with("localhost");
-            builder = builder.proxy(host, use_http);
+        if proxy_url.is_some() {
+            // Reuse the already-validated origin, never reparse raw input for
+            // the nested request factory with a different set of rules.
+            builder = builder.proxy(transport.host.expose().clone(), transport.scheme_http);
         }
         builder = builder.default_allowed_mentions(AllowedMentions {
             parse: vec![],
@@ -1183,6 +1215,8 @@ impl ActionExecutor {
             body["nonce"] = n;
             body["enforce_nonce"] = serde_json::Value::Bool(true);
         }
+        crate::message_safety::sanitize_message(&mut body);
+        crate::message_safety::validate_create(&body)?;
         let body_bytes = serde_json::to_vec(&body)
             .map_err(|e| DiscordError::Rejected(format!("build message body: {e}")))?;
         let req = Request::builder(&Route::CreateMessage {
@@ -1268,6 +1302,28 @@ impl ActionExecutor {
         }
     }
 
+    /// Resolve the authenticated bot's application for a resumed startup
+    /// without READY. One bounded, paced read; no alternate client or guessed id.
+    pub async fn current_application_id(&self) -> Result<u64, DiscordError> {
+        let req = Self::request_of(self.inner.factory.current_user_application())?;
+        self.pace(false).await;
+        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
+            .await
+            .map_err(|_| DiscordError::Timeout)?
+            .map_err(DiscordError::Unavailable)?;
+        match res.status {
+            200..=299 => {
+                let body: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
+                    DiscordError::Unavailable("invalid application response".to_owned())
+                })?;
+                let id: Id<ApplicationMarker> = serde_json::from_value(body["id"].clone())
+                    .map_err(|_| DiscordError::Unavailable("invalid application id".to_owned()))?;
+                Ok(id.get())
+            }
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
     /// Publish the router's full guild command set in one send
     /// (`PUT /applications/{app}/guilds/{guild}/commands`).
     pub async fn publish_guild_commands(
@@ -1330,11 +1386,12 @@ impl ActionExecutor {
             Id::<InteractionMarker>::new_checked(interaction_id).ok_or_else(|| {
                 DiscordError::Rejected(format!("bad interaction id: {interaction_id}"))
             })?;
+        let response = crate::message_safety::interaction_response(response)?;
         let req = Self::request_of(
             self.inner
                 .factory
                 .interaction(Id::<ApplicationMarker>::new(1))
-                .create_response(interaction_id, interaction_token, response),
+                .create_response(interaction_id, interaction_token, &response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
         let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
@@ -1359,13 +1416,14 @@ impl ActionExecutor {
             Id::<ApplicationMarker>::new_checked(application_id).ok_or_else(|| {
                 DiscordError::Rejected(format!("bad application id: {application_id}"))
             })?;
+        let content = two_bot_core::message_safety::content(content);
         let mentions = AllowedMentions::default();
         let req = Self::request_of(
             self.inner
                 .factory
                 .interaction(application)
                 .update_response(interaction_token)
-                .content(Some(content))
+                .content(Some(&content))
                 .allowed_mentions(Some(&mentions)),
         )?;
         self.call_once_raw(req, &[200]).await.map(|_| ())
@@ -1726,6 +1784,81 @@ pub fn pace_delay_ms(last_at_ms: u64, interval_ms: u64, now_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn debug_redacts_transport_and_nested_executor_token() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let marker = "fixture-rest-executor-bot-token";
+        let transport = HyperTransport::new(marker.to_owned()).unwrap();
+        let executor = ActionExecutor::new(marker.to_owned()).unwrap();
+        for output in [
+            format!("{transport:?}"),
+            format!("{transport:#?}"),
+            format!("{executor:?}"),
+            format!("{executor:#?}"),
+            format!("{:?}", executor.inner),
+        ] {
+            assert!(!output.contains(marker));
+            assert!(output.contains("[REDACTED]"));
+        }
+        assert_eq!(transport.token.expose(), &format!("Bot {marker}"));
+    }
+
+    #[test]
+    fn credential_bearing_proxy_is_rejected_before_tls_or_network() {
+        for proxy in [
+            "https://fixture-user:fixture-password@proxy.invalid",
+            "http://fixture-user:fixture-password@127.0.0.1:9",
+            "https://proxy.invalid/fixture-path-secret",
+            "https://proxy.invalid?key=fixture-query-secret",
+        ] {
+            for error in [
+                HyperTransport::with_proxy("fixture-token".to_owned(), Some(proxy.to_owned()))
+                    .unwrap_err(),
+                ActionExecutor::with_proxy("fixture-token".to_owned(), Some(proxy.to_owned()))
+                    .unwrap_err(),
+            ] {
+                assert!(!error.contains("fixture"));
+                assert!(!error.contains(proxy));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_proxy_is_redacted_in_transport_and_twilight_factory_debug() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let proxy = "https://fixture-proxy-origin.invalid";
+        let transport =
+            HyperTransport::with_proxy("fixture-token".to_owned(), Some(proxy.to_owned())).unwrap();
+        let executor =
+            ActionExecutor::with_proxy("fixture-token".to_owned(), Some(proxy.to_owned())).unwrap();
+        for shown in [
+            format!("{transport:?}"),
+            format!("{transport:#?}"),
+            format!("{executor:?}"),
+            format!("{executor:#?}"),
+            format!("{:?}", executor.inner),
+            format!("{:#?}", executor.inner),
+        ] {
+            assert!(!shown.contains("fixture-token"));
+            assert!(!shown.contains("fixture-proxy-origin"));
+        }
+        assert!(transport.url("users/@me").starts_with(proxy));
+    }
+
+    #[test]
+    fn raw_response_debug_never_formats_remote_echoes() {
+        let response = RawResponse {
+            status: 403,
+            retry_after_header: Some("fixture-echoed-header-secret".to_owned()),
+            body: b"fixture-echoed-body-secret".to_vec(),
+        };
+        for shown in [format!("{response:?}"), format!("{response:#?}")] {
+            assert!(!shown.contains("fixture"));
+            assert!(!shown.contains("102, 105, 120, 116, 117, 114, 101"));
+            assert!(shown.contains("403"));
+        }
+    }
 
     #[test]
     fn constants_match_legacy() {

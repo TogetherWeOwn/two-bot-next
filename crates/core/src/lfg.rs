@@ -405,14 +405,7 @@ pub fn role_fill(signups: &[LfgSignup], role_key: &str) -> usize {
 
 /// Cap UTF-16 length like legacy without splitting a Unicode scalar.
 fn truncate_utf16(value: &str, limit: usize) -> String {
-    let mut used = 0;
-    value
-        .chars()
-        .take_while(|ch| {
-            used += ch.len_utf16();
-            used <= limit
-        })
-        .collect()
+    crate::message_safety::truncate(value, limit)
 }
 
 /// Post body (legacy `renderLfg` content): title, state, Discord timestamp,
@@ -441,7 +434,7 @@ pub fn lfg_content(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> 
         lines.push(line);
     }
     let content = lines.join("\n");
-    truncate_utf16(&content, MAX_MESSAGE_CHARS)
+    crate::message_safety::content(&content)
 }
 
 /// One signup-select option (plain data; the adapter maps this to the

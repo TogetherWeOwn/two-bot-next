@@ -92,9 +92,17 @@ async fn persistence_failure_stops_service_and_restart_recovers_committed_sequen
     .expect("failure trigger");
     let mut first = MockGateway::new(false, false).await;
     let (runner, state) = spawn_runner(&db, &first.url).await;
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        crate::supervise_gateway(runner, std::future::pending()),
+        crate::supervise_gateway(
+            runner,
+            async move {
+                crate::server::shutdown_requested(receiver).await;
+                Ok(())
+            },
+            shutdown,
+        ),
     )
     .await
     .expect("service must stop")

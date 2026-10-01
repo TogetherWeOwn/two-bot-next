@@ -2268,10 +2268,13 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "futures-util",
+ "hex",
+ "rand 0.10.3",
  "rustls",
  "serde",
  "serde_json",
  "sqlx",
+ "time",
  "tokio",
  "tokio-websockets",
  "tower",
@@ -2285,6 +2288,7 @@ dependencies = [
  "two-bot-core",
  "two-bot-cutover",
  "two-bot-discord",
+ "two-bot-testsupport",
 ]
 
 [[package]]
@@ -2315,6 +2319,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tower-service",
  "tracing",
  "two-bot-testsupport",
  "unicode-normalization",
