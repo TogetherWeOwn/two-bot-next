@@ -658,10 +658,10 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
     if obj.get("createdAt").and_then(Value::as_str).is_none() {
         return Err(refuse("manifest has no createdAt timestamp"));
     }
-    if !obj
+    if obj
         .get("eventsSequence")
         .and_then(Value::as_i64)
-        .is_some_and(|mark| mark >= 0)
+        .is_none_or(|mark| mark < 0)
     {
         return Err(refuse("manifest has an invalid eventsSequence"));
     }
@@ -684,7 +684,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     "manifest sequence {name:?} is not a table this backup format owns"
                 )));
             }
-            if !mark.as_i64().is_some_and(|mark| mark >= 0) {
+            if mark.as_i64().is_none_or(|mark| mark < 0) {
                 return Err(refuse(format!(
                     "manifest sequence {name} has an invalid high-water mark"
                 )));
