@@ -2,6 +2,7 @@ use std::sync::Mutex as StdMutex;
 
 use serde_json::json;
 use tokio::sync::watch;
+use tracing_subscriber::{layer::SubscriberExt, Layer};
 use two_bot_core::settings::{SettingRow, SettingsSnapshot};
 use two_bot_testsupport::TestDatabase;
 
@@ -16,8 +17,9 @@ fn row(guild: &str, key: &str, value: serde_json::Value) -> SettingRow {
     }
 }
 
-/// Capture every formatted tracing event on this thread while the guard
-/// lives. `set_default` is thread-scoped; `#[tokio::test]` is current-thread,
+/// Capture settings events on this thread while the guard lives. Unrelated
+/// SQL/supervisor timings can contain numeric cold values by coincidence.
+/// `set_default` is thread-scoped; `#[tokio::test]` is current-thread,
 /// so supervised job tasks land in the buffer too.
 #[derive(Clone, Default)]
 struct Capture(Arc<StdMutex<String>>);
@@ -50,12 +52,16 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
 
 fn captured() -> (Capture, tracing::subscriber::DefaultGuard) {
     let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(capture.clone())
-        .with_ansi(false)
-        .without_time() // Numeric cold-value assertions must not match timestamp fractions.
-        .with_max_level(tracing::Level::TRACE)
-        .finish();
+    let settings_target = module_path!().strip_suffix("::tests").unwrap();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_filter(tracing_subscriber::filter::filter_fn(move |metadata| {
+                metadata.is_event() && metadata.target() == settings_target
+            })),
+    );
     (capture, tracing::subscriber::set_default(subscriber))
 }
 
@@ -138,6 +144,33 @@ fn applied_swap_logs_spec_events_and_never_cold_values() {
     // Key names only for the applied line's `keys`; cold values are never rendered.
     assert!(!log.contains("600"), "cold value leaked: {log}");
     assert!(!log.contains("unlisted"), "ignored value leaked: {log}");
+}
+
+#[test]
+fn settings_log_capture_excludes_unrelated_numeric_trace_events() {
+    let (mut writer, _reader) = live_channel();
+    let report = writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![row("g1", "TWO_FEED_POLL_SECONDS", json!(600))],
+    });
+    let (capture, _guard) = captured();
+    tracing::trace!(
+        target: "sqlx::query",
+        elapsed_secs = 0.000326008,
+        "query completed"
+    );
+    tracing::trace!(
+        target: "sqlx::query",
+        elapsed_secs = 0.000900001,
+        "query completed"
+    );
+    log_applied(&report);
+    let log = capture.contents();
+    assert!(log.contains("settings_restart_required"), "{log}");
+    assert!(log.contains("TWO_FEED_POLL_SECONDS"), "{log}");
+    assert!(!log.contains("elapsed_secs"), "unrelated event captured: {log}");
+    assert!(!log.contains("600"), "cold value leaked: {log}");
+    assert!(!log.contains("900"), "updated cold value leaked: {log}");
 }
 
 #[test]
