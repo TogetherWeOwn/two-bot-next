@@ -137,6 +137,8 @@
   backups; replace stale destination ownership and reset generation sequences
   on restore. Old v3 restores quarantine unknown expiries without inventing
   acceptance or discarding running DELETE fences.
+- Redact unban claim tokens from diagnostics, lock member migrations to their
+  unchanged checksums, and isolate moderation database CI on self-hosted runners.
 
 ### Notes
 

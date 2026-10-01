@@ -305,13 +305,25 @@ pub struct AuditRow {
 }
 
 /// One claimed-due unban job (legacy `claimDueUnbans` rows).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UnbanJob {
     pub request_id: String,
     pub claim_token: String,
     pub guild_id: String,
     pub user_id: String,
     pub reason: String,
+}
+
+impl std::fmt::Debug for UnbanJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnbanJob")
+            .field("request_id", &self.request_id)
+            .field("claim_token", &crate::Secret::new(&self.claim_token))
+            .field("guild_id", &self.guild_id)
+            .field("user_id", &self.user_id)
+            .field("reason", &self.reason)
+            .finish()
+    }
 }
 
 /// Authoritative outcome for an uncertain dispatched unban (reconciliation
@@ -1146,7 +1158,7 @@ enum IdemState {
     Done,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct UnbanRow {
     guild_id: String,
     user_id: String,
@@ -1156,6 +1168,21 @@ struct UnbanRow {
     created_at: String,
     completed_at: Option<String>,
     claim_token: Option<String>,
+}
+
+impl std::fmt::Debug for UnbanRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnbanRow")
+            .field("guild_id", &self.guild_id)
+            .field("user_id", &self.user_id)
+            .field("execute_at", &self.execute_at)
+            .field("reason", &self.reason)
+            .field("state", &self.state)
+            .field("created_at", &self.created_at)
+            .field("completed_at", &self.completed_at)
+            .field("claim_token", &crate::Secret::new(&self.claim_token))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1894,6 +1921,45 @@ mod tests {
     const TARGET_ID: &str = "333333333333333333";
     const STAFF_ROLE: &str = "444444444444444444";
     const BOT_ID: &str = "555555555555555555";
+
+    #[test]
+    fn unban_debug_redacts_claim_tokens() {
+        let token = "fixture-unban-claim-token";
+        let job = UnbanJob {
+            request_id: "request".into(),
+            claim_token: token.into(),
+            guild_id: GUILD.into(),
+            user_id: TARGET_ID.into(),
+            reason: "expiry".into(),
+        };
+        let row = UnbanRow {
+            guild_id: GUILD.into(),
+            user_id: TARGET_ID.into(),
+            execute_at: "2023-11-14T23:13:20.000Z".into(),
+            reason: "expiry".into(),
+            state: UnbanState::Running,
+            created_at: "2023-11-14T22:13:20.000Z".into(),
+            completed_at: None,
+            claim_token: Some(token.into()),
+        };
+        let inner = MemInner {
+            unbans: HashMap::from([("request".into(), row.clone())]),
+            ..MemInner::default()
+        };
+        for output in [
+            format!("{job:?}"),
+            format!("{job:#?}"),
+            format!("{row:?}"),
+            format!("{row:#?}"),
+            format!("{inner:?}"),
+            format!("{inner:#?}"),
+        ] {
+            assert!(!output.contains(token));
+            assert!(output.contains("[REDACTED]"));
+        }
+        assert_eq!(job.claim_token, token);
+        assert_eq!(row.claim_token.as_deref(), Some(token));
+    }
 
     fn policy() -> ModerationPolicy {
         ModerationPolicy {

@@ -9,6 +9,18 @@
       "sha256": "e257889e79beb83896f686fecd2116ca653ce0ef9392c622618f720ccd9b712c",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0110_moderation_member.sql": {
+      "sha256": "5cac88b239c9a38ead5318f0d1f75bc0ffc1abeaf414d2d8e7bccf6a2da327a4",
+      "justification": "Add reserved member moderation ledger migration for TOG-10078; SQL unchanged during main reconciliation."
+    },
+    "crates/cutover/migrations/0111_moderation_ban_ownership.sql": {
+      "sha256": "844a52f1418acd339e48193fa530bf8a3cd0768379599e4bffedf1bc6d3f467c",
+      "justification": "Add reserved member ban ownership migration for TOG-10078; SQL unchanged during main reconciliation."
+    },
+    "crates/cutover/migrations/0112_moderation_legacy_timestamps.sql": {
+      "sha256": "739be64512d6b22fd72438060366201300a76d954cdd6d19aa08f6947b1eed47",
+      "justification": "Add reserved legacy moderation timestamp migration for TOG-10078; SQL unchanged during main reconciliation."
+    },
     "crates/cutover/migrations/0120_channel_moderation.sql": {
       "sha256": "a1e8df92e0c51e14447ff74dc6d08cb45b871cb53da2b40d7949472762637838",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
