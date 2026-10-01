@@ -214,7 +214,7 @@ fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static 
 /// A configured gateway is essential: never leave a health-only zombie after
 /// initialization/dispatch failure, stream termination, or a task panic. Exit
 /// nonzero so the Container supervisor can restart from the committed checkpoint.
-/// Source: https://docs.rs/tokio/1/tokio/macro.select.html#cancellation-safety
+/// Source: <https://docs.rs/tokio/1/tokio/macro.select.html#cancellation-safety>
 async fn supervise_gateway(
     mut task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
     http: impl std::future::Future<Output = std::io::Result<()>>,
