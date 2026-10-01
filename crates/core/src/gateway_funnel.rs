@@ -6,12 +6,22 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use crate::{EventType, FunnelEvent, FunnelStore, MemStore, RecordOutcome, Snowflake};
+use crate::{EventType, FunnelEvent, FunnelStore, InviteState, MemStore, RecordOutcome, Snowflake};
+
+/// A successful counter read replaces the guild snapshot. InviteCreate only
+/// upserts its one code: it says nothing about other invites still being live.
+pub struct InviteSnapshotWrite {
+    pub guild_id: Snowflake,
+    pub states: Vec<InviteState>,
+    pub observed_at: String,
+    pub replace_all: bool,
+}
 
 #[derive(Default)]
 pub struct FunnelBatch {
     pub events: Vec<FunnelEvent>,
     pub activity: Vec<(Snowflake, Snowflake, String)>,
+    pub invite_snapshots: Vec<InviteSnapshotWrite>,
 }
 
 #[derive(Default)]
@@ -38,6 +48,14 @@ impl GatewayFunnelBuffer {
 }
 
 impl FunnelStore for GatewayFunnelBuffer {
+    fn stage_invite_snapshot(&self, snapshot: InviteSnapshotWrite) {
+        self.pending
+            .lock()
+            .expect("funnel buffer")
+            .invite_snapshots
+            .push(snapshot);
+    }
+
     fn record(&self, event: FunnelEvent) -> RecordOutcome {
         if !self
             .keys

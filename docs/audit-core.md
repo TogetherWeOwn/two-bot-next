@@ -13,6 +13,13 @@ This is the framework-free core and durable storage part of
   rows, opaque owner/generation claims, accepted-ID evidence, crash-safe
   reconciliation/quarantine, and persistent halt. See the minimal downstream
   protocol and migration allocation in [audit-store.md](audit-store.md).
+- `two_bot_core::audit_service` (optional `db`, TOG-10345): the mirror delivery
+  engine — record-before-deliver routing, guild/privacy/permission preflight,
+  bounded history dedup, per-row and immediate pre-POST halt checks, held-claim
+  release, and reconcile-after-ambiguity with no blind resend.
+  `two_bot_discord::audit_mirror` adapts `ActionExecutor` to that contract:
+  enforced string nonce, disabled allowed mentions, paced channel-document and
+  history reads. See [audit-service.md](audit-service.md).
 - `two_bot_core::classify`: member role/nickname-change metadata, voice
   join/leave/move boundaries, raw message edit/delete dispatches, and fourteen
   Discord audit-log action classifications. Voice classification does not
@@ -71,21 +78,24 @@ must return before delivery if recording fails.
 
 ## Acceptance still open
 
-TOG-9810 is not complete until the following have been implemented and tested:
+TOG-9810 is not complete until the following has been implemented and tested:
 
-1. Mock-Discord mirror adapter with guild/privacy/permission gates,
-   `allowed_mentions: { parse: [] }`, deterministic enforced nonce, history
-   reconciliation and no blind resend after an ambiguous accepted post.
-2. Wire the persistent delivery halt into the service, check it per row and
-   immediately before each send, and safely release held claims. Store checks
-   at claim/preparation are implemented, not a runtime pre-POST check.
-3. Gateway classification and successful-moderation recording wired into the
-   runtime; readyz/retry lifecycle exercised in a container.
+1. Gateway classification and successful-moderation recording wired into the
+   runtime; readyz/retry lifecycle exercised in a container. Scheduled for
+   [TOG-10346](/TOG/issues/TOG-10346).
+
+Mirror delivery was completed in [TOG-10345](/TOG/issues/TOG-10345): the
+mirror adapter carries guild/privacy/permission gates,
+`allowed_mentions: { parse: [] }`, the deterministic enforced nonce and
+history reconciliation with no blind resend after an ambiguous accepted post;
+the persistent delivery halt is checked per row and immediately before each
+send, with held claims released safely. See
+[audit-service.md](audit-service.md).
 
 Storage acceptance is implemented in [TOG-10344](/TOG/issues/TOG-10344):
 unit decisions and 12 isolated Postgres tests cover replay, concurrent workers,
 fenced writes, restart, ambiguity/quarantine, halt, fresh embedded migrations
-and populated legacy upgrade. This does not claim the service/runtime is complete.
+and populated legacy upgrade.
 
 Database tests may use only agent-testdb or CI Postgres service containers;
 Discord tests use doubles, never the production guild or token. No database or
@@ -99,6 +109,7 @@ None are included here.
 
 ```sh
 cargo test -p two-bot-core --lib --locked -j 1
+cargo test -p two-bot-core --features db --test audit_service --locked -- --ignored
 cargo clippy -p two-bot-core --all-targets --locked -j 1 -- -D warnings
 cargo fmt --all -- --check
 git diff --check

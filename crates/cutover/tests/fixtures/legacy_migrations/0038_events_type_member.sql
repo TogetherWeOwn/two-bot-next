@@ -1,0 +1,42 @@
+-- 0038_events_type_member: cover "how many distinct members reached stage X" (TOG-5709).
+--
+-- WHAT THIS IS
+-- ------------
+-- One composite btree on `events (event_type, member_id)`.
+--
+-- WHY
+-- ---
+-- Every funnel count is served: `idx_events_type_time (event_type,
+-- occurred_at)` covers `WHERE event_type = ? AND occurred_at >= ?`, and
+-- `idx_events_member (guild_id, member_id, event_type)` covers the
+-- per-member lookups (`nextMessageRung`, `secondsBetween`, `hasEvent`).
+--
+-- The one shape with no covering index is "distinct members per stage":
+-- `SELECT COUNT(DISTINCT member_id) FROM events WHERE event_type = ?`
+-- (`EventStore.countMembersWith`, and the `COUNT(DISTINCT member_id)`
+-- lines in scripts/funnel.ts). The planner could only bitmap-scan the
+-- type slice, fetch every `member_id` from the heap, and sort. Measured
+-- 2026-09-27 on a scratch cluster (vendored embedded Postgres, 130k
+-- events, 30k members, ANALYZE'd): 18.6ms / 2341 buffers before,
+-- 2.8ms / 151 buffers after - index-only, zero heap fetches. The
+-- windowed funnel variant (`... AND occurred_at >= ?`) keeps its existing
+-- optimal plan; nothing regressed. scripts/event-store-bench.ts reproduces
+-- both numbers; run it before touching this index.
+--
+-- Why (event_type, member_id) and not (event_type, occurred_at, member_id):
+-- the wider shape serves the windowed query a hair better but loses the
+-- unwindowed DISTINCT 2x (the sort comes back - rows arrive ordered by
+-- occurred_at, not member_id). The narrow shape wins the query that has no
+-- other good plan. See TOG-5709.
+--
+-- ADDITIVE AND SAFE
+-- -----------------
+-- `CREATE INDEX` (not CONCURRENTLY - the runner wraps each file in one
+-- transaction, and CONCURRENTLY cannot run inside one) on an append-mostly
+-- log. One extra btree per insert; the write path stays ~2.2k events/s on
+-- the same scratch cluster, far above the handful of rows per member event
+-- the bot actually writes. `IF NOT EXISTS` so re-running is a no-op.
+-- Readers are untouched: no query text changes, the planner just stops
+-- sorting.
+
+CREATE INDEX IF NOT EXISTS idx_events_type_member ON events (event_type, member_id);

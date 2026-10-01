@@ -1,0 +1,5 @@
+<rss version="2.0"><channel><item>
+  <guid isPermaLink="false">twitch:stream:42</guid>
+  <title>Example is live</title><link>https://www.twitch.tv/example</link>
+  <pubDate>Wed, 30 Sep 2026 01:00:00 GMT</pubDate>
+</item></channel></rss>
