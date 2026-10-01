@@ -59,8 +59,13 @@
   response/no-send receipts before stale aggregate writes; retain timeout and
   cancellation uncertainty without retry. Extend runtime/executor source fixtures
   for status provenance, generation transfer, post-journal no-send and pending
-  tickets. Fenced current-owner incorporation and migration of the legacy lane-only
-  stale-maintenance journal remain deferred.
+  tickets. Add live-fenced current-owner receipt evidence incorporation to processing
+  recovery and typed terminal repair, restoring cumulative attempts and acknowledged
+  204 compensation while preserving pending/legacy uncertainty, snapshot effects,
+  terminal outcome and committed target. Distinguish received ambiguous effects
+  from unknown in-flight sends. Add replay, stale-fence, lock-wait and recovery
+  source coverage. Receipt-specific uncertainty attribution/retirement and migration
+  of the legacy lane-only stale-maintenance journal remain deferred.
   Production boot remains disabled until approved shared boot configuration,
   unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,

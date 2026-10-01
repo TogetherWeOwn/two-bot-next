@@ -191,6 +191,15 @@ pub enum ExchangeReceipt {
     Response { status: u16 },
 }
 
+/// Current-owner aggregate evidence, not authorization to retry or settle.
+/// Incorporation never clears inherited pending/unresolved evidence: the legacy
+/// aggregate schema cannot attribute overlapping uncertainty to a single ticket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptEvidence {
+    pub effects: AuditEffects,
+    pub exchange_pending: bool,
+}
+
 /// Each attempt gets a distinct ticket, including repeated same-role/direction
 /// sends. Role ID and direction cannot be changed by receipt completion.
 #[derive(Debug, Clone)]
@@ -1347,6 +1356,76 @@ impl SelfRoleStore {
         .rows_affected() == 1)
     }
 
+    /// Incorporate sender facts only with the current live processing fences.
+    /// The optional lane must be a normal same-scope lane; receipt possession
+    /// alone is deliberately insufficient. Observed effects, immutable intent,
+    /// outcome, tokens, expiries and committed targets remain untouched.
+    pub async fn incorporate_role_receipts(
+        &self,
+        claim: &EventClaim,
+        panel: Option<&PanelClaim>,
+    ) -> Result<Option<ReceiptEvidence>, StoreError> {
+        if panel.is_some_and(|panel| panel.maintenance) {
+            return Err(StoreError::WrongPanel);
+        }
+        let mut tx = self.pool.begin().await?;
+        if let Some(panel) = panel {
+            lock_panel(&mut tx, panel).await?;
+        }
+        lock_event(&mut tx, claim).await?;
+        check_panel_scope(&mut tx, claim, panel).await?;
+        let now = self.now(&mut tx).await?;
+        let (owned,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM self_role_audit WHERE event_id=$1
+             AND claim_token=$2 AND claim_generation=$3 AND outcome='processing'
+             AND intent_initialized AND processing_expires_at > $4)",
+        )
+        .bind(&claim.event_id)
+        .bind(claim.token.expose())
+        .bind(claim.generation)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !owned || !claim.intent_initialized {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        if let Some(panel) = panel {
+            if !owns_live_panel(&mut tx, panel, now).await? {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+        }
+        let evidence = incorporate_exchange_evidence(&mut tx, claim).await?;
+        tx.commit().await?;
+        Ok(Some(evidence))
+    }
+
+    /// Terminal incorporation requires a fresh typed evidence owner and the
+    /// live committed maintenance lane. It cannot resurrect the rejected event
+    /// or acknowledge repair completion. Unknown/legacy evidence stays pending.
+    pub async fn incorporate_terminal_receipts(
+        &self,
+        claim: &SupersededClaim,
+        panel: &PanelClaim,
+    ) -> Result<Option<ReceiptEvidence>, StoreError> {
+        check_repair_scope(claim, panel)?;
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, panel).await?;
+        lock_event(&mut tx, &claim.event).await?;
+        let now = self.now(&mut tx).await?;
+        if !claim.intent_initialized()
+            || !owns_terminal(&mut tx, claim, now).await?
+            || !owns_repair_panel(&mut tx, panel, now).await?
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let evidence = incorporate_exchange_evidence(&mut tx, &claim.event).await?;
+        tx.commit().await?;
+        Ok(Some(evidence))
+    }
+
     /// Atomically retain exchange evidence and the monotonic rollback decision.
     /// Like late effects this is token/generation fenced, not REST authorization.
     /// A false phase never clears a persisted rollback, including after recovery.
@@ -1529,6 +1608,18 @@ async fn check_exchange_scope(
     panel: Option<&PanelClaim>,
     intent: &ExchangeIntent,
 ) -> Result<(), StoreError> {
+    let guild = check_panel_scope(conn, claim, panel).await?;
+    if intent.role_id == guild {
+        return Err(StoreError::InvalidAudit);
+    }
+    Ok(())
+}
+
+async fn check_panel_scope(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+    panel: Option<&PanelClaim>,
+) -> Result<String, StoreError> {
     let scope: Option<(String, String, String)> =
         sqlx::query_as("SELECT guild_id,member_id,panel_id FROM self_role_audit WHERE event_id=$1")
             .bind(&claim.event_id)
@@ -1537,9 +1628,6 @@ async fn check_exchange_scope(
     let Some((guild, member, panel_id)) = scope else {
         return Err(StoreError::StaleClaim);
     };
-    if intent.role_id == guild {
-        return Err(StoreError::InvalidAudit);
-    }
     if panel.is_some_and(|panel| {
         panel.key.guild_id != guild
             || panel.key.member_id != member
@@ -1547,7 +1635,112 @@ async fn check_exchange_scope(
     }) {
         return Err(StoreError::WrongPanel);
     }
-    Ok(())
+    Ok(guild)
+}
+
+// Caller holds the audit lock and has checked every applicable live fence.
+// Receipt reads use a new post-lock snapshot. Completion takes no audit lock,
+// so a receipt arriving after this read is picked up by a later incorporation;
+// observing pending is conservative and never retires unknown work.
+async fn incorporate_exchange_evidence(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+) -> Result<ReceiptEvidence, StoreError> {
+    let (fields, pending): (Vec<String>, bool) = sqlx::query_as(
+        "SELECT ARRAY[added_role_ids,removed_role_ids,attempted_added_role_ids,
+         attempted_removed_role_ids,compensated_added_role_ids,compensated_removed_role_ids,
+         unresolved_added_role_ids,unresolved_removed_role_ids],exchange_pending
+         FROM self_role_audit WHERE event_id=$1",
+    )
+    .bind(&claim.event_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let mut evidence = ReceiptEvidence {
+        effects: AuditEffects::decoded(&fields)?,
+        exchange_pending: pending,
+    };
+    let receipts: Vec<(String, bool, bool, String, Option<i16>)> = sqlx::query_as(
+        "SELECT role_id,adding,compensating,disposition,response_status
+         FROM self_role_exchanges WHERE event_id=$1",
+    )
+    .bind(&claim.event_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (role, adding, compensating, disposition, status) in receipts {
+        merge_receipt_evidence(
+            &mut evidence,
+            &role,
+            adding,
+            compensating,
+            &disposition,
+            status,
+        );
+    }
+    let mut query = sqlx::query(
+        "UPDATE self_role_audit SET attempted_added_role_ids=$1,attempted_removed_role_ids=$2,
+         compensated_added_role_ids=$3,compensated_removed_role_ids=$4,
+         unresolved_added_role_ids=$5,unresolved_removed_role_ids=$6,
+         exchange_pending=exchange_pending OR $7 WHERE event_id=$8",
+    );
+    // Observed fields are snapshot evidence, never reconstructed from a receipt.
+    for field in evidence.effects.encoded().into_iter().skip(2) {
+        query = query.bind(field);
+    }
+    query
+        .bind(evidence.exchange_pending)
+        .bind(&claim.event_id)
+        .execute(conn)
+        .await?;
+    Ok(evidence)
+}
+
+fn merge_receipt_evidence(
+    evidence: &mut ReceiptEvidence,
+    role: &str,
+    adding: bool,
+    compensating: bool,
+    disposition: &str,
+    status: Option<i16>,
+) {
+    let effects = &mut evidence.effects;
+    let attempted = if adding {
+        &mut effects.attempted_added_role_ids
+    } else {
+        &mut effects.attempted_removed_role_ids
+    };
+    retain_role(attempted, role);
+    if compensating && disposition == "response" && status == Some(204) {
+        let compensated = if adding {
+            &mut effects.compensated_added_role_ids
+        } else {
+            &mut effects.compensated_removed_role_ids
+        };
+        retain_role(compensated, role);
+    }
+    let definite = disposition == "no_send"
+        || (disposition == "response"
+            && status.is_some_and(|status| status == 204 || (400..=499).contains(&status)));
+    if !definite {
+        // A received ambiguous status is not an unknown in-flight send. Retain
+        // effect uncertainty without reopening a sender-resolved pending flag.
+        if disposition != "response" {
+            evidence.exchange_pending = true;
+        }
+        let unresolved = if adding {
+            &mut effects.unresolved_added_role_ids
+        } else {
+            &mut effects.unresolved_removed_role_ids
+        };
+        retain_role(unresolved, role);
+    }
+    // Even a definite receipt cannot erase aggregate unknown evidence: it may
+    // overlap a different same-role attempt or legacy work without a ticket.
+}
+
+fn retain_role(ids: &mut Vec<String>, role: &str) {
+    ids.push(role.to_owned());
+    ids.sort();
+    ids.dedup();
 }
 
 async fn owns_live_panel(
@@ -1836,4 +2029,97 @@ async fn finish_audit(
         return Err(StoreError::StaleClaim);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn receipts_retain_unknown_and_only_acknowledge_204_compensation() {
+        for adding in [false, true] {
+            for compensating in [false, true] {
+                for (disposition, status, definite) in [
+                    ("no_send", None, true),
+                    ("response", Some(204), true),
+                    ("response", Some(403), true),
+                    ("response", Some(429), true),
+                    ("response", Some(500), false),
+                    ("response", Some(302), false),
+                    ("response", Some(200), false),
+                    ("pending", None, false),
+                ] {
+                    let baseline = ReceiptEvidence {
+                        effects: AuditEffects {
+                            added_role_ids: vec!["observed".into()],
+                            unresolved_added_role_ids: vec!["101".into(), "legacy".into()],
+                            unresolved_removed_role_ids: vec!["101".into(), "legacy".into()],
+                            ..AuditEffects::default()
+                        },
+                        exchange_pending: true,
+                    };
+                    let mut evidence = baseline.clone();
+                    merge_receipt_evidence(
+                        &mut evidence,
+                        "101",
+                        adding,
+                        compensating,
+                        disposition,
+                        status,
+                    );
+                    assert!(evidence.exchange_pending);
+                    assert_eq!(
+                        evidence.effects.added_role_ids,
+                        baseline.effects.added_role_ids
+                    );
+                    assert_eq!(
+                        evidence.effects.unresolved_added_role_ids,
+                        baseline.effects.unresolved_added_role_ids
+                    );
+                    assert_eq!(
+                        evidence.effects.unresolved_removed_role_ids,
+                        baseline.effects.unresolved_removed_role_ids
+                    );
+                    let compensated = if adding {
+                        &evidence.effects.compensated_added_role_ids
+                    } else {
+                        &evidence.effects.compensated_removed_role_ids
+                    };
+                    assert_eq!(
+                        compensated.contains(&"101".into()),
+                        compensating && status == Some(204)
+                    );
+                    let once = evidence.clone();
+                    merge_receipt_evidence(
+                        &mut evidence,
+                        "101",
+                        adding,
+                        compensating,
+                        disposition,
+                        status,
+                    );
+                    assert_eq!(evidence, once);
+                    let mut empty = ReceiptEvidence {
+                        effects: AuditEffects::default(),
+                        exchange_pending: false,
+                    };
+                    merge_receipt_evidence(
+                        &mut empty,
+                        "101",
+                        adding,
+                        compensating,
+                        disposition,
+                        status,
+                    );
+                    assert_eq!(empty.exchange_pending, disposition == "pending");
+                    let unresolved = if adding {
+                        &empty.effects.unresolved_added_role_ids
+                    } else {
+                        &empty.effects.unresolved_removed_role_ids
+                    };
+                    assert_eq!(unresolved.contains(&"101".into()), !definite);
+                }
+            }
+        }
+    }
 }

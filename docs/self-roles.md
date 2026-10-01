@@ -227,8 +227,23 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   lane-only stale-maintenance path still uses aggregate journaling: migrating it
   requires a fresh typed evidence owner, not a fabricated live event fence.
   Receipt completion alone does not clear aggregate uncertainty or establish
-  convergence: fenced current-owner incorporation and that stale-path migration
-  remain follow-up work. Boot stays disabled. Isolated source fixtures cover
+  convergence. Live-fenced current-owner incorporation now merges cumulative
+  attempts and only acknowledged 204 compensation receipts, preserving observed
+  snapshot fields, every inherited unresolved ID and the persisted pending flag.
+  Pending tickets add their direction evidence and force pending; received 5xx
+  and other ambiguous statuses add effect uncertainty without fabricating an
+  unknown in-flight send or acknowledged compensation. The processing path checks
+  its live event and optional normal lane; terminal incorporation requires a fresh
+  typed evidence owner and the live committed maintenance lane. Both sample time
+  after panel -> audit waits and read receipts in a new post-lock statement.
+  Neither path changes outcome, immutable intent, ownership, expiry or target.
+  Recovery synchronizes effects/pending before planning or observation and rejects
+  catalogue drift in incorporated evidence. Replays retain cumulative facts.
+  This is conservative evidence incorporation, not receipt-specific uncertainty
+  retirement: aggregate IDs cannot distinguish overlapping ticket and legacy
+  uncertainty. Safe attribution/retirement and the stale-path migration remain
+  follow-up work; no timer or optimistic snapshot substitutes for that provenance.
+  Boot stays disabled. Isolated source fixtures cover
   processing/terminal generation transfer, same-direction ticket separation,
   no-send and 204/403/429/500 receipts, exact/contradictory replay, invalid status,
   uninitialized/stale journaling, snapshot-free owner-state preservation and
@@ -238,6 +253,10 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   terminal generation transfer without replacement audit/target writes, raw status
   retention despite truncated/stalled bodies, definitive post-journal no-send,
   no ticket before journaling, and pending receipts across timeout/cancellation.
+  Additional incorporation source fixtures cover acknowledged compensation versus
+  refusal/ambiguity, idempotent replay, stale event/lane refusal, terminal post-lock
+  expiry, unchanged authority metadata and retained pending settlement gates.
+  Processing runtime recovery synchronizes the late evidence without new sends.
   These Rust fixtures remain uncompiled while the required bounded pool is absent.
 - Added regressions exercise late in-flight 204 after a newer worker commits,
   repair to both selected and empty targets, unknown-target refusal, interrupted

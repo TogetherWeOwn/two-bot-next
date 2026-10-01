@@ -1196,6 +1196,7 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             panel.exclusive = exclusive;
             let mut script = snapshot(&[OLD_ROLE, OTHER]);
             script.push(ScriptedResponse::status(status).delayed(Duration::from_secs(3)));
+            script.extend(snapshot(&[OLD_ROLE, OTHER]));
             let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
             let feature = runtime(pool, &clock, &mock);
             let request = request(
@@ -1270,12 +1271,30 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             .fetch_one(pool)
             .await?;
             assert!(pending); // a completed receipt does not incorporate itself
+            feature.park(&mut prepared).await;
+            drop(prepared);
+            clock.store(NOW + 601, Ordering::SeqCst);
+            let receipts = role_receipts(pool, &request.event_id).await?;
+            let mut current = ready(feature.prepare(&request, &panel).await.unwrap());
+            assert!(current.event.recovered);
+            assert!(current.event.exchange_pending);
+            assert_eq!(current.audit.effects.attempted_removed_role_ids, [OLD_ROLE]);
+            assert_eq!(
+                current.audit.effects.unresolved_removed_role_ids,
+                [OLD_ROLE]
+            );
+            assert!(current
+                .audit
+                .effects
+                .compensated_removed_role_ids
+                .is_empty());
+            assert_eq!(role_receipts(pool, &request.event_id).await?, receipts);
             assert_eq!(
                 mock.requests().iter().filter(|r| r.method != "GET").count(),
                 1
             );
-            feature.park(&mut prepared).await;
-            drop(prepared);
+            feature.park(&mut current).await;
+            drop(current);
             mock.shutdown().await;
         }
     }
@@ -1393,13 +1412,36 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
                     .record_superseded_repair(&owner.claim, &owner.effects, false)
                     .await?
             );
+            let incorporated = feature
+                .store
+                .incorporate_terminal_receipts(&replacement, &lane.claim)
+                .await?
+                .unwrap();
+            assert!(incorporated.exchange_pending);
+            assert_eq!(incorporated.effects.unresolved_removed_role_ids, [OLD_ROLE]);
+            assert_eq!(
+                incorporated.effects.compensated_removed_role_ids,
+                if status == 204 {
+                    vec![OLD_ROLE.to_owned()]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(
+                feature
+                    .store
+                    .incorporate_terminal_receipts(&replacement, &lane.claim)
+                    .await?
+                    .unwrap(),
+                incorporated
+            );
             assert!(
                 feature
                     .store
                     .record_superseded_repair(
                         &replacement,
-                        &replacement.audit().effects,
-                        replacement.exchange_pending(),
+                        &incorporated.effects,
+                        incorporated.exchange_pending,
                     )
                     .await?
             );

@@ -996,6 +996,17 @@ impl SelfRoleRuntime {
             if !owner.owns(&self.store, lane).await? {
                 return Err(RuntimeError::Stale);
             }
+            let evidence = store_io(
+                self.store
+                    .incorporate_terminal_receipts(&owner.claim, &lane.claim),
+            )
+            .await?
+            .ok_or(RuntimeError::Stale)?;
+            if !effects_match_catalogue(&evidence.effects, &offered) {
+                return Err(RuntimeError::InvalidSnapshot);
+            }
+            owner.effects = evidence.effects;
+            owner.pending = evidence.exchange_pending;
             let mut snapshot = self
                 .executor
                 .fetch_self_role_snapshot(
@@ -1387,6 +1398,13 @@ impl SelfRoleRuntime {
         event: &mut EventClaim,
         lane: &mut Option<PanelClaim>,
     ) -> Result<Result<PreparedPlans, &'static str>, RuntimeError> {
+        if event.recovered && event.intent_initialized {
+            let evidence = store_io(self.store.incorporate_role_receipts(event, lane.as_ref()))
+                .await?
+                .ok_or(RuntimeError::Stale)?;
+            event.effects = evidence.effects;
+            event.exchange_pending = evidence.exchange_pending;
+        }
         if request.selection.source() == PanelMode::Reaction {
             self.executor
                 .fetch_self_role_message(&panel.channel_id, &panel.message_id)
@@ -1449,6 +1467,9 @@ impl SelfRoleRuntime {
             }
         }
         // Fail closed on catalogue drift, not by filtering persisted intent away.
+        if !effects_match_catalogue(&event.effects, &offered) {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
         for ids in [&event.desired_role_ids, &event.pre_mutation_role_ids] {
             if ids.iter().any(|id| !offered.contains(id)) {
                 return Err(RuntimeError::InvalidSnapshot);
@@ -1595,6 +1616,21 @@ fn push_role(ids: &mut Vec<String>, role: &str) {
     if !ids.iter().any(|id| id == role) {
         ids.push(role.into());
     }
+}
+
+fn effects_match_catalogue(effects: &AuditEffects, offered: &[String]) -> bool {
+    [
+        &effects.added_role_ids,
+        &effects.removed_role_ids,
+        &effects.attempted_added_role_ids,
+        &effects.attempted_removed_role_ids,
+        &effects.compensated_added_role_ids,
+        &effects.compensated_removed_role_ids,
+        &effects.unresolved_added_role_ids,
+        &effects.unresolved_removed_role_ids,
+    ]
+    .iter()
+    .all(|ids| ids.iter().all(|id| offered.contains(id)))
 }
 
 fn mark_attempt(effects: &mut AuditEffects, role: &str, add: bool) {

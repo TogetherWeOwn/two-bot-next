@@ -123,6 +123,23 @@ async fn exchange_owner_state(pool: &PgPool, event: &str) -> TestResult<(String,
     Ok((audit, panel.map(|row| row.0)))
 }
 
+async fn incorporation_authority_state(
+    pool: &PgPool,
+    event: &str,
+) -> TestResult<(String, Option<String>)> {
+    let (audit,): (String,) = sqlx::query_as(
+        "SELECT (to_jsonb(a)-ARRAY['claim_token','attempted_added_role_ids',
+         'attempted_removed_role_ids','compensated_added_role_ids','compensated_removed_role_ids',
+         'unresolved_added_role_ids','unresolved_removed_role_ids','exchange_pending'])::text
+         FROM self_role_audit a WHERE event_id=$1",
+    )
+    .bind(event)
+    .fetch_one(pool)
+    .await?;
+    let (_, panel) = exchange_owner_state(pool, event).await?;
+    Ok((audit, panel))
+}
+
 async fn exchange_receipts_survive_generation_transfer(pool: &PgPool) -> TestResult {
     let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
     let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
@@ -292,6 +309,65 @@ async fn exchange_receipts_survive_generation_transfer(pool: &PgPool) -> TestRes
         );
         assert_eq!(exchange_owner_state(pool, &audit.event_id).await?, before);
     }
+    let acknowledged = store
+        .journal_role_exchange(
+            &recovered,
+            Some(&new_lane),
+            &ExchangeIntent {
+                role_id: "103".into(),
+                compensating: true,
+                ..intent.clone()
+            },
+        )
+        .await?
+        .unwrap();
+    assert!(
+        store
+            .complete_role_exchange(&acknowledged, ExchangeReceipt::Response { status: 204 })
+            .await?
+    );
+    let before = exchange_owner_state(pool, &audit.event_id).await?;
+    assert!(store
+        .incorporate_role_receipts(&original, Some(&new_lane))
+        .await?
+        .is_none());
+    assert!(store
+        .incorporate_role_receipts(&recovered, Some(&lane))
+        .await?
+        .is_none());
+    assert_eq!(exchange_owner_state(pool, &audit.event_id).await?, before);
+    let authority = incorporation_authority_state(pool, &audit.event_id).await?;
+    let evidence = store
+        .incorporate_role_receipts(&recovered, Some(&new_lane))
+        .await?
+        .unwrap();
+    assert!(evidence.exchange_pending);
+    assert!(evidence
+        .effects
+        .unresolved_added_role_ids
+        .contains(&"101".into()));
+    assert!(evidence
+        .effects
+        .unresolved_removed_role_ids
+        .contains(&"102".into()));
+    assert_eq!(evidence.effects.compensated_added_role_ids, ["103"]);
+    assert!(evidence.effects.compensated_removed_role_ids.is_empty());
+    assert_eq!(
+        incorporation_authority_state(pool, &audit.event_id).await?,
+        authority
+    );
+    assert_eq!(
+        store
+            .incorporate_role_receipts(&recovered, Some(&new_lane))
+            .await?
+            .unwrap(),
+        evidence
+    );
+    assert!(matches!(
+        store.finish_owned_audit(&audit, &recovered).await,
+        Err(StoreError::PendingExchange)
+    ));
+
     audit.event_id = "exchange-uninitialized".into();
     audit.effects = AuditEffects::default();
     audit.desired_role_ids.clear();
@@ -392,6 +468,43 @@ async fn terminal_exchange_receipts_survive_generation_transfer(pool: &PgPool) -
             .await?
     );
     assert_eq!(exchange_owner_state(pool, name).await?, before);
+    assert!(store
+        .incorporate_terminal_receipts(&former, &new_lane)
+        .await?
+        .is_none());
+    assert!(store
+        .incorporate_terminal_receipts(&current, &lane)
+        .await?
+        .is_none());
+    assert!(matches!(
+        store.incorporate_terminal_receipts(&current, &normal).await,
+        Err(StoreError::WrongPanel)
+    ));
+    assert_eq!(exchange_owner_state(pool, name).await?, before);
+    let authority = incorporation_authority_state(pool, name).await?;
+    let evidence = store
+        .incorporate_terminal_receipts(&current, &new_lane)
+        .await?
+        .unwrap();
+    assert!(evidence.exchange_pending);
+    assert!(evidence
+        .effects
+        .unresolved_removed_role_ids
+        .contains(&"101".into()));
+    assert_eq!(evidence.effects.compensated_removed_role_ids, ["101"]);
+    assert!(evidence.effects.compensated_added_role_ids.is_empty());
+    assert_eq!(incorporation_authority_state(pool, name).await?, authority);
+    assert_eq!(
+        store
+            .incorporate_terminal_receipts(&current, &new_lane)
+            .await?
+            .unwrap(),
+        evidence
+    );
+    assert!(matches!(
+        store.finish_superseded_repair(&current, &new_lane).await,
+        Err(StoreError::PendingExchange)
+    ));
     let tokens: Vec<String> =
         sqlx::query_scalar("SELECT receipt_token FROM self_role_exchanges WHERE event_id=$1")
             .bind(name)
@@ -839,6 +952,8 @@ async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
         "paired-panel",
         "renew",
         "journal",
+        "incorporate",
+        "incorporate-panel",
         "finish",
         "acquire",
     ] {
@@ -854,7 +969,7 @@ async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
         let mut panel = acquired(store.claim_panel(&panel_key(&audit), None).await?);
         assert!(store.set_panel_claim_option(&mut panel, None).await?);
         let mut lock = pool.begin().await?;
-        if operation == "paired-panel" {
+        if matches!(operation, "paired-panel" | "incorporate-panel") {
             sqlx::query("SELECT panel_id FROM self_role_panel_claims WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3 FOR UPDATE")
                 .bind(&panel.key.guild_id).bind(&panel.key.member_id).bind(&panel.key.panel_id)
                 .execute(&mut *lock).await?;
@@ -874,6 +989,10 @@ async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
                         .journal_superseded_repair(&claim, &panel, &AuditEffects::default())
                         .await
                 }
+                "incorporate" | "incorporate-panel" => store
+                    .incorporate_terminal_receipts(&claim, &panel)
+                    .await
+                    .map(|evidence| evidence.is_some()),
                 "finish" => store.finish_superseded_repair(&claim, &panel).await,
                 "acquire" => store
                     .claim_superseded_audit(&hint)
