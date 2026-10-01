@@ -451,7 +451,7 @@ pub struct RestRequest {
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
-    pub received_at: std::time::Instant,
+    pub received_at: tokio::time::Instant,
 }
 
 impl RestRequest {
@@ -462,6 +462,17 @@ impl RestRequest {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+}
+
+/// Delay the first mock observation after parsing, not executor admission.
+pub struct ReceiptGate {
+    pub entered: oneshot::Receiver<()>,
+    pub release: oneshot::Sender<()>,
+}
+
+struct ReceiptHold {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
 }
 
 /// The running scripted REST double.
@@ -476,6 +487,38 @@ impl MockRest {
     /// Bind on 127.0.0.1 and start serving `script` in order; once the queue
     /// is spent, every further request gets `default`.
     pub async fn start(script: Vec<ScriptedResponse>, default: ScriptedResponse) -> Self {
+        Self::start_inner(script, default, None).await
+    }
+
+    pub async fn start_with_first_receipt_gate(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+    ) -> (Self, ReceiptGate) {
+        let (entered, observed) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let mock = Self::start_inner(
+            script,
+            default,
+            Some(ReceiptHold {
+                entered,
+                release: released,
+            }),
+        )
+        .await;
+        (
+            mock,
+            ReceiptGate {
+                entered: observed,
+                release,
+            },
+        )
+    }
+
+    async fn start_inner(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+        first_receipt: Option<ReceiptHold>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -483,7 +526,7 @@ impl MockRest {
         let handle = {
             let recorded = Arc::clone(&recorded);
             tokio::spawn(async move {
-                rest_task(listener, recorded, queue, default).await;
+                rest_task(listener, recorded, queue, default, first_receipt).await;
             })
         };
         Self {
@@ -511,12 +554,22 @@ impl MockRest {
     }
 }
 
+impl Drop for MockRest {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 async fn rest_task(
     listener: TcpListener,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
     queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
     default: ScriptedResponse,
+    mut first_receipt: Option<ReceiptHold>,
 ) {
+    let mut handlers = tokio::task::JoinSet::new();
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             break;
@@ -524,7 +577,9 @@ async fn rest_task(
         let recorded = Arc::clone(&recorded);
         let queue = Arc::clone(&queue);
         let default = default.clone();
-        tokio::spawn(async move { handle_rest(stream, recorded, queue, default).await });
+        let receipt = first_receipt.take();
+        handlers.spawn(async move { handle_rest(stream, recorded, queue, default, receipt).await });
+        while handlers.try_join_next().is_some() {}
     }
 }
 
@@ -533,16 +588,21 @@ async fn handle_rest(
     recorded: Arc<Mutex<Vec<RestRequest>>>,
     queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
     default: ScriptedResponse,
+    receipt: Option<ReceiptHold>,
 ) {
     let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
         return;
     };
+    if let Some(receipt) = receipt {
+        let _ = receipt.entered.send(());
+        let _ = receipt.release.await;
+    }
     recorded.lock().expect("recorded").push(RestRequest {
         method,
         path,
         headers,
         body,
-        received_at: std::time::Instant::now(),
+        received_at: tokio::time::Instant::now(),
     });
     let next = queue
         .lock()

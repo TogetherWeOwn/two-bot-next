@@ -123,14 +123,22 @@ async fn databases_are_migrated_isolated_and_removed_even_after_setup_failure() 
     while let Some(result) = creating.join_next().await {
         fixtures.push(result.unwrap());
     }
-    let mut closing = tokio::task::JoinSet::new();
+    let mut prepared = Vec::new();
     for fixture in fixtures {
         let peer = fixture.independent_pool().await.unwrap();
+        prepared.push((fixture, peer));
+    }
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(prepared.len() + 1));
+    let mut closing = tokio::task::JoinSet::new();
+    for (fixture, peer) in prepared {
+        let start = start.clone();
         closing.spawn(async move {
+            start.wait().await;
             fixture.close().await.unwrap();
             assert!(peer.is_closed());
         });
     }
+    start.wait().await;
     while let Some(result) = closing.join_next().await {
         result.unwrap();
     }

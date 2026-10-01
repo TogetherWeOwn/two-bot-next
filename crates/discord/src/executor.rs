@@ -411,6 +411,20 @@ pub struct ActionExecutor {
     inner: Arc<ExecutorInner>,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PacingLane {
+    Shared,
+    Kick,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PacingAdmission {
+    pub lane: PacingLane,
+    pub at: tokio::time::Instant,
+}
+
 struct ExecutorInner {
     transport: HyperTransport,
     /// Twilight client kept as the request factory (builders + audit
@@ -420,8 +434,10 @@ struct ExecutorInner {
     pace_interval: Duration,
     kick_interval: Duration,
     moderation_timeout: Duration,
-    pace_last_at: tokio::sync::Mutex<std::time::Instant>,
-    kick_last_at: tokio::sync::Mutex<std::time::Instant>,
+    pace_last_at: tokio::sync::Mutex<tokio::time::Instant>,
+    kick_last_at: tokio::sync::Mutex<tokio::time::Instant>,
+    #[cfg(test)]
+    pacing_probe: Option<tokio::sync::mpsc::UnboundedSender<PacingAdmission>>,
     requests: std::sync::atomic::AtomicU64,
 }
 
@@ -472,11 +488,13 @@ impl ActionExecutor {
                 kick_interval: Duration::from_millis(KICK_INTERVAL_MS),
                 moderation_timeout: Duration::from_millis(MODERATION_TIMEOUT_MS),
                 pace_last_at: tokio::sync::Mutex::new(
-                    std::time::Instant::now() - Duration::from_secs(60),
+                    tokio::time::Instant::now() - Duration::from_secs(60),
                 ),
                 kick_last_at: tokio::sync::Mutex::new(
-                    std::time::Instant::now() - Duration::from_secs(60),
+                    tokio::time::Instant::now() - Duration::from_secs(60),
                 ),
+                #[cfg(test)]
+                pacing_probe: None,
                 requests: std::sync::atomic::AtomicU64::new(0),
             }),
         })
@@ -490,9 +508,38 @@ impl ActionExecutor {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_pacing_probe(
+        token: String,
+        proxy_url: Option<String>,
+    ) -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<PacingAdmission>), String> {
+        let mut executor = Self::with_proxy(token, proxy_url)?;
+        let (probe, admissions) = tokio::sync::mpsc::unbounded_channel();
+        Arc::get_mut(&mut executor.inner).unwrap().pacing_probe = Some(probe);
+        Ok((executor, admissions))
+    }
+
     async fn pace(&self, kick_lane: bool) {
         let mut last = self.paced_lane(kick_lane).await;
-        *last = std::time::Instant::now();
+        self.stamp_paced_lane(&mut last, kick_lane);
+    }
+
+    pub(crate) fn stamp_paced_lane(&self, last: &mut tokio::time::Instant, _kick_lane: bool) {
+        let at = tokio::time::Instant::now();
+        *last = at;
+        // Emit only committed admission, synchronously under the lane lock.
+        // Reservation and refused late authorization are not admission.
+        #[cfg(test)]
+        if let Some(probe) = &self.inner.pacing_probe {
+            let _ = probe.send(PacingAdmission {
+                lane: if _kick_lane {
+                    PacingLane::Kick
+                } else {
+                    PacingLane::Shared
+                },
+                at,
+            });
+        }
     }
 
     /// Keep the reservation through late authorization and the bounded send
@@ -500,7 +547,7 @@ impl ActionExecutor {
     pub(crate) async fn paced_lane(
         &self,
         kick_lane: bool,
-    ) -> tokio::sync::MutexGuard<'_, std::time::Instant> {
+    ) -> tokio::sync::MutexGuard<'_, tokio::time::Instant> {
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
         } else {
@@ -508,9 +555,8 @@ impl ActionExecutor {
         };
         let last = lock.lock().await;
         let earliest = *last + interval;
-        let now = std::time::Instant::now();
-        if earliest > now {
-            tokio::time::sleep(earliest - now).await;
+        if earliest > tokio::time::Instant::now() {
+            tokio::time::sleep_until(earliest).await;
         }
         last
     }

@@ -17,6 +17,8 @@ pub mod internal_actions;
 pub mod internal_channel_moderation;
 mod message_safety;
 pub mod pipeline;
+#[cfg(test)]
+mod test_clock;
 
 pub use adapter::event_to_core;
 pub use executor::{

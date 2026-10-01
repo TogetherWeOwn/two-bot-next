@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_clock::{wall_clock_timeout, ClockHold};
 use serde_json::json;
 use std::{io, sync::Mutex};
 use tokio::{
@@ -54,23 +55,22 @@ struct MockDiscord {
     requests: Arc<Mutex<Vec<Recorded>>>,
     request_received: Arc<tokio::sync::Notify>,
     response_received: Arc<tokio::sync::Notify>,
+    clock_released: Arc<tokio::sync::Notify>,
     stall_response: bool,
     task: JoinHandle<()>,
-    _clock_hold: std::sync::mpsc::Sender<()>,
+    _clock_hold: ClockHold,
 }
 
 impl MockDiscord {
     async fn start(reply: Reply) -> Self {
-        // Paused time normally auto-advances while real sockets wait on the
-        // reactor. A live blocking task inhibits that documented Tokio behavior,
-        // without spinning or tying the HTTP deadline to host scheduling speed.
-        let (clock_hold, release) = std::sync::mpsc::channel();
-        let (started, ready) = tokio::sync::oneshot::channel();
-        tokio::task::spawn_blocking(move || {
-            let _ = started.send(());
-            let _ = release.recv();
-        });
-        ready.await.unwrap();
+        wall_clock_timeout(Duration::from_secs(2), Self::start_inner(reply))
+            .await
+            .expect("mock setup must finish without advancing Tokio time")
+    }
+
+    async fn start_inner(reply: Reply) -> Self {
+        let clock_hold = ClockHold::start().await;
+        let clock_released = clock_hold.released.clone();
         let request_received = Arc::new(tokio::sync::Notify::new());
         let response_received = Arc::new(tokio::sync::Notify::new());
         let received = request_received.clone();
@@ -152,6 +152,7 @@ impl MockDiscord {
             requests,
             request_received,
             response_received,
+            clock_released,
             stall_response,
             task,
             _clock_hold: clock_hold,
@@ -195,14 +196,26 @@ fn announcement(content: &str) -> Map<String, Value> {
 }
 
 async fn run_once(executor: &AnnouncementExecutor, body: &Map<String, Value>) -> ExecutionOutcome {
-    let start = tokio::time::Instant::now();
-    let outcome = executor.execute("announcement.post", body).await;
-    assert_eq!(
-        start.elapsed(),
-        Duration::ZERO,
-        "socket I/O advanced the clock"
-    );
-    outcome
+    run_action(executor, "announcement.post", body).await
+}
+
+async fn run_action(
+    executor: &AnnouncementExecutor,
+    action: &str,
+    body: &Map<String, Value>,
+) -> ExecutionOutcome {
+    wall_clock_timeout(Duration::from_secs(2), async {
+        let start = tokio::time::Instant::now();
+        let outcome = executor.execute(action, body).await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "socket I/O advanced the clock"
+        );
+        outcome
+    })
+    .await
+    .expect("HTTP fixture must finish without advancing Tokio time")
 }
 
 async fn run_until_timeout(
@@ -210,24 +223,54 @@ async fn run_until_timeout(
     executor: &AnnouncementExecutor,
     body: &Map<String, Value>,
 ) -> ExecutionOutcome {
-    let ready = if mock.stall_response {
-        &mock.request_received
-    } else {
-        &mock.response_received
-    };
-    let pending = executor.execute("announcement.post", body);
-    tokio::pin!(pending);
-    tokio::select! {
-        outcome = &mut pending => panic!("stalled request finished before its deadline: {outcome:?}"),
-        () = ready.notified() => {}
+    wall_clock_timeout(Duration::from_secs(2), async {
+        let ready = if mock.stall_response {
+            &mock.request_received
+        } else {
+            &mock.response_received
+        };
+        let pending = executor.execute("announcement.post", body);
+        tokio::pin!(pending);
+        tokio::select! {
+            outcome = &mut pending => panic!("stalled request finished before its deadline: {outcome:?}"),
+            () = ready.notified() => {}
+        }
+        // Cross the deadline only after request/client-header acquisition.
+        let tick = Duration::from_millis(1);
+        tokio::time::advance(executor.timeout - tick).await;
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        tokio::time::advance(tick + tick).await;
+        pending.await
+    })
+    .await
+    .expect("deadline fixture must finish after controlled advancement")
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_cancels_never_ready_barriers_and_hidden_timers_and_releases_hold() {
+    for hidden_timer in [false, true] {
+        let mock = MockDiscord::start(Reply::success()).await;
+        let released = mock.clock_released.clone();
+        let start = tokio::time::Instant::now();
+        let result = wall_clock_timeout(Duration::from_millis(20), async move {
+            let _mock = mock;
+            if hidden_timer {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            } else {
+                let never_ready = tokio::sync::Notify::new();
+                never_ready.notified().await;
+            }
+        })
+        .await;
+        assert_eq!(
+            result,
+            Err("frozen-clock fixture exceeded wall-clock watchdog")
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        wall_clock_timeout(Duration::from_secs(2), released.notified())
+            .await
+            .expect("cancelled fixture must release its blocking clock hold");
     }
-    // The fixture has received the request (or the executor has acquired the
-    // headers). Only now cross the deadline; kernel I/O cannot race virtual time.
-    let tick = Duration::from_millis(1);
-    tokio::time::advance(executor.timeout - tick).await;
-    assert!(futures_util::poll!(&mut pending).is_pending());
-    tokio::time::advance(tick + tick).await;
-    pending.await
 }
 
 #[tokio::test(start_paused = true)]
@@ -287,14 +330,12 @@ async fn refuses_bad_inputs_missing_mapping_and_every_other_core_verb_without_ht
         }
         assert!(!AnnouncementExecutor::supports(action));
         assert_eq!(
-            executor.execute(action, &announcement("ok")).await,
+            run_action(&executor, action, &announcement("ok")).await,
             ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed)
         );
     }
     assert_eq!(
-        executor
-            .execute("attacker-controlled-verb", &Map::new())
-            .await,
+        run_action(&executor, "attacker-controlled-verb", &Map::new()).await,
         ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed)
     );
     for value in [

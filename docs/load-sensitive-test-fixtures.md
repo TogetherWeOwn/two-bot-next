@@ -6,6 +6,44 @@ Announcement transport tests use paused Tokio time, a blocking clock hold during
 real socket I/O, and request/header barriers. Only deadline tests advance time,
 and they check the pending outcome immediately before the existing deadline.
 The production deadline, response classification and retry policy are unchanged.
+An independent standard-thread watchdog bounds setup, notification barriers and
+final completion without advancing or unpausing Tokio. Its cancellation drops
+the pending future and releases the blocking clock hold. Negative regressions
+exercise both a never-ready notification and a hidden virtual sleep, verify zero
+virtual advancement, and acknowledge the released hold.
+
+## Shared audit pacing
+
+The executor's lane timestamps and waits use the same Tokio monotonic clock.
+Unpaused production keeps the existing 110 ms shared and 350 ms kick intervals;
+checked posts retain their reservation through late authorization and HTTP send.
+A refused authorization commits neither a lane stamp nor a request.
+
+Three former receipt-gap integration cases now run in the adapter's always-built
+unit suite, against the real adapter/transport and the same loopback REST double.
+This keeps the committed-admission probe `cfg(test)` without a release API or a
+feature that could silently omit the tests. The probe reports the exact stamp
+synchronously under the real lane lock, only after authorization succeeds.
+
+Paused-clock cases check pending state at 109 ms, release at 111 ms, assert each
+committed shared gap is at least 110 ms, and verify request counts, methods and
+body order. A barrier deliberately delays the first mock receipt by 100 ms;
+correct 111 ms admission spacing then yields an 11 ms receipt gap. That controlled
+counterexample distinguishes observer lag from admission under-pacing; it does
+not reproduce or establish the historical failing schedule. Further cases prove
+late refusal sends nothing and consumes no slot, and held authorization cannot
+be overtaken by another post or a shared-lane read. All use the independent
+wall-clock watchdog and non-spinning clock hold.
+
+## Single-core harness concurrency
+
+Before applying native-binary CPU affinity, the workflow preserves explicit
+`RUST_TEST_THREADS` or queries unpinned Rust `available_parallelism()` (which
+accounts for CPU quotas, not just the affinity mask). It exports that count,
+records its source and original affinity, and leaves explicit `--test-threads`
+overrides intact. Compilation is unpinned and test bodies are not serialized.
+Old single-core runs that did not preserve libtest's original parallelism do not
+establish this concurrency requirement. A corrected SHA starts at **0/3**.
 
 ## Disposable database lifecycle
 
@@ -14,6 +52,9 @@ CREATE/DROP statements before their SQL deadline starts; migration and test bodi
 remain concurrent. Teardown closes all fixture-owned pools and propagates DROP
 errors. The lifecycle regression checks catalog absence, independent-pool closure,
 eight-way create/close, migration failure and cancellation-resilient cleanup.
+The close wave prepares all eight fixtures and independent peers before a
+nine-participant barrier releases all eight teardown callers together; SQL DDL
+alone remains queued by the existing gate.
 
 These measures do not remove PostgreSQL's internal waits. PostgreSQL 18.6 DROP
 unconditionally requests a forced immediate checkpoint and waits for it after
