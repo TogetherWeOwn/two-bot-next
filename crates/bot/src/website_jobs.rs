@@ -6,10 +6,10 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
-    apply_web_contract, build_community_snapshot, build_counter_reading, match_rank_roles,
-    normalize_events, now_iso, read_raid_windows, replace_events, write_counter,
-    write_rank_snapshot, Config, RawScheduledEvent, RosterMember, WebsiteStoreError,
-    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    build_community_snapshot, build_counter_reading, match_rank_roles, normalize_events, now_iso,
+    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config,
+    RawScheduledEvent, RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
+    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::ActionExecutor;
 
@@ -69,15 +69,11 @@ impl Context {
                 let db = two_bot_cutover::connect(
                     &self.url,
                     two_bot_cutover::DB_POOL_MAX_DEFAULT,
-                    false,
+                    true, // Operator provisions migrations/views; runtime is DML-only.
                 )
                 .await
                 .map_err(|_| ErrorClass::Database)?;
-                let pool = db.pool().clone();
-                apply_web_contract(&pool)
-                    .await
-                    .map_err(|_| ErrorClass::Database)?;
-                Ok(pool)
+                Ok(db.pool().clone())
             })
             .await
     }
@@ -91,6 +87,16 @@ impl Drop for Shutdown {
     }
 }
 
+fn governed_executor(
+    token: &str,
+    proxy: Option<String>,
+    pool: PgPool,
+) -> Result<ActionExecutor, String> {
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(pool, token)
+        .map_err(|error| error.to_string())?;
+    ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
+}
+
 pub async fn serve(
     config: &Config,
     listener: tokio::net::TcpListener,
@@ -99,7 +105,16 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
-        match ActionExecutor::with_proxy(token.to_owned(), std::env::var("DISCORD_API_BASE").ok()) {
+        // Lazy connection preserves parked/startup behavior; every wire attempt
+        // still fails closed on this same runtime database authority.
+        let rest = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(url)
+            .map_err(|_| "invalid admission authority".to_owned())
+            .and_then(|pool| {
+                governed_executor(token, std::env::var("DISCORD_API_BASE").ok(), pool)
+            });
+        match rest {
             Ok(rest) => {
                 let context = Arc::new(Context {
                     url: url.to_owned(),

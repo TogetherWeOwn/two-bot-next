@@ -41,6 +41,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'internal_idempotency', 'table'),
     ('public', 'internal_action_log', 'table'),
     ('public', 'internal_discord_events', 'table'),
+    ('public', 'discord_send_admission', 'admission'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),
     ('public', 'xp_awards_id_seq', 'sequence'),

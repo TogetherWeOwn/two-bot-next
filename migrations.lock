@@ -69,6 +69,10 @@
       "sha256": "c291e8683b2afdeb23a985953a2afeba86519c06ec1deb8c6d2c5dd56d2f22bd",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0360_discord_send_admission.sql": {
+      "sha256": "5f5986ae81173571aaea237bff45f09d6e23256f5023ed7a3570697796da791d",
+      "justification": "TOG-11045: add durable token-wide Discord send admission; no existing migration SQL changed."
+    },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."

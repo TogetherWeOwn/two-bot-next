@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use two_bot_core::apply_web_contract;
 use two_bot_testsupport::TestDatabase;
 
 #[allow(dead_code)]
@@ -84,7 +85,12 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     let observation = Arc::new(Mutex::new(()));
 
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
-    let rest = executor(&mock);
+    let rest = governed_executor(
+        "synthetic-job-test-token",
+        Some(mock.origin()),
+        pool.clone(),
+    )
+    .unwrap();
     run_once(Kind::Rank, &pool, &rest, guild, &observation)
         .await
         .unwrap();
@@ -126,7 +132,12 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         ScriptedResponse::status(500),
     )
     .await;
-    let rest = executor(&mock);
+    let rest = governed_executor(
+        "synthetic-job-test-token",
+        Some(mock.origin()),
+        pool.clone(),
+    )
+    .unwrap();
     // Exercise the supervisor as well as the adapters, sequentially for the
     // ordered-response mock. Each job has an immediate first deadline.
     for (name, kind) in NAMES
@@ -214,6 +225,27 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         .unwrap();
     assert_eq!(rows, 0, "valid empty response clears mirror");
     assert_eq!(mock.requests().len(), 8);
+    // The production constructor joins the same lane even for a mock proxy.
+    let guarded = governed_executor(
+        "synthetic-job-test-token",
+        Some(mock.origin()),
+        pool.clone(),
+    )
+    .unwrap();
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(
+        pool.clone(),
+        "synthetic-job-test-token",
+    )
+    .unwrap();
+    admission
+        .extend(two_bot_core::send_admission::SendCooldown::Indefinite)
+        .await
+        .unwrap();
+    assert_eq!(
+        run_once(Kind::Events, &pool, &guarded, guild, &observation).await,
+        Err(ErrorClass::Rest)
+    );
+    assert_eq!(mock.requests().len(), 8, "held job must not reach HTTP");
     mock.shutdown().await;
     for query in [
         "SELECT human_member_count_at FROM guild_counters WHERE guild_id=$1",

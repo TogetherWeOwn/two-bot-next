@@ -13,7 +13,13 @@ installed by this change.
 
 1. Apply migration `0360_discord_send_admission.sql` through the existing,
    separately authorized migration process. Every consumer of the same token
-   must use the **same database authority** as the bot's `TWO_DATABASE_URL`.
+   must use the **same database authority**. Container gateway/sticky/jobs use
+   `Config.database_url` (`DATABASE_URL`); administrative tools use
+   `TWO_DATABASE_URL`, which must reach that same database for the same token.
+   A distinct administrative data-import target is not an admission authority.
+   The print-only role plan/verifier grants `two_bot_runtime` SELECT, INSERT
+   and UPDATE on this lane only; DELETE/TRUNCATE and reader/PUBLIC access are
+   forbidden. Apply that reviewed plan separately, not through runtime startup.
    The table is explicitly `public.discord_send_admission`: changing
    `search_path`, guild, channel, caller or process cannot split its lane.
 2. Construct `PgSendAdmission::new(pool.clone(), bot_token)` and share it through
@@ -61,6 +67,11 @@ until the durable hold allows it.
   bounded response cap is 8 MiB for list/history responses. Local legacy pacing
   is additional, never the authority. Ungoverned constructor paths accept only
   explicit loopback HTTP fixtures; real Discord is refused.
+- **Website-contract jobs (added to main during this change):** the supervised
+  counter/rank/events adapters construct a governed ActionExecutor from the same
+  gateway `DATABASE_URL`. Their lazy admission pool preserves startup/parking
+  behavior; every authenticated roster/role/event read fails closed before wire
+  I/O when the shared lane is held or unavailable.
 - **Cutover:** the three Discord-reading CLI bootstraps call
   `RestClient::from_env`. It requires the runtime `TWO_DATABASE_URL` authority
   even if a data import target is different. Twilight builds requests/models
