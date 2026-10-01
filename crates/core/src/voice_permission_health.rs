@@ -335,8 +335,8 @@ impl NoticeThrottle {
     /// [`NOTICE_MAX_SENDS`] sends so far and the backoff since the previous
     /// send elapsed. Unknown failures are always due.
     #[must_use]
-    pub fn should_notify(&self, failure: &TrackedFailure, now_ms: u64) -> bool {
-        let Some(entry) = self.entries.get(failure) else {
+    pub fn should_notify(&self, failure: TrackedFailure, now_ms: u64) -> bool {
+        let Some(entry) = self.entries.get(&failure) else {
             return true;
         };
         if entry.sends >= NOTICE_MAX_SENDS {
@@ -363,8 +363,8 @@ impl NoticeThrottle {
 
     /// Drop a resolved failure so a recurrence starts a fresh budget.
     /// Returns true when the failure was tracked.
-    pub fn resolve(&mut self, failure: &TrackedFailure) -> bool {
-        self.entries.remove(failure).is_some()
+    pub fn resolve(&mut self, failure: TrackedFailure) -> bool {
+        self.entries.remove(&failure).is_some()
     }
 
     /// Drop every failure for one guild. Returns the number removed.

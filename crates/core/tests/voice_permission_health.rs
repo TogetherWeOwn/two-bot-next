@@ -418,19 +418,19 @@ fn throttle_budget_and_backoff_are_documented() {
 fn throttle_sends_a_few_times_with_backoff_then_stops() {
     let failure = tracked();
     let mut throttle = NoticeThrottle::new();
-    assert!(throttle.should_notify(&failure, 0));
+    assert!(throttle.should_notify(failure, 0));
     throttle.record_sent(failure, 0);
     // First repeat is not due before 5 minutes.
-    assert!(!throttle.should_notify(&failure, NOTICE_BACKOFF_MS[1] - 1));
-    assert!(throttle.should_notify(&failure, NOTICE_BACKOFF_MS[1]));
+    assert!(!throttle.should_notify(failure, NOTICE_BACKOFF_MS[1] - 1));
+    assert!(throttle.should_notify(failure, NOTICE_BACKOFF_MS[1]));
     throttle.record_sent(failure, NOTICE_BACKOFF_MS[1]);
     // Second repeat is not due before 30 more minutes.
     let second = NOTICE_BACKOFF_MS[1] + NOTICE_BACKOFF_MS[2];
-    assert!(!throttle.should_notify(&failure, second - 1));
-    assert!(throttle.should_notify(&failure, second));
+    assert!(!throttle.should_notify(failure, second - 1));
+    assert!(throttle.should_notify(failure, second));
     throttle.record_sent(failure, second);
     // Budget exhausted: silent afterwards, however late.
-    assert!(!throttle.should_notify(&failure, second + 7 * 24 * 60 * 60 * 1_000));
+    assert!(!throttle.should_notify(failure, second + 7 * 24 * 60 * 60 * 1_000));
     // The failure stays listed for /setup until resolved.
     assert_eq!(throttle.current_failures(), vec![failure]);
 }
@@ -442,11 +442,11 @@ fn throttle_resolve_starts_a_fresh_budget() {
     for now in [0, NOTICE_BACKOFF_MS[1], NOTICE_BACKOFF_MS[1] + NOTICE_BACKOFF_MS[2]] {
         throttle.record_sent(failure, now);
     }
-    assert!(!throttle.should_notify(&failure, u64::MAX));
-    assert!(throttle.resolve(&failure));
-    assert!(!throttle.resolve(&failure));
+    assert!(!throttle.should_notify(failure, u64::MAX));
+    assert!(throttle.resolve(failure));
+    assert!(!throttle.resolve(failure));
     assert!(throttle.current_failures().is_empty());
-    assert!(throttle.should_notify(&failure, u64::MAX));
+    assert!(throttle.should_notify(failure, u64::MAX));
 }
 
 #[test]
@@ -460,7 +460,9 @@ fn throttle_lists_failures_in_deterministic_order() {
     let failure = tracked();
     throttle.record_sent(other, 5);
     throttle.record_sent(failure, 0);
-    assert_eq!(throttle.current_failures(), vec![failure, other]);
+    // BTreeMap key order: guild, then location (None sorts before Some),
+    // then diagnostic — insertion order does not matter.
+    assert_eq!(throttle.current_failures(), vec![other, failure]);
     assert_eq!(throttle.clear_guild(1), 2);
     assert!(throttle.current_failures().is_empty());
 }
