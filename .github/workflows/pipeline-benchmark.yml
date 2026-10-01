@@ -55,8 +55,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-pipeline-bench-${{ hashFiles('Cargo.lock') }}
-      - name: Comparator regressions
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench.py' -v
+      - name: Comparator and source-receipt regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test*pipeline_bench*.py' -v
       - name: Benchmark fixture and guard regressions (CI job container only)
         run: |
           cargo test -p two-bot-discord --example pipeline_bench --locked
@@ -71,11 +71,11 @@ jobs:
         # The first evidence run bootstraps the measured baseline; no invented numbers.
         if: hashFiles('docs/pipeline-benchmark-baseline.json') != ''
         run: python3 scripts/compare_pipeline_bench.py pipeline-benchmark.json
-      - name: Upload measurement and revision
+      - name: Record actual source and separate PR head
         if: always()
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: printf '%s\n' "$HEAD_SHA" > pipeline-benchmark-revision.txt
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: sh scripts/pipeline_bench_revision.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
@@ -83,4 +83,5 @@ jobs:
           path: |
             pipeline-benchmark.json
             pipeline-benchmark-revision.txt
+            pipeline-benchmark-pr-head.txt
           retention-days: 14
