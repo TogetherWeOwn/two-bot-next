@@ -208,7 +208,12 @@ class SupplyChainTests(unittest.TestCase):
         self.assertEqual(supply.count("cache-dir: ${{ runner.temp }}/trivy-cache"), 4)
         for name in ["check", "release", "supply-chain"]:
             path = ROOT / ".github/workflows" / f"{name}.yml"
-            self.assertNotIn("ubuntu-latest", path.read_text(), str(path))
+            # Comments may name the overflow example; no runs-on may use it.
+            code = "\n".join(
+                line for line in path.read_text().splitlines()
+                if not line.lstrip().startswith("#")
+            )
+            self.assertNotIn("ubuntu-latest", code, str(path))
 
     def test_candidate_preflight_cannot_replace_existing_gates(self):
         supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
