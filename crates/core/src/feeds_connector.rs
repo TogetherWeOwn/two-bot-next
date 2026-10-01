@@ -412,7 +412,7 @@ fn content_codings(response: &FeedResponse) -> Result<WireCoding, FeedConnectErr
         let value = value
             .is_ascii()
             .then_some(value)
-            .ok_or_else(|| FeedConnectError::Policy(FetchError::UnsupportedContentType))?;
+            .ok_or(FeedConnectError::Policy(FetchError::UnsupportedContentType))?;
         for layer in value.split(',') {
             let layer = layer.trim().to_ascii_lowercase();
             if layer.is_empty() {
