@@ -81,7 +81,13 @@ fn staging_token() -> Result<String, String> {
 
 /// Bump-friendly usage text. `--help` after any subcommand prints it.
 const USAGE: &str = "\
-two-bot backup & restore (TOG-9881)
+two-bot operator commands
+
+  two-bot db roles plan
+      Print the reviewed role SQL; never connects or applies it.
+
+  two-bot db roles verify
+      Read-only privilege drift inspection. Env: TWO_DATABASE_URL (required).
 
   two-bot backup
       Dump all bot-owned tables (v3 format) to TWO_BACKUP_DIR
@@ -138,6 +144,7 @@ pub async fn dispatch(args: &[String]) -> i32 {
         return 0;
     }
     match args[0].as_str() {
+        "db" => crate::database_roles_cli::dispatch(&args[1..]).await,
         "backup" => cmd_backup().await,
         "restore" => cmd_restore(&args[1..]).await,
         "backup-upload" => cmd_backup_upload(&args[1..]).await,
