@@ -348,6 +348,15 @@ impl UnbanResolution {
     }
 }
 
+/// Identity of one durable PUT attempt, returned before dispatch. A rejected
+/// request may be retried, but the retry gets a different generation. Keep this
+/// identity with the operation's evidence; never relabel old evidence using a
+/// lookup of the current request. Generation does not prove remote ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BanAttempt {
+    pub generation: i64,
+}
+
 /// Persistence seam for the member slice (legacy `ModerationStore`,
 /// member-slice methods only; lockdown methods belong to TOG-10079).
 /// All timestamps are `YYYY-MM-DDTHH:MM:SS.sssZ` ISO strings, bound with
@@ -416,24 +425,38 @@ pub trait MemberModerationStore: Send + Sync {
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Persist a prepared permanent-ban intent BEFORE Discord, fencing any
-    /// older expiry until this intent is explicitly confirmed or rejected.
+    /// older expiry until this exact attempt is explicitly resolved. The
+    /// returned identity must accompany the PUT and its outcome evidence.
     fn stage_ban(
         &self,
         guild_id: &str,
         user_id: &str,
         request_id: &str,
         created_at: &str,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    ) -> impl Future<Output = Result<BanAttempt, StoreError>> + Send;
 
-    /// Record observed Discord acceptance and supersede strictly older
-    /// schedules atomically. Order is persisted, not derived from wall time.
-    fn confirm_ban(
+    /// Record observed acceptance of this exact PUT and supersede strictly
+    /// older schedules atomically. Local order is not remote ordering proof.
+    fn confirm_ban_attempt(
         &self,
         guild_id: &str,
         user_id: &str,
         request_id: &str,
+        attempt: BanAttempt,
         completed_at: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Identity-only evidence cannot safely distinguish retried PUTs. Kept
+    /// for source compatibility, but deliberately never mutates the ledger.
+    fn confirm_ban(
+        &self,
+        _guild_id: &str,
+        _user_id: &str,
+        _request_id: &str,
+        _completed_at: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(Err(StoreError::new("exact ban attempt required")))
+    }
 
     /// Persist a prepared intent and `staged` expiry together BEFORE Discord.
     /// A prepared intent is uncertain, never automatically activated.
@@ -445,7 +468,7 @@ pub trait MemberModerationStore: Send + Sync {
         reason: &str,
         request_id: &str,
         created_at: &str,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    ) -> impl Future<Output = Result<BanAttempt, StoreError>> + Send;
 
     /// Activate only a confirmed accepted expiry which is still the newest
     /// non-rejected ban intent. Errors when that ownership or staging is lost.
@@ -457,15 +480,27 @@ pub trait MemberModerationStore: Send + Sync {
         completed_at: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Atomically reject a prepared intent and cancel its staged expiry.
+    /// Atomically reject this exact prepared PUT and cancel its staged expiry.
     /// If cleanup fails, the prepared fence survives: no guessed recovery.
-    fn reject_ban(
+    fn reject_ban_attempt(
         &self,
         guild_id: &str,
         user_id: &str,
         request_id: &str,
+        attempt: BanAttempt,
         completed_at: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Like identity-only confirmation, identity-only rejection fails closed.
+    fn reject_ban(
+        &self,
+        _guild_id: &str,
+        _user_id: &str,
+        _request_id: &str,
+        _completed_at: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(Err(StoreError::new("exact ban attempt required")))
+    }
 
     /// Claim due accepted expiries in THIS guild only. Recover only staged
     /// rows with durable acceptance and current generation ownership. Takes
@@ -868,7 +903,7 @@ where
             validated.action,
             ModerationAction::Ban | ModerationAction::TempBan
         ) {
-            self.audit_accepted(exec, validated, outcome).await;
+            self.audit_accepted(exec, validated, outcome, None).await;
         }
         self.store
             .complete(
@@ -897,7 +932,8 @@ where
             .unwrap_or("");
         match validated.action {
             ModerationAction::Ban => {
-                self.store
+                let attempt = self
+                    .store
                     .stage_ban(
                         &exec.guild_id,
                         target_id,
@@ -905,7 +941,8 @@ where
                         &format_iso_millis((self.now)()),
                     )
                     .await?;
-                self.dispatch_ban(exec, target_id, validated).await?;
+                self.dispatch_ban(exec, target_id, validated, attempt)
+                    .await?;
                 Ok(MemberOutcome::Banned)
             }
             ModerationAction::TempBan => {
@@ -914,7 +951,8 @@ where
                     format_iso_millis((self.now)().saturating_add(seconds as i64 * 1000));
                 // Prepared is not evidence of acceptance. Persist acceptance
                 // separately before activation; only confirmed rows recover.
-                self.store
+                let attempt = self
+                    .store
                     .stage_unban(
                         &exec.guild_id,
                         target_id,
@@ -930,7 +968,8 @@ where
                         &format_iso_millis((self.now)()),
                     )
                     .await?;
-                self.dispatch_ban(exec, target_id, validated).await?;
+                self.dispatch_ban(exec, target_id, validated, attempt)
+                    .await?;
                 self.store
                     .activate_staged_unban(
                         &exec.guild_id,
@@ -981,6 +1020,7 @@ where
         exec: &MemberExecution,
         target: &str,
         validated: &ValidatedMemberRequest,
+        attempt: BanAttempt,
     ) -> Result<(), MemberError> {
         if let Err(err) = self
             .discord
@@ -989,10 +1029,11 @@ where
         {
             if err.is_safe_pre_mutation() {
                 self.store
-                    .reject_ban(
+                    .reject_ban_attempt(
                         &exec.guild_id,
                         target,
                         &exec.request_id,
+                        attempt,
                         &format_iso_millis((self.now)()),
                     )
                     .await?;
@@ -1007,12 +1048,14 @@ where
         } else {
             MemberOutcome::Banned
         };
-        self.audit_accepted(exec, validated, outcome).await;
+        self.audit_accepted(exec, validated, outcome, Some(attempt))
+            .await;
         self.store
-            .confirm_ban(
+            .confirm_ban_attempt(
                 &exec.guild_id,
                 target,
                 &exec.request_id,
+                attempt,
                 &format_iso_millis((self.now)()),
             )
             .await?;
@@ -1024,10 +1067,11 @@ where
         exec: &MemberExecution,
         validated: &ValidatedMemberRequest,
         outcome: MemberOutcome,
+        attempt: Option<BanAttempt>,
     ) {
         if let Err(err) = self
             .store
-            .record_audit(&self.audit_row(exec, validated, outcome))
+            .record_audit(&self.audit_row(exec, validated, outcome, attempt))
             .await
         {
             tracing::error!(
@@ -1043,7 +1087,14 @@ where
         exec: &MemberExecution,
         validated: &ValidatedMemberRequest,
         outcome: MemberOutcome,
+        attempt: Option<BanAttempt>,
     ) -> AuditRow {
+        let mut metadata = serde_json::json!({
+            "duration_seconds": validated.duration_seconds,
+        });
+        if let Some(attempt) = attempt {
+            metadata["ban_attempt_generation"] = serde_json::json!(attempt.generation);
+        }
         AuditRow {
             request_id: exec.request_id.clone(),
             guild_id: exec.guild_id.clone(),
@@ -1053,10 +1104,7 @@ where
             reason: validated.reason.clone(),
             outcome: outcome.as_str(),
             idempotency_key: exec.idempotency_key.clone(),
-            metadata_json: serde_json::json!({
-                "duration_seconds": validated.duration_seconds,
-            })
-            .to_string(),
+            metadata_json: metadata.to_string(),
         }
     }
 
@@ -1199,7 +1247,7 @@ enum UnbanState {
 struct BanRow {
     guild_id: String,
     user_id: String,
-    generation: u64,
+    generation: i64,
     state: BanState,
 }
 
@@ -1217,7 +1265,7 @@ struct MemInner {
     warnings: Vec<(String, String, String, String, String, String)>,
     unbans: HashMap<String, UnbanRow>,
     bans: HashMap<String, BanRow>,
-    ban_sequence: u64,
+    ban_sequence: i64,
     claim_sequence: u64,
 }
 
@@ -1237,7 +1285,12 @@ impl MemInner {
         Ok(())
     }
 
-    fn stage_ban(&mut self, guild: &str, user: &str, request: &str) -> Result<(), StoreError> {
+    fn stage_ban(
+        &mut self,
+        guild: &str,
+        user: &str,
+        request: &str,
+    ) -> Result<BanAttempt, StoreError> {
         self.refuse_uncertain_effects(guild, user)?;
         if self.bans.get(request).is_some_and(|row| {
             row.state != BanState::Rejected || row.guild_id != guild || row.user_id != user
@@ -1247,7 +1300,11 @@ impl MemInner {
             // safe — but never under this same conflicting key.
             return Err(StoreError::rolled_back("ban request id is already in use"));
         }
-        self.ban_sequence += 1;
+        let generation = self
+            .ban_sequence
+            .checked_add(1)
+            .ok_or_else(|| StoreError::rolled_back("ban generation exhausted"))?;
+        self.ban_sequence = generation;
         self.bans.insert(
             request.to_owned(),
             BanRow {
@@ -1257,7 +1314,7 @@ impl MemInner {
                 state: BanState::Prepared,
             },
         );
-        Ok(())
+        Ok(BanAttempt { generation })
     }
 
     fn current_ban(&self, request: &str) -> bool {
@@ -1342,6 +1399,14 @@ impl MemMemberStore {
     /// `(warning_id, guild, user, actor, reason, request_id)` in order.
     pub fn warnings(&self) -> Vec<(String, String, String, String, String, String)> {
         self.lock().warnings.clone()
+    }
+
+    /// Durable attempt identity (test introspection). This is a snapshot, not
+    /// authoritative evidence of a PUT outcome or remote execution order.
+    pub fn ban_attempt(&self, request_id: &str) -> Option<BanAttempt> {
+        self.lock().bans.get(request_id).map(|row| BanAttempt {
+            generation: row.generation,
+        })
     }
 
     /// Current unban state per request id (test introspection).
@@ -1472,15 +1537,16 @@ impl MemberModerationStore for MemMemberStore {
         user_id: &str,
         request_id: &str,
         _created_at: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<BanAttempt, StoreError> {
         self.lock().stage_ban(guild_id, user_id, request_id)
     }
 
-    async fn confirm_ban(
+    async fn confirm_ban_attempt(
         &self,
         guild_id: &str,
         user_id: &str,
         request_id: &str,
+        attempt: BanAttempt,
         completed_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
@@ -1488,7 +1554,10 @@ impl MemberModerationStore for MemMemberStore {
             .bans
             .get(request_id)
             .filter(|r| {
-                r.guild_id == guild_id && r.user_id == user_id && r.state == BanState::Prepared
+                r.guild_id == guild_id
+                    && r.user_id == user_id
+                    && r.state == BanState::Prepared
+                    && r.generation == attempt.generation
             })
             .cloned()
             .ok_or_else(|| StoreError::new("lost prepared ban"))?;
@@ -1529,7 +1598,7 @@ impl MemberModerationStore for MemMemberStore {
         reason: &str,
         request_id: &str,
         created_at: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<BanAttempt, StoreError> {
         let mut inner = self.lock();
         inner.refuse_uncertain_effects(guild_id, user_id)?;
         if inner.unbans.get(request_id).is_some_and(|row| {
@@ -1539,7 +1608,7 @@ impl MemberModerationStore for MemMemberStore {
                 "unban request id is already in use",
             ));
         }
-        inner.stage_ban(guild_id, user_id, request_id)?;
+        let attempt = inner.stage_ban(guild_id, user_id, request_id)?;
         inner.unbans.insert(
             request_id.to_owned(),
             UnbanRow {
@@ -1553,7 +1622,7 @@ impl MemberModerationStore for MemMemberStore {
                 claim_token: None,
             },
         );
-        Ok(())
+        Ok(attempt)
     }
 
     async fn activate_staged_unban(
@@ -1583,11 +1652,12 @@ impl MemberModerationStore for MemMemberStore {
         }
     }
 
-    async fn reject_ban(
+    async fn reject_ban_attempt(
         &self,
         guild_id: &str,
         user_id: &str,
         request_id: &str,
+        attempt: BanAttempt,
         completed_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
@@ -1595,7 +1665,10 @@ impl MemberModerationStore for MemMemberStore {
             .bans
             .get_mut(request_id)
             .filter(|r| {
-                r.state == BanState::Prepared && r.guild_id == guild_id && r.user_id == user_id
+                r.state == BanState::Prepared
+                    && r.guild_id == guild_id
+                    && r.user_id == user_id
+                    && r.generation == attempt.generation
             })
             .ok_or_else(|| StoreError::new("lost prepared ban"))?;
         intent.state = BanState::Rejected;
@@ -2849,7 +2922,13 @@ mod tests {
             .await
             .expect("stage");
         store
-            .confirm_ban(GUILD, TARGET_ID, "old", NOW)
+            .confirm_ban_attempt(
+                GUILD,
+                TARGET_ID,
+                "old",
+                store.ban_attempt("old").unwrap(),
+                NOW,
+            )
             .await
             .expect("accepted");
         let job = store
@@ -2879,7 +2958,13 @@ mod tests {
         };
         assert!(old_generation < store.inner.lock().expect("lock").bans["new"].generation);
         store
-            .confirm_ban(GUILD, TARGET_ID, "new", NOW)
+            .confirm_ban_attempt(
+                GUILD,
+                TARGET_ID,
+                "new",
+                store.ban_attempt("new").unwrap(),
+                NOW,
+            )
             .await
             .expect("newer acceptance");
         // The newer ban is accepted, but the uncertain row is neither closed
@@ -3017,7 +3102,13 @@ mod tests {
         // A late confirmation for the same expiry cannot close the uncertain
         // row either: the token and the fence survive it.
         assert!(store
-            .confirm_ban(GUILD, TARGET_ID, "old", NOW)
+            .confirm_ban_attempt(
+                GUILD,
+                TARGET_ID,
+                "old",
+                store.ban_attempt("old").unwrap(),
+                NOW
+            )
             .await
             .is_err());
         assert_eq!(store.unban_state("old").as_deref(), Some("running"));
@@ -3045,7 +3136,13 @@ mod tests {
             .await
             .expect("stage");
         store
-            .confirm_ban(GUILD, TARGET_ID, "old", NOW)
+            .confirm_ban_attempt(
+                GUILD,
+                TARGET_ID,
+                "old",
+                store.ban_attempt("old").unwrap(),
+                NOW,
+            )
             .await
             .expect("accepted");
         let job = store
@@ -3256,7 +3353,7 @@ mod tests {
             user_id: &str,
             request_id: &str,
             created_at: &str,
-        ) -> Result<(), StoreError> {
+        ) -> Result<BanAttempt, StoreError> {
             if Self::fail_once(&self.fail_stage_once) {
                 // A rolled-back staging transaction: nothing persisted, so a
                 // retry is provably safe.
@@ -3267,15 +3364,16 @@ mod tests {
                 .await
         }
 
-        async fn confirm_ban(
+        async fn confirm_ban_attempt(
             &self,
             guild_id: &str,
             user_id: &str,
             request_id: &str,
+            attempt: BanAttempt,
             completed_at: &str,
         ) -> Result<(), StoreError> {
             self.inner
-                .confirm_ban(guild_id, user_id, request_id, completed_at)
+                .confirm_ban_attempt(guild_id, user_id, request_id, attempt, completed_at)
                 .await
         }
 
@@ -3287,7 +3385,7 @@ mod tests {
             reason: &str,
             request_id: &str,
             created_at: &str,
-        ) -> Result<(), StoreError> {
+        ) -> Result<BanAttempt, StoreError> {
             if Self::fail_once(&self.fail_stage_once) {
                 return Err(StoreError::rolled_back("injected stage rollback"));
             }
@@ -3310,15 +3408,16 @@ mod tests {
                 .await
         }
 
-        async fn reject_ban(
+        async fn reject_ban_attempt(
             &self,
             guild_id: &str,
             user_id: &str,
             request_id: &str,
+            attempt: BanAttempt,
             completed_at: &str,
         ) -> Result<(), StoreError> {
             self.inner
-                .reject_ban(guild_id, user_id, request_id, completed_at)
+                .reject_ban_attempt(guild_id, user_id, request_id, attempt, completed_at)
                 .await
         }
 

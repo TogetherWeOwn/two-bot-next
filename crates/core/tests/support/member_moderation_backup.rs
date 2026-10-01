@@ -65,24 +65,24 @@ async fn seed(pool: &PgPool) {
         .activate_staged_unban("guild", "temporary", "temp", NOW)
         .await
         .unwrap();
-    store
+    let attempt = store
         .stage_ban("guild", "permanent", "perm", NOW)
         .await
         .unwrap();
     store
-        .confirm_ban("guild", "permanent", "perm", NOW)
+        .confirm_ban_attempt("guild", "permanent", "perm", attempt, NOW)
         .await
         .unwrap();
     store
         .stage_ban("guild", "uncertain", "prepared", NOW)
         .await
         .unwrap();
-    store
+    let attempt = store
         .stage_ban("guild", "rejected", "reject", NOW)
         .await
         .unwrap();
     store
-        .reject_ban("guild", "rejected", "reject", NOW)
+        .reject_ban_attempt("guild", "rejected", "reject", attempt, NOW)
         .await
         .unwrap();
     assert_eq!(
@@ -144,12 +144,12 @@ async fn ownership_round_trip_replaces_stale_rows_and_resets_generation() {
             // not left to suppress the restored expiry.
             sqlx::query("SELECT setval(pg_get_serial_sequence('moderation_member_bans', 'generation'), 50000, false)")
                 .execute(&target).await.unwrap();
-            store
+            let attempt = store
                 .stage_ban("guild", "temporary", "post-backup", NOW)
                 .await
                 .unwrap();
             store
-                .confirm_ban("guild", "temporary", "post-backup", NOW)
+                .confirm_ban_attempt("guild", "temporary", "post-backup", attempt, NOW)
                 .await
                 .unwrap();
         }

@@ -22,7 +22,13 @@ async fn sweep_does_not_recover_a_live_prepared_ban() {
                 ban_entered.notify_one();
                 ban_release.notified().await;
                 ban_store
-                    .reject_ban("guild", "user", "live", NOW)
+                    .reject_ban_attempt(
+                        "guild",
+                        "user",
+                        "live",
+                        ban_store.ban_attempt("live").expect("fixture attempt"),
+                        NOW,
+                    )
                     .await
                     .expect("reject");
             })
@@ -60,7 +66,13 @@ async fn accepted_recovery_waits_on_owning_member_queue() {
                     .await
                     .expect("stage");
                 ban_store
-                    .confirm_ban("guild", "user", "accepted", NOW)
+                    .confirm_ban_attempt(
+                        "guild",
+                        "user",
+                        "accepted",
+                        ban_store.ban_attempt("accepted").expect("fixture attempt"),
+                        NOW,
+                    )
                     .await
                     .expect("acceptance");
                 ban_entered.notify_one();
@@ -94,7 +106,13 @@ async fn newer_expiry_supersedes_older_accepted_crash_staged_jobs() {
             .await
             .expect("old stage");
         store
-            .confirm_ban("guild", user, &old, NOW)
+            .confirm_ban_attempt(
+                "guild",
+                user,
+                &old,
+                store.ban_attempt(&old).expect("fixture attempt"),
+                NOW,
+            )
             .await
             .expect("old accepted");
         store
@@ -102,7 +120,13 @@ async fn newer_expiry_supersedes_older_accepted_crash_staged_jobs() {
             .await
             .expect("new stage");
         store
-            .confirm_ban("guild", user, &new, NOW)
+            .confirm_ban_attempt(
+                "guild",
+                user,
+                &new,
+                store.ban_attempt(&new).expect("fixture attempt"),
+                NOW,
+            )
             .await
             .expect("new accepted");
         if user == "activated" {
@@ -141,7 +165,13 @@ async fn due_claim_waits_in_member_queue_and_cancelled_wait_has_no_dispatch_clai
         .await
         .expect("stage");
     store
-        .confirm_ban("guild", "user", "old", NOW)
+        .confirm_ban_attempt(
+            "guild",
+            "user",
+            "old",
+            store.ban_attempt("old").expect("fixture attempt"),
+            NOW,
+        )
         .await
         .expect("accepted");
     store
@@ -163,7 +193,13 @@ async fn due_claim_waits_in_member_queue_and_cancelled_wait_has_no_dispatch_clai
                     .await
                     .expect("ban is not fenced by undispatched queue waiter");
                 ban_store
-                    .confirm_ban("guild", "user", "new", NOW)
+                    .confirm_ban_attempt(
+                        "guild",
+                        "user",
+                        "new",
+                        ban_store.ban_attempt("new").expect("fixture attempt"),
+                        NOW,
+                    )
                     .await
                     .expect("new accepted");
             })
@@ -214,7 +250,13 @@ async fn claims_and_retry_tokens_have_single_owners() {
         .await
         .expect("stage");
     store
-        .confirm_ban("guild", "user", "request", NOW)
+        .confirm_ban_attempt(
+            "guild",
+            "user",
+            "request",
+            store.ban_attempt("request").expect("fixture attempt"),
+            NOW,
+        )
         .await
         .expect("acceptance");
     let job = store

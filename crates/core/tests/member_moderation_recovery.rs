@@ -118,7 +118,13 @@ async fn recovery_uses_execution_order_not_timestamp_or_request_id() {
             .await
             .expect("old");
         store
-            .confirm_ban(GUILD, user, &old, NOW)
+            .confirm_ban_attempt(
+                GUILD,
+                user,
+                &old,
+                store.ban_attempt(&old).expect("fixture attempt"),
+                NOW,
+            )
             .await
             .expect("old accepted");
         store
@@ -126,7 +132,13 @@ async fn recovery_uses_execution_order_not_timestamp_or_request_id() {
             .await
             .expect("new");
         store
-            .confirm_ban(GUILD, user, &new, second_time)
+            .confirm_ban_attempt(
+                GUILD,
+                user,
+                &new,
+                store.ban_attempt(&new).expect("fixture attempt"),
+                second_time,
+            )
             .await
             .expect("new accepted");
     }
@@ -162,10 +174,11 @@ async fn uncertain_ban_fences_old_expiry_until_explicit_reconciliation() {
         assert_eq!(discord.call_count("ban"), 2);
         // Simulate authoritative proof of refusal, not an age-based guess.
         store
-            .reject_ban(
+            .reject_ban_attempt(
                 GUILD,
                 &req.target.expect("target").user_id,
                 "uncertain",
+                store.ban_attempt("uncertain").expect("fixture attempt"),
                 DUE,
             )
             .await
@@ -205,10 +218,11 @@ async fn uncertain_old_put_refuses_new_bans_and_preserves_retry_until_reconciled
             // Exact-operation proof that the old PUT cannot land, not age,
             // local cancellation, or the current banned status.
             store
-                .reject_ban(
+                .reject_ban_attempt(
                     GUILD,
                     &new.target.as_ref().expect("target").user_id,
                     "old-put",
+                    store.ban_attempt("old-put").expect("fixture attempt"),
                     DUE,
                 )
                 .await
@@ -243,7 +257,13 @@ async fn prepared_staging_is_never_activated_without_acceptance() {
         .expect("no guessed recovery")
         .is_empty());
     store
-        .confirm_ban(GUILD, "user", "request", DUE)
+        .confirm_ban_attempt(
+            GUILD,
+            "user",
+            "request",
+            store.ban_attempt("request").expect("fixture attempt"),
+            DUE,
+        )
         .await
         .expect("observed acceptance");
     assert_eq!(
@@ -273,7 +293,13 @@ async fn safe_sweep_failure_does_not_retry_or_reserve_the_next_job() {
             .await
             .expect("stage");
         store
-            .confirm_ban(GUILD, user, user, NOW)
+            .confirm_ban_attempt(
+                GUILD,
+                user,
+                user,
+                store.ban_attempt(user).expect("fixture attempt"),
+                NOW,
+            )
             .await
             .expect("confirm");
     }
@@ -331,7 +357,13 @@ async fn permanent_ban_waits_for_the_same_members_live_unban() {
         .await
         .expect("stage");
     store
-        .confirm_ban(GUILD, &target, "old", NOW)
+        .confirm_ban_attempt(
+            GUILD,
+            &target,
+            "old",
+            store.ban_attempt("old").expect("fixture attempt"),
+            NOW,
+        )
         .await
         .expect("accepted");
     let discord = HeldUnban {
@@ -375,7 +407,13 @@ async fn cancelled_sweep_does_not_reserve_undispatched_jobs() {
             .await
             .expect("stage");
         store
-            .confirm_ban(GUILD, user, user, NOW)
+            .confirm_ban_attempt(
+                GUILD,
+                user,
+                user,
+                store.ban_attempt(user).expect("fixture attempt"),
+                NOW,
+            )
             .await
             .expect("accepted");
         store

@@ -114,12 +114,12 @@ async fn accepted_unban(
     execute_at: &str,
     created_at: &str,
 ) {
-    store
+    let attempt = store
         .stage_unban(guild, user, execute_at, "expiry", request, created_at)
         .await
         .expect("prepared expiry");
     store
-        .confirm_ban(guild, user, request, created_at)
+        .confirm_ban_attempt(guild, user, request, attempt, created_at)
         .await
         .expect("accepted ban");
 }
@@ -140,12 +140,172 @@ async fn unban_state(pool: &PgPool, request: &str) -> String {
         .expect("schedule state")
 }
 
+// Explicit identities of imported fixture operations. Real outcome evidence
+// must retain the identity from staging, not look up the current retry here.
+async fn fixture_attempt(
+    pool: &PgPool,
+    request: &str,
+) -> two_bot_core::member_moderation::BanAttempt {
+    two_bot_core::member_moderation::BanAttempt {
+        generation: generation(pool, request).await,
+    }
+}
+
 async fn generation(pool: &PgPool, request: &str) -> i64 {
     sqlx::query_scalar("SELECT generation FROM moderation_member_bans WHERE request_id = $1")
         .bind(request)
         .fetch_one(pool)
         .await
         .expect("persisted generation")
+}
+
+async fn put_snapshot(pool: &PgPool, request: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT json_build_object('intent', row_to_json(intent),
+           'expiry', (SELECT row_to_json(job) FROM moderation_scheduled_unbans AS job
+                      WHERE job.request_id = intent.request_id))::text
+         FROM moderation_member_bans AS intent WHERE intent.request_id = $1",
+    )
+    .bind(request)
+    .fetch_one(pool)
+    .await
+    .expect("complete attempt and expiry snapshot")
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_stale_put_outcomes_cannot_resolve_a_retried_generation() {
+    let (admin, pool, schema) = database().await;
+    let guild = "100000000000000001";
+    let store = PgMemberModerationStore::new(pool.clone(), guild);
+    for (action, user) in [
+        (ModerationAction::Ban, "333333333333333333"),
+        (ModerationAction::TempBan, "444444444444444444"),
+    ] {
+        let clock = AtomicI64::new(1_700_000_000_000);
+        let discord = MockMemberDiscord::new();
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            clock.load(Ordering::SeqCst)
+        });
+        let old_id = format!("old-{user}");
+        let mut old = execution(ModerationAction::TempBan, &old_id);
+        old.target.as_mut().unwrap().user_id = user.into();
+        svc.execute(&old).await.expect("older accepted expiry");
+        let retry_id = format!("retry-{user}");
+        let mut retry = execution(action, &retry_id);
+        retry.target.as_mut().unwrap().user_id = user.into();
+        discord.fail_with("ban", DiscordError::Rejected("definite refusal".into()));
+        assert!(matches!(
+            svc.execute(&retry).await,
+            Err(two_bot_core::member_moderation::MemberError::Discord(
+                DiscordError::Rejected(_)
+            ))
+        ));
+        let first = fixture_attempt(&pool, &retry_id).await;
+        assert_eq!(ban_state(&pool, &retry_id).await, "rejected");
+        discord.fail_with("ban", DiscordError::Timeout);
+        assert!(matches!(
+            svc.execute(&retry).await,
+            Err(two_bot_core::member_moderation::MemberError::Discord(
+                DiscordError::Timeout
+            ))
+        ));
+        let second = fixture_attempt(&pool, &retry_id).await;
+        assert!(second.generation > first.generation);
+        let before = put_snapshot(&pool, &retry_id).await;
+        let older_before = put_snapshot(&pool, &old_id).await;
+        for accepted in [false, true] {
+            for identity_only in [false, true] {
+                let result = match (accepted, identity_only) {
+                    (false, false) => {
+                        store
+                            .reject_ban_attempt(guild, user, &retry_id, first, DUE)
+                            .await
+                    }
+                    (true, false) => {
+                        store
+                            .confirm_ban_attempt(guild, user, &retry_id, first, DUE)
+                            .await
+                    }
+                    (false, true) => store.reject_ban(guild, user, &retry_id, DUE).await,
+                    (true, true) => store.confirm_ban(guild, user, &retry_id, DUE).await,
+                };
+                assert!(result.is_err(), "stale or missing attempt must fail closed");
+                assert_eq!(put_snapshot(&pool, &retry_id).await, before);
+                assert_eq!(put_snapshot(&pool, &old_id).await, older_before);
+            }
+        }
+        clock.store(1_700_003_600_000, Ordering::SeqCst);
+        assert_eq!(svc.run_due_unbans(guild).await.unwrap(), 0);
+        assert_eq!(discord.call_count("unban"), 0);
+        assert!(matches!(
+            svc.execute(&retry).await,
+            Err(two_bot_core::member_moderation::MemberError::InFlight)
+        ));
+        let mut fresh = execution(ModerationAction::Ban, &format!("fresh-{user}"));
+        fresh.target.as_mut().unwrap().user_id = user.into();
+        assert!(svc.execute(&fresh).await.is_err());
+        assert_eq!(discord.call_count("ban"), 3);
+        store
+            .reject_ban_attempt(guild, user, &retry_id, second, DUE)
+            .await
+            .unwrap();
+        assert_eq!(ban_state(&pool, &retry_id).await, "rejected");
+        if action == ModerationAction::TempBan {
+            assert_eq!(unban_state(&pool, &retry_id).await, "cancelled");
+        }
+        assert_eq!(svc.run_due_unbans(guild).await.unwrap(), 1);
+        assert_eq!(discord.call_count("unban"), 1);
+    }
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_staging_returns_the_committed_put_attempt() {
+    let (admin, pool, schema) = database().await;
+    let store = PgMemberModerationStore::new(pool.clone(), "guild");
+    for temporary in [false, true] {
+        let user = if temporary { "temporary" } else { "permanent" };
+        let first = if temporary {
+            store
+                .stage_unban("guild", user, DUE, "expiry", user, NOW)
+                .await
+        } else {
+            store.stage_ban("guild", user, user, NOW).await
+        }
+        .unwrap();
+        assert_eq!(first.generation, generation(&pool, user).await);
+        store
+            .reject_ban_attempt("guild", user, user, first, NOW)
+            .await
+            .unwrap();
+        let second = if temporary {
+            store
+                .stage_unban("guild", user, DUE, "retry expiry", user, NOW)
+                .await
+        } else {
+            store.stage_ban("guild", user, user, NOW).await
+        }
+        .unwrap();
+        assert!(second.generation > first.generation);
+        let before = put_snapshot(&pool, user).await;
+        assert!(store
+            .confirm_ban_attempt("guild", user, user, first, DUE)
+            .await
+            .is_err());
+        assert!(store
+            .reject_ban_attempt("guild", user, user, first, DUE)
+            .await
+            .is_err());
+        assert_eq!(put_snapshot(&pool, user).await, before);
+        store
+            .confirm_ban_attempt("guild", user, user, second, DUE)
+            .await
+            .unwrap();
+        assert_eq!(ban_state(&pool, user).await, "accepted");
+    }
+    cleanup(admin, pool, schema).await;
 }
 
 fn execution(action: ModerationAction, id: &str) -> MemberExecution {
@@ -307,9 +467,15 @@ async fn postgres_member_ledger() {
     g2.stage_unban("g2", "u2", NOW, "expiry", "crash", NOW)
         .await
         .expect("stage");
-    g2.confirm_ban("g2", "u2", "crash", NOW)
-        .await
-        .expect("Discord acceptance persisted before crash");
+    g2.confirm_ban_attempt(
+        "g2",
+        "u2",
+        "crash",
+        fixture_attempt(&pool, "crash").await,
+        NOW,
+    )
+    .await
+    .expect("Discord acceptance persisted before crash");
     let (a, b) = tokio::join!(
         g2.claim_due_unbans("g2", NOW, 25),
         g2.claim_due_unbans("g2", NOW, 25)
@@ -379,7 +545,7 @@ async fn postgres_member_ledger() {
         .activate_staged_unban("g2", "u2", "new", NOW)
         .await
         .is_err());
-    g2.confirm_ban("g2", "u2", "new", NOW)
+    g2.confirm_ban_attempt("g2", "u2", "new", fixture_attempt(&pool, "new").await, NOW)
         .await
         .expect("new acceptance");
     g2.activate_staged_unban("g2", "u2", "new", NOW)
@@ -405,9 +571,15 @@ async fn postgres_member_ledger() {
     g3.stage_unban("g3", "u3", NOW, "old expiry", "old-staged", NOW)
         .await
         .expect("old crash");
-    g3.confirm_ban("g3", "u3", "old-staged", NOW)
-        .await
-        .expect("old acceptance");
+    g3.confirm_ban_attempt(
+        "g3",
+        "u3",
+        "old-staged",
+        fixture_attempt(&pool, "old-staged").await,
+        NOW,
+    )
+    .await
+    .expect("old acceptance");
     g3.stage_unban(
         "g3",
         "u3",
@@ -418,9 +590,15 @@ async fn postgres_member_ledger() {
     )
     .await
     .expect("new crash");
-    g3.confirm_ban("g3", "u3", "new-staged", NOW)
-        .await
-        .expect("new acceptance");
+    g3.confirm_ban_attempt(
+        "g3",
+        "u3",
+        "new-staged",
+        fixture_attempt(&pool, "new-staged").await,
+        NOW,
+    )
+    .await
+    .expect("new acceptance");
     assert!(g3
         .claim_due_unbans("g3", NOW, 25)
         .await
@@ -573,11 +751,23 @@ async fn postgres_guild_bound_sweep_and_write_fences() {
         .await
         .is_err());
     assert!(g1
-        .confirm_ban("g2", "same-member", "foreign-ban-held", NOW)
+        .confirm_ban_attempt(
+            "g2",
+            "same-member",
+            "foreign-ban-held",
+            fixture_attempt(&pool, "foreign-ban-held").await,
+            NOW
+        )
         .await
         .is_err());
     assert!(g1
-        .reject_ban("g2", "same-member", "foreign-ban-held", NOW)
+        .reject_ban_attempt(
+            "g2",
+            "same-member",
+            "foreign-ban-held",
+            fixture_attempt(&pool, "foreign-ban-held").await,
+            NOW
+        )
         .await
         .is_err());
     assert!(g1
@@ -744,7 +934,13 @@ async fn postgres_generation_wins_over_timestamp_and_confirmation_order() {
     sqlx::query("INSERT INTO moderation_scheduled_unbans (request_id, guild_id, user_id, execute_at, reason, state, created_at) VALUES ('newer-first-confirm', 'guild', 'late-confirm', $1::text::timestamptz, 'expiry', 'staged', $1::text::timestamptz)")
         .bind(NOW).execute(&pool).await.expect("historical newer expiry");
     assert!(store
-        .confirm_ban("guild", "late-confirm", "older-late-confirm", DUE)
+        .confirm_ban_attempt(
+            "guild",
+            "late-confirm",
+            "older-late-confirm",
+            fixture_attempt(&pool, "older-late-confirm").await,
+            DUE
+        )
         .await
         .is_err());
     assert!(store
@@ -759,7 +955,13 @@ async fn postgres_generation_wins_over_timestamp_and_confirmation_order() {
     assert_eq!(ban_state(&pool, "older-late-confirm").await, "prepared");
     assert_eq!(unban_state(&pool, "older-late-confirm").await, "staged");
     store
-        .reject_ban("guild", "late-confirm", "older-late-confirm", DUE)
+        .reject_ban_attempt(
+            "guild",
+            "late-confirm",
+            "older-late-confirm",
+            fixture_attempt(&pool, "older-late-confirm").await,
+            DUE,
+        )
         .await
         .expect("authoritative old PUT refusal");
     let jobs = store
@@ -804,7 +1006,13 @@ async fn postgres_permanent_ban_supersession_and_failed_confirmation_fence() {
         .await
         .expect("permanent prepared before Discord");
     let error = store
-        .confirm_ban("guild", "pending-user", "permanent-pending", NOW)
+        .confirm_ban_attempt(
+            "guild",
+            "pending-user",
+            "permanent-pending",
+            fixture_attempt(&pool, "permanent-pending").await,
+            NOW,
+        )
         .await
         .expect_err("confirmation rollback");
     assert_eq!(error.message, "postgres moderation ledger: 23514");
@@ -819,7 +1027,13 @@ async fn postgres_permanent_ban_supersession_and_failed_confirmation_fence() {
     sqlx::query("INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('permanent-running', 'guild', 'running-user', 'prepared', $1::text::timestamptz)")
         .bind(NOW).execute(&pool).await.expect("scratch late intent");
     store
-        .confirm_ban("guild", "running-user", "permanent-running", NOW)
+        .confirm_ban_attempt(
+            "guild",
+            "running-user",
+            "permanent-running",
+            fixture_attempt(&pool, "permanent-running").await,
+            NOW,
+        )
         .await
         .expect("running row is not superseded by confirmation");
     assert_eq!(unban_state(&pool, "pending-expiry").await, "pending");
@@ -838,7 +1052,13 @@ async fn postgres_permanent_ban_supersession_and_failed_confirmation_fence() {
         .await
         .expect("allow explicit reconciliation");
     store
-        .confirm_ban("guild", "pending-user", "permanent-pending", DUE)
+        .confirm_ban_attempt(
+            "guild",
+            "pending-user",
+            "permanent-pending",
+            fixture_attempt(&pool, "permanent-pending").await,
+            DUE,
+        )
         .await
         .expect("reconciled permanent acceptance");
     assert_eq!(ban_state(&pool, "permanent-pending").await, "accepted");
@@ -920,11 +1140,23 @@ async fn postgres_stage_atomicity_and_rejected_retry_generation() {
         .await
         .is_err());
     assert!(store
-        .confirm_ban("guild", "wrong-user", "retry", NOW)
+        .confirm_ban_attempt(
+            "guild",
+            "wrong-user",
+            "retry",
+            fixture_attempt(&pool, "retry").await,
+            NOW
+        )
         .await
         .is_err());
     assert!(store
-        .reject_ban("guild", "wrong-user", "retry", NOW)
+        .reject_ban_attempt(
+            "guild",
+            "wrong-user",
+            "retry",
+            fixture_attempt(&pool, "retry").await,
+            NOW
+        )
         .await
         .is_err());
     assert!(store
@@ -933,7 +1165,13 @@ async fn postgres_stage_atomicity_and_rejected_retry_generation() {
         .expect("prepared is never recovered")
         .is_empty());
     store
-        .reject_ban("guild", "user", "retry", NOW)
+        .reject_ban_attempt(
+            "guild",
+            "user",
+            "retry",
+            fixture_attempt(&pool, "retry").await,
+            NOW,
+        )
         .await
         .expect("safe rejection");
     assert_eq!(ban_state(&pool, "retry").await, "rejected");
@@ -961,7 +1199,13 @@ async fn postgres_stage_atomicity_and_rejected_retry_generation() {
         .await
         .is_err());
     store
-        .confirm_ban("guild", "user", "retry", NOW)
+        .confirm_ban_attempt(
+            "guild",
+            "user",
+            "retry",
+            fixture_attempt(&pool, "retry").await,
+            NOW,
+        )
         .await
         .expect("retried acceptance");
     assert!(store
@@ -969,7 +1213,13 @@ async fn postgres_stage_atomicity_and_rejected_retry_generation() {
         .await
         .is_err());
     assert!(store
-        .reject_ban("guild", "user", "retry", NOW)
+        .reject_ban_attempt(
+            "guild",
+            "user",
+            "retry",
+            fixture_attempt(&pool, "retry").await,
+            NOW
+        )
         .await
         .is_err());
     assert_eq!(
@@ -994,7 +1244,13 @@ async fn postgres_stage_atomicity_and_rejected_retry_generation() {
         .expect("prepared fence")
         .is_empty());
     store
-        .reject_ban("guild", "safe-reject", "safe-new", NOW)
+        .reject_ban_attempt(
+            "guild",
+            "safe-reject",
+            "safe-new",
+            fixture_attempt(&pool, "safe-new").await,
+            NOW,
+        )
         .await
         .expect("safe rejection removes fence");
     let jobs = store

@@ -10,7 +10,7 @@ use std::future::Future;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::member_moderation::{
-    AuditRow, ClaimState, MemberModerationStore, MemberQueues, StoreError, UnbanJob,
+    AuditRow, BanAttempt, ClaimState, MemberModerationStore, MemberQueues, StoreError, UnbanJob,
     UnbanResolution,
 };
 
@@ -48,9 +48,9 @@ impl PgMemberModerationStore {
         user: &str,
         request: &str,
         now: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<BanAttempt, StoreError> {
         self.ensure_guild(guild)?;
-        let changed = sqlx::query(
+        let generation: Option<i64> = sqlx::query_scalar(
             "INSERT INTO moderation_member_bans
              (request_id, guild_id, user_id, state, created_at)
              VALUES ($1, $2, $3, 'prepared', $4::text::timestamptz)
@@ -59,22 +59,18 @@ impl PgMemberModerationStore {
                completed_at = NULL
              WHERE moderation_member_bans.state = 'rejected'
                AND moderation_member_bans.guild_id = EXCLUDED.guild_id
-               AND moderation_member_bans.user_id = EXCLUDED.user_id",
+               AND moderation_member_bans.user_id = EXCLUDED.user_id
+             RETURNING generation",
         )
         .bind(request)
         .bind(&self.guild_id)
         .bind(user)
         .bind(now)
-        .execute(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await
-        .map_err(rolled_back_error)?
-        .rows_affected();
-        if changed != 1 {
-            // The competing non-rejected intent survives; the failed insert
-            // wrote nothing for this request. Rolled back either way.
-            return Err(StoreError::rolled_back(REQUEST_ID_IN_USE));
-        }
-        Ok(())
+        .map_err(rolled_back_error)?;
+        let generation = generation.ok_or_else(|| StoreError::rolled_back(REQUEST_ID_IN_USE))?;
+        Ok(BanAttempt { generation })
     }
 
     // Acceptance, current generation and the exact staged schedule are checked
@@ -352,7 +348,7 @@ impl MemberModerationStore for PgMemberModerationStore {
         user: &str,
         request: &str,
         now: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<BanAttempt, StoreError> {
         self.ensure_guild(guild)?;
         // No transaction, intent, schedule or dispatch exists yet: a
         // begin failure is provably mutation-free, so the new key may be
@@ -366,15 +362,17 @@ impl MemberModerationStore for PgMemberModerationStore {
         // refusal writes nothing; the insert either conflicts with a live
         // row or fails the statement), so the whole transaction rolls back
         // mutation-free and the error already carries that provenance.
-        self.prepare(&mut tx, guild, user, request, now).await?;
-        tx.commit().await.map_err(db_error)
+        let attempt = self.prepare(&mut tx, guild, user, request, now).await?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(attempt)
     }
 
-    async fn confirm_ban(
+    async fn confirm_ban_attempt(
         &self,
         guild: &str,
         user: &str,
         request: &str,
+        attempt: BanAttempt,
         now: &str,
     ) -> Result<(), StoreError> {
         self.ensure_guild(guild)?;
@@ -383,7 +381,7 @@ impl MemberModerationStore for PgMemberModerationStore {
             "UPDATE moderation_member_bans AS intent SET state = 'accepted',
                completed_at = $4::text::timestamptz
              WHERE intent.request_id = $1 AND intent.guild_id = $2 AND intent.user_id = $3
-               AND intent.state = 'prepared'
+               AND intent.state = 'prepared' AND intent.generation = $5
                AND NOT EXISTS (
                  SELECT 1 FROM moderation_member_bans AS newer
                  WHERE newer.guild_id = intent.guild_id AND newer.user_id = intent.user_id
@@ -396,6 +394,7 @@ impl MemberModerationStore for PgMemberModerationStore {
         .bind(&self.guild_id)
         .bind(user)
         .bind(now)
+        .bind(attempt.generation)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -436,7 +435,7 @@ impl MemberModerationStore for PgMemberModerationStore {
         reason: &str,
         request: &str,
         now: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<BanAttempt, StoreError> {
         self.ensure_guild(guild)?;
         // As in `stage_ban`: no transaction, intent, schedule or dispatch
         // exists yet, so a begin failure is provably mutation-free.
@@ -444,7 +443,7 @@ impl MemberModerationStore for PgMemberModerationStore {
         Self::refuse_uncertain_effects(&mut *tx, &self.guild_id, user).await?;
         // As in `stage_ban`: `prepare` failures precede any write for this
         // request, so the rolled-back transaction stays mutation-free.
-        self.prepare(&mut tx, guild, user, request, now).await?;
+        let attempt = self.prepare(&mut tx, guild, user, request, now).await?;
         let changed = sqlx::query(
             "INSERT INTO moderation_scheduled_unbans
              (request_id, guild_id, user_id, execute_at, reason, state, created_at)
@@ -469,7 +468,8 @@ impl MemberModerationStore for PgMemberModerationStore {
         if changed != 1 {
             return Err(StoreError::rolled_back(UNBAN_REQUEST_ID_IN_USE));
         }
-        tx.commit().await.map_err(db_error)
+        tx.commit().await.map_err(db_error)?;
+        Ok(attempt)
     }
 
     async fn activate_staged_unban(
@@ -482,23 +482,26 @@ impl MemberModerationStore for PgMemberModerationStore {
         self.activate(guild, user, request, false).await
     }
 
-    async fn reject_ban(
+    async fn reject_ban_attempt(
         &self,
         guild: &str,
         user: &str,
         request: &str,
+        attempt: BanAttempt,
         now: &str,
     ) -> Result<(), StoreError> {
         self.ensure_guild(guild)?;
         let mut tx = self.pool.begin().await.map_err(db_error)?;
         let changed = sqlx::query(
             "UPDATE moderation_member_bans SET state = 'rejected', completed_at = $4::text::timestamptz
-             WHERE request_id = $1 AND guild_id = $2 AND user_id = $3 AND state = 'prepared'",
+             WHERE request_id = $1 AND guild_id = $2 AND user_id = $3
+               AND state = 'prepared' AND generation = $5",
         )
         .bind(request)
         .bind(&self.guild_id)
         .bind(user)
         .bind(now)
+        .bind(attempt.generation)
         .execute(&mut *tx)
         .await
         .map_err(db_error)?

@@ -41,8 +41,10 @@ until the shared S4 interaction router and REST executor merge.
   old PUT may land after a newer temporary ban expires, just as an unfinished
   DELETE may land after a new PUT. Every prepared PUT also fences expiry selection,
   recovery and dispatch, regardless of whether its generation is older or newer.
-  Under the member queue, `confirm_ban` / `reject_ban` may reconcile the exact
-  prepared intent only with proof the PUT finished or provably cannot still land;
+  Staging returns a `BanAttempt` before dispatch. Keep its generation with the
+  PUT's evidence, including its guild/member/request identity. Under the member
+  queue, `confirm_ban_attempt` / `reject_ban_attempt` may reconcile that exact
+  prepared attempt only with proof the PUT finished or provably cannot still land;
   neither a current banned snapshot nor local cancellation supplies that proof. Under the member queue, only
   `resolve_uncertain_unban(request_id, claim_token, resolution)` may close this
   uncertainty. `Completed` requires proof the DELETE finished; `Void` requires
@@ -80,7 +82,16 @@ fences all older expiries immediately, including during a live or uncertain
 permanent ban. Generations are durable execution order, not timestamps or
 lexicographical request IDs; clock ties or clock rollback cannot pick a winner.
 
-Observed Discord acceptance is explicitly recorded with `confirm_ban` before
+A definitely rejected request may reuse its request ID, but staging returns a
+fresh attempt generation. Every confirmation and rejection compares the expected
+attempt in the mutation itself. Delayed evidence for the previous attempt cannot
+accept the retry, reject it, or cancel/supersede any of its expiry state. The old
+identity-only `confirm_ban` / `reject_ban` methods remain callable but **always fail
+closed**; migrate callers to the attempt-fenced methods. Never attach old evidence
+to a generation fetched from the current row. A member queue alone does not
+identify which retry an outcome describes.
+
+Observed Discord acceptance is explicitly recorded with `confirm_ban_attempt` before
 expiry activation. Confirmation atomically supersedes strictly older staged or
 pending schedules, never dispatched `running` rows or authoritative terminal
 states. A permanent ban therefore cannot be undone by an earlier undispatched
