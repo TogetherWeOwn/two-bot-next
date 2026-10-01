@@ -710,7 +710,9 @@ mod tests {
                 let err = parse_mee6_export(&export.to_string()).unwrap_err();
                 assert_eq!(
                     err.problems,
-                    [format!("row 1 xp must be an integer between 0 and {MAX_STORED_XP}")]
+                    [format!(
+                        "row 1 xp must be an integer between 0 and {MAX_STORED_XP}"
+                    )]
                 );
             }
         }
@@ -729,7 +731,9 @@ mod tests {
                     let err = parse_mee6_export(&export.to_string()).unwrap_err();
                     assert_eq!(
                         err.problems,
-                        [format!("row 1 xp must be an integer between 0 and {MAX_STORED_XP}")]
+                        [format!(
+                            "row 1 xp must be an integer between 0 and {MAX_STORED_XP}"
+                        )]
                     );
                 }
             }
