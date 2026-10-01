@@ -207,6 +207,17 @@ class SupplyChainTests(unittest.TestCase):
         self.assertEqual(supply.count("exit-code: '1'"), 2)
         self.assertNotIn("continue-on-error", supply)
 
+    def test_native_selector_diagnostics_cannot_replace_vulnerability_gates(self):
+        supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        self.assertIn("python3 scripts/test-trivy-selector-probes.py", supply)
+        selectors = supply.index("python3 scripts/probe-trivy-selectors.py sbom")
+        self.assertLess(supply.index("python3 scripts/vulnerability-preflight.py sbom"), selectors)
+        self.assertLess(selectors, supply.index("Retain SBOMs and findings"))
+        self.assertIn("timeout-minutes: 4", supply)
+        self.assertIn("sha256sum trivy-selector-probes.json", supply)
+        self.assertEqual(supply.count("exit-code: '1'"), 2)
+        self.assertNotIn("continue-on-error", supply)
+
     def test_required_check_rejects_every_non_success_scan_result(self):
         workflow = (ROOT / ".github/workflows/check.yml").read_text()
         job = workflow.split("\n  check:\n", 1)[1]

@@ -61,6 +61,52 @@ independent final-head approval remain required before any activation. Changes
 to modules, interpreters, payloads or startup environment cannot be waived by a
 matching tuple. Stock-image observations are not deployed privilege controls.
 
+### Actual pinned-scanner selector diagnostics (no activation)
+
+`scripts/probe-trivy-selectors.py` runs the installed **Trivy v0.69.3** binary's
+`convert` command against isolated copies of the retained raw image report.
+Upstream `convert` calls the same `result.Filter` implementation used during
+scans. This tests native filtering, not a Python approximation, but **does not
+rescan an image or refresh a vulnerability database**. It never edits the raw
+reports or `.trivyignore.yaml` and never feeds filtered copies to either gate.
+The four-minute CI step retains `trivy-selector-probes.json` and its checksum.
+
+For each observed conditional tuple, the matrix measures exact selection,
+different packages/versions/architectures, unknown CVEs, missing/null PURLs and
+identifiers, epoch changes where applicable, source/image/distro binding changes
+and expiry. Consistent alternative tuples update both inventories; malformed
+fixtures intentionally do not. Receipts distinguish native exit/finding counts
+from prerequisite preflight rejection or an unaccepted classification. Binary,
+input, synthetic ignore and output hashes identify the experiment. Zero observed
+candidates means zero selector coverage, not exception safety.
+
+Each subprocess executes one private, hashed snapshot of the installed binary,
+so a concurrent setup action cannot replace its executable during the matrix.
+It has an explicit empty config and isolated HOME/cache, with only PATH/HOME
+inherited and a 20-second timeout. Synthetic YAML expiry controls use
+RFC3339 timestamps in the distant past/future; JSON-quoted date-only strings do
+not decode into Trivy's timestamp field. These test dates do **not** renew the
+real decision. The preflight's exclusive expiry boundary is independently
+checked at the original **2026-10-08T00:00:00Z**; Trivy's wall clock is unchanged.
+
+Native conversion shows why YAML alone is insufficient: missing/null target
+PURLs can match a selected CVE, and source/image/distro provenance is not a YAML
+PURL condition. Missing identifiers may also be repaired from scan inventory.
+A null whole `PkgIdentifier` triggers a v0.69.3 JSON decoder panic; its nonzero
+exit/no output is recorded separately, never as suppression or successful
+conversion. All these malformed prerequisites are rejected by the preflight.
+Unexpected conversion failures or failed controls fail the diagnostic step.
+This does not implement the remaining affected-code, authenticated payload or
+injection conditions, does not clear the rejected tuples and does not authorize
+any exception. Independent exact-head review and successful real gates remain
+mandatory.
+
+To reproduce with an already verified raw artifact and verified pinned binary:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/probe-trivy-selectors.py <artifact-directory> --trivy <verified-trivy-binary>
+```
+
 ## Exact-image applicability evidence
 
 After the vulnerability gates, including when either fails, CI runs
@@ -188,6 +234,7 @@ Offline regressions (no Cargo compile, Docker daemon or database access):
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-supply-chain.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-runtime-image-evidence.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-vulnerability-preflight.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-trivy-selector-probes.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_container_smoke.py
 python3 scripts/test-docker-deps.py
 python3 scripts/test-release-retry.py
