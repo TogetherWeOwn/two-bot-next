@@ -93,11 +93,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
       # Serial execution prevents the ignored stores' shared tables/locks from
       # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
-      # Two suites cannot share this command's URL without weakening their guards:
-      # channel_moderation_store requires the exact agent_test URL without :@;
-      # internal_action_store requires agent_test with the explicit empty :@.
-      # Skip only those test names here, then run BOTH suites below with their
-      # accepted URLs. No ignored suite is permanently excluded.
+      # Channel moderation, feeds_store and legacy_verify_db require agent_test,
+      # not the two_bot_test_* bootstrap used by TestDatabase suites. Skip only
+      # those tests here, then run ALL three suites below with their accepted URL.
+      # No ignored suite is permanently excluded.
       - name: Full workspace sweep including ignored tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
@@ -112,14 +111,10 @@ jobs:
           --skip channel_moderation_store::tests::stale_claim_writes_cannot_affect_a_new_winner
           --skip channel_moderation_store::tests::action_only_reuse_is_mismatch_in_flight_and_done
           --skip channel_moderation_store::tests::audit_rows_are_written_once
-          --skip rollback_wait_starts_retention_and_staleness_after_winning_insert
-          --skip stale_wait_cannot_win_second_nonce_burn
-          --skip nonce_race_restart_and_expiry_window
-          --skip claims_race_bind_payload_action_caller_and_replay_after_restart
-          --skip stale_and_unknown_claims_never_reexecute_and_reconciliation_is_terminal
-          --skip audit_failures_roll_back_claim_and_terminal_without_leaking_details
-          --skip discord_event_dedup_is_atomic_global_and_durable
-          --skip completion_and_reconciliation_race_cannot_overwrite_terminal
+          --skip feed_crud_audit_scope_and_timestamp_roundtrip
+          --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
+          --skip mock_delivery_crash_reconciliation_restart_and_overflow
+          --skip parity_mismatch_cursor_and_read_only_acceptance
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
@@ -127,12 +122,19 @@ jobs:
         run: >-
           cargo test -p two-bot-core --all-features --lib --locked channel_moderation_store::
           -- --include-ignored --test-threads=1
-      - name: Internal action ignored tests with their guarded URL
+      - name: Feed store ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
-          cargo test -p two-bot-core --all-features --test internal_action_store --locked
+          cargo test -p two-bot-core --all-features --test feeds_store --locked
+          -- --include-ignored --test-threads=1
+      - name: Legacy verification ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test legacy_verify_db --locked
           -- --include-ignored --test-threads=1
       # Backup integration tests are opt-in (not #[ignore]); the URL is unset in
       # the broad sweep because they rebuild tables and need dedicated databases.
