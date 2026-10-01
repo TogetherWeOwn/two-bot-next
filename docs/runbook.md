@@ -139,9 +139,10 @@ that monitoring is armed.
   to `main`, and also allows manual dispatch, but currently accepts a 503
   readiness response as a scaffold-era gate. **Workflow green is not gateway
   ready**: require your own first `/readyz` 200 observation and feature evidence.
-- A routine redeploy may auto-apply embedded database migrations at startup.
-  This is not permission to perform manual SQL, restore, or migration tests on
-  staging/production databases.
+- A routine redeploy never applies database migrations at startup: the gateway
+  runs DML-only, so the operator applies pending migrations first, then
+  redeploys. This is not permission to perform manual SQL, restore, or
+  migration tests on staging/production databases.
 
 ```bash
 npm --prefix wrangler run deployments -- list --env staging
@@ -218,7 +219,9 @@ or SIGINT drains HTTP and cancels the gateway task. A configured gateway task
 failure is process-fatal (exit 1); external supervision owns restarting it.
 
 Startup requires `DISCORD_TOKEN`, `DATABASE_URL`, and a nonzero numeric `GUILD_ID`.
-It connects Postgres (fixed pool maximum 5), applies embedded migrations, loads
+`DATABASE_URL` must point at the runtime login after the operator has applied
+migrations: the gateway connects Postgres (fixed pool maximum 5) with a DML-only
+identity and never migrates at startup. It loads
 funnel milestones, and reads `gateway_sessions` for **guild + shard 0**. A saved
 session ID, sequence and resume URL are supplied to Twilight when the checkpoint
 is valid and at most **15 minutes old** (inclusive). Missing, empty, expired or

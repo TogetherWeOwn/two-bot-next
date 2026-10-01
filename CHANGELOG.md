@@ -4,7 +4,15 @@
 
 ### Added
 
+- Wire `/feed-add`, `/feed-remove` and `/feed-list` through the same command runtime, router and REST executor as sticky commands. Defer ephemerally before guild-scoped CRUD and audit writes, preserve the invoking channel, and publish the complete gated command registry on Ready. Isolated Postgres and mock REST acceptance cover feed commands and sticky coexistence; announcements remain off by default, with no fetching, polling or relay posts.
 - Wire `/sticky` and `/sticky-remove` through the shared interaction router and drive accepted-message re-posts through the shared REST executor. The runtime claims one re-post window atomically per burst, validates and records the replacement id before retiring the previous sticky (best-effort), releases the claim and audits `post_failed` on REST failure, and deletes an orphaned replacement when the claim moved on. Commands defer ephemerally before I/O and edit the original reply; refusals are limited to owned sticky commands. `TWO_AUTOMATIONS` gates both surfaces; ManageGuild is required, and `/sticky` validates a 1–2000 UTF-16 body with a 1–300 s debounce (default 5 s). Covered by isolated Postgres and mock REST acceptance tests.
+- Add the audit mirror delivery service over the shared REST executor: record-before-deliver, private guild-fenced destinations, enforced nonce/mention suppression, kill-switch enforcement, crash-safe marker reconciliation and quarantine. Revalidate prepared ownership after shared transport pacing, preserve interrupted dedup adoption evidence, treat malformed history as uncertain, and run service fault-injection regressions in CI. Runtime wiring and activation remain deferred.
+- Add the pinned-address HTTPS feed connector (`feeds_connector`). `fetch_feed` validates the source through `feeds_http`, resolves all A/AAAA answers once, pins them into a `PublicRequest`, and dials only those addresses through a per-request hyper/rustls client whose resolver answers only the pinned host. TLS SNI, certificate verification and the Host header keep the URL hostname; every redirect hop re-validates and re-pins under a three-hop, same-host, HTTPS-only budget, one 15 s total deadline, `Owen/1.0 (+https://two.gg)` identity, and compressed-then-decompressed `MAX_FEED_BYTES` bounds before XML parsing. Injected resolver/connector seams keep every test hermetic; the private-fixture constructor exists only under `#[cfg(test)]`.
+
+### Fixed
+
+- Answer published but unwired commands ephemerally instead of timing out, preserving the existing router refusals and complete registry. Synchronize the registry on resumed process startup as well as Ready, without blocking gateway polling.
+- Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 
