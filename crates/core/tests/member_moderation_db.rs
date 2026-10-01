@@ -17,6 +17,46 @@ use two_bot_core::{ModerationAction, ModerationActor, ModerationPolicy, Moderati
 #[path = "support/member_moderation_backup.rs"]
 mod backup;
 
+#[path = "support/member_moderation_retry.rs"]
+mod retry;
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_repeated_refusal_yields_across_consumer_reconstruction() {
+    let (admin, pool, schema) = database().await;
+    retry::repeated_refusal_yields(
+        || PgMemberModerationStore::new(pool.clone(), "100000000000000001"),
+        policy(),
+    )
+    .await;
+    let row = sqlx::query("SELECT retry_generation, execute_at = $1::text::timestamptz AS original_expiry, claim_token IS NULL AND NOT dispatch_uncertain AS safe_pending FROM moderation_scheduled_unbans WHERE request_id = 'refused'")
+        .bind(NOW).fetch_one(&pool).await.unwrap();
+    assert!(row.get::<i64, _>("retry_generation") > generation(&pool, "newer").await);
+    assert!(row.get::<bool, _>("original_expiry"));
+    assert!(row.get::<bool, _>("safe_pending"));
+    assert_eq!(unban_state(&pool, "refused").await, "pending");
+    assert_eq!(unban_state(&pool, "later").await, "done");
+    assert_eq!(unban_state(&pool, "newer").await, "done");
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_unknown_unban_outcome_never_receives_a_retry_position() {
+    let (admin, pool, schema) = database().await;
+    retry::unknown_outcome_stays_fenced(
+        || PgMemberModerationStore::new(pool.clone(), "100000000000000001"),
+        policy(),
+    )
+    .await;
+    let row = sqlx::query("SELECT retry_generation IS NULL AS no_retry, claim_token IS NOT NULL AND dispatch_uncertain AS fenced FROM moderation_scheduled_unbans WHERE request_id = 'refused'")
+        .fetch_one(&pool).await.unwrap();
+    assert!(row.get::<bool, _>("no_retry"));
+    assert!(row.get::<bool, _>("fenced"));
+    assert_eq!(unban_state(&pool, "refused").await, "running");
+    cleanup(admin, pool, schema).await;
+}
+
 const NOW: &str = "2023-11-14T22:13:20.000Z";
 const DUE: &str = "2023-11-14T23:13:20.000Z";
 
@@ -75,6 +115,7 @@ async fn database() -> (PgPool, PgPool, String) {
             include_str!("../../cutover/migrations/0110_moderation_member.sql"),
             include_str!("../../cutover/migrations/0111_moderation_ban_ownership.sql"),
             include_str!("../../cutover/migrations/0112_moderation_legacy_timestamps.sql"),
+            include_str!("../../cutover/migrations/0113_moderation_unban_retry_order.sql"),
         ] {
             sqlx::raw_sql(migration)
                 .execute(&pool)

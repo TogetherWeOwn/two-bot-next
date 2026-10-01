@@ -59,7 +59,7 @@ until the shared S4 interaction router and REST executor merge.
 
 ## Durability
 
-Migrations 0110–0112 stay in `crates/cutover/migrations`, the directory embedded
+Migrations 0110–0114 stay in `crates/cutover/migrations`, the directory embedded
 by the S6 migration runner. Existing warnings, scheduled unbans, audits and
 idempotency retain legacy table/column names. Migration 0111 adds
 `moderation_member_bans`, a separate ban-intent ownership ledger. Migration 0112
@@ -135,6 +135,20 @@ the job immediately being processed becomes running; process loss after this
 transition may make that one job uncertain, but does not strand the remaining
 batch. No running claim is reclaimed by age. `claim_due_unbans` acquires member
 queues internally; do not wrap it in another `serialize_member` callback.
+
+A definite DELETE refusal still ends that tick without automatically retrying it.
+Migration 0113 adds a nullable `retry_generation` queue ticket. Exact-token requeue
+allocates the next value from the existing ban-generation sequence, then clears
+only the safe dispatch claim. Due jobs sort by that ticket (or their original
+intent generation), so a persistently refused member yields to existing work,
+while later arrivals cannot continually push its retry back. The original expiry
+and PUT ownership generation are unchanged; sequence gaps do not prove remote
+order. Memory mirrors SQL even with a frozen/backwards clock. Retry tickets are
+preserved in backups; restore resets the shared sequence above both high-water
+marks. Unknown/timeout/cancelled dispatches remain running/fenced and never gain
+retry tickets from elapsed time. Migration 0114 supplies the narrow member-ledger
+grants for an existing runtime group; the explicit role matrix and privilege tests
+also cover the member relations and attached generation sequence.
 
 Migration 0111 quarantines active imported schedules without a matching trusted
 intent; it neither invents acceptance/order nor deletes their history. Its separate

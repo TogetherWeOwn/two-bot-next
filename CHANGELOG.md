@@ -39,6 +39,7 @@
 - Record late result/compensation evidence for superseded self-role events under their still-current token/generation without reopening settlement or panel publication, with regression coverage.
 - Reject the guild @everyone role as a self-role mutation target during catalogue validation and unconditionally at dispatch.
 - Hold self-role claim fencing tokens in `Secret` so derived `Debug` redacts them; the raw value is exposed only at the SQL fencing comparisons.
+- Grant the existing runtime group narrow member-moderation ledger and generation-sequence access, with explicit role-matrix and restricted-store coverage. Definite unban refusals yield a durable queue ticket so later due members progress without retrying the same operation in a tick or reclaiming unknown outcomes.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 

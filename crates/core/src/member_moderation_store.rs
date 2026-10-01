@@ -531,7 +531,7 @@ impl MemberModerationStore for PgMemberModerationStore {
              VALUES ($1, $2, $3, $4::text::timestamptz, $5, 'staged', $6::text::timestamptz)
              ON CONFLICT (request_id) DO UPDATE SET state = 'staged',
                execute_at = EXCLUDED.execute_at, reason = EXCLUDED.reason,
-               created_at = EXCLUDED.created_at, completed_at = NULL, claimed_at = NULL, claim_token = NULL, dispatch_uncertain = FALSE
+               created_at = EXCLUDED.created_at, completed_at = NULL, claimed_at = NULL, claim_token = NULL, dispatch_uncertain = FALSE, retry_generation = NULL
              WHERE moderation_scheduled_unbans.state = 'cancelled'
                AND moderation_scheduled_unbans.guild_id = EXCLUDED.guild_id
                AND moderation_scheduled_unbans.user_id = EXCLUDED.user_id",
@@ -667,7 +667,7 @@ impl MemberModerationStore for PgMemberModerationStore {
                    AND (newer.state = 'prepared'
                      OR (newer.generation > intent.generation AND newer.state <> 'rejected'))
                )
-             ORDER BY job.execute_at, intent.generation LIMIT $3",
+             ORDER BY COALESCE(job.retry_generation, intent.generation), job.execute_at LIMIT $3",
         )
         .bind(&self.guild_id)
         .bind(now)
@@ -764,6 +764,7 @@ impl MemberModerationStore for PgMemberModerationStore {
     async fn requeue_unban(&self, request: &str, token: &str) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE moderation_scheduled_unbans SET state = 'pending',
+               retry_generation = nextval(pg_get_serial_sequence('moderation_member_bans', 'generation')),
                claimed_at = NULL, claim_token = NULL, dispatch_uncertain = FALSE
              WHERE request_id = $1 AND state = 'running' AND claim_token = $2 AND guild_id = $3",
         )

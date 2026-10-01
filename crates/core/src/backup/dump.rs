@@ -426,8 +426,10 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     .await?;
     sqlx::query(
         "SELECT setval(pg_get_serial_sequence('moderation_member_bans', 'generation'), \
-         GREATEST((SELECT COALESCE(MAX(generation), 0) FROM moderation_member_bans), 1), \
-         EXISTS (SELECT 1 FROM moderation_member_bans))",
+         GREATEST((SELECT COALESCE(MAX(generation), 0) FROM moderation_member_bans), \
+           (SELECT COALESCE(MAX(retry_generation), 0) FROM moderation_scheduled_unbans), 1), \
+         EXISTS (SELECT 1 FROM moderation_member_bans) \
+           OR EXISTS (SELECT 1 FROM moderation_scheduled_unbans WHERE retry_generation IS NOT NULL))",
     )
     .execute(&mut *tx)
     .await?;

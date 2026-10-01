@@ -634,7 +634,9 @@ pub trait MemberModerationStore: Send + Sync {
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Give a safely-failed claim back as `pending` for the next sweep
-    /// (legacy `requeueUnban`).
+    /// (legacy `requeueUnban`). Allocate a durable queue ticket after existing
+    /// work only for the exact claim; preserve its original expiry and intent.
+    /// Unknown outcomes must not call this or gain timer-based retry eligibility.
     fn requeue_unban(
         &self,
         request_id: &str,
@@ -880,8 +882,9 @@ where
 
     /// Fire at most 25 due expiries for the owning guild. Claim immediately
     /// before each dispatch, not a whole batch before the first await. Stop
-    /// on error: a definite rejection is requeued for the NEXT sweep, never
-    /// retried automatically in this one. Uncertain running claims need
+    /// on error: a definite rejection yields its durable queue position and
+    /// is requeued for the NEXT sweep, never retried automatically in this one.
+    /// Other members can progress on later ticks. Uncertain running claims need
     /// reconciliation; other undispatched jobs stay pending.
     #[expect(
         clippy::manual_async_fn,
@@ -1300,6 +1303,7 @@ struct UnbanRow {
     created_at: String,
     completed_at: Option<String>,
     claim_token: Option<String>,
+    retry_generation: Option<i64>,
 }
 
 impl std::fmt::Debug for UnbanRow {
@@ -1312,6 +1316,7 @@ impl std::fmt::Debug for UnbanRow {
             .field("state", &self.state)
             .field("created_at", &self.created_at)
             .field("completed_at", &self.completed_at)
+            .field("retry_generation", &self.retry_generation)
             .field("claim_token", &crate::Secret::new(&self.claim_token))
             .finish()
     }
@@ -1773,6 +1778,7 @@ impl MemberModerationStore for MemMemberStore {
                 created_at: created_at.to_owned(),
                 completed_at: None,
                 claim_token: None,
+                retry_generation: None,
             },
         );
         Ok(attempt)
@@ -1881,7 +1887,7 @@ impl MemberModerationStore for MemMemberStore {
             })
             .await?;
         }
-        let mut due: Vec<(String, UnbanRow)> = {
+        let mut due: Vec<(i64, String, UnbanRow)> = {
             let inner = self.lock();
             inner
                 .unbans
@@ -1892,16 +1898,21 @@ impl MemberModerationStore for MemMemberStore {
                         && r.execute_at.as_str() <= now
                         && inner.accepted_unfenced_unban(id)
                 })
-                .map(|(id, r)| (id.clone(), r.clone()))
+                .map(|(id, r)| {
+                    (
+                        r.retry_generation.unwrap_or(inner.bans[id].generation),
+                        id.clone(),
+                        r.clone(),
+                    )
+                })
                 .collect()
         };
         due.sort_by(|a, b| {
-            a.1.execute_at
-                .cmp(&b.1.execute_at)
-                .then_with(|| a.0.cmp(&b.0))
+            a.0.cmp(&b.0)
+                .then_with(|| a.2.execute_at.cmp(&b.2.execute_at))
         });
         let mut jobs = Vec::new();
-        for (id, row) in due.into_iter().take(limit.clamp(0, 25) as usize) {
+        for (_, id, row) in due.into_iter().take(limit.clamp(0, 25) as usize) {
             // Selection is advisory. Staging and dispatch ownership transition
             // share the same queue; recheck after waiting, before marking running.
             let job = self
@@ -1969,11 +1980,18 @@ impl MemberModerationStore for MemMemberStore {
 
     async fn requeue_unban(&self, request_id: &str, claim_token: &str) -> Result<(), StoreError> {
         let mut inner = self.lock();
-        if let Some(row) = inner.unbans.get_mut(request_id) {
-            if row.state == UnbanState::Running && row.claim_token.as_deref() == Some(claim_token) {
-                row.state = UnbanState::Pending;
-                row.claim_token = None;
-            }
+        if inner.unbans.get(request_id).is_some_and(|row| {
+            row.state == UnbanState::Running && row.claim_token.as_deref() == Some(claim_token)
+        }) {
+            let generation = inner
+                .ban_sequence
+                .checked_add(1)
+                .ok_or_else(|| StoreError::new("unban retry generation exhausted"))?;
+            inner.ban_sequence = generation;
+            let row = inner.unbans.get_mut(request_id).expect("checked claim");
+            row.state = UnbanState::Pending;
+            row.claim_token = None;
+            row.retry_generation = Some(generation);
         }
         Ok(())
     }
@@ -2167,6 +2185,7 @@ mod tests {
             created_at: "2023-11-14T22:13:20.000Z".into(),
             completed_at: None,
             claim_token: Some(token.into()),
+            retry_generation: None,
         };
         let inner = MemInner {
             unbans: HashMap::from([("request".into(), row.clone())]),

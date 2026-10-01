@@ -10,6 +10,21 @@ use two_bot_core::member_moderation::{
 };
 use two_bot_core::{ModerationAction, ModerationActor, ModerationPolicy, ModerationTarget};
 
+#[path = "support/member_moderation_retry.rs"]
+mod retry;
+
+#[tokio::test]
+async fn repeated_refusal_yields_to_later_members_and_retries_fairly() {
+    let store = MemMemberStore::new();
+    retry::repeated_refusal_yields(|| store.clone(), policy()).await;
+}
+
+#[tokio::test]
+async fn unknown_unban_outcome_is_not_given_a_retry_position() {
+    let store = MemMemberStore::new();
+    retry::unknown_outcome_stays_fenced(|| store.clone(), policy()).await;
+}
+
 const GUILD: &str = "100000000000000001";
 const NOW: &str = "2023-11-14T22:13:20.000Z";
 const DUE: &str = "2023-11-14T23:13:20.000Z";

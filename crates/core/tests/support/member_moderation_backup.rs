@@ -331,6 +331,51 @@ async fn restore_refuses_each_destination_evidence_kind_without_writes() {
     cleanup(admin, source, schema).await;
 }
 
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn retry_queue_ticket_round_trip_sets_the_shared_sequence_high_water_mark() {
+    let (admin, source, schema) = backup_database().await;
+    seed(&source).await;
+    let store = PgMemberModerationStore::new(source.clone(), "guild");
+    let job = store
+        .claim_due_unbans("guild", DUE, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    store
+        .requeue_unban(&job.request_id, &job.claim_token)
+        .await
+        .unwrap();
+    let retry: i64 = sqlx::query_scalar(
+        "SELECT retry_generation FROM moderation_scheduled_unbans WHERE request_id = 'temp'",
+    )
+    .fetch_one(&source)
+    .await
+    .unwrap();
+    assert!(retry > generation(&source, "reject").await);
+    let path = archive_path();
+    dump::dump(&source, &path).await.unwrap();
+    let (target_admin, target, target_schema) = backup_database().await;
+    dump::restore(&target, &path).await.unwrap();
+    let restored: i64 = sqlx::query_scalar(
+        "SELECT retry_generation FROM moderation_scheduled_unbans WHERE request_id = 'temp'",
+    )
+    .fetch_one(&target)
+    .await
+    .unwrap();
+    assert_eq!(restored, retry);
+    assert_eq!(unban_state(&target, "temp").await, "quarantined");
+    let store = PgMemberModerationStore::new(target.clone(), "guild");
+    let attempt = store
+        .stage_ban("guild", "fresh", "after-retry", NOW)
+        .await
+        .unwrap();
+    assert_eq!(attempt.generation, retry + 1);
+    cleanup(target_admin, target, target_schema).await;
+    cleanup(admin, source, schema).await;
+}
+
 fn legacy_without_ownership(source: &Path, target: &Path) {
     let file = std::fs::File::open(source).unwrap();
     let mut lines: Vec<Value> = BufReader::new(GzDecoder::new(file))
@@ -342,30 +387,29 @@ fn legacy_without_ownership(source: &Path, target: &Path) {
         .unwrap()
         .retain(|t| t["name"] != "moderation_member_bans");
     lines.retain(|line| line["table"] != "moderation_member_bans");
-    // Old v3 has no ownership or persistent dispatch-fence column.
-    let schedule = lines[0]["tables"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|t| t["name"] == "moderation_scheduled_unbans")
-        .unwrap();
-    let index = schedule["columns"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .position(|c| c == "dispatch_uncertain")
-        .unwrap();
-    schedule["columns"].as_array_mut().unwrap().remove(index);
-    schedule["column_types"]
-        .as_array_mut()
-        .unwrap()
-        .remove(index);
-    for line in &mut lines {
-        if line["table"] == "moderation_scheduled_unbans" {
-            line["data"]
-                .as_object_mut()
-                .unwrap()
-                .remove("dispatch_uncertain");
+    // Old v3 has no ownership, persistent dispatch fence or retry ticket.
+    for column in ["dispatch_uncertain", "retry_generation"] {
+        let schedule = lines[0]["tables"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t["name"] == "moderation_scheduled_unbans")
+            .unwrap();
+        let index = schedule["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c == column)
+            .unwrap();
+        schedule["columns"].as_array_mut().unwrap().remove(index);
+        schedule["column_types"]
+            .as_array_mut()
+            .unwrap()
+            .remove(index);
+        for line in &mut lines {
+            if line["table"] == "moderation_scheduled_unbans" {
+                line["data"].as_object_mut().unwrap().remove(column);
+            }
         }
     }
     let rows = lines.iter().filter(|line| line["kind"] == "row").count();

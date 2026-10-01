@@ -52,6 +52,11 @@ mod tests {
         for migration in [
             include_str!("../../cutover/migrations/0001_funnel.sql"),
             include_str!("../../cutover/migrations/0002_leveling.sql"),
+            include_str!("../../cutover/migrations/0110_moderation_member.sql"),
+            include_str!("../../cutover/migrations/0111_moderation_ban_ownership.sql"),
+            include_str!("../../cutover/migrations/0112_moderation_legacy_timestamps.sql"),
+            include_str!("../../cutover/migrations/0113_moderation_unban_retry_order.sql"),
+            include_str!("../../cutover/migrations/0114_moderation_member_runtime_grants.sql"),
             include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
             include_str!("../../cutover/migrations/0150_sticky_messages.sql"),
             include_str!("../../cutover/migrations/0160_rsvp.sql"),
