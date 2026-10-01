@@ -15,6 +15,7 @@ use two_bot_core::{
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
+    community_jobs,
     jobs::{self, ErrorClass, Job},
     server,
 };
@@ -70,16 +71,19 @@ fn cadence(kind: Kind) -> Duration {
     Duration::from_millis(millis)
 }
 
-struct Context {
-    url: String,
-    pool: OnceCell<PgPool>,
-    rest: ActionExecutor,
-    guild: String,
+/// Shared REST/DB context: website jobs also read `observation`; the community
+/// jobs in [`crate::community_jobs`] reuse the pool, executor and guild but
+/// hold their own lanes.
+pub(crate) struct Context {
+    pub(crate) url: String,
+    pub(crate) pool: OnceCell<PgPool>,
+    pub(crate) rest: ActionExecutor,
+    pub(crate) guild: String,
     observation: Mutex<()>,
 }
 
 impl Context {
-    async fn pool(&self) -> Result<&PgPool, ErrorClass> {
+    pub(crate) async fn pool(&self) -> Result<&PgPool, ErrorClass> {
         self.pool
             .get_or_try_init(|| async {
                 let db = two_bot_cutover::connect(
@@ -114,6 +118,7 @@ pub async fn serve(
     shutdown: watch::Sender<bool>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
+    let mut parked = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
         // The settings poll is DB-only: register it before REST construction
         // so a bad DISCORD_API_BASE cannot park hot reload.
@@ -154,20 +159,28 @@ pub async fn serve(
                         }),
                     });
                 }
+                let registration = community_jobs::register(context);
+                registered.extend(registration.jobs);
+                parked = registration.parked;
             }
             Err(_) => tracing::warn!("website jobs parked: invalid REST configuration"),
         }
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    // `parked` means "not registered this boot": every job starts parked and
-    // only registered names clear it, so a parked settings poll or a parked
-    // website domain is distinguishable on /readyz.
-    let status = jobs::statuses(&NAMES, true);
+    let names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
+    // Every job starts parked; only registered names clear it. A DB-only
+    // settings poll can be live while REST-backed or env-gated jobs park.
+    let status = jobs::statuses(&names, true);
     {
-        let mut statuses = status.write().await;
+        let mut entries = status.write().await;
         for job in &registered {
-            statuses.get_mut(job.name).expect("named job").parked = false;
+            entries.get_mut(job.name).expect("named job").parked = false;
+        }
+        for name in parked {
+            if let Some(entry) = entries.get_mut(name) {
+                entry.parked = true;
+            }
         }
     }
     let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
@@ -211,7 +224,7 @@ async fn drain_http(
     }
 }
 
-async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, ErrorClass> {
+pub(crate) async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, ErrorClass> {
     rest.get_json(path)
         .await
         .map_err(|_| ErrorClass::Rest)?
@@ -227,7 +240,11 @@ fn snowflake(value: &Value) -> Result<u64, ErrorClass> {
 }
 
 /// Discord's paginated roster is the denominator, never approximate counts.
-async fn roster(rest: &ActionExecutor, guild: &str) -> Result<Vec<RosterMember>, ErrorClass> {
+/// The presence probe reuses it for the daily bot-floor re-list.
+pub(crate) async fn roster(
+    rest: &ActionExecutor,
+    guild: &str,
+) -> Result<Vec<RosterMember>, ErrorClass> {
     let mut after = 0;
     let mut members = Vec::new();
     loop {

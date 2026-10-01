@@ -6,7 +6,12 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod backup_cli;
+mod community_jobs;
 mod database_roles_cli;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../discord/tests/common/mod.rs"]
+mod discord_test_common;
 mod gateway;
 mod gateway_metrics;
 #[cfg(test)]
@@ -188,12 +193,14 @@ async fn print_backup_help_and_exit() -> ! {
 fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static str> {
     let token = config
         .discord_token
-        .as_deref()
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
         .filter(|token| !token.is_empty())
         .ok_or("DISCORD_TOKEN")?;
     let url = config
         .database_url
-        .as_deref()
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
         .filter(|url| !url.is_empty())
         .ok_or("DATABASE_URL")?;
     let guild_id = config.guild_id.filter(|id| *id != 0).ok_or("GUILD_ID")?;
