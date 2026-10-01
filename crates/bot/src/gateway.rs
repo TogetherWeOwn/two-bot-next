@@ -84,23 +84,35 @@ pub fn session_snapshot(shard: &Shard) -> Option<Session> {
     shard.session().cloned()
 }
 
-/// Resolve the gateway intents from the environment, mirroring legacy
-/// `needsMessageContent` (`src/discord/client.ts`): privileged
-/// `MESSAGE_CONTENT` only when enabled automod inspects public messages
-/// (`TWO_AUTOMOD=1`) or tickets are configured.
-pub fn intents_from_env() -> Intents {
+/// Resolve the gateway intents after boot activation: privileged
+/// `MESSAGE_CONTENT` only when permitted automod is enabled or tickets
+/// are independently configured (legacy `needsMessageContent`).
+pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Intents {
     fn var(name: &str) -> String {
         std::env::var(name).unwrap_or_default()
     }
-    let message_content = needs_message_content(
+    intents_for_settings(
+        activation,
         &var("TWO_AUTOMOD"),
         [
             var("DISCORD_TICKET_CATEGORY_ID").as_str(),
             var("DISCORD_TICKET_STAFF_ROLE_ID").as_str(),
             var("DISCORD_TICKET_PANEL_CHANNEL_ID").as_str(),
         ],
-    );
-    gateway_intents(message_content)
+    )
+}
+
+fn intents_for_settings(
+    activation: &crate::activation::BootActivation,
+    automod: &str,
+    ticket_vars: [&str; 3],
+) -> Intents {
+    let automod = if activation.permitted(two_bot_core::activation::LiveCapability::Automod) {
+        automod
+    } else {
+        "0"
+    };
+    gateway_intents(needs_message_content(automod, ticket_vars))
 }
 
 pub type GatewayPipeline = Pipeline<GatewayFunnelBuffer>;
@@ -140,7 +152,7 @@ struct Hello {
 /// Bound the entire SQL operation (pool acquire through COMMIT), not each query.
 /// Twilight only drives heartbeats while polled, so use at most a quarter of
 /// HELLO's interval and fail closed instead of waiting through missed heartbeats.
-/// Source: https://docs.rs/tokio/1/tokio/time/fn.timeout.html
+/// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
     deadline: std::time::Duration,
@@ -163,7 +175,7 @@ async fn checkpoint_io<T>(
 
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
-/// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
+/// fallback. Source: <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html>
 ///
 /// `runtime` is the shared command runtime (TOG-11020; S4 sticky slice was
 /// TOG-10309): `dispatch` spawns detached work so this loop never awaits a
@@ -384,6 +396,38 @@ pub fn build_pipeline(milestones: Vec<FunnelEvent>) -> GatewayPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_intents_refuse_automod_but_preserve_independent_tickets() {
+        const STAGING: u64 = 1545644954272137297;
+        const LIVE: u64 = 326474832151838730;
+        const STAGING_TOKEN: &str = "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature";
+        const LIVE_TOKEN: &str = "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature";
+        for (guild, token, permitted) in [
+            (STAGING, Some(STAGING_TOKEN), true),
+            (LIVE, Some(LIVE_TOKEN), false),
+            (LIVE, Some(STAGING_TOKEN), false),
+            (STAGING, Some(LIVE_TOKEN), false),
+            (STAGING, Some("not-a-token"), false),
+            (STAGING, None, false),
+        ] {
+            let activation = crate::activation::BootActivation::from_token(Some(guild), token);
+            for automod in ["1", "0", "true", ""] {
+                for tickets in [
+                    ["", "", ""],
+                    ["cat", "", "panel"],
+                    ["cat", "staff", "panel"],
+                ] {
+                    let expected = (permitted && automod == "1")
+                        || tickets.iter().all(|value| !value.is_empty());
+                    assert_eq!(
+                        intents_for_settings(&activation, automod, tickets),
+                        gateway_intents(expected)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn mock_gateway_override_accepts_literal_loopback_only() {

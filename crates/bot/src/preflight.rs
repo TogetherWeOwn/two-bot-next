@@ -536,6 +536,8 @@ pub async fn dispatch(args: &[String]) -> i32 {
         report.render(json, 2);
         return 2;
     }
+    let activation =
+        crate::activation::BootActivation::from_token(Some(targets.guild_id), Some(&token));
     let mut builder = Client::builder().token(token);
     let proxy = env("DISCORD_PREFLIGHT_API_BASE");
     if !proxy.is_empty() {
@@ -557,7 +559,7 @@ pub async fn dispatch(args: &[String]) -> i32 {
     if let Err(check) = check_discord(
         &builder.build(),
         &targets,
-        crate::gateway::intents_from_env(),
+        crate::gateway::intents_from_env(&activation),
         &mut report,
     )
     .await

@@ -7,7 +7,7 @@
 //! every Discord side effect, and each feature's domain + sqlx store owns
 //! its validation and mutation. No competing interaction listener, private
 //! dispatcher, or Discord client exists: gateway events arrive via
-//! [`Self::dispatch`] and are handled entirely through those interfaces.
+//! [`CommandRuntime::dispatch`] and are handled entirely through those interfaces.
 //!
 //! Served slices:
 //! - sticky (`/sticky`, `/sticky-remove` + the accepted-message re-post hook;
@@ -140,13 +140,25 @@ impl CommandRuntime {
                 return None;
             }
         };
-        let moderation = match ModerationGates::from_env() {
-            Ok(moderation) => moderation,
-            Err(err) => {
-                warn!(error = %err, "moderation gates invalid; command runtime disabled");
-                return None;
-            }
-        };
+        // A denied capability never reaches its feature-specific validation:
+        // live/unknown identities must retain unrelated commands even with
+        // stale moderation env. Permitted staging still validates every gate.
+        let moderation =
+            if activation.permitted(two_bot_core::activation::LiveCapability::Moderation) {
+                match ModerationGates::from_env() {
+                    Ok(moderation) => moderation,
+                    Err(err) => {
+                        warn!(error = %err, "moderation gates invalid; command runtime disabled");
+                        return None;
+                    }
+                }
+            } else {
+                ModerationGates {
+                    enabled: false,
+                    owen_user_id: String::new(),
+                    protected_role_ids: Default::default(),
+                }
+            };
         let gates = RouterGates::from_slices(
             Some(guild_id),
             &features,

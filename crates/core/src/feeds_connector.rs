@@ -11,7 +11,7 @@
 //!
 //! The stock connector is [`PinnedHttpsConnector`]: hyper 1.x over rustls
 //! (ring + Mozilla roots — the same stack [`crate::backup::http`] uses) with an
-//! [`HttpConnector`] whose resolver is [`PinnedResolver`]. `PinnedResolver`
+//! [`HttpConnector`] whose resolver is `PinnedResolver`. `PinnedResolver`
 //! answers only the request's pinned socket addresses and refuses any other
 //! name, so the only dial targets are the ones [`PublicRequest::prepare`]
 //! validated. TLS SNI and certificate verification still come from the URL
@@ -20,8 +20,8 @@
 //!
 //! Redirects are manual: the legacy client never auto-follows, each hop is
 //! re-planned by [`redirect_target`] (same host, HTTPS only, bounded by
-//! [`MAX_REDIRECT_HOPS`]), and the previous response stream is dropped before
-//! the next dial. DNS names resolve from the parsed `Url::host()` so IPv6
+//! [`MAX_REDIRECT_HOPS`](crate::feeds_http::MAX_REDIRECT_HOPS)), and the previous
+//! response stream is dropped before the next dial. DNS names resolve from the parsed `Url::host()` so IPv6
 //! literals reach the resolver bracket-free; TLS identity still comes from
 //! the untouched URL. Response bodies are bounded twice — on the compressed
 //! wire and again decompressed into [`LimitedBody`] — before the caller ever

@@ -499,9 +499,14 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
             false,
         ),
         (STAGING, THIRD_TOKEN, 1555555555555555556, false, false),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|(guild, token, app, staging, self_roles)| {
+        [token.to_owned(), format!("Bot {token}")]
+            .map(|token| (guild, token, app, staging, self_roles))
+    }) {
         let (mock, origin) = MockRest::start(Vec::new()).await;
-        let runtime = activation_runtime(guild, token, origin);
+        let runtime = activation_runtime(guild, &token, origin);
         runtime.publish_registry(Some(app)).await;
         let requests = mock.requests();
         assert_eq!(requests.len(), 1, "one full replacement, guild={guild}");
@@ -549,7 +554,7 @@ async fn activation_boot_publishes_only_permitted_capabilities() {
                 ComponentOutcome::Ignore
             }
         );
-        let activation = crate::activation::BootActivation::from_token(Some(guild), Some(token));
+        let activation = crate::activation::BootActivation::from_token(Some(guild), Some(&token));
         assert_eq!(activation.permitted(LiveCapability::Automod), staging);
         if !staging {
             // Even old sticky state cannot trigger the message hook. A lazy
@@ -578,18 +583,20 @@ async fn activation_boot_invalid_token_and_ready_identity_cannot_publish() {
 
 #[tokio::test]
 async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
-    for app in [1539711683898118154u64, 1469137636663758888u64] {
+    for (token, app) in [
+        "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+        "Bot MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+    ]
+    .into_iter()
+    .flat_map(|token| [1539711683898118154u64, 1469137636663758888u64].map(|app| (token, app)))
+    {
         let (mock, origin) = MockRest::start_script(vec![RestResponse {
             status: 200,
             body: Some(format!("{{\"id\":\"{app}\"}}")),
             delay: Duration::ZERO,
         }])
         .await;
-        let runtime = activation_runtime(
-            326474832151838730,
-            "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
-            origin,
-        );
+        let runtime = activation_runtime(326474832151838730, token, origin);
         runtime.publish_registry(None).await;
         let requests = mock.requests();
         assert_eq!(requests[0].method, "GET");
@@ -612,6 +619,115 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
             );
         }
         mock.shutdown().await;
+    }
+}
+
+/// Use child test processes rather than mutating the parallel suite's env.
+#[test]
+fn activation_boot_from_env_isolates_denied_moderation_validation() {
+    for (guild, token, owen, expected) in [
+        (
+            "326474832151838730",
+            "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+            "",
+            "narrowed",
+        ),
+        (
+            "326474832151838730",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "narrowed",
+        ),
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "invalid",
+        ),
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "123456789012345678",
+            "enabled",
+        ),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "command_runtime_tests::activation_boot_from_env_fixture",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("ACTIVATION_ENV_TEST_EXPECTED", expected)
+            .env("GUILD_ID", guild)
+            .env("DISCORD_TOKEN", token)
+            .env("DISCORD_API_BASE", "http://127.0.0.1:9")
+            .env("TWO_MODERATION", "1")
+            .env("TWO_OWEN_USER_ID", owen)
+            .env(
+                "TWO_MODERATION_PROTECTED_ROLE_IDS",
+                if expected == "narrowed" {
+                    "invalid"
+                } else {
+                    ""
+                },
+            )
+            .env("TWO_AUTOMOD", "1")
+            .env("TWO_AUTOMATIONS", "1")
+            .env("TWO_ANNOUNCEMENTS", "1")
+            .output()
+            .expect("isolated boot env fixture");
+        assert!(
+            output.status.success(),
+            "fixture {expected}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+}
+
+#[tokio::test]
+async fn activation_boot_from_env_fixture() {
+    let Ok(expected) = std::env::var("ACTIVATION_ENV_TEST_EXPECTED") else {
+        return;
+    };
+    let config = two_bot_core::Config::from_env().unwrap();
+    let guild = config.guild_id.unwrap();
+    let token = config.discord_token.as_ref().unwrap().expose();
+    let activation = crate::activation::BootActivation::from_config(&config);
+    assert_eq!(
+        crate::gateway::intents_from_env(&activation)
+            .contains(twilight_gateway::Intents::MESSAGE_CONTENT),
+        expected != "narrowed"
+    );
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .unwrap();
+    let runtime = CommandRuntime::from_env(pool, token, guild, &activation);
+    if expected == "invalid" {
+        assert!(
+            runtime.is_none(),
+            "permitted staging moderation still validates Owen"
+        );
+        return;
+    }
+    let runtime = runtime.expect("denied moderation must not disable unrelated commands");
+    let defs = runtime.router().publish_set(&[]).unwrap();
+    let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
+    if expected == "narrowed" {
+        assert_eq!(names, ["rank", "leaderboard"]);
+        assert!(!runtime.router().gates().moderation);
+        assert!(!runtime.router().gates().automations);
+        assert!(!runtime.router().gates().announcements);
+        assert!(
+            !runtime.router().gates().self_roles,
+            "permission never enables an unconfigured surface"
+        );
+    } else {
+        assert!(runtime.router().gates().moderation);
+        assert!(names.contains(&"ban"));
+        assert!(names.contains(&"sticky"));
     }
 }
 

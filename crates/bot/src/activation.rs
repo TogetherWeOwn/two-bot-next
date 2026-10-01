@@ -79,6 +79,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn activation_bare_and_prefixed_token_decisions_match() {
+        for guild in [1545644954272137297, 326474832151838730] {
+            for token in [
+                "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+                "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+            ] {
+                let bare = BootActivation::from_token(Some(guild), Some(token));
+                let prefixed =
+                    BootActivation::from_token(Some(guild), Some(&format!("Bot {token}")));
+                assert_eq!(bare.application_id(), prefixed.application_id());
+                for capability in LiveCapability::ALL {
+                    assert_eq!(bare.permitted(capability), prefixed.permitted(capability));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn activation_token_identity_not_configured_application() {
         // Synthetic first segment for public staging application id, not a credential.
         let config = Config {
