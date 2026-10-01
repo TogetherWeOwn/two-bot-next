@@ -1,6 +1,5 @@
 //! Env-cleared child probes avoid racing process-global bootstrap configuration.
-#[path = "../../core/tests/support/tracing_capture.rs"]
-mod tracing_capture;
+use crate::tracing_capture;
 
 pub fn capture_probe(future: impl std::future::Future<Output = ()>) {
     let capture = tracing_capture::Capture::default();

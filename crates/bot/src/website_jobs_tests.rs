@@ -5,8 +5,7 @@ use two_bot_testsupport::TestDatabase;
 
 use crate::discord_test_common::{MockRest, ScriptedResponse};
 
-#[path = "../../core/tests/support/tracing_capture.rs"]
-mod tracing_capture;
+use crate::tracing_capture;
 
 #[test]
 fn admission_lazy_pool_rejects_query_secrets_before_sqlx_logging() {
