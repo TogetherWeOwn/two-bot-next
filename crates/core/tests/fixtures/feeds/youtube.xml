@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+  <entry><id>yt:video:123</id><yt:videoId>123</yt:videoId><title>New upload</title>
+    <link rel="self" href="https://www.youtube.com/feeds/videos.xml"/>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=123"/>
+    <published>2026-09-30T01:00:00Z</published>
+  </entry>
+</feed>

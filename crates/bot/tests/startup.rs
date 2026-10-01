@@ -23,9 +23,6 @@ fn command(listen_addr: &str) -> Command {
     command
         .env_clear()
         .env("LISTEN_ADDR", listen_addr)
-        .env("GUILD_ID", "not-a-snowflake")
-        .env("DISCORD_TOKEN", "INVALID")
-        .env("DATABASE_URL", "synthetic-database-must-not-connect")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     command
@@ -44,6 +41,139 @@ fn get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
 
 #[test]
 fn invalid_guild_preserves_custom_listener_and_gateway_down() {
+    assert_parked_gateway(&[
+        ("DISCORD_TOKEN", "INVALID"),
+        ("DATABASE_URL", "synthetic-database-must-not-connect"),
+        ("GUILD_ID", "not-a-snowflake"),
+    ]);
+}
+
+#[test]
+fn missing_database_with_token_parks_gateway() {
+    assert_parked_gateway(&[("DISCORD_TOKEN", "INVALID"), ("GUILD_ID", "123")]);
+}
+
+#[test]
+fn empty_database_with_token_parks_gateway() {
+    assert_parked_gateway(&[
+        ("DISCORD_TOKEN", "INVALID"),
+        ("DATABASE_URL", ""),
+        ("GUILD_ID", "123"),
+    ]);
+}
+
+#[test]
+fn missing_guild_with_token_parks_gateway() {
+    assert_parked_gateway(&[
+        ("DISCORD_TOKEN", "INVALID"),
+        ("DATABASE_URL", "synthetic-database-must-not-connect"),
+    ]);
+}
+
+#[test]
+fn zero_guild_with_token_parks_gateway() {
+    assert_parked_gateway(&[
+        ("DISCORD_TOKEN", "INVALID"),
+        ("DATABASE_URL", "synthetic-database-must-not-connect"),
+        ("GUILD_ID", "0"),
+    ]);
+}
+
+#[test]
+fn missing_token_parks_gateway() {
+    assert_parked_gateway(&[
+        ("DATABASE_URL", "synthetic-database-must-not-connect"),
+        ("GUILD_ID", "123"),
+    ]);
+}
+
+#[test]
+fn empty_token_parks_gateway() {
+    assert_parked_gateway(&[
+        ("DISCORD_TOKEN", ""),
+        ("DATABASE_URL", "synthetic-database-must-not-connect"),
+        ("GUILD_ID", "123"),
+    ]);
+}
+
+#[test]
+fn configured_gateway_initialization_failure_exits_nonzero() {
+    // A malformed synthetic URL fails locally; no database or Discord is contacted.
+    let mut bot = Bot(command("127.0.0.1:0")
+        .env("DISCORD_TOKEN", "INVALID")
+        .env("DATABASE_URL", "synthetic-database-must-not-connect")
+        .env("GUILD_ID", "123")
+        .spawn()
+        .expect("start test bot"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = bot.0.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(1));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "configured failed gateway stayed alive"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_gateway_override_exits_without_logging_its_value() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    let override_url = OsString::from_vec(b"ws://127.0.0.1:1/synthetic-secret-\xff".to_vec());
+    let mut bot = Bot(command("127.0.0.1:0")
+        .env("DISCORD_TOKEN", "INVALID")
+        .env("DATABASE_URL", "synthetic-database-must-not-connect")
+        .env("GUILD_ID", "123")
+        .env("DISCORD_GATEWAY_URL", override_url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start test bot"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = bot.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "invalid gateway override stayed alive"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut logs = String::new();
+    bot.0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    bot.0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "child logs: {logs}");
+    assert!(
+        logs.contains("DISCORD_GATEWAY_URL must be valid UTF-8"),
+        "child logs: {logs}"
+    );
+    assert!(
+        !logs.contains("synthetic-secret"),
+        "override value leaked: {logs}"
+    );
+    assert!(
+        !logs.contains("durable gateway"),
+        "gateway initialized before rejection: {logs}"
+    );
+}
+
+fn assert_parked_gateway(vars: &[(&str, &str)]) {
     // Reserve a non-default local port; no deployed service is contacted.
     let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
     let addr = reserved.local_addr().unwrap();
@@ -51,7 +181,10 @@ fn invalid_guild_preserves_custom_listener_and_gateway_down() {
     let listen_addr = format!("0.0.0.0:{}", addr.port());
     drop(reserved);
 
-    let mut bot = Bot(command(&listen_addr).spawn().expect("start test bot"));
+    let mut bot = Bot(command(&listen_addr)
+        .envs(vars.iter().copied())
+        .spawn()
+        .expect("start test bot"));
     let deadline = Instant::now() + Duration::from_secs(5);
     let health = loop {
         assert!(
@@ -77,6 +210,12 @@ fn invalid_guild_preserves_custom_listener_and_gateway_down() {
         report["components"],
         serde_json::json!([["process", "ready"], ["gateway", "down"]])
     );
+
+    for name in ["counter", "rank", "scheduled_events"] {
+        assert_eq!(report["jobs"][name]["parked"], true);
+        assert_eq!(report["jobs"][name]["running"], false);
+        assert_eq!(report["jobs"][name]["last_start"], serde_json::Value::Null);
+    }
 
     let mut probe = Bot(command(&listen_addr).arg("--healthcheck").spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(5);

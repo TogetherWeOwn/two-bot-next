@@ -1,0 +1,40 @@
+# Nightly TWO Staging guild-configuration snapshot.
+# Captures roles, channels, overwrites, settings and emoji, seals the
+# snapshot (TOG-3513), writes a drift report against the accepted
+# clean-slate spec, then uploads both through the backup-store wrapper.
+# A local-only snapshot is an error, not success.
+
+[Unit]
+Description=Back up TWO Staging Discord configuration (two-bot-next)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=twobot
+Group=twobot
+WorkingDirectory=/opt/two-bot-next
+LoadCredential=discord_staging_token:/etc/two-bot-next/credentials/discord_staging_token
+EnvironmentFile=/etc/two-bot-next/backup.env
+EnvironmentFile=/etc/two-bot-next/two-bot-next.env
+Environment=TWO_GUILD_CONFIG_BACKUP_DIR=/var/backups/two-bot-next/guild-config
+ExecStart=/opt/two-bot-next/two-bot guild-config-snapshot
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=two-bot-next-guild-config-backup
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/two-bot-next/guild-config
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
