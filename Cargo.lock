@@ -2318,6 +2318,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tower-service",
  "tracing",
  "two-bot-testsupport",
  "unicode-normalization",
