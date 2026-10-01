@@ -14,7 +14,7 @@
 //!   legacy order pinned below: claim → post → record → delete previous →
 //!   audit, with `post_failed`/orphan cleanup on the failure edges).
 //! - feed relays (`/feed-add`, `/feed-remove`, `/feed-list`; TOG-10085 domain
-//!   + store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
+//!   and store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
 //!   completion. The generated relay/audit ids replace legacy `randomUUID()`.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
