@@ -213,6 +213,10 @@ async fn exercise(pool: &PgPool) -> TestResult {
     terminal_restart_refuses_unknown_or_uninitialized_target(pool).await?;
     terminal_restart_preserves_inherited_pending(pool).await?;
     terminal_restart_cancellation_preserves_journal(pool).await?;
+    terminal_partial_repair_exchange_outcomes(pool).await?;
+    terminal_late_response_after_independent_transfer(pool).await?;
+    terminal_pacing_loss_is_definite_no_send(pool).await?;
+    terminal_post_journal_wait_is_definite_no_send(pool).await?;
     mixed_terminal_processing_sweep_and_dry_run(pool).await?;
     supervised_processing_recovery(pool).await?;
     bounded_processing_sweep(pool).await?;
@@ -703,6 +707,412 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
         1
     );
     mock.shutdown().await;
+    Ok(())
+}
+
+async fn terminal_partial_repair_exchange_outcomes(pool: &PgPool) -> TestResult {
+    for case in ["forbidden", "rate-limited", "server-error", "timeout"] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("terminal-partial-{case}");
+        let pending = case == "timeout";
+        let failure = match case {
+            "forbidden" => ScriptedResponse::status(403),
+            "rate-limited" => ScriptedResponse::rate_limited(0.1, "0.1"),
+            "server-error" => ScriptedResponse::status(500),
+            "timeout" => ScriptedResponse::status(204).delayed(Duration::from_secs(6)),
+            _ => unreachable!(),
+        };
+        let expected = match case {
+            "forbidden" => SelfRoleRestError::Rejected(403),
+            "rate-limited" => SelfRoleRestError::RateLimited,
+            _ => SelfRoleRestError::Ambiguous,
+        };
+        let mut script = snapshot(&[OLD_ROLE, OTHER]);
+        script.push(ScriptedResponse::status(204)); // acknowledged obsolete-role removal
+        script.extend(snapshot(&[OTHER]));
+        script.push(failure); // only one add attempt, no executor retry
+        script.extend(snapshot(&[NEW_ROLE, OTHER])); // later authoritative convergence
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
+        let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
+        let hint = feature
+            .terminal_candidates(&panel, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(matches!(feature.recover_terminal(&hint, &panel).await,
+            Err(RuntimeError::Rest(error)) if error == expected));
+        let effects = terminal_evidence(pool, &audit, pending, false).await?;
+        assert_eq!(effects.compensated_removed_role_ids, [OLD_ROLE]);
+        assert!(effects.compensated_added_role_ids.is_empty());
+        assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]);
+        assert!(effects.attempted_added_role_ids.contains(&NEW_ROLE.into()));
+        assert_eq!(
+            effects.unresolved_added_role_ids.contains(&NEW_ROLE.into()),
+            matches!(case, "server-error" | "timeout")
+        );
+        assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
+        let calls = mock.requests();
+        let mutations: Vec<_> = calls.iter().filter(|r| r.method != "GET").collect();
+        assert_eq!(calls.len(), 10);
+        assert_eq!(mutations.len(), 2);
+        assert_eq!(mutations[0].method, "DELETE");
+        assert!(mutations[0].path.ends_with(OLD_ROLE));
+        assert_eq!(mutations[1].method, "PUT");
+        assert!(mutations[1].path.ends_with(NEW_ROLE));
+        assert!(mutations
+            .iter()
+            .all(|r| r.body.is_empty() && !r.path.ends_with(OTHER)));
+
+        clock.store(NOW + 1_000, Ordering::SeqCst);
+        let hint = feature
+            .terminal_candidates(&panel, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let repaired = feature.recover_terminal(&hint, &panel).await;
+        if pending {
+            assert!(matches!(repaired, Err(RuntimeError::PendingExchange)));
+        } else {
+            assert!(repaired.unwrap());
+        }
+        let after = terminal_evidence(pool, &audit, pending, !pending).await?;
+        assert_eq!(after.compensated_removed_role_ids, [OLD_ROLE]);
+        // A snapshot observes the attempted addition; it does not fabricate an
+        // acknowledged compensation response to the prior failed/unknown PUT.
+        assert_eq!(after.added_role_ids, [NEW_ROLE]);
+        assert!(after.compensated_added_role_ids.is_empty());
+        assert_eq!(
+            after.unresolved_added_role_ids.contains(&NEW_ROLE.into()),
+            pending
+        );
+        assert_eq!(mock.requests().len(), 14);
+        assert_eq!(
+            mock.requests().iter().filter(|r| r.method != "GET").count(),
+            2
+        );
+        assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
+        // Even after the delayed mock send has finished, its lost response was
+        // not received by this owner. Elapsed time cannot retire that uncertainty.
+        if pending {
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            terminal_evidence(pool, &audit, true, false).await?;
+        }
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn terminal_fixture_owners(
+    feature: &SelfRoleRuntime,
+    panel: &SelfRolePanel,
+) -> TestResult<(TerminalRepair, RepairLease)> {
+    let hint = feature
+        .terminal_candidates(panel, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let claim = feature.store.claim_superseded_audit(&hint).await?.unwrap();
+    let lost = Arc::new(AtomicBool::new(false));
+    let owner = TerminalRepair {
+        effects: claim.audit().effects.clone(),
+        pending: claim.exchange_pending(),
+        _keeper: LeaseKeeper::terminal(feature.store.clone(), claim.clone(), lost.clone()),
+        claim,
+        lost: lost.clone(),
+    };
+    let key = PanelKey {
+        guild_id: GUILD.into(),
+        member_id: USER.into(),
+        panel_id: panel.id.clone(),
+    };
+    let claim = match feature.store.claim_panel(&key, None).await? {
+        PanelClaimResult::Acquired(claim) => claim,
+        other => panic!("expected maintenance lane, got {other:?}"),
+    };
+    let lane = RepairLease {
+        _keeper: LeaseKeeper::start(
+            feature.store.clone(),
+            None,
+            Some(claim.clone()),
+            lost.clone(),
+        ),
+        claim,
+        lost,
+    };
+    // These fault fixtures advance the DB clock independently for each lease.
+    // Disable only their owned keepers; no host process or cache is touched.
+    owner._keeper.0.abort();
+    lane._keeper.0.abort();
+    Ok((owner, lane))
+}
+
+async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> TestResult {
+    for evidence_transfer in [true, false] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("terminal-late-transfer-{evidence_transfer}");
+        let mut script = snapshot(&[OLD_ROLE, OTHER]);
+        script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(3)));
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
+        let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
+        let (mut owner, lane) = terminal_fixture_owners(&feature, &panel).await?;
+        let mut snapshot = feature
+            .executor
+            .fetch_self_role_snapshot(GUILD, USER, BOT)
+            .await
+            .unwrap();
+        let evidence_claim = owner.claim.clone();
+        let mut step =
+            Box::pin(feature.terminal_step(&mut owner, &lane, &mut snapshot, OLD_ROLE, false));
+        tokio::select! {
+            result = step.as_mut() => panic!("step completed before transfer: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(2), async {
+                while !mock.requests().iter().any(|r| r.method == "DELETE") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result?,
+        }
+        clock.store(NOW + 100, Ordering::SeqCst);
+        if evidence_transfer {
+            assert!(feature.store.renew_panel_claim(&lane.claim).await?);
+        } else {
+            assert!(
+                feature
+                    .store
+                    .renew_superseded_claim(&evidence_claim)
+                    .await?
+            );
+        }
+        clock.store(NOW + 300, Ordering::SeqCst);
+        let replacement_evidence;
+        let replacement_lane;
+        if evidence_transfer {
+            let hint = feature
+                .terminal_candidates(&panel, 1)
+                .await
+                .unwrap()
+                .remove(0);
+            replacement_evidence =
+                Some(feature.store.claim_superseded_audit(&hint).await?.unwrap());
+            replacement_lane = None;
+            assert!(feature.store.owns_panel_claim(&lane.claim).await?);
+        } else {
+            replacement_evidence = None;
+            replacement_lane = Some(
+                match feature.store.claim_panel(&lane.claim.key, None).await? {
+                    PanelClaimResult::Acquired(claim) => claim,
+                    other => panic!("expected replacement maintenance lane, got {other:?}"),
+                },
+            );
+            assert!(feature.store.owns_superseded_claim(&evidence_claim).await?);
+        }
+        assert!(matches!(step.await, Err(RuntimeError::Stale)));
+        assert_eq!(owner.effects.compensated_removed_role_ids, [OLD_ROLE]);
+        let effects = terminal_evidence(pool, &audit, evidence_transfer, false).await?;
+        assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]);
+        if let Some(replacement) = replacement_evidence {
+            assert_eq!(replacement.generation(), owner.claim.generation() + 1);
+            assert!(replacement.exchange_pending());
+            assert!(effects.compensated_removed_role_ids.is_empty());
+            assert_eq!(effects.unresolved_removed_role_ids, [OLD_ROLE]);
+            // The former response is not authority after token transfer. Even a
+            // fresh owner's evidence-only write cannot erase inherited unknown work.
+            assert!(
+                !feature
+                    .store
+                    .record_superseded_repair(&owner.claim, &owner.effects, false)
+                    .await?
+            );
+            assert!(
+                feature
+                    .store
+                    .record_superseded_repair(&replacement, &AuditEffects::default(), false)
+                    .await?
+            );
+            let effects = terminal_evidence(pool, &audit, true, false).await?;
+            assert_eq!(effects.unresolved_removed_role_ids, [OLD_ROLE]);
+            assert!(
+                !feature
+                    .store
+                    .finish_superseded_repair(&owner.claim, &lane.claim)
+                    .await?
+            );
+        }
+        if let Some(replacement) = replacement_lane {
+            assert_eq!(replacement.generation, lane.claim.generation + 1);
+            assert_eq!(effects.compensated_removed_role_ids, [OLD_ROLE]);
+            assert!(effects.unresolved_removed_role_ids.is_empty());
+            assert!(!feature.store.release_panel_claim(&lane.claim).await?);
+            assert!(feature.store.owns_panel_claim(&replacement).await?);
+            assert!(
+                !feature
+                    .store
+                    .finish_superseded_repair(&owner.claim, &lane.claim)
+                    .await?
+            );
+            assert!(feature.store.release_panel_claim(&replacement).await?);
+        }
+        assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
+        assert_eq!(mock.requests().len(), 5);
+        assert_eq!(
+            mock.requests().iter().filter(|r| r.method != "GET").count(),
+            1
+        );
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn terminal_pacing_loss_is_definite_no_send(pool: &PgPool) -> TestResult {
+    for inherited_pending in [false, true] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("terminal-pacing-loss-{inherited_pending}");
+        let mut script = snapshot(&[OLD_ROLE, OTHER]);
+        let mut blocker_reads = snapshot(&[OLD_ROLE, OTHER]);
+        blocker_reads[0] =
+            ScriptedResponse::json(200, json!({"user":{"id":USER},"roles":[OLD_ROLE,OTHER]}))
+                .delayed(Duration::from_secs(1));
+        script.extend(blocker_reads);
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let audit = terminal_seed(&feature.store, &panel, &panel.id, inherited_pending).await?;
+        let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
+        let (mut owner, lane) = terminal_fixture_owners(&feature, &panel).await?;
+        let mut snapshot = feature
+            .executor
+            .fetch_self_role_snapshot(GUILD, USER, BOT)
+            .await
+            .unwrap();
+        let blocker = {
+            let executor = feature.executor.clone();
+            tokio::spawn(async move { executor.fetch_self_role_snapshot(GUILD, USER, BOT).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.requests().len() < 5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let mut step =
+            Box::pin(feature.terminal_step(&mut owner, &lane, &mut snapshot, OLD_ROLE, false));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), step.as_mut())
+                .await
+                .is_err()
+        );
+        clock.store(NOW + 300, Ordering::SeqCst); // expire while shared paced lane is occupied
+        assert!(matches!(step.await, Err(RuntimeError::Stale)));
+        blocker.await?.unwrap();
+        let effects = terminal_evidence(pool, &audit, inherited_pending, false).await?;
+        assert_eq!(effects.attempted_added_role_ids, [OLD_ROLE]);
+        assert!(effects.attempted_removed_role_ids.is_empty()); // no journal, no send intent
+        assert!(effects.compensated_removed_role_ids.is_empty());
+        assert!(effects.unresolved_removed_role_ids.is_empty());
+        assert_eq!(
+            effects.unresolved_added_role_ids.contains(&OLD_ROLE.into()),
+            inherited_pending
+        );
+        assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
+        assert_eq!(mock.requests().len(), 8);
+        assert!(mock.requests().iter().all(|r| r.method == "GET"));
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn terminal_post_journal_wait_is_definite_no_send(pool: &PgPool) -> TestResult {
+    for inherited_pending in [false, true] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("terminal-journal-wait-{inherited_pending}");
+        let mock =
+            MockRest::start(snapshot(&[OLD_ROLE, OTHER]), ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let audit = terminal_seed(&feature.store, &panel, &panel.id, inherited_pending).await?;
+        let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
+        let (mut owner, lane) = terminal_fixture_owners(&feature, &panel).await?;
+        let mut snapshot = feature
+            .executor
+            .fetch_self_role_snapshot(GUILD, USER, BOT)
+            .await
+            .unwrap();
+
+        // The generated test schema owns this trigger. Delay only the journal
+        // UPDATE, after its pre-write ownership checks; read-only checks cannot
+        // block here. This exercises the executor's post-journal fence without
+        // adding a production hook or inventing a remote response.
+        sqlx::raw_sql(
+            "CREATE FUNCTION terminal_fixture_journal_wait() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF NEW.attempted_removed_role_ids IS DISTINCT FROM OLD.attempted_removed_role_ids THEN
+                     PERFORM pg_advisory_xact_lock(hashtextextended(current_schema() || NEW.event_id, 0));
+                 END IF;
+                 RETURN NEW;
+             END $$;
+             CREATE TRIGGER terminal_fixture_journal_wait BEFORE UPDATE ON self_role_audit
+             FOR EACH ROW EXECUTE FUNCTION terminal_fixture_journal_wait();",
+        ).execute(pool).await?;
+        let mut blocker = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || $1, 0))")
+            .bind(&audit.event_id)
+            .execute(&mut *blocker)
+            .await?;
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await?;
+        let mut step =
+            Box::pin(feature.terminal_step(&mut owner, &lane, &mut snapshot, OLD_ROLE, false));
+        tokio::select! {
+            result = step.as_mut() => panic!("step completed before journal wait: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let blocked: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                         WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))",
+                    ).bind(blocker_pid).fetch_one(pool).await?;
+                    if blocked {
+                        return Ok::<(), sqlx::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result??,
+        }
+        clock.store(NOW + 300, Ordering::SeqCst);
+        blocker.rollback().await?;
+        let result = step.await;
+        sqlx::raw_sql(
+            "DROP TRIGGER terminal_fixture_journal_wait ON self_role_audit;
+             DROP FUNCTION terminal_fixture_journal_wait();",
+        )
+        .execute(pool)
+        .await?;
+        assert!(matches!(result, Err(RuntimeError::Stale)));
+        let effects = terminal_evidence(pool, &audit, inherited_pending, false).await?;
+        assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]); // journal committed, send refused
+        assert_eq!(effects.attempted_added_role_ids, [OLD_ROLE]);
+        assert!(effects.compensated_removed_role_ids.is_empty());
+        assert!(effects.unresolved_removed_role_ids.is_empty()); // only the definite no-send is resolved
+        assert_eq!(
+            effects.unresolved_added_role_ids.contains(&OLD_ROLE.into()),
+            inherited_pending
+        );
+        assert!(
+            !feature
+                .store
+                .finish_superseded_repair(&owner.claim, &lane.claim)
+                .await?
+        );
+        assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
+        assert_eq!(mock.requests().len(), 4);
+        assert!(mock.requests().iter().all(|r| r.method == "GET"));
+        mock.shutdown().await;
+    }
     Ok(())
 }
 

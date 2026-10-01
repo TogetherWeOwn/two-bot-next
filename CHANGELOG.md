@@ -36,9 +36,12 @@
   selected/empty target, atomic paired ownership checks and bounded fair mixed
   discovery. Preserve inherited uncertainty and terminal rejection; dry-run skips
   terminal claims. Add source fixtures for restart convergence, missing/unknown
-  targets, pending evidence, cancelled renewals and mixed sweeps. Production boot
-  remains disabled until approved shared boot configuration, unresolved-work
-  continuation and compiled acceptance are complete.
+  targets, pending evidence, cancelled renewals and mixed sweeps. Extend terminal
+  fault-injection source coverage for partial repair rejection/rate-limit/received
+  ambiguity/timeout, independent evidence/lane transfer during REST, and expiry
+  after pacing or journal waits without false sends or uncertainty retirement.
+  Production boot remains disabled until approved shared boot configuration,
+  unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

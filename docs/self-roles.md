@@ -333,7 +333,14 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
 - Added isolated source fixtures cover restarted selected/missing/empty target
   repair, remove-before-add/unrelated-role preservation, unknown/uninitialized
   refusal, inherited pending, cancellation-owned renewals and mixed/dry-run
-  sweeps. Paired store fixtures cover normal/unknown lane refusal and expiry
+  sweeps. Terminal fault fixtures cover acknowledged removal followed by
+  403/429/received-500/timeout addition, later authoritative convergence without
+  inventing acknowledged compensation, independent evidence-token/lane transfer
+  during a delayed response, and expiry while shared pacing is occupied. A
+  generated-schema-only trigger delays the journal UPDATE after its initial
+  ownership checks; post-journal expiry must prevent REST, retain attempted
+  history, resolve only the new definite no-send and preserve inherited unknown
+  evidence. Paired store fixtures cover normal/unknown lane refusal and expiry
   after both panel and audit lock waits. These are **uncompiled source coverage**,
   not passed Rust acceptance or independent review.
 
