@@ -96,8 +96,7 @@ fn connect_options(raw: &str) -> Result<PgConnectOptions> {
         .username("agent_test")
         .password("")
         .database(url.path().trim_start_matches('/'))
-        .ssl_mode(PgSslMode::Disable)
-        .options([("statement_timeout", "5000ms")]))
+        .ssl_mode(PgSslMode::Disable))
 }
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -148,10 +147,12 @@ pub struct TestDatabase {
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
         let options = connect_options(raw)?;
+        // CREATE/DROP DATABASE can wait for a checkpoint on busy CI storage.
+        // Keep a finite administrative bound without relaxing test query limits.
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_with(options.clone())
+            .connect_with(options.clone().options([("statement_timeout", "120000ms")]))
             .await
             .context("connect to test bootstrap database")?;
         let name = database_name();
@@ -167,7 +168,12 @@ impl TestDatabase {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_lazy_with(options.database(&name).application_name(&name));
+            .connect_lazy_with(
+                options
+                    .database(&name)
+                    .application_name(&name)
+                    .options([("statement_timeout", "5000ms")]),
+            );
         let fixture = Self {
             cleanup: Some(Cleanup { admin, pool, name }),
         };
@@ -246,6 +252,34 @@ mod tests {
     use super::*;
 
     const SAFE: &str = "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard";
+
+    #[tokio::test]
+    async fn administrative_timeout_does_not_relax_fixture_queries() {
+        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return,
+            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+        };
+        let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
+            .await
+            .unwrap();
+        let admin = &fixture.cleanup.as_ref().unwrap().admin;
+        let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(admin)
+            .await
+            .unwrap();
+        assert_eq!(timeout, "2min");
+        let peer = fixture.independent_pool().await.unwrap();
+        for pool in [fixture.pool(), &peer] {
+            let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(timeout, "5s");
+        }
+        peer.close().await;
+        fixture.close().await.unwrap();
+    }
 
     #[test]
     fn accepts_only_explicit_test_connections() {
