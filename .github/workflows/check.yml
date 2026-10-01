@@ -22,8 +22,16 @@ concurrency:
 jobs:
   check:
     name: check
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    needs: self-role-store
+    # A skipped dependency must not make the required check appear green.
+    if: ${{ always() }}
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
+    # Self-hosted runners share one Docker host, so a published 5432 collides
+    # across concurrent jobs. A job container gets its own network namespace:
+    # the service resolves as agent-testdb:5432 and loopback is job-private.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
       TWO_LFG_TESTDB_CI: '1'
@@ -37,8 +45,6 @@ jobs:
           # Ephemeral CI service only; tests explicitly use an empty password.
           # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 127.0.0.1:5432:5432
         options: >-
           --health-cmd "pg_isready -U agent_test -d agent_test"
           --health-interval 5s
@@ -49,6 +55,20 @@ jobs:
         with:
           # The migration guard reads PR base/push-before blobs, including the lock.
           fetch-depth: 0
+
+      - name: Job-container prerequisites (loopback forward to agent-testdb)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          # Tests that pin 127.0.0.1/localhost:5432 reach the service through
+          # this job-private forward.
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
+
+      - name: require self-role store tests to pass
+        if: needs.self-role-store.result != 'success'
+        run: exit 1
 
       - name: Check migration numbering and immutability
         env:
@@ -71,8 +91,12 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restore on every run; save only on pushes to main (below). A PR-scoped
+      # cache is unreadable by other PRs, and uploading the ~4 GiB target dir
+      # from a busy self-hosted runner pushed PR jobs past their timeout.
+      - name: Restore cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -99,13 +123,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Prepare isolated test databases
-        env:
-          TEST_DB_CONTAINER: ${{ job.services.agent-testdb.id }}
-        run: |
-          # Host-runner steps reach only this job's published service port.
-          # Keep the test guards' required hostname instead of weakening them.
-          printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
-          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_ci
+        run: createdb -h agent-testdb -U agent_test two_bot_test_ci
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
       # Migrated suites create/drop unique databases; this bootstrap is not reset.
@@ -161,8 +179,18 @@ jobs:
       # only this slice's tests activate their test-container guard here.
       - name: channel moderation domain and store tests
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
+
+      - name: Internal channel moderation executor (mock REST and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
+
+      - name: Internal-member durable store regressions (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
 
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
@@ -180,9 +208,49 @@ jobs:
         with:
           command: check all
 
+      - name: Save cargo cache (main only)
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  self-role-store:
+    name: self-role store leases
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 30
+    # A job container resolves service names directly. The test's fixed
+    # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    services:
+      agent-testdb:
+        image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        with:
+          toolchain: stable
+      - name: self-role claim, renewal, recovery and fencing tests
+        run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
+
   container:
     name: container smoke
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -221,22 +289,25 @@ jobs:
 
   community-db:
     name: community db
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 15
+    # Self-hosted runners share one Docker host, so a published 5432 collides
+    # across concurrent jobs. A job container gets its own network namespace:
+    # the service resolves as agent-testdb:5432 and loopback is job-private.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     services:
-      postgres:
+      agent-testdb:
         image: postgres:17
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: postgres
           POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U agent_test -d postgres"
           --health-interval 10s --health-timeout 5s --health-retries 5
     env:
-      TWO_TEST_DATABASE_URL: postgres://agent_test@localhost:5432/postgres
+      TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/postgres
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -253,8 +324,13 @@ jobs:
 
   feeds-db:
     name: feeds db check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 15
+    # Self-hosted runners share one Docker host, so a published 5432 collides
+    # across concurrent jobs. A job container gets its own network namespace:
+    # the service resolves as agent-testdb:5432 and loopback is job-private.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
     services:
@@ -264,7 +340,6 @@ jobs:
           POSTGRES_USER: agent_test
           POSTGRES_DB: agent_test
           POSTGRES_HOST_AUTH_METHOD: trust
-        ports: [5432:5432]
         options: >-
           --health-cmd "pg_isready -U agent_test -d agent_test"
           --health-interval 5s --health-timeout 5s --health-retries 10
@@ -274,15 +349,49 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - name: Map test-container-only hostname on runner
-        run: printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
       - run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - run: cargo test -p two-bot-core --features db --test feeds --locked
       - run: cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
 
+  tickets-postgres:
+    name: tickets postgres
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 15
+    # Service DNS stays inside this job's network; never publish a shared port.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    services:
+      agent-testdb:
+        image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TICKET_TEST_DB_HOST: agent-testdb
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        with:
+          toolchain: stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-tickets-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Ticket lifecycle and migration integration tests
+        run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
+
   worker:
     name: worker check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 10
     defaults:
       run:
@@ -302,7 +411,9 @@ jobs:
       # TOG-9907: named envs do not inherit bindings; fail if any [env.*]
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
       - name: check env bindings are explicit
-        run: python3 scripts/check-env-bindings.py wrangler.toml
+        run: |
+          python3 scripts/check-env-bindings.py wrangler.toml
+          python3 scripts/test-env-bindings.py
       - name: Verify frozen legacy registry export preconditions
         run: node --test ../scripts/test-export-legacy-registry.mjs
       - name: Verify PR lint event and dispatch paths

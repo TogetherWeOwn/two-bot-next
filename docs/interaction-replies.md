@@ -2,9 +2,11 @@
 
 The router's async entry point is `two_bot_discord::dispatch_interaction`.
 `route_interaction` remains the pure selection API; by itself it does not send
-replies. The current gateway adapter still models `InteractionCreate` as an
-unmodelled event: production feature/gateway wiring is a separate slice, not a
-second dispatcher hidden in this change.
+replies. The bot's `CommandRuntime` now receives gateway interactions and uses
+`response_for_slash` for refusals and unknown slash names. Its sticky/feed
+handlers still use their existing explicit defer/edit paths; adopting the shared
+lifecycle there is separate feature wiring, not a second dispatcher hidden in
+this change.
 
 ## Adapting existing feature functions
 
@@ -113,3 +115,8 @@ and Twilight request builders into `MockRest` on loopback. It asserts type 5
 then PATCH original for both visibility policies, mention suppression,
 consistent unknown/refusal callbacks, guild fencing and the DELETE/private
 followup sequence. These tests do not contact production/staging or a DB.
+
+`crates/bot/src/command_runtime_tests.rs` additionally verifies the current
+sticky/feed runtime's immediate unknown-command callback: type 4, flags 64,
+the same uniform text, no mentions, and no other REST effects. Unknown and known
+non-moderation commands in foreign/missing guilds still produce no callbacks.

@@ -48,6 +48,7 @@ pub mod inactivity_store;
 #[cfg(feature = "db")]
 pub mod internal_action_store;
 pub mod internal_actions;
+pub mod internal_settings;
 pub mod invites;
 pub mod leveling;
 #[cfg(feature = "db")]
@@ -73,8 +74,10 @@ pub mod rsvp_store;
 pub mod scheduled_events;
 pub mod secret;
 pub use secret::Secret;
+pub mod self_roles;
 pub mod settings;
 pub mod sticky;
+pub mod tickets;
 pub mod voice;
 pub mod voice_config;
 pub mod voice_ownership;
@@ -219,9 +222,9 @@ pub use onboarding_store::{
 };
 pub use presence::{
     bot_floor_due, daily_peaks, decide_probe_cycle, evaluate_trigger, latest_bot_floor,
-    sanitize_presence_count, DailyPeak, PresenceReading, ProbeDecision, TriggerOptions,
-    TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS, PRESENCE_PROBE_INTERVAL_MS,
-    REOPEN_PEAK_THRESHOLD,
+    sanitize_presence_count, BotFloorScan, DailyPeak, PresenceReading, ProbeDecision,
+    TriggerOptions, TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS,
+    PRESENCE_PROBE_INTERVAL_MS, REOPEN_PEAK_THRESHOLD,
 };
 pub use raid::{
     count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,
@@ -251,6 +254,17 @@ pub use rsvp_store::{
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
     ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+};
+pub use self_roles::{
+    emoji_identity, event_order_for_event_id, event_order_from_snowflake,
+    find_disallowed_permission, find_unsafe_channel_grant, parse_self_role_custom_id,
+    parse_self_role_panels, plan_select_delta, plan_self_role_change, reaction_endpoint_emoji,
+    reaction_option_key, self_role_claim_owned, self_role_custom_id, self_role_renew_after_ms,
+    self_role_reply, validate_panel_roles, validate_self_role_dispatch, ChannelOverwrite,
+    ChannelSnapshot, DispatchCheck, DispatchFailure, DispatchRole, PanelMode, ParsedCustomId,
+    PlanRejection, ResolvedRole, RoleOperation, SelfRoleConfigError, SelfRoleGates, SelfRoleOption,
+    SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
+    SELF_ROLE_ALLOWED_MASK, SELF_ROLE_ALLOWED_PERMISSIONS, SELF_ROLE_CLAIM_LEASE_MS,
 };
 pub use settings::{
     assert_storable_key, classify_key, is_declared_env_only, is_env_only_key, is_storable_key,

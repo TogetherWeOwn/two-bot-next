@@ -216,6 +216,11 @@ impl InteractionHandler for Stub {
     }
 }
 
+// The tracing callsite cache is shared even with thread-local subscribers.
+// Serialize both denial-emitting tests so an unsubscribed thread cannot race
+// the audit subscriber when the permission-denial callsite is first registered.
+static PERMISSION_AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Capture structured security events without a global subscriber or a store.
 type PermissionAuditFields = std::collections::BTreeMap<String, String>;
 
@@ -261,6 +266,7 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
     use twilight_model::channel::message::MessageFlags;
     use two_bot_core::command_permissions::{CommandSurface, COMMAND_PERMISSIONS};
 
+    let _permission_audit_guard = PERMISSION_AUDIT_LOCK.lock().unwrap();
     let router = InteractionRouter::new(all_on());
     let audit = PermissionAudit::default();
     let restricted: Vec<_> = COMMAND_PERMISSIONS
@@ -456,6 +462,7 @@ fn rsvp_attendance_namespacing_holds_on_the_wire() {
 
 #[test]
 fn disabled_and_ungated_wire_interactions_take_the_refusal_path() {
+    let _permission_audit_guard = PERMISSION_AUDIT_LOCK.lock().unwrap();
     let off = InteractionRouter::new(RouterGates {
         scorecard: false,
         automations: false,

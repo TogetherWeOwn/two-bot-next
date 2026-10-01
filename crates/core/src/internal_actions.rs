@@ -503,6 +503,8 @@ pub enum ErrorCode {
     StaleRequest,
     ActionNotAllowed,
     Replayed,
+    /// A settings row changed since the caller observed it; refresh, do not retry blindly.
+    VersionConflict,
     /// The one 409 that IS retryable: an earlier attempt at this same operation
     /// has not finished yet. Retrying with the same key is exactly right.
     InProgress,
@@ -523,6 +525,7 @@ impl ErrorCode {
             Self::StaleRequest => "stale_request",
             Self::ActionNotAllowed => "action_not_allowed",
             Self::Replayed => "replayed",
+            Self::VersionConflict => "version_conflict",
             Self::InProgress => "in_progress",
             Self::DiscordRejected => "discord_rejected",
             Self::RateLimited => "rate_limited",
@@ -539,7 +542,7 @@ impl ErrorCode {
             Self::Malformed => 400,
             Self::Unauthorized | Self::StaleRequest => 401,
             Self::ActionNotAllowed => 403,
-            Self::Replayed | Self::InProgress => 409,
+            Self::Replayed | Self::VersionConflict | Self::InProgress => 409,
             Self::DiscordRejected => 422,
             Self::RateLimited => 429,
             Self::Internal => 500,
@@ -562,6 +565,7 @@ impl ErrorCode {
             | Self::StaleRequest
             | Self::ActionNotAllowed
             | Self::Replayed
+            | Self::VersionConflict
             | Self::DiscordRejected => false,
         }
     }
@@ -1231,6 +1235,56 @@ pub fn validate_guild_add_member(body: &Map<String, Value>) -> Result<(), Action
     require_snowflake(body, "discord_id")?;
     require_field_str(body, "access_token")?;
     Ok(())
+}
+
+/// Resolved allowlisted role assignment. No caller can supply an arbitrary role ID.
+#[derive(Debug, Clone, Copy)]
+pub struct RoleAssignRequest<'a> {
+    discord_id: &'a str,
+    role_id: &'a str,
+}
+
+impl<'a> RoleAssignRequest<'a> {
+    pub fn validate(
+        body: &'a Map<String, Value>,
+        role_keys: &'a HashMap<String, String>,
+    ) -> Result<Self, ActionError> {
+        let role_id = validate_role_assign(body, role_keys)?;
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+            role_id,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    #[must_use]
+    pub fn role_id(&self) -> &str {
+        self.role_id
+    }
+}
+
+/// Validated member subject only. The OAuth token stays a separate transient argument.
+#[derive(Debug, Clone, Copy)]
+pub struct GuildAddMemberRequest<'a> {
+    discord_id: &'a str,
+}
+
+impl<'a> GuildAddMemberRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        validate_guild_add_member(body)?;
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
 }
 
 /// `announcement.post` field validation: channel through the key map, body
@@ -2114,6 +2168,7 @@ mod tests {
             (ErrorCode::StaleRequest, 401, false),
             (ErrorCode::ActionNotAllowed, 403, false),
             (ErrorCode::Replayed, 409, false),
+            (ErrorCode::VersionConflict, 409, false),
             (ErrorCode::InProgress, 409, true),
             (ErrorCode::DiscordRejected, 422, false),
             (ErrorCode::RateLimited, 429, true),
