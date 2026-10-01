@@ -608,20 +608,23 @@ fn parse_plural(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
     })
 }
 
+// The literal payload and consumed width after a choice's opening `[[`.
+fn named_list_payload(input: &str) -> Option<(&str, usize)> {
+    let payload = input.strip_prefix("list:")?;
+    let end = payload.find("]]")?;
+    let name = payload[..end].trim();
+    (!name.is_empty()).then_some((name, "list:".len() + end + 2))
+}
+
 /// Parse `[[a/b/c]]` or `[[list:name]]`, without rewinding malformed bodies.
 fn parse_choice(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
     cursor.pos += 2;
     // List identifiers are literal keys, not nested templates. In particular,
     // token case, plural separators and slashes must survive lookup unchanged.
-    if let Some(payload) = cursor.rest().strip_prefix("list:") {
-        if let Some(end) = payload.find("]]") {
-            let name = payload[..end].trim();
-            if !name.is_empty() {
-                let name = name.to_string();
-                cursor.pos += "list:".len() + end + 2;
-                return Some(Segment::Choice(Choice::NamedList(name)));
-            }
-        }
+    if let Some((name, width)) = named_list_payload(cursor.rest()) {
+        let name = name.to_string();
+        cursor.pos += width;
+        return Some(Segment::Choice(Choice::NamedList(name)));
     }
     let branch_stops = Stops {
         singles: &['/'],
@@ -770,23 +773,43 @@ fn conditional_separator(input: &str, separator: &str) -> Option<usize> {
     None
 }
 
-// Each quote pair is visited once; mode headers are disjoint. This is linear
-// in source length, and never reparses a failed styling suffix. Only a colon
-// before a quote or newline forms a header, matching parse_styled's grammar.
+// Each payload and quote pair is visited once; mode headers are disjoint.
+// Only a colon before a quote or newline forms a header, matching parse_styled.
 fn separator_style_ends(input: &str) -> Vec<Option<usize>> {
+    let mut payload_starts = vec![None; input.len()];
+    let mut payload_end = 0;
+    for (start, _) in input.match_indices("[[list:") {
+        if start < payload_end {
+            continue;
+        }
+        let suffix = &input[start + 2..];
+        if !suffix.contains("]]") {
+            break; // No subsequent list can close either; scan this suffix once.
+        }
+        if let Some((_, width)) = named_list_payload(suffix) {
+            payload_end = start + 2 + width;
+            payload_starts[start..payload_end].fill(Some(start));
+        }
+    }
+
     let mut ends = vec![None; input.len()];
     let quotes: Vec<_> = input.match_indices("\"\"").map(|(pos, _)| pos).collect();
     for pair in quotes.windows(2).rev() {
         let (start, close) = (pair[0], pair[1]);
-        if ends[close].is_some() {
-            continue; // This quote already opens a complete later style.
+        if payload_starts[start].is_some() || ends[close].is_some() {
+            continue; // Literal list keys cannot open styles.
         }
         let modes = &input[start + 2..close];
-        if matches!(
-            modes.chars().find(|c| matches!(c, ':' | '"' | '\n')),
-            Some(':')
-        ) {
-            ends[start] = Some(close + 2);
+        if let Some((colon, ':')) = modes
+            .char_indices()
+            .find(|(_, c)| matches!(c, ':' | '"' | '\n'))
+        {
+            // A style already opened before a list still uses its first raw
+            // quote as a closer. But a colon in the list's opaque payload must
+            // not turn the preceding style's closer into another opener.
+            if payload_starts[close].is_none_or(|list| start + 2 + colon < list) {
+                ends[start] = Some(close + 2);
+            }
         }
     }
     ends
@@ -1790,6 +1813,18 @@ mod tests {
                 "\"\"identity:[[a/b]]\"\" text:literal",
                 "\"\"lower:[[c/d]]\"\"",
             ),
+            ("\"\"identity:a//b\"\"", "[[list:\"\"]] [[c/d]]"),
+            ("[[list:\"\"]] \"\"identity:a//b\"\"", "[[c/d]]"),
+            (
+                "\"\"identity:a//b\"\"",
+                "[[list:\"\"upper:x//y\"\"]] [[c/d]]",
+            ),
+            (
+                "\"\"identity:a//b\"\"",
+                "[[list:\"\"]] \"\"identity:[[c/d]]\"\" [[e/f]]",
+            ),
+            ("[[\"\"identity:a//b\"\"/c]]", "[[list:\"\"]] [[c/d]]"),
+            ("\"\"identity:[[list:\"\"]]tail\"\"", "[[c/d]]"),
         ] {
             let inner = format!("LIVE ?? {yes} // {no}");
             assert_eq!(
