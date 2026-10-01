@@ -91,11 +91,11 @@ fn runtime(store: Arc<Store>, http: GatedHttp) -> Runtime {
 }
 
 fn ready_event() -> Event {
-    Event::Ready(Box::new(serde_json::from_value::<Ready>(json!({
+    Event::Ready(serde_json::from_value::<Ready>(json!({
         "v": 10, "user": {"id": "999", "username": "mock-bot", "discriminator": "0", "bot": true},
         "session_id": "session", "resume_gateway_url": "wss://gateway.discord.gg",
         "guilds": [{"id": "100", "unavailable": true}], "application": {"id": "1111", "flags": 0}
-    })).unwrap()))
+    })).unwrap())
 }
 
 fn guild_event(extra: &[u64], allowed: Permissions) -> Event {
