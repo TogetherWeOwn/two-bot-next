@@ -285,6 +285,18 @@ async fn history_permission_member_grants_need_no_role_fetch_but_validate_entire
         .await
         .unwrap());
     assert!(mock.requests().is_empty());
+    let unrelated_deny = permission_channel(vec![
+        overwrite("100", 0, 0, required),
+        overwrite("400", 1, required, Permissions::SEND_MESSAGES.bits()),
+    ]);
+    assert!(rest
+        .ticket_history_readable("100", "400", &unrelated_deny)
+        .await
+        .unwrap());
+    assert!(
+        mock.requests().is_empty(),
+        "unrelated deny cannot require role lookups"
+    );
     for malformed in [
         json!({"id":"300","type":0,"allow":"bad","deny":"0"}),
         json!({"id":"300","type":2,"allow":"0","deny":"0"}),

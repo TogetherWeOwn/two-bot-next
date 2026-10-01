@@ -35,6 +35,8 @@ const BUTTON_TIMEOUT: Duration = Duration::from_secs(120);
 const LANE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECOVERY_ITEM_TIMEOUT: Duration = Duration::from_secs(20);
 const RECOVERY_ROWS_BUDGET: Duration = Duration::from_secs(180);
+const IDENTITY_TIMEOUT: Duration = Duration::from_secs(6);
+const PANEL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[path = "ticket_history.rs"]
 mod history;
@@ -88,6 +90,10 @@ where
     if tickets.is_empty() {
         return None;
     }
+    // Imported timestamps may have sub-ms precision that decoding discards.
+    // Sort by the same decoded key the cursor uses, not the database's full instant.
+    tickets
+        .sort_unstable_by(|a, b| (a.created_at, a.id.as_str()).cmp(&(b.created_at, b.id.as_str())));
     let after = cursor.lock().expect("ticket recovery cursor").clone();
     if let Some((created_at, id)) = after {
         let start = tickets
@@ -638,9 +644,18 @@ impl TicketRuntime {
         let Ok(_guard) = self.lane.try_lock() else {
             return Ok(());
         };
-        // Before READY there is no trustworthy own-author id. Do no REST work.
+        // A cold RESUMED lookup can fail once without another gateway event.
+        // Periodic recovery retries only authenticated identity until it is known.
         if self.bot_id.load(Ordering::Acquire) == 0 {
-            return Ok(());
+            let bot_id = bounded(IDENTITY_TIMEOUT, async {
+                self.executor
+                    .current_bot_user_id()
+                    .await
+                    .map_err(Failure::from)
+            })
+            .await
+            .map_err(|error| error.class())?;
+            self.on_ready(bot_id);
         }
         let tickets = bounded(RECOVERY_ITEM_TIMEOUT, async {
             self.store.recoverable().await.map_err(Failure::from)
@@ -657,7 +672,7 @@ impl TicketRuntime {
         };
         // Rows consume at most 180s, leaving a separate bounded panel slot
         // inside the 240s supervisor budget, even with a permanent slow prefix.
-        if let Err(error) = bounded(RECOVERY_ITEM_TIMEOUT, self.ensure_panel()).await {
+        if let Err(error) = bounded(PANEL_TIMEOUT, self.ensure_panel()).await {
             failed = Some(error.class());
         }
         failed.map_or(Ok(()), Err)

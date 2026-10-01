@@ -1001,3 +1001,57 @@ async fn cancelled_close_drops_partial_capture_and_recovery_restores_unsaved_tic
     mock.shutdown().await;
     db.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn failed_cold_resumed_identity_retries_during_recovery_without_another_gateway_event() {
+    let db = TestDb::new().await;
+    let mut panel = channel();
+    panel["id"] = json!("700");
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(500),
+            ScriptedResponse::json(200, json!({"id":"400","bot":true})),
+            ScriptedResponse::json(200, panel),
+            ScriptedResponse::json(200, json!([])),
+            ScriptedResponse::json(200, json!({"id":"801"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let executor =
+        ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
+    let tickets =
+        Arc::new(TicketRuntime::new(db.pool.clone(), executor.clone(), config()).unwrap());
+    let commands = CommandRuntime::with_tickets(db.pool.clone(), executor, Arc::clone(&tickets));
+    commands.suppress_registry_for_test().await;
+    commands.dispatch(&twilight_model::gateway::event::Event::Resumed);
+    // Await the actual managed identity task, not merely request arrival.
+    let mut tasks = {
+        let mut tasks = tickets.tasks.lock().unwrap();
+        std::mem::take(&mut *tasks)
+    };
+    while tasks.join_next().await.is_some() {}
+    assert_eq!(tickets.readiness_for_test(), (0, 0));
+    assert_eq!(mock.requests().len(), 1);
+    // Exercise the same recovery action invoked by the 300-second timer.
+    assert!(tickets.recover().await.is_ok());
+    assert_eq!(tickets.readiness_for_test(), (400, 1));
+    assert_eq!(mock.requests().len(), 5);
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|r| r.path == "/api/v10/users/@me")
+            .count(),
+        2
+    );
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .count(),
+        1
+    );
+    mock.shutdown().await;
+    db.close().await;
+}

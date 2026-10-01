@@ -121,7 +121,7 @@ async fn slow_recovery_prefix_rotates_and_leaves_a_panel_slot_on_each_pass() {
         )
         .await;
         assert!(matches!(failed, Some(ErrorClass::Timeout)));
-        bounded(RECOVERY_ITEM_TIMEOUT, async {
+        bounded(PANEL_TIMEOUT, async {
             panels += 1;
             Ok(())
         })
@@ -174,6 +174,68 @@ async fn cancelled_recovery_resumes_after_the_in_flight_row_even_if_it_disappear
     )
     .await;
     assert_eq!(*attempted.lock().unwrap(), vec!["2", "3"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn sub_millisecond_import_order_cannot_starve_decoded_cursor_rows() {
+    let cursor = TaskMutex::new(None);
+    let attempted = Arc::new(TaskMutex::new(Vec::new()));
+    // Full database instants can put these rows in any order within one ms.
+    let ids = [9, 8, 7, 6, 5, 4, 3, 2, 1, 15, 14, 13, 12, 11, 10];
+    for _ in 0..2 {
+        let attempted = Arc::clone(&attempted);
+        recovery_batch(
+            &cursor,
+            ids.into_iter()
+                .map(|id| {
+                    let mut ticket = recovery_ticket(id);
+                    ticket.created_at = 0;
+                    ticket
+                })
+                .collect(),
+            move |ticket| {
+                let attempted = Arc::clone(&attempted);
+                async move {
+                    attempted.lock().unwrap().push(ticket.id);
+                    tokio::time::sleep(Duration::from_secs(50)).await;
+                    Ok(())
+                }
+            },
+        )
+        .await;
+    }
+    let attempted = attempted.lock().unwrap();
+    for id in ids {
+        assert!(
+            attempted.contains(&id.to_string()),
+            "decoded-key row must not starve"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn panel_slot_admits_five_slow_successful_calls_inside_supervisor_budget() {
+    let started = Instant::now();
+    let result = bounded(PANEL_TIMEOUT, async {
+        // Ordinary panels need channel, member, roles, history and POST calls.
+        for _ in 0..5 {
+            bounded(Duration::from_secs(5), async {
+                tokio::time::sleep(Duration::from_millis(4_900)).await;
+                Ok(())
+            })
+            .await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        Ok(())
+    })
+    .await;
+    assert!(result.is_ok());
+    assert!(started.elapsed() > RECOVERY_ITEM_TIMEOUT);
+    assert!(started.elapsed() < PANEL_TIMEOUT);
+    assert!(
+        IDENTITY_TIMEOUT + RECOVERY_ITEM_TIMEOUT + RECOVERY_ROWS_BUDGET + PANEL_TIMEOUT
+            < RECOVERY_TIMEOUT
+    );
 }
 
 #[tokio::test]

@@ -190,7 +190,7 @@ impl ActionExecutor {
             .find(|row| row.kind == 1 && row.id == bot.get());
         // Member allows override every role deny. Our generated private ticket
         // has these explicit grants; no guild role fetch is needed to prove them.
-        if member.is_some_and(|row| row.allow & required == required && row.deny == 0) {
+        if member.is_some_and(|row| row.allow & required == required && row.deny & required == 0) {
             return Ok(true);
         }
 
