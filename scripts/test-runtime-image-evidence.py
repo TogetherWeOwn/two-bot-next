@@ -229,6 +229,130 @@ class EvidenceTests(unittest.TestCase):
                 self.assertFalse(report["complete"])
                 self.assertEqual(docker.call_count, 5)
 
+    def test_non_utf8_subprocess_output_retains_probe_and_failed_cleanup(self):
+        scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
+        self.assertTrue(scratch, "Fake Docker requires PAPERCLIP_RUN_SCRATCH_DIR or RUNNER_TEMP")
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            directory = Path(temporary)
+            self.fixture(directory)
+            executable = directory / "docker"
+            calls_path = directory / "calls.jsonl"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys\n"
+                f"with open({str(calls_path)!r}, 'a') as calls:\n"
+                "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "if sys.argv[1:3] == ['image', 'inspect']:\n"
+                f"    print({json.dumps(METADATA)!r})\n"
+                "elif sys.argv[1] == 'run':\n"
+                f"    if sys.argv[-1] == {evidence.PROBES['affected_files']!r}:\n"
+                "        sys.stdout.buffer.write(b'/tmp/minizip-\\xff\\n')\n"
+                "        sys.stderr.buffer.write(b'find warning: \\xfe\\n')\n"
+                "        sys.exit(2)\n"
+                "    sys.stdout.buffer.write(b'prior observation: \\xef\\xbf\\xbd\\n')\n"
+                "elif sys.argv[1] == 'rm':\n"
+                f"    calls = [json.loads(line) for line in open({str(calls_path)!r})]\n"
+                "    if sum(call[0] == 'run' for call in calls) == 5:\n"
+                "        sys.stdout.buffer.write(b'cleanup partial: \\xff\\n')\n"
+                "        sys.stderr.buffer.write(b'cleanup refused: \\xfe\\n')\n"
+                "        sys.exit(1)\n"
+            )
+            executable.chmod(0o700)
+            # Restrict PATH to the fake executable: never reach a real daemon.
+            with patch.dict(os.environ, {"PATH": str(directory)}), patch.object(sys, "argv", ["evidence", "two-bot:fixture", str(directory)]):
+                with self.assertRaisesRegex(SystemExit, "cleanup"):
+                    evidence.main()
+            report = json.loads((directory / "runtime-image-evidence.json").read_text())
+            calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+        self.assertEqual(len(calls), 11)
+        self.assertEqual(len(report["probes"]), 5)
+        self.assertFalse(report["complete"])
+        self.assertIn("cleanup", report["collection_error"])
+        for key in list(evidence.PROBES)[:4]:
+            prior = report["probes"][key]
+            self.assertEqual(prior["returncode"], 0)
+            self.assertEqual(prior["stdout"], "prior observation: \ufffd\n")
+            self.assertEqual(prior["lossy_decoding"], [])
+            self.assertFalse(prior["timed_out"])
+            self.assertEqual(prior["cleanup"]["status"], "removed")
+            self.assertEqual(prior["cleanup"]["lossy_decoding"], [])
+        result = report["probes"]["affected_files"]
+        run = calls[-2]
+        name = run[run.index("--name") + 1]
+        self.assertRegex(name, r"^two-bot-inspect-[0-9a-f]{32}$")
+        self.assertEqual(calls[-1], ["rm", "--force", name])
+        self.assertEqual(result["container_name"], name)
+        self.assertNotIn(name, [report["probes"][key]["container_name"] for key in list(evidence.PROBES)[:4]])
+        self.assertEqual(result["command"], evidence.PROBES["affected_files"])
+        self.assertEqual(result["returncode"], 2)
+        self.assertEqual(result["stdout"], "/tmp/minizip-\ufffd\n")
+        self.assertEqual(result["stderr"], "find warning: \ufffd\n")
+        self.assertEqual(result["lossy_decoding"], ["stdout", "stderr"])
+        self.assertFalse(result["timed_out"])
+        cleanup = result["cleanup"]
+        self.assertEqual(cleanup["status"], "failed")
+        self.assertEqual(cleanup["returncode"], 1)
+        self.assertEqual(cleanup["stdout"], "cleanup partial: \ufffd\n")
+        self.assertEqual(cleanup["stderr"], "cleanup refused: \ufffd\n")
+        self.assertEqual(cleanup["lossy_decoding"], ["stdout", "stderr"])
+        self.assertFalse(cleanup["timed_out"])
+        self.assertEqual(report["source_sha"], SOURCE_SHA)
+        self.assertEqual(report["image_id"], IMAGE_ID)
+
+    def test_decoding_loss_marks_only_invalid_utf8_streams(self):
+        for stdout, stderr, lossy in [
+            (b"valid \xef\xbf\xbd\r\n", b"valid \xef\xbf\xbd\n", []),
+            (b"invalid \xff\n", b"valid \xef\xbf\xbd\n", ["stdout"]),
+            (b"valid \xef\xbf\xbd\n", b"incomplete \xe2\x82", ["stderr"]),
+        ]:
+            for timed_out in [False, True]:
+                with self.subTest(lossy=lossy, timed_out=timed_out):
+                    response = subprocess.TimeoutExpired("docker", 20, output=stdout, stderr=stderr) if timed_out else subprocess.CompletedProcess([], 2, stdout, stderr)
+                    with patch.object(evidence, "docker", side_effect=[response]):
+                        result = evidence.observation("run", timeout=20)
+                    self.assertEqual(result["stdout"], stdout.decode("utf-8", errors="replace"))
+                    suffix = "\nDocker command exceeded 20 seconds" if timed_out else ""
+                    self.assertEqual(result["stderr"], stderr.decode("utf-8", errors="replace") + suffix)
+                    self.assertEqual(result["lossy_decoding"], lossy)
+                    self.assertEqual(result["returncode"], None if timed_out else 2)
+                    self.assertEqual(result["timed_out"], timed_out)
+                    self.assertEqual(json.loads(json.dumps(result)), result)
+
+    def test_lossy_timeout_output_persists_owned_name_and_cleanup_failure(self):
+        responses = [subprocess.CompletedProcess([], 0, json.dumps(METADATA), ""),
+                     subprocess.CompletedProcess([], 0, b"first observation", b""),
+                     subprocess.CompletedProcess([], 0, b"", b""),
+                     subprocess.TimeoutExpired("docker", 20, output=b"partial \xe2\x82", stderr=b"valid \xef\xbf\xbd"),
+                     subprocess.TimeoutExpired("docker rm", 30, output=b"valid \xef\xbf\xbd", stderr=b"cleanup \xff")]
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")) as temporary:
+            directory = Path(temporary)
+            self.fixture(directory)
+            with patch.object(evidence, "docker", side_effect=responses) as docker, patch.object(sys, "argv", ["evidence", "two-bot:fixture", str(directory)]):
+                with self.assertRaisesRegex(SystemExit, "cleanup"):
+                    evidence.main()
+            report = json.loads((directory / "runtime-image-evidence.json").read_text())
+        result = report["probes"]["affected_package_files"]
+        run = docker.call_args_list[3].args
+        name = run[run.index("--name") + 1]
+        self.assertEqual(result["container_name"], name)
+        self.assertEqual(docker.call_args_list[4].args, ("rm", "--force", name))
+        self.assertIsNone(result["returncode"])
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["stdout"], "partial �")
+        self.assertEqual(result["stderr"], "valid �\nDocker command exceeded 20 seconds")
+        self.assertEqual(result["lossy_decoding"], ["stdout"])
+        cleanup = result["cleanup"]
+        self.assertEqual(cleanup["status"], "failed")
+        self.assertIsNone(cleanup["returncode"])
+        self.assertTrue(cleanup["timed_out"])
+        self.assertEqual(cleanup["stdout"], "valid �")
+        self.assertEqual(cleanup["stderr"], "cleanup �\nDocker command exceeded 30 seconds")
+        self.assertEqual(cleanup["lossy_decoding"], ["stderr"])
+        self.assertEqual(report["probes"]["installed_packages"]["stdout"], "first observation")
+        self.assertEqual(len(report["probes"]), 2)
+        self.assertFalse(report["complete"])
+        self.assertEqual(docker.call_count, 5)
+
     def test_ci_retains_evidence_after_failed_gates_without_changing_gates(self):
         workflow = (ROOT / ".github/workflows/supply-chain.yml").read_text()
         self.assertIn("python3 scripts/test-runtime-image-evidence.py", workflow)

@@ -52,6 +52,10 @@ bound. Docker inspection does not record image environment values.
 
 Nonzero exits, unavailable tools and timeouts are retained explicitly; they are
 not absence proof. For example, missing `getcap` leaves capabilities unresolved.
+Completed and timed-out output is decoded as UTF-8; invalid bytes are replaced and
+marked per stream in `lossy_decoding` for both the probe and cleanup result. Such
+output is incomplete evidence, not a valid filename or absence determination.
+A valid UTF-8 replacement character alone does not set the loss marker.
 Each probe retains its exact UUID `container_name` and original result separately
 from cleanup, so a cleanup timeout or daemon transport failure still leaves an
 ownership-scoped follow-up target in the partial report. Only the daemon's

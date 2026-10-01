@@ -36,23 +36,38 @@ PROBES = {
 
 def docker(*args, timeout=30):
     return subprocess.run(
-        ["docker", *args], capture_output=True, text=True, timeout=timeout, check=False
+        ["docker", *args], capture_output=True, timeout=timeout, check=False
     )
 
 
 def observation(*args, timeout):
+    timed_out = False
     try:
         result = docker(*args, timeout=timeout)
-        return {"returncode": result.returncode, "stdout": result.stdout,
-                "stderr": result.stderr, "timed_out": False}
     except subprocess.TimeoutExpired as error:
-        def text(value):
-            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
-        return {"returncode": None, "stdout": text(error.stdout),
-                "stderr": text(error.stderr) + f"\nDocker command exceeded {timeout} seconds",
-                "timed_out": True}
+        result = subprocess.CompletedProcess(args, None, error.stdout, error.stderr)
+        timed_out = True
     except OSError as error:
-        return {"returncode": None, "stdout": "", "stderr": str(error), "timed_out": False}
+        result = subprocess.CompletedProcess(args, None, "", str(error))
+
+    lossy_decoding = []
+
+    def text(value, stream):
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError:
+                # A valid UTF-8 U+FFFD is not evidence of decoding loss.
+                lossy_decoding.append(stream)
+                return value.decode("utf-8", errors="replace")
+        return value or ""
+
+    stdout = text(result.stdout, "stdout")
+    stderr = text(result.stderr, "stderr")
+    if timed_out:
+        stderr += f"\nDocker command exceeded {timeout} seconds"
+    return {"returncode": result.returncode, "stdout": stdout,
+            "stderr": stderr, "timed_out": timed_out, "lossy_decoding": lossy_decoding}
 
 
 def probe(image_id, command):
