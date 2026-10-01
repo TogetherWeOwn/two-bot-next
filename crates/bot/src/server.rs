@@ -45,6 +45,8 @@ struct ReadinessReport {
     health: HealthReport,
     // Informational component: not included in HealthReport::ready().
     jobs: std::collections::BTreeMap<String, crate::jobs::JobStatus>,
+    build_revision: &'static str,
+    build_id: &'static str,
 }
 
 async fn readyz(
@@ -68,6 +70,8 @@ async fn readyz(
         Json(ReadinessReport {
             health: report,
             jobs: jobs.read().await.clone(),
+            build_revision: option_env!("BOT_BUILD_REVISION").unwrap_or("unknown"),
+            build_id: option_env!("BOT_BUILD_ID").unwrap_or("unknown"),
         }),
     )
 }
@@ -169,6 +173,14 @@ mod tests {
             assert_eq!(json["jobs"]["counter"]["last_error_class"], "timeout");
             assert_eq!(json["jobs"]["counter"]["consecutive_failures"], 2);
             assert_eq!(json["components"][0][0], "process");
+            assert_eq!(
+                json["build_revision"],
+                option_env!("BOT_BUILD_REVISION").unwrap_or("unknown")
+            );
+            assert_eq!(
+                json["build_id"],
+                option_env!("BOT_BUILD_ID").unwrap_or("unknown")
+            );
         }
     }
 

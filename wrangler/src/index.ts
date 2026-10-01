@@ -32,6 +32,8 @@ import { RedirectStore, parseMappingsSnapshot } from "./redirect-store.ts";
 
 export interface Env {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
+  /** Serving Worker version; never forwarded as container env. */
+  CF_VERSION_METADATA?: { id: string };
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
   GUILD_ID?: string;
@@ -331,13 +333,23 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {
+      let response: Response;
       try {
         const container = env.TWO_BOT.getByName(SINGLETON_NAME);
-        return await container.fetch(request);
+        response = await container.fetch(request);
       } catch {
         // Includes DO construction/binding failures before its fetch handler.
-        return containerUnavailable();
+        response = containerUnavailable();
       }
+      // The outer Worker owns provenance, not the container or DO version.
+      // Copy the response to get mutable headers without changing status/body.
+      const result = new Response(response.body, response);
+      if (env.CF_VERSION_METADATA) {
+        result.headers.set("x-two-worker-version", env.CF_VERSION_METADATA.id);
+      } else {
+        result.headers.delete("x-two-worker-version");
+      }
+      return result;
     }
 
     // Metrics are container-internal, never a public proxy or invite campaign.

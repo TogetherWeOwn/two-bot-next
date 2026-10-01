@@ -101,7 +101,10 @@ fn configured_gateway_initialization_failure_exits_nonzero() {
     // A malformed synthetic URL fails locally; no database or Discord is contacted.
     let mut bot = Bot(command("127.0.0.1:0")
         .env("DISCORD_TOKEN", "INVALID")
-        .env("DATABASE_URL", "postgres://fixture-user:fixture-db-secret@agent-testdb/db?api_key=fixture-query-secret")
+        .env(
+            "DATABASE_URL",
+            "postgres://fixture-user:fixture-db-secret@agent-testdb/db?api_key=fixture-query-secret",
+        )
         .env("GUILD_ID", "123")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -120,10 +123,23 @@ fn configured_gateway_initialization_failure_exits_nonzero() {
         thread::sleep(Duration::from_millis(20));
     }
     let mut logs = String::new();
-    bot.0.stdout.take().unwrap().read_to_string(&mut logs).unwrap();
-    bot.0.stderr.take().unwrap().read_to_string(&mut logs).unwrap();
+    bot.0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    bot.0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
     assert!(logs.contains("database_connect_failed"), "child logs: {logs}");
-    assert!(logs.contains("container_service_failed"), "child logs: {logs}");
+    assert!(
+        logs.contains("container_service_failed"),
+        "child logs: {logs}"
+    );
     for secret in ["fixture-user", "fixture-db-secret", "fixture-query-secret"] {
         assert!(!logs.contains(secret), "startup diagnostic leaked: {logs}");
     }

@@ -12,6 +12,7 @@ import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 
 const WORKER_ENV = {
+  CF_VERSION_METADATA: { id: "synthetic-do-worker-version" },
   DISCORD_TOKEN: "synthetic-discord-token",
   DATABASE_URL: "synthetic-database-value",
   GUILD_ID: "111222333444555666",
@@ -54,6 +55,7 @@ async function harness(
   const gates: Promise<unknown>[] = [];
   let listenerPort = 8080;
   let probeStatus = 503;
+  let probeResponse: ((status: number) => Response) | undefined;
   const runtime = {
     running: false,
     start(options: StartConfig) {
@@ -74,7 +76,8 @@ async function harness(
         // Liveness is not readiness, even with a configured token. Preserve
         // gateway-down; a synthetic env fixture is NOT proof of a READY event.
         const status = pathname === "/readyz" ? probeStatus : 200;
-        const response = Response.json({ ready: status === 200, gateway_connected: status === 200 }, { status });
+        const response = probeResponse?.(status)
+          ?? Response.json({ ready: status === 200, gateway_connected: status === 200 }, { status });
         Object.defineProperty(response, "webSocket", { value: null });
         return response;
       },
@@ -110,6 +113,7 @@ async function harness(
   return {
     bot, runtime, starts, requests, logs, values, ctx, database,
     setProbeStatus: (status: number) => { probeStatus = status; },
+    setProbeResponse: (factory: (status: number) => Response) => { probeResponse = factory; },
     pending: () => database.prepare("SELECT * FROM container_schedules WHERE callback = 'keepalive'").all(),
   };
 }
@@ -139,29 +143,77 @@ for (const path of ["/health", "/readyz"]) {
 }
 
 for (const path of ["/health", "/readyz"]) {
-  test(`SDK native startup failure returns sanitized ${path} 500`, async (t) => {
-    const h = await harness(t);
-    t.mock.method(h.runtime, "start", () => {
-      throw new Error(`fixture startup failure ${WORKER_ENV.DISCORD_TOKEN} ${WORKER_ENV.DATABASE_URL}`);
-    });
-    const response = await h.bot.fetch(new Request(`https://worker.invalid${path}`));
-    assert.equal(response.status, 500);
-    assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
-    assert.ok(h.logs.every((line) =>
-      !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
-  });
+  for (const metadata of [undefined, { id: "synthetic-serving-worker-version" }]) {
+    const provenance = metadata ? "serving metadata" : "no metadata";
+    for (const status of path === "/health" ? [200] : [200, 503]) {
+      test(`outer Worker ${path} (${status}) replaces/removes SDK spoofed version with ${provenance}`, async (t) => {
+        // The DO has different metadata: only the outer serving Worker counts.
+        const h = await harness(t);
+        h.setProbeStatus(status);
+        const body = JSON.stringify(path === "/health" ? { status: "ok" } : {
+          ready: status === 200,
+          components: [["process", "ready"], ["gateway", status === 200 ? "ready" : "unconfigured"]],
+          jobs: {},
+          build_revision: "synthetic-image-revision",
+          build_id: "synthetic-image-build",
+        }, null, 2) + "\n";
+        const statusText = status === 503 ? "Parked" : "Healthy";
+        h.setProbeResponse((status) => new Response(body, {
+          status,
+          statusText,
+          headers: {
+            "content-type": "application/json",
+            "X-Two-Worker-Version": "spoofed-container-version, second-spoof",
+            "x-fixture": "preserved",
+          },
+        }));
+        const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+          CF_VERSION_METADATA: metadata,
+          TWO_BOT: { getByName: () => h.bot },
+        } as unknown as Env, {} as ExecutionContext);
+        assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
+        assert.equal(response.status, status, "parked readiness must stay 503");
+        assert.equal(response.statusText, statusText);
+        assert.equal(response.headers.get("content-type"), "application/json");
+        assert.equal(response.headers.get("x-fixture"), "preserved");
+        assert.equal(await response.text(), body, "container JSON/build provenance must stay byte-for-byte unchanged");
+        assert.equal(h.starts.length, 1);
+        assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV, "version metadata must never enter container env");
+        assert.ok(h.requests.some((r) => r.pathname === path && r.port === 8080));
+      });
+    }
 
-  test(`Worker DO rejection returns sanitized ${path} 500`, async (t) => {
-    const h = await harness(t);
-    const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
-      TWO_BOT: { getByName: () => ({ fetch: async () => {
-        throw new Error(`fixture DO failure ${WORKER_ENV.DATABASE_URL}`);
-      } }) },
-    } as unknown as Env, {} as ExecutionContext);
-    assert.equal(response.status, 500);
-    assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
-    assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DATABASE_URL)));
-  });
+    test(`SDK native startup failure returns sanitized outer ${path} 500 with ${provenance}`, async (t) => {
+      const h = await harness(t);
+      t.mock.method(h.runtime, "start", () => {
+        throw new Error(`fixture startup failure ${WORKER_ENV.DISCORD_TOKEN} ${WORKER_ENV.DATABASE_URL}`);
+      });
+      const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+        CF_VERSION_METADATA: metadata,
+        TWO_BOT: { getByName: () => h.bot },
+      } as unknown as Env, {} as ExecutionContext);
+      assert.equal(response.status, 500);
+      assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
+      assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+      assert.ok(h.logs.every((line) =>
+        !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
+    });
+
+    for (const failure of ["lookup", "fetch"]) {
+      test(`Worker DO ${failure} rejection returns sanitized ${path} 500 with ${provenance}`, async (t) => {
+        const h = await harness(t);
+        const reject = () => { throw new Error(`fixture DO failure ${WORKER_ENV.DATABASE_URL}`); };
+        const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+          CF_VERSION_METADATA: metadata,
+          TWO_BOT: { getByName: () => failure === "lookup" ? reject() : { fetch: async () => reject() } },
+        } as unknown as Env, {} as ExecutionContext);
+        assert.equal(response.status, 500);
+        assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
+        assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+        assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DATABASE_URL)));
+      });
+    }
+  }
 }
 
 test("lifecycle error replaces arbitrary exception without inspecting it", async (t) => {

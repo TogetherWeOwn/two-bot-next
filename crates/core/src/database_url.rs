@@ -187,7 +187,8 @@ mod tests {
             "sslmode=require&channel_binding=require",
             "channel%5Fbinding=fixture-secret&sslmode=require&channel_binding=require",
         ] {
-            let raw = format!("postgres://fixture:fixture-password@ep-fixture.neon.tech/db?{query}");
+            let raw =
+                format!("postgres://fixture:fixture-password@ep-fixture.neon.tech/db?{query}");
             assert!(validate(&raw).is_ok());
             let filtered = url::Url::parse(&url_for_sqlx(&raw).unwrap()).unwrap();
             assert_eq!(filtered.query().unwrap(), "sslmode=require");
@@ -202,9 +203,13 @@ mod tests {
             url_for_sqlx("postgres://agent-testdb/db?channel_binding=require").unwrap(),
             "postgres://agent-testdb/db"
         );
-        assert!(url_for_sqlx("postgres://agent-testdb/db?channel_binding=require&api_key=fixture-secret").is_err());
+        let unknown = "postgres://agent-testdb/db?channel_binding=require&api_key=fixture-secret";
+        assert!(url_for_sqlx(unknown).is_err());
         #[cfg(feature = "db")]
-        assert!(connect_options("postgres://agent-testdb/db?sslmode=invalid&channel_binding=require").is_err());
+        {
+            let invalid = "postgres://agent-testdb/db?sslmode=invalid&channel_binding=require";
+            assert!(connect_options(invalid).is_err());
+        }
     }
 
     #[test]
