@@ -111,6 +111,8 @@ pub struct EventClaim {
     /// Monotonic rollback phase. Recovery must never retry the original target
     /// after a failed exchange has committed the decision to compensate.
     pub compensating: bool,
+    /// An interrupted exchange may still apply remotely. Never clear on reads.
+    pub exchange_pending: bool,
     /// Persisted effect snapshot at acquisition; attempts/compensations remain
     /// cumulative in storage while observed/unresolved fields are replaceable.
     pub effects: AuditEffects,
@@ -165,6 +167,8 @@ pub enum StoreError {
     StaleClaim,
     #[error("self-role event and panel claim scopes differ")]
     WrongPanel,
+    #[error("self-role remote exchange is still unresolved")]
+    PendingExchange,
     #[error("lease duration must be positive and expiry must be representable")]
     InvalidLease,
     #[error("claim generation exhausted")]
@@ -306,19 +310,29 @@ impl SelfRoleStore {
                 recovered: false,
                 intent_initialized: initialized,
                 compensating: false,
+                exchange_pending: false,
                 effects: row.effects.clone(),
                 desired_role_ids: row.desired_role_ids.clone(),
                 pre_mutation_role_ids: row.pre_mutation_role_ids.clone(),
                 renew_after_ms: self_role_renew_after_ms(self.lease_ms),
             })
         } else {
-            type RecoveryRow = (i32, String, String, OffsetDateTime, Vec<String>, bool, bool);
+            type RecoveryRow = (
+                i32,
+                String,
+                String,
+                OffsetDateTime,
+                Vec<String>,
+                bool,
+                bool,
+                bool,
+            );
             let prior: Option<RecoveryRow> = sqlx::query_as(
                 "SELECT claim_generation, desired_role_ids, pre_mutation_role_ids,
                  processing_expires_at, ARRAY[added_role_ids,removed_role_ids,
                  attempted_added_role_ids,attempted_removed_role_ids,
                  compensated_added_role_ids,compensated_removed_role_ids,
-                 unresolved_added_role_ids,unresolved_removed_role_ids], intent_initialized, compensating
+                 unresolved_added_role_ids,unresolved_removed_role_ids], intent_initialized, compensating, exchange_pending
                  FROM self_role_audit WHERE event_id=$1 AND outcome='processing'
                  AND guild_id=$2 AND member_id=$3 AND panel_id=$4 AND source_id=$5
                  AND source=$6 AND event_order IS NOT DISTINCT FROM $7
@@ -346,6 +360,7 @@ impl SelfRoleStore {
                 effects,
                 intent_initialized,
                 compensating,
+                exchange_pending,
             )) = prior.filter(|p| p.3 <= now)
             {
                 let effects = AuditEffects::decoded(&effects)?;
@@ -372,6 +387,7 @@ impl SelfRoleStore {
                     recovered: true,
                     intent_initialized,
                     compensating,
+                    exchange_pending,
                     effects,
                     desired_role_ids,
                     pre_mutation_role_ids,
@@ -688,6 +704,20 @@ impl SelfRoleStore {
         effects: &AuditEffects,
         compensating: bool,
     ) -> Result<bool, StoreError> {
+        self.checkpoint_exchange(claim, effects, compensating, None)
+            .await
+    }
+
+    /// Pending send intent and effects commit together. Only the worker that
+    /// received this exchange's response (or knows it did not send) may clear
+    /// its pending flag; recovery must preserve any earlier unknown exchange.
+    pub async fn checkpoint_exchange(
+        &self,
+        claim: &EventClaim,
+        effects: &AuditEffects,
+        compensating: bool,
+        exchange_pending: Option<bool>,
+    ) -> Result<bool, StoreError> {
         let mut query = sqlx::query(
             "UPDATE self_role_audit SET added_role_ids=$1,removed_role_ids=$2,
              attempted_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
@@ -699,7 +729,8 @@ impl SelfRoleStore {
              compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
                  FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
              unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8,
-             compensating=compensating OR $12
+             compensating=compensating OR $12,
+             exchange_pending=COALESCE($13,exchange_pending)
              WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11 AND outcome='processing'
              AND (NOT $12 OR intent_initialized)",
         );
@@ -711,6 +742,7 @@ impl SelfRoleStore {
             .bind(claim.token.expose())
             .bind(claim.generation)
             .bind(compensating)
+            .bind(exchange_pending)
             .execute(&self.pool)
             .await?
             .rows_affected()
@@ -729,6 +761,17 @@ impl SelfRoleStore {
         claim: &EventClaim,
         effects: &AuditEffects,
     ) -> Result<bool, StoreError> {
+        self.record_superseded_exchange(claim, effects, None).await
+    }
+
+    /// Same terminal evidence fence, including the original response's pending
+    /// state. This cannot reopen rejection or publish a target.
+    pub async fn record_superseded_exchange(
+        &self,
+        claim: &EventClaim,
+        effects: &AuditEffects,
+        exchange_pending: Option<bool>,
+    ) -> Result<bool, StoreError> {
         let mut query = sqlx::query(
             "UPDATE self_role_audit SET added_role_ids=$1,removed_role_ids=$2,
              attempted_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
@@ -739,7 +782,8 @@ impl SelfRoleStore {
                  FROM jsonb_array_elements_text(compensated_added_role_ids::jsonb || $5::jsonb)),
              compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
                  FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
-             unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8
+             unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8,
+             exchange_pending=COALESCE($12,exchange_pending)
              WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11
              AND outcome='rejected' AND code='superseded_by_later_event'",
         );
@@ -750,6 +794,7 @@ impl SelfRoleStore {
             .bind(&claim.event_id)
             .bind(claim.token.expose())
             .bind(claim.generation)
+            .bind(exchange_pending)
             .execute(&self.pool)
             .await?
             .rows_affected()
@@ -765,6 +810,22 @@ impl SelfRoleStore {
     ) -> Result<(), StoreError> {
         let mut conn = self.pool.acquire().await?;
         finish_audit(&mut conn, row, claim).await
+    }
+
+    /// Runtime settlement, unlike late evidence, requires a live event and no
+    /// unknown exchange. Sample the clock only after acquiring the event lock.
+    pub async fn finish_owned_audit(
+        &self,
+        row: &SelfRoleAudit,
+        claim: &EventClaim,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
+        require_settleable_event(&mut tx, claim, now).await?;
+        finish_audit(&mut tx, row, claim).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Publish committed target and settled audit atomically. A stale event
@@ -792,6 +853,7 @@ impl SelfRoleStore {
             tx.rollback().await?;
             return Ok(false);
         }
+        require_settleable_event(&mut tx, claim, now).await?;
         finish_audit(&mut tx, row, claim).await?;
         tx.commit().await?;
         panel.target.option_key = option.map(str::to_owned);
@@ -818,6 +880,29 @@ async fn lock_panel(conn: &mut PgConnection, claim: &PanelClaim) -> Result<(), S
         .bind(&claim.key.guild_id).bind(&claim.key.member_id).bind(&claim.key.panel_id)
         .fetch_optional(conn).await?;
     Ok(())
+}
+
+async fn require_settleable_event(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let pending: Option<(bool,)> = sqlx::query_as(
+        "SELECT exchange_pending FROM self_role_audit WHERE event_id=$1
+         AND claim_token=$2 AND claim_generation=$3 AND outcome='processing'
+         AND intent_initialized AND processing_expires_at > $4",
+    )
+    .bind(&claim.event_id)
+    .bind(claim.token.expose())
+    .bind(claim.generation)
+    .bind(now)
+    .fetch_optional(conn)
+    .await?;
+    match pending {
+        Some((false,)) => Ok(()),
+        Some((true,)) => Err(StoreError::PendingExchange),
+        None => Err(StoreError::StaleClaim),
+    }
 }
 
 // Call only with the panel row locked and time sampled after all needed locks.

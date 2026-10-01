@@ -213,8 +213,14 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0203_self_role_pending_exchange.sql"
+    ))
+    .execute(pool)
+    .await?;
     pending_intent_initialization(pool).await?;
     compensation_phase_recovery(pool).await?;
+    pending_exchange_and_live_settlement(pool).await?;
 
     let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
     let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
@@ -384,6 +390,113 @@ async fn exercise(pool: &PgPool) -> TestResult {
     exercise_generated_event_order(pool).await?;
     exercise_db_clock_waits(pool).await?;
     exercise_atomic_finish_wait(pool).await?;
+    Ok(())
+}
+
+async fn pending_exchange_and_live_settlement(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    let mut audit = row("pending-exchange", "0001");
+    audit.panel_id = "pending-exchange".into();
+    let event = store.claim_audit(&audit).await?.unwrap();
+    assert!(!event.exchange_pending);
+    let key = panel_key(&audit);
+    let mut lane = acquired(
+        store
+            .claim_panel(&key, Some((&audit.event_id, "0001")))
+            .await?,
+    );
+    assert!(store.set_panel_claim_option(&mut lane, Some("old")).await?);
+    let effects = AuditEffects {
+        attempted_added_role_ids: vec!["role-a".into()],
+        unresolved_added_role_ids: vec!["role-a".into()],
+        ..AuditEffects::default()
+    };
+    assert!(
+        store
+            .checkpoint_exchange(&event, &effects, false, Some(true))
+            .await?
+    );
+    assert!(store.update_audit_effects(&event, &effects).await?); // cannot clear pending
+    assert!(matches!(
+        store.finish_owned_audit(&audit, &event).await,
+        Err(StoreError::PendingExchange)
+    ));
+    assert!(matches!(
+        store
+            .finish_audit_and_set_panel_option(&audit, &event, &mut lane, Some("new"))
+            .await,
+        Err(StoreError::PendingExchange)
+    ));
+    let (target, outcome): (String, String) = sqlx::query_as(
+        "SELECT latest_option_key,outcome FROM self_role_panel_claims JOIN self_role_audit
+         USING(guild_id,member_id,panel_id) WHERE event_id=$1",
+    )
+    .bind(&audit.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!((target.as_str(), outcome.as_str()), ("old", "processing"));
+    clock.store(TEST_NOW_MS + 500, Ordering::SeqCst);
+    let recovered = store.claim_audit(&audit).await?.unwrap();
+    assert!(recovered.exchange_pending);
+    assert!(
+        !store
+            .checkpoint_exchange(&event, &effects, false, Some(false))
+            .await?
+    );
+    assert!(
+        !store
+            .record_superseded_exchange(&event, &effects, Some(false))
+            .await?
+    );
+    // A recovery checkpoint with no pending argument preserves the unknown work.
+    assert!(
+        store
+            .checkpoint_execution(&recovered, &effects, true)
+            .await?
+    );
+    let (pending, phase): (bool, bool) = sqlx::query_as(
+        "SELECT exchange_pending,compensating FROM self_role_audit WHERE event_id=$1",
+    )
+    .bind(&audit.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert!(pending && phase);
+
+    // A live panel is insufficient if the event expired while waiting. Both
+    // atomic target settlement and nonexclusive runtime settlement refuse it.
+    clock.store(TEST_NOW_MS, Ordering::SeqCst);
+    let mut expired = row("expired-settlement", "0001");
+    expired.panel_id = "expired-settlement".into();
+    let event = store.claim_audit(&expired).await?.unwrap();
+    let mut lane = acquired(
+        store
+            .claim_panel(&panel_key(&expired), Some((&expired.event_id, "0001")))
+            .await?,
+    );
+    assert!(store.set_panel_claim_option(&mut lane, Some("old")).await?);
+    clock.store(TEST_NOW_MS + 200, Ordering::SeqCst);
+    assert!(store.renew_panel_claim(&lane).await?);
+    clock.store(TEST_NOW_MS + 300, Ordering::SeqCst);
+    assert!(store.owns_panel_claim(&lane).await?);
+    assert!(matches!(
+        store
+            .finish_audit_and_set_panel_option(&expired, &event, &mut lane, Some("new"))
+            .await,
+        Err(StoreError::StaleClaim)
+    ));
+    assert!(matches!(
+        store.finish_owned_audit(&expired, &event).await,
+        Err(StoreError::StaleClaim)
+    ));
+    let (target, outcome): (String, String) = sqlx::query_as(
+        "SELECT latest_option_key,outcome FROM self_role_panel_claims JOIN self_role_audit
+         USING(guild_id,member_id,panel_id) WHERE event_id=$1",
+    )
+    .bind(&expired.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!((target.as_str(), outcome.as_str()), ("old", "processing"));
     Ok(())
 }
 

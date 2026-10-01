@@ -38,6 +38,9 @@ pub enum SelfRoleRestError {
 pub struct RoleExchange {
     pub result: Result<(), SelfRoleRestError>,
     pub owned_after: bool,
+    /// False on timeout/transport loss: remote work may still finish later.
+    /// A subsequent member snapshot cannot establish exchange completion.
+    pub response_received: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -346,20 +349,24 @@ impl ActionExecutor {
             return Err(SelfRoleRestError::StaleClaim);
         }
         *lane = std::time::Instant::now();
-        let result = match tokio::time::timeout(
+        let (result, response_received) = match tokio::time::timeout(
             Duration::from_millis(MODERATION_TIMEOUT_MS),
             self.send(&request),
         )
         .await
         {
-            Ok(Ok(response)) if response.status == 204 => Ok(()),
-            Ok(Ok(response)) => status(&response).and(Err(SelfRoleRestError::Ambiguous)),
-            _ => Err(SelfRoleRestError::Ambiguous),
+            Ok(Ok(response)) if response.status == 204 => (Ok(()), true),
+            Ok(Ok(response)) => (
+                status(&response).and(Err(SelfRoleRestError::Ambiguous)),
+                true,
+            ),
+            _ => (Err(SelfRoleRestError::Ambiguous), false),
         };
         let owned_after = owns().await.unwrap_or(false);
         Ok(RoleExchange {
             result,
             owned_after,
+            response_received,
         })
     }
 }

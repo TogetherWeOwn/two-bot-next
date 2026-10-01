@@ -270,6 +270,7 @@ async fn rejected_rate_limited_and_uncertain_exchanges_do_not_retry_or_leak_bodi
             .unwrap();
         assert_eq!(exchange.result, Err(error));
         assert!(exchange.owned_after);
+        assert!(exchange.response_received);
         assert!(!format!("{exchange:?}").contains("provider-secret"));
         assert_eq!(mock.requests().len(), 1);
         mock.shutdown().await;
@@ -292,7 +293,26 @@ async fn lost_post_call_ownership_retains_accepted_effect() {
         .unwrap();
     assert_eq!(exchange.result, Ok(()));
     assert!(!exchange.owned_after);
+    assert!(exchange.response_received);
     assert_eq!(checks.load(Ordering::SeqCst), 3);
+    assert_eq!(mock.requests().len(), 1);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn timeout_cannot_claim_remote_completion_or_retry() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204).delayed(Duration::from_secs(6))],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let exchange = executor(&mock)
+        .self_role_step(GUILD, USER, ROLE, true, || async { Ok(true) })
+        .await
+        .unwrap();
+    assert_eq!(exchange.result, Err(SelfRoleRestError::Ambiguous));
+    assert!(exchange.owned_after);
+    assert!(!exchange.response_received);
     assert_eq!(mock.requests().len(), 1);
     mock.shutdown().await;
 }

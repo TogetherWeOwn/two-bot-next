@@ -53,6 +53,10 @@
       "sha256": "3659d8b3d2bbbdc9a4aca6b4d2518dbdc204a9f6d381c8d7a9f6bc28a64ef0c4",
       "justification": "Persist the monotonic self-role rollback phase alongside effects for TOG-10292; recovery must not resume a rejected original target. Preserve legacy names."
     },
+    "crates/cutover/migrations/0203_self_role_pending_exchange.sql": {
+      "sha256": "7fc3c6113a679ffac694e624d52ca94784aab7e38e13fe40d421c59f78c62ba5",
+      "justification": "Preserve interrupted self-role exchanges through recovery and refuse false successful settlement for TOG-10292; retain legacy names."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."

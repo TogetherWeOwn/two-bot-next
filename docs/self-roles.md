@@ -63,9 +63,12 @@ it does **not** enable live Discord dispatch.
    a stale panel publishes nothing. Release retains chronology/commitment.
    Committed null target means empty selection; uncommitted null is unknown.
 
-Settlement/effect writes intentionally follow the legacy token+generation
-fence without an expiry check: late effect evidence may be recorded until
-ownership transfers. When a newer exclusive-panel event supersedes an older
+Late effect writes and the legacy `finish_audit` evidence/rejection seam follow
+the token+generation fence without an expiry check: late evidence may be recorded
+until ownership transfers. Runtime settlement uses `finish_owned_audit` or
+`finish_audit_and_set_panel_option`: both require initialized intent, no pending
+exchange, and a live event after lock waits. Atomic publication also requires a
+live panel; either refusal rolls back the target and audit together. When a newer exclusive-panel event supersedes an older
 one, its rejection is terminal but the former worker may still record late
 result/compensation evidence under its still-current token/generation via
 `record_superseded_effects`; a transferred generation (new token) is refused,
@@ -161,16 +164,44 @@ registered with the gateway:
   restoration history while net observed deltas follow authoritative reads.
 - `Execution::Applied`/`Compensated` are provisional convergence results, **not**
   final audits or user success. A transport timeout cannot prove a remote call
-  has stopped. Stale-worker/late-exchange committed-target repair and atomic
-  final settlement are still required before these results can be published.
+  has stopped. The settlement/repair checkpoint below consumes these results
+  only after additional authoritative verification and live database fences.
 - Isolated DB/mock regressions cover remove-then-add, partial rejection,
   an ambiguously applied addition, failed compensation and restart into rollback.
   Store coverage proves phase/evidence recovery and stale-generation refusal;
   REST coverage proves failed journaling and post-journal loss prevent sends.
 
+The settlement/repair checkpoint adds these runtime seams, still without handlers:
+
+- `settle` re-fetches authoritative policy/member state, requires convergence to
+  the immutable target, and commits a successful audit and exclusive target
+  atomically. A fully restored compensation is a rejected audit, not success.
+  Nonexclusive settlement requires the same live event fence. Release failure
+  cannot change an already committed outcome into a false rejection.
+- `reconcile_stale` stops old keepers and acquires a **new** renewing maintenance
+  lane without changing event chronology. It force-fetches and revalidates policy,
+  removes before adding, and restores only the last committed option (including
+  committed empty). Unknown targets and catalogue drift fail closed. Late effects
+  retain terminal supersession and cannot publish an obsolete before/desired set.
+- Migration `0203_self_role_pending_exchange.sql` adds `exchange_pending` (30
+  audit columns after upgrade). Journaling sets it before send. Only a received
+  response or a definite no-send path may clear that exchange's flag; a later
+  acknowledged compensation cannot clear an earlier interrupted exchange.
+  Recovery retains pending state, switches to rollback, and preserves unresolved
+  evidence even when a read looks restored. Pending audits cannot settle or
+  publish success. Generation transfer refuses old workers' flag/effect writes.
+- Added regressions exercise late in-flight 204 after a newer worker commits,
+  repair to both selected and empty targets, unknown-target refusal, interrupted
+  exchange recovery, settlement of success/compensation, event-expiry rollback
+  with a still-live panel, and REST timeout completion evidence.
+
 This checkpoint does **not** register handlers or enable live role mutations.
-Stale-worker committed-target repair, atomic final settlement, staging/dry-run
-gates and gateway integration remain on the same follow-up. The REST regression
+Shared handler/reaction wiring, staging/dry-run gates, and end-to-end acceptance
+remain on the same follow-up. Interrupted remote work stays explicitly unresolved;
+its continuation/reconciliation lifecycle must be wired before activation, not
+silently cleared by a timer or member snapshot. Added Rust regressions remain
+unverified locally while the mandated bounded Cargo pool is unavailable.
+The REST regression
 target is `two-bot-discord --test self_roles_rest`; admission coverage is
 `two-bot self_role_runtime:: -- --include-ignored --test-threads=1`, opted in by
 CI's isolated `self-role-store` service job. Neither needs a real token or guild.

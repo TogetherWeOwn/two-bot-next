@@ -13,10 +13,14 @@
   intentionally empty snapshots and computes remaining work from freshly fetched
   member state. Add durable paced send journaling, fresh-policy singular execution,
   effect checkpoints, and a monotonic compensation phase (migration 0202) that
-  survives restart without retrying rejected intent. Add isolated Postgres/mock
-  REST regressions for partial/ambiguous failures and compensation recovery.
-  Gateway registration remains disabled until stale-worker repair, atomic final
-  settlement and the runtime follow-up are complete.
+  survives restart without retrying rejected intent. Add newly leased stale-worker
+  repair to the committed target, live atomic runtime settlement, and durable
+  pending-exchange recovery (migration 0203) that refuses false success after an
+  interrupted remote send. Add isolated Postgres/mock REST regressions for
+  partial/ambiguous failures, compensation recovery, stale in-flight repair,
+  selected/empty targets, expiry rollback and unresolved settlement refusal.
+  Gateway registration remains disabled until shared handler gates/wiring,
+  unresolved-work continuation and the runtime follow-up are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

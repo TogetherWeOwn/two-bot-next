@@ -199,7 +199,15 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0203_self_role_pending_exchange.sql"
+    ))
+    .execute(pool)
+    .await?;
     execution_and_compensation(pool).await?;
+    stale_inflight_repairs_committed_target(pool).await?;
+    interrupted_exchange_cannot_settle(pool).await?;
+    unknown_target_is_not_empty(pool).await?;
     recovery_and_renewal(pool).await?;
     empty_select_recovery(pool).await?;
     reaction_partial_and_duplicate(pool).await?;
@@ -244,6 +252,7 @@ async fn execution_and_compensation(pool: &PgPool) -> TestResult {
         script.push(ScriptedResponse::status(status));
         if status == 204 {
             script.extend(snapshot(&[NEW_ROLE, OTHER])); // final observed target
+            script.extend(snapshot(&[NEW_ROLE, OTHER])); // settlement revalidation
         } else {
             if status == 503 {
                 // An ambiguous PUT may have applied. Rollback removes it before
@@ -254,6 +263,7 @@ async fn execution_and_compensation(pool: &PgPool) -> TestResult {
             script.extend(snapshot(&[OTHER]));
             script.push(ScriptedResponse::status(204)); // compensation PUT old
             script.extend(snapshot(&[OLD_ROLE, OTHER]));
+            script.extend(snapshot(&[OLD_ROLE, OTHER])); // settlement revalidation
         }
         let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
         let runtime = runtime(pool, &clock, &mock);
@@ -328,6 +338,37 @@ async fn execution_and_compensation(pool: &PgPool) -> TestResult {
                 .await?;
         assert_eq!(phase, status != 204);
         assert_eq!(outcome, "processing"); // execute is NOT final settlement
+        let settled = runtime
+            .settle(&mut prepared, &panel, execution)
+            .await
+            .unwrap();
+        assert_eq!(
+            settled,
+            if status == 204 {
+                SettledOutcome::Switched
+            } else {
+                SettledOutcome::Rejected
+            }
+        );
+        let (target, committed, outcome, pending): (Option<String>, bool, String, bool) =
+            sqlx::query_as(
+                "SELECT latest_option_key,target_committed,outcome,exchange_pending
+             FROM self_role_panel_claims JOIN self_role_audit USING(guild_id,member_id,panel_id)
+             WHERE event_id=$1",
+            )
+            .bind(&request.event_id)
+            .fetch_one(pool)
+            .await?;
+        assert_eq!(
+            target.as_deref(),
+            Some(if status == 204 { "new" } else { "old" })
+        );
+        assert!(committed && !pending);
+        assert_eq!(outcome, settled.as_str());
+        assert!(matches!(
+            runtime.prepare(&request, &panel).await.unwrap(),
+            Admission::Duplicate
+        ));
         drop(prepared);
         mock.shutdown().await;
     }
@@ -392,6 +433,222 @@ async fn compensation_restart(pool: &PgPool) -> TestResult {
     );
     assert!(recovered.audit.effects.removed_role_ids.is_empty());
     drop(recovered);
+    mock.shutdown().await;
+    Ok(())
+}
+
+async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
+    for empty in [false, true] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("stale-inflight-{empty}");
+        let mut old_script = snapshot(&[OTHER]);
+        old_script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(4)));
+        let live = if empty {
+            vec![OLD_ROLE, OTHER]
+        } else {
+            vec![OLD_ROLE, NEW_ROLE, OTHER]
+        };
+        let target = if empty {
+            vec![OTHER]
+        } else {
+            vec![NEW_ROLE, OTHER]
+        };
+        old_script.extend(snapshot(&live)); // stale PUT applied AFTER winner settled
+        old_script.push(ScriptedResponse::status(204)); // repair DELETE obsolete old
+        old_script.extend(snapshot(&target));
+        let old_mock = MockRest::start(old_script, ScriptedResponse::status(500)).await;
+        let old_runtime = Arc::new(runtime(pool, &clock, &old_mock));
+        let mut old_request = request(
+            &format!("stale-old-{empty}"),
+            Selection::Select {
+                option_keys: vec!["old".into()],
+            },
+        );
+        old_request.event_order = "0001".into();
+        let mut old = ready(old_runtime.prepare(&old_request, &panel).await.unwrap());
+        let inflight = {
+            let runtime = old_runtime.clone();
+            tokio::spawn(async move {
+                let result = runtime.execute_step(&mut old, OLD_ROLE, true, None).await;
+                (old, result)
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !old_mock.requests().iter().any(|r| r.method == "PUT") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        // Database expiry while the remote mutation is in flight. A different
+        // worker/executor wins; the stale worker cannot cancel Discord's call.
+        clock.store(NOW + 500, Ordering::SeqCst);
+        let mut new_script = snapshot(&[OTHER]);
+        new_script.extend(snapshot(&[OTHER]));
+        if !empty {
+            new_script.push(ScriptedResponse::status(204));
+            new_script.extend(snapshot(&target));
+        }
+        new_script.extend(snapshot(&target)); // final settlement verification
+        let new_mock = MockRest::start(new_script, ScriptedResponse::status(500)).await;
+        let new_runtime = runtime(pool, &clock, &new_mock);
+        let mut new_request = request(
+            &format!("stale-new-{empty}"),
+            Selection::Select {
+                option_keys: if empty { vec![] } else { vec!["new".into()] },
+            },
+        );
+        new_request.event_order = "0002".into();
+        let mut winner = ready(new_runtime.prepare(&new_request, &panel).await.unwrap());
+        let applied = new_runtime.execute(&mut winner, &panel).await.unwrap();
+        new_runtime
+            .settle(&mut winner, &panel, applied)
+            .await
+            .unwrap();
+        assert!(
+            !inflight.is_finished(),
+            "winner must settle before old response arrives"
+        );
+        let (mut stale, result) = tokio::time::timeout(Duration::from_secs(6), inflight).await??;
+        assert!(matches!(result, Err(RuntimeError::Stale)));
+        assert!(!stale.event.exchange_pending); // received late 204, retained evidence
+        old_runtime
+            .reconcile_stale(&mut stale, &panel)
+            .await
+            .unwrap();
+        assert_eq!(
+            panel_roles(&panel, &stale.snapshot.member_role_ids),
+            if empty {
+                vec![]
+            } else {
+                vec![NEW_ROLE.to_owned()]
+            }
+        );
+        assert!(stale.snapshot.member_role_ids.contains(OTHER));
+        let mutations: Vec<_> = old_mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.method != "GET")
+            .collect();
+        assert_eq!(mutations.len(), 2);
+        assert_eq!(
+            (&*mutations[0].method, &*mutations[1].method),
+            ("PUT", "DELETE")
+        );
+        assert!(mutations
+            .iter()
+            .all(|r| r.path.ends_with(OLD_ROLE) && r.body.is_empty()));
+        let (event, option, committed): (String, Option<String>, bool) = sqlx::query_as(
+            "SELECT latest_event_id,latest_option_key,target_committed FROM self_role_panel_claims
+             WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3",
+        )
+        .bind(GUILD)
+        .bind(USER)
+        .bind(&panel.id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(event, new_request.event_id);
+        assert_eq!(option.as_deref(), if empty { None } else { Some("new") });
+        assert!(committed);
+        let (outcome, code, pending, compensated): (String, String, bool, String) = sqlx::query_as(
+            "SELECT outcome,code,exchange_pending,compensated_removed_role_ids
+             FROM self_role_audit WHERE event_id=$1",
+        )
+        .bind(&old_request.event_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(
+            (outcome.as_str(), code.as_str()),
+            ("rejected", "superseded_by_later_event")
+        );
+        assert!(!pending);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&compensated)?,
+            [OLD_ROLE]
+        );
+        drop(stale);
+        drop(winner);
+        old_mock.shutdown().await;
+        new_mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn interrupted_exchange_cannot_settle(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mut script = snapshot(&[OLD_ROLE, OTHER]);
+    script.extend(snapshot(&[OLD_ROLE, OTHER])); // recovered admission
+    script.extend(snapshot(&[OLD_ROLE, OTHER])); // looks restored, NOT remote completion
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let runtime = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Button);
+    panel.id = "interrupted-exchange".into();
+    let request = request(
+        "interrupted-exchange",
+        Selection::Button {
+            option_key: "new".into(),
+        },
+    );
+    let prepared = ready(runtime.prepare(&request, &panel).await.unwrap());
+    let mut effects = prepared.audit.effects.clone();
+    mark_attempt(&mut effects, NEW_ROLE, true);
+    assert!(
+        runtime
+            .store
+            .checkpoint_exchange(&prepared.event, &effects, false, Some(true))
+            .await?
+    );
+    drop(prepared); // process stops between journal and response
+    clock.store(NOW + 500, Ordering::SeqCst);
+    let mut recovered = ready(runtime.prepare(&request, &panel).await.unwrap());
+    assert!(recovered.event.exchange_pending);
+    assert!(recovered.remaining.add_role_ids.is_empty()); // no retry of rejected target
+    let result = runtime.execute(&mut recovered, &panel).await.unwrap();
+    assert_eq!(result, Execution::Compensated);
+    assert!(matches!(
+        runtime.settle(&mut recovered, &panel, result).await,
+        Err(RuntimeError::PendingExchange)
+    ));
+    let (outcome, pending, unresolved): (String, bool, String) = sqlx::query_as(
+        "SELECT outcome,exchange_pending,unresolved_added_role_ids FROM self_role_audit WHERE event_id=$1",
+    ).bind(&request.event_id).fetch_one(pool).await?;
+    assert_eq!(outcome, "processing");
+    assert!(pending);
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&unresolved)?,
+        [NEW_ROLE]
+    );
+    assert!(mock.requests().iter().all(|r| r.method == "GET"));
+    drop(recovered);
+    mock.shutdown().await;
+    Ok(())
+}
+
+async fn unknown_target_is_not_empty(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mock = MockRest::start(
+        snapshot(&[OLD_ROLE, NEW_ROLE, OTHER]),
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Select);
+    panel.id = "unknown-target".into();
+    let request = request(
+        "unknown-target",
+        Selection::Select {
+            option_keys: vec!["new".into()],
+        },
+    );
+    let mut prepared = ready(runtime.prepare(&request, &panel).await.unwrap());
+    assert!(!prepared.panel.as_ref().unwrap().target.committed);
+    clock.store(NOW + 500, Ordering::SeqCst);
+    assert!(matches!(
+        runtime.reconcile_stale(&mut prepared, &panel).await,
+        Err(RuntimeError::InvalidSnapshot)
+    ));
+    assert_eq!(mock.requests().len(), 4); // no repair read/mutation to an unknown target
+    drop(prepared);
     mock.shutdown().await;
     Ok(())
 }

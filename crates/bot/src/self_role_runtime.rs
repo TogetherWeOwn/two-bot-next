@@ -122,6 +122,7 @@ pub(crate) enum RuntimeError {
     Rest(SelfRoleRestError),
     Stale,
     InvalidSnapshot,
+    PendingExchange,
 }
 
 async fn store_io<T>(
@@ -130,7 +131,11 @@ async fn store_io<T>(
     tokio::time::timeout(STORE_TIMEOUT, operation)
         .await
         .map_err(|_| RuntimeError::Store)?
-        .map_err(|_| RuntimeError::Store)
+        .map_err(|error| match error {
+            StoreError::StaleClaim => RuntimeError::Stale,
+            StoreError::PendingExchange => RuntimeError::PendingExchange,
+            _ => RuntimeError::Store,
+        })
 }
 
 /// Renewal is concurrent with REST/pacing/pool waits. Failure latches a shared
@@ -221,6 +226,34 @@ pub(crate) enum Execution {
     Compensated,
 }
 
+/// Stale-worker repair is authorized by a NEW maintenance lane, never by the
+/// expired event or its old panel fence. It retains the committed chronology.
+struct RepairLease {
+    claim: PanelClaim,
+    lost: Arc<AtomicBool>,
+    _keeper: LeaseKeeper,
+}
+
+impl RepairLease {
+    async fn owns(&self, store: &SelfRoleStore) -> Result<bool, RuntimeError> {
+        if self.lost.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let owned = store_io(store.owns_panel_claim(&self.claim)).await?;
+        Ok(owned && !self.lost.load(Ordering::SeqCst))
+    }
+}
+
+async fn owns_step(
+    prepared: &PreparedSelfRole,
+    repair: Option<&RepairLease>,
+) -> Result<bool, RuntimeError> {
+    match repair {
+        Some(repair) => repair.owns(&prepared.store).await,
+        None => prepared.owns().await,
+    }
+}
+
 struct PreparedPlans {
     snapshot: SelfRoleSnapshot,
     original: SelfRolePlan,
@@ -250,6 +283,12 @@ impl SelfRoleRuntime {
         {
             return Err(RuntimeError::InvalidSnapshot);
         }
+        if prepared.event.exchange_pending {
+            // A crashed/timeout exchange must not resume the original intention
+            // or become settled success just because a later read looks right.
+            prepared.event.compensating = true;
+            self.checkpoint(prepared).await?;
+        }
         // At most one remove and add per option in each phase. A moving external
         // target cannot keep an event in an unbounded mutation/retry loop.
         for _ in 0..(panel.options.len() * 4 + 2) {
@@ -264,11 +303,7 @@ impl SelfRoleRuntime {
             if !prepared.owns().await? {
                 return Err(RuntimeError::Stale);
             }
-            observe_effects(
-                &mut prepared.audit.effects,
-                &prepared.event.pre_mutation_role_ids,
-                &snapshot.member_role_ids,
-            );
+            observe_prepared(prepared, &snapshot.member_role_ids);
             self.checkpoint(prepared).await?;
             let offered: Vec<_> = panel.options.iter().map(|o| o.role_id.clone()).collect();
             if snapshot.member_is_bot
@@ -309,7 +344,7 @@ impl SelfRoleRuntime {
                     Execution::Applied
                 });
             };
-            self.execute_step(prepared, &role, add).await?;
+            self.execute_step(prepared, &role, add, None).await?;
         }
         prepared.event.compensating = true;
         self.checkpoint(prepared).await?;
@@ -317,19 +352,21 @@ impl SelfRoleRuntime {
     }
 
     async fn checkpoint(&self, prepared: &mut PreparedSelfRole) -> Result<(), RuntimeError> {
-        let stored = store_io(self.store.checkpoint_execution(
+        let stored = store_io(self.store.checkpoint_exchange(
             &prepared.event,
             &prepared.audit.effects,
             prepared.event.compensating,
+            Some(prepared.event.exchange_pending),
         ))
         .await?;
         if !stored {
             // A later panel event may have rejected this audit while its remote
             // exchange was in flight. Evidence is allowed; more sends are not.
-            store_io(
-                self.store
-                    .record_superseded_effects(&prepared.event, &prepared.audit.effects),
-            )
+            store_io(self.store.record_superseded_exchange(
+                &prepared.event,
+                &prepared.audit.effects,
+                Some(prepared.event.exchange_pending),
+            ))
             .await?;
             return Err(RuntimeError::Stale);
         }
@@ -337,17 +374,42 @@ impl SelfRoleRuntime {
         Ok(())
     }
 
+    async fn record_evidence(
+        &self,
+        event: &EventClaim,
+        effects: &AuditEffects,
+        compensating: bool,
+        pending: bool,
+    ) -> Result<bool, RuntimeError> {
+        if store_io(
+            self.store
+                .checkpoint_exchange(event, effects, compensating, Some(pending)),
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+        store_io(
+            self.store
+                .record_superseded_exchange(event, effects, Some(pending)),
+        )
+        .await
+    }
+
     async fn execute_step(
         &self,
         prepared: &mut PreparedSelfRole,
         role: &str,
         add: bool,
+        repair: Option<&RepairLease>,
     ) -> Result<(), RuntimeError> {
-        let compensating = prepared.event.compensating;
+        let compensating = repair.is_some() || prepared.event.compensating;
+        let prior_pending = prepared.event.exchange_pending;
         let mut attempted = prepared.audit.effects.clone();
         mark_attempt(&mut attempted, role, add);
-        // This checkpoint runs AFTER pacing, before send, with a fresh ownership
-        // check after its DB wait. An interrupted attempt remains unresolved.
+        let journaled = AtomicBool::new(false);
+        // Journal AFTER pacing; fence again after the database wait. A crash
+        // after journal cannot be distinguished from an unknown in-flight send.
         let exchange = self
             .executor
             .self_role_step_journaled(
@@ -356,28 +418,55 @@ impl SelfRoleRuntime {
                 role,
                 add,
                 || async {
-                    prepared
-                        .owns()
+                    owns_step(prepared, repair)
                         .await
                         .map_err(|_| SelfRoleRestError::StaleClaim)
                 },
                 || async {
-                    if !store_io(self.store.checkpoint_execution(
-                        &prepared.event,
-                        &attempted,
-                        compensating,
-                    ))
-                    .await
-                    .map_err(|_| SelfRoleRestError::StaleClaim)?
+                    if !self
+                        .record_evidence(&prepared.event, &attempted, compensating, true)
+                        .await
+                        .map_err(|_| SelfRoleRestError::StaleClaim)?
                     {
                         return Err(SelfRoleRestError::StaleClaim);
                     }
+                    journaled.store(true, Ordering::SeqCst);
                     Ok(())
                 },
             )
-            .await
-            .map_err(RuntimeError::Rest)?;
+            .await;
+        let exchange = match exchange {
+            Ok(exchange) => exchange,
+            Err(error) => {
+                if journaled.load(Ordering::SeqCst) {
+                    // The shared step returns Err only BEFORE send. Retain send
+                    // intent history but do not invent remote uncertainty here.
+                    clear_unresolved(&mut attempted, role, add);
+                    if prior_pending {
+                        attempted.unresolved_added_role_ids =
+                            prepared.audit.effects.unresolved_added_role_ids.clone();
+                        attempted.unresolved_removed_role_ids =
+                            prepared.audit.effects.unresolved_removed_role_ids.clone();
+                    }
+                    prepared.audit.effects = attempted;
+                    self.record_evidence(
+                        &prepared.event,
+                        &prepared.audit.effects,
+                        compensating,
+                        prior_pending,
+                    )
+                    .await?;
+                }
+                return Err(if error == SelfRoleRestError::StaleClaim {
+                    RuntimeError::Stale
+                } else {
+                    RuntimeError::Rest(error)
+                });
+            }
+        };
         prepared.audit.effects = attempted;
+        // A later acknowledged rollback cannot erase an earlier unknown send.
+        prepared.event.exchange_pending = prior_pending || !exchange.response_received;
         match exchange.result {
             Ok(()) => {
                 if add {
@@ -385,11 +474,8 @@ impl SelfRoleRuntime {
                 } else {
                     prepared.snapshot.member_role_ids.remove(role);
                 }
-                observe_effects(
-                    &mut prepared.audit.effects,
-                    &prepared.event.pre_mutation_role_ids,
-                    &prepared.snapshot.member_role_ids,
-                );
+                let held = prepared.snapshot.member_role_ids.clone();
+                observe_prepared(prepared, &held);
                 if compensating {
                     let restored = if add {
                         &mut prepared.audit.effects.compensated_added_role_ids
@@ -399,22 +485,263 @@ impl SelfRoleRuntime {
                     push_role(restored, role);
                 }
             }
-            Err(SelfRoleRestError::Ambiguous) => {} // leave send intent unresolved
-            Err(_) => clear_unresolved(&mut prepared.audit.effects, role, add),
+            Err(SelfRoleRestError::Ambiguous) => {} // retain unresolved intent
+            Err(_) if !prior_pending => clear_unresolved(&mut prepared.audit.effects, role, add),
+            Err(_) => {}
         }
-        // Failure and rollback decision commit together. If ownership was lost,
-        // do NOT decide to restore the old before snapshot over a newer target.
-        if exchange.owned_after && exchange.result.is_err() {
+        if exchange.owned_after && exchange.result.is_err() && repair.is_none() {
             prepared.event.compensating = true;
         }
-        self.checkpoint(prepared).await?;
-        if !exchange.owned_after || !prepared.owns().await? {
+        if repair.is_some() {
+            if !self
+                .record_evidence(
+                    &prepared.event,
+                    &prepared.audit.effects,
+                    compensating,
+                    prepared.event.exchange_pending,
+                )
+                .await?
+            {
+                return Err(RuntimeError::Stale);
+            }
+            prepared.event.effects = prepared.audit.effects.clone();
+        } else {
+            self.checkpoint(prepared).await?;
+        }
+        if !exchange.owned_after || !owns_step(prepared, repair).await? {
             return Err(RuntimeError::Stale);
         }
         if compensating {
             exchange.result.map_err(RuntimeError::Rest)?;
         }
         Ok(())
+    }
+
+    /// Verify observed convergence again, then publish audit and exclusive
+    /// target in one live, locked transaction. A provisional result is not a
+    /// reply, and no snapshot can clear an interrupted exchange's uncertainty.
+    pub async fn settle(
+        &self,
+        prepared: &mut PreparedSelfRole,
+        panel: &SelfRolePanel,
+        execution: Execution,
+    ) -> Result<SettledOutcome, RuntimeError> {
+        if prepared.audit.guild_id != self.guild_id
+            || prepared.audit.panel_id != panel.id
+            || prepared.audit.source_id != panel.message_id
+            || !prepared.event.intent_initialized
+            || (prepared.event.compensating != (execution == Execution::Compensated))
+            || (panel.exclusive != prepared.panel.is_some())
+        {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        if prepared.event.exchange_pending {
+            return Err(RuntimeError::PendingExchange);
+        }
+        if !prepared.owns().await? {
+            return Err(RuntimeError::Stale);
+        }
+        let snapshot = self
+            .executor
+            .fetch_self_role_snapshot(&self.guild_id, &prepared.audit.member_id, &self.bot_id)
+            .await
+            .map_err(RuntimeError::Rest)?;
+        if !prepared.owns().await? {
+            return Err(RuntimeError::Stale);
+        }
+        let offered: Vec<_> = panel.options.iter().map(|o| o.role_id.clone()).collect();
+        let target = if prepared.event.compensating {
+            &prepared.event.pre_mutation_role_ids
+        } else {
+            &prepared.event.desired_role_ids
+        };
+        if snapshot.member_is_bot
+            || snapshot.validate(&self.guild_id, panel, &offered).is_some()
+            || panel_roles(panel, &snapshot.member_role_ids) != *target
+        {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        let option = if panel.exclusive {
+            match target.as_slice() {
+                [] => None,
+                [role] => Some(
+                    panel
+                        .options
+                        .iter()
+                        .find(|o| &o.role_id == role)
+                        .ok_or(RuntimeError::InvalidSnapshot)?
+                        .key
+                        .clone(),
+                ),
+                _ => return Err(RuntimeError::InvalidSnapshot),
+            }
+        } else {
+            None
+        };
+        observe_prepared(prepared, &snapshot.member_role_ids);
+        let outcome = if execution == Execution::Compensated {
+            prepared.audit.code = Some("compensated".into());
+            SettledOutcome::Rejected
+        } else {
+            prepared.plan.outcome
+        };
+        prepared.audit.outcome = outcome;
+        let settled = if let Some(lane) = &mut prepared.panel {
+            store_io(self.store.finish_audit_and_set_panel_option(
+                &prepared.audit,
+                &prepared.event,
+                lane,
+                option.as_deref(),
+            ))
+            .await?
+        } else {
+            store_io(
+                self.store
+                    .finish_owned_audit(&prepared.audit, &prepared.event),
+            )
+            .await?;
+            true
+        };
+        if !settled {
+            return Err(RuntimeError::Stale);
+        }
+        // The write above is authoritative. Release failure must not falsely
+        // turn an already committed success into a rejected audit/user reply.
+        if let Some(lane) = &prepared.panel {
+            let _ = store_io(self.store.release_panel_claim(lane)).await;
+        }
+        prepared._event_keeper.0.abort();
+        prepared._panel_keeper.take();
+        Ok(outcome)
+    }
+
+    /// A stale worker may repair ONLY the last committed target under a new
+    /// maintenance lane. Never restore its obsolete immutable before snapshot,
+    /// reinterpret an uncommitted null as empty, or rewrite the winner's target.
+    pub async fn reconcile_stale(
+        &self,
+        prepared: &mut PreparedSelfRole,
+        panel: &SelfRolePanel,
+    ) -> Result<(), RuntimeError> {
+        if !panel.exclusive
+            || prepared.audit.guild_id != self.guild_id
+            || prepared.audit.panel_id != panel.id
+            || prepared.audit.source_id != panel.message_id
+        {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        if prepared.owns().await? {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        // Stop the old keepers before safely releasing only our old fence.
+        prepared._event_keeper.0.abort();
+        prepared._panel_keeper.take();
+        let old = prepared
+            .panel
+            .as_ref()
+            .ok_or(RuntimeError::InvalidSnapshot)?;
+        let key = old.key.clone();
+        store_io(self.store.release_panel_claim(old)).await?;
+        let deadline = tokio::time::Instant::now() + LANE_WAIT;
+        let claim = loop {
+            match store_io(self.store.claim_panel(&key, None)).await? {
+                PanelClaimResult::Acquired(claim) => break claim,
+                PanelClaimResult::Busy if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(LANE_BACKOFF).await;
+                }
+                PanelClaimResult::Busy => return Err(RuntimeError::Stale),
+                PanelClaimResult::Superseded(_) => return Err(RuntimeError::Stale),
+            }
+        };
+        let lost = Arc::new(AtomicBool::new(false));
+        let keeper =
+            LeaseKeeper::start(self.store.clone(), None, Some(claim.clone()), lost.clone());
+        let repair = RepairLease {
+            claim,
+            lost,
+            _keeper: keeper,
+        };
+        let result = self.reconcile_owned(prepared, panel, &repair).await;
+        // A stale release is harmless; cancellation falls back to lease expiry.
+        let _ = store_io(self.store.release_panel_claim(&repair.claim)).await;
+        result
+    }
+
+    async fn reconcile_owned(
+        &self,
+        prepared: &mut PreparedSelfRole,
+        panel: &SelfRolePanel,
+        repair: &RepairLease,
+    ) -> Result<(), RuntimeError> {
+        if !repair.claim.target.committed {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        let target = match repair.claim.target.option_key.as_deref() {
+            None => vec![],
+            Some(key) => vec![panel
+                .options
+                .iter()
+                .find(|o| o.key == key)
+                .ok_or(RuntimeError::InvalidSnapshot)?
+                .role_id
+                .clone()],
+        };
+        let offered: Vec<_> = panel.options.iter().map(|o| o.role_id.clone()).collect();
+        for _ in 0..(panel.options.len() * 2 + 1) {
+            if !repair.owns(&self.store).await? {
+                return Err(RuntimeError::Stale);
+            }
+            let snapshot = self
+                .executor
+                .fetch_self_role_snapshot(&self.guild_id, &prepared.audit.member_id, &self.bot_id)
+                .await
+                .map_err(RuntimeError::Rest)?;
+            if !repair.owns(&self.store).await? {
+                return Err(RuntimeError::Stale);
+            }
+            observe_prepared(prepared, &snapshot.member_role_ids);
+            if !self
+                .record_evidence(
+                    &prepared.event,
+                    &prepared.audit.effects,
+                    prepared.event.compensating,
+                    prepared.event.exchange_pending,
+                )
+                .await?
+            {
+                return Err(RuntimeError::Stale);
+            }
+            if snapshot.member_is_bot
+                || snapshot.validate(&self.guild_id, panel, &offered).is_some()
+            {
+                return Err(RuntimeError::Rest(SelfRoleRestError::Snapshot));
+            }
+            prepared.remaining = plan_select_delta(panel, &snapshot.member_role_ids, &target)
+                .map_err(|_| RuntimeError::InvalidSnapshot)?;
+            prepared.snapshot = snapshot;
+            let next = prepared
+                .remaining
+                .remove_role_ids
+                .first()
+                .map(|id| (id.clone(), false))
+                .or_else(|| {
+                    prepared
+                        .remaining
+                        .add_role_ids
+                        .first()
+                        .map(|id| (id.clone(), true))
+                });
+            let Some((role, add)) = next else {
+                return if prepared.event.exchange_pending {
+                    Err(RuntimeError::PendingExchange)
+                } else {
+                    Ok(())
+                };
+            };
+            self.execute_step(prepared, &role, add, Some(repair))
+                .await?;
+        }
+        Err(RuntimeError::Rest(SelfRoleRestError::Ambiguous))
     }
 
     /// Claim first, exclusive lane second, authoritative policy/member last.
@@ -628,7 +955,7 @@ impl SelfRoleRuntime {
         if panel_roles(panel, &intended) != event.desired_role_ids {
             return Err(RuntimeError::InvalidSnapshot);
         }
-        let recovery_target = if event.compensating {
+        let recovery_target = if event.compensating || event.exchange_pending {
             &event.pre_mutation_role_ids
         } else {
             &event.desired_role_ids
@@ -655,6 +982,23 @@ impl SelfRoleRuntime {
         lane: Option<&PanelClaim>,
         code: &'static str,
     ) -> Result<Admission, RuntimeError> {
+        if event.intent_initialized
+            && (event.exchange_pending
+                || event.compensating
+                || !event.effects.attempted_added_role_ids.is_empty()
+                || !event.effects.attempted_removed_role_ids.is_empty())
+        {
+            // Policy/refusal during recovery cannot silently settle unfinished
+            // mutation or discard its pending remote work.
+            if let Some(lane) = lane {
+                store_io(self.store.release_panel_claim(lane)).await?;
+            }
+            return Err(if event.exchange_pending {
+                RuntimeError::PendingExchange
+            } else {
+                RuntimeError::InvalidSnapshot
+            });
+        }
         audit.code = Some(code.into());
         // Recovery retains all cumulative and unresolved evidence on refusals.
         audit.effects = event.effects.clone();
@@ -715,6 +1059,22 @@ fn observe_effects(effects: &mut AuditEffects, before: &[String], held: &HashSet
         .collect();
     effects.unresolved_added_role_ids.clear();
     effects.unresolved_removed_role_ids.clear();
+}
+
+/// Observation can replace net effects, but cannot clear unknown in-flight
+/// work. Only the original completed response/no-send path clears pending.
+fn observe_prepared(prepared: &mut PreparedSelfRole, held: &HashSet<String>) {
+    let added = prepared.audit.effects.unresolved_added_role_ids.clone();
+    let removed = prepared.audit.effects.unresolved_removed_role_ids.clone();
+    observe_effects(
+        &mut prepared.audit.effects,
+        &prepared.event.pre_mutation_role_ids,
+        held,
+    );
+    if prepared.event.exchange_pending {
+        prepared.audit.effects.unresolved_added_role_ids = added;
+        prepared.audit.effects.unresolved_removed_role_ids = removed;
+    }
 }
 
 fn panel_roles(panel: &SelfRolePanel, roles: &HashSet<String>) -> Vec<String> {
