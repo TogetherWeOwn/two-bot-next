@@ -1039,17 +1039,19 @@ impl TestDb {
     /// Seed a feed relay directly (other-guild isolation rows, missing-id
     /// targets) without going through the command path under test.
     async fn seed_feed(&self, guild_id: &str, id: &str, kind: &str) {
+        // Distinct sources respect UNIQUE (guild_id, channel_id, kind, source).
         // created_at/updated_at are NOT NULL without defaults (0180_feeds.sql).
         sqlx::query(
             "INSERT INTO feed_relays
                (id, guild_id, channel_id, kind, source, created_by, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, 'https://example.com/feed.xml', '77',
+             VALUES ($1, $2, $3, $4, $5, '77',
                      clock_timestamp(), clock_timestamp())",
         )
         .bind(id)
         .bind(guild_id)
         .bind(CHANNEL_S)
         .bind(kind)
+        .bind(format!("https://example.com/{id}.xml"))
         .execute(&self.pool)
         .await
         .expect("seed feed relay");
