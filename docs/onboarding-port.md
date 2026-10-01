@@ -170,11 +170,28 @@ ambiguity: neither the queue nor these transactions claims exactly-once sends
 across a crash in that window. Session goodbyes are at-least-once across such a
 crash; the legacy welcome marker suppresses retries after its successful commit.
 
-**Not review-ready:** database reservation/admission and recovery changes require
-exact-head CI validation and independent review. Initial component acknowledgement
-still waits behind preceding gateway SQL and worker admission/settings: the
-receive-relative, bounded-ingress ACK repair and its regressions remain open.
-Database isolation alone does not establish Discord's three-second ACK budget.
+Ingress now polls Twilight independently of the ordered SQL/pipeline owner through
+an explicit 32-packet buffer. Overflow fails the essential runner; no dispatch is
+silently discarded. Eligible shared-router components begin an ephemeral callback
+through the shared executor with a 2.5-second receive-relative deadline, without
+settings SQL or feature-worker admission. The ACK JoinSet is owned by the ingress
+future; shutdown/error cancels it together with feature workers. Memory-only tickets
+allow selection processing only after ordered checkpoint/job COMMIT and confirmed
+ACK. Restart still retains only the token-free interruption receipt.
+
+Ingress snapshots each dispatch's session, sequence, occurrence time and transport
+generation before later packets can change Twilight state. Sequence replays are
+fenced before ACK and again by the store. Transport invalidation immediately removes
+readiness; an older pending SQL completion cannot restore Connected. Queued stale
+interaction tickets are marked interrupted rather than applied. Settings/config
+failures and disabled-mode submissions after defer receive bounded honest edits,
+with no successful selection/routing rows or role writes.
+
+**Not review-ready:** the pool-repair head passed its required check, including the
+saturation/admission regressions. The subsequent ingress/ACK repair and new wire-clock,
+blocked-SQL, settings-timeout, overflow and unconfirmed-ACK regressions still require
+exact-head CI validation and independent review. Database isolation alone does not
+establish Discord's three-second ACK budget.
 Local Rust compilation has no certified bounded admission in this workspace; use the existing authorized CI
 service containers, never a speculative local build or target-directory bypass.
 Do not enable this checkpoint as a live onboarding flow or claim deployment

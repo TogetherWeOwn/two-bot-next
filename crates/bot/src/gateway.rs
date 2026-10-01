@@ -12,11 +12,13 @@
 //! stop the runner rather than checkpointing ahead of uncommitted effects.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod ingress;
 
 use crate::onboarding::OnboardingJob;
 
-use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, ShardId};
@@ -132,6 +134,18 @@ const ONBOARDING_WORKER_LIMIT: usize = 2;
 
 const CHECKPOINT_IO_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
+struct LiveInteraction {
+    interaction: Box<twilight_model::application::interaction::Interaction>,
+    ticket: tokio::sync::oneshot::Receiver<bool>,
+    generation: u64,
+}
+
+async fn generation_changed(generation: &AtomicU64, expected: u64) {
+    while generation.load(Ordering::SeqCst) == expected {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct Header {
     op: u8,
@@ -149,14 +163,16 @@ struct Hello {
 }
 
 /// Bound the entire SQL operation (pool acquire through COMMIT), not each query.
-/// Twilight only drives heartbeats while polled, so use at most a quarter of
-/// HELLO's interval and fail closed instead of waiting through missed heartbeats.
+/// Retain the quarter-heartbeat SQL budget even with independent ingress.
+/// A transport invalidation during SQL must not restore stale readiness.
 /// Source: https://docs.rs/tokio/1/tokio/time/fn.timeout.html
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
+    generation: &AtomicU64,
     deadline: std::time::Duration,
     operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, sqlx::Error> {
+    let started_generation = generation.load(Ordering::SeqCst);
     let previous = {
         let mut state = state.write().await;
         let previous = *state;
@@ -167,7 +183,10 @@ async fn checkpoint_io<T>(
         .await
         .map_err(|_| sqlx::Error::InvalidArgument("gateway checkpoint deadline exceeded".into()))?;
     if result.is_ok() {
-        *state.write().await = previous;
+        let mut state = state.write().await;
+        if generation.load(Ordering::SeqCst) == started_generation {
+            *state = previous;
+        }
     }
     result
 }
@@ -187,38 +206,59 @@ pub async fn run_shard(
     onboarding: Option<Arc<crate::onboarding::OnboardingRuntime>>,
     sticky: Option<Arc<crate::sticky_runtime::StickyRuntime>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(
-        &mut shard,
-        &pipeline,
-        &state,
-        &store,
-        onboarding.as_ref(),
-        sticky.as_ref(),
+    let (sender, mut packets) = tokio::sync::mpsc::channel(ingress::CAPACITY);
+    let (saved, checkpoint) = tokio::sync::watch::channel(None);
+    let generation = Arc::new(AtomicU64::new(0));
+    // Both futures are cancellation-owned by the essential runner. SQL never
+    // prevents ingress polling; failure drops ACK/feature JoinSets together.
+    let result = tokio::try_join!(
+        ingress::run(
+            &mut shard,
+            &state,
+            &generation,
+            onboarding.as_ref(),
+            sender,
+            checkpoint,
+        ),
+        run_loop(
+            &mut packets,
+            &pipeline,
+            &state,
+            &store,
+            onboarding.as_ref(),
+            sticky.as_ref(),
+            (&generation, saved),
+        ),
     )
-    .await;
+    .map(|_| ());
     *state.write().await = GatewayState::Armed;
     result
 }
 
 async fn run_loop(
-    shard: &mut Shard,
+    packets: &mut tokio::sync::mpsc::Receiver<ingress::Packet>,
     pipeline: &GatewayPipeline,
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
     onboarding: Option<&Arc<crate::onboarding::OnboardingRuntime>>,
     sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
+    progress: (
+        &Arc<AtomicU64>,
+        tokio::sync::watch::Sender<Option<GatewaySession>>,
+    ),
 ) -> Result<(), sqlx::Error> {
-    let mut observer = crate::gateway_metrics::Observer::default();
+    let (generation, saved_checkpoint) = progress;
     let mut deadline = CHECKPOINT_IO_MAX;
-    let mut committed = checkpoint_io(state, deadline, store.load()).await?;
+    let mut committed = checkpoint_io(state, generation, deadline, store.load()).await?;
+    saved_checkpoint.send_replace(committed.clone());
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
     let mut feature_jobs = tokio::task::JoinSet::new();
-    let mut live_interactions = HashMap::new();
+    let mut live_interactions: HashMap<i64, LiveInteraction> = HashMap::new();
     let mut queue_dirty = true;
     let mut queue_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     queue_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if onboarding.is_some() {
-        checkpoint_io(state, deadline, store.recover_onboarding_jobs()).await?;
+        checkpoint_io(state, generation, deadline, store.recover_onboarding_jobs()).await?;
     }
     loop {
         if let Some(runtime) = onboarding {
@@ -226,10 +266,11 @@ async fn run_loop(
             // SQL deadlines without driving the shard's heartbeat machinery.
             if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT {
                 if let Some(saved) =
-                    checkpoint_io(state, deadline, store.claim_onboarding_job()).await?
+                    checkpoint_io(state, generation, deadline, store.claim_onboarding_job()).await?
                 {
-                    let job = if let Some(job) = live_interactions.remove(&saved.id) {
-                        Some(job)
+                    let live = live_interactions.remove(&saved.id);
+                    let job = if let Some(live) = &live {
+                        Some(OnboardingJob::Interaction(live.interaction.clone()))
                     } else {
                         OnboardingJob::recover(&saved.payload).map_err(|_| {
                             sqlx::Error::InvalidArgument("invalid durable onboarding job".into())
@@ -237,20 +278,43 @@ async fn run_loop(
                     };
                     if let Some(job) = job {
                         let runtime = Arc::clone(runtime);
+                        let generation = Arc::clone(generation);
                         feature_jobs.spawn(async move {
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(90),
-                                runtime.handle(job, saved.occurred_at_ms),
-                            )
-                            .await
-                            .map_err(|_| crate::onboarding::RuntimeError::Discord)??;
-                            Ok::<_, crate::onboarding::RuntimeError>(saved.id)
+                            let interrupted =
+                                tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                                    if let Some(live) = live {
+                                        // Invalidation cancels even settings/selection waits;
+                                        // staged SQL rolls back and credentials are not replayed.
+                                        tokio::select! {
+                                            biased;
+                                            _ = generation_changed(&generation, live.generation) => return Ok(true),
+                                            result = async {
+                                                if live.ticket.await.unwrap_or(false) {
+                                                    runtime.handle_acknowledged(&live.interaction, saved.occurred_at_ms).await
+                                                } else {
+                                                    runtime.unconfirmed_interaction(&live.interaction).await
+                                                }
+                                            } => result?,
+                                        }
+                                    } else {
+                                        runtime.handle(job, saved.occurred_at_ms).await?;
+                                    }
+                                    Ok::<_, crate::onboarding::RuntimeError>(false)
+                                })
+                                .await
+                                .map_err(|_| crate::onboarding::RuntimeError::Discord)??;
+                            Ok::<_, crate::onboarding::RuntimeError>((saved.id, interrupted))
                         });
                     } else {
                         // Callback credentials never survive a process boundary.
                         // Keep an interruption receipt, not a guessed role replay.
-                        checkpoint_io(state, deadline, store.finish_onboarding_job(saved.id, true))
-                            .await?;
+                        checkpoint_io(
+                            state,
+                            generation,
+                            deadline,
+                            store.finish_onboarding_job(saved.id, true),
+                        )
+                        .await?;
                         warn!(
                             job_id = saved.id,
                             "onboarding interaction interrupted; member must reselect"
@@ -262,17 +326,17 @@ async fn run_loop(
             }
         }
         let item = tokio::select! {
-            item = shard.next() => item,
+            item = packets.recv() => item,
             _ = queue_tick.tick(), if onboarding.is_some() && queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT => {
                 continue;
             },
             result = feature_jobs.join_next(), if !feature_jobs.is_empty() => {
-                let Some(Ok(Ok(id))) = result else {
+                let Some(Ok(Ok((id, interrupted)))) = result else {
                     return Err(sqlx::Error::InvalidArgument(
                         "onboarding worker failed; durable job retained for bounded restart recovery".into(),
                     ));
                 };
-                checkpoint_io(state, deadline, store.finish_onboarding_job(id, false)).await?;
+                checkpoint_io(state, generation, deadline, store.finish_onboarding_job(id, interrupted)).await?;
                 queue_dirty = true;
                 continue;
             }
@@ -280,113 +344,37 @@ async fn run_loop(
         let Some(item) = item else {
             break;
         };
-        let message = match item {
-            Ok(message) => message,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    twilight_gateway::error::ReceiveMessageErrorType::Reconnect
-                ) =>
-            {
-                *state.write().await = GatewayState::Armed;
-                warn!("gateway reconnect failed; Twilight will retry");
+        let (event, checkpoint, received_generation, acknowledgement) = match item {
+            ingress::Packet::Hello(budget) => {
+                deadline = budget;
                 continue;
             }
-            Err(_) => {
-                return Err(sqlx::Error::InvalidArgument(
-                    "gateway receive failed; checkpoint unchanged".into(),
-                ))
+            ingress::Packet::Invalidate { clear } => {
+                if clear {
+                    checkpoint_io(state, generation, deadline, store.clear()).await?;
+                    committed = None;
+                    saved_checkpoint.send_replace(None);
+                }
+                continue;
             }
+            ingress::Packet::Dispatch {
+                event,
+                checkpoint,
+                generation,
+                acknowledgement,
+            } => (event, checkpoint, generation, acknowledgement),
         };
-        observer.observe(&message, shard);
-        let Message::Text(text) = message else {
-            *state.write().await = GatewayState::Armed;
-            // Twilight 0.17.1 retains its session on gateway-initiated closes.
-            // Discord requires a new session for these two reconnectable codes.
-            // Source: https://docs.discord.com/developers/topics/opcodes-and-status-codes#gateway-gateway-close-event-codes
-            let rejected = matches!(
-                message,
-                Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009)
-            );
-            if rejected || shard.session().is_none() {
-                checkpoint_io(state, deadline, store.clear()).await?;
-                committed = None;
-            }
-            if rejected {
-                // Shard construction consumed the config's saved session/URL,
-                // so this fresh shard IDENTIFYs while retaining intents/queue.
-                *shard = Shard::with_config(shard.id(), shard.config().clone());
-            }
-            continue;
-        };
-        let header: Header = serde_json::from_str(&text)
-            .map_err(|_| sqlx::Error::InvalidArgument("invalid gateway header".into()))?;
-        if header.op == 10 {
-            let hello: HelloPacket = serde_json::from_str(&text)
-                .map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
-            if hello.d.heartbeat_interval == 0 {
-                return Err(sqlx::Error::InvalidArgument(
-                    "zero heartbeat interval".into(),
-                ));
-            }
-            deadline = CHECKPOINT_IO_MAX
-                .min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
-        }
-        if header.op == 9 {
-            let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
-                sqlx::Error::InvalidArgument("invalid gateway session packet".into())
-            })?;
-            let resumable = value["d"].as_bool().ok_or_else(|| {
-                sqlx::Error::InvalidArgument("invalid gateway session flag".into())
-            })?;
-            *state.write().await = GatewayState::Armed;
-            if invalidates_session(resumable) {
-                checkpoint_io(state, deadline, store.clear()).await?;
-                committed = None;
-            }
-        }
-        if header.op != 0 {
-            continue;
-        }
-        let sequence = header
-            .s
-            .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing sequence".into()))?;
-        let session = session_snapshot(shard)
-            .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing session".into()))?;
-        // Twilight drops resume_url on a failed connect, but retains the session
-        // and may successfully RESUME at its bootstrap endpoint. RESUMED carries
-        // no new URL: retain READY's committed URL only for this same session.
-        let resume_url = shard
-            .resume_url()
-            .or_else(|| {
-                committed
-                    .as_ref()
-                    .filter(|saved| saved.session_id == session.id())
-                    .map(|saved| saved.resume_url.as_str())
-            })
-            .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
-        let checkpoint = GatewaySession {
-            session_id: session.id().to_owned(),
-            sequence,
-            resume_url: resume_url.to_owned(),
-            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
-        };
+        let sequence = checkpoint.sequence;
         if dispatch_action(committed.as_ref(), &checkpoint.session_id, sequence)
             == DispatchAction::Duplicate
         {
             continue;
         }
         let timer = crate::gateway_metrics::DispatchTimer::start();
-        let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| {
-            sqlx::Error::InvalidArgument(
-                "gateway dispatch parse failed; checkpoint unchanged".into(),
-            )
-        })?;
         let mut connected = false;
         let mut onboarding_job = None;
-        if let Some(parsed) = parsed {
-            let event = Event::from(parsed);
-            connected = matches!(event, Event::Ready(_) | Event::Resumed);
+        if let Some(event) = event {
+            connected = matches!(*event, Event::Ready(_) | Event::Resumed);
             onboarding_job = onboarding.and_then(|runtime| runtime.capture(&event, pipeline));
             pipeline.handle(&event);
             // Detached dispatch only: awaiting sticky work inline would stall
@@ -408,6 +396,7 @@ async fn run_loop(
             .transpose()?;
         let (_, job_id) = checkpoint_io(
             state,
+            generation,
             deadline,
             store.commit_dispatch_with_job(
                 &checkpoint,
@@ -418,15 +407,31 @@ async fn run_loop(
         .await?;
         timer.committed();
         committed = Some(checkpoint);
+        saved_checkpoint.send_replace(committed.clone());
         if let Some(id) = job_id {
-            if let Some(job @ OnboardingJob::Interaction(_)) = onboarding_job {
-                live_interactions.insert(id, job);
+            if let Some(OnboardingJob::Interaction(interaction)) = onboarding_job {
+                let ticket = acknowledgement.ok_or_else(|| {
+                    sqlx::Error::InvalidArgument(
+                        "onboarding interaction missing ingress ticket".into(),
+                    )
+                })?;
+                live_interactions.insert(
+                    id,
+                    LiveInteraction {
+                        interaction,
+                        ticket,
+                        generation: received_generation,
+                    },
+                );
             }
             queue_dirty = true;
         }
         if connected {
-            *state.write().await = GatewayState::Connected;
-            info!(sequence, "gateway ready; checkpoint committed");
+            let mut state = state.write().await;
+            if generation.load(Ordering::SeqCst) == received_generation {
+                *state = GatewayState::Connected;
+                info!(sequence, "gateway ready; checkpoint committed");
+            }
         }
     }
     warn!("gateway shard stream ended; supervisor reports down until restart");
@@ -548,6 +553,7 @@ mod tests {
         let state = RwLock::new(GatewayState::Connected);
         let result = checkpoint_io(
             &state,
+            &AtomicU64::new(0),
             std::time::Duration::from_millis(10),
             std::future::pending::<Result<(), sqlx::Error>>(),
         )
@@ -559,18 +565,31 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_io_restores_readiness_only_after_success() {
         let state = RwLock::new(GatewayState::Connected);
-        checkpoint_io(&state, CHECKPOINT_IO_MAX, async {
+        checkpoint_io(&state, &AtomicU64::new(0), CHECKPOINT_IO_MAX, async {
             assert_eq!(*state.read().await, GatewayState::Armed);
             Ok(())
         })
         .await
         .unwrap();
         assert_eq!(*state.read().await, GatewayState::Connected);
-        let result = checkpoint_io(&state, CHECKPOINT_IO_MAX, async {
+        let result = checkpoint_io(&state, &AtomicU64::new(0), CHECKPOINT_IO_MAX, async {
             Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
         })
         .await;
         assert!(result.is_err());
+        assert_eq!(*state.read().await, GatewayState::Armed);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_io_cannot_restore_an_invalidated_transport_generation() {
+        let state = RwLock::new(GatewayState::Connected);
+        let generation = AtomicU64::new(0);
+        checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+            generation.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
         assert_eq!(*state.read().await, GatewayState::Armed);
     }
 

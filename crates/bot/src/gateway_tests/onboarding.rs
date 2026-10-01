@@ -24,6 +24,8 @@ use super::*;
 use crate::gateway::GatewayPipeline;
 use crate::onboarding::{OnboardingJob, OnboardingRuntime};
 
+mod ingress;
+
 const SESSION: &str = "onboarding-session";
 const DEADLINE: Duration = Duration::from_secs(20);
 const RECEIPT_AT: i64 = 1_790_780_400_000;
@@ -57,13 +59,18 @@ impl Drop for Runner {
 
 struct GatewayFixture {
     mock: MockGateway,
-    dispatch: mpsc::Sender<Value>,
+    dispatch: mpsc::Sender<(Value, tokio::sync::oneshot::Sender<std::time::Instant>)>,
     heartbeats: mpsc::Receiver<()>,
 }
 
 impl GatewayFixture {
-    async fn send(&self, packet: Value) {
-        self.dispatch.send(packet).await.expect("mock dispatch");
+    async fn send(&self, packet: Value) -> std::time::Instant {
+        let (sent, receipt) = tokio::sync::oneshot::channel();
+        self.dispatch
+            .send((packet, sent))
+            .await
+            .expect("mock dispatch");
+        receipt.await.expect("actual WebSocket send receipt")
     }
 }
 
@@ -84,7 +91,8 @@ async fn gateway_with_heartbeat(resume: bool, heartbeat_interval: u64) -> Gatewa
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let ready_url = url.clone();
     let (auth_tx, auth) = mpsc::channel(4);
-    let (dispatch, mut packets) = mpsc::channel::<Value>(8);
+    let (dispatch, mut packets) =
+        mpsc::channel::<(Value, tokio::sync::oneshot::Sender<std::time::Instant>)>(8);
     let (send_heartbeat, heartbeats) = mpsc::channel(16);
     let task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -119,10 +127,12 @@ async fn gateway_with_heartbeat(resume: bool, heartbeat_interval: u64) -> Gatewa
         loop {
             tokio::select! {
                 packet = packets.recv() => {
-                    let Some(packet) = packet else { return };
+                    let Some((packet, receipt)) = packet else { return };
+                    let sent_at = std::time::Instant::now();
                     if ws.send(Message::text(packet.to_string())).await.is_err() {
                         return;
                     }
+                    let _ = receipt.send(sent_at);
                 }
                 message = ws.next() => {
                     let Some(Ok(message)) = message else { return };
@@ -1050,8 +1060,8 @@ async fn onboarding_gateway_worker_admission_bounds_held_game_transactions() {
             .filter(|request| request.method == "POST" && request.path.ends_with("/callback"))
             .count();
         assert_eq!(
-            callbacks, 2,
-            "pending commands never start settings or REST work"
+            callbacks, 6,
+            "pending commands are deferred at ingress without starting settings or role work"
         );
         assert!(!mock
             .requests()

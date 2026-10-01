@@ -575,10 +575,21 @@ async fn onboarding_runtime_roleless_session_reselection_stale_menu_and_goodbye_
             .handle(component(GAME_SELECT_ID, &["shooters"]), NOW)
             .await
             .unwrap();
-        assert!(
-            mock.requests().is_empty(),
-            "mode-exclusive shared router gates"
+        let stale_requests = mock.requests();
+        assert_eq!(
+            stale_requests.len(),
+            2,
+            "stale menu receives defer and error edit only"
         );
+        assert!(stale_requests[0].path.ends_with("/callback"));
+        assert!(stale_requests[1].path.ends_with("/messages/@original"));
+        let stale_reply: Value = serde_json::from_slice(&stale_requests[1].body).unwrap();
+        assert!(stale_reply["content"]
+            .as_str()
+            .unwrap()
+            .contains("no longer enabled"));
+        assert_eq!(db.count(EVENT_GAME_ROLES_SELECTED).await, 0);
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 0);
         runtime
             .handle(component(SESSION_SELECT_ID, &["find-players"]), NOW)
             .await
@@ -888,7 +899,7 @@ async fn onboarding_runtime_picker_insert_and_commit_failures_are_atomic_and_ter
 
 #[tokio::test]
 #[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
-async fn onboarding_runtime_picker_begin_and_lock_failures_finish_the_defer() {
+async fn onboarding_runtime_picker_settings_and_lock_failures_finish_the_defer() {
     let db = TestSchema::new().await;
     let result = std::panic::AssertUnwindSafe(async {
         let runtime_pool = TestSchema::pool(&db.schema).await;

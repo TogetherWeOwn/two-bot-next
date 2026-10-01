@@ -225,38 +225,113 @@ impl OnboardingRuntime {
                         .map(|at| at.as_micros() / 1000),
                 })
             }
-            Event::InteractionCreate(interaction)
-                if interaction
-                    .guild_id
-                    .is_some_and(|guild| guild.get() == self.guild_id) =>
-            {
-                let router = InteractionRouter::new(RouterGates {
-                    configured_guild: Some(self.guild_id),
-                    scorecard: false,
-                    automations: false,
-                    announcements: false,
-                    moderation: false,
-                    tickets: false,
-                    self_roles: false,
-                    onboarding_picker: true,
-                    session_picker: true,
-                });
-                matches!(
-                    route_interaction(&router, &interaction.0, None),
-                    RoutedInteraction::Component {
-                        outcome: ComponentOutcome::Handled {
-                            handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
-                        },
-                        ..
-                    }
-                )
-                .then(|| OnboardingJob::Interaction(Box::new(interaction.0.clone())))
+            Event::InteractionCreate(interaction) if self.accepts_interaction(&interaction.0) => {
+                Some(OnboardingJob::Interaction(Box::new(interaction.0.clone())))
             }
             _ => None,
         }
     }
 
+    /// Ingress eligibility uses only immutable identity and the shared router,
+    /// never settings SQL. Stale/disabled mode submissions get an honest edit
+    /// after defer; hot configuration cannot delay the initial acknowledgement.
+    pub fn accepts_interaction(&self, interaction: &Interaction) -> bool {
+        let router = InteractionRouter::new(RouterGates {
+            configured_guild: Some(self.guild_id),
+            scorecard: false,
+            automations: false,
+            announcements: false,
+            moderation: false,
+            tickets: false,
+            self_roles: false,
+            onboarding_picker: true,
+            session_picker: true,
+        });
+        interaction
+            .member
+            .as_ref()
+            .and_then(|member| member.user.as_ref())
+            .is_some_and(|user| !user.bot)
+            && matches!(
+                route_interaction(&router, interaction, None),
+                RoutedInteraction::Component {
+                    outcome: ComponentOutcome::Handled {
+                        handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
+                    },
+                    ..
+                }
+            )
+    }
+
+    pub async fn acknowledge(
+        &self,
+        interaction: &Interaction,
+        received: tokio::time::Instant,
+    ) -> bool {
+        // Include executor scheduling/HTTP in one receive-relative deadline,
+        // leaving margin below Discord's three-second limit. Never retry defer.
+        matches!(
+            tokio::time::timeout_at(
+                received + Duration::from_millis(2500),
+                self.executor.answer_interaction(
+                    interaction.id.get(),
+                    &interaction.token,
+                    &defer_ephemeral(),
+                ),
+            )
+            .await,
+            Ok(Ok(()))
+        )
+    }
+
+    pub async fn unconfirmed_interaction(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<(), RuntimeError> {
+        self.reply(
+            interaction,
+            "I couldn't confirm this interaction. Your selection may already have been processed, so I won't apply it again. Please open the menu and try again.",
+        )
+        .await
+    }
+
+    pub async fn handle_acknowledged(
+        &self,
+        interaction: &Interaction,
+        now_ms: i64,
+    ) -> Result<(), RuntimeError> {
+        let occurred_at = two_bot_core::funnel::format_iso_millis(now_ms);
+        // Configuration/settings failures are inside the post-defer boundary.
+        // A successful error edit is terminal, with no role or success writes.
+        let config = match self.config().await {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "onboarding picker configuration unavailable after defer"
+                );
+                return self
+                    .reply(interaction, "I couldn't load the menu configuration. No selection was applied. Please open the menu and try again later.")
+                    .await;
+            }
+        };
+        self.interaction(&config, interaction, &occurred_at).await
+    }
+
     pub async fn handle(&self, job: OnboardingJob, now_ms: i64) -> Result<(), RuntimeError> {
+        if let OnboardingJob::Interaction(interaction) = job {
+            if !self.accepts_interaction(&interaction) {
+                return Ok(());
+            }
+            return if self
+                .acknowledge(&interaction, tokio::time::Instant::now())
+                .await
+            {
+                self.handle_acknowledged(&interaction, now_ms).await
+            } else {
+                self.unconfirmed_interaction(&interaction).await
+            };
+        }
         let config = self.config().await?;
         let occurred_at = two_bot_core::funnel::format_iso_millis(now_ms);
         match job {
@@ -445,7 +520,9 @@ impl OnboardingRuntime {
             ..
         } = route_interaction(&router, interaction, None)
         else {
-            return Ok(());
+            return self
+                .reply(interaction, "This menu is no longer enabled. No selection was applied. Please open the current menu and try again.")
+                .await;
         };
         if !matches!(
             handler,
@@ -463,25 +540,8 @@ impl OnboardingRuntime {
         if user.bot {
             return Ok(());
         }
-        // A rejected callback may be a replay of an already-deferred click.
-        // Try an edit, but never apply the user's role command in that case.
-        let deferred = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.executor.answer_interaction(
-                interaction.id.get(),
-                &interaction.token,
-                &defer_ephemeral(),
-            ),
-        )
-        .await;
-        if !matches!(deferred, Ok(Ok(()))) {
-            return self
-                .reply(
-                    interaction,
-                    "I couldn't confirm this interaction. Your selection may already have been processed, so I won't apply it again. Please open the menu and try again.",
-                )
-                .await;
-        }
+        // The caller has confirmed ingress defer and committed the delivery
+        // receipt. Never issue a second initial callback from a feature worker.
         let keys: Vec<_> = values.iter().map(String::as_str).collect();
         // Keep the error boundary outside the processing timeout: cancellation
         // drops uncommitted success rows before we try to finish the defer.

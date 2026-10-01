@@ -464,11 +464,20 @@ impl RestRequest {
     }
 }
 
+/// A response successfully written to the mock socket, not merely scheduled.
+#[derive(Debug, Clone)]
+pub struct RestResponse {
+    pub path: String,
+    pub status: u16,
+    pub sent_at: std::time::Instant,
+}
+
 /// The running scripted REST double.
 pub struct MockRest {
     /// Listener address; `origin()` renders the `DISCORD_API_BASE` override.
     pub addr: SocketAddr,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
+    responses: Arc<Mutex<Vec<RestResponse>>>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -496,14 +505,17 @@ impl MockRest {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
+        let responses = Arc::new(Mutex::new(Vec::new()));
         let responder: RestResponder = Arc::new(responder);
         let handle = {
             let recorded = Arc::clone(&recorded);
-            tokio::spawn(async move { rest_task(listener, recorded, responder).await })
+            let responses = Arc::clone(&responses);
+            tokio::spawn(async move { rest_task(listener, recorded, responses, responder).await })
         };
         Self {
             addr,
             recorded,
+            responses,
             handle: Some(handle),
         }
     }
@@ -518,7 +530,11 @@ impl MockRest {
         self.recorded.lock().expect("recorded").clone()
     }
 
-    /// Stop the listener.
+    pub fn responses(&self) -> Vec<RestResponse> {
+        self.responses.lock().expect("responses").clone()
+    }
+
+    /// Stop the listener and its owned connection tasks.
     pub async fn shutdown(mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
@@ -529,21 +545,27 @@ impl MockRest {
 async fn rest_task(
     listener: TcpListener,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
+    responses: Arc<Mutex<Vec<RestResponse>>>,
     responder: RestResponder,
 ) {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            break;
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
         };
+        let Ok((stream, _)) = accepted else { break };
         let recorded = Arc::clone(&recorded);
+        let responses = Arc::clone(&responses);
         let responder = Arc::clone(&responder);
-        tokio::spawn(async move { handle_rest(stream, recorded, responder).await });
+        connections.spawn(async move { handle_rest(stream, recorded, responses, responder).await });
     }
 }
 
 async fn handle_rest(
     mut stream: TcpStream,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
+    responses: Arc<Mutex<Vec<RestResponse>>>,
     responder: RestResponder,
 ) {
     let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
@@ -557,6 +579,7 @@ async fn handle_rest(
         received_at: std::time::Instant::now(),
     };
     let next = responder(&request);
+    let path = request.path.clone();
     recorded.lock().expect("recorded").push(request);
     if !next.delay.is_zero() {
         tokio::time::sleep(next.delay).await;
@@ -571,8 +594,14 @@ async fn handle_rest(
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
-    let _ = stream.write_all(head.as_bytes()).await;
-    let _ = stream.write_all(&next.body).await;
+    if stream.write_all(head.as_bytes()).await.is_ok() && stream.write_all(&next.body).await.is_ok()
+    {
+        responses.lock().expect("responses").push(RestResponse {
+            path,
+            status: next.status,
+            sent_at: std::time::Instant::now(),
+        });
+    }
 }
 
 /// Read one HTTP/1.1 request: request line, all headers, `content-length`
