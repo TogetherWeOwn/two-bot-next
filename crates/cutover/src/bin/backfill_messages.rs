@@ -204,7 +204,7 @@ async fn main() {
     println!(
         "  members with 3+ posts   {}   (AM7 text bar, {})",
         pad(summary.authors_with_full_ladder),
-        if scan_report.has_interruptions() || !summary.truncated.is_empty() {
+        if scan_report.has_incomplete_history() {
             "lower bound - incomplete history"
         } else {
             "exactly"

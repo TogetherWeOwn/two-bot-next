@@ -98,8 +98,9 @@ impl RestClient {
         *last = std::time::Instant::now();
     }
 
-    // twilight surfaces the Discord `retry-after` via the ratelimiter, which
-    // the tools bypass for one-shot pacing; 429s wait 1s + 250ms.
+    // Twilight handles 429 retries internally via its default ratelimiter.
+    // Preserve the legacy fallback branch below without changing that behavior.
+    // https://docs.rs/twilight-http/0.17.1/twilight_http/response/struct.ResponseFuture.html#rate-limits
 
     /// Classify a request error without confusing an unreadable/exhausted
     /// page with a successfully read empty page.

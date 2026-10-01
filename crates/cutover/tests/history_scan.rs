@@ -182,7 +182,7 @@ async fn empty_and_short_pages_really_complete_history() {
             report.render(),
             "  scan completion       end-of-history=1\n"
         );
-        assert!(!report.has_interruptions());
+        assert!(!report.has_incomplete_history());
     }
     let (page, requests, _) = scan(vec![messages(100), messages(0)], 10, None).await;
     assert_eq!(page.messages.len(), 100);
@@ -273,9 +273,16 @@ fn shared_cli_summary_keeps_completion_reasons_separate() {
     ] {
         assert!(output.contains(&format!("{label}=1")));
     }
-    assert!(report.has_interruptions());
+    assert!(report.has_incomplete_history());
     assert_eq!(output.matches("INCOMPLETE:").count(), 4);
     assert!(!output.contains("INCOMPLETE: end-of-history"));
     assert!(!output.contains("INCOMPLETE: time-boundary"));
     assert!(!output.contains("INCOMPLETE: page-cap"));
+    // A completed time window is still partial all-time history for AM7.
+    for reason in [ScanCompletion::TimeBoundary, ScanCompletion::PageCap] {
+        let mut bounded = ScanReport::default();
+        bounded.record("42", reason);
+        assert!(bounded.has_incomplete_history());
+        assert!(!bounded.render().contains("INCOMPLETE: unreadable"));
+    }
 }

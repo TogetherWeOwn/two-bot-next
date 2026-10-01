@@ -24,8 +24,10 @@ impl ScanReport {
     }
 
     #[must_use]
-    pub fn has_interruptions(&self) -> bool {
-        !self.interrupted.is_empty()
+    pub fn has_incomplete_history(&self) -> bool {
+        self.counts
+            .keys()
+            .any(|reason| *reason != ScanCompletion::EndOfHistory)
     }
 
     #[must_use]
