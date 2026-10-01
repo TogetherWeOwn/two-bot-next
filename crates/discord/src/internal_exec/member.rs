@@ -225,14 +225,17 @@ impl ActionExecutor {
         let role = numeric_id(request.role_id())?.cast();
         numeric_id(bot_user_id)?;
         // Legacy: failure to read the target is not proof of absence, but a
-        // redundant role PUT is naturally idempotent. Policy reads still fail closed.
-        if let Ok(Some(held)) = self
+        // redundant role PUT is naturally idempotent. A 429 must stop all further
+        // REST calls during cooldown. Policy reads still fail closed.
+        match self
             .internal_member_roles(guild_id, request.discord_id())
             .await
         {
-            if held.iter().any(|id| id == request.role_id()) {
+            Ok(Some(held)) if held.iter().any(|id| id == request.role_id()) => {
                 return Ok(MemberOutcome::AlreadyHeld);
             }
+            Err(error) if error.code == ErrorCode::RateLimited => return Err(error),
+            _ => {}
         }
         let bot_roles = self
             .internal_member_roles(guild_id, bot_user_id)

@@ -17,16 +17,18 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::Secret;
+
 /// Off-box destination: endpoint, bucket, credentials and optional prefix.
 /// Values come from `TWO_BACKUP_S3_*` (see [`load_s3_target`]); the secret
 /// never appears in logs — callers log only `bucket/key` and the etag.
 #[derive(Debug, Clone)]
 pub struct S3Target {
-    pub endpoint: String,
+    pub endpoint: Secret<String>,
     pub region: String,
     pub bucket: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
+    pub access_key_id: Secret<String>,
+    pub secret_access_key: Secret<String>,
     /// Optional key prefix, e.g. `two-bot/`. Leading/trailing slashes tidied.
     pub prefix: Option<String>,
 }
@@ -34,8 +36,8 @@ pub struct S3Target {
 /// A signed PUT, ready for the transport.
 #[derive(Debug, Clone)]
 pub struct SignedRequest {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
+    pub url: Secret<String>,
+    pub headers: Secret<Vec<(String, String)>>,
 }
 
 /// Destination-config refusal. Every failure names the variable, never a
@@ -106,9 +108,9 @@ pub fn load_s3_target(env: &dyn Fn(&str) -> Option<String>) -> Result<S3Target, 
 
     let endpoint = get_env(env, "TWO_BACKUP_S3_ENDPOINT").unwrap_or_default();
     if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
-        return Err(S3ConfigError(format!(
-            "TWO_BACKUP_S3_ENDPOINT must start with https:// or http:// (got {endpoint:?})."
-        )));
+        return Err(S3ConfigError(
+            "TWO_BACKUP_S3_ENDPOINT must start with https:// or http://.".to_owned(),
+        ));
     }
     // http:// to anything but a local test server would ship the funnel log,
     // and the credential signing it, in clear text across the internet.
@@ -118,10 +120,11 @@ pub fn load_s3_target(env: &dyn Fn(&str) -> Option<String>) -> Result<S3Target, 
     // `::1`, which `http::check_url` and the guild-config seams also treat
     // as loopback.
     if endpoint.starts_with("http://") && !is_loopback_endpoint(&endpoint) {
-        return Err(S3ConfigError(format!(
-            "TWO_BACKUP_S3_ENDPOINT must be https:// for a remote host (got {endpoint:?}). \
+        return Err(S3ConfigError(
+            "TWO_BACKUP_S3_ENDPOINT must be https:// for a remote host. \
              Plain http would send the dump and its credentials in clear text."
-        )));
+                .to_owned(),
+        ));
     }
 
     let bucket = get_env(env, "TWO_BACKUP_S3_BUCKET").unwrap_or_default();
@@ -147,11 +150,13 @@ pub fn load_s3_target(env: &dyn Fn(&str) -> Option<String>) -> Result<S3Target, 
     }
 
     Ok(S3Target {
-        endpoint,
+        endpoint: Secret::new(endpoint),
         region: get_env(env, "TWO_BACKUP_S3_REGION").unwrap_or_else(|| "auto".to_owned()),
         bucket,
-        access_key_id: get_env(env, "TWO_BACKUP_S3_ACCESS_KEY_ID").unwrap_or_default(),
-        secret_access_key: get_env(env, "TWO_BACKUP_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+        access_key_id: Secret::new(get_env(env, "TWO_BACKUP_S3_ACCESS_KEY_ID").unwrap_or_default()),
+        secret_access_key: Secret::new(
+            get_env(env, "TWO_BACKUP_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+        ),
         prefix: get_env(env, "TWO_BACKUP_S3_PREFIX"),
     })
 }
@@ -285,7 +290,7 @@ pub fn sign_put(
     amz_date: &str,
     date_stamp: &str,
 ) -> SignedRequest {
-    let endpoint = target.endpoint.trim_end_matches('/');
+    let endpoint = target.endpoint.expose().trim_end_matches('/');
     let without_scheme = endpoint
         .trim_start_matches("https://")
         .trim_start_matches("http://");
@@ -296,7 +301,7 @@ pub fn sign_put(
     // path and the URL. Dropping it signs one thing and sends another —
     // a 403 at best, a write to the wrong place at worst (PR #11 review).
     let endpoint_prefix = without_scheme.split_at(host.len()).1.trim_end_matches('/');
-    let scheme = if target.endpoint.starts_with("http://") {
+    let scheme = if target.endpoint.expose().starts_with("http://") {
         "http"
     } else {
         "https"
@@ -351,7 +356,7 @@ pub fn sign_put(
     .join("\n");
     let signature = hex_of(&hmac_sha256(
         &signing_key(
-            &target.secret_access_key,
+            target.secret_access_key.expose(),
             date_stamp,
             &target.region,
             service,
@@ -364,13 +369,13 @@ pub fn sign_put(
         "authorization".to_owned(),
         format!(
             "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_header_list}, Signature={signature}",
-            target.access_key_id
+            target.access_key_id.expose()
         ),
     ));
 
     SignedRequest {
-        url: format!("{scheme}://{host}{path}"),
-        headers: signed,
+        url: Secret::new(format!("{scheme}://{host}{path}")),
+        headers: Secret::new(signed),
     }
 }
 
@@ -426,11 +431,11 @@ mod tests {
 
     fn target() -> S3Target {
         S3Target {
-            endpoint: "https://acct.r2.cloudflarestorage.com".to_owned(),
+            endpoint: Secret::new("https://acct.r2.cloudflarestorage.com".to_owned()),
             region: "auto".to_owned(),
             bucket: "paperclip-backups".to_owned(),
-            access_key_id: "AKIDEXAMPLE".to_owned(),
-            secret_access_key: worked_example_secret(),
+            access_key_id: Secret::new("AKIDEXAMPLE".to_owned()),
+            secret_access_key: Secret::new(worked_example_secret()),
             prefix: Some("two-bot".to_owned()),
         }
     }
@@ -492,8 +497,14 @@ mod tests {
         );
         assert!(req
             .url
+            .expose()
             .starts_with("https://acct.r2.cloudflarestorage.com/paperclip-backups/"));
-        let names: Vec<&str> = req.headers.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = req
+            .headers
+            .expose()
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
         assert_eq!(
             names,
             [
@@ -506,6 +517,7 @@ mod tests {
         );
         let auth = req
             .headers
+            .expose()
             .iter()
             .find(|(n, _)| n == "authorization")
             .expect("auth header")
@@ -602,7 +614,7 @@ mod tests {
     #[test]
     fn sign_put_keeps_an_endpoint_path_prefix_in_signed_path_and_url() {
         let mut prefixed = target();
-        prefixed.endpoint = "https://proxy.example.com/s3-prefix".to_owned();
+        prefixed.endpoint = Secret::new("https://proxy.example.com/s3-prefix".to_owned());
         let req = sign_put(
             &prefixed,
             "two-bot/f.gz",
@@ -611,12 +623,13 @@ mod tests {
             "20260903",
         );
         assert_eq!(
-            req.url,
+            req.url.expose(),
             "https://proxy.example.com/s3-prefix/paperclip-backups/two-bot/f.gz"
         );
         // The host header stays the bare host; the prefix lives in the path.
         let host = req
             .headers
+            .expose()
             .iter()
             .find(|(n, _)| n == "host")
             .map(|(_, v)| v.as_str());

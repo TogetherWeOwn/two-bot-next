@@ -149,6 +149,11 @@ impl ActionExecutor {
             guild_id: Some(DiscordId::new(config.guild_id).map_err(storage_error)?),
             target_id: Some(DiscordId::new(user).map_err(storage_error)?),
             actor_id: None,
+            resolved_role_id: role_request
+                .as_ref()
+                .map(|request| DiscordId::new(request.role_id()))
+                .transpose()
+                .map_err(storage_error)?,
         };
         let claim = match store
             .claim(&identity, &subject)

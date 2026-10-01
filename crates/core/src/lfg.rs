@@ -591,6 +591,83 @@ pub fn lfg_nonce(post_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn property_lfg_parsers_accept_arbitrary_unicode_without_panicking(
+            text in proptest::collection::vec(any::<char>(), 0..256)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            now in any::<i64>(),
+        ) {
+            if let Ok(roles) = parse_role_spec(&text) {
+                let wire = roles.iter().map(|r| format!("{}:{}:{}", r.key, r.label, r.slots))
+                    .collect::<Vec<_>>().join(",");
+                prop_assert_eq!(parse_role_spec(&wire), Ok(roles));
+            }
+            if let Ok(title) = validate_title(&text) {
+                prop_assert_eq!(validate_title(&title), Ok(title));
+            }
+            if let Ok(instant) = normalize_starts_at(&text, now) {
+                prop_assert_eq!(normalize_starts_at(&instant, now), Ok(instant));
+            }
+            let _ = parse_lfg_select(&text, &text);
+        }
+
+        #[test]
+        fn property_role_specs_round_trip_normalized_values(
+            entries in proptest::collection::vec(("[A-Za-z][A-Za-z0-9 _-]{0,79}", 1u8..=99), 1..=20),
+        ) {
+            let wire = entries.iter().enumerate()
+                .map(|(i, (label, slots))| format!(" ROLE{i} : {label} : {slots} "))
+                .collect::<Vec<_>>().join(",");
+            let parsed = parse_role_spec(&wire).unwrap();
+            let expected = entries.iter().enumerate().map(|(i, (label, slots))| LfgRoleSpec {
+                key: format!("role{i}"), label: label.trim().to_owned(), slots: *slots,
+            }).collect::<Vec<_>>();
+            prop_assert_eq!(&parsed, &expected);
+            let canonical = parsed.iter().map(|r| format!("{}:{}:{}", r.key, r.label, r.slots))
+                .collect::<Vec<_>>().join(",");
+            prop_assert_eq!(parse_role_spec(&canonical), Ok(parsed));
+        }
+
+        #[test]
+        fn property_lfg_bounds_match_legacy_utf16_and_slot_limits(
+            count in 0usize..=22,
+            slots in -2i32..=102,
+            chars in proptest::collection::vec(prop::sample::select(vec!['a', 'é', '😀', '\u{0085}']), 0..=110),
+        ) {
+            let spec = (0..count).map(|i| format!("r{i}:Role:{slots}"))
+                .collect::<Vec<_>>().join(",");
+            prop_assert_eq!(parse_role_spec(&spec).is_ok(), (1..=20).contains(&count) && (1..=99).contains(&slots));
+            let title: String = chars.into_iter().collect();
+            let expected = (1..=100).contains(&title.encode_utf16().count());
+            prop_assert_eq!(validate_title(&format!("\u{feff}{title}\u{feff}")).is_ok(), expected);
+            let label_spec = format!("role:{title}:1");
+            prop_assert_eq!(parse_role_spec(&label_spec).is_ok(), (1..=80).contains(&title.encode_utf16().count()));
+        }
+
+        #[test]
+        fn property_starts_at_normalizes_offsets_and_enforces_future_boundary(
+            seconds in 946_684_800i64..4_102_444_800,
+            millis in 0u16..1000,
+            offset_minutes in -720i32..=840,
+        ) {
+            use time::format_description::well_known::Rfc3339;
+            let instant = time::OffsetDateTime::from_unix_timestamp(seconds).unwrap()
+                + time::Duration::milliseconds(i64::from(millis));
+            let local = instant.to_offset(time::UtcOffset::from_whole_seconds(offset_minutes * 60).unwrap());
+            let input = local.format(&Rfc3339).unwrap();
+            let now = seconds * 1000 + i64::from(millis);
+            let normalized = normalize_starts_at(&input, now - 1).unwrap();
+            prop_assert_eq!(&normalized, &iso_millis_utc(instant));
+            prop_assert_eq!(normalize_starts_at(&normalized, now - 1), Ok(normalized));
+            prop_assert_eq!(normalize_starts_at(&input, now), Err(StartsAtError::NotFuture));
+            prop_assert_eq!(normalize_starts_at(&input, now + 1), Err(StartsAtError::NotFuture));
+        }
+    }
 
     #[test]
     fn role_spec_parses_legacy_example() {

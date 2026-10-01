@@ -313,6 +313,135 @@ async fn redirects_never_persist_success_or_forward_credentials() {
 
 #[tokio::test]
 #[ignore = "requires agent-testdb; CI explicitly runs this suite"]
+async fn uncertain_role_intent_retains_resolved_role_after_configuration_remapping() {
+    let db = TestDb::new().await;
+    let store = InternalActionStore::new(db.pool.clone());
+    let mut keys = HashMap::from([("member".into(), ROLE.into())]);
+    let payload = json!({"action":"role.assign","discord_id":USER,"role_key":"member"}).to_string();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"roles":[]})),
+            ScriptedResponse::json(200, json!({"roles":[BOT_ROLE]})),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id":GUILD,"position":0,"managed":false},
+                    {"id":ROLE,"position":1,"managed":false},
+                    {"id":BOT_ROLE,"position":10,"managed":true}
+                ]),
+            ),
+            ScriptedResponse::status(503),
+        ],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let exec = executor(&mock);
+    assert_eq!(
+        exec.execute_stored_member(
+            &store,
+            "website",
+            "resolved-role-key",
+            payload.as_bytes(),
+            &config(&keys)
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::DiscordUnavailable
+    );
+    let calls = mock.requests();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[3].method, "PUT");
+    assert_eq!(
+        calls[3].path,
+        format!("/api/v10/guilds/{GUILD}/members/{USER}/roles/{ROLE}")
+    );
+    let intent: (String, String, String, String) = sqlx::query_as(
+        "SELECT state, guild_id, target_id, resolved_role_id FROM internal_idempotency",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        intent,
+        ("unknown".into(), GUILD.into(), USER.into(), ROLE.into())
+    );
+    let audits: Vec<(String, String)> =
+        sqlx::query_as("SELECT phase, resolved_role_id FROM internal_action_log ORDER BY audit_id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        audits,
+        vec![
+            ("intent".into(), ROLE.into()),
+            ("unknown".into(), ROLE.into())
+        ]
+    );
+
+    keys.insert("member".into(), "100000000000000006".into());
+    for _ in 0..2 {
+        assert_eq!(
+            executor(&mock)
+                .execute_stored_member(
+                    &store,
+                    "website",
+                    "resolved-role-key",
+                    payload.as_bytes(),
+                    &config(&keys)
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InProgress
+        );
+        assert_eq!(mock.requests().len(), 4);
+    }
+    let identity = RequestIdentity::new(
+        "website",
+        "resolved-role-key",
+        "role.assign",
+        payload.as_bytes(),
+    )
+    .unwrap();
+    store
+        .reconcile(
+            &identity,
+            &TerminalResponse::Success {
+                resource_id: None,
+                affected: 1,
+            },
+            ReconciliationEvidence::DiscordConfirmedEffect,
+        )
+        .await
+        .unwrap();
+    let replay = executor(&mock)
+        .execute_stored_member(
+            &store,
+            "website",
+            "resolved-role-key",
+            payload.as_bytes(),
+            &config(&keys),
+        )
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.outcome, MemberOutcome::Assigned);
+    assert_eq!(mock.requests().len(), 4);
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT resolved_role_id FROM internal_idempotency \
+         UNION ALL SELECT resolved_role_id FROM internal_action_log",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(roles, vec![ROLE.to_owned(); 4]);
+    mock.shutdown().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn uncertain_response_retains_fence_and_disabled_action_never_sends() {
     let db = TestDb::new().await;
     let store = InternalActionStore::new(db.pool.clone());

@@ -219,6 +219,35 @@ async fn rate_limit_returns_header_retry_delay_without_hidden_retry() {
 }
 
 #[tokio::test]
+async fn rate_limited_target_probe_stops_role_assignment_before_any_further_request() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::rate_limited(0.5, "60")],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let body = role_body();
+    let keys = keys();
+    let error = executor(&mock)
+        .assign_internal_role(
+            GUILD,
+            BOT,
+            &RoleAssignRequest::validate(&body, &keys).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RateLimited);
+    assert_eq!(error.retry_after_secs, Some(60));
+    let calls = mock.requests();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].method, "GET");
+    assert_eq!(
+        calls[0].path,
+        format!("/api/v10/guilds/{GUILD}/members/{USER}")
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn role_assignment_reads_policy_then_sends_empty_put() {
     let mut script = policy_script(2, false);
     script.push(ScriptedResponse::status(204));

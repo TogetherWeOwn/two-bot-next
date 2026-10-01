@@ -7,7 +7,8 @@ website join-journey verbs over the shared single-attempt REST transport.
 
 - `RoleAssignRequest::validate` resolves a configured role key, not a caller role
   ID. The target member read preserves legacy `already_held` / read-failure
-  fallback behavior. Before a PUT, authoritative bot-member and guild-role reads
+  fallback behavior except that a 429 immediately returns its retry delay without
+  any further GET or PUT. Before a PUT, authoritative bot-member and guild-role reads
   must succeed; managed roles, `@everyone`, and targets at or above the bot's
   highest position refuse. Equal positions conservatively refuse.
 - `GuildAddMemberRequest` holds only the validated user ID. The OAuth token is a
@@ -46,7 +47,12 @@ Only `InternalClaim::Claimed` may make REST calls. Success is returned only afte
 `finish` commits. The store's typed scalar `affected` is 1 for added/assigned and
 0 for already-member/already-held, with no resource ID. Action plus that scalar
 reconstructs the exact success result on replay. Caller/key/payload are hashes,
-and audit subjects contain only validated IDs.
+and audit subjects contain only validated IDs. For `role.assign`, the claimed
+intent and its audit also pin `resolved_role_id` before any REST call. Unknown
+and terminal audits copy that original ID even if the role key is later remapped.
+A duplicate still cannot execute: reconciliation must inspect the persisted
+role, never infer it from today's map. Migration `0351` leaves older intents NULL
+rather than pretending their historical role is known.
 
 Definitive Discord refusals terminalize as `discord_rejected`. Replay preserves
 the code, HTTP status, and retryability but uses a generic rejection message;
