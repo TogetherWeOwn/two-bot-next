@@ -187,6 +187,59 @@ assert(!nextBody.includes('- historical repair'), 'Later release must not repeat
 assert(!nextBody.includes('- historical caveat'), 'Later release must not repeat bootstrap Notes');
 console.log('PASS 6 bootstrap migration guards: layout, history, section, ambiguous body, notes tail, subsequent release');
 
+// Live 0.3.0 regression: contributors add Unreleased above published 0.2.0,
+// and the pinned native updater keeps that prefix above its generated entry.
+const unreleasedNotes = '### Added\n\n- pending sticky runtime\n\n### Notes\n\n- pending caveat';
+const pendingSnapshot = firstRelease.changelog.replace('# Changelog\n\n', `# Changelog\n\n## Unreleased\n\n${unreleasedNotes}\n\n`);
+const pendingChangelog = new Changelog({version: Version.parse('0.3.0'), changelogEntry: nextBody}).updateContent(pendingSnapshot);
+assert(pendingChangelog.startsWith('# Changelog\n\n## Unreleased\n'), 'Native updater must reproduce the live prefix layout');
+const pendingBody = `:robot: release\n---\n\n${nextBody}\n\n---\nRefs: TOG-9865\n`;
+const pendingRelease = migrateReleaseNotes(pendingChangelog, pendingBody);
+const publishedHistory = firstRelease.changelog.slice('# Changelog\n\n'.length);
+assert(pendingRelease.changelog.endsWith(publishedHistory), 'Published history must remain byte-for-byte intact');
+assert(!/^## Unreleased$/m.test(pendingRelease.changelog));
+for (const note of ['- pending sticky runtime', '- pending caveat']) {
+  assert.equal(pendingRelease.changelog.split(note).length - 1, 1);
+  assert.equal(pendingRelease.body.split(note).length - 1, 1);
+}
+assert(!pendingRelease.body.includes('- historical repair'), 'Latest PR must not repeat published notes');
+assert(!pendingRelease.body.includes('- historical caveat'), 'Latest PR must not repeat the bootstrap Notes tail');
+assert(pendingRelease.body.startsWith(':robot: release\n---\n\n'));
+assert(pendingRelease.body.endsWith('\n\n---\nRefs: TOG-9865\n'));
+assert.deepEqual(migrateReleaseNotes(pendingRelease.changelog, pendingRelease.body), pendingRelease, 'Prefix migration must be idempotent');
+assert.deepEqual(migrateReleaseNotes(pendingRelease.changelog, pendingBody), pendingRelease, 'Retry after changelog push repairs only the body');
+assert.deepEqual(migrateReleaseNotes(pendingChangelog, pendingRelease.body), pendingRelease, 'Already migrated body still repairs the changelog');
+const afterPendingBody = '## 0.4.0\n\n### Added\n\n* future feature';
+const afterPendingChangelog = new Changelog({version: Version.parse('0.4.0'), changelogEntry: afterPendingBody}).updateContent(pendingRelease.changelog);
+assert.deepEqual(migrateReleaseNotes(afterPendingChangelog, afterPendingBody), {changelog: afterPendingChangelog, body: afterPendingBody});
+assert(afterPendingChangelog.endsWith(pendingRelease.changelog.slice('# Changelog\n\n'.length)));
+assert(!afterPendingBody.includes('- pending sticky runtime'), 'Following release must not repeat the consumed Unreleased notes');
+const emptyPending = pendingChangelog.replace(`${unreleasedNotes}\n\n`, '');
+assert.deepEqual(migrateReleaseNotes(emptyPending, pendingBody), {changelog: nextChangelog, body: pendingBody}, 'Empty Unreleased prefix is consumed without inventing notes');
+assert.throws(() => migrateReleaseNotes('# Changelog\n\n## Unreleased\n', pendingBody), /Missing versioned/);
+assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n- pending', '## Unreleased\n\n### Added\n\n- pending'), pendingBody), /Duplicate unreleased/);
+assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n- pending', '### Unknown\n\n- pending'), pendingBody), /Unsupported/);
+assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n- pending', '- pending'), pendingBody), /Unsectioned/);
+assert.throws(() => migrateReleaseNotes(pendingChangelog.replace('### Added\n\n- pending', '## Changelog\n\n### Added\n\n- pending'), pendingBody), /historical release/);
+console.log('PASS post-release Unreleased prefix: native layout, history, body/footer, partial retries, next release, empty prefix, 5 fail-closed guards');
+
+// Native treats a version-shaped line in a pending fence as a release boundary
+// and can insert its generated entry inside the fence. Refuse this admission
+// before returning either output, rather than silently publishing partial notes.
+for (const fence of ['```markdown', '````markdown', '~~~markdown', '   ```markdown']) {
+  const pending = `### Notes\n\n- Pending formatting example:\n\n${fence}\n## 1.2.3\n${fence.trim().startsWith('~') ? '~~~' : '````'}\n\n- pending caveat AFTER example`;
+  const snapshot = `# Changelog\n\n## Unreleased\n\n${pending}\n\n${publishedHistory}`;
+  const generated = new Changelog({version: Version.parse('0.3.0'), changelogEntry: nextBody}).updateContent(snapshot);
+  assert(generated.includes(`${fence}\n${nextBody}`), 'Pinned native updater must reproduce insertion inside the pending fence');
+  assert(generated.includes('- pending caveat AFTER example'));
+  assert(generated.endsWith(publishedHistory));
+  assert.throws(() => migrateReleaseNotes(generated, pendingBody), /Ambiguous fenced Unreleased notes/);
+  assert.throws(() => migrateReleaseNotes(generated, pendingBody), /Ambiguous fenced Unreleased notes/, 'Retry must fail closed too');
+}
+const fencedWithoutVersion = pendingChangelog.replace('- pending caveat', '```text\nexample\n```\n\n- pending caveat');
+assert.throws(() => migrateReleaseNotes(fencedWithoutVersion, pendingBody), /Ambiguous fenced Unreleased notes/, 'The supported prefix contract requires unfenced notes, even without a version-shaped example');
+console.log('PASS fenced pending notes: 4 native version-heading reproductions and retries fail closed; ordinary fenced prefix refused explicitly');
+
 // Overflow link parsing retains the exact native single-line contract.
 const overflowUrl = `https://github.com/fixture/two-bot-next/blob/${NATIVE_NOTES_BRANCH}/release-notes.md`;
 const overflowBody = `${NATIVE_OVERFLOW_SENTENCE} ${overflowUrl}`;
@@ -294,16 +347,16 @@ async function overflowLifecycle() {
 }
 
 async function migrationGrowthOverflowLifecycle() {
-  // The reviewer's P2: a real native normal body (351 conventional commits,
-  // 65,109 chars) that bootstrap migration grows past the 65,536-char PR
-  // limit. The reconciled output must take the overflow representation, and
-  // the next run must resolve it like a native overflow.
+  // The reviewer's P2: a real native normal body (351 conventional commits)
+  // that bootstrap migration grows past the 65,536-char PR limit. Include
+  // the configured template header in the boundary calibration. Reconciled
+  // output must overflow, and the next run must resolve it like native overflow.
   const snapshot = {...bootstrapSnapshot};
   const content = {...snapshot};
   // Calibrated so the real native body lands just under the 65,536-char
   // limit while the migrated body (native notes + bootstrap RSVP notes)
-  // crosses it: 351 commits at this padding yield ~65.1k chars in-suite.
-  const pad = i => `feat: scoped release item ${String(i).padStart(3, '0')} ${'x'.repeat(57)}`;
+  // crosses it: 351 commits at this padding yield ~65.3k chars in-suite.
+  const pad = i => `feat: scoped release item ${String(i).padStart(3, '0')} ${'x'.repeat(56)}`;
   const github = {
     repository: {owner: 'fixture', repo: 'two-bot-next'},
     async getFileJson(file) { return JSON.parse(content[file]); },
@@ -371,12 +424,13 @@ async function migrationGrowthOverflowLifecycle() {
   for (const file of [
     'src/lib.rs', 'crates/core/src/lib.rs', 'crates/discord/src/lib.rs',
     'crates/bot/src/main.rs', 'crates/cutover/src/lib.rs', 'crates/store/src/lib.rs',
-    'wrangler/src/index.ts',
+    'crates/testsupport/src/lib.rs', 'wrangler/src/index.ts',
   ]) {
     assert(scopes.includes(file), `Retain release lifecycle coverage for ${file}`);
   }
   // Two tag modes for root, every member, worker, and three change types.
   const expectedLifecycleCount = 2 * (members.length + 5);
+  assert(expectedLifecycleCount >= 18, 'Retain all existing workspace lifecycle coverage');
   assert.equal(bootstrapCount, expectedLifecycleCount, 'Exercise every bootstrap lifecycle case');
   assert.equal(postReleaseCount, expectedLifecycleCount, 'Exercise the actual next native release for every generated snapshot');
   console.log(`PASS ${bootstrapCount} bootstrap + ${postReleaseCount} generated post-release native lifecycles; 5 migration guards; 8 overflow guards; 4 snapshot guards; 1 overflow lifecycle`);

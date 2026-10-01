@@ -11,8 +11,12 @@ milestones are first-write-wins, activity is monotonic, and a rejoin clears
 are TIMESTAMPTZ, and metadata stays ordered JSON TEXT for legacy row parity.
 
 The stable migration directory is **`crates/store/migrations/`**. Bot versions
-are 0001–0999; feature slices reserve 0100–0339. The foundation uses legacy
-0001/0003/0005/0007/0008 plus a conversion-aware 0009. The migration ledger is
+are 0001–0999 and unique across the workspace. The unpublished foundation uses
+0400–0405, retaining the legacy SQL bytes under unused numbers; 0405 performs
+conversion-aware normalization. Each file is checksum-locked in `migrations.lock`.
+No staging/production deployment of the old proposed numbers is recorded; an
+unexpected existing runtime ledger is a cutover gate, never rewritten here.
+The migration ledger is
 `_two_bot_migrations`; the cutover tools retain their own `_sqlx_migrations`.
 Checksums, removed applied versions and out-of-range versions fail boot. Never
 edit an applied migration: add a new version. `build.rs` tracks directory changes
@@ -34,11 +38,14 @@ retain the existing website role's SELECT-only grants and lack of base-table
 access. No roles, grants or credentials are created by this implementation.
 
 The runtime pool is capped at **5**, with a **15-second statement timeout** and
-10-second acquire timeout. Whole foundation initialization and the S5 migration
-chain each have a **30-second client deadline**. Boot applies both independent
-ledgers and the contract before admitting dispatches; configured startup failure
-exits nonzero. With no token the gateway stays parked; a token requires DB and
-guild configuration. There is no ephemeral persistence fallback. `/health` stays
+10-second acquire timeout. Database initialization retains a **30-second client
+deadline**. Main's DML-only gateway startup is preserved: initialization opens
+the configured pool, checks schema/readiness prerequisites and hydrates durable
+state without applying migrations or contract DDL. Provision both chains and the
+contract through the separately authorized migrator path before boot; this slice
+does not grant runtime credentials DDL permission. Configured initialization failure exits nonzero.
+Incomplete token/DB/guild configuration keeps the gateway parked, as on main.
+There is no ephemeral persistence fallback. `/health` stays
 process-only; `/readyz` checks gateway state and a live DB ping (2-second bound).
 HTTP readiness exposes no connection strings or database error text. Invite REST
 failure/timeout/incomplete counters retain the durable baseline rather than
@@ -115,7 +122,7 @@ probes. Tests continue to run on test containers only.
 - [ ] Preserve the current staging image/config and a provider-managed database
       restore point through the authorized operator path before boot migrations.
       Establish the approved schema/search_path; do not blindly replay against
-      an arbitrary legacy migration ledger. 0009 refuses legacy conversion with
+      an arbitrary legacy migration ledger. 0405 refuses legacy conversion with
       dependent views; arrange a separately authorized dependency-preserving
       transition instead of dropping views, grants or editing checksums.
 - [ ] Record the versioned image and deploy through the normal staging workflow.

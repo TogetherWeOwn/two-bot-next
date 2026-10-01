@@ -169,6 +169,43 @@ impl GatewaySessionStore {
                  WHERE members.last_active_at IS NULL OR members.last_active_at < EXCLUDED.last_active_at",
             ).bind(&self.guild_id).bind(member_id.to_string()).bind(&at).execute(&mut *tx).await?;
         }
+        for snapshot in batch.invite_snapshots {
+            if snapshot.guild_id.to_string() != self.guild_id {
+                return Err(sqlx::Error::InvalidArgument(
+                    "gateway invite snapshot belongs to another guild".into(),
+                ));
+            }
+            let mut live_codes = Vec::with_capacity(snapshot.states.len());
+            for state in snapshot.states {
+                let uses =
+                    i32::try_from(state.uses).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                sqlx::query(
+                    "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $6::timestamptz)
+                     ON CONFLICT (guild_id, code) DO UPDATE SET
+                     uses = EXCLUDED.uses, inviter_id = EXCLUDED.inviter_id,
+                     channel_id = EXCLUDED.channel_id, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(&self.guild_id)
+                .bind(&state.code)
+                .bind(uses)
+                .bind(state.inviter_id.map(|id| id.to_string()))
+                .bind(state.channel_id.map(|id| id.to_string()))
+                .bind(&snapshot.observed_at)
+                .execute(&mut *tx)
+                .await?;
+                live_codes.push(state.code);
+            }
+            if snapshot.replace_all {
+                sqlx::query(
+                    "DELETE FROM invite_snapshots WHERE guild_id = $1 AND NOT (code = ANY($2))",
+                )
+                .bind(&self.guild_id)
+                .bind(&live_codes)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         sqlx::query(
             "INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at)
              VALUES ($1, $2, $3, $4, $5, to_timestamp($6::double precision / 1000))

@@ -5,7 +5,11 @@
 //! can be driven by the twilight adapter (`two-bot-discord`), by unit tests,
 //! or by future transports. Slices S3+ build on these seams.
 
+pub mod action_outcomes;
 pub mod audit;
+pub mod audit_mirror;
+#[cfg(feature = "db")]
+pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
 pub mod automod;
@@ -14,6 +18,7 @@ pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;
+pub mod command_permissions;
 pub mod commands;
 pub mod community;
 pub mod community_snapshots;
@@ -21,9 +26,17 @@ pub mod community_snapshots;
 pub mod community_store;
 pub mod config;
 pub mod containment;
+#[cfg(feature = "db")]
+pub mod database_roles;
+pub mod database_url;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
+pub mod feeds;
+pub mod feeds_connector;
+pub mod feeds_http;
+#[cfg(feature = "db")]
+pub mod feeds_store;
 pub mod funnel;
 pub mod gateway_funnel;
 pub mod gateway_session;
@@ -32,6 +45,8 @@ pub mod health;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
+#[cfg(feature = "db")]
+pub mod internal_action_store;
 pub mod internal_actions;
 pub mod invites;
 pub mod leveling;
@@ -41,6 +56,8 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod message_safety;
+pub mod metrics;
 pub mod moderation;
 pub mod onboarding;
 #[cfg(feature = "db")]
@@ -54,6 +71,9 @@ pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
 pub mod scheduled_events;
+pub mod secret;
+pub use secret::Secret;
+pub mod self_roles;
 pub mod settings;
 pub mod sticky;
 pub mod voice;
@@ -63,6 +83,12 @@ pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
 
+pub use action_outcomes::{
+    backoff_ms, classify_kick_status, clear_send_bit, lockdown_overwrite, pace_wait_ms,
+    parse_retry_after_secs, retry_after_ms, set_send_bit, unlock_overwrite, ActionOutcome,
+    KickOutcome, KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
+    MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
+};
 pub use automod::{
     match_automod, normalize_content, sanction_for, validate_automod_rules, AutomodConfig,
     AutomodExportError, AutomodExportRule, AutomodFilter, AutomodGateError, AutomodMessage,
@@ -226,6 +252,17 @@ pub use rsvp_store::{
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
     ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+};
+pub use self_roles::{
+    emoji_identity, event_order_for_event_id, event_order_from_snowflake,
+    find_disallowed_permission, find_unsafe_channel_grant, parse_self_role_custom_id,
+    parse_self_role_panels, plan_select_delta, plan_self_role_change, reaction_endpoint_emoji,
+    reaction_option_key, self_role_claim_owned, self_role_custom_id, self_role_renew_after_ms,
+    self_role_reply, validate_panel_roles, validate_self_role_dispatch, ChannelOverwrite,
+    ChannelSnapshot, DispatchCheck, DispatchFailure, DispatchRole, PanelMode, ParsedCustomId,
+    PlanRejection, ResolvedRole, RoleOperation, SelfRoleConfigError, SelfRoleGates, SelfRoleOption,
+    SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
+    SELF_ROLE_ALLOWED_MASK, SELF_ROLE_ALLOWED_PERMISSIONS, SELF_ROLE_CLAIM_LEASE_MS,
 };
 pub use settings::{
     assert_storable_key, classify_key, is_declared_env_only, is_env_only_key, is_storable_key,

@@ -15,12 +15,22 @@ pub enum SnapshotWrite {
     DeleteMissing(Snowflake, HashSet<String>),
 }
 
+/// A successful counter read replaces the guild snapshot. InviteCreate only
+/// upserts its one code: it says nothing about other invites still being live.
+pub struct InviteSnapshotWrite {
+    pub guild_id: Snowflake,
+    pub states: Vec<InviteState>,
+    pub observed_at: String,
+    pub replace_all: bool,
+}
+
 #[derive(Default)]
 pub struct FunnelBatch {
     pub events: Vec<FunnelEvent>,
     pub activity: Vec<(Snowflake, Snowflake, String)>,
     pub bots: Vec<(Snowflake, Snowflake)>,
     pub snapshots: Vec<SnapshotWrite>,
+    pub invite_snapshots: Vec<InviteSnapshotWrite>,
 }
 
 #[derive(Clone, Default)]
@@ -59,6 +69,29 @@ impl GatewayFunnelBuffer {
 }
 
 impl FunnelStore for GatewayFunnelBuffer {
+    fn stage_invite_snapshot(&self, snapshot: InviteSnapshotWrite) {
+        let mut pending = self.pending.lock().expect("funnel buffer");
+        // The persistent tracker has just staged this same mutation through
+        // InviteSnapshotStore. Replace only that matching tail with the receipt-
+        // stamped form, not unrelated/directly staged snapshot writes.
+        let counterpart = if snapshot.replace_all {
+            let live: HashSet<String> = snapshot.states.iter().map(|s| s.code.clone()).collect();
+            matches!(pending.snapshots.as_slice(), [..,
+                SnapshotWrite::StoreAll(guild, states),
+                SnapshotWrite::DeleteMissing(prune_guild, codes)]
+                if *guild == snapshot.guild_id && *prune_guild == snapshot.guild_id
+                    && states == &snapshot.states && codes == &live)
+        } else {
+            matches!(pending.snapshots.last(), Some(SnapshotWrite::StoreAll(guild, states))
+                if *guild == snapshot.guild_id && states == &snapshot.states)
+        };
+        if counterpart {
+            let retained = pending.snapshots.len() - if snapshot.replace_all { 2 } else { 1 };
+            pending.snapshots.truncate(retained);
+        }
+        pending.invite_snapshots.push(snapshot);
+    }
+
     fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake) {
         self.pending
             .lock()
@@ -154,6 +187,69 @@ impl InviteSnapshotStore for GatewayFunnelBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_snapshots_replace_only_their_tracker_staging_counterpart() {
+        let buffer = GatewayFunnelBuffer::default();
+        let invite = |code: &str| InviteState {
+            code: code.into(),
+            uses: 1,
+            inviter_id: Some(9),
+            channel_id: Some(8),
+        };
+        // A direct write for a different code is not part of the tracker tail.
+        buffer.store_all(1, &[invite("direct")]);
+        buffer.store_all(1, &[invite("created")]);
+        buffer.stage_invite_snapshot(InviteSnapshotWrite {
+            guild_id: 1,
+            states: vec![invite("created")],
+            observed_at: "2026-09-30T04:00:00.000Z".into(),
+            replace_all: false,
+        });
+        let batch = buffer.take_batch();
+        assert!(matches!(batch.snapshots.as_slice(),
+            [SnapshotWrite::StoreAll(1, states)] if states[0].code == "direct"));
+        assert_eq!(batch.invite_snapshots.len(), 1);
+        assert!(!batch.invite_snapshots[0].replace_all);
+        assert_eq!(batch.invite_snapshots[0].states[0].inviter_id, Some(9));
+
+        buffer.store_all(1, &[invite("created")]);
+        buffer.delete_missing(1, &HashSet::from(["created".into()]));
+        buffer.stage_invite_snapshot(InviteSnapshotWrite {
+            guild_id: 1,
+            states: vec![invite("created")],
+            observed_at: "2026-09-30T04:00:01.000Z".into(),
+            replace_all: true,
+        });
+        let batch = buffer.take_batch();
+        assert!(
+            batch.snapshots.is_empty(),
+            "full reads must not write twice"
+        );
+        assert_eq!(batch.invite_snapshots.len(), 1);
+        assert!(batch.invite_snapshots[0].replace_all);
+        assert_eq!(
+            batch.invite_snapshots[0].observed_at,
+            "2026-09-30T04:00:01.000Z"
+        );
+        assert_eq!(buffer.load(1), vec![invite("created")]);
+
+        // Pipeline::new owns an in-memory tracker, with no legacy counterpart.
+        buffer.store_all(2, &[invite("foreign")]);
+        buffer.stage_invite_snapshot(InviteSnapshotWrite {
+            guild_id: 1,
+            states: Vec::new(),
+            observed_at: "2026-09-30T04:00:02.000Z".into(),
+            replace_all: true,
+        });
+        let batch = buffer.take_batch();
+        assert!(matches!(
+            batch.snapshots.as_slice(),
+            [SnapshotWrite::StoreAll(2, _)]
+        ));
+        assert!(batch.invite_snapshots[0].states.is_empty());
+        assert!(buffer.take_batch().invite_snapshots.is_empty());
+    }
 
     #[test]
     fn hydrated_baseline_and_staged_seed_do_not_prune_unrelated_codes() {

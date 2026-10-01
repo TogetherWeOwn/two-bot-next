@@ -220,11 +220,17 @@ enum ReceivedWork {
 /// Raw packets retain unmapped dispatch sequences too. Poll transport separately
 /// from the serial effects/checkpoint writer. Metadata may advance in reception;
 /// only the worker's successful transaction advances the durable replay cursor.
+///
+/// The shared command runtime dispatches detached work at reception (after the
+/// replay guard), so slash acknowledgements do not queue behind slow funnel I/O.
+/// It never awaits REST/store work on the transport polling path. Shutdown ends
+/// reception cooperatively so the bounded writer remains supervised through drain.
 pub async fn run_shard<I: InviteSource + 'static>(
     shard: Shard,
     pipeline: Arc<GatewayPipeline<I>>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
+    runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
     let generation = Arc::new(AtomicU64::new(0));
@@ -232,10 +238,16 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let receive_generation = Arc::clone(&generation);
     let receive_state = Arc::clone(&state);
     let events = futures_util::stream::unfold(
-        (shard, saved, CHECKPOINT_IO_MAX),
-        move |(mut shard, mut received, mut deadline)| {
+        (
+            shard,
+            saved,
+            CHECKPOINT_IO_MAX,
+            crate::gateway_metrics::Observer::default(),
+        ),
+        move |(mut shard, mut received, mut deadline, mut observer)| {
             let state = Arc::clone(&receive_state);
             let generation = Arc::clone(&receive_generation);
+            let runtime = runtime.clone();
             async move {
                 // Failure is emitted to the ordered worker, never skipped past.
                 let work: Result<Option<ReceivedWork>, sqlx::Error> = async {
@@ -249,6 +261,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             }
                             Err(_) => return Err(sqlx::Error::InvalidArgument("gateway receive failed".into())),
                         };
+                        observer.observe(&message, &shard);
                         let Message::Text(text) = message else {
                             transport_disconnected(&state, &generation).await;
                             let rejected = matches!(message, Message::Close(Some(ref frame)) if matches!(frame.code, 4007 | 4009));
@@ -280,14 +293,20 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| sqlx::Error::InvalidArgument("gateway dispatch parse failed".into()))?;
                         received = Some(checkpoint.clone());
                         let dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at }));
+                        // Detached command ingress must not wait behind the
+                        // serial funnel writer's REST/SQL latency. Main's
+                        // command claims remain independent of this checkpoint.
+                        if let (Some(runtime), Some(dispatch)) = (runtime.as_ref(), dispatch.as_ref()) {
+                            runtime.dispatch(&dispatch.event);
+                        }
                         return Ok(Some(ReceivedWork::Dispatch { dispatch, checkpoint, deadline, generation: generation.load(std::sync::atomic::Ordering::Acquire) }));
                     }
                     Ok(None)
                 }.await;
                 match work {
-                    Ok(Some(work)) => Some((work, (shard, received, deadline))),
+                    Ok(Some(work)) => Some((work, (shard, received, deadline, observer))),
                     Ok(None) => None,
-                    Err(_) => Some((ReceivedWork::Failed, (shard, received, deadline))),
+                    Err(_) => Some((ReceivedWork::Failed, (shard, received, deadline, observer))),
                 }
             }
         },
@@ -317,6 +336,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 deadline,
                 generation: observed_generation,
             } => {
+                let timer = crate::gateway_metrics::DispatchTimer::start();
                 let mut connected = false;
                 if let Some(dispatch) = dispatch {
                     connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed);
@@ -331,12 +351,17 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             .commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
                     ))
                     .unwrap_or_else(|_| panic!("gateway checkpoint failed"));
+                timer.committed();
                 if connected {
                     let mut state = handle.block_on(worker_state.write());
                     if *state != GatewayState::Draining
                         && generation.load(Ordering::Acquire) == observed_generation
                     {
                         *state = GatewayState::Connected;
+                        info!(
+                            sequence = checkpoint.sequence,
+                            "gateway ready; checkpoint committed"
+                        );
                     }
                 }
             }
@@ -359,8 +384,28 @@ pub async fn run_shard<I: InviteSource + 'static>(
 /// A stored [`Session`] (S5) resumes the previous gateway session instead of
 /// a fresh IDENTIFY.
 #[must_use]
-pub fn build_shard(token: String, intents: Intents, session: Option<&GatewaySession>) -> Shard {
-    Shard::with_config(ShardId::ONE, build_shard_config(token, intents, session))
+pub fn build_shard(
+    token: String,
+    intents: Intents,
+    session: Option<&GatewaySession>,
+    gateway_url: Option<&str>,
+) -> Shard {
+    let config = build_shard_config(token, intents, session);
+    let config = match gateway_url {
+        Some(url) => twilight_gateway::ConfigBuilder::from(config)
+            .proxy_url(url.to_owned())
+            .build(),
+        None => config,
+    };
+    Shard::with_config(ShardId::ONE, config)
+}
+
+/// The opt-in binary acceptance seam must never send a token to a remote host.
+/// Accept literal loopback sockets only; no DNS, credentials, paths or queries.
+pub fn is_loopback_gateway(url: &str) -> bool {
+    url.strip_prefix("ws://")
+        .and_then(|socket| socket.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|socket| socket.ip().is_loopback() && socket.port() != 0)
 }
 
 pub fn build_shard_config(
@@ -469,9 +514,30 @@ pub async fn build_persistent_pipeline(
 mod tests {
     use super::*;
 
+    #[test]
+    fn mock_gateway_override_accepts_literal_loopback_only() {
+        for url in ["ws://127.0.0.1:1234", "ws://[::1]:1234"] {
+            assert!(is_loopback_gateway(url));
+        }
+        for url in [
+            "ws://discord.com:443",
+            "wss://127.0.0.1:443",
+            "ws://192.0.2.1:1234",
+            "ws://localhost:1234",
+            "ws://127.0.0.1:0",
+            "ws://127.0.0.1:1234/path",
+            "ws://user@127.0.0.1:1234",
+            "ws://127.0.0.1:1234?host=discord.com",
+            "ws://[::ffff:192.0.2.1]:1234",
+            "",
+        ] {
+            assert!(!is_loopback_gateway(url), "must reject {url}");
+        }
+    }
+
     fn configured() -> Config {
         Config {
-            discord_token: Some("token".to_owned()),
+            discord_token: Some(two_bot_core::Secret::new("token".to_owned())),
             database_url: None,
             listen_addr: "0.0.0.0:8080".to_owned(),
             guild_id: None,
@@ -593,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_shard_has_no_session_to_persist() {
         ensure_crypto_provider();
-        let shard = build_shard("token".to_owned(), Intents::empty(), None);
+        let shard = build_shard("token".to_owned(), Intents::empty(), None, None);
         assert_eq!(session_snapshot(&shard), None);
     }
 

@@ -66,13 +66,13 @@ pub trait InviteSource: Send + Sync {
     fn current(&self, guild_id: Snowflake) -> Option<Vec<InviteState>>;
 }
 
-/// No invites visible (default; joins attribute `unknown`/`vanity`).
+/// Invite fetching unavailable (default; joins attribute `unknown`/`vanity`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoInvites;
 
 impl InviteSource for NoInvites {
     fn current(&self, _guild_id: Snowflake) -> Option<Vec<InviteState>> {
-        Some(Vec::new())
+        None
     }
 }
 
@@ -314,30 +314,39 @@ impl<
     /// handler: per-guild baseline so the first join's growth diff measures
     /// against witnessed counters, not an empty table).
     pub fn prime_invite_snapshot(&self, guild_id: Snowflake) -> Vec<String> {
-        self.snapshot_invites(guild_id)
+        self.snapshot_invites(guild_id, &two_bot_core::now_iso())
     }
 
     /// Snapshot invite counters for a guild; returns the codes that grew.
     /// A failed read (`None`) keeps the old snapshot and returns empty, so
     /// the join still records with source `unknown`.
-    fn snapshot_invites(&self, guild_id: Snowflake) -> Vec<String> {
+    fn snapshot_invites(&self, guild_id: Snowflake, observed_at: &str) -> Vec<String> {
         match self.invite_source.current(guild_id) {
-            Some(current) => self.invites.diff_and_store(guild_id, &current),
+            Some(current) => {
+                let grew = self.invites.diff_and_store(guild_id, &current);
+                self.handlers.store().stage_invite_snapshot(
+                    two_bot_core::gateway_funnel::InviteSnapshotWrite {
+                        guild_id,
+                        states: current,
+                        observed_at: observed_at.to_owned(),
+                        replace_all: true,
+                    },
+                );
+                grew
+            }
             None => Vec::new(),
         }
     }
 
-    /// Seed one fresh code at its current uses (0 live): creates the baseline
-    /// the next join's growth diff measures against, instead of treating the
-    /// whole counter as new.
-    fn seed_invite_code(&self, guild_id: Snowflake, code: &str) {
-        self.invites.seed(
-            guild_id,
-            InviteState {
-                code: code.to_owned(),
-                uses: 0,
-                inviter_id: None,
-                channel_id: None,
+    /// A newly created code is an upsert, not a full REST snapshot.
+    fn seed_invite_code(&self, guild_id: Snowflake, state: InviteState, observed_at: &str) {
+        self.invites.seed(guild_id, state.clone());
+        self.handlers.store().stage_invite_snapshot(
+            two_bot_core::gateway_funnel::InviteSnapshotWrite {
+                guild_id,
+                states: vec![state],
+                observed_at: observed_at.to_owned(),
+                replace_all: false,
             },
         );
     }
@@ -377,7 +386,7 @@ impl<
                 {
                     let gid = guild.id.get();
                     self.set_guild_vanity(gid, guild.vanity_url_code.is_some());
-                    self.snapshot_invites(gid);
+                    self.snapshot_invites(gid, observed_at);
                 }
                 self.cache.update(event);
             }
@@ -386,7 +395,7 @@ impl<
                 let member_id = add.user.id.get();
                 // Snapshot regardless of arrival path so counters stay current
                 // for the next organic join.
-                let grew = self.snapshot_invites(guild_id);
+                let grew = self.snapshot_invites(guild_id, observed_at);
                 // The web path's expected join beats the invite diff: a code
                 // that grew in the same window belongs to some other join.
                 let expected = self
@@ -405,12 +414,12 @@ impl<
                 } else {
                     None
                 };
-                let joined_at = add.member.joined_at.map(legacy_stamp);
-                let source_event_id = format!(
-                    "{guild_id}:{member_id}:{}",
-                    joined_at.as_deref().unwrap_or("observed")
-                );
-                let occurred_at = Some(joined_at.unwrap_or_else(|| observed_at.to_owned()));
+                let joined_at = add
+                    .member
+                    .joined_at
+                    .map_or_else(|| observed_at.to_owned(), legacy_stamp);
+                let source_event_id = format!("{guild_id}:{member_id}:{joined_at}");
+                let occurred_at = Some(joined_at);
                 let is_bot = add.user.bot;
                 self.cache.update(event);
                 self.handlers.on_join(JoinInput {
@@ -541,7 +550,16 @@ impl<
                 }
             }
             Event::InviteCreate(invite) => {
-                self.seed_invite_code(invite.guild_id.get(), &invite.code);
+                self.seed_invite_code(
+                    invite.guild_id.get(),
+                    InviteState {
+                        code: invite.code.clone(),
+                        uses: u64::from(invite.uses),
+                        inviter_id: invite.inviter.as_ref().map(|user| user.id.get()),
+                        channel_id: Some(invite.channel_id.get()),
+                    },
+                    observed_at,
+                );
                 self.cache.update(event);
             }
             // Connection lifecycle and S4/S5 surfaces: no funnel row.

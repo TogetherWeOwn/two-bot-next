@@ -1,0 +1,32 @@
+{
+  "invite_seed": [
+    {"guild_id":"2222","code":"journey","uses":0,"inviter_id":"99","channel_id":"4444","updated_at":"2026-09-30T11:59:50.000Z"},
+    {"guild_id":"2222","code":"side","uses":0,"inviter_id":"99","channel_id":"4444","updated_at":"2026-09-30T11:59:40.000Z"},
+    {"guild_id":"3333","code":"journey","uses":8,"inviter_id":"88","channel_id":"4444","updated_at":"2026-09-30T11:59:30.000Z"}
+  ],
+  "events": [
+    {"guild_id":"3333","member_id":"77","event_type":"member_join","occurred_at":"2026-09-30T11:59:30.000Z","source":"invite:journey","metadata":{"inviterId":"88"},"idempotency_key":"3333:77:member_join:2026-09-30T11:59:30.000Z"},
+    {"guild_id":"2222","member_id":"77","event_type":"member_join","occurred_at":"2026-09-30T12:00:00.000Z","source":"invite:journey","metadata":{"inviterId":"99"},"idempotency_key":"2222:77:member_join:2026-09-30T12:00:00.000Z"},
+    {"guild_id":"2222","member_id":"77","event_type":"gate_cleared","occurred_at":"2026-09-30T12:01:00.000Z","source":"gateway","metadata":null,"idempotency_key":"2222:77:gate_cleared"},
+    {"guild_id":"2222","member_id":"77","event_type":"first_message","occurred_at":"2026-09-30T12:02:00.000Z","source":"channel:4444","metadata":null,"idempotency_key":"2222:77:first_message"},
+    {"guild_id":"2222","member_id":"77","event_type":"second_message","occurred_at":"2026-09-30T12:03:00.000Z","source":"channel:4444","metadata":null,"idempotency_key":"2222:77:second_message"},
+    {"guild_id":"2222","member_id":"77","event_type":"third_message","occurred_at":"2026-09-30T12:04:00.000Z","source":"channel:4444","metadata":null,"idempotency_key":"2222:77:third_message"},
+    {"guild_id":"2222","member_id":"77","event_type":"voice_session_start","occurred_at":"2026-09-30T12:10:00.000Z","source":"channel:5555","metadata":null,"idempotency_key":"2222:77:voice_session_start:2026-09-30T12:10:00.000Z:channel:5555"},
+    {"guild_id":"2222","member_id":"77","event_type":"first_voice_session","occurred_at":"2026-09-30T12:10:00.000Z","source":"channel:5555","metadata":null,"idempotency_key":"2222:77:first_voice_session"},
+    {"guild_id":"2222","member_id":"77","event_type":"voice_session_end","occurred_at":"2026-09-30T12:20:00.000Z","source":"channel:5555","metadata":{"startKnown":true,"startedAt":"2026-09-30T12:10:00.000Z","durationSeconds":600},"idempotency_key":"2222:77:voice_session_end:2026-09-30T12:20:00.000Z:channel:5555"},
+    {"guild_id":"2222","member_id":"77","event_type":"voice_session_start","occurred_at":"2026-09-30T12:20:00.000Z","source":"channel:6666","metadata":null,"idempotency_key":"2222:77:voice_session_start:2026-09-30T12:20:00.000Z:channel:6666"},
+    {"guild_id":"2222","member_id":"77","event_type":"voice_session_end","occurred_at":"2026-09-30T12:25:30.000Z","source":"channel:6666","metadata":{"startKnown":true,"startedAt":"2026-09-30T12:20:00.000Z","durationSeconds":330},"idempotency_key":"2222:77:voice_session_end:2026-09-30T12:25:30.000Z:channel:6666"},
+    {"guild_id":"2222","member_id":"77","event_type":"voice_session_start","occurred_at":"2026-09-30T12:30:00.000Z","source":"channel:5555","metadata":null,"idempotency_key":"2222:77:voice_session_start:2026-09-30T12:30:00.000Z:channel:5555"},
+    {"guild_id":"2222","member_id":"77","event_type":"voice_session_end","occurred_at":"2026-09-30T12:41:00.000Z","source":"channel:5555","metadata":{"startKnown":false,"startedAt":null,"durationSeconds":null},"idempotency_key":"2222:77:voice_session_end:2026-09-30T12:41:00.000Z:channel:5555"},
+    {"guild_id":"2222","member_id":"77","event_type":"member_leave","occurred_at":"2026-09-30T13:00:00.000Z","source":"gateway","metadata":null,"idempotency_key":"2222:77:member_leave:2026-09-30T13:00:00.000Z"}
+  ],
+  "members": [
+    {"guild_id":"2222","member_id":"77","joined_at":"2026-09-30T12:00:00.000Z","join_source":"invite:journey","first_message_at":"2026-09-30T12:02:00.000Z","third_message_at":"2026-09-30T12:04:00.000Z","first_voice_at":"2026-09-30T12:10:00.000Z","last_active_at":"2026-09-30T12:41:00.000Z","left_at":"2026-09-30T13:00:00.000Z","inactive_flagged_at":null,"gate_cleared_at":"2026-09-30T12:01:00.000Z","is_bot":false},
+    {"guild_id":"3333","member_id":"77","joined_at":"2026-09-30T11:59:30.000Z","join_source":"invite:journey","first_message_at":null,"third_message_at":null,"first_voice_at":null,"last_active_at":null,"left_at":null,"inactive_flagged_at":null,"gate_cleared_at":null,"is_bot":false}
+  ],
+  "invite_snapshots": [
+    {"guild_id":"2222","code":"journey","uses":1,"inviter_id":"99","channel_id":"4444","updated_at":"2026-09-30T12:00:05.000Z"},
+    {"guild_id":"2222","code":"side","uses":0,"inviter_id":"99","channel_id":"4444","updated_at":"2026-09-30T12:00:05.000Z"},
+    {"guild_id":"3333","code":"journey","uses":8,"inviter_id":"88","channel_id":"4444","updated_at":"2026-09-30T11:59:30.000Z"}
+  ]
+}

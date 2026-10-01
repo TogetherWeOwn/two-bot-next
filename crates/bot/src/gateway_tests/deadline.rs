@@ -64,13 +64,17 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
     .await
     .expect("readiness unavailable during blocked SQL");
 
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let result = tokio::time::timeout(
         Duration::from_millis(700),
         crate::supervise_gateway(
             runner,
-            std::future::pending(),
+            async move {
+                crate::server::shutdown_requested(receiver).await;
+                Ok(())
+            },
             state.clone(),
-            tokio::sync::watch::channel(false).0,
+            shutdown,
         ),
     )
     .await

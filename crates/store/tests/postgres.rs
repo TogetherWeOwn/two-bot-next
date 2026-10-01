@@ -92,7 +92,7 @@ async fn migrations_contract_and_checksum_guard() {
             .fetch_all(&f.pool)
             .await
             .unwrap();
-    for v in [1, 3, 5, 7, 8, 9] {
+    for v in 400..=405 {
         assert!(versions.contains(&v));
     }
     assert!(versions.iter().all(|v| (1..=999).contains(v)));
@@ -127,13 +127,15 @@ async fn migrations_contract_and_checksum_guard() {
     .unwrap();
     assert_eq!(ranks, 5);
     // Corrupt only this test's ledger: a deployed checksum mismatch must fail.
-    sqlx::query("UPDATE _two_bot_migrations SET checksum = decode('00', 'hex') WHERE version = 1")
-        .execute(&f.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE _two_bot_migrations SET checksum = decode('00', 'hex') WHERE version = 400",
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
     assert!(
         matches!(migrate(&f.pool).await, Err(sqlx::Error::Migrate(e))
-        if matches!(*e, sqlx::migrate::MigrateError::VersionMismatch(1)))
+        if matches!(*e, sqlx::migrate::MigrateError::VersionMismatch(400)))
     );
     f.finish().await;
 }
@@ -200,7 +202,7 @@ async fn legacy_normalization_rejects_dependencies_without_losing_views_or_grant
     let mut legacy = sqlx::migrate::Migrator::with_migrations(
         two_bot_store::MIGRATOR
             .iter()
-            .filter(|m| m.version < 9)
+            .filter(|m| m.version < 405)
             .cloned()
             .collect(),
     );
@@ -245,7 +247,7 @@ async fn legacy_normalization_rejects_dependencies_without_losing_views_or_grant
     ).fetch_one(&f.pool).await.unwrap();
     assert_eq!(columns, ("text".to_owned(), "smallint".to_owned()));
     let applied: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM _two_bot_migrations WHERE version = 9 AND success)",
+        "SELECT EXISTS (SELECT 1 FROM _two_bot_migrations WHERE version = 405 AND success)",
     )
     .fetch_one(&f.pool)
     .await

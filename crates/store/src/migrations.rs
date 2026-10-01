@@ -10,13 +10,12 @@
 //! safe in either order; checksums are per-chain, so a same-version number
 //! in the other chain can never trip a mismatch here.
 //!
-//! Directory contract (announced on TOG-9811 for the parallel slice cards):
-//! `crates/store/migrations/` is stable. Feature slices add their own
-//! migrations in reserved number blocks **0100–0339** inside this directory
-//! (guild_settings hot reload lives at TOG-10096); the runner picks up every
-//! `NNNN_*.sql` file in the directory, so no code change is needed when a
-//! slice lands a new block. sqlx orders by version; the bot foundation set
-//! is 0001–0009 and feature blocks sort after it. sqlx fails loudly on a
+//! `crates/store/migrations/` is stable. The unpublished S6 foundation uses
+//! **0400–0405**, preserving the legacy SQL bytes while avoiding main's
+//! workspace-wide number allocations. Feature migrations must choose unused
+//! bot numbers and add reviewed checksum entries in `migrations.lock`.
+//! The runner picks up every `NNNN_*.sql` file in this directory; sqlx orders
+//! by version. sqlx fails loudly on a
 //! checksum mismatch (`VersionMismatch`) and on a previously-applied version
 //! that vanished from the directory (`VersionMissing`) — both are deploy
 //! failures, never silent drift. Never edit an applied migration; add a new
@@ -51,7 +50,7 @@ pub async fn migrate(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
 }
 
 /// Versions embedded in this build, ascending. Tests assert the foundation
-/// set is complete (0001/0003/0005/0007/0008/0009) without pinning the
+/// set is complete (0400–0405) without pinning the
 /// feature-block tail, which grows as slice cards land.
 #[must_use]
 pub fn embedded_versions() -> Vec<i64> {

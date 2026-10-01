@@ -34,6 +34,7 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
         snapshots: vec![SnapshotWrite::StoreAll(2222, vec![invite(2)])],
         activity: vec![(2222, 88, "2026-09-30T04:00:00.000Z".into())],
         events: vec![event(EventType::MemberLeave, "not-a-timestamp")],
+        ..Default::default()
     };
     assert!(db
         .store
@@ -60,6 +61,7 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
                 snapshots: vec![SnapshotWrite::StoreAll(2222, vec![invite(2)])],
                 activity: vec![(2222, 88, "2026-09-30T04:00:00.000Z".into())],
                 events: vec![event(EventType::MemberLeave, "2026-09-30T04:00:01.000Z")],
+                ..Default::default()
             },
         )
         .await
