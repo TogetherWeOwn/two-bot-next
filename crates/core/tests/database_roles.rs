@@ -93,6 +93,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
         include_str!("../../cutover/migrations/0320_gateway_sessions.sql"),
         include_str!("../../cutover/migrations/0330_guild_settings.sql"),
+        include_str!("../../cutover/migrations/0331_guild_settings_versions.sql"),
+        include_str!("../../cutover/migrations/0332_guild_settings_allocator.sql"),
+        include_str!("../../cutover/migrations/0333_guild_settings_revision.sql"),
+        include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
         include_str!("../../cutover/migrations/0340_operational_audit.sql"),
         include_str!("../../cutover/migrations/0350_internal_actions.sql"),
     ] {
@@ -120,13 +124,67 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "clean plan drifted",
     )?;
 
+    // Effective ACLs include PUBLIC/inherited access. Schema denial alone is
+    // not proof of no reader sequence or function grant. The CAS sequence is
+    // deliberately unowned by a column, so it needs an explicit matrix entry.
+    require(
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT
+                has_sequence_privilege($1::text, 'public.guild_settings_cas_seq', 'USAGE')
+                AND has_sequence_privilege($1::text, 'public.guild_settings_cas_seq', 'SELECT')
+                AND NOT has_sequence_privilege($1::text, 'public.guild_settings_cas_seq', 'UPDATE')
+                AND NOT has_sequence_privilege($2::text, 'public.guild_settings_cas_seq', 'USAGE')
+                AND NOT has_sequence_privilege($2::text, 'public.guild_settings_cas_seq', 'SELECT')
+                AND NOT has_sequence_privilege($2::text, 'public.guild_settings_cas_seq', 'UPDATE')
+                AND NOT has_function_privilege($1::text, 'public.guild_settings_assign_version()', 'EXECUTE')
+                AND NOT has_function_privilege($2::text, 'public.guild_settings_assign_version()', 'EXECUTE')
+                AND NOT (SELECT prosecdef FROM pg_proc
+                    WHERE oid = 'public.guild_settings_assign_version()'::regprocedure)
+                AND NOT EXISTS (SELECT FROM pg_depend
+                    WHERE classid = 'pg_class'::regclass
+                      AND refclassid = 'pg_class'::regclass
+                      AND objid = 'public.guild_settings_cas_seq'::regclass
+                      AND deptype IN ('a', 'i'))"#,
+        )
+        .bind(&roles[1])
+        .bind(&roles[2])
+        .fetch_one(pool)
+        .await?,
+        "CAS sequence or trigger function privileges differ",
+    )?;
     as_role(
         pool,
         &roles[0],
         "CREATE TABLE public.migrator_probe (id int)",
     )
     .await?;
-    as_role(pool, &roles[1], "SELECT * FROM public.members; INSERT INTO public.guild_settings (guild_id, key, value, version, updated_by) VALUES ('test', 'test', '1', nextval('public.guild_settings_version_seq'), 'test'); UPDATE public.guild_settings SET value = '2' WHERE guild_id = 'test'; DELETE FROM public.guild_settings WHERE guild_id = 'test'").await?;
+    // Invoker trigger DML must work without runtime direct function EXECUTE.
+    as_role(
+        pool,
+        &roles[1],
+        r#"SELECT * FROM public.members;
+        SELECT nextval('public.guild_settings_cas_seq');
+        SELECT last_value FROM public.guild_settings_cas_seq;
+        DO $cas$
+        DECLARE
+            inserted bigint;
+            updated bigint;
+        BEGIN
+            INSERT INTO public.guild_settings (guild_id, key, value, updated_by, cas_version)
+                VALUES ('test', 'test', '1', 'test', 42) RETURNING cas_version INTO inserted;
+            IF inserted IS NULL OR inserted >= 0 THEN
+                RAISE EXCEPTION 'insert did not allocate a CAS token';
+            END IF;
+            UPDATE public.guild_settings SET value = '2', cas_version = inserted
+                WHERE guild_id = 'test' AND key = 'test' RETURNING cas_version INTO updated;
+            IF updated IS NULL OR updated >= inserted THEN
+                RAISE EXCEPTION 'update did not advance the CAS token';
+            END IF;
+            DELETE FROM public.guild_settings WHERE guild_id = 'test' AND key = 'test';
+        END;
+        $cas$;"#,
+    )
+    .await?;
     // Migration 0200 relations are runtime-operated: event claims and panel
     // lane leases must work under the least-privilege login.
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_audit; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); UPDATE public.self_role_audit SET reason = 'probe' WHERE event_id = 'roles-probe'; DELETE FROM public.self_role_audit WHERE event_id = 'roles-probe'").await?;
@@ -151,6 +209,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "ALTER TABLE public.members ADD COLUMN forbidden int",
         "TRUNCATE public.members",
         "SELECT * FROM public._sqlx_migrations",
+        "SELECT setval('public.guild_settings_cas_seq', -1)",
+        "SELECT public.guild_settings_assign_version()",
     ] {
         denied(pool, &roles[1], sql).await?;
     }
@@ -161,6 +221,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "SELECT * FROM public.self_role_panel_claims",
         "CREATE TABLE web_v1.reader_probe (id int)",
         "SELECT nextval('public.guild_settings_version_seq')",
+        "SELECT nextval('public.guild_settings_cas_seq')",
+        "SELECT last_value FROM public.guild_settings_cas_seq",
+        "SELECT setval('public.guild_settings_cas_seq', -1)",
+        "SELECT public.guild_settings_assign_version()",
     ] {
         denied(pool, &roles[2], sql).await?;
     }
@@ -229,6 +293,14 @@ async fn verifier_gap_regressions(pool: &PgPool, roles: &[String]) -> Result<(),
         (format!("REVOKE SELECT ON public.members FROM {migrator}"), "missing table privilege:"),
         (format!("REVOKE EXECUTE ON FUNCTION web_v1._iso(timestamptz) FROM {migrator}"), "missing function EXECUTE:"),
         (format!("ALTER SEQUENCE public.events_id_seq OWNED BY NONE; REVOKE USAGE, SELECT ON SEQUENCE public.events_id_seq FROM {runtime}"), "sequence privilege differs:"),
+        (format!("REVOKE USAGE ON SEQUENCE public.guild_settings_cas_seq FROM {runtime}"), "sequence privilege differs:"),
+        (format!("REVOKE SELECT ON SEQUENCE public.guild_settings_cas_seq FROM {runtime}"), "sequence privilege differs:"),
+        (format!("GRANT UPDATE ON SEQUENCE public.guild_settings_cas_seq TO {runtime}"), "sequence privilege differs:"),
+        (format!("GRANT USAGE, SELECT, UPDATE ON SEQUENCE public.guild_settings_cas_seq TO {reader}"), "sequence privilege differs:"),
+        ("GRANT USAGE, SELECT ON SEQUENCE public.guild_settings_cas_seq TO PUBLIC".to_owned(), "sequence privilege differs:"),
+        (format!("GRANT EXECUTE ON FUNCTION public.guild_settings_assign_version() TO {runtime}"), "function privilege differs:"),
+        ("GRANT EXECUTE ON FUNCTION public.guild_settings_assign_version() TO PUBLIC".to_owned(), "function privilege differs:"),
+        ("ALTER FUNCTION public.guild_settings_assign_version() SECURITY DEFINER".to_owned(), "function owner/security differs:"),
     ] {
         let detected = transactional_drift(pool, roles, &change).await?;
         require(detected.iter().any(|f| f.starts_with(expected)), &format!("missed drift: {change}"))?;
