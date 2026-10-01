@@ -120,6 +120,15 @@ an idle container awake. Do not disable the keepalive or increase capacity
 without measured evidence. `lite`, `max_instances=1` is the declared placement,
 not evidence of the measured RSS budget. See [staging soak](staging-soak.md).
 
+### Sustained-unready alerts
+
+The keepalive records consecutive failed readiness probes and emits one alert
+and one recovery per incident. See [Container readiness monitoring](container-readiness.md)
+for threshold tuning, the optional Worker-only webhook secret, delivery limits
+and response guidance. `container_keepalive_arm_failed` indicates monitoring
+setup failed; health/readiness responses still reflect the Container, not proof
+that monitoring is armed.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.

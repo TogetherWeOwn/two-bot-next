@@ -4,7 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -121,6 +121,18 @@ function checkWranglerCommands(markdown: string, aliases: Record<string, string>
   }
   return checked;
 }
+
+test("operations runbook links readiness guidance without case-colliding filenames", () => {
+  const names = readdirSync(new URL("docs/", root));
+  assert.equal(new Set(names.map((name) => name.toLowerCase())).size, names.length,
+    "docs must be safe to check out on case-insensitive filesystems");
+  assert.ok(runbook.includes("[Container readiness monitoring](container-readiness.md)"));
+  const readiness = read("docs/container-readiness.md");
+  assert.ok(readiness.includes("[operations runbook](runbook.md#sustained-unready-alerts)"));
+  for (const event of ["container_unready_alert", "container_unready_recovery", "container_keepalive_arm_failed"]) {
+    assert.ok(readiness.includes(event), `missing readiness guidance: ${event}`);
+  }
+});
 
 // Intentional typo fixtures prove this test does not silently skip new commands.
 test("binary runbook examples grep the selected dispatcher/parser, not help prose", () => {

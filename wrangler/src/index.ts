@@ -48,6 +48,10 @@ export interface Env {
   GUILD_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
+  /** Consecutive failed probes; default covers ~10 minutes of keepalive ticks. */
+  UNREADY_ALERT_FAILURES?: string;
+  /** Optional Worker secret; never forwarded to the container or logged. */
+  OPS_ALERT_WEBHOOK_URL?: string;
   /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -81,8 +85,20 @@ interface KeepalivePayload {
   epoch?: number;
 }
 
+interface ReadinessState {
+  failures: number;
+  firstFailureAt: number | null;
+  alerted: boolean;
+  lastProbeAt: number;
+  lastStatus: number | null;
+}
+
+type ReadinessEvent = "container_unready_alert" | "container_unready_recovery";
+
 const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
+const DEFAULT_UNREADY_SECONDS = 600;
+const READINESS_KEY = "two-bot:readiness";
 
 function containerPort(raw: string | undefined): number {
   if (raw === undefined) return 8080;
@@ -228,16 +244,29 @@ export class TwoBotContainer extends Container<Env> {
     return this.owned(() => super.containerFetch(...args));
   }
 
-  /** SDK schedule() inserts a new row each call; use a persisted schedule ID. */
+  private keepaliveArming: Promise<void> | undefined;
+  private keepaliveRunning = false;
+
+  /** One persisted chain, with ownership checked outside fail-open monitoring. */
   private async armKeepalive(): Promise<void> {
     const owner = await this.ownership.require(this.id());
-    const key = TwoBotContainer.KEEPALIVE_KEY;
-    const pending = await this.ctx.storage.get<{ id: string; epoch: number }>(key);
-    if (pending?.epoch === owner.epoch && await this.getSchedule(pending.id)) return;
-    const task = await this.schedule(this.keepaliveSeconds(), "keepalive", {
-      startedAt: Date.now(), deploymentId: this.id(), epoch: owner.epoch,
-    } satisfies KeepalivePayload);
-    await this.ctx.storage.put(key, { id: task.taskId, epoch: owner.epoch });
+    if (this.keepaliveRunning) return;
+    if (this.keepaliveArming) return this.keepaliveArming;
+    // SDK 0.3.7 inserts a new row on every schedule() call. An old epoch's
+    // pending callback is never authority to keep this deployment alive.
+    this.keepaliveArming = (async () => {
+      const [pending] = await this.listSchedules<KeepalivePayload>("keepalive");
+      if (pending?.payload?.deploymentId === this.id() && pending.payload.epoch === owner.epoch) return;
+      this.deleteSchedules("keepalive");
+      await this.schedule(this.keepaliveSeconds(), "keepalive", {
+        startedAt: Date.now(), deploymentId: this.id(), epoch: owner.epoch,
+      } satisfies KeepalivePayload);
+    })().catch(() => {
+      // Scheduling failures are monitoring failures, not permission failures.
+      // Never suppress the ownership read above or expose provider error text.
+      console.warn(JSON.stringify({ event: "container_keepalive_arm_failed" }));
+    }).finally(() => { this.keepaliveArming = undefined; });
+    return this.keepaliveArming;
   }
 
   private keepaliveSeconds(): number {
@@ -245,23 +274,133 @@ export class TwoBotContainer extends Container<Env> {
     return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_KEEPALIVE_SECONDS;
   }
 
-  /** Old/legacy epoch payloads drain without renewing, starting or rearming. */
-  public async keepalive(payload: KeepalivePayload): Promise<void> {
+  /** Stale epochs drain without renewing, probing, notifying or rearming. */
+  public async keepalive(payload: KeepalivePayload, schedule?: { taskId: string }): Promise<void> {
+    // The SDK can pass undefined for rows deleted from its due-task snapshot.
+    if (!schedule || this.keepaliveRunning) return;
+    this.keepaliveRunning = true;
     try {
       await this.owned(async () => {
         const owner = await this.ownership.require(this.id());
         if (payload?.deploymentId !== this.id() || payload.epoch !== owner.epoch) {
           throw new OwnershipRefused("stale_keepalive");
         }
-        await this.ctx.storage.delete(TwoBotContainer.KEEPALIVE_KEY);
+        await this.keepaliveArming;
         this.renewActivityTimeout();
+        let admitted = true;
         try {
-          const res = await this.containerFetch("http://c/readyz", { signal: AbortSignal.timeout(6000) });
-          if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${res.status}`);
-        } catch { console.warn("two-bot keepalive probe failed"); }
-        await this.armKeepalive();
+          let status: number | null = null;
+          try {
+            const res = await this.containerFetch("http://c/readyz", { signal: AbortSignal.timeout(6000) });
+            status = res.status;
+            if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${status}`);
+            // Drain rather than cancel the SDK 0.3.7 proxy response pipe.
+            await res.arrayBuffer();
+          } catch (error) {
+            if (error instanceof OwnershipRefused) {
+              admitted = false;
+              throw error;
+            }
+            status = null;
+            console.warn("two-bot keepalive probe failed");
+          }
+          await this.recordReadiness(status);
+        } finally {
+          // Collapse duplicate chains, preserving unrelated SDK schedules.
+          // No takeover can interleave with this owned callback's I/O.
+          this.deleteSchedules("keepalive");
+          if (admitted) {
+            await this.ownership.require(this.id());
+            await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
+          }
+        }
       });
-    } catch (error) { refused(error); }
+    } catch (error) {
+      if (error instanceof OwnershipRefused) refused(error);
+      else throw error;
+    } finally {
+      this.keepaliveRunning = false;
+    }
+  }
+
+  private unreadyAlertFailures(): number {
+    const raw = this.env.UNREADY_ALERT_FAILURES;
+    const count = Number(raw);
+    if (raw && /^\d+$/.test(raw) && Number.isSafeInteger(count) && count > 0) {
+      return count;
+    }
+    return Math.max(1, Math.ceil(DEFAULT_UNREADY_SECONDS / this.keepaliveSeconds()));
+  }
+
+  private async recordReadiness(status: number | null): Promise<void> {
+    const now = Date.now();
+    const ready = status !== null && status >= 200 && status < 300;
+    const threshold = this.unreadyAlertFailures();
+    // Container extends DurableObject; KV survives restarts and DO eviction.
+    // No network await between the read and write: DO storage input gates
+    // protect this transition from interleaving read/modify/write calls.
+    // https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#access-storage
+    const previous = await this.ctx.storage.get<ReadinessState>(READINESS_KEY);
+    const failures = ready ? 0 : (previous?.failures ?? 0) + 1;
+    let event: ReadinessEvent | undefined;
+    if (ready && previous?.alerted) {
+      event = "container_unready_recovery";
+    } else if (!ready && failures >= threshold && !previous?.alerted) {
+      event = "container_unready_alert";
+    }
+    const state: ReadinessState = {
+      failures,
+      firstFailureAt: ready ? null : previous?.firstFailureAt ?? now,
+      alerted: !ready && (previous?.alerted === true || event === "container_unready_alert"),
+      lastProbeAt: now,
+      lastStatus: status,
+    };
+    // Persist the transition BEFORE notifying: at most one attempt per event,
+    // even if the webhook times out after accepting it or an alarm is retried.
+    await this.ctx.storage.put(READINESS_KEY, state);
+    if (!event) return;
+
+    console.warn(JSON.stringify({
+      event,
+      service: "two-bot-next",
+      consecutive_failures: ready ? previous!.failures : failures,
+      threshold,
+      status,
+      first_failure_at: ready ? previous!.firstFailureAt : state.firstFailureAt,
+      observed_at: now,
+    }));
+    await this.postReadinessWebhook(event);
+  }
+
+  private async postReadinessWebhook(event: ReadinessEvent): Promise<void> {
+    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
+    if (!binding) return;
+    try {
+      const url = new URL(binding);
+      if (url.protocol !== "https:" || url.username || url.password) {
+        throw new Error("invalid webhook binding");
+      }
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(6000),
+        body: JSON.stringify({
+          content: event === "container_unready_alert"
+            ? "two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs."
+            : "two-bot-next: Container /readyz is ready again. The unready incident has recovered.",
+          // https://docs.discord.com/developers/resources/webhook#execute-webhook
+          allowed_mentions: { parse: [], replied_user: false },
+        }),
+      });
+      await response.body?.cancel();
+      if (!response.ok) {
+        console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: response.status }));
+      }
+    } catch {
+      // Fetch errors can contain the secret URL. Never log the error or body.
+      console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: null }));
+    }
   }
 
   override async onStart(): Promise<void> {
