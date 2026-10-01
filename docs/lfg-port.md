@@ -14,7 +14,7 @@ Role keys, duplicate detection, JavaScript numeric slot forms, and UTF-16 title/
 
 ## Shared interaction integration (TOG-10260)
 
-`two_bot_discord::interactions::InteractionRuntime` routes `/lfg`, `/lfg-close`, and `two:lfg:` string selects through the existing `InteractionRouter`. Configured-guild/default-off announcement fencing and builder/runtime `ManageEvents` checks remain in the shared registry/router. Signup and leave require no elevated permission. A deferred ephemeral acknowledgement precedes SQL, advisory locks and paced REST; the shared `ActionExecutor` finishes the reply.
+The bot's `CommandRuntime` composes LFG, sticky and feed registrations in one `InteractionRouter`; it routes once and delegates `/lfg`, `/lfg-close`, and `two:lfg:` string selects to `two_bot_discord::interactions::InteractionRuntime::handle_routed`. Configured-guild/default-off announcement fencing and builder/runtime `ManageEvents` checks remain in the shared registry/router. Signup and leave require no elevated permission. A deferred ephemeral acknowledgement precedes SQL, advisory locks and paced REST; the shared `ActionExecutor` finishes the reply.
 
 `LfgInteractions` persists the post and roles before sending through that executor. A per-post runtime advisory lock serializes mutations and remote refresh across instances, separately from the store's capacity/closure lock. Acceptance saves only `message_id`, without replacing roles, signups or closure. Signup, leave and close refresh mention-suppressed content/components; closed posts remove the select. ID-only leave is called only after a guild-fenced lookup.
 

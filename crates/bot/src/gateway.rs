@@ -164,6 +164,10 @@ async fn checkpoint_io<T>(
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
 /// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
+///
+/// `interactions` admits bounded tasks for the shared command runtime. This loop
+/// never awaits feature REST/SQL work: Twilight drives heartbeats only while
+/// polled. Capacity or task-panic failures stop before advancing the checkpoint.
 pub async fn run_shard(
     mut shard: Shard,
     pipeline: Arc<GatewayPipeline>,
@@ -183,6 +187,7 @@ async fn run_loop(
     store: &GatewaySessionStore,
     mut interactions: Option<&mut crate::interactions::InteractionDispatch>,
 ) -> Result<(), sqlx::Error> {
+    let mut observer = crate::gateway_metrics::Observer::default();
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
@@ -205,6 +210,7 @@ async fn run_loop(
                 ))
             }
         };
+        observer.observe(&message, shard);
         let Message::Text(text) = message else {
             *state.write().await = GatewayState::Armed;
             // Twilight 0.17.1 retains its session on gateway-initiated closes.
@@ -282,6 +288,7 @@ async fn run_loop(
         {
             continue;
         }
+        let timer = crate::gateway_metrics::DispatchTimer::start();
         let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| {
             sqlx::Error::InvalidArgument(
                 "gateway dispatch parse failed; checkpoint unchanged".into(),
@@ -292,6 +299,7 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
+            // Bounded detached work: REST/SQL must never stall shard polling.
             if let Some(runtime) = interactions.as_deref_mut() {
                 runtime.handle(&event)?;
             }
@@ -302,9 +310,11 @@ async fn run_loop(
             store.commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
         )
         .await?;
+        timer.committed();
         committed = Some(checkpoint);
         if connected {
             *state.write().await = GatewayState::Connected;
+            info!(sequence, "gateway ready; checkpoint committed");
         }
     }
     warn!("gateway shard stream ended; supervisor reports down until restart");
@@ -317,8 +327,28 @@ async fn run_loop(
 /// A stored [`Session`] (S5) resumes the previous gateway session instead of
 /// a fresh IDENTIFY.
 #[must_use]
-pub fn build_shard(token: String, intents: Intents, session: Option<&GatewaySession>) -> Shard {
-    Shard::with_config(ShardId::ONE, build_shard_config(token, intents, session))
+pub fn build_shard(
+    token: String,
+    intents: Intents,
+    session: Option<&GatewaySession>,
+    gateway_url: Option<&str>,
+) -> Shard {
+    let config = build_shard_config(token, intents, session);
+    let config = match gateway_url {
+        Some(url) => twilight_gateway::ConfigBuilder::from(config)
+            .proxy_url(url.to_owned())
+            .build(),
+        None => config,
+    };
+    Shard::with_config(ShardId::ONE, config)
+}
+
+/// The opt-in binary acceptance seam must never send a token to a remote host.
+/// Accept literal loopback sockets only; no DNS, credentials, paths or queries.
+pub fn is_loopback_gateway(url: &str) -> bool {
+    url.strip_prefix("ws://")
+        .and_then(|socket| socket.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|socket| socket.ip().is_loopback() && socket.port() != 0)
 }
 
 pub fn build_shard_config(
@@ -353,9 +383,30 @@ pub fn build_pipeline(milestones: Vec<FunnelEvent>) -> GatewayPipeline {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mock_gateway_override_accepts_literal_loopback_only() {
+        for url in ["ws://127.0.0.1:1234", "ws://[::1]:1234"] {
+            assert!(is_loopback_gateway(url));
+        }
+        for url in [
+            "ws://discord.com:443",
+            "wss://127.0.0.1:443",
+            "ws://192.0.2.1:1234",
+            "ws://localhost:1234",
+            "ws://127.0.0.1:0",
+            "ws://127.0.0.1:1234/path",
+            "ws://user@127.0.0.1:1234",
+            "ws://127.0.0.1:1234?host=discord.com",
+            "ws://[::ffff:192.0.2.1]:1234",
+            "",
+        ] {
+            assert!(!is_loopback_gateway(url), "must reject {url}");
+        }
+    }
+
     fn configured() -> Config {
         Config {
-            discord_token: Some("token".to_owned()),
+            discord_token: Some(two_bot_core::Secret::new("token".to_owned())),
             database_url: None,
             listen_addr: "0.0.0.0:8080".to_owned(),
             guild_id: None,
@@ -414,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_shard_has_no_session_to_persist() {
         ensure_crypto_provider();
-        let shard = build_shard("token".to_owned(), Intents::empty(), None);
+        let shard = build_shard("token".to_owned(), Intents::empty(), None, None);
         assert_eq!(session_snapshot(&shard), None);
     }
 }

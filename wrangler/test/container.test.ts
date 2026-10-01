@@ -7,7 +7,7 @@
  */
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { TwoBotContainer, type Env } from "../src/index.ts";
+import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 
 const WORKER_ENV = {
   DISCORD_TOKEN: "synthetic-discord-token",
@@ -213,6 +213,28 @@ for (const method of ["start", "startAndWaitForPorts"] as const) {
     assert.deepEqual(h.starts[0]?.env, envVars);
     assert.deepEqual(h.bot.envVars, EXPECTED_ENV, "per-start override must not mutate defaults");
   });
+}
+
+for (const path of ["/metrics", "/metrics?token=synthetic", "/metrics/", "/metrics/extra", "/METRICS", "/%6detrics", "//metrics", "/metrics//extra"]) {
+  for (const method of ["GET", "HEAD", "POST"]) {
+    test(`${method} ${path} is never publicly routed or sent to the container`, async (t) => {
+      const h = await harness(t);
+      const request = new Request(`https://worker.invalid${path}`, { method });
+      const env = {
+        ...WORKER_ENV,
+        // Even a configured invite campaign cannot make the reserved route public.
+        REDIRECT_MAPPINGS_JSON: JSON.stringify([{ slug: "metrics", invite_code: "synthetic" }]),
+        TWO_BOT: { getByName: () => { throw new Error("metrics must not access the DO"); } },
+      } as unknown as Env;
+      const ctx = { waitUntil: () => { throw new Error("metrics must not record clicks"); } } as unknown as ExecutionContext;
+      const response = await worker.fetch(request, env, ctx);
+      assert.equal(response.status, 404);
+      assert.equal(response.headers.get("location"), null);
+      assert.equal((await h.bot.fetch(request)).status, 404);
+      assert.equal(h.starts.length, 0);
+      assert.equal(h.requests.length, 0);
+    });
+  }
 }
 
 test("non-probe route remains 404 without starting a container", async (t) => {

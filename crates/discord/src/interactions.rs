@@ -144,6 +144,16 @@ impl InteractionRuntime {
         executor: crate::ActionExecutor,
         bot_user_id: u64,
     ) -> Self {
+        Self::with_router(InteractionRouter::new(gates), pool, executor, bot_user_id)
+    }
+
+    /// Compose LFG with the bot's existing feature registrations in ONE router.
+    pub fn with_router(
+        mut router: InteractionRouter,
+        pool: sqlx::PgPool,
+        executor: crate::ActionExecutor,
+        bot_user_id: u64,
+    ) -> Self {
         #[derive(Debug)]
         struct LfgRegistration(two_bot_core::HandlerId);
         impl two_bot_core::InteractionHandler for LfgRegistration {
@@ -151,7 +161,6 @@ impl InteractionRuntime {
                 self.0
             }
         }
-        let mut router = InteractionRouter::new(gates);
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::Lfg)));
         router.register(Box::new(LfgRegistration(two_bot_core::HandlerId::LfgClose)));
         Self {
@@ -181,11 +190,26 @@ impl InteractionRuntime {
         if application_id != 0 && interaction.application_id.get() != application_id {
             return Ok(false);
         }
+        let routed = route_interaction(&self.router, interaction, None);
+        self.handle_routed(interaction, routed).await
+    }
+
+    /// Execute an outcome from this runtime's shared router without routing twice.
+    pub async fn handle_routed(
+        &self,
+        interaction: &Interaction,
+        routed: RoutedInteraction,
+    ) -> Result<bool, crate::DiscordError> {
+        let application_id = self
+            .application_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return Ok(false);
+        }
         use crate::lfg_interactions::{LfgError, LfgRequest};
         use twilight_model::application::interaction::application_command::CommandOptionValue;
         use twilight_model::channel::message::{component::ComponentType, AllowedMentions};
         use two_bot_core::{ComponentHandler, HandlerId};
-        let routed = route_interaction(&self.router, interaction, None);
         let request = match routed {
             RoutedInteraction::Slash {
                 outcome: SlashOutcome::Refuse { refusal },

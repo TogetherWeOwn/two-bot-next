@@ -5,7 +5,9 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinSet;
 use twilight_gateway::Event;
 use two_bot_core::{FeatureGates, ModerationGates, RouterGates, SurfaceFlags};
-use two_bot_discord::{interactions::InteractionRuntime, ActionExecutor};
+use two_bot_discord::ActionExecutor;
+
+use crate::command_runtime::{router_with_commands, CommandRuntime};
 
 const MAX_IN_FLIGHT: usize = 32;
 
@@ -29,28 +31,23 @@ pub async fn initialize(
             .env_snapshot(Some(&guild_id.to_string())),
     );
     let gates = boot_gates(guild_id, &vars)?;
-    let executor = ActionExecutor::new(token)
+    let proxy = std::env::var("DISCORD_API_BASE")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let executor = ActionExecutor::with_proxy(token, proxy)
         .map_err(|_| unavailable("interaction executor initialization failed"))?;
     // This also supplies identity on a RESUME boot, which receives no READY user.
     let (bot_user_id, application_id) = executor
         .current_identity()
         .await
         .map_err(|_| unavailable("interaction identity unavailable"))?;
-    let runtime = Arc::new(InteractionRuntime::new(
-        gates,
-        pool,
-        executor.clone(),
-        bot_user_id,
-    ));
-    runtime.set_application_id(application_id);
     // TOG-10080 owns the custom-command store. None is unavailable, not zero rows.
-    if let Some(definitions) = publication_definitions(&runtime.router, gates, None)? {
-        let commands = two_bot_discord::interactions::publish_commands(&definitions);
-        executor
-            .publish_guild_commands(application_id, guild_id, &commands)
-            .await
-            .map_err(|_| unavailable("command registry publication failed"))?;
-    }
+    let runtime =
+        CommandRuntime::build(pool, executor, router_with_commands(gates), guild_id, None);
+    runtime.set_identity(bot_user_id, application_id);
+    runtime
+        .publish_registry_checked(Some(application_id))
+        .await?;
     Ok(InteractionDispatch::new(
         runtime,
         bot_user_id,
@@ -58,7 +55,7 @@ pub async fn initialize(
     ))
 }
 
-fn publication_definitions(
+pub(crate) fn publication_definitions(
     router: &two_bot_core::InteractionRouter,
     gates: RouterGates,
     custom: Option<&[two_bot_core::CustomCommand]>,
@@ -94,14 +91,14 @@ fn boot_gates(guild_id: u64, vars: &HashMap<String, String>) -> Result<RouterGat
 }
 
 pub struct InteractionDispatch {
-    runtime: Arc<InteractionRuntime>,
+    runtime: Arc<CommandRuntime>,
     bot_user_id: u64,
     application_id: u64,
     tasks: JoinSet<()>,
 }
 
 impl InteractionDispatch {
-    fn new(runtime: Arc<InteractionRuntime>, bot_user_id: u64, application_id: u64) -> Self {
+    fn new(runtime: Arc<CommandRuntime>, bot_user_id: u64, application_id: u64) -> Self {
         Self {
             runtime,
             bot_user_id,
@@ -118,6 +115,16 @@ impl InteractionDispatch {
         while let Some(result) = self.tasks.try_join_next() {
             result.map_err(|_| unavailable("interaction task panicked"))?;
         }
+        let handled = matches!(
+            event,
+            Event::Ready(_)
+                | Event::Resumed
+                | Event::InteractionCreate(_)
+                | Event::MessageCreate(_)
+        );
+        if handled && self.tasks.len() >= MAX_IN_FLIGHT {
+            return Err(unavailable("interaction dispatch capacity exceeded"));
+        }
         match event {
             Event::Ready(ready) => {
                 if ready.user.id.get() != self.bot_user_id
@@ -125,22 +132,32 @@ impl InteractionDispatch {
                 {
                     return Err(unavailable("gateway and REST identities differ"));
                 }
-                self.runtime.set_bot_user_id(ready.user.id.get());
+                self.runtime
+                    .set_identity(self.bot_user_id, self.application_id);
+                let runtime = Arc::clone(&self.runtime);
+                let application_id = self.application_id;
+                self.tasks.spawn(async move {
+                    runtime.publish_registry(Some(application_id)).await;
+                });
+            }
+            Event::Resumed => {
+                let runtime = Arc::clone(&self.runtime);
+                self.tasks.spawn(async move {
+                    runtime.publish_registry(None).await;
+                });
             }
             Event::InteractionCreate(interaction) => {
-                if self.tasks.len() >= MAX_IN_FLIGHT {
-                    return Err(unavailable("interaction dispatch capacity exceeded"));
-                }
                 let runtime = Arc::clone(&self.runtime);
                 let interaction = interaction.0.clone();
                 self.tasks.spawn(async move {
-                    if runtime.handle(&interaction).await.is_err() {
-                        // Tokens, HTTP bodies and database errors are never logged.
-                        tracing::warn!(
-                            interaction_id = interaction.id.get(),
-                            "interaction execution failed"
-                        );
-                    }
+                    runtime.on_interaction(&interaction).await;
+                });
+            }
+            Event::MessageCreate(message) => {
+                let runtime = Arc::clone(&self.runtime);
+                let message = message.0.clone();
+                self.tasks.spawn(async move {
+                    runtime.on_message(&message).await;
                 });
             }
             _ => {}
@@ -169,14 +186,15 @@ mod tests {
             .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
             .unwrap();
         let gates = boot_gates(22, &HashMap::new()).unwrap();
-        let runtime = Arc::new(InteractionRuntime::new(
-            gates,
+        let runtime = CommandRuntime::build(
             pool,
             ActionExecutor::with_proxy("mock-token".into(), Some("http://127.0.0.1:1".into()))
                 .unwrap(),
-            99,
-        ));
-        runtime.set_application_id(11);
+            router_with_commands(gates),
+            22,
+            None,
+        );
+        runtime.set_identity(99, 11);
         InteractionDispatch::new(runtime, 99, 11)
     }
 
@@ -230,7 +248,7 @@ mod tests {
         for _ in 0..MAX_IN_FLIGHT {
             aborts.push(dispatch.tasks.spawn(std::future::pending::<()>()));
         }
-        dispatch.handle(&Event::Resumed).unwrap();
+        assert!(dispatch.handle(&Event::Resumed).is_err());
         let interaction = event(
             "INTERACTION_CREATE",
             serde_json::json!({

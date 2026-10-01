@@ -1,0 +1,549 @@
+{
+  "source": "TogetherWeOwn/two-bot",
+  "revision": "d5d1179348feb9157bcac8c875de9399d4f5c76a",
+  "configuration": "All builtins enabled (including staging-only rota); no DB custom rows",
+  "commands": [
+    {
+      "name": "rank",
+      "description": "Show your XP, level and server rank.",
+      "options": [
+        {
+          "type": 6,
+          "name": "member",
+          "description": "Show another member.",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "leaderboard",
+      "description": "Show the server XP leaderboard."
+    },
+    {
+      "name": "attendance",
+      "description": "Record a verified human attendee for a Discord event occurrence.",
+      "options": [
+        {
+          "type": 3,
+          "name": "event-occurrence",
+          "description": "Scheduled event id or stable occurrence id.",
+          "required": true
+        },
+        {
+          "type": 6,
+          "name": "member",
+          "description": "Human member who attended.",
+          "required": true
+        }
+      ],
+      "default_member_permissions": "8589934592"
+    },
+    {
+      "name": "rota-acknowledge",
+      "description": "Accepted primary: acknowledge ownership of a newcomer response.",
+      "options": [
+        {
+          "type": 3,
+          "name": "message-link",
+          "description": "Discord link to the newcomer’s first eligible message.",
+          "required": true
+        }
+      ],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "command",
+      "description": "Define or replace a custom command",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "name",
+          "description": "Command name, a-z 0-9 _ -",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "template",
+          "description": "What the bot replies; {user} {username} {server} {channel}",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "description",
+          "description": "Shown in the command picker",
+          "required": false
+        },
+        {
+          "type": 3,
+          "name": "text-trigger",
+          "description": "Optional !trigger form, e.g. !faq",
+          "required": false
+        }
+      ],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "command-remove",
+      "description": "Delete a custom command",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "name",
+          "description": "Command to delete",
+          "required": true
+        }
+      ],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "command-list",
+      "description": "List this server's custom commands",
+      "type": 1,
+      "options": [],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "schedule",
+      "description": "Schedule a message, once or recurring",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "body",
+          "description": "Message text",
+          "required": true
+        },
+        {
+          "type": 4,
+          "name": "in-minutes",
+          "description": "Fire this many minutes from now",
+          "required": false,
+          "min_value": 1,
+          "max_value": 525600
+        },
+        {
+          "type": 4,
+          "name": "every-minutes",
+          "description": "Recur at this interval (60 min minimum)",
+          "required": false,
+          "min_value": 60,
+          "max_value": 525600
+        }
+      ],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "schedule-remove",
+      "description": "Cancel a scheduled message",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "id",
+          "description": "Scheduled message id",
+          "required": true
+        }
+      ],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "schedule-list",
+      "description": "List scheduled messages for this server",
+      "type": 1,
+      "options": [],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "sticky",
+      "description": "Set this channel's sticky message",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "body",
+          "description": "Sticky text",
+          "required": true
+        },
+        {
+          "type": 4,
+          "name": "debounce",
+          "description": "Quiet seconds before re-posting (default 5, max 300)",
+          "required": false,
+          "min_value": 1,
+          "max_value": 300
+        }
+      ],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "sticky-remove",
+      "description": "Remove this channel's sticky message",
+      "type": 1,
+      "options": [],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "rsvp",
+      "description": "RSVP to a Discord scheduled event",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "event-id",
+          "description": "Discord scheduled event id",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "status",
+          "description": "Your response",
+          "required": true,
+          "choices": [
+            {
+              "name": "Going",
+              "value": "going"
+            },
+            {
+              "name": "Interested",
+              "value": "interested"
+            },
+            {
+              "name": "Declined",
+              "value": "declined"
+            }
+          ]
+        }
+      ],
+      "dm_permission": false
+    },
+    {
+      "name": "attendance",
+      "description": "Show Owen RSVP totals for a scheduled event",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "event-id",
+          "description": "Discord scheduled event id",
+          "required": true
+        }
+      ],
+      "dm_permission": false
+    },
+    {
+      "name": "lfg",
+      "description": "Post a raid/LFG signup with role slots",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "title",
+          "description": "Event or group title",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "starts-at",
+          "description": "ISO-8601 start time",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "roles",
+          "description": "tank:Tank:2,healer:Healer:2,dps:DPS:6",
+          "required": true
+        }
+      ],
+      "default_member_permissions": "8589934592",
+      "dm_permission": false
+    },
+    {
+      "name": "lfg-close",
+      "description": "Close a raid/LFG signup",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "id",
+          "description": "LFG id",
+          "required": true
+        }
+      ],
+      "default_member_permissions": "8589934592",
+      "dm_permission": false
+    },
+    {
+      "name": "feed-add",
+      "description": "Relay an RSS, YouTube, or Twitch feed into this channel",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "kind",
+          "description": "Feed kind",
+          "required": true,
+          "choices": [
+            {
+              "name": "RSS",
+              "value": "rss"
+            },
+            {
+              "name": "YouTube",
+              "value": "youtube"
+            },
+            {
+              "name": "Twitch",
+              "value": "twitch"
+            }
+          ]
+        },
+        {
+          "type": 3,
+          "name": "source",
+          "description": "HTTPS URL or YouTube channel id",
+          "required": true
+        }
+      ],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "feed-remove",
+      "description": "Remove a feed relay",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "id",
+          "description": "Feed id",
+          "required": true
+        }
+      ],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "feed-list",
+      "description": "List this server's feed relays",
+      "type": 1,
+      "options": [],
+      "default_member_permissions": "32",
+      "dm_permission": false
+    },
+    {
+      "name": "ban",
+      "description": "Ban a member",
+      "type": 1,
+      "options": [
+        {
+          "type": 6,
+          "name": "target",
+          "description": "Member to moderate",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "required": true,
+          "max_length": 512
+        }
+      ],
+      "default_member_permissions": "4",
+      "dm_permission": false
+    },
+    {
+      "name": "tempban",
+      "description": "Temporarily ban a member",
+      "type": 1,
+      "options": [
+        {
+          "type": 6,
+          "name": "target",
+          "description": "Member to moderate",
+          "required": true
+        },
+        {
+          "type": 4,
+          "name": "duration_seconds",
+          "description": "Duration in seconds",
+          "required": true,
+          "min_value": 60
+        },
+        {
+          "type": 3,
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "required": true,
+          "max_length": 512
+        }
+      ],
+      "default_member_permissions": "4",
+      "dm_permission": false
+    },
+    {
+      "name": "kick",
+      "description": "Kick a member",
+      "type": 1,
+      "options": [
+        {
+          "type": 6,
+          "name": "target",
+          "description": "Member to moderate",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "required": true,
+          "max_length": 512
+        }
+      ],
+      "default_member_permissions": "2",
+      "dm_permission": false
+    },
+    {
+      "name": "timeout",
+      "description": "Timeout a member",
+      "type": 1,
+      "options": [
+        {
+          "type": 6,
+          "name": "target",
+          "description": "Member to moderate",
+          "required": true
+        },
+        {
+          "type": 4,
+          "name": "duration_seconds",
+          "description": "Duration in seconds",
+          "required": true,
+          "min_value": 60
+        },
+        {
+          "type": 3,
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "required": true,
+          "max_length": 512
+        }
+      ],
+      "default_member_permissions": "1099511627776",
+      "dm_permission": false
+    },
+    {
+      "name": "warn",
+      "description": "Record a warning for a member",
+      "type": 1,
+      "options": [
+        {
+          "type": 6,
+          "name": "target",
+          "description": "Member to moderate",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "required": true,
+          "max_length": 512
+        }
+      ],
+      "default_member_permissions": "1099511627776",
+      "dm_permission": false
+    },
+    {
+      "name": "purge",
+      "description": "Delete recent messages",
+      "type": 1,
+      "options": [
+        {
+          "type": 4,
+          "name": "count",
+          "description": "Messages to delete (1-100)",
+          "required": true,
+          "min_value": 1,
+          "max_value": 100
+        },
+        {
+          "type": 3,
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "required": true,
+          "max_length": 512
+        }
+      ],
+      "default_member_permissions": "8192",
+      "dm_permission": false
+    },
+    {
+      "name": "slowmode",
+      "description": "Set channel slowmode",
+      "type": 1,
+      "options": [
+        {
+          "type": 4,
+          "name": "seconds",
+          "description": "Delay in seconds (0 disables)",
+          "required": true,
+          "min_value": 0,
+          "max_value": 21600
+        },
+        {
+          "type": 3,
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "required": true,
+          "max_length": 512
+        }
+      ],
+      "default_member_permissions": "16",
+      "dm_permission": false
+    },
+    {
+      "name": "lockdown",
+      "description": "Prevent @everyone from sending messages",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "required": true,
+          "max_length": 512
+        }
+      ],
+      "default_member_permissions": "16",
+      "dm_permission": false
+    },
+    {
+      "name": "unlock",
+      "description": "Allow @everyone to send messages",
+      "type": 1,
+      "options": [
+        {
+          "type": 3,
+          "name": "reason",
+          "description": "Mandatory audit reason",
+          "required": true,
+          "max_length": 512
+        }
+      ],
+      "default_member_permissions": "16",
+      "dm_permission": false
+    }
+  ]
+}
