@@ -100,6 +100,10 @@ fn connect_options(raw: &str) -> Result<PgConnectOptions> {
         .options([("statement_timeout", "5000ms")]))
 }
 
+// CREATE/DROP DATABASE can wait for checkpoints. Queue fixture lifecycle DDL
+// outside the unchanged SQL deadline instead of making concurrent drops race it.
+// Cargo runs test binaries sequentially; tests inside each binary share this gate.
+static DATABASE_DDL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
 
 fn database_name() -> String {
@@ -117,19 +121,26 @@ fn database_name() -> String {
 struct Cleanup {
     admin: PgPool,
     pool: PgPool,
+    independent_pools: std::sync::Mutex<Vec<PgPool>>,
     name: String,
 }
 
 impl Cleanup {
     async fn close(self) -> Result<()> {
+        for pool in self.independent_pools.into_inner().unwrap() {
+            pool.close().await;
+        }
         self.pool.close().await;
         // The name is generated internally, not supplied by a caller.
-        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE \"{}\" WITH (FORCE)",
-            self.name
-        )))
-        .execute(&self.admin)
-        .await;
+        let result = {
+            let _ddl = DATABASE_DDL.lock().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE \"{}\" WITH (FORCE)",
+                self.name
+            )))
+            .execute(&self.admin)
+            .await
+        };
         self.admin.close().await;
         result.context("drop disposable test database")?;
         Ok(())
@@ -155,10 +166,13 @@ impl TestDatabase {
             .await
             .context("connect to test bootstrap database")?;
         let name = database_name();
-        if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
-            .execute(&admin)
-            .await
-        {
+        let created = {
+            let _ddl = DATABASE_DDL.lock().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+                .execute(&admin)
+                .await
+        };
+        if let Err(error) = created {
             admin.close().await;
             return Err(error).context("create disposable test database");
         }
@@ -169,7 +183,12 @@ impl TestDatabase {
             .acquire_timeout(Duration::from_secs(10))
             .connect_lazy_with(options.database(&name).application_name(&name));
         let fixture = Self {
-            cleanup: Some(Cleanup { admin, pool, name }),
+            cleanup: Some(Cleanup {
+                admin,
+                pool,
+                independent_pools: std::sync::Mutex::new(Vec::new()),
+                name,
+            }),
         };
         if let Err(error) = migrations.run(fixture.pool()).await {
             fixture
@@ -193,7 +212,7 @@ impl TestDatabase {
     /// Set a bound search_path within this fixture, never a connection redirect.
     pub async fn pool_with_search_path(&self, path: &str) -> Result<PgPool> {
         let path = path.to_owned();
-        PgPoolOptions::new()
+        let pool = PgPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(10))
             .after_connect(move |conn, _| {
@@ -208,7 +227,15 @@ impl TestDatabase {
             })
             .connect_with(self.pool().connect_options().as_ref().clone())
             .await
-            .context("connect independent fixture pool")
+            .context("connect independent fixture pool")?;
+        self.cleanup
+            .as_ref()
+            .expect("fixture not closed")
+            .independent_pools
+            .lock()
+            .unwrap()
+            .push(pool.clone());
+        Ok(pool)
     }
 
     pub fn name(&self) -> &str {
@@ -334,6 +361,23 @@ mod tests {
             .to_string();
         assert!(!error.contains("private_password"));
         assert!(!error.contains("postgres://"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_ddl_waits_for_the_gate_before_starting_sql() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let first = DATABASE_DDL.lock().await;
+        let second = DATABASE_DDL.lock();
+        tokio::pin!(second);
+        let state = std::future::poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx))).await;
+        assert!(
+            state.is_pending(),
+            "concurrent DDL entered the timed statement"
+        );
+        drop(first);
+        let _second = second.await;
     }
 
     #[test]

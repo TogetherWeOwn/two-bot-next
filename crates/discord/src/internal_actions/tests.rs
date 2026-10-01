@@ -15,8 +15,8 @@ struct Reply {
     status: u16,
     headers: String,
     body: String,
-    delay: Duration,
-    body_delay: Duration,
+    stall_response: bool,
+    stall_body: bool,
     truncate: bool,
     disconnect: bool,
 }
@@ -27,8 +27,8 @@ impl Reply {
             status,
             headers: String::new(),
             body: body.into(),
-            delay: Duration::ZERO,
-            body_delay: Duration::ZERO,
+            stall_response: false,
+            stall_body: false,
             truncate: false,
             disconnect: false,
         }
@@ -52,11 +52,29 @@ struct Recorded {
 struct MockDiscord {
     origin: String,
     requests: Arc<Mutex<Vec<Recorded>>>,
+    request_received: Arc<tokio::sync::Notify>,
+    response_received: Arc<tokio::sync::Notify>,
+    stall_response: bool,
     task: JoinHandle<()>,
+    _clock_hold: std::sync::mpsc::Sender<()>,
 }
 
 impl MockDiscord {
     async fn start(reply: Reply) -> Self {
+        // Paused time normally auto-advances while real sockets wait on the
+        // reactor. A live blocking task inhibits that documented Tokio behavior,
+        // without spinning or tying the HTTP deadline to host scheduling speed.
+        let (clock_hold, release) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = release.recv();
+        });
+        ready.await.unwrap();
+        let request_received = Arc::new(tokio::sync::Notify::new());
+        let response_received = Arc::new(tokio::sync::Notify::new());
+        let received = request_received.clone();
+        let stall_response = reply.stall_response;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -106,16 +124,21 @@ impl MockDiscord {
                     body: serde_json::from_slice(&bytes[head_end..head_end + content_length])
                         .unwrap(),
                 });
+                received.notify_one();
                 if reply.disconnect {
                     continue;
                 }
-                tokio::time::sleep(reply.delay).await;
+                if reply.stall_response {
+                    std::future::pending::<()>().await;
+                }
                 let response = format!(
                     "HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{}connection: close\r\n\r\n",
                     reply.status, reply.body.len(), reply.headers,
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
-                tokio::time::sleep(reply.body_delay).await;
+                if reply.stall_body {
+                    std::future::pending::<()>().await;
+                }
                 let end = if reply.truncate {
                     reply.body.len() / 2
                 } else {
@@ -127,7 +150,11 @@ impl MockDiscord {
         Self {
             origin,
             requests,
+            request_received,
+            response_received,
+            stall_response,
             task,
+            _clock_hold: clock_hold,
         }
     }
 
@@ -140,6 +167,7 @@ impl MockDiscord {
         let mut executor = AnnouncementExecutor::new(Arc::new(client), keys);
         executor.api_origin = self.origin.clone();
         executor.timeout = Duration::from_millis(100);
+        executor.response_received = Some(self.response_received.clone());
         executor
     }
 
@@ -167,16 +195,42 @@ fn announcement(content: &str) -> Map<String, Value> {
 }
 
 async fn run_once(executor: &AnnouncementExecutor, body: &Map<String, Value>) -> ExecutionOutcome {
-    // A hidden retry loop must fail the test rather than hang for minutes.
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        executor.execute("announcement.post", body),
-    )
-    .await
-    .unwrap()
+    let start = tokio::time::Instant::now();
+    let outcome = executor.execute("announcement.post", body).await;
+    assert_eq!(
+        start.elapsed(),
+        Duration::ZERO,
+        "socket I/O advanced the clock"
+    );
+    outcome
 }
 
-#[tokio::test]
+async fn run_until_timeout(
+    mock: &MockDiscord,
+    executor: &AnnouncementExecutor,
+    body: &Map<String, Value>,
+) -> ExecutionOutcome {
+    let ready = if mock.stall_response {
+        &mock.request_received
+    } else {
+        &mock.response_received
+    };
+    let pending = executor.execute("announcement.post", body);
+    tokio::pin!(pending);
+    tokio::select! {
+        outcome = &mut pending => panic!("stalled request finished before its deadline: {outcome:?}"),
+        () = ready.notified() => {}
+    }
+    // The fixture has received the request (or the executor has acquired the
+    // headers). Only now cross the deadline; kernel I/O cannot race virtual time.
+    let tick = Duration::from_millis(1);
+    tokio::time::advance(executor.timeout - tick).await;
+    assert!(futures_util::poll!(&mut pending).is_pending());
+    tokio::time::advance(tick + tick).await;
+    pending.await
+}
+
+#[tokio::test(start_paused = true)]
 async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
@@ -222,7 +276,7 @@ async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn refuses_bad_inputs_missing_mapping_and_every_other_core_verb_without_http() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
@@ -283,7 +337,7 @@ async fn refuses_bad_inputs_missing_mapping_and_every_other_core_verb_without_ht
     assert_eq!(mock.count(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn utf16_ceiling_is_preserved_for_non_ascii_content() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
@@ -296,7 +350,7 @@ async fn utf16_ceiling_is_preserved_for_non_ascii_content() {
     assert_eq!(mock.count(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn definite_discord_rejections_and_rate_limit_are_one_attempt() {
     for status in [400, 401, 403, 404, 405, 413, 415, 422, 429] {
         // Error content is deliberately malformed and sensitive; status alone
@@ -319,7 +373,7 @@ async fn definite_discord_rejections_and_rate_limit_are_one_attempt() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn rate_limits_preserve_timing_and_conservative_scope_for_shared_governor() {
     let channel = CooldownScope::Channel(Id::new(CHANNEL.parse().unwrap()));
     for (headers, body, scope, delay) in [
@@ -397,20 +451,26 @@ async fn rate_limits_preserve_timing_and_conservative_scope_for_shared_governor(
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn broken_rate_limit_bodies_retain_headers_and_definite_no_effect() {
     let mut slow = Reply::new(429, r#"{"retry_after":1,"global":true}"#);
-    slow.body_delay = Duration::from_secs(1);
+    slow.stall_body = true;
     let mut truncated = slow.clone();
-    truncated.body_delay = Duration::ZERO;
+    truncated.stall_body = false;
     truncated.truncate = true;
     let oversized = Reply::new(429, "x".repeat(MAX_RESPONSE_BYTES + 1));
     for mut reply in [slow, truncated, oversized] {
         reply.headers = "Retry-After: 6.5\r\nX-RateLimit-Global: true\r\n".to_owned();
+        let stalled = reply.stall_body;
         let mock = MockDiscord::start(reply).await;
         let executor = mock.executor(keys());
+        let outcome = if stalled {
+            run_until_timeout(&mock, &executor, &announcement("ok")).await
+        } else {
+            run_once(&executor, &announcement("ok")).await
+        };
         assert_eq!(
-            run_once(&executor, &announcement("ok")).await,
+            outcome,
             ExecutionOutcome::RateLimited(RateLimitCooldown {
                 scope: CooldownScope::Global,
                 retry_after_ms: Some(6500),
@@ -420,7 +480,7 @@ async fn broken_rate_limit_bodies_retain_headers_and_definite_no_effect() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn redirects_request_timeout_and_server_errors_remain_unknown_without_retry() {
     for status in [202, 204, 301, 307, 408, 500, 502, 503, 504] {
         let mock = MockDiscord::start(Reply::new(status, "provider-secret")).await;
@@ -433,14 +493,14 @@ async fn redirects_request_timeout_and_server_errors_remain_unknown_without_retr
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_and_lost_response_are_unknown_and_not_retried() {
     let mut delayed = Reply::success();
-    delayed.delay = Duration::from_secs(1);
+    delayed.stall_response = true;
     let mock = MockDiscord::start(delayed).await;
     let executor = mock.executor(keys());
     assert_eq!(
-        run_once(&executor, &announcement("private-message")).await,
+        run_until_timeout(&mock, &executor, &announcement("private-message")).await,
         ExecutionOutcome::Unknown(UnknownReason::Timeout)
     );
     assert_eq!(mock.count(), 1);
@@ -456,7 +516,7 @@ async fn timeout_and_lost_response_are_unknown_and_not_retried() {
     assert_eq!(mock.count(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn invalid_success_receipts_are_unknown_instead_of_cached_failures() {
     for response in [
         "not-json".to_owned(),
@@ -477,14 +537,14 @@ async fn invalid_success_receipts_are_unknown_instead_of_cached_failures() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deadline_covers_success_body_and_truncated_body_is_unknown() {
     let mut slow_body = Reply::success();
-    slow_body.body_delay = Duration::from_secs(1);
+    slow_body.stall_body = true;
     let mock = MockDiscord::start(slow_body).await;
     let executor = mock.executor(keys());
     assert_eq!(
-        run_once(&executor, &announcement("ok")).await,
+        run_until_timeout(&mock, &executor, &announcement("ok")).await,
         ExecutionOutcome::Unknown(UnknownReason::Timeout)
     );
     assert_eq!(mock.count(), 1);
@@ -500,7 +560,7 @@ async fn deadline_covers_success_body_and_truncated_body_is_unknown() {
     assert_eq!(mock.count(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn missing_authentication_is_local_no_effect() {
     let mock = MockDiscord::start(Reply::success()).await;
     let mut executor = mock.executor(keys());
@@ -532,7 +592,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn outcomes_debug_serialization_and_logs_never_echo_sensitive_values() {
     let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
     let subscriber = tracing_subscriber::fmt()
