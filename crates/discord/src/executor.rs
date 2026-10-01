@@ -434,6 +434,9 @@ fn is_interaction_token_request(request: &Request) -> bool {
             && request.path().ends_with("/messages/@original"))
 }
 
+#[path = "internal_exec/member.rs"]
+pub mod member;
+
 /// The S4 REST executor: paced lane + moderation lane over one transport.
 #[derive(Debug, Clone)]
 pub struct ActionExecutor {
@@ -607,7 +610,17 @@ impl ActionExecutor {
         request: &Request,
         lane: Option<bool>,
     ) -> Result<(RawResponse, bool), DiscordError> {
-        let deadline = tokio::time::Instant::now() + self.inner.moderation_timeout;
+        self.send_with_timeout_for(request, lane, self.inner.moderation_timeout)
+            .await
+    }
+
+    async fn send_with_timeout_for(
+        &self,
+        request: &Request,
+        lane: Option<bool>,
+        timeout: Duration,
+    ) -> Result<(RawResponse, bool), DiscordError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         tokio::time::timeout_at(deadline, self.admit(request, lane))
             .await
             .map_err(|_| GuardError::AdmissionTimeout)??;

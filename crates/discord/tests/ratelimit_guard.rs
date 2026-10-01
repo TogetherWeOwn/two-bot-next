@@ -105,6 +105,40 @@ async fn interaction_webhook_401_counts_invalid_without_latching_the_bot_token()
     mock.shutdown().await;
 }
 
+#[tokio::test]
+async fn internal_member_guard_refusals_preserve_the_pre_dispatch_boundary() {
+    use two_bot_core::internal_actions::{ErrorCode, GuildAddMemberRequest};
+
+    for restriction in ["token", "global"] {
+        let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+        let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+        let exec = executor(&mock, &guard);
+        if restriction == "token" {
+            guard.observe_status(401, true);
+        } else {
+            guard.observe_global(Some(600.0));
+        }
+        let body = serde_json::json!({
+            "action": "guild.add_member",
+            "discord_id": "100000000000000002",
+            "access_token": "fixture-only-oauth"
+        });
+        let request = GuildAddMemberRequest::validate(body.as_object().unwrap()).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            exec.add_internal_member("2222", &request, "fixture-only-oauth"),
+        )
+        .await
+        .expect("member admission retains its 1500ms total deadline")
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::DiscordRejected);
+        assert_eq!(error.log_reason, "discord_guard_refused");
+        assert_eq!(exec.requests(), 0);
+        assert_eq!(mock.requests().len(), 0);
+        mock.shutdown().await;
+    }
+}
+
 async fn ban(executor: &ActionExecutor) -> Result<(), DiscordError> {
     executor.ban("2222", "3333", "guard test").await
 }
