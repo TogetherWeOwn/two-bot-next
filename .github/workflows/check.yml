@@ -11,6 +11,11 @@ on:
   # PRs opened with GITHUB_TOKEN trigger no workflows, so the required `check`
   # / `worker check` would never run on the release PR without this path.
   workflow_dispatch:
+    inputs:
+      single_core_tests:
+        description: Pin native Rust test binaries to one allowed CPU for flake validation
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -78,7 +83,9 @@ jobs:
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
       - name: offline build-cache safety regressions
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_single_core.py' -v
 
       - name: parity soak checklist coverage (offline)
         run: |
@@ -90,6 +97,30 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+
+      - name: Pin native tests to one CPU (loaded-runner validation)
+        if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+
+          taskset = shutil.which('taskset')
+          if taskset is None:
+              raise SystemExit('single-core validation requires taskset')
+          cpu = min(os.sched_getaffinity(0))
+          subprocess.run([taskset, '-c', str(cpu), 'true'], check=True)
+          version = subprocess.check_output(['rustc', '-vV'], text=True)
+          host = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
+          key = 'CARGO_TARGET_' + host.upper().replace('-', '_') + '_RUNNER'
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'{key}={taskset} -c {cpu}\n')
+          print(f'Native Rust test binaries: {taskset} -c {cpu}; revision {os.environ["GITHUB_SHA"]}')
+          print('loadavg:', pathlib.Path('/proc/loadavg').read_text().strip())
+          print('cpu pressure:', pathlib.Path('/proc/pressure/cpu').read_text().strip())
+          PY
 
       # Restore on every run; save only on pushes to main (below). A PR-scoped
       # cache is unreadable by other PRs, and uploading the ~4 GiB target dir
