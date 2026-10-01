@@ -79,8 +79,12 @@
   inherited pending/legacy work and former-worker refusal, without publishing a
   target or claiming success for obsolete input. Add active-owner/mismatched-hint,
   stale-cache, overlap/no-send and selected/empty convergence source fixtures.
-  Production boot remains disabled until approved shared boot configuration,
-  unresolved-work continuation and compiled acceptance are complete.
+  Document bounded unknown-work continuation and add a shared-service restart
+  regression for repeated pending sweeps, durable lease backoff, other-row progress,
+  one acknowledged repair, genuine sender completion and preserved legacy floors.
+  These source fixtures remain uncompiled. Production boot remains disabled until
+  approved shared boot configuration and compiled continuation acceptance are
+  complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

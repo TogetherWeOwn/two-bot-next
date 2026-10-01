@@ -366,7 +366,38 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   service, and `CommandRuntime::from_env` still creates none; approved boot
   composition must share one Arc across both paths. Processing discovery still
   refuses terminal rows; the separate terminal consumer below repairs only to
-  committed targets. The unknown-work lifecycle remains an activation blocker.
+  committed targets. The unknown-work continuation contract below remains subject
+  to compiled acceptance before activation.
+
+### Unknown-work continuation contract (not activation evidence)
+
+The existing service/supervisor keeps unknown work durably discoverable, not
+successful or discarded. A bounded sweep can repair drift to the committed target
+while retaining the original pending ticket; a later sweep with that target already
+restored performs fresh reads but does not resend the acknowledged repair. Each
+attempt drops its renewal owners and releases only its own lane. Persisted expiry
+provides backoff; discovery rotation/interleaving lets other processing and terminal
+work advance. Restart loses only the in-memory cursor, not intent or uncertainty.
+A completed sweep is job progress, never a successful role-change result.
+
+Only the original sender's genuine final response or definite no-send receipt can
+complete its ticket. Completion does not itself change aggregate evidence or grant
+settlement authority: a subsequent fresh live owner retires that receipt and
+verifies convergence. A conservative legacy floor has no invented sender identity
+and survives all of those operations. Such work remains unresolved indefinitely;
+there is no retry-count, elapsed-time, restart, snapshot or acknowledged-repair
+shortcut to successful settlement. Disabling the catalogue parks recovery without
+deleting its evidence; dry-run never acquires terminal repair ownership.
+
+The uncompiled `service_continues_unknown_work_without_redelivery` fixture exercises
+three service sweeps with a same-direction pending ticket, acknowledged repair and
+optional overlapping legacy floor. It asserts lease backoff, generation rotation,
+progress for fresh processing rows, unchanged winner chronology, one total repair
+send, genuine sender completion without aggregate authority, and continuation after
+service restart. The ticket-only case completes a terminal convergence receipt;
+the legacy case remains pending and discoverable. Neither case reports success for
+the superseded event or republishes the target. Rust acceptance and approved shared
+boot composition still gate activation; source fixtures are not passed tests.
 
 ### Terminal repair storage checkpoint (not runtime activation)
 

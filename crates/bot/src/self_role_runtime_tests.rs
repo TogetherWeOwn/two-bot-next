@@ -314,6 +314,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     execution_and_compensation(pool).await?;
     stale_inflight_repairs_committed_target(pool).await?;
     stale_handoff_preserves_unknown_and_refuses_other_owners(pool).await?;
+    service_continues_unknown_work_without_redelivery(pool).await?;
     interrupted_exchange_cannot_settle(pool).await?;
     unknown_target_is_not_empty(pool).await?;
     dry_run_refuses_recovered_mutation(pool).await?;
@@ -3465,6 +3466,163 @@ async fn stale_handoff_preserves_unknown_and_refuses_other_owners(pool: &PgPool)
         assert_eq!(mutations[0].method, "PUT");
         assert!(mutations[0].path.ends_with(OLD_ROLE) && mutations[0].body.is_empty());
         drop(stale);
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn service_continues_unknown_work_without_redelivery(pool: &PgPool) -> TestResult {
+    use crate::self_role_handlers::SelfRoleService;
+    use two_bot_core::self_roles::SelfRoleGates;
+
+    for legacy in [false, true] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("service-unknown-continuation-{legacy}");
+        let mut script = snapshot(&[OTHER]); // original admission
+        script.extend(snapshot(&[OTHER])); // missing committed role
+        script.push(ScriptedResponse::status(204));
+        script.extend(snapshot(&[OLD_ROLE, OTHER])); // restored, sender still unknown
+        for _ in 0..if legacy { 4 } else { 3 } {
+            script.extend(snapshot(&[OLD_ROLE, OTHER]));
+        }
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let mut request = request(
+            &panel.id,
+            Selection::Select {
+                option_keys: vec!["new".into()],
+            },
+        );
+        request.event_order = "0001".into();
+        let original = ready(feature.prepare(&request, &panel).await.unwrap());
+        if legacy {
+            let mut effects = original.audit.effects.clone();
+            mark_attempt(&mut effects, OLD_ROLE, true);
+            assert!(
+                feature
+                    .store
+                    .journal_legacy_exchange(&original.event, &effects, false)
+                    .await?
+            );
+        }
+        let ticket = feature
+            .store
+            .journal_role_exchange(
+                &original.event,
+                original.panel.as_ref(),
+                &ExchangeIntent {
+                    role_id: OLD_ROLE.into(),
+                    adding: true,
+                    compensating: false,
+                },
+            )
+            .await?
+            .unwrap();
+        let original_claim = original.event.clone();
+        let mut audit = original.audit.clone();
+        audit.outcome = SettledOutcome::Rejected;
+        audit.code = Some("superseded_by_later_event".into());
+        audit.reason = Some("a later exclusive-panel event was accepted".into());
+        drop(original); // no retained gateway input or renewal task
+        clock.store(NOW + 500, Ordering::SeqCst);
+        let winner = terminal_winner(&feature.store, &panel, Some("old")).await?;
+        let store = feature.store.clone();
+        let gates = SelfRoleGates {
+            panels: vec![panel.clone()],
+            dry_run: false,
+        };
+        let allowlist = [GUILD.to_owned()].into_iter().collect();
+        let service = SelfRoleService::new(feature, gates.clone(), &allowlist).unwrap();
+
+        for sweep in 0..3 {
+            // A fresh, uninitialized processing row can still finish while the
+            // terminal sender remains unknown. Neither queue can starve the other.
+            let mut clean = audit.clone();
+            clean.event_id = format!("{}-clean-{sweep}", panel.id);
+            clean.event_order = Some(format!("900{sweep}"));
+            clean.code = None;
+            clean.reason = None;
+            clean.desired_role_ids.clear();
+            clean.pre_mutation_role_ids.clear();
+            assert!(store.claim_pending_audit(&clean).await?.is_some());
+            clock.store(NOW + 1000 + sweep * 500, Ordering::SeqCst);
+            assert_eq!(service.recover_once().await.unwrap(), 2);
+            let effects = terminal_evidence(pool, &audit, true, false).await?;
+            assert_eq!(effects.unresolved_added_role_ids, [OLD_ROLE]);
+            assert_eq!(effects.compensated_added_role_ids, [OLD_ROLE]);
+            let (outcome, code): (String, Option<String>) =
+                sqlx::query_as("SELECT outcome,code FROM self_role_audit WHERE event_id=$1")
+                    .bind(&clean.event_id)
+                    .fetch_one(pool)
+                    .await?;
+            assert_eq!(outcome, "rejected");
+            assert_eq!(code.as_deref(), Some("interrupted_before_intent"));
+            let (generation,): (i32,) =
+                sqlx::query_as("SELECT claim_generation FROM self_role_audit WHERE event_id=$1")
+                    .bind(&audit.event_id)
+                    .fetch_one(pool)
+                    .await?;
+            assert_eq!(generation, original_claim.generation + sweep as i32 + 1);
+            let (pending, retired, floor): (i64, i64, bool) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM self_role_exchanges WHERE event_id=$1
+                 AND disposition='pending' AND retired_at IS NULL),
+                 (SELECT count(*) FROM self_role_exchanges WHERE event_id=$1 AND retired_at IS NOT NULL),
+                 legacy_pending FROM self_role_exchange_baselines WHERE event_id=$1",
+            ).bind(&audit.event_id).fetch_one(pool).await?;
+            assert_eq!((pending, retired, floor), (1, 1, legacy));
+            assert_terminal_winner(pool, &panel, &winner, Some("old")).await?;
+            let calls = mock.requests().len();
+            assert_eq!(service.recover_once().await.unwrap(), 0); // durable lease backoff
+            assert_eq!(mock.requests().len(), calls);
+        }
+        let state = exchange_owner_state(pool, &audit.event_id).await?;
+        assert!(!store.owns_claim(&original_claim).await?);
+        assert!(
+            store
+                .complete_role_exchange(&ticket, ExchangeReceipt::NoSend)
+                .await?
+        );
+        assert_eq!(exchange_owner_state(pool, &audit.event_id).await?, state);
+        assert_eq!(role_receipts(pool, &audit.event_id).await?.len(), 2);
+        drop(service);
+
+        // Process restart discards the cursor, not durable pending provenance.
+        // Only genuine sender completion plus a fresh live owner retires the ticket.
+        let restarted =
+            SelfRoleService::new(runtime(pool, &clock, &mock), gates, &allowlist).unwrap();
+        clock.store(NOW + 2500, Ordering::SeqCst);
+        assert_eq!(restarted.recover_once().await.unwrap(), 1);
+        let effects = terminal_evidence(pool, &audit, legacy, !legacy).await?;
+        assert_eq!(effects.compensated_added_role_ids, [OLD_ROLE]);
+        assert_eq!(
+            effects.unresolved_added_role_ids,
+            if legacy {
+                vec![OLD_ROLE.to_owned()]
+            } else {
+                vec![]
+            }
+        );
+        let (unretired,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM self_role_exchanges WHERE event_id=$1 AND retired_at IS NULL",
+        )
+        .bind(&audit.event_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(unretired, 0);
+        assert_eq!(restarted.recover_once().await.unwrap(), 0);
+        clock.store(NOW + 3000, Ordering::SeqCst);
+        assert_eq!(restarted.recover_once().await.unwrap(), usize::from(legacy));
+        terminal_evidence(pool, &audit, legacy, !legacy).await?;
+        assert_terminal_winner(pool, &panel, &winner, Some("old")).await?;
+        let calls = mock.requests();
+        assert_eq!(calls.len(), if legacy { 29 } else { 25 });
+        let mutations: Vec<_> = calls.iter().filter(|r| r.method != "GET").collect();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].method, "PUT");
+        assert!(mutations[0].path.ends_with(OLD_ROLE) && mutations[0].body.is_empty());
+        assert_eq!(role_receipts(pool, &audit.event_id).await?.len(), 2);
+        drop(restarted);
         mock.shutdown().await;
     }
     Ok(())
