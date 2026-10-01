@@ -105,7 +105,7 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
     if !is_ref(&req.acl_plan_ref) {
         return refuse("reviewed ACL plan reference is missing or not a bare reference");
     }
-    if req.url.as_deref().map_or(true, str::is_empty) {
+    if req.url.as_deref().is_none_or(str::is_empty) {
         return refuse(format!("migrator binding {URL_ENV} is not provided"));
     }
     Ok(())
