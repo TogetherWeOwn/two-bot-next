@@ -20,7 +20,7 @@ fn curves_and_rank_replies_match_executed_legacy() {
             rank_text(
                 profile["display"].as_str().unwrap(),
                 profile["level"].as_u64().unwrap(),
-                profile["rank"].as_u64().unwrap(),
+                Some(profile["rank"].as_u64().unwrap()),
                 profile["memberCount"].as_u64().unwrap(),
                 profile["xp"].as_u64().unwrap(),
             ),

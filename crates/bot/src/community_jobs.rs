@@ -30,7 +30,7 @@ use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
     jobs::{self, ErrorClass, Job},
-    website_jobs::{get, roster, Context},
+    website_jobs::{bot_floor_scan, get, Context},
 };
 
 pub const NAMES: [&str; 3] = ["presence_probe", "community_scorecard", "inactivity"];
@@ -271,10 +271,8 @@ async fn presence_tick(
         .map_err(|_| ErrorClass::Database)?
         .and_then(|at| parse_iso_millis(&at));
     let fresh_floor = if bot_floor_due(last_floor_ms, now_ms, BOT_FLOOR_MAX_AGE_MS) {
-        match roster(rest, guild).await {
-            Ok(members) => {
-                Some(i64::try_from(members.iter().filter(|m| m.is_bot).count()).unwrap_or(i64::MAX))
-            }
+        match bot_floor_scan(rest, guild).await {
+            Ok(scan) => Some(scan),
             Err(_) => {
                 tracing::warn!(job = "presence_probe", "presence_probe_bot_floor_failed");
                 None
