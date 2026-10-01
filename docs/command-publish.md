@@ -83,6 +83,12 @@ For an approved live rollout only, also set:
 TWO_COMMANDS_ALLOW_LIVE_GUILD=1
 ```
 
+In the Worker deployment, configure these as Worker bindings: the container
+startup allowlist forwards the publication opt-in, application ID, live-guild
+acknowledgement, and the registry feature bindings (including moderation's
+protected-user/role settings). None of these are enabled by default. Unrelated
+Worker bindings and `DISCORD_API_BASE` are not forwarded into the container.
+
 Boot uses the normal `GUILD_ID`, `DISCORD_TOKEN`, and feature bindings. Normal
 gateway prerequisites (including `DATABASE_URL`) still apply. If enabled,
 publication/refusal happens before opening the gateway database or connecting
