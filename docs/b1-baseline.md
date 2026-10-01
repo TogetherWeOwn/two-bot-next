@@ -119,37 +119,47 @@ rounded up to the next MiB. Base-image/toolchain changes must remeasure and
 justify any future budget increase. Docker is not available in the controller
 workspace; offline fixture sizes are not measurements.
 
-### Storage-backend-independent image measurement
+### Docker history image measurement and immutable-ID pinning
 
 Docker 29.8.1 with the containerd image store reports packed content plus
-unpacked snapshot usage in inspect `Size`; that is not the logical
-uncompressed-layer metric previously claimed here. See the exact-version
+unpacked snapshot usage in inspect `Size`; that is not the uncompressed-layer
+budget metric. See the exact-version
 [Moby inspect implementation](https://github.com/moby/moby/blob/docker-v29.8.1/daemon/containerd/image_inspect.go),
 [size accounting](https://github.com/moby/moby/blob/docker-v29.8.1/daemon/containerd/image_list.go),
 and [Docker's containerd storage documentation](https://docs.docker.com/engine/storage/containerd/).
 The original runner's storage backend was not recorded, so its historical
 number is not proof that a current image fits the limit.
 
-The gate now uses `scripts/docker_image_size.py` to stream `docker image save`
-for the inspected immutable image ID and count **unique uncompressed layer tar
-bytes**. It binds the exported config digest to that image ID and checks the
-platform and every layer diff ID against inspect metadata. Plain and gzip
-objects are supported; OCI blob paths also require matching encoded descriptor
-digests. Whiteouts and overwritten/deleted lower-layer files still count: this
-is not merged-filesystem size or compressed registry transfer size. The
-storage-driver `Size` is printed for diagnosis only, never used as a fallback.
-The binary measurement and runtime probes use the same immutable image ID.
+The gate reuses merged main [PR #145](https://github.com/TogetherWeOwn/two-bot-next/pull/145)'s
+metric: **summed uncompressed Docker history layer bytes**, from
+`docker history --no-trunc --human=false --format '{{.Size}}' IMAGE_ID`.
+This is Docker history accounting, not unique tar-export bytes,
+merged-filesystem size or compressed registry transfer size. The tag is
+inspected once and its `Id` is used for history, binary measurement, the
+runtime container and the no-server healthcheck probe. The storage-driver
+inspect `Size` is printed for diagnosis only, never used as a fallback.
 
-The export has a 120-second kill bound, reads in 64-KiB chunks, caps archive and
-decompressed traversal at 1 GiB and individual metadata at 1 MiB, and never
-extracts files or retains layer payloads. Malformed, truncated, ambiguous or
-mismatched archives fail closed. Offline fixtures exercise classic/OCI layouts,
-gzip, shared layers, whiteouts, corruption, bounds, and subprocess cleanup.
+Each history record must contain a nonempty, nonnegative integer byte count.
+Missing output, malformed/blank/negative records and an all-zero sum fail
+before any containers are created. Zero-size metadata layers are accepted
+alongside positive layers. History uses the existing 30-second Docker
+subprocess timeout; a timeout or nonzero exit aborts measurement without
+falling back to inspect `Size`. Offline fixtures cover this validation,
+separate history/daemon sizes, immutable-ID use and subprocess failures.
+
+The earlier **52/52 offline fixtures for the archive-parser implementation
+are historical and superseded**, not current-head validation. That parser
+failed real CI with `missing image config` in
+[run 36829502178, job 110273465190](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36829502178/job/110273465190).
+The unused streamed-archive helper and its archive-specific builders/tests
+have been removed in favor of main's history metric; the smoke/runtime
+contract fixtures remain.
+
 The **112 MiB image and 10 MiB binary ceilings are unchanged**. Real current-head
 CI must still record the corrected image size and pass the runtime contract and
 both one-byte-budget negative checks; fixture success alone cannot establish
-compliance. This measurement repair does not change the Dockerfile, runtime
-base, CA assets or configured user.
+compliance. No current-head image-fit claim is made here. This measurement
+repair does not change the Dockerfile, runtime base, CA assets or configured user.
 
 The historical hosted parked-mode contract passed, including SIGTERM exit 0 in 0.095 s.
 Manual log verification confirmed both deliberate one-byte-budget invocations

@@ -26,7 +26,7 @@ jobs:
     # A skipped dependency must not make the required check appear green.
     if: ${{ always() }}
     runs-on: [self-hosted, two-selfhosted]
-    timeout-minutes: 30
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
@@ -91,8 +91,12 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restore on every run; save only on pushes to main (below). A PR-scoped
+      # cache is unreadable by other PRs, and uploading the ~4 GiB target dir
+      # from a busy self-hosted runner pushed PR jobs past their timeout.
+      - name: Restore cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -206,6 +210,16 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+
+      - name: Save cargo cache (main only)
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   self-role-store:
     name: self-role store leases

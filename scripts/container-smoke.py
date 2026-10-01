@@ -10,8 +10,6 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
-from docker_image_size import image_bytes
-
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
 BINARY_MAX_BYTES = 10 * MIB
@@ -62,9 +60,18 @@ def http_response(url):
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
     metadata = json.loads(docker("image", "inspect", image).stdout)[0]
+    # Resolve the tag once; measurement and every image probe use this ID.
     image = metadata["Id"]
-    measured_image_bytes = image_bytes(metadata)
     report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")
+    # Sum Docker's uncompressed history layer sizes. Containerd inspect Size
+    # also counts compressed content blobs, so it is not the budget metric.
+    history = docker("history", "--no-trunc", "--human=false", "--format", "{{.Size}}", image).stdout
+    records = [line.strip() for line in history.splitlines()]
+    require(records, "Docker history returned no layer sizes")
+    require(all(record.isascii() and record.isdecimal() for record in records),
+            "Docker history layer sizes must be nonempty nonnegative integers")
+    measured_image_bytes = sum(int(record) for record in records)
+    require(measured_image_bytes > 0, "Docker history returned only zero-size layers")
     # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
     # orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex
@@ -77,7 +84,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     finally:
         docker("rm", "--force", measure, check=False)
     for label, size, limit in (
-        ("image (unique uncompressed layer tar bytes)", measured_image_bytes, image_max_bytes),
+        ("image (summed uncompressed Docker history layer bytes)", measured_image_bytes, image_max_bytes),
         ("release binary", binary_bytes, binary_max_bytes),
     ):
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")
