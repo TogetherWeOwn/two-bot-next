@@ -104,11 +104,8 @@ pub(crate) fn register(context: Arc<Context>) -> Option<Job> {
             return None;
         }
     };
-    if !gates.announcements {
-        return None;
-    }
-    scheduled_job(
-        gates.feed_poll_seconds,
+    register_gated(
+        gates,
         Arc::new(move || {
             let context = context.clone();
             Box::pin(async move {
@@ -122,7 +119,13 @@ pub(crate) fn register(context: Arc<Context>) -> Option<Job> {
             })
         }),
     )
-    .ok()
+}
+
+fn register_gated(gates: FeatureGates, action: JobAction) -> Option<Job> {
+    if !gates.announcements {
+        return None;
+    }
+    scheduled_job(gates.feed_poll_seconds, action).ok()
 }
 
 #[derive(Default)]
@@ -229,15 +232,14 @@ async fn deliver(
     error: &mut Option<ErrorClass>,
 ) {
     let token = new_id();
-    let claim = match store::claim_delivery(
-        pool,
-        &feed.guild_id,
-        post,
-        &token,
-        now_millis_for_test(),
-    )
-    .await
-    {
+    // Empty content denotes a ledger-only recovery placeholder, never an XML
+    // send. Only the bounded pending queue may take over an expired claim.
+    let acquired = if post.content.is_empty() {
+        store::claim_delivery(pool, &feed.guild_id, post, &token, now_millis_for_test()).await
+    } else {
+        store::claim_fresh_delivery(pool, &feed.guild_id, post, &token, now_millis_for_test()).await
+    };
+    let claim = match acquired {
         Ok(Some(claim)) => claim,
         Ok(None) => return,
         Err(_) => {

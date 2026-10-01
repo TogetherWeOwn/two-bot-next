@@ -209,6 +209,37 @@ fn default_off_and_interval_validation() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn registration_parks_off_values_without_constructing_work() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    for value in [None, Some("0"), Some("true"), Some("yes")] {
+        let mut vars = std::collections::HashMap::new();
+        if let Some(value) = value {
+            vars.insert("TWO_ANNOUNCEMENTS".to_owned(), value.to_owned());
+        }
+        let gates = FeatureGates::from_map(&vars).unwrap();
+        assert!(register_gated(gates, action.clone()).is_none());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let gates = FeatureGates::from_map(&std::collections::HashMap::from([
+        ("TWO_ANNOUNCEMENTS".to_owned(), "1".to_owned()),
+        ("TWO_FEED_POLL_SECONDS".to_owned(), "60".to_owned()),
+    ]))
+    .unwrap();
+    let job = register_gated(gates, action).unwrap();
+    assert_eq!(job.cadence, Duration::from_secs(60));
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "registration is lazy");
+    (job.action)().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 struct Active(Arc<AtomicUsize>);
 impl Drop for Active {
     fn drop(&mut self) {
@@ -287,6 +318,55 @@ async fn aborted_schedule_guard_allows_later_poll() {
     assert_eq!(starts.load(Ordering::SeqCst), 2);
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn supervisor_timeout_finishes_schedule_and_later_tick_runs() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let starts = starts.clone();
+        let active = active.clone();
+        move || {
+            let starts = starts.clone();
+            let active = active.clone();
+            Box::pin(async move {
+                assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                let _active = Active(active);
+                if starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+    });
+    let mut job = scheduled_job(60, action).unwrap();
+    job.timeout = Duration::from_secs(3);
+    let status = crate::jobs::statuses(&[NAME], false);
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let owner = tokio::spawn(crate::jobs::supervise(vec![job], status.clone(), receiver));
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        status.read().await[NAME].last_error_class,
+        Some(ErrorClass::Timeout)
+    );
+    tokio::time::advance(Duration::from_secs(57)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 2, "timeout guard released");
+    assert!(status.read().await[NAME].last_success.is_some());
+    assert_eq!(status.read().await[NAME].consecutive_failures, 0);
+    stop.send_replace(true);
+    owner.await.unwrap();
 }
 
 #[tokio::test]
@@ -460,7 +540,7 @@ async fn success_before_completion_db_failure_recovers_without_repost() {
 
 #[tokio::test]
 #[ignore = "requires guarded agent-testdb; CI runs explicitly"]
-async fn item_and_feed_failures_are_isolated_and_foreign_guild_is_silent() {
+async fn item_failures_are_isolated_and_foreign_guild_is_silent() {
     let db = fixture().await;
     store::add_feed(db.pool(), &feed("isolation"))
         .await
@@ -494,6 +574,190 @@ async fn item_and_feed_failures_are_isolated_and_foreign_guild_is_silent() {
         .await
         .unwrap();
     assert_eq!(post_count(&mock), 2);
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+struct FailFirstFeed {
+    failed: String,
+    visited: Mutex<Vec<String>>,
+}
+
+impl FeedFetch for FailFirstFeed {
+    fn fetch(&self, feed: FeedRelay) -> FetchFuture {
+        self.visited.lock().unwrap().push(feed.id.clone());
+        let failed = feed.id == self.failed;
+        Box::pin(async move {
+            if failed {
+                Err(ErrorClass::Feed)
+            } else {
+                FixtureHttp::items(1).fetch(feed).await
+            }
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn failed_feed_does_not_stop_later_feeds_or_hide_checked_status() {
+    let db = fixture().await;
+    for id in ["failed", "healthy"] {
+        store::add_feed(db.pool(), &feed(id)).await.unwrap();
+    }
+    let feeds = store::list_feeds(db.pool(), GUILD, true).await.unwrap();
+    let http = FailFirstFeed {
+        failed: feeds[0].id.clone(),
+        visited: Mutex::new(Vec::new()),
+    };
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"9001"}))).await;
+    assert_eq!(
+        run_once(db.pool(), &executor(&mock), GUILD, &http)
+            .await
+            .err(),
+        Some(ErrorClass::Feed)
+    );
+    assert_eq!(
+        *http.visited.lock().unwrap(),
+        feeds.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(post_count(&mock), 1);
+    assert_eq!(states(db.pool()).await, (1, 0));
+    assert!(store::list_feeds(db.pool(), GUILD, true)
+        .await
+        .unwrap()
+        .iter()
+        .all(|f| f.last_checked_at.is_some()));
+    let outcomes: Vec<(String, String)> = sqlx::query_as("SELECT target_key, outcome FROM announcements_audit_log WHERE outcome IN ('poll_failed', 'poll_result') ORDER BY target_key, outcome")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(outcomes.len(), 3, "failed feed plus one summary per feed");
+    assert!(outcomes.contains(&(http.failed.clone(), "poll_failed".to_owned())));
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn wire_timeout_keeps_pending_but_later_item_delivers_and_history_miss_never_reposts() {
+    let db = fixture().await;
+    store::add_feed(db.pool(), &feed("timeout")).await.unwrap();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id":"9001"})).delayed(Duration::from_secs(6)),
+            ScriptedResponse::json(200, json!({"id":"9002"})),
+            me(),
+            ScriptedResponse::json(200, json!([])),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+    assert_eq!(
+        run_once(db.pool(), &rest, GUILD, &FixtureHttp::items(2))
+            .await
+            .err(),
+        Some(ErrorClass::RecoveryRequired)
+    );
+    assert_eq!(states(db.pool()).await, (1, 1));
+    assert_eq!(
+        post_count(&mock),
+        2,
+        "single attempt per item even on timeout"
+    );
+    expire(db.pool()).await;
+    let reopened = db.independent_pool().await.unwrap();
+    assert_eq!(
+        run_once(&reopened, &rest, GUILD, &FixtureHttp::items(0))
+            .await
+            .err(),
+        Some(ErrorClass::RecoveryRequired)
+    );
+    assert_eq!(states(&reopened).await, (1, 1));
+    assert_eq!(post_count(&mock), 2);
+    reopened.close().await;
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn bounded_recovery_rotates_unresolved_rows_even_when_they_remain_in_xml() {
+    let db = fixture().await;
+    let relay = feed("recovery_budget");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    for index in 0..25 {
+        let post = plan_post(&relay, &item(index)).unwrap();
+        assert_eq!(
+            store::claim_delivery(
+                db.pool(),
+                GUILD,
+                &post,
+                &format!("seed-{index}"),
+                now_millis_for_test() - 120_000
+            )
+            .await
+            .unwrap(),
+            Some(DeliveryClaim::Fresh)
+        );
+    }
+    let pending = store::pending_deliveries(db.pool(), &relay, now_millis_for_test(), 200)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 25);
+    let mut script = Vec::new();
+    for _ in 0..20 {
+        script.extend([me(), ScriptedResponse::json(200, json!([]))]);
+    }
+    script.push(ScriptedResponse::json(200, json!({"id":"9999"})));
+    // Only leases actually searched rotate. The five previously unsearched
+    // rows must be first next pass, regardless of their current XML presence.
+    for post in &pending[20..] {
+        script.extend([me(), history(post)]);
+    }
+    for _ in 0..15 {
+        script.extend([me(), ScriptedResponse::json(200, json!([]))]);
+    }
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let rest = executor(&mock);
+    assert_eq!(
+        run_once(db.pool(), &rest, GUILD, &FixtureHttp::items(26))
+            .await
+            .err(),
+        Some(ErrorClass::RecoveryRequired)
+    );
+    assert_eq!(states(db.pool()).await, (1, 25));
+    assert_eq!(
+        post_count(&mock),
+        1,
+        "fresh item not blocked by recovery budget"
+    );
+    assert_eq!(
+        mock.requests().iter().filter(|r| r.method == "GET").count(),
+        40,
+        "twenty bounded recovery attempts, shared with XML"
+    );
+    sqlx::query("UPDATE feed_deliveries SET claimed_at = claimed_at - interval '120 seconds' WHERE state = 'pending'").execute(db.pool()).await.unwrap();
+    let rotated = store::pending_deliveries(db.pool(), &relay, now_millis_for_test(), 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        rotated[..5].iter().map(|p| &p.item_key).collect::<Vec<_>>(),
+        pending[20..]
+            .iter()
+            .map(|p| &p.item_key)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        run_once(db.pool(), &rest, GUILD, &FixtureHttp::items(0))
+            .await
+            .err(),
+        Some(ErrorClass::RecoveryRequired)
+    );
+    assert_eq!(states(db.pool()).await, (6, 20));
+    assert_eq!(post_count(&mock), 1, "recovery never posts");
+    assert_eq!(
+        mock.requests().iter().filter(|r| r.method == "GET").count(),
+        80
+    );
     mock.shutdown().await;
     db.close().await.unwrap();
 }

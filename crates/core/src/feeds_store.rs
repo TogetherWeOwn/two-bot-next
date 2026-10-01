@@ -102,6 +102,30 @@ pub async fn claim_delivery(
     token: &str,
     now_ms: i64,
 ) -> Result<Option<DeliveryClaim>, FeedStoreError> {
+    if let Some(claim) = claim_fresh_delivery(pool, guild_id, post, token, now_ms).await? {
+        return Ok(Some(claim));
+    }
+    let reclaimed = sqlx::query(
+        "UPDATE feed_deliveries d SET claim_token = $3, claimed_at = to_timestamp($4::bigint::double precision / 1000)
+         FROM feed_relays f WHERE d.feed_id = $1 AND d.item_key = $2 AND d.state = 'pending'
+         AND (d.claimed_at IS NULL OR d.claimed_at <= to_timestamp($5::bigint::double precision / 1000))
+         AND f.id = d.feed_id AND f.guild_id = $6 AND f.channel_id = $7 AND f.enabled"
+    ).bind(&post.feed_id).bind(&post.item_key).bind(token).bind(now_ms)
+        .bind(now_ms.saturating_sub(DELIVERY_CLAIM_LEASE_MS)).bind(guild_id).bind(&post.channel_id)
+        .execute(pool).await?.rows_affected();
+    Ok((reclaimed == 1).then_some(DeliveryClaim::Recovered))
+}
+
+/// XML candidates may acquire only never-claimed items. Recovery has its own
+/// bounded oldest-first queue: taking over skipped rows here would rotate their
+/// leases without examining history, starving them behind the same first page.
+pub async fn claim_fresh_delivery(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    post: &FeedPost,
+    token: &str,
+    now_ms: i64,
+) -> Result<Option<DeliveryClaim>, FeedStoreError> {
     if token.is_empty() {
         return Err(FeedStoreError::EmptyClaimToken);
     }
@@ -123,18 +147,7 @@ pub async fn claim_delivery(
     .execute(pool)
     .await?
     .rows_affected();
-    if inserted == 1 {
-        return Ok(Some(DeliveryClaim::Fresh));
-    }
-    let reclaimed = sqlx::query(
-        "UPDATE feed_deliveries d SET claim_token = $3, claimed_at = to_timestamp($4::bigint::double precision / 1000)
-         FROM feed_relays f WHERE d.feed_id = $1 AND d.item_key = $2 AND d.state = 'pending'
-         AND (d.claimed_at IS NULL OR d.claimed_at <= to_timestamp($5::bigint::double precision / 1000))
-         AND f.id = d.feed_id AND f.guild_id = $6 AND f.channel_id = $7 AND f.enabled"
-    ).bind(&post.feed_id).bind(&post.item_key).bind(token).bind(now_ms)
-        .bind(now_ms.saturating_sub(DELIVERY_CLAIM_LEASE_MS)).bind(guild_id).bind(&post.channel_id)
-        .execute(pool).await?.rows_affected();
-    Ok((reclaimed == 1).then_some(DeliveryClaim::Recovered))
+    Ok((inserted == 1).then_some(DeliveryClaim::Fresh))
 }
 
 /// Recovery must not depend on an item remaining in the current feed document.

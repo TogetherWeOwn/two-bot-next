@@ -143,7 +143,10 @@ summaries; raw HTTP, source and database errors are not logged.
 Recovery separately discovers up to 20 expired ledger rows per feed/pass, even
 when HTTP fails or the item disappeared from XML. Oldest leases are selected
 first; reclaiming unresolved rows rotates their lease to avoid starving the
-rest of the recovery queue. Each reconciliation uses the shared executor for
+rest of the recovery queue. XML candidates use fresh-only arbitration: existing
+pending rows are left to that queue, never reclaimed without a history read
+because the pass's recovery budget ran out. New items retain their independent
+20-attempt POST budget. Each reconciliation uses the shared executor for
 one authenticated-user read and one bounded 100-message history read. Exact
 string nonce, channel, authenticated author and nonzero snowflake message ID
 must all match uniquely. A miss, malformed/ambiguous evidence, failed send or
