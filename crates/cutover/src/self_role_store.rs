@@ -1041,6 +1041,70 @@ impl SelfRoleStore {
         }))
     }
 
+    /// Move an older processing owner to terminal discovery even when its row
+    /// arrived after the winning lane's bulk supersession. This is not settlement:
+    /// pending exchanges, immutable intent and all effects remain untouched.
+    /// Recheck stored chronology/scope and the live event fence after panel ->
+    /// audit waits; a discovery hint or a stale Superseded result is insufficient.
+    pub async fn supersede_processing_audit(
+        &self,
+        claim: &EventClaim,
+        key: &PanelKey,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let panel: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT latest_event_id,latest_event_order FROM self_role_panel_claims
+             WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3 FOR UPDATE",
+        )
+        .bind(&key.guild_id)
+        .bind(&key.member_id)
+        .bind(&key.panel_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        lock_event(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
+        let event: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT event_order FROM self_role_audit WHERE event_id=$1
+             AND guild_id=$2 AND member_id=$3 AND panel_id=$4",
+        )
+        .bind(&claim.event_id)
+        .bind(&key.guild_id)
+        .bind(&key.member_id)
+        .bind(&key.panel_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let later =
+            panel
+                .filter(|(id, _)| id.as_deref().is_some_and(|id| id != claim.event_id))
+                .and_then(|(id, order)| {
+                    order.or_else(|| id.as_deref().and_then(event_order_from_snowflake))
+                })
+                .zip(event.and_then(|(order,)| {
+                    order.or_else(|| event_order_from_snowflake(&claim.event_id))
+                }))
+                .is_some_and(|(panel, event)| event < panel);
+        if !later {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let changed = sqlx::query(
+            "UPDATE self_role_audit SET outcome='rejected',code='superseded_by_later_event',
+             reason='a later exclusive-panel event was accepted',processing_expires_at=NULL
+             WHERE event_id=$1 AND claim_token=$2 AND claim_generation=$3
+             AND outcome='processing' AND processing_expires_at > $4",
+        )
+        .bind(&claim.event_id)
+        .bind(claim.token.expose())
+        .bind(claim.generation)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(changed)
+    }
+
     pub async fn owns_panel_claim(&self, claim: &PanelClaim) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         lock_panel(&mut tx, claim).await?;

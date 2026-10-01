@@ -921,9 +921,232 @@ async fn exercise(pool: &PgPool) -> TestResult {
 
     exercise_effect_recovery(pool).await?;
     exercise_superseded_evidence(pool).await?;
+    early_processing_supersession(pool).await?;
+    early_processing_supersession_waits(pool).await?;
     exercise_generated_event_order(pool).await?;
     exercise_db_clock_waits(pool).await?;
     exercise_atomic_finish_wait(pool).await?;
+    Ok(())
+}
+
+async fn early_processing_supersession(pool: &PgPool) -> TestResult {
+    for case in [
+        "preserve",
+        "missing",
+        "guild",
+        "member",
+        "panel",
+        "equal",
+        "newer",
+        "unknown",
+        "same-event",
+        "legacy",
+        "expired",
+        "rotated",
+    ] {
+        let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+        let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+        let mut audit = row(&format!("early-supersession-{case}"), "0001");
+        audit.panel_id = audit.event_id.clone();
+        if case == "equal" {
+            audit.event_order = Some("0002".into());
+        }
+        if case == "newer" {
+            audit.event_order = Some("0003".into());
+        }
+        if case == "unknown" || case == "legacy" {
+            audit.event_order = None;
+        }
+        if case == "legacy" {
+            audit.event_id = "100000000000000011".into();
+        }
+        let key = panel_key(&audit);
+        let winner = if case == "same-event" {
+            audit.event_id.clone()
+        } else if case == "legacy" {
+            "100000000000000012".into()
+        } else {
+            format!("{}-winner", audit.panel_id)
+        };
+        if case != "missing" {
+            let mut lane = acquired(store.claim_panel(&key, Some((&winner, "0002"))).await?);
+            assert!(
+                store
+                    .set_panel_claim_option(&mut lane, Some("chess"))
+                    .await?
+            );
+            assert!(store.release_panel_claim(&lane).await?);
+            if case == "legacy" {
+                sqlx::query(
+                    "UPDATE self_role_panel_claims SET latest_event_order=NULL WHERE panel_id=$1",
+                )
+                .bind(&key.panel_id)
+                .execute(pool)
+                .await?;
+            }
+        }
+        audit.effects = AuditEffects {
+            added_role_ids: vec!["role-a".into()],
+            removed_role_ids: vec!["role-b".into()],
+            attempted_added_role_ids: vec!["role-a".into()],
+            attempted_removed_role_ids: vec!["role-b".into()],
+            compensated_added_role_ids: vec!["role-b".into()],
+            compensated_removed_role_ids: vec!["role-a".into()],
+            unresolved_added_role_ids: vec!["role-a".into()],
+            unresolved_removed_role_ids: vec!["role-b".into()],
+        };
+        // Insert AFTER the winner so bulk supersession cannot hide this gap.
+        let event = store.claim_audit(&audit).await?.unwrap();
+        assert!(
+            store
+                .checkpoint_exchange(&event, &audit.effects, true, Some(true))
+                .await?
+        );
+        let mut supplied_key = key.clone();
+        match case {
+            "guild" => supplied_key.guild_id.push_str("-other"),
+            "member" => supplied_key.member_id.push_str("-other"),
+            "panel" => supplied_key.panel_id.push_str("-other"),
+            _ => {}
+        }
+        if supplied_key != key {
+            let lane = acquired(
+                store
+                    .claim_panel(&supplied_key, Some((&winner, "0002")))
+                    .await?,
+            );
+            assert!(store.release_panel_claim(&lane).await?); // a real later lane, but wrong audit scope
+        }
+        if case == "expired" || case == "rotated" {
+            clock.store(TEST_NOW_MS + 300, Ordering::SeqCst);
+        }
+        if case == "rotated" {
+            let replacement = store.claim_audit(&audit).await?.unwrap();
+            assert_eq!(replacement.generation, event.generation + 1);
+        }
+        let before: String = sqlx::query_scalar(
+            "SELECT (to_jsonb(a)-'claim_token'-'outcome'-'code'-'reason'-'processing_expires_at')::text
+             FROM self_role_audit a WHERE event_id=$1",
+        ).bind(&audit.event_id).fetch_one(pool).await?;
+        let panel_before: Option<String> = sqlx::query_scalar(
+            "SELECT (to_jsonb(p)-'claim_token')::text FROM self_role_panel_claims p
+             WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3",
+        )
+        .bind(&key.guild_id)
+        .bind(&key.member_id)
+        .bind(&key.panel_id)
+        .fetch_optional(pool)
+        .await?;
+        let changed = store
+            .supersede_processing_audit(&event, &supplied_key)
+            .await?;
+        assert_eq!(changed, matches!(case, "preserve" | "legacy"));
+        let after: String = sqlx::query_scalar(
+            "SELECT (to_jsonb(a)-'claim_token'-'outcome'-'code'-'reason'-'processing_expires_at')::text
+             FROM self_role_audit a WHERE event_id=$1",
+        ).bind(&audit.event_id).fetch_one(pool).await?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&before)?,
+            serde_json::from_str::<serde_json::Value>(&after)?
+        );
+        let panel_after: Option<String> = sqlx::query_scalar(
+            "SELECT (to_jsonb(p)-'claim_token')::text FROM self_role_panel_claims p
+             WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3",
+        )
+        .bind(&key.guild_id)
+        .bind(&key.member_id)
+        .bind(&key.panel_id)
+        .fetch_optional(pool)
+        .await?;
+        assert_eq!(panel_before, panel_after);
+        let state: (String, Option<String>, Option<String>, bool) = sqlx::query_as(
+            "SELECT outcome,code,reason,processing_expires_at IS NULL FROM self_role_audit WHERE event_id=$1",
+        ).bind(&audit.event_id).fetch_one(pool).await?;
+        if changed {
+            assert_eq!(
+                state,
+                (
+                    "rejected".into(),
+                    Some("superseded_by_later_event".into()),
+                    Some("a later exclusive-panel event was accepted".into()),
+                    true
+                )
+            );
+            assert!(!store.supersede_processing_audit(&event, &key).await?); // no replay/reopening
+            assert!(!store.owns_claim(&event).await?);
+            assert!(store
+                .recoverable_audits(
+                    &key.guild_id,
+                    &key.panel_id,
+                    &audit.source_id,
+                    audit.source,
+                    1
+                )
+                .await?
+                .is_empty());
+            assert_eq!(
+                store
+                    .superseded_audits(
+                        &key.guild_id,
+                        &key.panel_id,
+                        &audit.source_id,
+                        audit.source,
+                        1
+                    )
+                    .await?
+                    .len(),
+                1
+            );
+        } else {
+            assert_eq!(state, ("processing".into(), None, None, false));
+        }
+    }
+    Ok(())
+}
+
+async fn early_processing_supersession_waits(pool: &PgPool) -> TestResult {
+    for case in ["panel-expiry", "audit-expiry", "chronology"] {
+        let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+        let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+        let mut audit = row(&format!("early-supersession-wait-{case}"), "0001");
+        audit.panel_id = audit.event_id.clone();
+        let key = panel_key(&audit);
+        let lane = acquired(
+            store
+                .claim_panel(&key, Some(("wait-winner", "0002")))
+                .await?,
+        );
+        assert!(store.release_panel_claim(&lane).await?);
+        let event = store.claim_audit(&audit).await?.unwrap();
+        let mut blocker = pool.begin().await?;
+        if case == "audit-expiry" {
+            sqlx::query("SELECT event_id FROM self_role_audit WHERE event_id=$1 FOR UPDATE")
+                .bind(&audit.event_id)
+                .fetch_one(&mut *blocker)
+                .await?;
+        } else {
+            sqlx::query("SELECT panel_id FROM self_role_panel_claims WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3 FOR UPDATE")
+                .bind(&key.guild_id).bind(&key.member_id).bind(&key.panel_id).fetch_one(&mut *blocker).await?;
+        }
+        let mut operation = Box::pin(store.supersede_processing_audit(&event, &key));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), operation.as_mut())
+                .await
+                .is_err()
+        );
+        if case == "chronology" {
+            sqlx::query("UPDATE self_role_panel_claims SET latest_event_order='0001' WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3")
+                .bind(&key.guild_id).bind(&key.member_id).bind(&key.panel_id).execute(&mut *blocker).await?;
+        } else {
+            clock.store(TEST_NOW_MS + 300, Ordering::SeqCst); // equality is expired AFTER the lock wait
+        }
+        blocker.commit().await?;
+        assert!(!operation.await?);
+        let state: (String, Option<String>, bool) = sqlx::query_as(
+            "SELECT outcome,code,processing_expires_at IS NULL FROM self_role_audit WHERE event_id=$1",
+        ).bind(&audit.event_id).fetch_one(pool).await?;
+        assert_eq!(state, ("processing".into(), None, false));
+    }
     Ok(())
 }
 

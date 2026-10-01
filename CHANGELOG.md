@@ -40,6 +40,11 @@
   fault-injection source coverage for partial repair rejection/rate-limit/received
   ambiguity/timeout, independent evidence/lane transfer during REST, and expiry
   after pacing or journal waits without false sends or uncertainty retirement.
+  Route older processing audits inserted after the winning lane's bulk
+  supersession into terminal discovery before prepared ownership, using a fresh
+  post-lock event fence and stored scope/chronology checks. Preserve all intent,
+  pending and compensation evidence without REST or winner publication; add
+  early-supersession runtime/store and lock-wait source fixtures.
   Production boot remains disabled until approved shared boot configuration,
   unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,

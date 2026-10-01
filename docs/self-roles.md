@@ -304,6 +304,19 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   snapshots or any effect array before REST. The dedicated terminal evidence
   owner renews while bounded-waiting for a new maintenance lane; both renewal
   tasks belong to the awaited repair and abort when it is dropped.
+- A processing audit inserted after a newer lane's bulk supersession can discover
+  that it is obsolete before constructing `PreparedSelfRole`. Admission now uses
+  `supersede_processing_audit`, not generic refusal/settlement: it locks the panel
+  then audit, rechecks stored scope and strictly later distinct-event chronology
+  (including legacy snowflake fallback), and checks the live event token/generation
+  against a clock sampled after both waits. Only rejection/code/reason/processing
+  expiry change; all snapshots, effects, compensation and pending state survive.
+  No REST, success reply or target publication occurs in this transition; dirty
+  admission still returns an unresolved/pending result, not a no-effect refusal.
+  Terminal rows with evidence become eligible for the separate repair queue;
+  clean rejections need no repair. Dry-run can record this rejection but never
+  claims terminal work.
+  Unknown sends remain unknown after the transition and cannot complete a receipt.
 - The only repair target is the maintenance lane's **committed** option or
   committed null/empty selection. Unknown targets and removed options fail
   before REST; no target is seeded from the old before/desired intent. Original
@@ -341,7 +354,10 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   ownership checks; post-journal expiry must prevent REST, retain attempted
   history, resolve only the new definite no-send and preserve inherited unknown
   evidence. Paired store fixtures cover normal/unknown lane refusal and expiry
-  after both panel and audit lock waits. These are **uncompiled source coverage**,
+  after both panel and audit lock waits. Early-supersession fixtures cover ten
+  selected/empty runtime cases (clean/effects/compensation/pending/dry-pending),
+  twelve store scope/chronology/generation/preservation cases and three
+  post-lock expiry/chronology cases. These are **uncompiled source coverage**,
   not passed Rust acceptance or independent review.
 
 Production dispatch/boot remains disabled. The conservative unknown-work

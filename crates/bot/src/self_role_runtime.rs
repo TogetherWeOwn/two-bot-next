@@ -1255,9 +1255,21 @@ impl SelfRoleRuntime {
                         break;
                     }
                     PanelClaimResult::Superseded(_) => {
-                        return self
-                            .reject(audit, &event, None, "superseded_by_later_event")
-                            .await;
+                        // No PreparedSelfRole exists yet. Preserve unfinished
+                        // work while making it discoverable by the dedicated
+                        // terminal repair path, never the generic settlement.
+                        if !store_io(self.store.supersede_processing_audit(&event, &key)).await? {
+                            return Err(RuntimeError::Stale);
+                        }
+                        // The audit is rejected, but unresolved effects still
+                        // require a pending user result until separate repair.
+                        if event.exchange_pending {
+                            return Err(RuntimeError::PendingExchange);
+                        }
+                        if event.compensating || event.effects != AuditEffects::default() {
+                            return Err(RuntimeError::Stale);
+                        }
+                        return Ok(Admission::Rejected("superseded_by_later_event"));
                     }
                     PanelClaimResult::Busy if tokio::time::Instant::now() < deadline => {
                         tokio::time::sleep(LANE_BACKOFF).await;
