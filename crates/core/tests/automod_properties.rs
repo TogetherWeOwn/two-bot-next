@@ -8,8 +8,7 @@
 
 use proptest::prelude::*;
 use two_bot_core::automod::{
-    match_automod, normalize_content, AutomodFilter, AutomodMessage, AutomodPolicy,
-    RepeatTracker,
+    match_automod, normalize_content, AutomodFilter, AutomodMessage, AutomodPolicy, RepeatTracker,
 };
 
 fn message(content: String) -> AutomodMessage {
