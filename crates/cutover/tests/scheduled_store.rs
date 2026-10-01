@@ -525,11 +525,14 @@ async fn audit_rows_record_outcomes() {
     .await
     .unwrap();
 
-    let (count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM automation_audit_log WHERE guild_id = $1")
-            .bind(guild)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM automation_audit_log
+         WHERE guild_id = $1 AND created_at = $2::TEXT::TIMESTAMPTZ",
+    )
+    .bind(guild)
+    .bind(iso(NOW))
+    .fetch_one(pool)
+    .await
+    .unwrap();
     assert_eq!(count, 1);
 }

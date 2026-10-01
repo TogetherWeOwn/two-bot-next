@@ -27,7 +27,7 @@ use sqlx::{Pool, Postgres};
 use crate::scheduled::advance_next_run_iso;
 
 /// One scheduled message row (legacy `ScheduledMessageRow`).
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ScheduledMessageRow {
     pub id: String,
     pub guild_id: String,
@@ -348,7 +348,7 @@ pub async fn audit_scheduled(
     sqlx::query(
         "INSERT INTO automation_audit_log
            (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::TEXT::TIMESTAMPTZ)",
     )
     .bind(id)
     .bind(&row.guild_id)

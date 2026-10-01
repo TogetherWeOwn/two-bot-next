@@ -98,23 +98,18 @@ impl ModerationAction {
     /// Discord permission gate (legacy `permissionFor` + builder flags).
     #[must_use]
     pub fn required_permission(self) -> u64 {
-        match self {
-            Self::Ban | Self::TempBan => PERM_BAN_MEMBERS,
-            Self::Kick => PERM_KICK_MEMBERS,
-            Self::Timeout | Self::Warn => PERM_MODERATE_MEMBERS,
-            Self::Purge => PERM_MANAGE_MESSAGES,
-            Self::Slowmode | Self::Lockdown | Self::Unlock => PERM_MANAGE_CHANNELS,
-        }
+        crate::command_permissions::command_permission(self.command_name())
+            .expect("moderation command has a permission row")
+            .required_permissions
     }
 
     /// Member-targeted verbs (legacy `TARGET_ACTIONS`). Channel verbs skip the
     /// target checks entirely in [`assert_moderation_allowed`].
     #[must_use]
     pub fn targets_member(self) -> bool {
-        matches!(
-            self,
-            Self::Ban | Self::TempBan | Self::Kick | Self::Timeout | Self::Warn
-        )
+        crate::command_permissions::command_permission(self.command_name()).is_some_and(|row| {
+            row.policy_hook == Some(crate::command_permissions::PolicyHook::MemberModeration)
+        })
     }
 }
 
@@ -355,14 +350,15 @@ pub enum ReasonError {
 }
 
 /// Validate the mandatory audit reason: trimmed, non-empty, at most 512
-/// characters (legacy `requireModerationReason`; counted in code points —
-/// identical to legacy UTF-16 units for BMP text).
+/// characters (legacy `requireModerationReason`, whose JS `length` counts
+/// UTF-16 code units — so an astral character costs 2, not the 1 that
+/// `chars().count()` would count).
 pub fn require_moderation_reason(value: &str) -> Result<String, ReasonError> {
     let reason = value.trim();
     if reason.is_empty() {
         return Err(ReasonError::Empty);
     }
-    if reason.chars().count() > 512 {
+    if reason.encode_utf16().count() > 512 {
         return Err(ReasonError::TooLong);
     }
     Ok(reason.to_owned())
@@ -694,6 +690,18 @@ mod tests {
             Err(ReasonError::TooLong)
         );
         assert!(require_moderation_reason(&"x".repeat(512)).is_ok());
+        // Legacy JS `length` counts UTF-16 units: 256 astral characters are
+        // exactly 512 units (accepted), 257 are 514 (refused). BMP text is
+        // unchanged — é is 1 unit either way.
+        assert!(require_moderation_reason(&"\u{1F600}".repeat(256)).is_ok());
+        assert_eq!(
+            require_moderation_reason(&"\u{1F600}".repeat(257)),
+            Err(ReasonError::TooLong)
+        );
+        assert_eq!(
+            require_moderation_reason(&"\u{1F600}".repeat(300)),
+            Err(ReasonError::TooLong)
+        );
     }
 
     #[test]

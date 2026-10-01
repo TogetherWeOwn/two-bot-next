@@ -1,7 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover"]
-default-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover"]
+members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/testsupport"]
+default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover"]
+
+# One native Rust release strategy versions the whole workspace. The root
+# library exposes release metadata; it is not a crates.io distribution.
+[package]
+name = "two-bot-next"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
 
 [workspace.package]
 edition = "2021"
@@ -18,8 +28,24 @@ axum = { version = "0.8", default-features = false, features = [
     "tokio",
     "tracing",
 ] }
+base64 = "0.22"
+bytes = "1"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 hex = "0.4"
 hmac = "0.13"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "http1",
+    "ring",
+    "webpki-roots",
+] }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "tokio",
+    "client-legacy",
+    "http1",
+] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: serde_json maps keep insertion order (IndexMap) instead of
@@ -44,6 +70,11 @@ sqlx = { version = "0.9", default-features = false, features = [
     "json",
     "time",
 ] }
+# Unicode link patterns and WHATWG host parsing preserve legacy automod semantics.
+regex = "1"
+url = "2"
+# NFKC normalization for the automod bad-word matcher.
+unicode-normalization = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -53,8 +84,12 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "io-util",
+    "process",
 ] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# hyper-util's DNS-pinned connector impls `tower_service::Service<Name>`;
+# already in the lockfile transitively (MIT, deny.toml-allowed).
+tower-service = "0.3"
 tower-http = { version = "0.7", default-features = false, features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -88,5 +123,6 @@ twilight-model = "0.17"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# Job tasks must unwind so the supervisor can isolate a panic in release too.
+panic = "unwind"
 strip = true

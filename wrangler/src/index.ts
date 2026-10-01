@@ -24,6 +24,7 @@ import { Container } from "@cloudflare/containers";
 import {
   TokenBuckets,
   handleRedirect,
+  isReservedInternal,
   type Campaign,
   type RedirectClick,
 } from "./redirect.ts";
@@ -70,22 +71,35 @@ interface KeepalivePayload {
 const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
 
+function containerPort(raw: string | undefined): number {
+  if (raw === undefined) return 8080;
+  const port = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("BOT_PORT must be an integer between 1 and 65535");
+  }
+  return port;
+}
+
 /** Readonly view of the secrets/vars the DO forwards into the container. */
-function containerEnvVars(env: Env): Record<string, string> {
+function containerEnvVars(env: Env, port: number): Record<string, string> {
   const vars: Record<string, string> = {};
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;
-  vars["LISTEN_ADDR"] = `0.0.0.0:${env.BOT_PORT ?? "8080"}`;
+  vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   return vars;
 }
 
 export class TwoBotContainer extends Container<Env> {
-  defaultPort = 8080;
+  override defaultPort = containerPort(this.env.BOT_PORT);
   // Belt and braces: the schedule() keepalive below is the primary guard;
   // a long sleepAfter means a missed tick or two never costs the session.
   sleepAfter = "30m";
   pingEndpoint = "health";
+  // SDK auto-start (containerFetch -> startAndWaitForPorts) bypasses start().
+  // Class defaults feed every startup path; explicit envVars replace them.
+  // https://developers.cloudflare.com/containers/examples/env-vars-and-secrets/
+  override envVars = containerEnvVars(this.env, this.defaultPort);
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -96,23 +110,6 @@ export class TwoBotContainer extends Container<Env> {
     }
 
     return new Response("not found", { status: 404 });
-  }
-
-  /**
-   * Start the container with secrets from the Worker env when it is not
-   * already running. containerFetch() auto-starts with class defaults, but
-   * secrets must be passed explicitly — this is the only place Worker
-   * secrets cross into the container, as env vars (never in image/layers).
-   */
-  override async start(...args: Parameters<Container<Env>["start"]>) {
-    const [startOptions, waitOptions] = args;
-    return super.start(
-      {
-        envVars: { ...containerEnvVars(this.env), ...startOptions?.envVars },
-        ...startOptions,
-      },
-      waitOptions,
-    );
   }
 
   /** Arm the self-perpetuating schedule() keepalive (idempotent). */
@@ -176,6 +173,13 @@ export default {
     if (url.pathname === "/health" || url.pathname === "/readyz") {
       const container = env.TWO_BOT.getByName(SINGLETON_NAME);
       return container.fetch(request);
+    }
+
+    // Metrics are container-internal, never a public proxy or invite campaign.
+    // Canonicalized like the campaign lookup so /METRICS, /%6detrics,
+    // //metrics and /metrics/* cannot become a campaign redirect.
+    if (isReservedInternal(url.pathname)) {
+      return new Response("not found", { status: 404 });
     }
 
     // B3: everything else is a go.two.gg tracked link. Clicks record after
