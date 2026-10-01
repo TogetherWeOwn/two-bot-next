@@ -215,11 +215,10 @@ async fn scenarios(source: PgPool, target: PgPool) -> TestResult {
         .fetch_one(&target)
         .await?;
     assert!(revision_after > revision);
-    let settings_metadata: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT xmin::text, cas_version FROM guild_settings ORDER BY guild_id, key",
-    )
-    .fetch_all(&target)
-    .await?;
+    let settings_metadata: Vec<(String, i64)> =
+        sqlx::query_as("SELECT xmin::text, cas_version FROM guild_settings ORDER BY guild_id, key")
+            .fetch_all(&target)
+            .await?;
     let cas_allocation: i64 = sqlx::query_scalar("SELECT last_value FROM guild_settings_cas_seq")
         .fetch_one(&target)
         .await?;
@@ -252,7 +251,10 @@ async fn scenarios(source: PgPool, target: PgPool) -> TestResult {
     // A genuine import change must invalidate destination CAS even when the
     // source retains the SAME legacy version. Preserve the existing mapping;
     // do not weaken equality/parity checks to accommodate rewritten versions.
-    let settings = tables.iter().find(|t| t.source == "guild_settings").unwrap();
+    let settings = tables
+        .iter()
+        .find(|t| t.source == "guild_settings")
+        .unwrap();
     let old_token: i64 = sqlx::query_scalar(
         "SELECT cas_version FROM guild_settings WHERE guild_id='g1' AND key='TWO_RAID_JOIN_THRESHOLD'",
     )
@@ -282,7 +284,13 @@ async fn scenarios(source: PgPool, target: PgPool) -> TestResult {
     for value in [Some(serde_json::json!(5)), None] {
         assert!(matches!(
             store
-                .set_if_version("g1", "TWO_RAID_JOIN_THRESHOLD", value, "fixture", Some(old_token))
+                .set_if_version(
+                    "g1",
+                    "TWO_RAID_JOIN_THRESHOLD",
+                    value,
+                    "fixture",
+                    Some(old_token)
+                )
                 .await,
             Err(two_bot_cutover::settings::SettingsWriteError::VersionConflict)
         ));

@@ -32,7 +32,7 @@ impl std::fmt::Debug for SettingsCommand {
 
 impl SettingsCommand {
     /// Validate before reaching any store. Null deletes; omission is malformed.
-    /// An optional expected_version is a row version, with zero meaning absent.
+    /// An optional expected_version is an opaque signed CAS token; zero is absent.
     pub fn parse(action: &str, body: &Map<String, Value>) -> Result<Self, ActionError> {
         if !matches!(action, "settings.get" | "settings.set") {
             return Err(ActionError::new(
