@@ -560,8 +560,9 @@ pub mod store {
 
     /// Atomically delete a sticky (`store.deleteSticky` + `deleteSticky`
     /// service half: legacy deletes the message best-effort after the row
-    /// delete). [`RemoveOutcome::Removed`] carries the previous message id
-    /// for Discord cleanup; [`RemoveOutcome::Absent`] means no row existed.
+    /// delete). [`RemoveOutcome::Removed`](super::RemoveOutcome::Removed) carries
+    /// the previous message id for Discord cleanup;
+    /// [`RemoveOutcome::Absent`](super::RemoveOutcome::Absent) means no row existed.
     pub async fn delete_sticky(
         pool: &Pool<Postgres>,
         guild_id: &str,
