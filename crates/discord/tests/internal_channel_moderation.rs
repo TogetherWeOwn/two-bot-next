@@ -493,6 +493,151 @@ async fn recovery_read_failures_release_both_fences_and_preserve_original_seed()
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service container"]
+async fn rejected_channel_reservations_release_request_claim_and_allow_same_key_retry() {
+    for repeated in [false, true] {
+        let db = TestDb::new().await;
+        let original = if repeated {
+            Some(seed_lockdown(&db, Some("3072")).await)
+        } else {
+            None
+        };
+        sqlx::query(
+            "ALTER TABLE moderation_channel_executions ADD CONSTRAINT reject_reservation \
+             CHECK (idempotency_key <> 'reservation-rejected-key')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mock = MockRest::start(
+            vec![
+                channel(Some("3072"), "8192"),
+                ScriptedResponse::status(204),
+                channel(None, "0"),
+                ScriptedResponse::json(200, json!({})),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let exec = executor(db.pool.clone(), &mock);
+        let req = request("moderation.lockdown", json!({}));
+        assert_eq!(
+            exec.execute(
+                &req,
+                &actor(),
+                "reservation-rejected",
+                "reservation-rejected-key",
+                TIME,
+            )
+            .await
+            .unwrap_err()
+            .code,
+            ErrorCode::Internal
+        );
+        assert!(mock.requests().is_empty());
+        assert_reservations(&db, 0).await;
+        assert_eq!(db.store().get_lockdown(CHANNEL).await.unwrap(), original);
+        sqlx::query("ALTER TABLE moderation_channel_executions DROP CONSTRAINT reject_reservation")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let result = exec
+            .execute(
+                &req,
+                &actor(),
+                "reservation-retry",
+                "reservation-rejected-key",
+                TIME,
+            )
+            .await
+            .unwrap();
+        assert!(!result.replayed);
+        assert_eq!(result.outcome, "locked_down");
+        if let Some(original) = original {
+            assert_eq!(
+                db.store().get_lockdown(CHANNEL).await.unwrap(),
+                Some(original)
+            );
+        }
+        exec.execute(
+            &request("moderation.slowmode", json!({"seconds":0})),
+            &actor(),
+            "after-reservation-retry",
+            "after-reservation-retry-key",
+            TIME,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock.requests().len(), 4);
+        mock.shutdown().await;
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn unknown_channel_reservation_completion_retains_request_claim() {
+    let db = TestDb::new().await;
+    // Inject a server-reported unknown completion in only this test's schema.
+    sqlx::query(
+        "CREATE FUNCTION unknown_reservation() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'reservation completion unknown' USING ERRCODE = '40003'; \
+         END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER unknown_reservation BEFORE INSERT ON moderation_channel_executions \
+         FOR EACH ROW EXECUTE FUNCTION unknown_reservation()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let exec = executor(db.pool.clone(), &mock);
+    let req = request("moderation.lockdown", json!({}));
+    assert_eq!(
+        exec.execute(
+            &req,
+            &actor(),
+            "unknown-reservation",
+            "unknown-reservation-key",
+            TIME
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Internal
+    );
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(claims, 1);
+    sqlx::query("DROP TRIGGER unknown_reservation ON moderation_channel_executions")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        exec.execute(
+            &req,
+            &actor(),
+            "unknown-reservation-retry",
+            "unknown-reservation-key",
+            TIME
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::InProgress
+    );
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
 async fn rejected_recovery_writes_release_reservations_without_discord_mutation() {
     for repeated in [false, true] {
         let db = TestDb::new().await;

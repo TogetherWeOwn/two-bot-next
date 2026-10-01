@@ -218,12 +218,25 @@ impl InternalChannelExecutor {
             }
             ChannelClaim::Claimed { ticket } => ticket,
         };
-        if !self
+        let reserved = match self
             .store
             .reserve_channel(&ticket, &request.channel_id)
             .await
-            .map_err(database_error)?
         {
+            Ok(reserved) => reserved,
+            Err(failure) => {
+                // A definitive rejection acquired no channel fence and sent no
+                // Discord request. Release only this generation's request claim;
+                // unknown completion must retain it for reconciliation.
+                if definitive_database_rejection(&failure)
+                    && !self.store.release(&ticket).await.map_err(database_error)?
+                {
+                    return Err(stale_fence());
+                }
+                return Err(database_error(failure));
+            }
+        };
+        if !reserved {
             if !self.store.release(&ticket).await.map_err(database_error)? {
                 return Err(stale_fence());
             }
@@ -346,13 +359,8 @@ impl InternalChannelExecutor {
                         // Only definitive SQL rejections prove no seed commit;
                         // transport/unknown-completion errors remain fenced.
                         // No Discord PUT was sent. Preserve any original seed.
-                        if let sqlx::Error::Database(db) = &failure {
-                            if db
-                                .code()
-                                .is_some_and(|code| definitive_sql_rejection(&code))
-                            {
-                                self.abort(&ticket, &audit, None).await?;
-                            }
+                        if definitive_database_rejection(&failure) {
+                            self.abort(&ticket, &audit, None).await?;
                         }
                         return Err(database_error(failure));
                     }
@@ -525,6 +533,15 @@ fn bounded_audit_reason(
 fn error(code: ErrorCode, message: impl Into<String>) -> ActionError {
     ActionError::new(code, message, "internal_channel_moderation")
 }
+fn definitive_database_rejection(failure: &sqlx::Error) -> bool {
+    match failure {
+        sqlx::Error::Database(db) => db
+            .code()
+            .is_some_and(|code| definitive_sql_rejection(&code)),
+        _ => false,
+    }
+}
+
 // Data/integrity/syntax-access rejection, serialization failure, deadlock and
 // cancellation abort the statement. Do not include class 08, 40003 (statement
 // completion unknown), shutdowns, or unrecognized/missing SQLSTATEs.
