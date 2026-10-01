@@ -2,6 +2,7 @@
 //! GitHub Actions. No app DB URL, credentials, migrations in public, or Discord.
 //! Run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -16,6 +17,10 @@ use two_bot_cutover::settings::SettingsStore;
 const KEY: &str = "TWO_RAID_JOIN_THRESHOLD";
 const OTHER_KEY: &str = "TWO_RAID_WINDOW_SECONDS";
 const CAS_MIN: i64 = -9_007_199_254_740_991;
+
+// Process-wide counter so concurrent tests in one harness never share a
+// schema even when SystemTime nanos repeat within the same process.
+static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn assert_cas_token(token: i64) {
     assert!(
@@ -79,9 +84,10 @@ impl TestDb {
             .connect_with(options.clone())
             .await?;
         let schema = format!(
-            "settings_test_{}_{}",
+            "settings_test_{}_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+            SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         // Identifier is a constant prefix plus numeric process/time IDs only.
         QueryBuilder::<Postgres>::new("CREATE SCHEMA ")
