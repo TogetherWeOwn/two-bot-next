@@ -89,8 +89,8 @@ export function isValidInviteCode(code: string): boolean {
 }
 
 /** Empty/unset disables fallback. A configured code must be valid before serving. */
-export function isValidFallback(code: string | null | undefined): boolean {
-  return code == null || code === "" || isValidInviteCode(code);
+export function isValidFallback(code: unknown): boolean {
+  return code == null || (typeof code === "string" && (code === "" || isValidInviteCode(code)));
 }
 
 /** Fixed vocabulary only: never log error messages, arbitrary names or stacks. */
@@ -183,27 +183,20 @@ const text = (status: number, body: string, extra?: Record<string, string>): Red
 });
 
 /**
- * Reserved internal paths that are never invite campaigns. Canonicalizes
- * using slash stripping, percent-decoding and lowercase matching (also strip
- * decoded edge slashes). `metrics` and `healthz` aliases/subpaths all match;
- * near-miss campaign slugs like `metricsfoo` do not. Undecodable input is not provably
- * reserved — callers still fail closed downstream (404 for GET/HEAD).
+ * Reserved internal paths that are never invite campaigns. Recognize only the
+ * first segment, stripping literal/encoded leading slashes and decoding once.
+ * A malformed suffix cannot unreserve a recognized `metrics`/`healthz` prefix;
+ * near-miss campaign slugs like `metricsfoo` still do not match.
  */
 export function isReservedInternal(path: string): boolean {
   const bare = path.split("?")[0] ?? "/";
-  let canonical: string;
+  const prefix = bare.replace(/^(?:\/|%2f)+/i, "").split(/\/|%2f/i, 1)[0] ?? "";
   try {
-    canonical = decodeURIComponent(
-      bare.replace(/^\/+/, "").replace(/\/+$/, ""),
-    ).replace(/^\/+/, "").replace(/\/+$/, "").toLowerCase();
+    return RESERVED_SLUGS.includes(decodeURIComponent(prefix).toLowerCase());
   } catch {
-    // Undecodable: not provably reserved; the caller fails closed downstream
-    // (404 for GET/HEAD, 405 for other methods).
+    // An undecodable prefix is not provably reserved; callers fail closed.
     return false;
   }
-  return RESERVED_SLUGS.some(
-    (slug) => canonical === slug || canonical.startsWith(`${slug}/`),
-  );
 }
 
 export async function handleRedirect(

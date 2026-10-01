@@ -9,19 +9,23 @@ proxy configuration, unchanged by this slice.
 
 ## Configuration
 
-- `REDIRECT_FALLBACK_CODE`: unset or empty disables fallback. A configured value
-  must be 1–64 ASCII letters, digits or hyphens. URLs, spaces and trailing line
-  terminators are invalid; values are not silently trimmed.
-- `REDIRECT_MAPPINGS_JSON`: unset or empty means no snapshot campaigns. Otherwise
-  it must be a JSON array of campaign rows. Each row requires a unique canonical
-  lowercase `slug` (2–40 ASCII alphanumeric/internal-hyphen characters) and a
+- `REDIRECT_FALLBACK_CODE`: unset, null or the empty string disables fallback.
+  A configured value must be a string of 1–64 ASCII letters, digits or hyphens.
+  Non-string values, URLs, spaces and trailing line terminators are invalid;
+  values are never coerced or silently trimmed.
+- `REDIRECT_MAPPINGS_JSON`: unset or the empty string means no snapshot campaigns.
+  Otherwise it must be a string containing a JSON array of campaign rows. Null,
+  booleans, numbers, arrays and objects are invalid binding types. Each row
+  requires a unique canonical lowercase `slug` (2–40 ASCII alphanumeric/internal-hyphen characters) and a
   valid `invite_code`. `label`, when supplied, must be a string; `disabled_at`
   must be absent, null or a string. Retired campaigns still redirect. Extra
   database export fields are ignored, as before.
 - `healthz` and `metrics` are reserved campaign inputs. Case, slash and encoded
   aliases cannot become campaign redirects. Only exact `/healthz` serves the
   redirect probe, and only GET/HEAD yield 200; aliases/subpaths return 404 with
-  no lookup or click. Near-miss slugs such as `healthz-campaign` remain valid.
+  no lookup, throttle, diagnostic or click, even when a reserved prefix has a
+  malformed percent-encoded suffix or configuration is invalid. Near-miss slugs
+  such as `healthz-campaign` remain valid.
 
 An invalid fallback or snapshot rejects the redirect configuration as a whole:
 503, `Retry-After: 30`, no Location, lookup or click. It does not silently become
