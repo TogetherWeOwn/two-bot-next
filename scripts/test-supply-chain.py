@@ -197,6 +197,16 @@ class SupplyChainTests(unittest.TestCase):
             path = ROOT / ".github/workflows" / f"{name}.yml"
             self.assertNotIn("ubuntu-latest", path.read_text(), str(path))
 
+    def test_candidate_preflight_cannot_replace_existing_gates(self):
+        supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        self.assertIn("python3 scripts/test-vulnerability-preflight.py", supply)
+        preflight = supply.index("python3 scripts/vulnerability-preflight.py sbom")
+        self.assertLess(supply.index("Collect exact-image applicability evidence"), preflight)
+        self.assertLess(preflight, supply.index("Retain SBOMs and findings"))
+        self.assertIn("sha256sum vulnerability-preflight.json", supply)
+        self.assertEqual(supply.count("exit-code: '1'"), 2)
+        self.assertNotIn("continue-on-error", supply)
+
     def test_required_check_rejects_every_non_success_scan_result(self):
         workflow = (ROOT / ".github/workflows/check.yml").read_text()
         job = workflow.split("\n  check:\n", 1)[1]

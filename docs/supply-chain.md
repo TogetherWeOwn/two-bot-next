@@ -31,6 +31,36 @@ security exceptions also need CISO agreement. Do not ignore a whole severity,
 a whole ecosystem or every unfixed finding. An expired exception restores the
 gate. New findings must be triaged on the same PR, never bypassed to get green.
 
+### Conditional-decision tuple preflight (no suppression)
+
+`scripts/vulnerability-preflight.py` binds the raw pinned-Trivy v0.69.3 image
+report to the source SHA, immutable image ID, Debian 12.15/amd64 metadata and a
+successful, lossless installed-package probe. It checks each HIGH/CRITICAL
+finding against both scan and dpkg inventory, including PURL package/version,
+architecture, distro and epoch. Duplicate qualifiers/rows, missing/null PURLs,
+inventory mismatches and failed/partial probes fail closed. Trivy's normalized
+`Version` and `SrcVersion` are not full Debian binary/source versions; the check
+uses installed versions and package IDs, not inferred downstream revisions.
+
+The frozen [CISO revision 3 decision](/TOG/issues/TOG-11261#document-vulnerability-disposition)
+lists 17 conditional tuples expiring at **2026-10-08T00:00:00Z**. Matching tuples
+are reported as `conditions-and-selector-proof-required`, never approved or
+suppressed. At or after expiry they are `expired`; any other tuple is
+`not-conditionally-accepted`. Every row retains `suppressed: false` and the
+report always has `suppressed_count: 0`. It does not distinguish previously
+rejected tuples from newly discovered tuples: neither is accepted.
+
+CI retains `vulnerability-preflight.json` and its checksum after diagnostics,
+including failed image gates. Successful preflight means only that observations
+were bound and classified; **it is not a vulnerability PASS**. Both existing
+Trivy gates, their exit codes and the empty ignore file remain unchanged. This
+preflight does not implement affected-code conditions, source/package
+authentication, extra/injected implementation exclusion or scanner suppression.
+Those checks, actual pinned-scanner positive/negative selector/expiry tests and
+independent final-head approval remain required before any activation. Changes
+to modules, interpreters, payloads or startup environment cannot be waived by a
+matching tuple. Stock-image observations are not deployed privilege controls.
+
 ## Exact-image applicability evidence
 
 After the vulnerability gates, including when either fails, CI runs
@@ -157,6 +187,7 @@ Offline regressions (no Cargo compile, Docker daemon or database access):
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-supply-chain.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-runtime-image-evidence.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-vulnerability-preflight.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_container_smoke.py
 python3 scripts/test-docker-deps.py
 python3 scripts/test-release-retry.py
