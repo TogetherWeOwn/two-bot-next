@@ -273,9 +273,14 @@ impl CommandRuntime {
             session_picker: false,
         });
         let mut runtime = Self::new(pool, executor, router, 100, false);
-        Arc::get_mut(&mut runtime)
-            .expect("unshared test runtime")
-            .tickets = Some(tickets);
+        {
+            let unshared = Arc::get_mut(&mut runtime).expect("unshared test runtime");
+            unshared.tickets = Some(tickets);
+            // No boot token pins this constructor: registry publication may
+            // resolve the application id through the token-authenticated
+            // lookup, exactly like a boot whose token never parses.
+            unshared.application_id = None;
+        }
         runtime
     }
 
@@ -380,22 +385,39 @@ impl CommandRuntime {
             return;
         }
         let application_id = match application_id {
-            Some(id) => id,
+            // A READY-supplied id is untrusted: the boot token's own identity
+            // must confirm it before anything is published. A runtime with no
+            // boot pin (the mock-Discord test constructor) never publishes on
+            // faith.
+            Some(id) => {
+                if Some(id) != self.application_id {
+                    warn!(
+                        application_id = id,
+                        "application identity differs from boot token; publish skipped"
+                    );
+                    return;
+                }
+                id
+            }
             None => match self.executor.current_application_id().await {
-                Ok(id) => id,
+                // The token-authenticated lookup answers for this very token;
+                // a production boot pin (always present for a parseable token,
+                // and an unparseable token cannot authenticate) must still
+                // agree before anything is published.
+                Ok(id) if self.application_id.is_none_or(|pinned| pinned == id) => id,
+                Ok(id) => {
+                    warn!(
+                        application_id = id,
+                        "application lookup differs from boot token; publish skipped"
+                    );
+                    return;
+                }
                 Err(err) => {
                     warn!(error = %err, "application lookup failed; publish skipped");
                     return;
                 }
             },
         };
-        if Some(application_id) != self.application_id {
-            warn!(
-                application_id,
-                "application identity differs from boot token; publish skipped"
-            );
-            return;
-        }
         let defs = match self.router.publish_set(&[]) {
             Ok(defs) => defs,
             Err(err) => {
