@@ -25,8 +25,12 @@ it does **not** enable live Discord dispatch.
    `TWO_SELF_ROLE_PANELS` disables the feature. `TWO_SELF_ROLE_DRY_RUN=1`
    must audit without emitting role mutations.
 2. Resolve configured roles/channels and revalidate live permission masks and
-   hierarchy before mutation. Component input is untrusted. Reaction partials
-   need fetches through the shared REST seam, not a private HTTP client.
+   hierarchy before mutation. A configured role whose id is the guild id (the
+   @everyone role) is rejected at catalogue validation when guild context is
+   available and unconditionally at dispatch; @everyone stays in the snapshot
+   as the channel permission baseline. Component input is untrusted. Reaction
+   partials need fetches through the shared REST seam, not a private HTTP
+   client.
 3. Claim the interaction ID once. Reactions have no delivery ID: use a globally
    unique event ID per delivery and converge by planning against freshly fetched
    member state. Preserve its original timestamp and generated order on retries;
@@ -61,7 +65,12 @@ it does **not** enable live Discord dispatch.
 
 Settlement/effect writes intentionally follow the legacy token+generation
 fence without an expiry check: late effect evidence may be recorded until
-ownership transfers. This is not permission for another Discord mutation.
+ownership transfers. When a newer exclusive-panel event supersedes an older
+one, its rejection is terminal but the former worker may still record late
+result/compensation evidence under its still-current token/generation via
+`record_superseded_effects`; a transferred generation (new token) is refused,
+and this authorizes no further REST work or panel-target publication. This is
+not permission for another Discord mutation.
 Unlike legacy's optional settlement claim, Rust requires an explicit claim;
 it never looks up and borrows a different worker's token. Malformed recovered
 intent fails closed rather than silently becoming an empty selection.

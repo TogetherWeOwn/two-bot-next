@@ -868,6 +868,16 @@ pub fn validate_panel_roles(
     }
     for panel in panels {
         for option in &panel.options {
+            // The guild @everyone role is held implicitly and cannot be
+            // removed like an ordinary member role. Reject it as soon as the
+            // guild id is known; it stays in the snapshot as the channel
+            // permission baseline.
+            if guild_id == Some(option.role_id.as_str()) {
+                return Err(SelfRoleConfigError::new(format!(
+                    "panel \"{}\" option \"{}\" role {} is the guild @everyone role and cannot be self-served",
+                    panel.id, option.key, option.role_id,
+                )));
+            }
             let role = by_id.get(option.role_id.as_str()).ok_or_else(|| {
                 SelfRoleConfigError::new(format!(
                     "panel \"{}\" option \"{}\" role {} does not exist",
@@ -1208,6 +1218,16 @@ pub fn validate_self_role_dispatch(check: &DispatchCheck<'_>) -> Option<Dispatch
     for role_id in check.role_ids {
         if !seen.insert(role_id.as_str()) {
             continue;
+        }
+        // The guild @everyone role is held implicitly and cannot be
+        // removed like an ordinary member role. Unconditional at dispatch:
+        // a configured catalogue id must never reach a role mutation.
+        if role_id == check.guild_id {
+            return Some(DispatchFailure {
+                code: "everyone_role",
+                reason: format!("role {role_id} is the guild @everyone role"),
+                public_message: UNSAFE_ROLE,
+            });
         }
         let Some(role) = check.roles.iter().find(|r| &r.id == role_id) else {
             return Some(DispatchFailure {
@@ -1775,6 +1795,80 @@ mod tests {
             validate_self_role_dispatch(&check(&panel, &roles, &ids)).map(|f| f.code),
             Some("missing_role")
         );
+    }
+
+    #[test]
+    fn dispatch_refuses_everyone_role_unconditionally() {
+        // Witness: guild 111..., select panel with one option targeting the
+        // guild id, ViewChannel mask 1024, nonexclusive non-color; @everyone
+        // resolved with a matching mask; a nonempty public channel snapshot
+        // with no overwrites; dispatch role unmanaged at rank 0, bot rank 1
+        // with ManageRoles. Catalogue validation without guild context cannot
+        // see the collision; dispatch must still refuse unconditionally.
+        let raw = serde_json::json!([{
+            "id": "games",
+            "channelId": GUILD,
+            "messageId": MSG,
+            "mode": "select",
+            "options": [{
+                "key": "everyone", "label": "Everyone",
+                "roleId": GUILD, "permissions": "1024",
+            }],
+        }])
+        .to_string();
+        let panels = parse_self_role_panels(&raw).expect("parses");
+        assert_eq!(panels.len(), 1);
+        let channels = [ChannelSnapshot {
+            id: "999999999999999999".to_owned(),
+            name: Some("general".to_owned()),
+            overwrites: vec![],
+        }];
+        let live = vec![ResolvedRole {
+            id: GUILD.to_owned(),
+            name: Some("@everyone".to_owned()),
+            permissions: 1 << 10,
+            color: None,
+        }];
+        // Catalogue validation rejects @everyone once guild context is known.
+        let err = validate_panel_roles(&panels, &live, &channels, Some(GUILD))
+            .expect_err("@everyone is not a mutable target");
+        assert!(err.message().contains("guild @everyone role"), "{err}");
+        // @everyone stays in the snapshot as the channel permission baseline:
+        // an ordinary role on the same public channel still validates.
+        let mut ordinary = panels.clone();
+        ordinary[0].options[0].role_id = ROLE_A.to_owned();
+        let mut live_ordinary = live.clone();
+        live_ordinary.push(ResolvedRole {
+            id: ROLE_A.to_owned(),
+            name: Some("Chess".to_owned()),
+            permissions: 1 << 10,
+            color: None,
+        });
+        assert!(validate_panel_roles(&ordinary, &live_ordinary, &channels, Some(GUILD)).is_ok());
+        // Dispatch refuses even a catalogue that was approved without guild
+        // context, before any hierarchy or channel reasoning.
+        let ids = [GUILD.to_owned()];
+        let roles = vec![DispatchRole {
+            id: GUILD.to_owned(),
+            permissions: 1 << 10,
+            color: 0,
+            managed: false,
+            position: 0,
+        }];
+        let mut full = check(&panels[0], &roles, &ids);
+        full.channels = &channels;
+        full.bot_highest_position = 1;
+        let failure = validate_self_role_dispatch(&full).expect("refused");
+        assert_eq!(failure.code, "everyone_role");
+        assert_eq!(
+            failure.public_message,
+            "That role is not safe for self-service. Staff have been notified in the logs."
+        );
+        // The impossible removal the old code produced is now unreachable:
+        // held @everyone with an empty desired state plans a removal, so the
+        // dispatch fence must stay unconditional.
+        let plan = plan_select_delta(&panels[0], &held(&[GUILD]), &[]).expect("plans");
+        assert_eq!(plan.remove_role_ids, [GUILD]);
     }
 
     #[test]

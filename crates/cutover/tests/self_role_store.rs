@@ -282,6 +282,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     assert!(store.owns_panel_claim(&empty).await?);
 
     exercise_effect_recovery(pool).await?;
+    exercise_superseded_evidence(pool).await?;
     exercise_generated_event_order(pool).await?;
     exercise_db_clock_waits(pool).await?;
     exercise_atomic_finish_wait(pool).await?;
@@ -427,6 +428,94 @@ async fn exercise_effect_recovery(pool: &PgPool) -> TestResult {
         &final_effects,
     );
     assert!(store.claim_audit(&audit).await?.is_none());
+    Ok(())
+}
+
+async fn exercise_superseded_evidence(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    let mut old = row("superseded-evidence-old", "sup-evidence-0001");
+    old.panel_id = "superseded-evidence".to_owned();
+    let mut newer = row("superseded-evidence-new", "sup-evidence-0002");
+    newer.panel_id = old.panel_id.clone();
+    let old_event = store.claim_audit(&old).await?.expect("superseded event");
+    let key = panel_key(&old);
+    acquired(
+        store
+            .claim_panel(
+                &key,
+                Some((&old.event_id, old.event_order.as_deref().unwrap())),
+            )
+            .await?,
+    );
+    // Attempt history recorded before supersession survives.
+    let mut pre = AuditEffects::default();
+    pre.attempted_added_role_ids = vec!["role-a".to_owned()];
+    assert!(store.update_audit_effects(&old_event, &pre).await?);
+    // An event-generation transfer rejects the former worker's evidence.
+    clock.store(TEST_NOW_MS + 500, Ordering::SeqCst);
+    let current = store
+        .claim_audit(&old)
+        .await?
+        .expect("recover superseded event");
+    assert!(current.recovered);
+    assert!(!store.record_superseded_effects(&old_event, &pre).await?);
+    assert!(
+        !store
+            .update_audit_effects(&old_event, &AuditEffects::default())
+            .await?
+    );
+    // A newer lane admission supersedes the transferred generation.
+    store.claim_audit(&newer).await?.expect("newer event");
+    let mut second = acquired(
+        store
+            .claim_panel(
+                &key,
+                Some((&newer.event_id, newer.event_order.as_deref().unwrap())),
+            )
+            .await?,
+    );
+    let (outcome, code, token, generation): (String, Option<String>, Option<String>, i32) = sqlx::query_as(
+        "SELECT outcome,code,claim_token,claim_generation FROM self_role_audit WHERE event_id='superseded-evidence-old'",
+    ).fetch_one(pool).await?;
+    assert_eq!(outcome, "rejected");
+    assert_eq!(code.as_deref(), Some("superseded_by_later_event"));
+    assert_eq!(token.as_deref(), Some(current.token.as_str()));
+    assert_eq!(generation, current.generation);
+    // Late result/compensation evidence records under the still-current
+    // token/generation; the rejection stays terminal and authorizes neither
+    // settlement nor panel-target publication.
+    let mut late = AuditEffects::default();
+    late.added_role_ids = vec!["role-a".to_owned()];
+    late.compensated_added_role_ids = vec!["role-b".to_owned()];
+    late.unresolved_removed_role_ids = vec!["role-c".to_owned()];
+    assert!(store.record_superseded_effects(&current, &late).await?);
+    let (outcome, code): (String, Option<String>) = sqlx::query_as(
+        "SELECT outcome,code FROM self_role_audit WHERE event_id='superseded-evidence-old'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(outcome.as_str(), "rejected");
+    assert_eq!(code.as_deref(), Some("superseded_by_later_event"));
+    let mut expected = late.clone();
+    expected.attempted_added_role_ids = vec!["role-a".to_owned()];
+    assert_effects(&stored_effects(pool, &old.event_id).await?, &expected);
+    assert!(
+        !store
+            .update_audit_effects(&current, &AuditEffects::default())
+            .await?
+    );
+    assert!(matches!(
+        store.finish_audit(&old, &current).await,
+        Err(StoreError::StaleClaim)
+    ));
+    assert!(matches!(
+        store
+            .finish_audit_and_set_panel_option(&old, &current, &mut second, Some("chess"))
+            .await,
+        Err(StoreError::StaleClaim)
+    ));
+    assert!(second.target.option_key.is_none());
     Ok(())
 }
 

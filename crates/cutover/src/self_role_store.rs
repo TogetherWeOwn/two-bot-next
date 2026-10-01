@@ -602,6 +602,45 @@ impl SelfRoleStore {
             == 1)
     }
 
+    /// Record late result/compensation evidence for a superseded event under
+    /// its still-current token/generation. An old worker can have a Discord
+    /// mutation in flight when its panel lane expires; the rejection stays
+    /// terminal (outcome/code are never rewritten) and this authorizes no
+    /// further REST work or panel-target publication. Only the supersession
+    /// rejection accepts evidence; a transferred generation (new token) and
+    /// any other terminal outcome are refused.
+    pub async fn record_superseded_effects(
+        &self,
+        claim: &EventClaim,
+        effects: &AuditEffects,
+    ) -> Result<bool, StoreError> {
+        let mut query = sqlx::query(
+            "UPDATE self_role_audit SET added_role_ids=$1,removed_role_ids=$2,
+             attempted_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM jsonb_array_elements_text(attempted_added_role_ids::jsonb || $3::jsonb)),
+             attempted_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM jsonb_array_elements_text(attempted_removed_role_ids::jsonb || $4::jsonb)),
+             compensated_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM jsonb_array_elements_text(compensated_added_role_ids::jsonb || $5::jsonb)),
+             compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
+             unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8
+             WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11
+             AND outcome='rejected' AND code='superseded_by_later_event'",
+        );
+        for effect in effects.encoded() {
+            query = query.bind(effect);
+        }
+        Ok(query
+            .bind(&claim.event_id)
+            .bind(&claim.token)
+            .bind(claim.generation)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            == 1)
+    }
+
     /// Explicit claim is required (no unsafe implicit lookup of another worker's
     /// token). Original intent/order/created_at stay immutable during settlement.
     pub async fn finish_audit(
