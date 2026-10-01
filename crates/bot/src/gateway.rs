@@ -219,6 +219,11 @@ async fn run_loop(
                 warn!("gateway reconnect failed; Twilight will retry");
                 continue;
             }
+            Err(_) => {
+                return Err(sqlx::Error::InvalidArgument(
+                    "gateway receive failed; checkpoint unchanged".into(),
+                ))
+            }
         };
         observer.observe(&message, shard);
         let Message::Text(text) = message else {
