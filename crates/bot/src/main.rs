@@ -25,6 +25,7 @@ mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
 mod server;
+mod ticket_runtime;
 mod website_jobs;
 
 use std::sync::Arc;
@@ -119,11 +120,13 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let (shutdown, _) = tokio::sync::watch::channel(false);
     let gateway_task = match gateway_prerequisites(&config) {
         Ok((token, url, guild_id)) => {
             let token = token.to_owned();
             let url = url.to_owned();
             let state = Arc::clone(&state);
+            let gateway_shutdown = shutdown.subscribe();
             Some(tokio::spawn(async move {
                 let result: Result<(), sqlx::Error> = async {
                     // Runtime is DML-only; the operator migrates before startup.
@@ -164,9 +167,16 @@ async fn main() {
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store, runtime)
-                        .await
-                        .map_err(|error| gateway_failure("gateway_runtime_failed", error))
+                    run_shard(
+                        shard,
+                        pipeline,
+                        Arc::clone(&state),
+                        store,
+                        runtime,
+                        Some(gateway_shutdown),
+                    )
+                    .await
+                    .map_err(|error| gateway_failure("gateway_runtime_failed", error))
                 }
                 .await;
                 if result.is_err() {
@@ -190,7 +200,6 @@ async fn main() {
         }
     };
 
-    let (shutdown, _) = tokio::sync::watch::channel(false);
     let http = serve(&config, listener, state, shutdown.clone());
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, shutdown).await,
@@ -256,6 +265,9 @@ async fn supervise_gateway(
         biased;
         // Never expose task/SQL errors: they may contain connection secrets.
         _ = &mut task => {
+            if *shutdown.borrow() {
+                return http.await;
+            }
             // Sticky even if HTTP has not subscribed yet. Keep polling HTTP so
             // its job supervisor can cancel and join every active action.
             shutdown.send_replace(true);
@@ -265,8 +277,13 @@ async fn supervise_gateway(
             ))
         },
         result = &mut http => {
-            task.abort();
-            let _ = task.await;
+            shutdown.send_replace(true);
+            // Let the shard cancel and join its ticket scope first. A stuck
+            // initializer still cannot hold container shutdown indefinitely.
+            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
             result
         }
     }
