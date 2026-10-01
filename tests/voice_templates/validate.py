@@ -205,7 +205,9 @@ def feature_used(key, template):
         # Only condition headers count, never ordinary text or branch bodies.
         # No closing delimiter is required: deferred malformed-block probes can
         # still exercise a recognizable header without claiming parser validity.
-        headers = re.findall(r"\{\{\s*([^{}?]+?)\s*\?\?", template)
+        # A single `?` is literal header text (game names may contain it); only
+        # the `??` pair closes a header.
+        headers = re.findall(r"\{\{\s*((?:[^{}?]|\?(?!\?))+?)\s*\?\?", template)
         if key.startswith("condition:"):
             word = key[10:]
             pattern = re.escape(word.replace(":id", ":"))

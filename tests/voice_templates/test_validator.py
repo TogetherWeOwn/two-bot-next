@@ -234,6 +234,23 @@ class CorpusTests(unittest.TestCase):
         self.validate_added_case("{{OWNER ??{{OWNER:owner ??yes//no}}//no}}", expected,
                                  ["condition:OWNER", "condition:OWNER:id"])
 
+    def test_condition_header_treats_single_question_mark_as_literal(self):
+        expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
+                    "stable_for_same_context": True}
+        # Spec-legal game names may contain `?` in every GAME form; only `??`
+        # closes the header, even immediately after the value.
+        for template in ["{{GAME=Quiz? ??yes//no}}", "{{GAME:Ape? ??yes}}",
+                         "{{GAME!=Quiz? ??yes//no}}", "{{GAME=Quiz?? ??yes//no}}"]:
+            with self.subTest(template=template):
+                self.validate_added_case(template, expected, ["condition:GAME"])
+        # A single `?` in branch text, as a keyword suffix, without a header, or
+        # outside a block never becomes a recognizable GAME header.
+        for template in ["{{PRIVATE ??GAME=Quiz?//no}}", "{{GAME? ??yes//no}}",
+                         "{{GAME=Quiz? plain}}", "GAME=Quiz? ??yes//no"]:
+            with self.subTest(template=template):
+                with self.assertRaisesRegex(validate.FixtureError, "not exercised"):
+                    self.validate_added_case(template, expected, ["condition:GAME"])
+
     def test_comparison_coverage_requires_conditional_header(self):
         expected = {"kind": "invariant", "nonempty": True, "max_characters": 100,
                     "stable_for_same_context": True}
