@@ -194,10 +194,10 @@ mod tests {
             assert_eq!(filtered.query().unwrap(), "sslmode=require");
             assert_eq!(filtered.password(), Some("fixture-password"));
             #[cfg(feature = "db")]
-            assert_eq!(
+            assert!(matches!(
                 connect_options(&raw).unwrap().get_ssl_mode(),
                 sqlx::postgres::PgSslMode::Require
-            );
+            ));
         }
         assert_eq!(
             url_for_sqlx("postgres://agent-testdb/db?channel_binding=require").unwrap(),

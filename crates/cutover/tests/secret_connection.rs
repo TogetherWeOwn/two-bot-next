@@ -150,7 +150,10 @@ fn neon_channel_binding_never_reaches_sqlx_warn_logs() {
             let url =
                 format!("postgres://fixture-user:fixture-password@ep-fixture.neon.tech/db?{query}");
             let options = two_bot_core::database_url::connect_options(&url).unwrap();
-            assert_eq!(options.get_ssl_mode(), sqlx::postgres::PgSslMode::Require);
+            assert!(matches!(
+                options.get_ssl_mode(),
+                sqlx::postgres::PgSslMode::Require
+            ));
         }
         tracing::warn!("capture remains active");
     });
