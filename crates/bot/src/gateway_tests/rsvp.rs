@@ -228,7 +228,7 @@ async fn queued_commands(slow_database: bool, checkpoint_failure: Option<Checkpo
         }
         lock.take().unwrap().rollback().await.unwrap();
     }
-    let runner = if checkpoint_failure.is_some() {
+    let runner = if let Some(failure) = checkpoint_failure {
         // The runner must finish both accepted commands, then return the original
         // checkpoint error. It may not checkpoint later funnel packets.
         let error = tokio::time::timeout(Duration::from_secs(15), runner)
@@ -236,7 +236,7 @@ async fn queued_commands(slow_database: bool, checkpoint_failure: Option<Checkpo
             .unwrap()
             .unwrap()
             .unwrap_err();
-        let message = match checkpoint_failure.unwrap() {
+        let message = match failure {
             CheckpointFailure::Rejected => "fixture checkpoint failure",
             CheckpointFailure::Timeout => "checkpoint deadline exceeded",
         };
