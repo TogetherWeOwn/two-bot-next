@@ -518,9 +518,8 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
                         (*name).to_owned(),
                         match count {
                             Ok((n,)) => n.to_string(),
-                            Err(_) => {
-                                "(no such table - the restore would migrate first)".to_owned()
-                            }
+                            Err(_) => "(no such table - provision matching schema before restore)"
+                                .to_owned(),
                         },
                     );
                 }

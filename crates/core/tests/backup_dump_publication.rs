@@ -289,6 +289,34 @@ async fn cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dum
     }
     assert_eq!(candidates(&empty_backups).len(), 4);
     std::fs::remove_dir_all(empty_backups).unwrap();
+
+    // The actual CLI must warn about v3's absent newer tables even in a
+    // file-only dry run. No restore URL, credentials or database probe supplied.
+    let legacy = dir.join("legacy-v3.ndjson.gz");
+    let mut encoder = dump_file::new_encoder();
+    for line in include_str!("fixtures/legacy-v3-native.ndjson").lines() {
+        dump_file::write_line(&mut encoder, &serde_json::from_str(line).unwrap()).unwrap();
+    }
+    std::fs::write(&legacy, dump_file::finish_gzip(encoder).unwrap()).unwrap();
+    let dry_run = Command::new(&binary)
+        .arg("restore")
+        .arg(&legacy)
+        .arg("--dry-run")
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    save_output(&dir, "legacy-v3-dry-run", &dry_run);
+    assert!(dry_run.status.success(), "{dry_run:?}");
+    let stdout = String::from_utf8_lossy(&dry_run.stdout);
+    let stderr = String::from_utf8_lossy(&dry_run.stderr);
+    assert!(stdout.contains("DRY RUN VERIFIED"));
+    assert!(stdout.contains("Nothing was written"));
+    assert!(stderr.contains("WARNING: v3 dump lacks tables that will be cleared"));
+    assert!(stderr.contains("guild_settings_revision"));
+    assert!(stderr.contains("singleton resets to zero"));
+    std::fs::remove_file(legacy).unwrap();
     pool.close().await;
     // Keep the bounded textual evidence above; remove only test backup files.
     std::fs::remove_dir_all(backups).unwrap();
