@@ -180,7 +180,7 @@ class ContainerSmokeTests(unittest.TestCase):
         self.clock += 1
         return self.clock
 
-    def run_smoke(self, live_http=False, **kwargs):
+    def run_smoke(self, live_http=False, image="two-bot:fixture", **kwargs):
         if live_http:
             http_patcher = contextlib.nullcontext()
         else:
@@ -192,7 +192,7 @@ class ContainerSmokeTests(unittest.TestCase):
                 patch.object(smoke.time, "sleep"), \
                 patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
-            smoke.smoke("two-bot:fixture", **kwargs)
+            smoke.smoke(image, **kwargs)
         return output.getvalue()
 
     def assert_rejected(self, message, **kwargs):
@@ -213,6 +213,29 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assertNotIn("--env-file", run)
         wait = next(kwargs for args, kwargs in self.fixture.calls if args[0] == "wait")
         self.assertLessEqual(wait["timeout"], 10)
+
+    def test_immutable_input_is_used_for_measure_runtime_and_dead_health_probe(self):
+        image_id = "sha256:" + "a" * 64
+        self.run_smoke(image=image_id)
+        self.assertEqual(self.fixture.calls[0][0], ("image", "inspect", image_id))
+        runs = [args for args, _ in self.fixture.calls if args[0] == "run"]
+        self.assertEqual(len(runs), 3)
+        for args in runs:
+            self.assertIn(image_id, args)
+            self.assertNotIn("two-bot:fixture", args)
+
+    def test_ci_smoke_is_bound_to_build_output_not_shared_tag(self):
+        workflow = (Path(__file__).resolve().parent.parent / ".github/workflows/check.yml").read_text()
+        job = workflow[workflow.index("\n  container:\n"):workflow.index("\n  community-db:\n")]
+        self.assertNotIn("two-bot:ci", job)
+        self.assertIn("IMAGE: two-bot-next:smoke-${{ github.run_id }}-${{ github.run_attempt }}", job)
+        self.assertIn("id: build", job)
+        self.assertIn("tags: ${{ env.IMAGE }}", job)
+        self.assertEqual(job.count("IMAGE_ID: ${{ steps.build.outputs.imageid }}"), 2)
+        self.assertIn('python3 scripts/container-smoke.py "$IMAGE_ID"', job)
+        self.assertIn('python3 scripts/container-smoke.py "$IMAGE_ID" "--$budget-max-bytes" 1', job)
+        self.assertIn('docker image rm "$IMAGE"', job)
+        self.assertNotIn("docker image prune", job)
 
     def test_runtime_trust_bundle_is_checked_as_configured_non_root_user(self):
         self.run_smoke()

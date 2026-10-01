@@ -102,6 +102,10 @@ The PR dry-run inventories the exact PR head SHA, validates lockfile coverage
 and Debian image components, and records checksums/provenance before scanning.
 Image tags include the Actions run ID and attempt; Trivy's cache is run-local.
 Cleanup removes only that run's image tag, never shared Docker caches.
+The separate container smoke job also uses a run/attempt-owned tag and binds
+both runtime probes and deliberate budget failures to the build action's immutable
+image output. This prevents another job's tag from changing the tested image;
+it does not change either size budget or establish why a prior size check failed.
 The optional release-workflow dry-run input also has no publication tag, even
 if a release tag input is supplied; PR verification does not use that dispatch.
 The repair path skips
