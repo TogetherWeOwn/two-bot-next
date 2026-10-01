@@ -137,6 +137,46 @@ pub async fn claim_delivery(
     Ok((reclaimed == 1).then_some(DeliveryClaim::Recovered))
 }
 
+/// Recovery must not depend on an item remaining in the current feed document.
+/// Oldest leases are examined first; reacquisition moves an unresolved row to
+/// the back of this bounded queue instead of starving later pending claims.
+pub async fn pending_deliveries(
+    pool: &Pool<Postgres>,
+    feed: &FeedRelay,
+    now_ms: i64,
+    limit: u32,
+) -> Result<Vec<FeedPost>, FeedStoreError> {
+    let rows = sqlx::query(
+        "SELECT d.item_key, d.nonce FROM feed_deliveries d
+         JOIN feed_relays f ON f.id = d.feed_id
+         WHERE f.id = $1 AND f.guild_id = $2 AND f.channel_id = $3 AND f.enabled
+         AND d.state = 'pending'
+         AND (d.claimed_at IS NULL OR d.claimed_at <= to_timestamp($4::bigint::double precision / 1000))
+         ORDER BY d.claimed_at NULLS FIRST, d.item_key LIMIT $5",
+    )
+    .bind(&feed.id)
+    .bind(&feed.guild_id)
+    .bind(&feed.channel_id)
+    .bind(now_ms.saturating_sub(DELIVERY_CLAIM_LEASE_MS))
+    .bind(i64::from(limit.min(200)))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(FeedPost {
+                feed_id: feed.id.clone(),
+                channel_id: feed.channel_id.clone(),
+                item_key: row.try_get("item_key")?,
+                nonce: row.try_get("nonce")?,
+                // Recovered claims only reconcile history; this is never sent.
+                content: String::new(),
+                suppress_mentions: true,
+                enforce_nonce: true,
+            })
+        })
+        .collect()
+}
+
 pub async fn mark_delivered(
     pool: &Pool<Postgres>,
     guild_id: &str,

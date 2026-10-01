@@ -15,6 +15,7 @@ mod database_roles_cli;
 #[allow(dead_code)]
 #[path = "../../discord/tests/common/mod.rs"]
 mod discord_test_common;
+mod feed_jobs;
 mod gateway;
 mod gateway_metrics;
 #[cfg(test)]

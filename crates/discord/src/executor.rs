@@ -1176,6 +1176,19 @@ impl ActionExecutor {
             .await
     }
 
+    /// Preserve the exact legacy feed nonce, even when all its hex digits are
+    /// decimal or it has leading zeroes. Never infer a numeric wire identity.
+    /// Uses the same paced, single-attempt transport and mention suppression.
+    pub async fn post_message_with_nonce(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: &str,
+    ) -> Result<String, DiscordError> {
+        self.send_message(channel_id, content, Some(serde_json::Value::from(nonce)))
+            .await
+    }
+
     /// Raw message send shared by [`Self::post_message`] and the audit
     /// string-nonce path: the pinned Twilight `CreateMessage` builder only
     /// models a `u64` nonce and never serializes `enforce_nonce`, so the body

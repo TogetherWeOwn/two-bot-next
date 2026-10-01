@@ -14,7 +14,7 @@ use two_bot_core::{
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
-    community_jobs,
+    community_jobs, feed_jobs,
     jobs::{self, ErrorClass, Job},
     server,
 };
@@ -143,18 +143,27 @@ pub async fn serve(
                         }),
                     });
                 }
-                let registration = community_jobs::register(context);
+                let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
+                if let Some(job) = feed_jobs::register(context) {
+                    registered.push(job);
+                } else {
+                    parked.push(feed_jobs::NAME);
+                }
             }
             Err(_) => tracing::warn!("website jobs parked: invalid REST configuration"),
         }
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
-    // All six names park together when nothing registered; otherwise only the
-    // env-gated community names are parked and the rest report live status.
+    let names: Vec<&'static str> = NAMES
+        .into_iter()
+        .chain(community_jobs::NAMES)
+        .chain([feed_jobs::NAME])
+        .collect();
+    // All names park together when nothing registered; otherwise only the
+    // env-gated community/feed names are parked and the rest report live status.
     let status = jobs::statuses(&names, registered.is_empty());
     {
         let mut entries = status.write().await;
