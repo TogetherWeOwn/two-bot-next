@@ -85,6 +85,14 @@ advance the same revision used by store CAS and polling, never a shadow table.
 A missing target revision row still refuses writes. Deletes advance the poll
 revision. No runtime hot-reload consumer is changed here.
 
+The reviewed database-role plan must include `guild_settings_cas_seq` and
+`guild_settings_assign_version()` after the migrations. Runtime needs allocator
+USAGE/SELECT, not UPDATE (which would permit reseeding); the web reader needs
+neither. The trigger stays SECURITY INVOKER, with no runtime/reader direct
+EXECUTE grant. Migration installation alone is not proof of runtime privileges:
+the authorized operator must apply and verify the reviewed role plan before
+activation. This executor does not provision roles or credentials.
+
 The outer durable store and this transaction are separate. A receiver must not
 re-execute an ambiguous write after losing a terminal-response commit. Its
 terminal-response adapter must preserve the value-free `{key,outcome}` result;
@@ -96,6 +104,7 @@ HTTP/durable-result integration belongs to the receiver slice.
 python3 scripts/cargo_cache.py run -- test -p two-bot-core internal_settings --lib
 python3 scripts/cargo_cache.py run -- test -p two-bot-cutover internal_settings --lib
 python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test settings_db -- --ignored
+python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test legacy_copy_db -- --ignored
 ```
 
 The existing `settings_db` harness pins `agent-testdb:5432` locally, or CI's
