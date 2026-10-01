@@ -11,6 +11,7 @@ are outside this implementation's scope.
   and event metadata (`members`, `events`, `invite_snapshots`).
 - XP totals, awards and cooldowns, rank projections and raid exclusions
   (`member_levels`, `xp_awards`, `xp_cooldowns`, `member_ranks`, `member_exclusions`).
+- Tickets: `tickets` and `ticket_transcripts` (opener or claimer; 90-day transcript purge applies independently).
 - Event RSVPs and attendance/community facts, including attribution and compound
   voice-session/event keys (`event_rsvps`, `community_facts`). Scorecards normally
   store aggregates; the erasure plan also checks their serialized payloads.

@@ -126,6 +126,16 @@
       "predicate": "guild_id = $1 AND member_id = $2"
     },
     {
+      "table": "ticket_transcripts",
+      "columns": ["opener_id", "claimed_by", "ticket_id"],
+      "predicate": "guild_id = $1 AND (opener_id = $2 OR claimed_by = $2)"
+    },
+    {
+      "table": "tickets",
+      "columns": ["opener_id", "claimed_by"],
+      "predicate": "guild_id = $1 AND (opener_id = $2 OR claimed_by = $2)"
+    },
+    {
       "table": "members",
       "columns": ["member_id"],
       "predicate": "guild_id = $1 AND member_id = $2"

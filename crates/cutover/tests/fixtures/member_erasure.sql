@@ -82,6 +82,11 @@ BEGIN
         (guild_id, member_id, panel_id, claim_token, claim_generation, processing_expires_at,
          latest_event_id, target_committed)
         VALUES (g, u, 'fixture-panel', 'fixture-claim', 1, '2000-01-01T00:00:00Z', k, TRUE);
+      INSERT INTO tickets (id, guild_id, channel_id, opener_id, claimed_by, status, created_at)
+        VALUES ('t-' || k, g, 'c-' || k, u, u, 'closed', '2026-10-01T00:00:00Z');
+      INSERT INTO ticket_transcripts
+        (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at, purge_after)
+        VALUES ('t-' || k, g, 'c-' || k, u, u, 'fixture', 1, '2026-10-01T00:00:00Z', '2026-12-30T00:00:00Z');
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);
