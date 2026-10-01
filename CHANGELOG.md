@@ -31,6 +31,8 @@
   unstamped updates prune delayed creates; retain immutable CREATE facts during
   role enrichment and clarify enforce-only preserved-match recovery. Run the
   preserved-replay database regression alongside durable dedupe in CI. (TOG-10089)
+- Redact automod delivery-claim capabilities from derived debug output, including
+  acquired and preserved results; expose tokens only at SQL fencing binds.
 - Answer published but unwired commands ephemerally instead of timing out, preserving the existing router refusals and complete registry. Synchronize the registry on resumed process startup as well as Ready, without blocking gateway polling.
 - Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
 - Grant the least-privilege runtime role CRUD on the self-role audit and panel-claim relations (migration 0200), cover 0200 in the role-matrix tests, and prove runtime claim access with continued web-reader denial.

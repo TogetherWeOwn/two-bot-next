@@ -19,7 +19,7 @@ pub struct AutomodStore {
 #[derive(Debug)]
 pub struct DeliveryClaim {
     key: DeliveryKey,
-    token: String,
+    token: crate::Secret<String>,
 }
 
 #[derive(Debug)]
@@ -91,7 +91,7 @@ impl AutomodStore {
         if let Some((token,)) = inserted {
             return Ok(ClaimResult::Acquired(DeliveryClaim {
                 key: key.clone(),
-                token,
+                token: token.into(),
             }));
         }
         let row: Option<ClaimRow> = sqlx::query_as(
@@ -164,7 +164,7 @@ impl AutomodStore {
                     Some((token,)) => Ok(ClaimResult::Preserved(
                         DeliveryClaim {
                             key: key.clone(),
-                            token,
+                            token: token.into(),
                         },
                         matched,
                     )),
@@ -208,7 +208,7 @@ impl AutomodStore {
         .bind(&matched.subject.channel_id)
         .bind(&matched.subject.message_id)
         .bind(&matched.subject.author_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(&claim.key.guild_id)
         .bind(&claim.key.message_id)
         .execute(&self.pool)
@@ -226,7 +226,7 @@ impl AutomodStore {
                AND result_json IS NULL AND mutation_started = FALSE AND dry_run = FALSE
                AND released = FALSE",
         )
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(&claim.key.guild_id)
         .bind(&claim.key.message_id)
         .execute(&self.pool)
@@ -257,7 +257,7 @@ impl AutomodStore {
                AND released = FALSE",
         )
         .bind(sqlx::types::Json(outcome))
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(&claim.key.guild_id)
         .bind(&claim.key.message_id)
         .execute(&self.pool)
@@ -287,7 +287,7 @@ impl AutomodStore {
                AND matched_filter IS NOT NULL AND released = FALSE
              RETURNING TRUE",
         )
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(&claim.key.guild_id)
         .bind(&claim.key.message_id)
         .fetch_optional(&self.pool)
@@ -301,7 +301,7 @@ impl AutomodStore {
                AND mutation_started = FALSE AND counted = FALSE AND result_json IS NULL
                AND matched_filter IS NULL",
         )
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(&claim.key.guild_id)
         .bind(&claim.key.message_id)
         .execute(&self.pool)
@@ -334,7 +334,7 @@ impl AutomodStore {
              FROM automod_delivery_claims
              WHERE claim_token = $1 AND guild_id = $2 AND message_id = $3 FOR UPDATE",
         )
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(&subject.guild_id)
         .bind(&subject.message_id)
         .fetch_optional(&mut *tx)
@@ -385,7 +385,7 @@ impl AutomodStore {
             "UPDATE automod_delivery_claims SET counted = TRUE
              WHERE claim_token = $1 AND guild_id = $2 AND message_id = $3",
         )
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(&subject.guild_id)
         .bind(&subject.message_id)
         .execute(&mut *tx)
@@ -417,4 +417,54 @@ async fn existing_count(
         ));
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::automod_runtime::{FunnelDisposition, MessageDeliveryKind};
+
+    #[test]
+    fn claim_debug_redacts_capability_in_nested_results() {
+        let fixture_token = "automod-claim-capability-fixture";
+        let key = DeliveryKey {
+            guild_id: "guild".into(),
+            message_id: "message".into(),
+            kind: MessageDeliveryKind::Create,
+            dry_run: false,
+            request_hash: "revision".into(),
+        };
+        let claim = DeliveryClaim {
+            key,
+            token: fixture_token.to_owned().into(),
+        };
+        assert_eq!(claim.token.expose(), fixture_token);
+        for output in [format!("{claim:?}"), format!("{claim:#?}")] {
+            assert!(output.contains("[REDACTED]"));
+            assert!(!output.contains(fixture_token));
+        }
+        let result = ClaimResult::Acquired(claim);
+        for output in [format!("{result:?}"), format!("{result:#?}")] {
+            assert!(output.contains("[REDACTED]"));
+            assert!(!output.contains(fixture_token));
+        }
+        let ClaimResult::Acquired(claim) = result else {
+            unreachable!()
+        };
+        let matched = AutomodMatch {
+            subject: MessageSubject {
+                guild_id: "guild".into(),
+                channel_id: "channel".into(),
+                message_id: "message".into(),
+                author_id: "author".into(),
+            },
+            filter: AutomodFilter::BadWords,
+            funnel: FunnelDisposition::CaptureOnly,
+        };
+        let result = ClaimResult::Preserved(claim, matched);
+        for output in [format!("{result:?}"), format!("{result:#?}")] {
+            assert!(output.contains("[REDACTED]"));
+            assert!(!output.contains(fixture_token));
+        }
+    }
 }
