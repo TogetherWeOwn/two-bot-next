@@ -144,8 +144,9 @@ fn as_u64(v: &serde_json::Value) -> Option<u64> {
 }
 
 /// Parse and fully validate a MEE6 export: an array of players, or
-/// `{players:[...]}`; each player needs `id`/`user_id` and `xp`. An optional
-/// `level` must agree with the MEE6 curve for that XP.
+/// `{players:[...]}`; each player needs `id`/`user_id` and `xp` within
+/// [`MAX_STORED_XP`]. An optional `level` must agree with the MEE6 curve for
+/// that XP.
 pub fn parse_mee6_export(text: &str) -> Result<Vec<Mee6ImportRow>, Mee6ExportError> {
     let parsed: serde_json::Value = serde_json::from_str(text).map_err(|e| Mee6ExportError {
         problems: vec![format!("file is not valid JSON: {e}")],
@@ -191,6 +192,12 @@ pub fn parse_mee6_export(text: &str) -> Result<Vec<Mee6ImportRow>, Mee6ExportErr
             problems.push(format!("{at} has invalid xp"));
             continue;
         };
+        if xp > MAX_STORED_XP {
+            problems.push(format!(
+                "{at} xp must be an integer between 0 and {MAX_STORED_XP}"
+            ));
+            continue;
+        }
         let level = match obj.get("level") {
             None => None,
             Some(v) => match as_u64(v) {
@@ -693,6 +700,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows[0].level, Some(1));
+    }
+
+    #[test]
+    fn parse_rejects_xp_above_ceiling_without_level() {
+        for xp in [MAX_STORED_XP + 1, u64::MAX] {
+            let players = serde_json::json!([{"id": "100000000000000001", "xp": xp}]);
+            for export in [players.clone(), serde_json::json!({"players": players})] {
+                let err = parse_mee6_export(&export.to_string()).unwrap_err();
+                assert_eq!(
+                    err.problems,
+                    [format!("row 1 xp must be an integer between 0 and {MAX_STORED_XP}")]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_rejects_xp_above_ceiling_before_optional_level() {
+        // Numeric levels must not reach the curve; malformed levels must not
+        // mask the XP ceiling error either.
+        for xp in [u64::MAX, MAX_STORED_XP + 1] {
+            for level in [serde_json::json!(0), serde_json::json!("not-a-level")] {
+                let players = serde_json::json!([
+                    {"id": "100000000000000001", "xp": xp, "level": level}
+                ]);
+                for export in [players.clone(), serde_json::json!({"players": players})] {
+                    let err = parse_mee6_export(&export.to_string()).unwrap_err();
+                    assert_eq!(
+                        err.problems,
+                        [format!("row 1 xp must be an integer between 0 and {MAX_STORED_XP}")]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_accepts_xp_ceiling_boundaries() {
+        for xp in [0, MAX_STORED_XP - 1, MAX_STORED_XP] {
+            for level in [None, Some(level_for_xp(xp))] {
+                let mut player = serde_json::json!({"id": "100000000000000001", "xp": xp});
+                if let Some(level) = level {
+                    player["level"] = serde_json::json!(level);
+                }
+                let players = serde_json::json!([player]);
+                for export in [players.clone(), serde_json::json!({"players": players})] {
+                    let rows = parse_mee6_export(&export.to_string()).unwrap();
+                    assert_eq!(
+                        rows,
+                        [Mee6ImportRow {
+                            member_id: "100000000000000001".to_owned(),
+                            xp,
+                            level,
+                        }]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_rejects_entire_export_and_reports_every_ceiling_violation() {
+        let export = serde_json::json!([
+            {"id": "100000000000000001", "xp": 100, "level": 1},
+            {"id": "100000000000000002", "xp": MAX_STORED_XP + 1},
+            {"id": "100000000000000003", "xp": 0, "level": 0},
+            {"id": "100000000000000004", "xp": u64::MAX, "level": 0}
+        ]);
+        let err = parse_mee6_export(&export.to_string()).unwrap_err();
+        assert_eq!(
+            err.problems,
+            [
+                format!("row 2 xp must be an integer between 0 and {MAX_STORED_XP}"),
+                format!("row 4 xp must be an integer between 0 and {MAX_STORED_XP}"),
+            ]
+        );
     }
 
     #[test]
