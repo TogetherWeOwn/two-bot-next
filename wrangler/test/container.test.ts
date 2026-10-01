@@ -311,11 +311,11 @@ async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map
 
 const ALERT_ENV = { UNREADY_ALERT_FAILURES: "3", OPS_ALERT_WEBHOOK_URL: WORKER_ENV.OPS_ALERT_WEBHOOK_URL };
 
-async function fireSdkAlarm(t: TestContext, bot: TwoBotContainer) {
+async function fireSdkAlarm(t: TestContext, bot: TwoBotContainer, advance = 60_000) {
   const firing = bot.alarm();
   await setImmediate();
   // The SDK waits until its next task is due before finishing the alarm.
-  t.mock.timers.tick(60_000);
+  t.mock.timers.tick(advance);
   await firing;
   await setImmediate();
 }
@@ -369,6 +369,73 @@ test("real SDK collapses old duplicate chains and ignores snapshotted stale call
   assert.equal(h.values.get("two-bot:readiness")?.failures, 2);
   assert.equal(h.pending().length, 1);
 });
+
+for (const warm of [false, true]) {
+  for (const status of [200, 503]) {
+    test(`real SDK ${warm ? "warm" : "cold"} alarm survives callback-name lookup failure (${status}) and eviction`, async (t) => {
+      t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+      t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 204 }));
+      const env = { ...WORKER_ENV, UNREADY_ALERT_FAILURES: "1" };
+      const h = await harness(t, env);
+      h.setProbeStatus(status);
+      if (warm) {
+        const response = await h.bot.fetch(new Request("https://worker.invalid/health"));
+        await response.arrayBuffer();
+      } else {
+        await h.bot.onStart();
+      }
+      const exec = h.ctx.storage.sql.exec;
+      t.mock.method(h.ctx.storage.sql, "exec", (query: string, ...bindings: (string | number | null)[]) => {
+        if (/SELECT \* FROM container_schedules WHERE callback =/.test(query)) {
+          throw new Error(`synthetic lookup failure ${WORKER_ENV.OPS_ALERT_WEBHOOK_URL}`);
+        }
+        return exec(query, ...bindings);
+      });
+      t.mock.timers.tick(60_000);
+      // With the old lost-chain bug, the SDK sleeps for its three-minute
+      // lifecycle fallback instead of the next minute tick. Bound either path.
+      await fireSdkAlarm(t, h.bot, 180_000);
+      assert.equal(h.values.get("two-bot:readiness")?.lastStatus, status);
+      assert.equal(h.requests.filter((r) => r.pathname === "/readyz").length, 1);
+      assert.equal(h.pending().length, 1, "SDK must not delete the last monitoring task on lookup failure");
+      assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.OPS_ALERT_WEBHOOK_URL)));
+
+      // Resume using only the persisted task: no inbound request or onStart to
+      // repair a lost chain, and no in-memory guard survives this eviction.
+      const resumed = await harness(t, env, h.values, h.database);
+      resumed.setProbeStatus(200);
+      await fireSdkAlarm(t, resumed.bot);
+      assert.equal(resumed.requests.filter((r) => r.pathname === "/readyz").length, 1);
+      assert.equal(resumed.values.get("two-bot:readiness")?.failures, 0);
+      assert.equal(resumed.pending().length, 1);
+      const events = [...h.logs, ...resumed.logs].filter((line) => line.startsWith("{"))
+        .map((line) => JSON.parse(line).event);
+      assert.deepEqual(events, status === 503
+        ? ["container_unready_alert", "container_unready_recovery"] : []);
+    });
+  }
+}
+
+for (const futureFirst of [true, false]) {
+  test(`real SDK samples due keepalive with ${futureFirst ? "future-first" : "due-first"} legacy rows`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+    const h = await harness(t, { KEEPALIVE_SECONDS: "60" });
+    for (const delay of futureFirst ? [1200, 60] : [60, 1200]) {
+      await h.bot.schedule(delay, "keepalive", { startedAt: Date.now() });
+    }
+    await h.bot.schedule(3600, "onStop", {});
+    t.mock.timers.tick(60_000);
+    await fireSdkAlarm(t, h.bot);
+    assert.equal(h.values.get("two-bot:readiness")?.failures, 1, "sample at +60s, not the future legacy deadline");
+    assert.equal(h.requests.filter((r) => r.pathname === "/readyz").length, 1);
+    assert.equal(h.pending().length, 1, "replace both due and future legacy rows with one successor");
+    assert.equal(h.pending()[0].time, Date.now() / 1000);
+    assert.equal((await h.bot.listSchedules("onStop")).length, 1);
+    await fireSdkAlarm(t, h.bot);
+    assert.equal(h.values.get("two-bot:readiness")?.failures, 2);
+    assert.equal(h.pending().length, 1);
+  });
+}
 
 test("health traffic and onStart during an in-flight SDK alarm do not arm another chain", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });

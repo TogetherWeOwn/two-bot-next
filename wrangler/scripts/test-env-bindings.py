@@ -15,12 +15,16 @@ checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
 # Optional operator tuning in the real config must not create duplicate keys
 # in our synthetic fixtures or change the omitted-binding test's meaning.
-BASE = re.sub(
-    r"^(?:UNREADY_ALERT_FAILURES|OPS_ALERT_WEBHOOK_URL)\s*=.*(?:\n|$)",
-    "",
-    Path(__file__).parents[1].joinpath("wrangler.toml").read_text(),
-    flags=re.MULTILINE,
-)
+def fixture_base(content):
+    return re.sub(
+        r"^[ \t]*(?:UNREADY_ALERT_FAILURES|OPS_ALERT_WEBHOOK_URL)[ \t]*=.*(?:\n|$)",
+        "",
+        content,
+        flags=re.MULTILINE,
+    )
+
+
+BASE = fixture_base(Path(__file__).parents[1].joinpath("wrangler.toml").read_text())
 
 
 class AlertBindingTests(unittest.TestCase):
@@ -32,6 +36,27 @@ class AlertBindingTests(unittest.TestCase):
 
     def test_missing_optional_secret_is_log_only(self):
         self.assertEqual(self.check_config(BASE), [])
+
+    def test_optional_fixture_keys_can_be_indented(self):
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            for indent in ["", "  ", "\t"]:
+                with self.subTest(section=section, indent=repr(indent)):
+                    config = BASE.replace(
+                        f"[{section}]",
+                        f'[{section}]\n{indent}UNREADY_ALERT_FAILURES = "5" # operator tuning',
+                    )
+                    self.assertEqual(self.check_config(config), [], "indented tuning is valid TOML")
+                    self.assertEqual(fixture_base(config), BASE)
+                    config = config.replace(
+                        f"[{section}]",
+                        f'[{section}]\n{indent}OPS_ALERT_WEBHOOK_URL = "synthetic-secret"',
+                    )
+                    normalized = fixture_base(config)
+                    self.assertEqual(normalized, BASE)
+                    replacement = normalized.replace(
+                        f"[{section}]", f'[{section}]\nUNREADY_ALERT_FAILURES = "3"'
+                    )
+                    self.assertEqual(self.check_config(replacement), [], "fixtures must not duplicate tuning keys")
 
     def test_plaintext_webhook_is_rejected_without_echoing_value(self):
         for section in ["vars", "env.staging.vars", "env.production.vars"]:

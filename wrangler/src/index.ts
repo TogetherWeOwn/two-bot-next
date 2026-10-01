@@ -170,8 +170,11 @@ export class TwoBotContainer extends Container<Env> {
     this.keepaliveRunning = true;
     try {
       await this.keepaliveArming;
-      const [pending] = await this.listSchedules("keepalive");
-      if (pending?.taskId !== schedule.taskId) return;
+      // The SDK already looked up this due task by ID before invoking us.
+      // listSchedules() in 0.3.7 is unordered LIMIT 1: it can select a future
+      // legacy row, and a failed extra lookup loses this task when the SDK
+      // deletes it after the callback. Trust the live callback context instead.
+      // Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
       this.renewActivityTimeout();
       try {
         let status: number | null = null;
