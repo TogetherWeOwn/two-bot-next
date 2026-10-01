@@ -47,10 +47,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          # The migration guard reads PR base/push-before blobs, including the lock.
+          fetch-depth: 0
+
+      - name: Check migration numbering and immutability
+        env:
+          MIGRATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
+          python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
       - name: offline build-cache safety regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+
+      - name: parity soak checklist coverage (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
@@ -71,6 +84,11 @@ jobs:
 
       - name: Verify Docker dependency layer
         run: python3 scripts/test-docker-deps.py --cargo
+
+      - name: Prevent raw secrets under derived Debug
+        run: |
+          python3 scripts/check-secret-debug.py --test
+          python3 scripts/check-secret-debug.py
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -101,8 +119,21 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --test '*' --features two-bot-core/db --locked
 
+      # Reuse the exact feature/target graph above so this measures execution,
+      # not a second compilation. Property tests are pure fixtures (64 cases).
+      - name: property tests stay under 30 seconds
+        run: |
+          start=$SECONDS
+          cargo test --workspace --lib --bins --test '*' --features two-bot-core/db --locked property_
+          elapsed=$((SECONDS - start))
+          printf 'Property suite: %s seconds (budget <30)\n' "$elapsed"
+          test "$elapsed" -lt 30
+
       - name: cargo test (docs)
         run: cargo test --workspace --doc --features two-bot-core/db --locked
+
+      - name: Measure metrics RSS (local fixtures only)
+        run: cargo run -p two-bot-core --example metrics_rss --locked
 
       - name: audit database regressions (CI service only)
         run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --locked -- --ignored
