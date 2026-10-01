@@ -6,10 +6,15 @@
 //! without a gateway connection.
 
 pub mod adapter;
+pub mod audit_mirror;
+pub mod channel_access;
 pub mod executor;
+mod executor_metrics;
 pub mod intents;
 pub mod interactions;
+pub mod internal_actions;
 pub mod internal_events;
+mod message_safety;
 pub mod pipeline;
 
 pub use adapter::event_to_core;

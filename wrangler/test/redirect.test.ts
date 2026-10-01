@@ -20,6 +20,7 @@ import {
   clickIdempotencyKey,
   handleRedirect,
   inviteUrl,
+  isReservedInternal,
   isValidInviteCode,
   isValidSlug,
   type Campaign,
@@ -269,6 +270,68 @@ describe("things that are not people", () => {
     assert.equal(res.status, 405);
     assert.equal(res.headers["allow"], "GET, HEAD");
     assert.equal(h.clicks.length, 0);
+  });
+});
+
+describe("reserved internal slugs never become campaigns", () => {
+  const METRICS_CAMPAIGN: Campaign = {
+    slug: "metrics",
+    inviteCode: "synthetic",
+  };
+  function metricsHarness() {
+    const h = harness();
+    const lookupCalls: string[] = [];
+    h.deps.lookup = async (slug) => {
+      lookupCalls.push(slug);
+      return MAPPINGS.find((c) => c.slug === slug) ?? METRICS_CAMPAIGN;
+    };
+    h.deps.recordClick = async () => {
+      throw new Error("reserved slug must not record clicks");
+    };
+    return { h, lookupCalls };
+  }
+
+  test("canonical aliases are reserved for every method", async () => {
+    for (const path of [
+      "/metrics",
+      "/METRICS",
+      "/%6detrics",
+      "//metrics",
+      "/metrics/",
+      "/metrics/extra",
+      "/metrics//extra",
+      "/metrics?token=synthetic",
+    ]) {
+      assert.ok(isReservedInternal(path), `${path} must be reserved`);
+      for (const method of ["GET", "HEAD", "POST"]) {
+        const { h, lookupCalls } = metricsHarness();
+        const res = await h.call(method, path);
+        assert.equal(res.status, 404, `${method} ${path} must 404, got ${res.status}`);
+        assert.equal(res.headers["location"], undefined);
+        assert.ok(!("click" in res) || res.click === undefined);
+        assert.equal(lookupCalls.length, 0, `${method} ${path} must skip lookup`);
+        assert.equal(h.clicks.length, 0);
+      }
+    }
+  });
+
+  test("near-miss slugs still resolve as campaigns", async () => {
+    // `metricsfoo` is not reserved: GET redirects and records, POST is 405.
+    assert.ok(!isReservedInternal("/metricsfoo"));
+    const { h } = metricsHarness();
+    const lookup = h.deps.lookup;
+    h.deps.lookup = async (slug) =>
+      slug === "metricsfoo"
+        ? { slug: "metricsfoo", inviteCode: CODE }
+        : lookup(slug);
+    const clicks: RedirectClick[] = [];
+    h.deps.recordClick = async (click) => { clicks.push(click); };
+    const res = await h.call("GET", "/metricsfoo");
+    assert.equal(res.status, 302);
+    assert.equal(res.headers["location"], `https://discord.gg/${CODE}`);
+    assert.equal(clicks.length, 1);
+    const post = await h.call("POST", "/metricsfoo");
+    assert.equal(post.status, 405);
   });
 });
 
