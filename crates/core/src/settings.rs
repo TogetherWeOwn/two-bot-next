@@ -608,6 +608,22 @@ pub enum WriteRefusal {
     Unknown(String),
     #[error("refused: settings writes must name an actor")]
     MissingActor,
+    #[error("refused: setting values cannot contain U+0000")]
+    NullCharacter,
+}
+
+/// Postgres JSONB cannot represent decoded NUL in strings or object keys.
+/// Inspect the domain value, not its encoding (literal `\\u0000` is valid).
+#[must_use]
+pub(crate) fn contains_json_nul(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.contains('\0'),
+        Value::Array(values) => values.iter().any(contains_json_nul),
+        Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key.contains('\0') || contains_json_nul(value)),
+        _ => false,
+    }
 }
 
 /// Validate a write: key guard first (env-only and unknown never reach SQL),
@@ -636,6 +652,9 @@ pub fn validate_write(
     }
     if actor.is_empty() {
         return Err(WriteRefusal::MissingActor);
+    }
+    if value.as_ref().is_some_and(contains_json_nul) {
+        return Err(WriteRefusal::NullCharacter);
     }
     Ok(ValidatedWrite {
         guild_id: guild_id.to_owned(),
