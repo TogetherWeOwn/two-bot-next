@@ -1,4 +1,4 @@
-"""Keep guarded channel fixtures routed to actual dedicated nightly execution."""
+"""Keep guarded fixtures, mock deadlines and strict docs correctly separated."""
 import re
 import unittest
 from pathlib import Path
@@ -27,6 +27,23 @@ class NightlyRoutingTests(unittest.TestCase):
         self.assertIn("cargo test -p two-bot-core --all-features --lib --locked channel_moderation_store::", dedicated)
         self.assertIn("-- --include-ignored --test-threads=1", dedicated)
         self.assertNotIn("--skip", dedicated, "routing is not permanent exclusion")
+
+    def test_response_classification_fixture_does_not_shorten_default_deadline(self):
+        source = (ROOT / "crates/discord/src/internal_actions/tests.rs").read_text()
+        fixture = source.split("    fn executor(", 1)[1].split("\n    fn ", 1)[0]
+        self.assertNotIn("executor.timeout =", fixture)
+
+    def test_short_deadlines_remain_explicit_in_timeout_coverage(self):
+        source = (ROOT / "crates/discord/src/internal_actions/tests.rs").read_text()
+        self.assertTrue("    fn deadline_executor(" in source, "deadline fixtures must be explicit")
+        for name in [
+            "timeout_and_lost_response_are_unknown_and_not_retried",
+            "deadline_covers_success_body_and_truncated_body_is_unknown",
+        ]:
+            body = source.split(f"async fn {name}()", 1)[1].split("#[tokio::test]", 1)[0]
+            self.assertIn("mock.deadline_executor(keys())", body)
+            self.assertIn("UnknownReason::Timeout", body)
+            self.assertIn("assert_eq!(mock.count(), 1)", body)
 
     def test_cutover_reference_urls_are_hyperlinks_without_suppressing_doc_lint(self):
         for name in ["self_role_store.rs", "tickets.rs"]:

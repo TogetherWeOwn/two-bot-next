@@ -23,6 +23,10 @@
 
 ### Fixed
 
+- Keep mock announcement response-classification tests on the production executor
+  deadline; reserve the 100 ms fixture deadline for deliberate header/body timeout
+  coverage. Preserve malformed-response, no-retry and uncertain-outcome assertions
+  without changing production timing or weakening checks.
 - Execute the standalone backup round trip in CI with the current retry-ticket
   schema while preserving frozen legacy-v3 input coverage. Release only a newly
   claimed warning key when connection acquisition fails before INSERT; uncertain

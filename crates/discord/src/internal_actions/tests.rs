@@ -139,6 +139,12 @@ impl MockDiscord {
             .build();
         let mut executor = AnnouncementExecutor::new(Arc::new(client), keys);
         executor.api_origin = self.origin.clone();
+        executor
+    }
+
+    fn deadline_executor(&self, keys: HashMap<String, String>) -> AnnouncementExecutor {
+        // Short deadlines belong only to intentional header/body timeout tests.
+        let mut executor = self.executor(keys);
         executor.timeout = Duration::from_millis(100);
         executor
     }
@@ -174,6 +180,19 @@ async fn run_once(executor: &AnnouncementExecutor, body: &Map<String, Value>) ->
     )
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn classification_fixture_keeps_default_deadline_and_timeout_fixture_is_explicit() {
+    let mock = MockDiscord::start(Reply::success()).await;
+    let executor = mock.executor(keys());
+    let production = AnnouncementExecutor::new(Arc::clone(&executor.twilight), keys());
+    assert_eq!(executor.timeout, production.timeout);
+    assert_eq!(
+        mock.deadline_executor(keys()).timeout,
+        Duration::from_millis(100)
+    );
+    assert_eq!(mock.count(), 0);
 }
 
 #[tokio::test]
@@ -407,8 +426,13 @@ async fn broken_rate_limit_bodies_retain_headers_and_definite_no_effect() {
     let oversized = Reply::new(429, "x".repeat(MAX_RESPONSE_BYTES + 1));
     for mut reply in [slow, truncated, oversized] {
         reply.headers = "Retry-After: 6.5\r\nX-RateLimit-Global: true\r\n".to_owned();
+        let slow_body = !reply.body_delay.is_zero();
         let mock = MockDiscord::start(reply).await;
-        let executor = mock.executor(keys());
+        let executor = if slow_body {
+            mock.deadline_executor(keys())
+        } else {
+            mock.executor(keys())
+        };
         assert_eq!(
             run_once(&executor, &announcement("ok")).await,
             ExecutionOutcome::RateLimited(RateLimitCooldown {
@@ -438,7 +462,7 @@ async fn timeout_and_lost_response_are_unknown_and_not_retried() {
     let mut delayed = Reply::success();
     delayed.delay = Duration::from_secs(1);
     let mock = MockDiscord::start(delayed).await;
-    let executor = mock.executor(keys());
+    let executor = mock.deadline_executor(keys());
     assert_eq!(
         run_once(&executor, &announcement("private-message")).await,
         ExecutionOutcome::Unknown(UnknownReason::Timeout)
@@ -482,7 +506,7 @@ async fn deadline_covers_success_body_and_truncated_body_is_unknown() {
     let mut slow_body = Reply::success();
     slow_body.body_delay = Duration::from_secs(1);
     let mock = MockDiscord::start(slow_body).await;
-    let executor = mock.executor(keys());
+    let executor = mock.deadline_executor(keys());
     assert_eq!(
         run_once(&executor, &announcement("ok")).await,
         ExecutionOutcome::Unknown(UnknownReason::Timeout)
