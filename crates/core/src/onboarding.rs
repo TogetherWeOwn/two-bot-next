@@ -4,14 +4,12 @@
 //! Parity source: TogetherWeOwn/two-bot @ d5d11793, `src/onboarding/{flow,
 //! catalog,session,mode,anchorEvent}.ts` and `src/discord/{onboarding,
 //! sessionWelcome,anchorWelcome}.ts`; see `docs/parity.md` §§2, 3, 8.
-//! Post-freeze selection/visibility fixes through bffccf3: b948b89, b3747a8,
-//! a40d4a5 and d3d9afe.
 //! Card-directed difference: anchor is selected by `TWO_ONBOARDING_MODE`, not
 //! by the presence of `DISCORD_ANCHOR_WELCOME_CHANNEL_ID`.
 //!
 //! Outcomes describe guild-channel posts and ephemeral replies, never DMs.
-//! Session picks have no role fields. Game routing uses the hub fallback only
-//! when visible; the executor must re-resolve visibility after granting roles.
+//! Session picks have no role fields. Game routing preserves the legacy hub
+//! fallback; the executor must re-resolve visibility after granting roles.
 //! Goodbyes require empty allowed-mentions even for mention-like usernames.
 //! The store's prompt guard serializes successful join/gate-clear sends.
 //!
@@ -379,30 +377,27 @@ pub struct Destination {
     pub key: String,
     pub label: String,
     pub emoji: String,
-    /// None when neither the primary nor the fallback is visible.
-    pub channel_id: Option<String>,
+    pub channel_id: String,
     pub degraded: bool,
 }
 
-/// Resolve one pick to a linkable channel (legacy `resolveDestination`). Both
-/// primary and fallback must be checked: an unavailable pick keeps its role
-/// but has no route. A visible hub-by-design is not flagged degraded.
+/// Resolve one pick to a linkable channel. A room the member cannot open is
+/// never linked — the fallback is (legacy `resolveDestination`). A pick with
+/// no dedicated room routes to the hub by design, not as a failure, so it is
+/// not flagged degraded.
 #[must_use]
 pub fn resolve_destination(pick: &GamePick, visible: &dyn Fn(&str) -> bool) -> Destination {
-    let (channel_id, degraded) = match pick.primary_channel_id {
-        Some(primary) if visible(primary) => (Some(primary.to_owned()), false),
-        _ if visible(pick.fallback_channel_id) => (
-            Some(pick.fallback_channel_id.to_owned()),
-            pick.primary_channel_id.is_some(),
-        ),
-        _ => (None, false),
+    let channel_id = match pick.primary_channel_id {
+        Some(primary) if visible(primary) => (primary.to_owned(), false),
+        Some(_) => (pick.fallback_channel_id.to_owned(), true),
+        None => (pick.fallback_channel_id.to_owned(), false),
     };
     Destination {
         key: pick.key.to_owned(),
         label: pick.label.to_owned(),
         emoji: pick.emoji.to_owned(),
-        channel_id,
-        degraded,
+        channel_id: channel_id.0,
+        degraded: channel_id.1,
     }
 }
 
@@ -412,7 +407,7 @@ pub struct GameSelection {
     /// Roles to hold afterwards — the menu returns the whole answer, not a delta.
     pub role_ids: Vec<String>,
     pub destinations: Vec<Destination>,
-    /// Visible channels to link, in first-submission order, deduped.
+    /// Distinct channels to link, in catalog order, deduped.
     pub channel_ids: Vec<String>,
     pub unknown_keys: Vec<String>,
     pub degraded_count: usize,
@@ -425,12 +420,7 @@ pub struct GameSelection {
 pub fn plan_game_selection(keys: &[&str], visible: &dyn Fn(&str) -> bool) -> GameSelection {
     let mut picks = Vec::new();
     let mut unknown_keys = Vec::new();
-    let mut seen = HashSet::new();
     for key in keys {
-        // First occurrence wins for known and unknown keys alike.
-        if !seen.insert(*key) {
-            continue;
-        }
         match pick_by_key(key) {
             Some(pick) => picks.push(pick),
             None => unknown_keys.push((*key).to_owned()),
@@ -442,10 +432,8 @@ pub fn plan_game_selection(keys: &[&str], visible: &dyn Fn(&str) -> bool) -> Gam
         .collect();
     let mut channel_ids = Vec::new();
     for d in &destinations {
-        if let Some(channel_id) = &d.channel_id {
-            if !channel_ids.contains(channel_id) {
-                channel_ids.push(channel_id.clone());
-            }
+        if !channel_ids.contains(&d.channel_id) {
+            channel_ids.push(d.channel_id.clone());
         }
     }
     GameSelection {
@@ -515,8 +503,7 @@ pub struct GamePickerOutcome {
     /// (legacy skips the row on a pure clear: the clear branch replies and
     /// returns before either recorder call).
     pub record_selected: bool,
-    /// Record `channel_routed` after success only with visible destinations;
-    /// clearing roles or saving roles with no route records nothing routed.
+    /// Record `channel_routed` after success — same clear-path exclusion.
     pub record_routed: bool,
     /// The re-resolved plan to record when `record_routed` is set. Re-resolve
     /// post-grant in the caller — a just-added role can itself reveal the
@@ -530,21 +517,14 @@ pub struct GamePickerOutcome {
 /// Build the successful ephemeral reply from a post-grant visibility plan.
 #[must_use]
 pub fn game_picker_reply(plan: &GameSelection, guild_id: u64) -> String {
-    let heading = if plan.channel_ids.is_empty() {
-        "Game roles saved."
-    } else {
-        "Done. Here is where to go:"
-    };
-    let mut lines = vec![heading.to_owned(), String::new()];
+    let mut lines = vec!["Done. Here is where to go:".to_owned(), String::new()];
     let mut seen = HashSet::new();
     for destination in &plan.destinations {
-        let target = match &destination.channel_id {
-            Some(channel_id) => channel_link(guild_id, channel_id),
-            None => "No channel is available to you right now.".to_owned(),
-        };
         let line = format!(
             "{} **{}** → {}",
-            destination.emoji, destination.label, target
+            destination.emoji,
+            destination.label,
+            channel_link(guild_id, &destination.channel_id)
         );
         if seen.insert(line.clone()) {
             lines.push(line);
@@ -613,7 +593,7 @@ pub fn adjudicate_game_select(
         reply: game_picker_reply(&plan, guild_id),
         ephemeral: true,
         record_selected: true,
-        record_routed: !plan.channel_ids.is_empty(),
+        record_routed: true,
         routed: plan,
     })
 }
@@ -688,38 +668,39 @@ pub struct SessionPlan {
 }
 
 /// Turn "member submitted these keys" into "acknowledge this, link that"
-/// (legacy `planSession`). Pure. Unknown keys are reported and skipped; valid
-/// picks still route in catalog order. Only an empty or wholly unroutable
-/// submission has no links, and stale choices get a retry note in the ack.
+/// (legacy `planSession`). Pure. Any unknown key poisons the whole plan —
+/// nothing routes and the ack offers a retry — so a stale panel can never
+/// half-route.
 #[must_use]
 pub fn plan_session(
     keys: &[&str],
     visible: &dyn Fn(&str) -> bool,
     catalog: &[SessionPick],
 ) -> SessionPlan {
+    let mut picks = Vec::new();
     let mut unknown_keys = Vec::new();
-    let mut wanted = HashSet::new();
+    let mut seen = HashSet::new();
     for key in keys {
         match session_pick_by_key(key, catalog) {
             None => unknown_keys.push((*key).to_owned()),
             Some(pick) => {
-                wanted.insert(pick.key);
+                if seen.insert(pick.key) {
+                    picks.push(pick);
+                }
             }
         }
     }
-    let picks: Vec<&SessionPick> = catalog
-        .iter()
-        .filter(|pick| wanted.contains(pick.key))
-        .collect();
     let mut channel_ids = Vec::new();
     let mut unavailable = Vec::new();
-    for pick in &picks {
-        if visible(&pick.channel_id) {
-            if !channel_ids.contains(&pick.channel_id) {
-                channel_ids.push(pick.channel_id.clone());
+    if unknown_keys.is_empty() {
+        for pick in &picks {
+            if visible(&pick.channel_id) {
+                if !channel_ids.contains(&pick.channel_id) {
+                    channel_ids.push(pick.channel_id.clone());
+                }
+            } else {
+                unavailable.push(pick.key.to_owned());
             }
-        } else {
-            unavailable.push(pick.key.to_owned());
         }
     }
     SessionPlan {
@@ -736,14 +717,14 @@ pub fn plan_session(
 /// acceptance asks for.
 #[must_use]
 pub fn session_ack_text(plan: &SessionPlan) -> String {
+    if !plan.unknown_keys.is_empty() {
+        return [
+            "That option is gone or stale - the panel was probably replaced by a newer one.",
+            "Nothing was changed. Open the picker again and choose afresh.",
+        ]
+        .join("\n");
+    }
     if plan.channel_ids.is_empty() {
-        if !plan.unknown_keys.is_empty() {
-            return [
-                "That option is gone or stale - the panel was probably replaced by a newer one.",
-                "Nothing was changed. Open the picker again and choose afresh.",
-            ]
-            .join("\n");
-        }
         return [
             "Those rooms are not open to you right now.",
             "Nothing was changed - try again in a moment, or say hello in the welcome channel and someone will grab you.",
@@ -754,11 +735,7 @@ pub fn session_ack_text(plan: &SessionPlan) -> String {
         .iter()
         .map(|id| format!("<#{id}>"))
         .collect();
-    let mut ack = format!("On it - head to {}.", links.join(" and "));
-    if !plan.unknown_keys.is_empty() {
-        ack.push_str(" One choice was gone or stale, so I skipped it - open the picker again if you want to re-pick that part.");
-    }
-    ack
+    format!("On it - head to {}.", links.join(" and "))
 }
 
 /// Session welcome copy (legacy `sessionWelcomeText`). Picks a destination
@@ -1332,10 +1309,6 @@ mod tests {
         |_| false
     }
 
-    fn see_hub() -> impl Fn(&str) -> bool {
-        |channel_id| channel_id == GAME_HUB_CHANNEL_ID
-    }
-
     fn catalog() -> [SessionPick; 2] {
         staging_session_picks()
     }
@@ -1457,13 +1430,16 @@ mod tests {
     fn visible_room_is_used_dark_room_falls_back_hubless_pick_is_not_degraded() {
         let shooters = pick_by_key("shooters").expect("catalog");
         let used = resolve_destination(shooters, &see_everything());
-        assert_eq!(used.channel_id.as_deref(), shooters.primary_channel_id);
+        assert_eq!(used.channel_id, shooters.primary_channel_id.expect("room"));
         assert!(!used.degraded);
-        let dark = resolve_destination(shooters, &see_hub());
-        assert_eq!(dark.channel_id.as_deref(), Some(GAME_HUB_CHANNEL_ID));
+        let dark = resolve_destination(shooters, &see_nothing());
+        assert_eq!(dark.channel_id, GAME_HUB_CHANNEL_ID);
         assert!(dark.degraded, "fallback must show in the numbers");
-        let hub = resolve_destination(pick_by_key("rocketleague").expect("catalog"), &see_hub());
-        assert_eq!(hub.channel_id.as_deref(), Some(GAME_HUB_CHANNEL_ID));
+        let hub = resolve_destination(
+            pick_by_key("rocketleague").expect("catalog"),
+            &see_nothing(),
+        );
+        assert_eq!(hub.channel_id, GAME_HUB_CHANNEL_ID);
         assert!(!hub.degraded, "hub-by-design is not a failure");
     }
 
@@ -1471,7 +1447,7 @@ mod tests {
     fn game_plan_dedupes_rooms_reports_unknown_and_handles_empty() {
         let plan = plan_game_selection(
             &["shooters", "rocketleague", "fallguys", "not-a-game"],
-            &see_hub(),
+            &see_nothing(),
         );
         assert_eq!(plan.unknown_keys, vec!["not-a-game".to_owned()]);
         assert_eq!(plan.role_ids.len(), 3);
@@ -1480,59 +1456,6 @@ mod tests {
         let empty = plan_game_selection(&[], &see_everything());
         assert!(empty.role_ids.is_empty() && empty.channel_ids.is_empty());
         assert_eq!(empty.degraded_count, 0);
-    }
-
-    #[test]
-    fn game_plan_dedupes_known_and_unknown_keys_in_first_submission_order() {
-        let plan = plan_game_selection(
-            &[
-                "horror", "shooters", "horror", "gone", "gone", "shooters", "retired",
-            ],
-            &see_hub(),
-        );
-        assert_eq!(
-            plan.role_ids,
-            vec![
-                pick_by_key("horror").unwrap().role_id,
-                pick_by_key("shooters").unwrap().role_id,
-            ]
-        );
-        assert_eq!(
-            plan.destinations
-                .iter()
-                .map(|d| d.key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["horror", "shooters"]
-        );
-        assert_eq!(plan.degraded_count, 2, "one fallback per distinct pick");
-        assert_eq!(plan.channel_ids, vec![GAME_HUB_CHANNEL_ID]);
-        assert_eq!(plan.unknown_keys, vec!["gone", "retired"]);
-        let unknown = plan_game_selection(&["gone", "gone"], &see_everything());
-        assert_eq!(unknown.unknown_keys, vec!["gone"]);
-        assert!(unknown.role_ids.is_empty() && unknown.destinations.is_empty());
-        assert_eq!(unknown.degraded_count, 0);
-    }
-
-    #[test]
-    fn invisible_primary_and_fallback_retain_roles_without_a_route() {
-        let plan = plan_game_selection(&["shooters", "rocketleague"], &see_nothing());
-        assert_eq!(
-            plan.role_ids,
-            vec![
-                pick_by_key("shooters").unwrap().role_id,
-                pick_by_key("rocketleague").unwrap().role_id,
-            ]
-        );
-        assert!(plan.channel_ids.is_empty());
-        assert!(plan.destinations.iter().all(|d| d.channel_id.is_none()));
-        assert_eq!(
-            plan.degraded_count, 0,
-            "unavailable is not a fallback route"
-        );
-        let reply = game_picker_reply(&plan, 1);
-        assert!(reply.starts_with("Game roles saved."));
-        assert!(reply.contains("No channel is available to you right now."));
-        assert!(!reply.contains("discord.com/channels") && !reply.contains("<#"));
     }
 
     #[test]
@@ -1658,66 +1581,22 @@ mod tests {
     }
 
     #[test]
-    fn session_valid_picks_survive_stale_keys_and_offer_a_partial_retry() {
+    fn session_unknown_keys_poison_the_plan_and_offer_a_retry() {
         let picks = catalog();
         let plan = plan_session(&["survival", "find-players"], &see_everything(), &picks);
-        assert_eq!(plan.unknown_keys, vec!["survival"]);
-        assert_eq!(plan.picks, vec!["find-players"]);
-        assert_eq!(plan.channel_ids, vec![STAGING_LOOKING_TO_PLAY_CHANNEL_ID]);
+        assert_eq!(plan.unknown_keys, vec!["survival".to_owned()]);
+        assert!(
+            plan.channel_ids.is_empty(),
+            "a stale panel never half-routes"
+        );
         let ack = session_ack_text(&plan);
         assert!(
             ack.contains("stale"),
-            "stale choices still get a retry note"
+            "caller must offer a retry, not silence"
         );
-        assert!(ack.contains(&format!("<#{STAGING_LOOKING_TO_PLAY_CHANNEL_ID}>")));
-        assert!(!ack.contains("Nothing was changed"));
-    }
-
-    #[test]
-    fn session_entirely_unknown_or_empty_submissions_route_nothing() {
-        let picks = catalog();
-        let unknown = plan_session(&["nonsense"], &see_everything(), &picks);
-        assert!(unknown.picks.is_empty() && unknown.channel_ids.is_empty());
-        assert_eq!(unknown.unknown_keys, vec!["nonsense"]);
-        let ack = session_ack_text(&unknown);
-        assert!(ack.contains("stale") && ack.contains("Nothing was changed"));
-        let empty = adjudicate_session_select(&[], &see_everything(), &picks);
-        assert!(empty.routed.picks.is_empty() && empty.routed.channel_ids.is_empty());
-        assert!(!empty.record_routed);
-        assert!(!empty.reply.contains("<#"));
-    }
-
-    #[test]
-    fn session_reordered_duplicate_submissions_follow_the_supplied_catalog() {
-        let picks = catalog();
-        let keys = ["join-voice", "find-players", "join-voice", "find-players"];
-        let plan = plan_session(&keys, &see_everything(), &picks);
-        assert_eq!(
-            plan,
-            plan_session(&["find-players", "join-voice"], &see_everything(), &picks)
-        );
-        let reversed = [picks[1].clone(), picks[0].clone()];
-        let plan = plan_session(&keys, &see_everything(), &reversed);
-        assert_eq!(plan.picks, vec!["join-voice", "find-players"]);
-        assert_eq!(
-            plan.channel_ids,
-            vec![
-                STAGING_LOBBY_VOICE_CHANNEL_ID,
-                STAGING_LOOKING_TO_PLAY_CHANNEL_ID
-            ]
-        );
-        let hidden = plan_session(&keys, &see_nothing(), &reversed);
-        assert_eq!(hidden.unavailable, vec!["join-voice", "find-players"]);
-        assert!(hidden.channel_ids.is_empty());
-    }
-
-    #[test]
-    fn session_shared_channels_dedupe_without_losing_selected_picks() {
-        let picks = build_session_picks("10", "10");
-        let plan = plan_session(&["join-voice", "find-players"], &see_everything(), &picks);
-        assert_eq!(plan.picks, vec!["find-players", "join-voice"]);
-        assert_eq!(plan.channel_ids, vec!["10"]);
-        assert_eq!(session_ack_text(&plan), "On it - head to <#10>.");
+        assert!(!ack.contains(STAGING_LOOKING_TO_PLAY_CHANNEL_ID));
+        let none = plan_session(&["nonsense"], &see_everything(), &picks);
+        assert!(none.channel_ids.is_empty());
     }
 
     #[test]
