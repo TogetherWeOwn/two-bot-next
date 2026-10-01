@@ -2,8 +2,8 @@
 //! must roll back with a failed checkpoint. Only test-container schemas.
 use super::*;
 use two_bot_core::gateway_funnel::SnapshotWrite;
-use two_bot_discord::MessageEligibility;
 use two_bot_core::{InviteSnapshotStore, InviteState};
+use two_bot_discord::MessageEligibility;
 
 fn invite(uses: u64) -> InviteState {
     InviteState {
