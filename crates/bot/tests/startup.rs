@@ -135,7 +135,10 @@ fn configured_gateway_initialization_failure_exits_nonzero() {
         .unwrap()
         .read_to_string(&mut logs)
         .unwrap();
-    assert!(logs.contains("database_connect_failed"), "child logs: {logs}");
+    assert!(
+        logs.contains("database_connect_failed"),
+        "child logs: {logs}"
+    );
     assert!(
         logs.contains("container_service_failed"),
         "child logs: {logs}"

@@ -86,16 +86,14 @@ async fn main() {
     });
 
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
-    let listener = server::bind(&config.listen_addr)
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(
-                startup_phase = "listener_bind",
-                error_class = "listener_bind_failed",
-                "container listener failed"
-            );
-            std::process::exit(1);
-        });
+    let listener = server::bind(&config.listen_addr).await.unwrap_or_else(|_| {
+        tracing::error!(
+            startup_phase = "listener_bind",
+            error_class = "listener_bind_failed",
+            "container listener failed"
+        );
+        std::process::exit(1);
+    });
     let gateway_url = match std::env::var("DISCORD_GATEWAY_URL") {
         Ok(url) => Some(url),
         Err(std::env::VarError::NotPresent) => None,
