@@ -342,8 +342,8 @@ impl SelfRoleService {
         match result {
             Ok(result) => result,
             Err(error) => {
-                // Repairs need a new lane, and must never run in dry-run mode.
-                // No repair of an old target becomes success for the old event.
+                // Repairs need fresh typed evidence ownership and a new lane;
+                // never enter in dry-run or report success for the old event.
                 if !self.dry_run
                     && matches!(&error, RuntimeError::Stale)
                     && panel.exclusive

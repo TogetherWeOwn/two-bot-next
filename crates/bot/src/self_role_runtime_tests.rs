@@ -313,6 +313,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     dry_run_audits_without_mutation_or_target_publication(pool).await?;
     execution_and_compensation(pool).await?;
     stale_inflight_repairs_committed_target(pool).await?;
+    stale_handoff_preserves_unknown_and_refuses_other_owners(pool).await?;
     interrupted_exchange_cannot_settle(pool).await?;
     unknown_target_is_not_empty(pool).await?;
     dry_run_refuses_recovered_mutation(pool).await?;
@@ -1217,7 +1218,7 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             let original = prepared.event.clone();
             let audit = prepared.audit.clone();
             let panel_claim = prepared.panel.clone();
-            let mut step = Box::pin(feature.execute_step(&mut prepared, OLD_ROLE, false, None));
+            let mut step = Box::pin(feature.execute_step(&mut prepared, OLD_ROLE, false));
             tokio::select! {
                 result = step.as_mut() => panic!("step completed before transfer: {result:?}"),
                 result = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1366,7 +1367,7 @@ async fn repeated_processing_tickets_preserve_pending(pool: &PgPool) -> TestResu
             feature.checkpoint(&mut prepared).await.unwrap();
             assert!(prepared.event.exchange_pending);
             feature
-                .execute_step(&mut prepared, NEW_ROLE, true, None)
+                .execute_step(&mut prepared, NEW_ROLE, true)
                 .await
                 .unwrap();
             assert!(prepared.event.exchange_pending);
@@ -3116,7 +3117,7 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
         let inflight = {
             let runtime = old_runtime.clone();
             tokio::spawn(async move {
-                let result = runtime.execute_step(&mut old, OLD_ROLE, true, None).await;
+                let result = runtime.execute_step(&mut old, OLD_ROLE, true).await;
                 (old, result)
             })
         };
@@ -3162,15 +3163,17 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
             .reconcile_stale(&mut stale, &panel)
             .await
             .unwrap();
-        assert_eq!(
-            panel_roles(&panel, &stale.snapshot.member_role_ids),
-            if empty {
-                vec![]
-            } else {
-                vec![NEW_ROLE.to_owned()]
-            }
-        );
+        // The old prepared state is not a repair owner or its output snapshot.
+        // Fresh terminal observation/receipt below proves target convergence.
+        assert!(stale.snapshot.member_role_ids.contains(OLD_ROLE));
         assert!(stale.snapshot.member_role_ids.contains(OTHER));
+        assert!(!old_runtime.store.owns_claim(&stale.event).await?);
+        assert!(
+            !old_runtime
+                .store
+                .record_superseded_exchange(&stale.event, &stale.audit.effects, Some(false))
+                .await?
+        );
         let mutations: Vec<_> = old_mock
             .requests()
             .into_iter()
@@ -3196,9 +3199,16 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
         assert_eq!(event, new_request.event_id);
         assert_eq!(option.as_deref(), if empty { None } else { Some("new") });
         assert!(committed);
-        let (outcome, code, pending, compensated): (String, String, bool, String) = sqlx::query_as(
-            "SELECT outcome,code,exchange_pending,compensated_removed_role_ids
-             FROM self_role_audit WHERE event_id=$1",
+        let (outcome, code, pending, compensated, complete, generation): (
+            String,
+            String,
+            bool,
+            String,
+            bool,
+            i32,
+        ) = sqlx::query_as(
+            "SELECT outcome,code,exchange_pending,compensated_removed_role_ids,
+             repair_complete,claim_generation FROM self_role_audit WHERE event_id=$1",
         )
         .bind(&old_request.event_id)
         .fetch_one(pool)
@@ -3207,18 +3217,255 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
             (outcome.as_str(), code.as_str()),
             ("rejected", "superseded_by_later_event")
         );
-        // Lane-only compatibility repair has no typed ticket migration. Once
-        // tracked attribution exists, its journal pins unknown legacy provenance;
-        // observed committed-target compensation cannot retire that durable floor.
-        assert!(pending);
+        assert!(!pending);
+        assert!(complete); // convergence receipt, not success of the old input
+        assert!(generation > stale.event.generation);
         assert_eq!(
             serde_json::from_str::<Vec<String>>(&compensated)?,
             [OLD_ROLE]
         );
+        let (desired, before, observed, unresolved_added, unresolved_removed): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT desired_role_ids,pre_mutation_role_ids,added_role_ids,
+             unresolved_added_role_ids,unresolved_removed_role_ids
+             FROM self_role_audit WHERE event_id=$1",
+        )
+        .bind(&old_request.event_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(serde_json::from_str::<Vec<String>>(&desired)?, [OLD_ROLE]);
+        assert!(serde_json::from_str::<Vec<String>>(&before)?.is_empty());
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&observed)?,
+            if empty {
+                vec![]
+            } else {
+                vec![NEW_ROLE.to_owned()]
+            }
+        );
+        assert!(serde_json::from_str::<Vec<String>>(&unresolved_added)?.is_empty());
+        assert!(serde_json::from_str::<Vec<String>>(&unresolved_removed)?.is_empty());
+        let receipts = role_receipts(pool, &old_request.event_id).await?;
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts.contains(&(
+            stale.event.generation,
+            OLD_ROLE.into(),
+            true,
+            false,
+            "response".into(),
+            Some(204),
+        )));
+        assert!(receipts.contains(&(
+            generation,
+            OLD_ROLE.into(),
+            false,
+            true,
+            "response".into(),
+            Some(204),
+        )));
+        let (retired, legacy): (i64, bool) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM self_role_exchanges WHERE event_id=$1
+             AND retired_at IS NOT NULL AND retired_generation=$2),legacy_pending
+             FROM self_role_exchange_baselines WHERE event_id=$1",
+        )
+        .bind(&old_request.event_id)
+        .bind(generation)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(retired, 2);
+        assert!(!legacy); // no new compatibility journal manufactured a floor
+        assert!(old_runtime
+            .terminal_candidates(&panel, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(old_mock.requests().len(), 14); // prepare, old PUT, two reads, repair DELETE
         drop(stale);
         drop(winner);
         old_mock.shutdown().await;
         new_mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn stale_handoff_preserves_unknown_and_refuses_other_owners(pool: &PgPool) -> TestResult {
+    for legacy in [false, true] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("stale-typed-handoff-{legacy}");
+        let mut script = snapshot(&[OTHER]); // processing admission
+        script.extend(snapshot(&[OTHER])); // repair observes missing committed role
+        script.push(ScriptedResponse::status(204)); // same-direction repair PUT
+        script.extend(snapshot(&[OLD_ROLE, OTHER])); // unknown sender still pending
+        script.extend(snapshot(&[OLD_ROLE, OTHER])); // original sender completed no-send
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let mut request = request(
+            &panel.id,
+            Selection::Select {
+                option_keys: vec!["new".into()],
+            },
+        );
+        request.event_order = "0001".into();
+        let mut stale = ready(feature.prepare(&request, &panel).await.unwrap());
+        stale._event_keeper.0.abort();
+        stale._panel_keeper.take();
+        if legacy {
+            let mut effects = stale.audit.effects.clone();
+            mark_attempt(&mut effects, OLD_ROLE, true);
+            assert!(
+                feature
+                    .store
+                    .journal_legacy_exchange(&stale.event, &effects, false)
+                    .await?
+            );
+        }
+        // The original sender retains an undispatched ticket. A different repair
+        // PUT/204 must not complete or retire that same-role/direction attempt.
+        let ticket = feature
+            .store
+            .journal_role_exchange(
+                &stale.event,
+                stale.panel.as_ref(),
+                &ExchangeIntent {
+                    role_id: OLD_ROLE.into(),
+                    adding: true,
+                    compensating: false,
+                },
+            )
+            .await?
+            .unwrap();
+        let original = stale.event.clone();
+        let mut audit = stale.audit.clone();
+        audit.outcome = SettledOutcome::Rejected;
+        audit.code = Some("superseded_by_later_event".into());
+        audit.reason = Some("a later exclusive-panel event was accepted".into());
+        clock.store(NOW + 500, Ordering::SeqCst);
+        let winner = terminal_winner(&feature.store, &panel, Some("old")).await?;
+        let hint = feature
+            .terminal_candidates(&panel, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let competing = feature.store.claim_superseded_audit(&hint).await?.unwrap();
+        let state = exchange_owner_state(pool, &request.event_id).await?;
+        assert!(matches!(
+            feature.reconcile_stale(&mut stale, &panel).await,
+            Err(RuntimeError::Stale)
+        ));
+        assert_eq!(exchange_owner_state(pool, &request.event_id).await?, state);
+        assert_eq!(mock.requests().len(), 4); // active evidence owner grants no repair
+
+        clock.store(NOW + 1000, Ordering::SeqCst);
+        let old_role = stale.audit.role_id.take();
+        stale.audit.role_id = Some(OTHER.into()); // wrong immutable discovery metadata
+        assert!(matches!(
+            feature.reconcile_stale(&mut stale, &panel).await,
+            Err(RuntimeError::Stale)
+        ));
+        assert_eq!(exchange_owner_state(pool, &request.event_id).await?, state);
+        assert_eq!(mock.requests().len(), 4);
+        stale.audit.role_id = old_role;
+        // Mutable caches do NOT cross the handoff. Claim reloads persisted intent,
+        // pending provenance and effects, despite misleading old worker snapshots.
+        stale.audit.effects = AuditEffects::default();
+        stale.audit.desired_role_ids = vec![OTHER.into()];
+        stale.audit.pre_mutation_role_ids = vec![OTHER.into()];
+        assert!(matches!(
+            feature.reconcile_stale(&mut stale, &panel).await,
+            Err(RuntimeError::PendingExchange)
+        ));
+        assert!(!feature.store.owns_superseded_claim(&competing).await?);
+        assert!(!feature.store.owns_claim(&original).await?);
+        assert!(
+            !feature
+                .store
+                .record_superseded_exchange(&original, &AuditEffects::default(), Some(false),)
+                .await?
+        );
+        let effects = terminal_evidence(pool, &audit, true, false).await?;
+        assert_eq!(effects.unresolved_added_role_ids, [OLD_ROLE]);
+        assert_eq!(effects.compensated_added_role_ids, [OLD_ROLE]);
+        let receipts = role_receipts(pool, &request.event_id).await?;
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts.contains(&(
+            original.generation,
+            OLD_ROLE.into(),
+            true,
+            false,
+            "pending".into(),
+            None
+        )));
+        assert!(receipts.contains(&(
+            competing.generation() + 1,
+            OLD_ROLE.into(),
+            true,
+            true,
+            "response".into(),
+            Some(204)
+        )));
+        let (pending_tickets, retired, floor): (i64, i64, bool) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM self_role_exchanges WHERE event_id=$1
+             AND disposition='pending' AND retired_at IS NULL),
+             (SELECT count(*) FROM self_role_exchanges WHERE event_id=$1 AND retired_at IS NOT NULL),
+             legacy_pending FROM self_role_exchange_baselines WHERE event_id=$1",
+        ).bind(&request.event_id).fetch_one(pool).await?;
+        assert_eq!((pending_tickets, retired, floor), (1, 1, legacy));
+        assert_terminal_winner(pool, &panel, &winner, Some("old")).await?;
+
+        assert!(
+            feature
+                .store
+                .complete_role_exchange(&ticket, ExchangeReceipt::NoSend)
+                .await?
+        );
+        assert!(
+            !feature
+                .store
+                .complete_role_exchange(&ticket, ExchangeReceipt::Response { status: 204 })
+                .await?
+        );
+        clock.store(NOW + 1500, Ordering::SeqCst);
+        let result = feature.reconcile_stale(&mut stale, &panel).await;
+        if legacy {
+            assert!(matches!(result, Err(RuntimeError::PendingExchange)));
+        } else {
+            result.unwrap();
+        }
+        let effects = terminal_evidence(pool, &audit, legacy, !legacy).await?;
+        assert_eq!(effects.compensated_added_role_ids, [OLD_ROLE]);
+        assert_eq!(
+            effects.unresolved_added_role_ids,
+            if legacy {
+                vec![OLD_ROLE.to_owned()]
+            } else {
+                vec![]
+            }
+        );
+        let (unretired,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM self_role_exchanges WHERE event_id=$1 AND retired_at IS NULL",
+        )
+        .bind(&request.event_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(unretired, 0);
+        assert_terminal_winner(pool, &panel, &winner, Some("old")).await?;
+        assert_eq!(mock.requests().len(), 17);
+        let mutations: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.method != "GET")
+            .collect();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].method, "PUT");
+        assert!(mutations[0].path.ends_with(OLD_ROLE) && mutations[0].body.is_empty());
+        drop(stale);
+        mock.shutdown().await;
     }
     Ok(())
 }
@@ -3294,9 +3541,11 @@ async fn unknown_target_is_not_empty(pool: &PgPool) -> TestResult {
     clock.store(NOW + 500, Ordering::SeqCst);
     assert!(matches!(
         runtime.reconcile_stale(&mut prepared, &panel).await,
-        Err(RuntimeError::InvalidSnapshot)
+        Err(RuntimeError::Stale)
     ));
-    assert_eq!(mock.requests().len(), 4); // no repair read/mutation to an unknown target
+    // Still processing: a lane alone cannot grant terminal ownership, even with
+    // expired processing leases. No repair read/mutation to an unknown target.
+    assert_eq!(mock.requests().len(), 4);
     drop(prepared);
     mock.shutdown().await;
     Ok(())

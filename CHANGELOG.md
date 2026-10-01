@@ -72,8 +72,13 @@
   processing/typed terminal retirement and post-commit claim refresh; atomically
   pin untracked stale-path journals instead of borrowing a ticket's provenance.
   Add classifier, overlap/replay, stale-fence, lock-wait and recovery source
-  fixtures plus baseline role-matrix coverage. Migration of the legacy lane-only
-  stale-maintenance journal to a fresh typed evidence owner remains deferred.
+  fixtures plus baseline role-matrix coverage. Replace lane-only stale-maintenance
+  journaling with immutable-metadata handoff to the shared fresh typed terminal
+  owner and newly leased committed target. Remove the maintenance alternative from
+  normal processing steps; every new repair send has a distinct ticket. Preserve
+  inherited pending/legacy work and former-worker refusal, without publishing a
+  target or claiming success for obsolete input. Add active-owner/mismatched-hint,
+  stale-cache, overlap/no-send and selected/empty convergence source fixtures.
   Production boot remains disabled until approved shared boot configuration,
   unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,

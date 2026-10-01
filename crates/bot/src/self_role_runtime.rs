@@ -250,16 +250,6 @@ struct RepairLease {
     _keeper: LeaseKeeper,
 }
 
-impl RepairLease {
-    async fn owns(&self, store: &SelfRoleStore) -> Result<bool, RuntimeError> {
-        if self.lost.load(Ordering::SeqCst) {
-            return Ok(false);
-        }
-        let owned = store_io(store.owns_panel_claim(&self.claim)).await?;
-        Ok(owned && !self.lost.load(Ordering::SeqCst))
-    }
-}
-
 /// Restarted terminal repair is not a fabricated successful-change plan. The
 /// rejected audit only supplies evidence; the fresh lane supplies its target.
 struct TerminalRepair {
@@ -272,11 +262,11 @@ struct TerminalRepair {
 
 impl TerminalRepair {
     async fn owns(&self, store: &SelfRoleStore, lane: &RepairLease) -> Result<bool, RuntimeError> {
-        if self.lost.load(Ordering::SeqCst) {
+        if self.lost.load(Ordering::SeqCst) || lane.lost.load(Ordering::SeqCst) {
             return Ok(false);
         }
         let owned = store_io(store.owns_superseded_repair(&self.claim, &lane.claim)).await?;
-        Ok(owned && !self.lost.load(Ordering::SeqCst))
+        Ok(owned && !self.lost.load(Ordering::SeqCst) && !lane.lost.load(Ordering::SeqCst))
     }
 
     fn observe(&mut self, held: &HashSet<String>) {
@@ -291,16 +281,6 @@ impl TerminalRepair {
             self.effects.unresolved_added_role_ids = added;
             self.effects.unresolved_removed_role_ids = removed;
         }
-    }
-}
-
-async fn owns_step(
-    prepared: &PreparedSelfRole,
-    repair: Option<&RepairLease>,
-) -> Result<bool, RuntimeError> {
-    match repair {
-        Some(repair) => repair.owns(&prepared.store).await,
-        None => prepared.owns().await,
     }
 }
 
@@ -394,7 +374,7 @@ impl SelfRoleRuntime {
                     Execution::Applied
                 });
             };
-            self.execute_step(prepared, &role, add, None).await?;
+            self.execute_step(prepared, &role, add).await?;
         }
         prepared.event.compensating = true;
         self.checkpoint(prepared).await?;
@@ -475,9 +455,8 @@ impl SelfRoleRuntime {
         prepared: &mut PreparedSelfRole,
         role: &str,
         add: bool,
-        repair: Option<&RepairLease>,
     ) -> Result<(), RuntimeError> {
-        let compensating = repair.is_some() || prepared.event.compensating;
+        let compensating = prepared.event.compensating;
         let prior_pending = prepared.event.exchange_pending;
         let prior_effects = prepared.audit.effects.clone();
         let mut attempted = prior_effects.clone();
@@ -494,43 +473,28 @@ impl SelfRoleRuntime {
                 role,
                 add,
                 || async {
-                    owns_step(prepared, repair)
+                    prepared
+                        .owns()
                         .await
                         .map_err(|_| SelfRoleRestError::StaleClaim)
                 },
                 || async {
-                    if repair.is_some() {
-                        // Legacy stale maintenance keeps its separate lane-only
-                        // authority until it migrates to a fresh typed evidence
-                        // owner. Never fabricate a live event for that path.
-                        if !store_io(self.store.journal_legacy_exchange(
-                            &prepared.event,
-                            &attempted,
-                            compensating,
-                        ))
-                        .await
-                        .map_err(|_| SelfRoleRestError::StaleClaim)?
-                        {
-                            return Err(SelfRoleRestError::StaleClaim);
-                        }
-                    } else {
-                        let intent = ExchangeIntent {
-                            role_id: role.into(),
-                            adding: add,
-                            compensating,
-                        };
-                        let receipt = store_io(self.store.journal_role_exchange(
-                            &prepared.event,
-                            prepared.panel.as_ref(),
-                            &intent,
-                        ))
-                        .await
-                        .map_err(|_| SelfRoleRestError::StaleClaim)?
-                        .ok_or(SelfRoleRestError::StaleClaim)?;
-                        ticket
-                            .set(receipt)
-                            .map_err(|_| SelfRoleRestError::StaleClaim)?;
-                    }
+                    let intent = ExchangeIntent {
+                        role_id: role.into(),
+                        adding: add,
+                        compensating,
+                    };
+                    let receipt = store_io(self.store.journal_role_exchange(
+                        &prepared.event,
+                        prepared.panel.as_ref(),
+                        &intent,
+                    ))
+                    .await
+                    .map_err(|_| SelfRoleRestError::StaleClaim)?
+                    .ok_or(SelfRoleRestError::StaleClaim)?;
+                    ticket
+                        .set(receipt)
+                        .map_err(|_| SelfRoleRestError::StaleClaim)?;
                     journaled.store(true, Ordering::SeqCst);
                     Ok(())
                 },
@@ -605,26 +569,11 @@ impl SelfRoleRuntime {
                 add,
             ),
         }
-        if exchange.owned_after && exchange.result.is_err() && repair.is_none() {
+        if exchange.owned_after && exchange.result.is_err() {
             prepared.event.compensating = true;
         }
-        if repair.is_some() {
-            if !self
-                .record_evidence(
-                    &prepared.event,
-                    &prepared.audit.effects,
-                    compensating,
-                    prepared.event.exchange_pending,
-                )
-                .await?
-            {
-                return Err(RuntimeError::Stale);
-            }
-            prepared.event.effects = prepared.audit.effects.clone();
-        } else {
-            self.checkpoint(prepared).await?;
-        }
-        if !exchange.owned_after || !owns_step(prepared, repair).await? {
+        self.checkpoint(prepared).await?;
+        if !exchange.owned_after || !prepared.owns().await? {
             return Err(RuntimeError::Stale);
         }
         if compensating {
@@ -780,9 +729,9 @@ impl SelfRoleRuntime {
         }
     }
 
-    /// A stale worker may repair ONLY the last committed target under a new
-    /// maintenance lane. Never restore its obsolete immutable before snapshot,
-    /// reinterpret an uncommitted null as empty, or rewrite the winner's target.
+    /// Hand stale work to a freshly claimed terminal evidence owner and a new
+    /// maintenance lane. Never borrow old processing authority/volatile effects,
+    /// restore obsolete intent, or reinterpret an uncommitted null as empty.
     pub async fn reconcile_stale(
         &self,
         prepared: &mut PreparedSelfRole,
@@ -805,96 +754,29 @@ impl SelfRoleRuntime {
             .panel
             .as_ref()
             .ok_or(RuntimeError::InvalidSnapshot)?;
-        let key = old.key.clone();
         store_io(self.store.release_panel_claim(old)).await?;
-        let deadline = tokio::time::Instant::now() + LANE_WAIT;
-        let claim = loop {
-            match store_io(self.store.claim_panel(&key, None)).await? {
-                PanelClaimResult::Acquired(claim) => break claim,
-                PanelClaimResult::Busy if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(LANE_BACKOFF).await;
-                }
-                PanelClaimResult::Busy => return Err(RuntimeError::Stale),
-                PanelClaimResult::Superseded(_) => return Err(RuntimeError::Stale),
-            }
+        // Only immutable metadata crosses this handoff. The typed acquisition
+        // reloads persisted evidence and rotates ownership; the old event/lane
+        // cannot journal a repair or clear its own completed receipt provenance.
+        let candidate = RecoverableAudit {
+            event_id: prepared.audit.event_id.clone(),
+            event_order: prepared.audit.event_order.clone(),
+            guild_id: prepared.audit.guild_id.clone(),
+            member_id: prepared.audit.member_id.clone(),
+            panel_id: prepared.audit.panel_id.clone(),
+            source_id: prepared.audit.source_id.clone(),
+            option_key: prepared.audit.option_key.clone(),
+            role_id: prepared.audit.role_id.clone(),
+            source: prepared.audit.source,
+            operation: prepared.audit.operation,
         };
-        let lost = Arc::new(AtomicBool::new(false));
-        let keeper =
-            LeaseKeeper::start(self.store.clone(), None, Some(claim.clone()), lost.clone());
-        let repair = RepairLease {
-            claim,
-            lost,
-            _keeper: keeper,
-        };
-        let result = self.reconcile_owned(prepared, panel, &repair).await;
-        // A stale release is harmless; cancellation falls back to lease expiry.
-        let _ = store_io(self.store.release_panel_claim(&repair.claim)).await;
-        result
-    }
-
-    async fn reconcile_owned(
-        &self,
-        prepared: &mut PreparedSelfRole,
-        panel: &SelfRolePanel,
-        repair: &RepairLease,
-    ) -> Result<(), RuntimeError> {
-        let target = committed_target(panel, &repair.claim)?;
-        let offered: Vec<_> = panel.options.iter().map(|o| o.role_id.clone()).collect();
-        for _ in 0..(panel.options.len() * 2 + 1) {
-            if !repair.owns(&self.store).await? {
-                return Err(RuntimeError::Stale);
-            }
-            let snapshot = self
-                .executor
-                .fetch_self_role_snapshot(&self.guild_id, &prepared.audit.member_id, &self.bot_id)
-                .await
-                .map_err(RuntimeError::Rest)?;
-            if !repair.owns(&self.store).await? {
-                return Err(RuntimeError::Stale);
-            }
-            observe_prepared(prepared, &snapshot.member_role_ids);
-            if !self
-                .record_evidence(
-                    &prepared.event,
-                    &prepared.audit.effects,
-                    prepared.event.compensating,
-                    prepared.event.exchange_pending,
-                )
-                .await?
-            {
-                return Err(RuntimeError::Stale);
-            }
-            if snapshot.member_is_bot
-                || snapshot.validate(&self.guild_id, panel, &offered).is_some()
-            {
-                return Err(RuntimeError::Rest(SelfRoleRestError::Snapshot));
-            }
-            prepared.remaining = plan_select_delta(panel, &snapshot.member_role_ids, &target)
-                .map_err(|_| RuntimeError::InvalidSnapshot)?;
-            prepared.snapshot = snapshot;
-            let next = prepared
-                .remaining
-                .remove_role_ids
-                .first()
-                .map(|id| (id.clone(), false))
-                .or_else(|| {
-                    prepared
-                        .remaining
-                        .add_role_ids
-                        .first()
-                        .map(|id| (id.clone(), true))
-                });
-            let Some((role, add)) = next else {
-                return if prepared.event.exchange_pending {
-                    Err(RuntimeError::PendingExchange)
-                } else {
-                    Ok(())
-                };
-            };
-            self.execute_step(prepared, &role, add, Some(repair))
-                .await?;
+        if self.recover_terminal(&candidate, panel).await? {
+            Ok(())
+        } else {
+            // Processing, already-owned and completed rows grant no fresh repair
+            // authority. Leave them to their existing owner/discovery lifecycle.
+            Err(RuntimeError::Stale)
         }
-        Err(RuntimeError::Rest(SelfRoleRestError::Ambiguous))
     }
 
     pub async fn terminal_candidates(

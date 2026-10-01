@@ -223,9 +223,9 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   executor carries raw final status independently of result mapping/ownership;
   outer pre-send errors become no-send receipts only when a ticket was committed.
   Inner timeout/transport ambiguity leaves the ticket pending. Receipt-write
-  failure stops the step without a retry or invented completion. The legacy
-  lane-only stale-maintenance path still uses aggregate journaling: migrating it
-  requires a fresh typed evidence owner, not a fabricated live event fence.
+  failure stops the step without a retry or invented completion. Stale-maintenance
+  handoff now enters that same typed terminal path with freshly claimed evidence
+  ownership, not a fabricated live processing event or lane-only send authority.
   Receipt completion alone does not clear aggregate uncertainty or establish
   convergence. Live-fenced current-owner incorporation now merges cumulative
   attempts and only acknowledged 204 compensation receipts, preserving observed
@@ -240,9 +240,9 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   Recovery synchronizes effects/pending before planning or observation and rejects
   catalogue drift in incorporated evidence. Replays retain cumulative facts.
   The incorporation APIs remain conservative; they do not retire uncertainty.
-  Migration 0206 below supplies separate attribution and retirement. The legacy
-  stale-path migration still requires a fresh typed owner; no timer or optimistic
-  snapshot substitutes for sender provenance.
+  Migration 0206 below supplies separate attribution and retirement. The stale
+  handoff uses a fresh typed owner; no timer or optimistic snapshot substitutes
+  for sender provenance.
   Boot stays disabled. Isolated source fixtures cover
   processing/terminal generation transfer, same-direction ticket separation,
   no-send and 204/403/429/500 receipts, exact/contradictory replay, invalid status,
@@ -286,10 +286,16 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
 - Processing recovery and normal checkpoints synchronize retired evidence into
   runtime state. Typed terminal recovery/steps also refresh the opaque claim's
   acquisition snapshot after commit, preventing stale preservation from reviving
-  its retired uncertainty. The legacy lane-only path remains aggregate-journaled;
-  its compatibility journal atomically pins untracked work when a baseline exists.
-  That conservative floor may remain permanently uncertain. Migrating this path
-  to a fresh typed evidence owner remains required before activation.
+  its retired uncertainty. The former lane-only stale path now hands immutable
+  discovery metadata to `recover_terminal`, which reloads evidence under a fresh
+  typed claim before acquiring a maintenance lane and performing any repair read
+  or send. It never copies the obsolete prepared intent/effects into that owner,
+  and does not update the obsolete prepared snapshot to impersonate repair output.
+  Normal `execute_step` no longer accepts a maintenance-lane alternative. Every
+  new repair send uses the shared terminal journal/receipt/retirement path. The
+  compatibility journal remains a storage seam for untracked legacy evidence and
+  still pins a conservative floor; existing floors are not retroactively assigned
+  tickets or retired by the handoff and may remain permanently uncertain.
 - Added uncompiled Rust classifier/store/runtime fixtures cover completed versus
   same-role pending tickets, legacy overlap, no-send/204/403/429/500/2xx/3xx facts,
   replay/contradiction, former-owner/lane refusal, post-receipt-lock expiry,
@@ -396,8 +402,8 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   ticket completion remains separate: 0206 current-owner retirement can resolve
   completed ticket provenance without restoring former-worker authority. Legacy
   or genuinely pending sends can still remain permanently uncertain; there is no
-  automatic timer/snapshot retirement. Their continuation and the legacy-path
-  migration remain activation blockers, not reasons to clear the flag.
+  automatic timer/snapshot retirement. Their continuation remains an activation
+  blocker, not a reason to clear the flag; typed stale handoff preserves that floor.
 - Added isolated store source fixtures cover scope/due/limit/race discovery,
   fresh secret generation and former-worker refusal, initialized empty targets,
   malformed intent, terminal renewal/expiry, panel-to-audit lock waits, selected/
@@ -414,6 +420,20 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   snapshots or any effect array before REST. The dedicated terminal evidence
   owner renews while bounded-waiting for a new maintenance lane; both renewal
   tasks belong to the awaited repair and abort when it is dropped.
+- `reconcile_stale` stops the obsolete keepers and releases only their old lane
+  fence, then uses `recover_terminal` rather than lane-only aggregate journaling.
+  Processing rows, already-claimed evidence, completed repair rows and mismatched
+  immutable metadata grant no handoff authority and cause no repair REST work.
+  Typed acquisition rotates away former aggregate-write authority; sender receipt
+  completion remains independent. Repairs observe fresh policy/member state and
+  reconcile only the new lane's committed selected/empty target. A completed
+  repair receipt is not success of the obsolete event and publishes no target.
+  Added uncompiled source regressions cover late processing 204 handoff to selected
+  and empty targets, distinct repair tickets without new legacy floors, active-owner
+  and wrong-metadata refusal, misleading obsolete caches, same-direction pending
+  overlap and legacy floors across genuine sender no-send completion. Existing
+  shared terminal source fixtures retain cancellation, timeout, partial/refused/
+  ambiguous response and pre/post-send fence coverage; no Rust execution is claimed.
 - A processing audit inserted after a newer lane's bulk supersession can discover
   that it is obsolete before constructing `PreparedSelfRole`. Admission now uses
   `supersede_processing_audit`, not generic refusal/settlement: it locks the panel
