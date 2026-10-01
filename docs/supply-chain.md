@@ -52,7 +52,9 @@ bound. Docker inspection does not record image environment values.
 
 Nonzero exits, unavailable tools and timeouts are retained explicitly; they are
 not absence proof. For example, missing `getcap` leaves capabilities unresolved.
-Each probe retains its original result separately from cleanup. Only the daemon's
+Each probe retains its exact UUID `container_name` and original result separately
+from cleanup, so a cleanup timeout or daemon transport failure still leaves an
+ownership-scoped follow-up target in the partial report. Only the daemon's
 exact missing-container response for that probe's UUID confirms absence after a
 startup failure; other cleanup errors/timeouts stop further probes and fail the
 job. The report is saved incrementally and checksummed even on cleanup failure,

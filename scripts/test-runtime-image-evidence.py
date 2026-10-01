@@ -92,6 +92,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertNotIn(forbidden, run)
         name = run[run.index("--name") + 1]
         self.assertEqual(calls[-1][0], ("rm", "--force", name))
+        self.assertEqual(result["container_name"], name)
         self.assertEqual(calls[0][1]["timeout"], 20)
         self.assertEqual(result["stdout"], "raw observation\n")
 
@@ -194,6 +195,39 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(report["probes"]["installed_packages"]["stdout"], "first observation")
         self.assertEqual(report["probes"]["affected_package_files"]["stderr"], "startup failed")
         self.assertEqual(report["probes"]["affected_package_files"]["cleanup"]["stderr"], "cleanup refused")
+
+    def test_cleanup_timeout_and_transport_failures_persist_exact_owned_name(self):
+        for failure in [subprocess.TimeoutExpired("docker rm", 30),
+                        OSError("daemon transport unavailable"),
+                        subprocess.CompletedProcess([], 1, "", "Cannot connect to the Docker daemon")]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")) as temporary:
+                directory = Path(temporary)
+                self.fixture(directory)
+                responses = [subprocess.CompletedProcess([], 0, json.dumps(METADATA), ""),
+                             subprocess.CompletedProcess([], 0, "first observation", ""),
+                             subprocess.CompletedProcess([], 0, "", ""),
+                             subprocess.CompletedProcess([], 0, "second observation", ""),
+                             failure]
+                with patch.object(evidence, "docker", side_effect=responses) as docker, patch.object(sys, "argv", ["evidence", "two-bot:fixture", str(directory)]):
+                    with self.assertRaisesRegex(SystemExit, "cleanup"):
+                        evidence.main()
+                report = json.loads((directory / "runtime-image-evidence.json").read_text())
+                run = docker.call_args_list[3].args
+                name = run[run.index("--name") + 1]
+                self.assertRegex(name, r"^two-bot-inspect-[0-9a-f]{32}$")
+                self.assertEqual(docker.call_args_list[4].args, ("rm", "--force", name))
+                result = report["probes"]["affected_package_files"]
+                self.assertEqual(result["container_name"], name)
+                self.assertEqual(result["stdout"], "second observation")
+                self.assertEqual(result["cleanup"]["status"], "failed")
+                self.assertEqual(result["cleanup"]["timed_out"], isinstance(failure, subprocess.TimeoutExpired))
+                self.assertTrue(result["cleanup"]["stderr"])
+                self.assertEqual(report["probes"]["installed_packages"]["stdout"], "first observation")
+                self.assertNotEqual(report["probes"]["installed_packages"]["container_name"], name)
+                self.assertEqual(report["source_sha"], SOURCE_SHA)
+                self.assertEqual(report["image_id"], IMAGE_ID)
+                self.assertFalse(report["complete"])
+                self.assertEqual(docker.call_count, 5)
 
     def test_ci_retains_evidence_after_failed_gates_without_changing_gates(self):
         workflow = (ROOT / ".github/workflows/supply-chain.yml").read_text()

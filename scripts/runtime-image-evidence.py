@@ -75,6 +75,7 @@ def probe(image_id, command):
     # arbitrary cleanup errors. Preserve both the startup and removal results.
     if cleanup["returncode"] == 1 and cleanup["stderr"].strip() == f"Error response from daemon: No such container: {name}" and not cleanup["stdout"]:
         status = "absent"
+    result["container_name"] = name
     result["cleanup"] = {"status": status, **cleanup}
     return result
 
