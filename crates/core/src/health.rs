@@ -201,6 +201,51 @@ mod tests {
         assert!(report.ready());
     }
 
+    #[test]
+    fn starting_counts_as_not_ready() {
+        let report = HealthReport::new(vec![
+            ("process".to_owned(), ComponentStatus::Ready),
+            ("gateway".to_owned(), ComponentStatus::Starting),
+        ]);
+        assert!(!report.ready());
+    }
+
+    #[test]
+    fn degraded_report_serialization_names_the_failing_component() {
+        // Pins the /readyz breakdown shape: the handler maps ready() to
+        // 200/503 and serves this JSON, so the 503 body must name the
+        // degraded component with a lowercase status — never a bare string.
+        let report = HealthReport::new(vec![
+            ("process".to_owned(), ComponentStatus::Ready),
+            ("gateway".to_owned(), ComponentStatus::Down),
+        ]);
+        assert!(!report.ready());
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({
+                "components": [["process", "ready"], ["gateway", "down"]],
+            })
+        );
+        let body = serde_json::to_string(&report).unwrap();
+        assert!(body.contains("\"gateway\""), "503 must name {body}");
+        assert!(body.contains("\"down\""));
+    }
+
+    #[test]
+    fn all_ready_report_serializes_for_200() {
+        let report = HealthReport::new(vec![
+            ("process".to_owned(), ComponentStatus::Ready),
+            ("gateway".to_owned(), ComponentStatus::Ready),
+        ]);
+        assert!(report.ready());
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({
+                "components": [["process", "ready"], ["gateway", "ready"]],
+            })
+        );
+    }
+
     fn voice_state() -> VoiceReadiness {
         VoiceReadiness {
             gateway: ComponentStatus::Ready,
