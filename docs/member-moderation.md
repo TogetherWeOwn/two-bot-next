@@ -180,11 +180,15 @@ post-dispatch failures never do.
 
 ## Verification
 
+On the persistent controller, use the bounded cache wrapper from this isolated
+workspace; a refused lease is not permission to compile directly. Hosted CI keeps
+its existing Cargo commands. See [the build-cache runbook](build-cache.md).
+
 ```sh
-cargo test -p two-bot-core --locked
-cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
-MEMBER_TESTDB=agent-testdb cargo test -p two-bot-core --features db --locked \
-  --test member_moderation_db -- --ignored
+python3 scripts/cargo_cache.py run -- test -p two-bot-core
+python3 scripts/cargo_cache.py run -- clippy -p two-bot-core --all-targets --features db -- -D warnings
+MEMBER_TESTDB=agent-testdb python3 scripts/cargo_cache.py run -- test \
+  -p two-bot-core --features db --test member_moderation_db -- --ignored
 ```
 
 The database tests accept only `agent-testdb:5432` as `agent_test` with an empty

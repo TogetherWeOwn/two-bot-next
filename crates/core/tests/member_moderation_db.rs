@@ -1729,6 +1729,7 @@ async fn postgres_legacy_text_timestamps_upgrade_without_reactivating_imports() 
     for migration in [
         include_str!("../../cutover/migrations/0110_moderation_member.sql"),
         include_str!("../../cutover/migrations/0111_moderation_ban_ownership.sql"),
+        include_str!("../../cutover/migrations/0113_moderation_unban_retry_order.sql"),
     ] {
         sqlx::raw_sql(migration)
             .execute(&pool)
