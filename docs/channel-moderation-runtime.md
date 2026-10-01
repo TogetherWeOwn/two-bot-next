@@ -69,12 +69,19 @@ integrated compatibility must be checked when the member slice merges.
 
 ## Verification and remaining gate
 
-Hosted ephemeral PR CI is the Rust verification of record under the 2026-10-01
-CEO decision on TOG-11174. The deferred Operator cache rollout TOG-10906 does not
-gate hosted CI. Controller compilation still requires admitted bounded-wrapper
-leases; no direct/unadmitted controller compilation or workflow dispatch is used.
-Local noncompiling checks cover formatting, migration locks, Docker dependency
-fixtures and the secret Debug guard.
+PR CI is the Rust verification of record under the 2026-10-01 CEO decision on
+TOG-11174; the private repository now uses `[self-hosted, two-selfhosted]` runners.
+The deferred Operator cache rollout TOG-10906 does not gate PR CI. Controller
+compilation still requires admitted bounded-wrapper leases; no direct/unadmitted
+controller compilation or workflow dispatch is used. Local noncompiling checks
+cover formatting, migration locks, Docker dependency fixtures, guarded channel
+CI routing/job-isolation fixtures and the secret Debug guard.
+
+Both required checks and nightly DB sweeps run in job containers with service-name
+Postgres endpoints and no published host port. Fixed-loopback fixtures use a
+job-private forward, never a host-network alias. Nightly routes all channel
+store/runtime acceptance separately onto their guarded `agent_test` database;
+no test is dropped or run against the broad sweep's incompatible bootstrap URL.
 
 CI runs channel runtime/store acceptance and the shared command-runtime DB suite.
 New integration regressions exercise complete-registry sticky/feed coexistence,
@@ -85,5 +92,5 @@ channel mutation and retains the in-flight lane after cancellation.
 Historical lifecycle checkpoint `25a032b5d91f3139e913bdb908100c79e7d0f30d` passed
 15 runtime acceptance tests, 19 executor regressions and Discord DB-feature
 Clippy before integration of newer main. Those results do not certify the new
-composition/dispatch head. Exact-head hosted CI and independent Code Reviewer
+composition/dispatch head. Exact-head PR CI and independent Code Reviewer
 approval/squash merge remain required; no review, merge or deployment is claimed.
