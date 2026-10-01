@@ -60,7 +60,11 @@ def http_response(url):
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
     metadata = json.loads(docker("image", "inspect", image).stdout)[0]
-    image_bytes = metadata["Size"]
+    # Sum of uncompressed layer sizes. With the containerd image store (the
+    # self-hosted runners) `inspect .Size` also counts the compressed content
+    # blobs; the layer sum equals the classic overlay2 Size on both stores.
+    history = docker("history", "--no-trunc", "--human=false", "--format", "{{.Size}}", image).stdout
+    image_bytes = sum(int(line) for line in history.split())
     # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
     # orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex

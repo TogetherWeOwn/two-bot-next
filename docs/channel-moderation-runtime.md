@@ -40,7 +40,7 @@ an original-response edit through the shared executor. Failed or ambiguous defer
 admits no mutation. Replies suppress mentions and bound content. Edit failure
 never repeats an accepted effect; logs/errors exclude interaction tokens.
 
-Migration 0123 adds `moderation_channel_execution`. `claim_channel` reserves one
+Migration 0123 (main's `moderation_channel_executions`, shared with the website executor) holds the single fence. `claim_channel` reserves one
 channel lane only for a current in-flight ticket, excluding different request
 keys as well as duplicate retries. There is deliberately no expiry: ambiguous
 HTTP outcomes or process loss require reconciliation, not another mutation.

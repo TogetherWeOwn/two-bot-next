@@ -84,7 +84,7 @@ impl Database {
         assert!([
             "moderation_audit",
             "moderation_idempotency",
-            "moderation_channel_execution",
+            "moderation_channel_executions",
             "moderation_lockdowns"
         ]
         .contains(&table));
@@ -279,7 +279,7 @@ async fn failed_result_edit_never_repeats_a_completed_effect() {
     );
     assert_eq!(mock.requests().len(), 3);
     assert_eq!(db.count("moderation_audit").await, 1);
-    assert_eq!(db.count("moderation_channel_execution").await, 0);
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
     mock.shutdown().await;
     db.close().await;
 }
@@ -312,7 +312,7 @@ async fn persistence_failure_edits_safe_reconciliation_reply_and_keeps_lane() {
         "The channel action requires reconciliation; do not repeat it."
     );
     assert_eq!(edit["allowed_mentions"]["parse"], json!([]));
-    assert_eq!(db.count("moderation_channel_execution").await, 1);
+    assert_eq!(db.count("moderation_channel_executions").await, 1);
     assert_eq!(
         runtime
             .execute(&router(true), &request)
@@ -503,7 +503,7 @@ async fn purge_and_slowmode_success_audit_and_replay_without_repeating_effects()
     );
     assert_eq!(mock.requests().len(), 4);
     assert_eq!(db.count("moderation_audit").await, 3);
-    assert_eq!(db.count("moderation_channel_execution").await, 0);
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
     mock.shutdown().await;
     db.close().await;
 }
@@ -704,7 +704,7 @@ async fn ambiguous_unlock_retains_recovery_and_both_claims_across_all_keys() {
             "no automatic retry or competing-key mutation"
         );
         assert_eq!(db.store.get_lockdown(CHANNEL).await.unwrap(), Some(rec));
-        assert_eq!(db.count("moderation_channel_execution").await, 1);
+        assert_eq!(db.count("moderation_channel_executions").await, 1);
         mock.shutdown().await;
         db.close().await;
     }
@@ -740,7 +740,7 @@ async fn rejected_first_lock_retires_only_its_seed_and_finishes_refusal() {
             .replayed
     );
     assert_eq!(db.count("moderation_lockdowns").await, 0);
-    assert_eq!(db.count("moderation_channel_execution").await, 0);
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
     assert_eq!(db.count("moderation_audit").await, 1);
     assert_eq!(mock.requests().len(), 2);
     mock.shutdown().await;
@@ -782,7 +782,7 @@ async fn audit_failure_retries_only_finalization_not_a_successful_discord_effect
             .replayed
     );
     assert_eq!(db.count("moderation_audit").await, 1);
-    assert_eq!(db.count("moderation_channel_execution").await, 0);
+    assert_eq!(db.count("moderation_channel_executions").await, 0);
     assert_eq!(mock.requests().len(), 1);
     mock.shutdown().await;
     db.close().await;
@@ -822,7 +822,7 @@ async fn first_seed_and_durable_lane_exist_before_lock_put_is_accepted() {
         (rec.prior_allow.as_str(), rec.prior_deny.as_str()),
         ("3072", "8192")
     );
-    assert_eq!(db.count("moderation_channel_execution").await, 1);
+    assert_eq!(db.count("moderation_channel_executions").await, 1);
     assert_eq!(
         running.await.unwrap().unwrap().unwrap().outcome,
         "locked_down"
@@ -868,7 +868,7 @@ async fn exhausted_audit_failure_retains_lane_and_cannot_redo_successful_effect(
         "in_progress"
     );
     assert_eq!(mock.requests().len(), 1);
-    assert_eq!(db.count("moderation_channel_execution").await, 1);
+    assert_eq!(db.count("moderation_channel_executions").await, 1);
     mock.shutdown().await;
     db.close().await;
 }

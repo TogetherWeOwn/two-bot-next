@@ -1638,7 +1638,7 @@ async fn gateway_keeps_checkpointing_and_heartbeating_during_channel_rest_work()
         "command scope cancellation",
     )
     .await;
-    let lanes: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_channel_execution")
+    let lanes: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_channel_executions")
         .fetch_one(&db.pool)
         .await
         .unwrap();

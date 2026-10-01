@@ -21,6 +21,8 @@ pub use channel_moderation::{
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
+#[cfg(feature = "db")]
+pub mod internal_channel_moderation;
 mod message_safety;
 pub mod pipeline;
 
