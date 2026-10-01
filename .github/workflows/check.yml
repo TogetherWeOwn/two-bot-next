@@ -25,7 +25,12 @@ jobs:
     needs: self-role-store
     # A skipped dependency must not make the required check appear green.
     if: ${{ always() }}
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch (TOG ops, 2026-10-01): stays on self-hosted unless repo vars
+    # CI_OVERFLOW_RUNNER (JSON runs-on, e.g. ["ubuntu-latest"]), CI_OVERFLOW_JOBS
+    # (JSON job ids) and CI_OVERFLOW_EVENTS (JSON event names) all select this job.
+    # Flip back without a PR by deleting CI_OVERFLOW_RUNNER. Private repo: hosted
+    # minutes come from the included allowance; an rbx1 guard reverts at 45k.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -231,7 +236,8 @@ jobs:
 
   self-role-store:
     name: self-role store leases
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'self-role-store') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     # A job container resolves service names directly. The test's fixed
     # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
@@ -300,7 +306,8 @@ jobs:
 
   community-db:
     name: community db
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'community-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -335,7 +342,8 @@ jobs:
 
   feeds-db:
     name: feeds db check
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'feeds-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -366,7 +374,8 @@ jobs:
 
   tickets-postgres:
     name: tickets postgres
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tickets-postgres') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
     # Service DNS stays inside this job's network; never publish a shared port.
     container:
@@ -405,7 +414,8 @@ jobs:
 
   worker:
     name: worker check
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'worker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
     defaults:
       run:
