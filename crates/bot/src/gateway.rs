@@ -282,16 +282,17 @@ where
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
 /// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
 ///
-/// `sticky` dispatch stays detached. RSVP effects are awaited in dispatch order
-/// with bounded read-ahead in `poll_while`; Twilight drives heartbeats only while
-/// the shard is polled, so a full backlog pauses transport until work drains.
+/// Shared sticky/feed dispatch stays detached. RSVP effects are awaited in
+/// dispatch order with bounded read-ahead in `poll_while`; Twilight drives
+/// heartbeats only while the shard is polled, so a full backlog pauses transport
+/// until work drains.
 pub async fn run_shard(
     mut shard: Shard,
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
     interactions: Option<Arc<two_bot_discord::interactions::InteractionRuntime>>,
-    sticky: Option<Arc<crate::sticky_runtime::StickyRuntime>>,
+    runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
 ) -> Result<(), sqlx::Error> {
     let result = run_loop(
         &mut shard,
@@ -299,7 +300,7 @@ pub async fn run_shard(
         &state,
         &store,
         interactions.as_ref(),
-        sticky.as_ref(),
+        runtime.as_ref(),
     )
     .await;
     *state.write().await = GatewayState::Armed;
@@ -312,13 +313,14 @@ async fn run_loop(
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
     interactions: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
-    sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
+    runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
 ) -> Result<(), sqlx::Error> {
     if let Some(runtime) = interactions {
         runtime.publish_current().await.map_err(|_| {
             sqlx::Error::InvalidArgument("interaction registry boot sync failed".into())
         })?;
     }
+    let mut observer = crate::gateway_metrics::Observer::default();
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
     let mut pending = std::collections::VecDeque::new();
@@ -351,6 +353,7 @@ async fn run_loop(
                 ))
             }
         };
+        observer.observe(&message, shard);
         let Message::Text(text) = message else {
             *state.write().await = GatewayState::Armed;
             // Twilight 0.17.1 retains its session on gateway-initiated closes.
@@ -430,6 +433,7 @@ async fn run_loop(
         {
             continue;
         }
+        let timer = crate::gateway_metrics::DispatchTimer::start();
         let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| {
             sqlx::Error::InvalidArgument(
                 "gateway dispatch parse failed; checkpoint unchanged".into(),
@@ -440,8 +444,13 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
-            if let Some(runtime) = sticky {
-                runtime.dispatch(&event);
+            // Detached dispatch only for slices not owned by ordered RSVP.
+            if let Some(runtime) = runtime {
+                if interactions.is_some() {
+                    runtime.dispatch_remaining(&event);
+                } else {
+                    runtime.dispatch(&event);
+                }
             }
             if let Some(runtime) = interactions {
                 if let Some(acknowledgement) = packet.acknowledgement {
@@ -479,6 +488,7 @@ async fn run_loop(
             store.commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
         )
         .await?;
+        timer.committed();
         committed = Some(checkpoint);
         if connected {
             *state.write().await = GatewayState::Connected;
@@ -574,7 +584,7 @@ mod tests {
 
     fn configured() -> Config {
         Config {
-            discord_token: Some("token".to_owned()),
+            discord_token: Some(two_bot_core::Secret::new("token".to_owned())),
             database_url: None,
             listen_addr: "0.0.0.0:8080".to_owned(),
             guild_id: None,

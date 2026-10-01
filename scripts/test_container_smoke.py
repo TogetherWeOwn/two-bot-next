@@ -154,11 +154,24 @@ class HttpHelperTests(unittest.TestCase):
             server.server_close()
 
 
+PARKED_JOB = {"parked": True, "running": False, "last_start": None,
+              "last_success": None, "last_error_class": None,
+              "consecutive_failures": 0}
+
+
+def parked_readyz_body():
+    return {"components": [["process", "ready"], ["gateway", "down"]],
+            "jobs": {name: dict(PARKED_JOB) for name in (
+                "counter", "rank", "scheduled_events", "presence_probe",
+                "community_scorecard", "inactivity",
+            )}}
+
+
 class ContainerSmokeTests(unittest.TestCase):
     def setUp(self):
         self.fixture = DockerFixture()
         self.clock = 0
-        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"]]}) if url.endswith("/readyz") else (200, {"status": "ok"})
+        self.http = lambda url: (503, parked_readyz_body()) if url.endswith("/readyz") else (200, {"status": "ok"})
 
     def tick(self):
         self.clock += 1
@@ -255,6 +268,57 @@ class ContainerSmokeTests(unittest.TestCase):
     def test_untruthful_readyz_body_fails(self):
         self.http = lambda url: (503, {}) if url.endswith("/readyz") else (200, {"status": "ok"})
         self.assert_rejected("/readyz body must report")
+
+    def test_legacy_components_only_readyz_body_fails(self):
+        # The pre-jobs contract is deliberately superseded: an informational
+        # jobs map is now always serialized, so a bare components body no
+        # longer satisfies the smoke gate.
+        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"]]}) if url.endswith("/readyz") else (200, {"status": "ok"})
+        self.assert_rejected("all six jobs parked")
+
+    def test_readyz_without_jobs_map_fails(self):
+        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"]], "jobs": {}}) if url.endswith("/readyz") else (200, {"status": "ok"})
+        self.assert_rejected("all six jobs parked")
+
+    def test_readyz_with_missing_job_fails(self):
+        for name in parked_readyz_body()["jobs"]:
+            with self.subTest(job=name):
+                body = parked_readyz_body()
+                del body["jobs"][name]
+                self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+                self.assert_rejected("all six jobs parked")
+
+    def test_readyz_with_unexpected_job_fails(self):
+        body = parked_readyz_body()
+        body["jobs"]["unexpected"] = dict(PARKED_JOB)
+        self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+        self.assert_rejected("all six jobs parked")
+
+    def test_readyz_with_running_job_fails(self):
+        for name in parked_readyz_body()["jobs"]:
+            with self.subTest(job=name):
+                body = parked_readyz_body()
+                body["jobs"][name] = dict(PARKED_JOB, running=True)
+                self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+                self.assert_rejected("all six jobs parked")
+
+    def test_readyz_with_started_job_fails(self):
+        for name in parked_readyz_body()["jobs"]:
+            with self.subTest(job=name):
+                body = parked_readyz_body()
+                body["jobs"][name] = dict(PARKED_JOB, parked=False, last_start=100)
+                self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+                self.assert_rejected("all six jobs parked")
+
+    def test_readyz_with_wrong_components_fails(self):
+        body = parked_readyz_body()
+        body["components"] = [["process", "ready"], ["gateway", "ready"]]
+        self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+        self.assert_rejected("ready process and parked gateway")
+
+    def test_readyz_non_object_body_fails(self):
+        self.http = lambda url: (503, []) if url.endswith("/readyz") else (200, {"status": "ok"})
+        self.assert_rejected("must be a JSON object")
 
     def test_live_healthcheck_failure_fails(self):
         self.fixture.live_health_exit = 1

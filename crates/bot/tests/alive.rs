@@ -7,7 +7,7 @@ mod database_guard;
 #[allow(dead_code)]
 #[path = "../../discord/tests/common/mod.rs"]
 mod common;
-use common::{MockRest, ScriptedResponse};
+use common::RestRequest;
 
 use std::{net::SocketAddr, panic::AssertUnwindSafe, process::Stdio, sync::Arc, time::Duration};
 
@@ -60,11 +60,20 @@ impl TestDb {
             .await
             .expect("isolated schema");
         // sqlx's to_url_lossy does NOT serialize options. Explicitly put the
-        // search_path in the URL so the separate binary migrates only our schema.
+        // search_path in the URL so the harness migration bootstrap and the
+        // child binary both stay inside our schema.
         let mut url = options.to_url_lossy();
         url.query_pairs_mut()
             .append_pair("options[search_path]", &schema);
         let child_url = url.to_string();
+        // The gateway binary is DML-only and never migrates: the harness
+        // performs the operator's migration step before spawning the child,
+        // exactly like the documented production bootstrap.
+        two_bot_cutover::connect(&child_url, 1, false)
+            .await
+            .expect("operator-equivalent migration bootstrap")
+            .close()
+            .await;
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .acquire_timeout(STEP)
@@ -85,13 +94,20 @@ impl TestDb {
 
     async fn close(self) {
         self.pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
-        )))
-        .execute(&self.admin)
-        .await
-        .expect("drop only our generated schema");
+        // Website jobs apply the companion contract schema (`<schema>_web_v1`)
+        // on first tick; drop both generated schemas so no companion schema
+        // or helper functions leak. Companion may not exist if jobs never fired.
+        for schema in [&self.schema, &format!("{}_web_v1", self.schema)] {
+            assert!(schema
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE"
+            )))
+            .execute(&self.admin)
+            .await
+            .expect("drop only our generated schemas");
+        }
         self.admin.close().await;
     }
 }
@@ -183,10 +199,12 @@ async fn capture(stream: impl AsyncRead + Unpin, logs: Logs) {
 
 struct MockDiscord {
     url: String,
-    rest: MockRest,
+    api: String,
     auth: mpsc::Receiver<Value>,
     release: mpsc::Sender<()>,
+    rest_requests: Arc<Mutex<Vec<RestRequest>>>,
     task: JoinHandle<()>,
+    rest_task: JoinHandle<()>,
 }
 
 impl MockDiscord {
@@ -195,17 +213,12 @@ impl MockDiscord {
         let addr = listener.local_addr().unwrap();
         let url = format!("ws://{addr}");
         // Registry publication is HTTP before gateway connect on BOTH boots.
-        // Keep REST on its own listener so it cannot be mistaken for an upgrade.
-        let rest = MockRest::start(
-            vec![
-                ScriptedResponse::json(200, json!({"id":"1111"})),
-                ScriptedResponse::status(200),
-                ScriptedResponse::json(200, json!({"id":"1111"})),
-                ScriptedResponse::status(200),
-            ],
-            ScriptedResponse::status(500),
-        )
-        .await;
+        // Website jobs share DISCORD_API_BASE, so use a route-aware REST socket
+        // separate from the gateway: job reads must neither consume scripted
+        // registry replies nor be mistaken for websocket upgrades. No `/api/v10`
+        // suffix — the executor appends `/api/v{version}/` to the origin itself.
+        let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
         let (release, mut gates) = mpsc::channel(4);
         let resume_url = url.clone();
@@ -264,12 +277,18 @@ impl MockDiscord {
                 }
             }
         });
+        // Dedicated REST double: records registry bodies and website-job
+        // reads so both full publication and a first-boot tick are observable.
+        let rest_requests: Arc<Mutex<Vec<RestRequest>>> = Arc::default();
+        let rest_task = tokio::spawn(serve_rest(rest_listener, rest_requests.clone()));
         Self {
             url,
-            rest,
+            api,
             auth,
             release,
+            rest_requests,
             task,
+            rest_task,
         }
     }
 
@@ -278,6 +297,92 @@ impl MockDiscord {
             .await
             .expect("authentication deadline")
             .expect("authentication packet")
+    }
+}
+
+/// Dedicated REST double on its own socket: answers registry publication and
+/// paced website-job reads by route, recording full request bodies. The gateway
+/// listener must never see plain HTTP — a queued job tick previously consumed
+/// its second accept slot and broke resume with `MissingHeader("Upgrade")`.
+async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>>) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
+        let recorded = recorded.clone();
+        tokio::spawn(async move {
+            let mut chunk = [0u8; 4096];
+            let mut head = Vec::new();
+            loop {
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&chunk[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if head.len() > 64 * 1024 {
+                    return;
+                }
+            }
+            let head_end = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let request_head = String::from_utf8_lossy(&head[..head_end]);
+            let mut lines = request_head.lines();
+            let mut request_line = lines.next().unwrap_or("").split_whitespace();
+            let method = request_line.next().unwrap_or("").to_owned();
+            let path = request_line.next().unwrap_or("").to_owned();
+            let headers: Vec<(String, String)> = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_lowercase(), value.trim().to_owned()))
+                .collect();
+            let content_len = headers
+                .iter()
+                .find(|(name, _)| name == "content-length")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if content_len > 1024 * 1024 {
+                return;
+            }
+            let mut request_body = head[head_end..].to_vec();
+            while request_body.len() < content_len {
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                request_body.extend_from_slice(&chunk[..n]);
+            }
+            request_body.truncate(content_len);
+            recorded.lock().await.push(RestRequest {
+                method: method.clone(),
+                path: path.clone(),
+                headers,
+                body: request_body,
+                received_at: std::time::Instant::now(),
+            });
+            // Registry and job requests can interleave, so never script replies
+            // by arrival order. The fixture grounds no raid windows; only the
+            // events mirror reads. Unknown routes fail closed on this socket.
+            let (status, body): (&str, &[u8]) = match (method.as_str(), path.as_str()) {
+                ("GET", "/api/v10/applications/@me") => ("200 OK", b"{\"id\":\"1111\"}"),
+                ("PUT", "/api/v10/applications/1111/guilds/2222/commands") => ("200 OK", b""),
+                ("GET", path) if path.contains("scheduled-events") => ("200 OK", b"[]"),
+                _ => (
+                    "404 Not Found",
+                    b"{\"message\":\"alive mock: unknown route\"}",
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        });
     }
 }
 
@@ -346,7 +451,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         } else {
             "ws://127.0.0.1:1"
         };
-        bots.push(Bot::spawn(db, addr, gateway, &discord.rest.origin(), logs));
+        bots.push(Bot::spawn(db, addr, gateway, &discord.api, logs));
         let bot = bots.last_mut().unwrap();
         let health = wait_http(bot, addr, "/healthz", 200).await;
         assert!(health.contains("\"status\":\"ok\""));
@@ -355,7 +460,17 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         assert!(before.contains("\"gateway\",\"starting\""));
         discord.release.send(()).await.unwrap(); // Health precedes HELLO.
         let auth = discord.authentication().await;
-        let requests = discord.rest.requests();
+        let requests: Vec<_> = discord
+            .rest_requests
+            .lock()
+            .await
+            .iter()
+            .filter(|request| {
+                request.path == "/api/v10/applications/@me"
+                    || request.path == "/api/v10/applications/1111/guilds/2222/commands"
+            })
+            .cloned()
+            .collect();
         assert_eq!(requests.len(), (boot + 1) * 2, "registry sync on each boot");
         let identity = &requests[boot * 2];
         assert_eq!(identity.method, "GET");
@@ -390,7 +505,8 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                 "same registry on RESUMED boot"
             );
         }
-        // The binary itself has now finished migration and checkpoint loading.
+        // The DML-only binary has now finished checkpoint loading against the
+        // harness-migrated schema.
         assert_eq!(
             db.store()
                 .load()
@@ -418,6 +534,30 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         checkpoint(db, if boot == 0 { 2 } else { 3 }).await;
         let ready = wait_http(bot, addr, "/readyz", 200).await;
         assert!(ready.contains("\"gateway\",\"ready\""));
+        if boot == 0 {
+            // Deterministic website-job coverage: the events mirror must tick
+            // on its own REST socket during the first boot, never the gateway
+            // listener. Jitter is bounded by min(cadence, 5s); STEP covers it.
+            let ticked = timeout(STEP, async {
+                loop {
+                    if discord
+                        .rest_requests
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|request| request.path.contains("scheduled-events"))
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                ticked.is_ok(),
+                "events job never hit REST during first boot"
+            );
+        }
         sleep(Duration::from_millis(100)).await;
         bot.assert_alive();
         bot.terminate().await;
@@ -474,8 +614,9 @@ async fn real_binary_is_alive_and_resumes_after_sigterm() {
         bot.cleanup().await;
     }
     discord.task.abort();
+    discord.rest_task.abort();
     let _ = discord.task.await;
-    discord.rest.shutdown().await;
+    let _ = discord.rest_task.await;
     db.close().await;
     match result {
         Ok(Ok(())) => eprintln!("real-binary lifecycle PASS in {:?}", started.elapsed()),

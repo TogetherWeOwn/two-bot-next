@@ -11,9 +11,8 @@
 //! `record_earliest`, forward-only `touch_activity`, and the members
 //! projection guards.
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
-use std::str::FromStr;
 
 /// Legacy pool default (`TWO_DB_POOL_MAX ?? 5`).
 pub const DB_POOL_MAX_DEFAULT: u32 = 5;
@@ -37,15 +36,19 @@ pub async fn connect(
                 .to_owned(),
         ));
     }
-    let mut options = PgConnectOptions::from_str(url)
-        .map_err(|e| sqlx::Error::InvalidArgument(format!("invalid database URL: {e}")))?;
+    two_bot_core::database_url::validate(url)
+        .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
+    // Passfile diagnostics stay suppressed during the synchronous parse, but a
+    // well-formed entry still supplies the password (see `database_url`).
+    let mut options = two_bot_core::database_url::connect_options(url)?;
     // Statement timeout rides the connection options (server-side setting
     // per connection), so no per-connection SET is needed.
     options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);
     let pool = PgPoolOptions::new()
         .max_connections(pool_max)
         .connect_with(options)
-        .await?;
+        .await
+        .map_err(|_| sqlx::Error::InvalidArgument("database connection failed".to_owned()))?;
     let db = CutoverDb { pool };
     if !skip_migrations {
         if let Err(e) = db.migrate().await {
@@ -73,7 +76,7 @@ impl CutoverDb {
         sqlx::migrate!("./migrations")
             .run(&self.pool)
             .await
-            .map_err(|e| sqlx::Error::InvalidArgument(format!("migration failed: {e}")))
+            .map_err(|_| sqlx::Error::InvalidArgument("database migration failed".to_owned()))
     }
 
     /// Close idle connections (drains the pool).

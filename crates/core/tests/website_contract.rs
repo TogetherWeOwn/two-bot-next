@@ -31,7 +31,7 @@ use two_bot_core::{
     RosterMember, ScheduledEvent, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
     RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS, WEB_CONTRACT_VIEWS,
 };
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{guard_database_url, TestDatabase};
 
 const GUILD: &str = "326474832151838730";
 const OBSERVED_AT: &str = "2026-08-25T20:00:00.000Z";
@@ -46,6 +46,44 @@ async fn connect() -> TestDatabase {
         .await
         .expect("apply web_v1 views");
     fixture
+}
+
+#[test]
+fn reset_guard_allows_only_parsed_test_container_and_scratch_database() {
+    // The shared guard also refuses PG* overrides; these pure URL cases assume
+    // the same clean environment required by the database fixtures.
+    for url in [
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090",
+        "postgresql://agent_test:@agent-testdb:5432/two_bot_test_tog10090_guard",
+    ] {
+        assert!(guard_database_url(url).is_ok());
+    }
+    // Pure guard tests: none of these targets are ever contacted.
+    for url in [
+        "postgres://user@production/two_bot",
+        "postgres://test_runner@production/real_data",
+        "postgres://agent_test:@production/two_bot_test_tog10090",
+        "postgres://agent_test:@agent-testdb/real_data",
+        "postgres://agent_test:@agent-testdb/test",
+        "postgres://agent_test:@agent-testdb/postgres",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090_",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090-unsafe",
+        "postgres://agent_test:@agent-testdb:5433/two_bot_test_tog10090",
+        "postgres://agent_test:@agent-testdb.example/two_bot_test_tog10090",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090?host=production",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090?hostaddr=127.0.0.1",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090?options=-csearch_path=test",
+        "postgres://agent_test:@production/real_data?application_name=test",
+        "postgres://agent_test:@%2Fvar%2Frun%2Fpostgresql/two_bot_test_tog10090",
+        "postgres://agent_test:unexpected@agent-testdb/two_bot_test_tog10090",
+        "postgresql://agent_test@agent-testdb:5432/two_bot_test_tog10090_guard",
+        "postgres://agent_test:@agent-testdb/two_bot_test_tog10090#test",
+        "postgres://agent_test:@agent-testdb/",
+        "postgres://agent-testdb/two_bot_test_tog10090",
+        "not a URL",
+    ] {
+        assert!(guard_database_url(url).is_err(), "unsafe target accepted");
+    }
 }
 
 fn role_ids() -> std::collections::HashMap<RankKey, String> {

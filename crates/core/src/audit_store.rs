@@ -86,7 +86,7 @@ pub struct StoredAudit {
 #[derive(Debug, Clone)]
 pub struct AuditClaim {
     row: StoredAudit,
-    token: String,
+    token: crate::Secret<String>,
     generation: i64,
 }
 
@@ -290,7 +290,7 @@ impl AuditStore {
             .map(|row| -> Result<_, AuditStoreError> {
                 Ok(AuditClaim {
                     row: stored(&row)?,
-                    token: row.try_get("delivery_claim_token")?,
+                    token: crate::Secret::new(row.try_get("delivery_claim_token")?),
                     generation: row.try_get("delivery_generation")?,
                 })
             })
@@ -336,7 +336,7 @@ impl AuditStore {
                AND delivery_search_before IS NULL AND mirror_message_id IS NULL",
         )
         .bind(&claim.row.event.entry_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(search_before)
         .execute(&mut *tx)
@@ -377,7 +377,7 @@ impl AuditStore {
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
                AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
                AND delivery_search_before IS NOT NULL AND mirror_message_id IS NULL",
-        ).bind(&claim.row.event.entry_id).bind(&claim.token).bind(claim.generation)
+        ).bind(&claim.row.event.entry_id).bind(claim.token.expose()).bind(claim.generation)
             .execute(&mut *tx).await?.rows_affected() == 1;
         tx.commit().await?;
         Ok(if updated {
@@ -408,7 +408,7 @@ impl AuditStore {
                AND delivery_search_before IS NOT NULL AND mirror_message_id IS NULL",
         )
         .bind(&claim.row.event.entry_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(message_id)
         .execute(&mut *tx)
@@ -433,7 +433,7 @@ impl AuditStore {
                AND mirror_message_id IS NOT NULL AND delivery_accepted_at IS NOT NULL",
         )
         .bind(&claim.row.event.entry_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .execute(&mut *tx)
         .await?
@@ -462,7 +462,7 @@ impl AuditStore {
                AND delivery_search_before IS NULL AND mirror_message_id IS NULL",
         )
         .bind(&claim.row.event.entry_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .execute(&mut *tx)
         .await?
@@ -495,7 +495,7 @@ impl AuditStore {
                AND delivery_search_before IS NULL AND mirror_message_id IS NULL",
         )
         .bind(&claim.row.event.entry_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(PREFLIGHT_DEFER_SECONDS)
         .execute(&mut *tx)
@@ -537,7 +537,7 @@ impl AuditStore {
                AND delivery_search_before IS NOT NULL AND mirror_message_id IS NULL",
         )
         .bind(&claim.row.event.entry_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(if definite {
             "discord_send_rejected"
@@ -562,7 +562,7 @@ impl AuditStore {
             "UPDATE operational_audit_log SET delivery_lease_until = clock_timestamp() + interval '5 minutes'
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
                AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()",
-        ).bind(&claim.row.event.entry_id).bind(&claim.token).bind(claim.generation)
+        ).bind(&claim.row.event.entry_id).bind(claim.token.expose()).bind(claim.generation)
             .execute(&mut *tx).await?.rows_affected() == 1;
         tx.commit().await?;
         Ok(updated)
@@ -582,7 +582,7 @@ impl AuditStore {
                AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()",
         )
         .bind(&claim.row.event.entry_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(reason.as_str())
         .execute(&mut *tx)
@@ -736,6 +736,37 @@ fn snowflake_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_audit_claim_capability() {
+        let claim = AuditClaim {
+            row: StoredAudit {
+                event: AuditEvent::new(
+                    "fixture-entry".into(),
+                    crate::audit::AuditKind::MessageDelete,
+                    "1".into(),
+                    "2026-09-30T00:00:00Z".into(),
+                ),
+                mirror_channel_id: None,
+                state: DeliveryState::Delivering,
+                attempts: 1,
+                attempted_at: None,
+                nonce: None,
+                search_before: None,
+                mirror_message_id: None,
+                accepted_at: None,
+                mirrored_at: None,
+                mirror_checked_at: None,
+                last_error: None,
+            },
+            token: crate::Secret::new("fixture-audit-ownership-capability".to_owned()),
+            generation: 1,
+        };
+        for output in [format!("{claim:?}"), format!("{claim:#?}")] {
+            assert!(!output.contains("fixture-audit-ownership-capability"));
+            assert!(output.contains("[REDACTED]"));
+        }
+    }
 
     #[test]
     fn any_recovery_evidence_forbids_a_send() {
