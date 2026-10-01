@@ -5,20 +5,17 @@ mod common;
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
-use sqlx::{
-    postgres::{PgConnectOptions, PgPoolOptions},
-    PgPool, Postgres, QueryBuilder,
-};
+use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use twilight_model::{application::interaction::Interaction, gateway::event::Event};
 use two_bot_core::{
     leveling::{rank_text, LevelRoleReward},
-    leveling_store as store, InteractionRouter, MemStore, OnboardingGates, OnboardingMode,
-    RouterGates,
+    leveling_store as store, HandlerId, MemStore, OnboardingGates, OnboardingMode,
 };
 use two_bot_discord::{
     pipeline::MessageEligibility, ActionExecutor, LevelingRuntime, OrderedLevelingPipeline,
 };
+use two_bot_testsupport::TestDatabase;
 
 const GUILD: u64 = 1545644954272137297;
 const MEMBER: u64 = 100000000000000001;
@@ -34,26 +31,13 @@ fn user(id: u64) -> Value {
 fn member() -> Value {
     json!({"user":user(MEMBER),"roles":[],"joined_at":null,"deaf":false,"mute":false,"pending":false,"flags":0,"permissions":"0"})
 }
-fn router() -> InteractionRouter {
-    InteractionRouter::new(RouterGates {
-        configured_guild: Some(GUILD),
-        scorecard: false,
-        automations: false,
-        announcements: false,
-        moderation: false,
-        tickets: false,
-        self_roles: false,
-        onboarding_picker: false,
-        session_picker: false,
-    })
-}
 fn runtime(pool: PgPool, mock: &MockRest, mode: OnboardingMode) -> LevelingRuntime {
     LevelingRuntime::new(
         pool,
         Arc::new(
             ActionExecutor::with_proxy("mock-only-token".into(), Some(mock.origin())).unwrap(),
         ),
-        router(),
+        GUILD,
         OnboardingGates {
             mode,
             dry_run: false,
@@ -81,65 +65,18 @@ fn interaction(name: &str, target: bool) -> Interaction {
 }
 
 struct TestDb {
-    admin: PgPool,
+    fixture: TestDatabase,
     pool: PgPool,
-    schema: String,
 }
 impl TestDb {
     async fn new() -> Self {
-        // Never read DATABASE_URL, and never fall back on credential failures.
-        let ci = std::env::var("CI").as_deref() == Ok("true")
-            && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
-            && std::env::var("TWO_LEVELING_TEST_CI").as_deref() == Ok("1");
-        let options = PgConnectOptions::new()
-            .host(if ci { "127.0.0.1" } else { "agent-testdb" })
-            .port(5432)
-            .username("agent_test")
-            .password("")
-            .database(if ci { "postgres" } else { "agent_test" })
-            .options([("statement_timeout", "5000ms")]);
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect_with(options.clone())
+        let url = std::env::var("TWO_TEST_DATABASE_URL")
+            .expect("explicit DB test requires TWO_TEST_DATABASE_URL (test bootstrap only)");
+        let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
             .await
-            .expect("approved test DB only; no credential fallback");
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("leveling_runtime_{}_{nonce}", std::process::id());
-        QueryBuilder::<Postgres>::new("CREATE SCHEMA ")
-            .push(&schema)
-            .build()
-            .execute(&admin)
-            .await
-            .unwrap();
-        let path = schema.clone();
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .after_connect(move |c, _| {
-                let path = path.clone();
-                Box::pin(async move {
-                    sqlx::query("SELECT set_config('search_path',$1,false)")
-                        .bind(path)
-                        .execute(c)
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::raw_sql(include_str!("../../cutover/migrations/0002_leveling.sql"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        Self {
-            admin,
-            pool,
-            schema,
-        }
+            .expect("create migrated test database; no credential fallback");
+        let pool = fixture.pool().clone();
+        Self { fixture, pool }
     }
     async fn seed(&self, xp: i64) {
         sqlx::query(
@@ -163,15 +100,7 @@ impl TestDb {
         .unwrap();
     }
     async fn close(self) {
-        self.pool.close().await;
-        QueryBuilder::<Postgres>::new("DROP SCHEMA ")
-            .push(&self.schema)
-            .push(" CASCADE")
-            .build()
-            .execute(&self.admin)
-            .await
-            .unwrap();
-        self.admin.close().await;
+        self.fixture.close().await.expect("drop test database");
     }
 }
 
@@ -182,15 +111,15 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
     let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
     let runtime = runtime(db.pool.clone(), &mock, OnboardingMode::Legacy);
     runtime
-        .handle_interaction(&interaction("rank", false))
+        .handle_interaction(&interaction("rank", false), HandlerId::Rank)
         .await
         .unwrap();
     runtime
-        .handle_interaction(&interaction("rank", true))
+        .handle_interaction(&interaction("rank", true), HandlerId::Rank)
         .await
         .unwrap();
     runtime
-        .handle_interaction(&interaction("leaderboard", false))
+        .handle_interaction(&interaction("leaderboard", false), HandlerId::Leaderboard)
         .await
         .unwrap();
     for offset in 0..12_u64 {
@@ -203,14 +132,17 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
             .unwrap();
     }
     runtime
-        .handle_interaction(&interaction("leaderboard", false))
+        .handle_interaction(&interaction("leaderboard", false), HandlerId::Leaderboard)
         .await
         .unwrap();
     let mut wrong_guild = interaction("rank", false);
     wrong_guild.guild_id = Some(twilight_model::id::Id::new(1234));
-    assert!(!runtime.handle_interaction(&wrong_guild).await.unwrap());
     assert!(!runtime
-        .handle_interaction(&interaction("not-ours", false))
+        .handle_interaction(&wrong_guild, HandlerId::Rank)
+        .await
+        .unwrap());
+    assert!(!runtime
+        .handle_interaction(&interaction("feed-list", false), HandlerId::FeedList)
         .await
         .unwrap());
     let requests = mock.requests();
@@ -403,7 +335,7 @@ async fn eligibility_unknown_duration_reconnect_and_session_mode_are_preserved()
 
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or credential-free CI service"]
-async fn dry_run_and_guild_fence_preserve_xp_and_gateway_interaction_dispatch() {
+async fn dry_run_and_guild_fence_preserve_xp_without_private_interaction_dispatch() {
     let db = TestDb::new().await;
     db.seed(90).await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
@@ -412,7 +344,7 @@ async fn dry_run_and_guild_fence_preserve_xp_and_gateway_interaction_dispatch() 
         Arc::new(
             ActionExecutor::with_proxy("mock-only-token".into(), Some(mock.origin())).unwrap(),
         ),
-        router(),
+        GUILD,
         OnboardingGates {
             mode: OnboardingMode::Legacy,
             dry_run: true,
@@ -432,19 +364,12 @@ async fn dry_run_and_guild_fence_preserve_xp_and_gateway_interaction_dispatch() 
         twilight_model::gateway::payload::incoming::InteractionCreate(interaction("rank", false)),
     ));
     assert!(pipeline.handle(&event).await.unwrap().is_empty());
-    let requests = mock.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].method, "POST");
-    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    // Only CommandRuntime may route/respond; ordered awards must stay silent.
+    assert!(mock.requests().is_empty());
     let profile = store::profile(&db.pool, &GUILD.to_string(), &MEMBER.to_string())
         .await
         .unwrap();
     assert_eq!(profile.xp, 105);
-    assert_eq!(
-        body["data"]["content"],
-        two_bot_core::leveling::rank_reply(&profile, "Global name").content
-    );
-    assert_eq!(body["data"]["flags"], 64);
     mock.shutdown().await;
     db.close().await;
 }
@@ -508,7 +433,7 @@ async fn gateway_reward_and_interaction_executor_errors_propagate() {
     assert_eq!(error.to_string(), "leveling Discord operation failed");
     let runtime = runtime(db.pool.clone(), &mock, OnboardingMode::Legacy);
     assert!(runtime
-        .handle_interaction(&interaction("rank", false))
+        .handle_interaction(&interaction("rank", false), HandlerId::Rank)
         .await
         .is_err());
     assert_eq!(mock.requests().len(), 2);

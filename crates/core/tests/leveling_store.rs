@@ -1,22 +1,21 @@
 #![cfg(feature = "db")]
 
-//! Opt-in database proof, restricted to agent-testdb or the CI service
-//! container. Run:
-//! cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
+//! Database proof restricted to the named disposable agent-testdb service.
+//! Create an empty two_bot_test_local bootstrap as described in CONTRIBUTING.md,
+//! then run all 13 tests:
+//! TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
+//! cargo test -p two-bot-core --features db --locked --test leveling_store
 //! No DATABASE_URL or inherited application credentials are consulted.
 //!
 //! Ports the runtime half of legacy `test/unit.leveling.test.ts` against the
 //! sqlx store in `leveling_store` (message cooldown, voice minutes +
 //! cooldown, tie-breaks, ceiling behaviour, reward replacement, rank text).
 
-use std::time::Duration;
-
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{PgPool, Postgres, QueryBuilder};
 use two_bot_core::leveling::{
     leaderboard_reply, rank_reply, total_xp_for_level, LevelRoleReward, MAX_STORED_XP,
 };
 use two_bot_core::leveling_store as store;
+use two_bot_testsupport::TestDatabase;
 
 const MIGRATION: &str = include_str!("../../cutover/migrations/0002_leveling.sql");
 const GUILD: &str = "1545644954272137297";
@@ -27,78 +26,27 @@ fn at(seconds: i64) -> String {
     two_bot_core::format_iso_millis(1_786_771_200_000 + seconds * 1000)
 }
 
-// No DATABASE_URL or inherited credentials: tests accept only the approved
-// agent container or the ephemeral Postgres service in GitHub Actions.
-async fn pool() -> (PgPool, PgPool, String) {
-    let ci = std::env::var("CI").as_deref() == Ok("true")
-        && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
-        && std::env::var("TWO_LEVELING_TEST_CI").as_deref() == Ok("1");
-    let host = if ci { "127.0.0.1" } else { "agent-testdb" };
-    let options = PgConnectOptions::new()
-        .host(host)
-        .port(5432)
-        .username("agent_test")
-        .password("")
-        .database(if ci { "postgres" } else { "agent_test" })
-        .options([("statement_timeout", "5000ms")]);
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect_with(options.clone())
+async fn database() -> TestDatabase {
+    let url = std::env::var("TWO_TEST_DATABASE_URL")
+        .expect("explicit DB test requires TWO_TEST_DATABASE_URL (test bootstrap only)");
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
         .await
-        .expect("approved test DB must connect; no credential fallback");
-    let schema = format!("leveling_test_{:032x}", rand::random::<u128>());
-    // Identifier is a fixed prefix + generated hexadecimal, never user input.
-    QueryBuilder::<Postgres>::new("CREATE SCHEMA ")
-        .push(&schema)
-        .build()
-        .execute(&admin)
-        .await
-        .expect("test schema");
-    let search_path = schema.clone();
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .acquire_timeout(Duration::from_secs(5))
-        .after_connect(move |connection, _| {
-            let query = search_path.clone();
-            Box::pin(async move {
-                sqlx::query("SELECT set_config('search_path', $1, false)")
-                    .bind(query)
-                    .execute(connection)
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect_with(options)
-        .await
-        .expect("schema pool");
-    sqlx::raw_sql(MIGRATION)
-        .execute(&pool)
-        .await
-        .expect("idempotent leveling migration");
-    sqlx::raw_sql(MIGRATION)
-        .execute(&pool)
-        .await
-        .expect("migration re-runs cleanly");
-    (admin, pool, schema)
-}
-
-async fn teardown(admin: PgPool, schema: &str) {
-    QueryBuilder::<Postgres>::new("DROP SCHEMA ")
-        .push(schema)
-        .push(" CASCADE")
-        .build()
-        .execute(&admin)
-        .await
-        .expect("drop test schema");
-    admin.close().await;
+        .expect("create migrated test database");
+    // Preserve the original repeated-DDL proof after applying the full chain.
+    for _ in 0..2 {
+        sqlx::raw_sql(MIGRATION)
+            .execute(fixture.pool())
+            .await
+            .expect("migration re-runs cleanly");
+    }
+    fixture
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn message_awards_enforce_durable_minute_cooldown(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     let channel = "200000000000000001";
     let first = store::award_message(&pool, GUILD, A, &at(0), Some(channel)).await?;
     let blocked = store::award_message(&pool, GUILD, A, &at(59), Some(channel)).await?;
@@ -117,16 +65,15 @@ async fn message_awards_enforce_durable_minute_cooldown(
         awards,
         vec![("message".to_owned(), 15), ("message".to_owned(), 15),]
     );
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn voice_awards_use_completed_minutes_and_voice_cooldown(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     let channel = "300000000000000001";
     let first = store::award_voice(&pool, GUILD, A, 125, &at(0), Some(channel)).await?;
     let blocked = store::award_voice(&pool, GUILD, A, 600, &at(30), Some(channel)).await?;
@@ -135,16 +82,15 @@ async fn voice_awards_use_completed_minutes_and_voice_cooldown(
     assert_eq!(blocked.awarded, 0);
     assert_eq!(second.awarded, 5);
     assert_eq!(store::profile(&pool, GUILD, A).await?.voice_xp, 15);
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn profile_and_leaderboard_break_xp_ties_by_member_id(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     // Same total for both members: import is idempotent in the fixture only
     // via repeated equal rows, so seed through two identical awards is not
     // possible under cooldown — write the tie directly, then exercise reads.
@@ -178,16 +124,15 @@ async fn profile_and_leaderboard_break_xp_ties_by_member_id(
     // Limit clamps to the legacy 1–25 bounds.
     assert_eq!(store::leaderboard(&pool, GUILD, 0).await?.len(), 1);
     assert_eq!(store::leaderboard(&pool, GUILD, 100).await?.len(), 2);
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn ceiling_rejection_preserves_cooldown_and_rank_text_reads(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     sqlx::query(
         "INSERT INTO member_levels
            (guild_id, member_id, xp, message_xp, voice_xp, imported_xp, updated_at)
@@ -216,16 +161,15 @@ async fn ceiling_rejection_preserves_cooldown_and_rank_text_reads(
     assert!(text.contains("Player One"), "rank text names the member");
     assert!(text.contains("Rank **#1**"), "sole member ranks first");
     assert!(text.contains("to level "), "rank text names the next level");
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn rewards_replace_atomically_and_reject_bad_rows(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     store::replace_role_rewards(
         &pool,
         GUILD,
@@ -282,16 +226,15 @@ async fn rewards_replace_atomically_and_reject_bad_rows(
     .await;
     assert!(bad.is_err());
     assert_eq!(store::role_rewards(&pool, GUILD).await?.len(), 1);
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn level_up_crosses_threshold_and_plans_grants(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     // Bring A to 99 XP (message 15 × 6 = 90, then a 9-XP top-up), then one
     // more award crosses the L1 floor at 100.
     for step in 0..6 {
@@ -344,16 +287,15 @@ async fn level_up_crosses_threshold_and_plans_grants(
     // (COUNT(*) + 1 over strictly-greater rows) — never an error.
     let ghost = store::profile(&pool, GUILD, "100000000000000099").await?;
     assert_eq!((ghost.xp, ghost.rank), (0, 2));
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn submillisecond_awards_keep_exact_sixty_second_boundary(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     // TOG-10359: the parser truncates sub-millisecond input, but the store
     // bound the raw string — the stored first instant sat 500µs after the
     // second cutoff, so an award exactly 60 s later was rejected. All binds
@@ -384,16 +326,15 @@ async fn submillisecond_awards_keep_exact_sixty_second_boundary(
         stored.starts_with("2026-09-30 12:02:00"),
         "cooldown instant normalized to millis, got {stored}"
     );
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn profile_stays_consistent_under_concurrent_awards(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     sqlx::query(
         "INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
                  VALUES ($1, $2, 100, 100, $3::text::timestamptz)",
@@ -419,16 +360,15 @@ async fn profile_stays_consistent_under_concurrent_awards(
         assert_eq!(profile.rank, 1, "round {round}");
         assert!(profile.rank <= profile.member_count, "round {round}");
     }
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn concurrent_empty_ladder_replacements_keep_one_ladder(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     let five = [LevelRoleReward {
         level: 5,
         role_id: "400000000000000005".to_owned(),
@@ -457,16 +397,15 @@ async fn concurrent_empty_ladder_replacements_keep_one_ladder(
             "round {round}: union of independent ladders: {ladder:?}"
         );
     }
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn concurrent_first_message_awards_have_one_winner(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..8 {
         let pool = pool.clone();
@@ -483,16 +422,15 @@ async fn concurrent_first_message_awards_have_one_winner(
         .fetch_one(&pool)
         .await?;
     assert_eq!(count, 1);
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn concurrent_message_and_voice_awards_emit_one_level_up(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     sqlx::query(
         "INSERT INTO member_levels (guild_id, member_id, xp, imported_xp, updated_at)
                  VALUES ($1, $2, 99, 99, $3::text::timestamptz)",
@@ -523,15 +461,14 @@ async fn concurrent_message_and_voice_awards_emit_one_level_up(
         ),
         (119, 15, 5, 99)
     );
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn zero_and_oversized_awards_write_nothing() -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     let short = store::award_voice(&pool, GUILD, A, 59, &at(0), None).await?;
     let oversized = store::award(
         &pool,
@@ -552,16 +489,15 @@ async fn zero_and_oversized_awards_write_nothing() -> Result<(), two_bot_core::L
     .fetch_one(&pool)
     .await?;
     assert_eq!(counts, (0, 0, 0));
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn audit_and_reward_write_failures_roll_back_everything(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
-    let (admin, pool, schema) = pool().await;
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
     // The existing audit xp column is INT4. An overflowing audit insert must
     // roll back the preceding projection and cooldown writes too.
     let failed = store::award(
@@ -605,7 +541,6 @@ async fn audit_and_reward_write_failures_roll_back_everything(
         .await
         .is_err());
     assert_eq!(store::role_rewards(&pool, GUILD).await?, original);
-    teardown(admin, &schema).await;
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
     Ok(())
 }

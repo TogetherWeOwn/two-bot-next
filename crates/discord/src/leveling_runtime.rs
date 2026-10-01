@@ -21,13 +21,12 @@ use two_bot_core::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
-    FunnelHandlers, FunnelStore, HandlerId, InteractionHandler, InteractionRouter, LevelOutcome,
-    LevelingHook, NoopFacts, SlashOutcome, Snowflake,
+    FunnelHandlers, FunnelStore, HandlerId, LevelOutcome, LevelingHook, NoopFacts, Snowflake,
 };
 
 use crate::{
-    pipeline::MessageEligibility, route_interaction, ActionExecutor, DiscordError,
-    NoClassification, NoInvites, Pipeline, RoutedInteraction,
+    pipeline::MessageEligibility, ActionExecutor, DiscordError, NoClassification, NoInvites,
+    Pipeline,
 };
 
 /// Failures propagate to the gateway supervisor; Display never includes SQL
@@ -105,20 +104,12 @@ impl DeferredLeveling {
     }
 }
 
-/// The two registered identities share one async implementation and executor.
-#[derive(Debug)]
-struct LevelingHandler(HandlerId);
-
-impl InteractionHandler for LevelingHandler {
-    fn id(&self) -> HandlerId {
-        self.0
-    }
-}
-
+/// Award/reply slice of the shared command runtime; no private router or client.
+#[derive(Clone)]
 pub struct LevelingRuntime {
     pool: PgPool,
     executor: Arc<ActionExecutor>,
-    router: InteractionRouter,
+    configured_guild: u64,
     onboarding: two_bot_core::OnboardingGates,
 }
 
@@ -126,21 +117,19 @@ impl LevelingRuntime {
     pub fn new(
         pool: PgPool,
         executor: Arc<ActionExecutor>,
-        mut router: InteractionRouter,
+        configured_guild: u64,
         onboarding: two_bot_core::OnboardingGates,
     ) -> Self {
-        router.register(Box::new(LevelingHandler(HandlerId::Rank)));
-        router.register(Box::new(LevelingHandler(HandlerId::Leaderboard)));
         Self {
             pool,
             executor,
-            router,
+            configured_guild,
             onboarding,
         }
     }
 
     async fn award(&self, request: AwardRequest) -> Result<Option<XpAward>, LevelingRuntimeError> {
-        if self.router.gates().configured_guild != Some(request.guild_id) {
+        if self.configured_guild != request.guild_id {
             return Ok(None);
         }
         let guild = request.guild_id.to_string();
@@ -188,20 +177,16 @@ impl LevelingRuntime {
         Ok(Some(result))
     }
 
-    /// The shared router is authoritative; unknown/nonleveling routes are left
-    /// for their owning feature, not dispatched by a second command registry.
+    /// Execute only the shared router's accepted leveling handler. The guild
+    /// fence is repeated here before any store read or Discord callback.
     pub async fn handle_interaction(
         &self,
         interaction: &Interaction,
+        handler: HandlerId,
     ) -> Result<bool, LevelingRuntimeError> {
-        let RoutedInteraction::Slash {
-            outcome: SlashOutcome::Handled { handler },
-            ..
-        } = route_interaction(&self.router, interaction, None)
-        else {
-            return Ok(false);
-        };
-        if !matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) {
+        if interaction.guild_id.map(|id| id.get()) != Some(self.configured_guild)
+            || !matches!(handler, HandlerId::Rank | HandlerId::Leaderboard)
+        {
             return Ok(false);
         }
         let guild = interaction
@@ -310,7 +295,7 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
         eligibility: MessageEligibility,
     ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
         let _dispatch = self.dispatch.lock().await;
-        self.pipeline.handle_at(event, at, eligibility);
+        self.pipeline.handle_at_with_eligibility(event, at, eligibility);
         let requests = self.pending.take();
         let mut results = Vec::with_capacity(requests.len());
         if let Some(runtime) = &self.runtime {
@@ -318,9 +303,6 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
                 if let Some(award) = runtime.award(request).await? {
                     results.push(award);
                 }
-            }
-            if let Event::InteractionCreate(interaction) = event {
-                runtime.handle_interaction(&interaction.0).await?;
             }
         }
         Ok(results)

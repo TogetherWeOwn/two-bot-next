@@ -2,10 +2,13 @@
 
 Leveling uses plain-data decisions in `two-bot-core::leveling`, async persistence
 in `two-bot-core::leveling_store` (feature `db`), and the ordered S3/S4 bridge in
-`two-bot-discord::leveling_runtime`. Configured gateway startup now installs that
-bridge with the shared interaction router and REST executor. Command publication
-still belongs to the shared registry; this integration does not bulk-overwrite
-guild commands or add a second registry.
+`two-bot-discord::leveling_runtime`. Configured gateway startup installs the
+award bridge using the pool, cloned REST executor (shared transport/pacing) and
+onboarding gates owned by `CommandRuntime`. That runtime alone routes interactions
+and publishes the complete shared registry on READY/first RESUMED. The award
+pipeline never answers interactions or publishes a private registry. Invalid
+feature/moderation gates or executor construction disable the shared runtime,
+including leveling; invalid onboarding mode remains a startup error.
 
 ## Legacy contract
 
@@ -74,9 +77,10 @@ Discord or the gateway checkpoint. A REST failure can leave committed XP without
 its role grant; no durable reward outbox/retry is claimed by this slice. A future
 level-up re-reads the whole earned ladder and can reconcile missing grants.
 
-The shared router owns `/rank [member]` and `/leaderboard`; the runtime maps
-`profile`/`leaderboard` through the existing reply functions and calls the shared
-executor's interaction callback. Rank uses an ephemeral response. Leaderboard
+`CommandRuntime` routes `/rank [member]` and `/leaderboard` once through the shared
+router, then delegates the accepted HandlerId to the leveling slice before its
+sticky/feed generic defer. The slice maps `profile`/`leaderboard` through the
+existing replies and shared executor callback. Rank is ephemeral. Leaderboard
 always uses limit 10, suppresses mention parsing and has no paging components.
 Other routes are left for their owning feature. Startup strictly validates
 `TWO_ONBOARDING_MODE` with the existing gates; session mode and onboarding dry-run
@@ -97,21 +101,31 @@ not treated as successful or atomic remote effects.
 
 ## Verification
 
+Create one empty `two_bot_test_local` bootstrap database on the disposable
+service, owned by `agent_test` with its documented empty password and `CREATEDB`
+permission (see [CONTRIBUTING.md](../CONTRIBUTING.md#database-tests)). Then run:
+
 ```sh
+export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --features two-bot-core/db --locked -- -D warnings
-cargo test --workspace --features two-bot-core/db --locked
-cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
-cargo test -p two-bot-discord --features db --locked --test leveling_roles
-cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test leveling_store
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test leveling_roles
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test leveling_runtime -- --ignored --test-threads=1
+python3 scripts/cargo_cache.py run -- test -p two-bot --locked command_runtime_tests::shared_runtime_routes_leveling -- --ignored
 ```
 
-The ignored leveling targets connect only to `agent-testdb:5432`, user/database
-`agent_test`, empty password, and creates a random isolated schema. It never
-reads `DATABASE_URL` or inherited application credentials and never falls back
-on connection failure. CI runs the same tests against its credential-free
-Postgres service container using all three explicit CI flags. No tests contact
-Discord, staging databases or production databases.
+Controller compilation must use the bounded cache wrapper; a missing/refused pool
+is not permission to compile directly. Hosted CI uses its ephemeral Cargo cache.
+The store command executes all 13 leveling tests (none are ignored); the runtime
+command explicitly activates the six ignored integration proofs. Both use the shared
+`two-bot-testsupport` fixture, which connects only to `agent-testdb:5432`, uses the
+passwordless `agent_test` principal, and creates a unique migrated database per
+test. The bootstrap is never migrated, reset or dropped. It never reads
+`DATABASE_URL` or inherited application credentials and never falls back on
+connection failure. CI aliases its disposable Postgres service as `agent-testdb`
+and supplies the shared bootstrap URL; no slice-specific CI opt-in is needed.
+Loopback URLs are refused even with CI flags set. No tests contact Discord,
+staging databases or production databases.
 
 The checked-in golden fixture executes the frozen legacy functions, covering
 104 level thresholds, 210 XP samples (threshold-minus-one and the storage
@@ -135,11 +149,13 @@ threshold grants, concurrent first-award races, independent-source races,
 imported-XP preservation, zero/oversized no-ops and audit-insert rollback.
 
 Runtime proofs use synthetic Twilight gateway events, the existing local mock
-REST double and an isolated approved test schema: independent concurrent sources
+REST double and isolated migrated disposable databases: independent concurrent sources
 produce exactly two audit rows and one threshold crossing; duplicate dispatches
 preserve totals; delayed role reads yield the current-thread Tokio executor while
 later member events remain ordered. Tests assert reply text, optional-member
 fallback, fixed top 10, mention suppression, no announcements, eligibility and
 unknown-duration guards, session suppression, observable executor failures,
-idempotent grant readback and whole-set revoke refusal. No staging deployment,
-command publication or live Discord verification is claimed.
+idempotent grant readback and whole-set revoke refusal. The bot acceptance proof
+passes the same interaction through the silent award pipeline and the shared
+command runtime, asserting exactly one callback, visibility and foreign-guild
+silence. No staging deployment or live Discord verification is claimed.
