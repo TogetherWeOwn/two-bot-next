@@ -45,6 +45,15 @@ fn runtime(db: &TestDb, rest: &MockRest) -> Arc<InteractionRuntime> {
 }
 
 async fn spawn(db: &TestDb, url: &str, rest: &MockRest) -> JoinHandle<Result<(), sqlx::Error>> {
+    spawn_with_shutdown(db, url, rest, None).await
+}
+
+async fn spawn_with_shutdown(
+    db: &TestDb,
+    url: &str,
+    rest: &MockRest,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> JoinHandle<Result<(), sqlx::Error>> {
     ensure_crypto_provider();
     let saved = load_boot_session(&db.store).await.unwrap();
     let shard =
@@ -62,6 +71,7 @@ async fn spawn(db: &TestDb, url: &str, rest: &MockRest) -> JoinHandle<Result<(),
             GUILD.parse().unwrap(),
             true,
         )),
+        shutdown,
     ))
 }
 
@@ -72,9 +82,20 @@ async fn connect(
     JoinHandle<Result<(), sqlx::Error>>,
     tokio_websockets::WebSocketStream<tokio::net::TcpStream>,
 ) {
+    connect_with_shutdown(db, rest, None).await
+}
+
+async fn connect_with_shutdown(
+    db: &TestDb,
+    rest: &MockRest,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    tokio_websockets::WebSocketStream<tokio::net::TcpStream>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
-    let runner = spawn(db, &url, rest).await;
+    let runner = spawn_with_shutdown(db, &url, rest, shutdown).await;
     let (socket, _) = listener.accept().await.unwrap();
     let (_, mut ws) = ServerBuilder::new().accept(socket).await.unwrap();
     ws.send(Message::text(
@@ -121,7 +142,11 @@ enum CheckpointFailure {
     Timeout,
 }
 
-async fn queued_commands(slow_database: bool, checkpoint_failure: Option<CheckpointFailure>) {
+async fn queued_commands(
+    slow_database: bool,
+    checkpoint_failure: Option<CheckpointFailure>,
+    graceful_shutdown: bool,
+) {
     let db = TestDb::new().await;
     let mut lock = if slow_database {
         let mut tx = db.pool.begin().await.unwrap();
@@ -152,7 +177,8 @@ async fn queued_commands(slow_database: bool, checkpoint_failure: Option<Checkpo
         ScriptedResponse::status(500),
     )
     .await;
-    let (runner, mut ws) = connect(&db, &rest).await;
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let (runner, mut ws) = connect_with_shutdown(&db, &rest, Some(receiver)).await;
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
@@ -185,6 +211,9 @@ async fn queued_commands(slow_database: bool, checkpoint_failure: Option<Checkpo
             .unwrap(),
         0
     );
+    if graceful_shutdown {
+        shutdown.send_replace(true);
+    }
     match checkpoint_failure {
         Some(CheckpointFailure::Rejected) => {
             sqlx::raw_sql(
@@ -247,6 +276,17 @@ async fn queued_commands(slow_database: bool, checkpoint_failure: Option<Checkpo
         assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
         assert_eq!(db.count().await, 0);
         None
+    } else if graceful_shutdown {
+        tokio::time::timeout(Duration::from_secs(15), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // The in-flight command commits; queued accepted commands drain but
+        // buffered gateway dispatches are not admitted after shutdown.
+        assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 2);
+        assert_eq!(db.count().await, 0);
+        None
     } else {
         wait_sequence(&db.store, 68).await;
         Some(runner)
@@ -291,25 +331,31 @@ async fn queued_commands(slow_database: bool, checkpoint_failure: Option<Checkpo
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn queued_rsvp_is_deferred_within_three_seconds_and_drains_on_overflow() {
-    queued_commands(false, None).await;
+    queued_commands(false, None, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn acknowledged_rsvp_survives_feature_deadline_and_backlog() {
-    queued_commands(true, None).await;
+    queued_commands(true, None, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn acknowledged_queue_drains_before_checkpoint_error_returns() {
-    queued_commands(false, Some(CheckpointFailure::Rejected)).await;
+    queued_commands(false, Some(CheckpointFailure::Rejected), false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn acknowledged_queue_drains_before_checkpoint_timeout_returns() {
-    queued_commands(false, Some(CheckpointFailure::Timeout)).await;
+    queued_commands(false, Some(CheckpointFailure::Timeout), false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn acknowledged_queue_drains_before_graceful_shutdown_returns() {
+    queued_commands(false, None, true).await;
 }
 
 #[tokio::test]

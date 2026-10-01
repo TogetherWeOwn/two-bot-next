@@ -28,6 +28,7 @@
 
 ### Fixed
 
+- Preserve ticket readiness and its authenticated bot-user lookup alongside ordered RSVP dispatch, without a competing registry publication. On graceful gateway shutdown, stop admission and drain accepted RSVP replies before joining ticket work; cover both integration seams with regressions.
 - Prepare CA certificates in a separate Docker stage and copy the complete trust store into the Debian runtime, excluding certificate installation tools and dependencies while retaining the non-root, healthcheck and port contracts. Image and binary size budgets remain unchanged.
 - Start shared sticky/feed interaction dispatch at receipt even while ordered RSVP I/O is pending; never dispatch the same buffered interaction twice. On checkpoint failure or timeout, stop admission and drain already-acknowledged RSVP work before returning the error, without advancing the failed checkpoint or applying queued funnel packets. Reuse the shared mock module under strict clippy and add mixed-command and checkpoint-failure regressions.
 - Keep the real-binary lifecycle acceptance mock's shared REST registry endpoint separate from its gateway WebSocket listener, and verify full command publication on initial and persisted-session boots alongside website-job traffic.

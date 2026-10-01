@@ -390,6 +390,7 @@ async fn spawn_runner(
         db.store.clone(),
         None,
         None,
+        None,
     ));
     (task, state)
 }

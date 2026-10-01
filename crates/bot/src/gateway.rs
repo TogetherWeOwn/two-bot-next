@@ -324,7 +324,9 @@ pub async fn run_shard(
     store: GatewaySessionStore,
     interactions: Option<Arc<two_bot_discord::interactions::InteractionRuntime>>,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), sqlx::Error> {
+    let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
     let result = run_loop(
         &mut shard,
         &pipeline,
@@ -332,9 +334,13 @@ pub async fn run_shard(
         &store,
         interactions.as_ref(),
         runtime.as_ref(),
+        shutdown,
     )
     .await;
     *state.write().await = GatewayState::Armed;
+    if let Some(tickets) = tickets {
+        tickets.shutdown().await;
+    }
     result
 }
 
@@ -345,6 +351,7 @@ async fn run_loop(
     store: &GatewaySessionStore,
     interactions: Option<&Arc<two_bot_discord::interactions::InteractionRuntime>>,
     runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), sqlx::Error> {
     if let Some(runtime) = interactions {
         runtime.publish_current().await.map_err(|_| {
@@ -359,9 +366,22 @@ async fn run_loop(
     let result = async {
         info!(shard = ?ShardId::ONE, "gateway shard loop started");
         loop {
+            // Stop admission between effects, never cancel accepted RSVP work.
+            if shutdown.as_ref().is_some_and(|receiver| *receiver.borrow()) {
+                break;
+            }
             let packet = match pending.pop_front() {
                 Some(packet) => packet,
-                None => match shard.next().await {
+                None => match tokio::select! {
+                    biased;
+                    _ = async {
+                        match shutdown.as_ref() {
+                            Some(receiver) => crate::server::shutdown_requested(receiver.clone()).await,
+                            None => std::future::pending().await,
+                        }
+                    } => break,
+                    packet = shard.next() => packet,
+                } {
                     Some(item) => BufferedPacket::capture(
                         shard,
                         item,
@@ -534,19 +554,17 @@ async fn run_loop(
         Ok(())
     }
     .await;
-    // A callback is an external effect: fail closed on the checkpoint error,
-    // but stop admission and finish already-accepted commands before returning.
-    // Do not advance the failed checkpoint or run buffered funnel dispatches.
-    if result.is_err() {
-        *state.write().await = GatewayState::Armed;
-        if let Some(runtime) = interactions {
-            if let Some(acknowledgement) = active_acknowledgement {
+    // A callback is an external effect: after error or shutdown, stop admission
+    // and finish accepted commands without advancing a failed checkpoint or
+    // running buffered funnel dispatches.
+    *state.write().await = GatewayState::Armed;
+    if let Some(runtime) = interactions {
+        if let Some(acknowledgement) = active_acknowledgement {
+            complete_acknowledgement(runtime, acknowledgement).await;
+        }
+        for packet in pending {
+            if let Some(acknowledgement) = packet.acknowledgement {
                 complete_acknowledgement(runtime, acknowledgement).await;
-            }
-            for packet in pending {
-                if let Some(acknowledgement) = packet.acknowledgement {
-                    complete_acknowledgement(runtime, acknowledgement).await;
-                }
             }
         }
     }
