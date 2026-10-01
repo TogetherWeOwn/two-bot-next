@@ -138,6 +138,33 @@ fn unsupported_query_secrets_never_reach_sqlx_warn_logs() {
     assert!(!text.contains("fixture-query-secret"));
     assert!(!text.contains("ignoring unrecognized connect parameter"));
 }
+#[test]
+fn neon_channel_binding_never_reaches_sqlx_warn_logs() {
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        for query in [
+            "sslmode=require&channel_binding=require",
+            "channel%5Fbinding=fixture-binding-secret&sslmode=require&channel_binding=fixture-repeated-secret",
+        ] {
+            // Parse only: this synthetic Neon hostname is never contacted.
+            let url = format!("postgres://fixture-user:fixture-password@ep-fixture.neon.tech/db?{query}");
+            let options = two_bot_core::database_url::connect_options(&url).unwrap();
+            assert_eq!(options.get_ssl_mode(), sqlx::postgres::PgSslMode::Require);
+        }
+        tracing::warn!("capture remains active");
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    for forbidden in [
+        "fixture-binding-secret",
+        "fixture-repeated-secret",
+        "channel_binding",
+        "ignoring unrecognized connect parameter",
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+}
+
 #[tokio::test]
 async fn connection_errors_and_their_source_chains_never_echo_urls() {
     for url in [

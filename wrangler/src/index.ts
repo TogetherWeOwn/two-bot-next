@@ -87,6 +87,13 @@ const DEFAULT_KEEPALIVE_SECONDS = 60;
 const DEFAULT_UNREADY_SECONDS = 600;
 const READINESS_KEY = "two-bot:readiness";
 
+// SDK failures do not carry a trustworthy Rust startup class. Never serialize
+// arbitrary exception text (or claim stderr crossed the Container boundary).
+function containerUnavailable(): Response {
+  console.error(JSON.stringify({ event: "container_probe_failed", error_class: "container_unavailable" }));
+  return Response.json({ ready: false, error_class: "container_unavailable" }, { status: 500 });
+}
+
 function containerPort(raw: string | undefined): number {
   if (raw === undefined) return 8080;
   const port = Number(raw);
@@ -122,7 +129,18 @@ export class TwoBotContainer extends Container<Env> {
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {
       await this.armKeepalive();
-      return this.containerFetch(request);
+      try {
+        const response = await this.containerFetch(request);
+        // SDK 0.3.7 also returns startup exceptions as text/plain 500 rather
+        // than rejecting. Drop that body without exposing its error message.
+        if (response.status >= 500 && response.status !== 503) {
+          await response.arrayBuffer();
+          return containerUnavailable();
+        }
+        return response;
+      } catch {
+        return containerUnavailable();
+      }
     }
 
     return new Response("not found", { status: 404 });
@@ -296,9 +314,11 @@ export class TwoBotContainer extends Container<Env> {
     console.log("two-bot container stopped");
   }
 
-  override onError(error: unknown): void {
-    console.error(`two-bot container error: ${String(error)}`);
-    throw error;
+  override onError(_error: unknown): void {
+    console.error(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" }));
+    // The SDK logs errors thrown by hooks too; replace rather than rethrow the
+    // original exception, and do not retain a credential-bearing cause.
+    throw new Error("container_lifecycle_failed");
   }
 }
 
@@ -311,8 +331,13 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {
-      const container = env.TWO_BOT.getByName(SINGLETON_NAME);
-      return container.fetch(request);
+      try {
+        const container = env.TWO_BOT.getByName(SINGLETON_NAME);
+        return await container.fetch(request);
+      } catch {
+        // Includes DO construction/binding failures before its fetch handler.
+        return containerUnavailable();
+      }
     }
 
     // Metrics are container-internal, never a public proxy or invite campaign.

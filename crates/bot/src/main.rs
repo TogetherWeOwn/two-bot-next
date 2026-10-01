@@ -87,15 +87,23 @@ async fn main() {
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
     let listener = server::bind(&config.listen_addr)
         .await
-        .unwrap_or_else(|err| {
-            tracing::error!(error = %err, "container listener failed");
+        .unwrap_or_else(|_| {
+            tracing::error!(
+                startup_phase = "listener_bind",
+                error_class = "listener_bind_failed",
+                "container listener failed"
+            );
             std::process::exit(1);
         });
     let gateway_url = match std::env::var("DISCORD_GATEWAY_URL") {
         Ok(url) => Some(url),
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => {
-            tracing::error!("DISCORD_GATEWAY_URL must be valid UTF-8");
+            tracing::error!(
+                startup_phase = "gateway_override",
+                error_class = "gateway_override_invalid",
+                "DISCORD_GATEWAY_URL must be valid UTF-8"
+            );
             std::process::exit(1);
         }
     };
@@ -103,7 +111,11 @@ async fn main() {
         .as_deref()
         .is_some_and(|url| !gateway::is_loopback_gateway(url))
     {
-        tracing::error!("DISCORD_GATEWAY_URL must be a loopback mock websocket address");
+        tracing::error!(
+            startup_phase = "gateway_override",
+            error_class = "gateway_override_invalid",
+            "DISCORD_GATEWAY_URL must be a loopback mock websocket address"
+        );
         std::process::exit(1);
     }
 
@@ -117,15 +129,22 @@ async fn main() {
                     // Runtime is DML-only; the operator migrates before startup.
                     let db =
                         two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, true)
-                            .await?;
+                            .await
+                            .map_err(|error| gateway_failure("database_connect_failed", error))?;
                     metrics_http::register_pool(db.pool().clone());
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
                         db.pool().clone(),
                         guild_id.to_string(),
                         0,
                     );
-                    let saved = gateway::load_boot_session(&store).await?;
-                    let pipeline = Arc::new(build_pipeline(store.milestones().await?));
+                    let saved = gateway::load_boot_session(&store)
+                        .await
+                        .map_err(|error| gateway_failure("checkpoint_load_failed", error))?;
+                    let milestones = store
+                        .milestones()
+                        .await
+                        .map_err(|error| gateway_failure("milestones_load_failed", error))?;
+                    let pipeline = Arc::new(build_pipeline(milestones));
                     // Shared command runtime (TOG-11020; S4 sticky slice was
                     // TOG-10309): ONE router + REST executor + sqlx stores
                     // over the same pool. `None` on bad env gates — the shard
@@ -145,7 +164,9 @@ async fn main() {
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store, runtime).await
+                    run_shard(shard, pipeline, Arc::clone(&state), store, runtime)
+                        .await
+                        .map_err(|error| gateway_failure("gateway_runtime_failed", error))
                 }
                 .await;
                 if result.is_err() {
@@ -175,10 +196,24 @@ async fn main() {
         Some(task) => supervise_gateway(task, http, shutdown).await,
         None => http.await,
     };
-    if let Err(err) = result {
-        tracing::error!(error = %err, "container service failed");
+    if result.is_err() {
+        tracing::error!(
+            startup_phase = "service_supervisor",
+            error_class = "container_service_failed",
+            "container service failed"
+        );
         std::process::exit(1);
     }
+}
+
+/// Fixed operation classes only: neither SQLx errors nor their sources are logged.
+fn gateway_failure(error_class: &'static str, error: sqlx::Error) -> sqlx::Error {
+    tracing::error!(
+        startup_phase = "durable_gateway",
+        error_class,
+        "configured gateway operation failed"
+    );
+    error
 }
 
 /// `--help` covers both the gateway server and the backup CLI.

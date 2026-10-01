@@ -138,6 +138,40 @@ for (const path of ["/health", "/readyz"]) {
   });
 }
 
+for (const path of ["/health", "/readyz"]) {
+  test(`SDK native startup failure returns sanitized ${path} 500`, async (t) => {
+    const h = await harness(t);
+    t.mock.method(h.runtime, "start", () => {
+      throw new Error(`fixture startup failure ${WORKER_ENV.DISCORD_TOKEN} ${WORKER_ENV.DATABASE_URL}`);
+    });
+    const response = await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+    assert.equal(response.status, 500);
+    assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+    assert.ok(h.logs.every((line) =>
+      !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
+  });
+
+  test(`Worker DO rejection returns sanitized ${path} 500`, async (t) => {
+    const h = await harness(t);
+    const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+      TWO_BOT: { getByName: () => ({ fetch: async () => {
+        throw new Error(`fixture DO failure ${WORKER_ENV.DATABASE_URL}`);
+      } }) },
+    } as unknown as Env, {} as ExecutionContext);
+    assert.equal(response.status, 500);
+    assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+    assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DATABASE_URL)));
+  });
+}
+
+test("lifecycle error replaces arbitrary exception without inspecting it", async (t) => {
+  const h = await harness(t);
+  const unsafe = { toString() { throw new Error(WORKER_ENV.DISCORD_TOKEN); } };
+  assert.throws(() => h.bot.onError(unsafe), { message: "container_lifecycle_failed" });
+  assert.ok(h.logs.includes(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" })));
+  assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN)));
+});
+
 for (const failure of ["lookup", "insert"] as const) {
   for (const warm of [false, true]) {
     for (const path of ["/health", "/readyz"]) {
