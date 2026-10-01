@@ -200,10 +200,11 @@ pub struct Pipeline<
     F = two_bot_core::NoopFacts,
     I = NoInvites,
     C = NoClassification,
+    P = PipelineSnapshots,
 > {
     cache: InMemoryCache,
     handlers: FunnelHandlers<S, L, F>,
-    invites: InviteTracker<PipelineSnapshots>,
+    invites: InviteTracker<P>,
     invite_source: I,
     expected_joins: Mutex<ExpectedJoins>,
     classifier: C,
@@ -212,7 +213,7 @@ pub struct Pipeline<
     vanity_guilds: Mutex<HashSet<Snowflake>>,
 }
 
-impl<S, L, F, I, C> std::fmt::Debug for Pipeline<S, L, F, I, C> {
+impl<S, L, F, I, C, P> std::fmt::Debug for Pipeline<S, L, F, I, C, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pipeline").finish_non_exhaustive()
     }
@@ -221,7 +222,7 @@ impl<S, L, F, I, C> std::fmt::Debug for Pipeline<S, L, F, I, C> {
 impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelClassifier>
     Pipeline<S, L, F, I, C>
 {
-    /// Build a pipeline over the given seams.
+    /// Build a pipeline over the given seams with in-memory snapshots.
     pub fn new(
         store: S,
         leveling: Option<L>,
@@ -229,12 +230,41 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
         invite_source: I,
         classifier: C,
     ) -> Self {
+        Self::with_snapshots(
+            store,
+            leveling,
+            facts,
+            invite_source,
+            classifier,
+            PipelineSnapshots::new(),
+        )
+    }
+}
+
+impl<
+        S: FunnelStore,
+        L: LevelingHook,
+        F: FactsSink,
+        I: InviteSource,
+        C: ChannelClassifier,
+        P: InviteSnapshotStore,
+    > Pipeline<S, L, F, I, C, P>
+{
+    /// Build over an explicit snapshot store (Postgres at runtime).
+    pub fn with_snapshots(
+        store: S,
+        leveling: Option<L>,
+        facts: Option<F>,
+        invite_source: I,
+        classifier: C,
+        snapshots: P,
+    ) -> Self {
         Self {
             cache: InMemoryCache::builder()
                 .resource_types(cache_resource_types())
                 .build(),
             handlers: FunnelHandlers::new(store, leveling, facts),
-            invites: InviteTracker::new(PipelineSnapshots::new()),
+            invites: InviteTracker::new(snapshots),
             invite_source,
             expected_joins: Mutex::new(ExpectedJoins::new()),
             classifier,
@@ -343,8 +373,8 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
         self.handle_at(event, &two_bot_core::now_iso());
     }
 
-    /// Replay with an explicit observation clock for frames without timestamps.
-    /// Join/message payload timestamps still take precedence over this clock.
+    /// Drive a received event after queueing without changing its occurrence
+    /// time. Payload timestamps win; timestamp-less transitions use receipt time.
     pub fn handle_at(&self, event: &Event, observed_at: &str) {
         match event {
             // Fresh session after (re-)identify: first connect starts empty
@@ -389,15 +419,12 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                 } else {
                     None
                 };
-                let joined_at = Some(
-                    add.member
-                        .joined_at
-                        .map_or_else(|| observed_at.to_owned(), legacy_stamp),
-                );
-                let source_event_id = format!(
-                    "{guild_id}:{member_id}:{}",
-                    joined_at.as_deref().unwrap_or("observed")
-                );
+                let joined_at = add
+                    .member
+                    .joined_at
+                    .map_or_else(|| observed_at.to_owned(), legacy_stamp);
+                let source_event_id = format!("{guild_id}:{member_id}:{joined_at}");
+                let occurred_at = Some(joined_at);
                 let is_bot = add.user.bot;
                 self.cache.update(event);
                 self.handlers.on_join(JoinInput {
@@ -405,7 +432,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                     member_id,
                     is_bot,
                     source,
-                    occurred_at: joined_at.clone(),
+                    occurred_at: occurred_at.clone(),
                     inviter_id,
                     source_event_id: Some(source_event_id),
                 });
@@ -417,7 +444,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink, I: InviteSource, C: ChannelC
                         guild_id,
                         member_id,
                         is_bot,
-                        occurred_at: joined_at,
+                        occurred_at,
                         source: None,
                     });
                 }
