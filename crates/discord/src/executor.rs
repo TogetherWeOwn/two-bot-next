@@ -1687,6 +1687,9 @@ fn format_iso_secs(epoch_secs: u64) -> String {
 /// (finding 2). Route Display renders the query string twilight's way so the
 /// mock sees byte-identical paths.
 fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
+    if path == "/users/@me" {
+        return Ok(Route::GetCurrentUser);
+    }
     let err = || format!("unsupported GET path: {path}");
     let (base, query) = match path.split_once('?') {
         Some((b, q)) => (b, q),
@@ -1800,6 +1803,23 @@ pub fn pace_delay_ms(last_at_ms: u64, interval_ms: u64, now_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_user_read_accepts_only_the_exact_route() {
+        assert!(matches!(
+            raw_get_route("/users/@me").unwrap(),
+            Route::GetCurrentUser
+        ));
+        for path in [
+            "/users/@me?",
+            "/users/@me?limit=100",
+            "/users/@me/",
+            "/users/5555",
+            "https://discord.com/api/v10/users/@me",
+        ] {
+            assert!(raw_get_route(path).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn debug_redacts_transport_and_nested_executor_token() {

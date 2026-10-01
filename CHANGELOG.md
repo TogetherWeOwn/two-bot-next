@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- Support the exact authenticated-user REST read used by feed history reconciliation, and preserve the uncompressed runtime-image budget when Docker's containerd store also accounts for compressed blobs.
 - Answer published but unwired commands ephemerally instead of timing out, preserving the existing router refusals and complete registry. Synchronize the registry on resumed process startup as well as Ready, without blocking gateway polling.
 - Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
 - Grant the least-privilege runtime role CRUD on the self-role audit and panel-claim relations (migration 0200), cover 0200 in the role-matrix tests, and prove runtime claim access with continued web-reader denial.

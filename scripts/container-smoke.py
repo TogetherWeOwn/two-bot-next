@@ -60,7 +60,6 @@ def http_response(url):
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
     metadata = json.loads(docker("image", "inspect", image).stdout)[0]
-    image_bytes = metadata["Size"]
     # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
     # orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex
@@ -72,8 +71,20 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         ).stdout)
     finally:
         docker("rm", "--force", measure, check=False)
+    # The measurement run above unpacks the image. On the containerd store,
+    # inspect Size also includes compressed blobs; history reports unpacked
+    # layer sizes in exact bytes with --human=false. Keep the original
+    # uncompressed-layer budget, not a host storage-driver accounting budget.
+    layers = docker("image", "history", "--no-trunc", "--human=false",
+                    "--format", "{{.Size}}", image).stdout.splitlines()
+    require(layers and all(size.isascii() and size.isdecimal() for size in layers),
+            "image history must report exact non-negative layer bytes")
+    image_bytes = sum(int(size) for size in layers)
+    require(image_bytes > 0 and image_bytes >= binary_bytes,
+            "unpacked image size must include the release binary")
+    report(f"Docker inspect Size (store-dependent disk usage): {metadata['Size']} bytes")
     for label, size, limit in (
-        ("image (uncompressed Docker Size)", image_bytes, image_max_bytes),
+        ("image (uncompressed layer sizes)", image_bytes, image_max_bytes),
         ("release binary", binary_bytes, binary_max_bytes),
     ):
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")

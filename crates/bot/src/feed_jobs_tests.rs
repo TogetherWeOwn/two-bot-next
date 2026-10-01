@@ -189,7 +189,10 @@ async fn bounded_history_requires_exact_nonce_and_confirmed_own_message() {
         .await;
         assert!(reconcile(&executor(&mock), &post).await.is_err());
         assert_eq!(post_count(&mock), 0);
-        assert!(mock.requests()[1].path.contains("limit=100"));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2, "identity and bounded history must be read");
+        assert!(requests[0].path.ends_with("/users/@me"));
+        assert!(requests[1].path.contains("limit=100"));
         mock.shutdown().await;
     }
     let mock = MockRest::start(vec![me(), history(&post)], ScriptedResponse::status(500)).await;

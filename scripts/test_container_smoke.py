@@ -22,6 +22,8 @@ class DockerFixture:
     def __init__(self):
         self.calls = []
         self.image_size = 110 * smoke.MIB
+        self.compressed_size = 32 * smoke.MIB
+        self.history = None
         self.binary_size = 7 * smoke.MIB
         self.user = "two-bot"
         self.health_command = ["CMD", smoke.BINARY, "--healthcheck"]
@@ -42,9 +44,11 @@ class DockerFixture:
         output = ""
         code = 0
         if args[:2] == ("image", "inspect"):
-            output = json.dumps([{"Size": self.image_size, "Config": {
+            output = json.dumps([{"Size": self.image_size + self.compressed_size, "Config": {
                 "User": self.user, "Healthcheck": {"Test": self.health_command},
             }}])
+        elif args[:2] == ("image", "history"):
+            output = self.history if self.history is not None else f"{self.image_size - self.binary_size}\n0\n{self.binary_size}\n"
         elif args[0] == "run" and "stat" in args:
             if self.measure_timeout:
                 raise subprocess.TimeoutExpired(["docker", *args], kwargs.get("timeout"))
@@ -210,6 +214,35 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assertNotIn("--env-file", run)
         wait = next(kwargs for args, kwargs in self.fixture.calls if args[0] == "wait")
         self.assertLessEqual(wait["timeout"], 10)
+
+    def test_containerd_compressed_storage_does_not_change_layer_budget(self):
+        output = self.run_smoke()
+        self.assertIn("148897792 bytes", output)
+        self.assertIn("image (uncompressed layer sizes): 115343360 bytes", output)
+        args = next(args for args, _ in self.fixture.calls if args[:2] == ("image", "history"))
+        self.assertIn("--human=false", args)
+        self.assertIn("{{.Size}}", args)
+
+    def test_classic_store_uses_the_same_layer_budget(self):
+        self.fixture.compressed_size = 0
+        self.run_smoke()
+
+    def test_invalid_layer_measurement_fails_closed(self):
+        for history in ["", "0\n0\n", "12MB\n", "-1\n", "1\n", "100000000\n\n"]:
+            with self.subTest(history=history):
+                self.fixture.history = history
+                self.assert_rejected("image history|unpacked image size")
+                self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
+
+    def test_layer_measurement_failure_is_not_an_inspect_size_fallback(self):
+        original = self.fixture
+        def missing(*args, **kwargs):
+            if args[:2] == ("image", "history"):
+                raise subprocess.CalledProcessError(1, args, stderr="history unavailable")
+            return original(*args, **kwargs)
+        self.fixture = missing
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_smoke()
 
     def test_image_budget_is_enforced_before_runtime_start(self):
         self.assert_rejected("image exceeds size budget", image_max_bytes=1)
