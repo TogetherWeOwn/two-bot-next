@@ -46,6 +46,9 @@ class DockerFixture:
             output = json.dumps([{"Size": self.image_size, "Config": {
                 "User": self.user, "Healthcheck": {"Test": self.health_command},
             }}])
+        elif args[0] == "history":
+            # Two layers summing to image_size (inspect .Size is not used).
+            output = f"{self.image_size - 4096}\n4096\n0\n"
         elif args[0] == "run" and "stat" in args:
             if self.measure_timeout:
                 raise subprocess.TimeoutExpired(["docker", *args], kwargs.get("timeout"))
