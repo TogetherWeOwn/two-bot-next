@@ -79,6 +79,10 @@ BOT_PORT = "8080"
 KEEPALIVE_SECONDS = "60"
 TWO_GUILD_NAME = "TWO Staging"
 
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
+
 [[env.production.containers]]
 class_name = "TwoBotContainer"
 image = "../Dockerfile"

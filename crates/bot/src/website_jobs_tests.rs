@@ -2,7 +2,11 @@ use super::*;
 use serde_json::json;
 use two_bot_testsupport::TestDatabase;
 
-use crate::discord_test_common::{MockRest, ScriptedResponse};
+#[allow(dead_code)]
+#[path = "../../discord/tests/common/mod.rs"]
+mod common;
+
+use common::{MockRest, ScriptedResponse};
 
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
