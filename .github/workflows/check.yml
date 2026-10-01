@@ -26,7 +26,7 @@ jobs:
     # A skipped dependency must not make the required check appear green.
     if: ${{ always() }}
     runs-on: [self-hosted, two-selfhosted]
-    timeout-minutes: 30
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
@@ -91,8 +91,12 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restore on every run; save only on pushes to main (below). A PR-scoped
+      # cache is unreadable by other PRs, and uploading the ~4 GiB target dir
+      # from a busy self-hosted runner pushed PR jobs past their timeout.
+      - name: Restore cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -175,8 +179,13 @@ jobs:
       # only this slice's tests activate their test-container guard here.
       - name: channel moderation domain and store tests
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
+
+      - name: Internal channel moderation executor (mock REST and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
 
       - name: Internal-member durable store regressions (CI service only)
         env:
@@ -198,6 +207,16 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+
+      - name: Save cargo cache (main only)
+        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   self-role-store:
     name: self-role store leases
@@ -333,6 +352,45 @@ jobs:
       - run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - run: cargo test -p two-bot-core --features db --test feeds --locked
       - run: cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
+
+  tickets-postgres:
+    name: tickets postgres
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 15
+    # Service DNS stays inside this job's network; never publish a shared port.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    services:
+      agent-testdb:
+        image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TICKET_TEST_DB_HOST: agent-testdb
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        with:
+          toolchain: stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-tickets-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Ticket lifecycle and migration integration tests
+        run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
+      - name: Ticket shared router and mock Discord lifecycle acceptance
+        run: >-
+          cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored
 
   worker:
     name: worker check
