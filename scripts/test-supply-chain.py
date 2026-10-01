@@ -178,6 +178,19 @@ class SupplyChainTests(unittest.TestCase):
         self.assertNotIn("--force-depends", dockerfile)
         self.assertNotIn("/var/lib/dpkg", dockerfile)
 
+    def test_mount_purge_is_build_only_guarded_and_keeps_real_scan_gates(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        runtime = dockerfile.split(" AS runtime", 1)[1]
+        self.assertIn("COPY --from=builder /app/scripts/purge-runtime-mount.sh", runtime)
+        purge = runtime.index("RUN /bin/sh /usr/local/libexec/purge-runtime-mount.sh")
+        self.assertLess(purge, runtime.index("RUN useradd"))
+        self.assertLess(purge, runtime.index("USER two-bot"))
+        self.assertIn("&& rm /usr/local/libexec/purge-runtime-mount.sh", runtime)
+        supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        self.assertIn("python3 scripts/test-purge-runtime-mount.py", supply)
+        self.assertEqual(supply.count("exit-code: '1'"), 2)
+        self.assertNotIn("continue-on-error", supply)
+
     def test_pr_dry_run_is_read_only_bounded_and_isolated(self):
         check = (ROOT / ".github/workflows/check.yml").read_text()
         supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()

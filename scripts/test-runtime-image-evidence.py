@@ -106,8 +106,7 @@ class EvidenceTests(unittest.TestCase):
                       "${source:Package}", "${source:Version}"]:
             with self.subTest(field=field):
                 self.assertIn(field, command)
-        for path in ["/usr/bin/mount", "/usr/bin/umount", "/usr/bin/nsenter",
-                     "/usr/lib/x86_64-linux-gnu/libmount.so.1"]:
+        for path in ["/usr/bin/nsenter", "/usr/lib/x86_64-linux-gnu/libmount.so.1"]:
             with self.subTest(path=path):
                 self.assertIn(path, command)
         self.assertIn("readlink -e", command)
@@ -116,8 +115,7 @@ class EvidenceTests(unittest.TestCase):
     def test_payload_identity_shell_preserves_hashes_and_fails_on_missing_evidence(self):
         scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
         self.assertTrue(scratch, "Fake tools require run-owned scratch")
-        paths = ["/usr/bin/mount", "/usr/bin/umount", "/usr/bin/nsenter",
-                 "/usr/lib/x86_64-linux-gnu/libmount.so.1"]
+        paths = ["/usr/bin/nsenter", "/usr/lib/x86_64-linux-gnu/libmount.so.1"]
         failures = [(None, None), ("dpkg-query", None), ("sha256sum", None)]
         failures += [("readlink", path) for path in paths]
         for failed_tool, failed_path in failures:
@@ -152,8 +150,8 @@ class EvidenceTests(unittest.TestCase):
                 with patch.dict(os.environ, {"PATH": str(directory)}):
                     result = subprocess.run(["/bin/sh", "-c", evidence.UTIL_LINUX_IDENTITY + "; printf 'later command\\n'"], capture_output=True, text=True)
                 calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
-                self.assertEqual(calls[0][-8:], ["bsdutils", "libblkid1", "libmount1", "libsmartcols1",
-                                               "libuuid1", "mount", "util-linux", "util-linux-extra"])
+                self.assertEqual(calls[0][:2], ["dpkg-query", "-W"])
+                self.assertEqual(len(calls[0]), 3, "Source query must not select a removed package")
                 if failed_tool:
                     self.assertEqual(result.returncode, 7)
                     self.assertIn("fixture evidence unavailable", result.stderr)
@@ -165,8 +163,8 @@ class EvidenceTests(unittest.TestCase):
                     self.assertIn("bsdutils\t1:2.38.1-5+deb12u3\tamd64\tutil-linux\t2.38.1-5+deb12u3", result.stdout)
                     for path in paths:
                         self.assertIn(f"resolved\t{path}\t{payload}\n", result.stdout)
-                    self.assertEqual(result.stdout.count(digest + "  " + str(payload)), 4)
-                    self.assertEqual(len(calls), 9)
+                    self.assertEqual(result.stdout.count(digest + "  " + str(payload)), 2)
+                    self.assertEqual(len(calls), 5)
 
     def test_fixed_probe_commands_parse_without_executing(self):
         self.assertEqual(len(evidence.PROBES), 16)

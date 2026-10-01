@@ -39,8 +39,14 @@ RUN apt-get update \
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
+# Purge only the stock non-Essential mount package through apt. Refuse any
+# additional package action or metadata change; never force Essential removal.
+COPY --from=builder /app/scripts/purge-runtime-mount.sh /usr/local/libexec/purge-runtime-mount.sh
+RUN /bin/sh /usr/local/libexec/purge-runtime-mount.sh \
+    && rm /usr/local/libexec/purge-runtime-mount.sh
+
 # Keep the bundle and hashed certificate links/targets, without copying the
-# builder's OpenSSL binaries or libraries. Debian package metadata is untouched.
+# builder's OpenSSL binaries or libraries or their package records.
 COPY --from=builder /etc/ssl/certs/ /etc/ssl/certs/
 COPY --from=builder /usr/share/ca-certificates/ /usr/share/ca-certificates/
 COPY --from=builder /usr/share/doc/ca-certificates/copyright /usr/share/doc/ca-certificates/copyright

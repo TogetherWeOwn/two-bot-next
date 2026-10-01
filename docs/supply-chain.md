@@ -157,16 +157,18 @@ all unresolved gates red; pursue supported Bookworm fixes or compatible removal
 of unnecessary packages before requesting a new disposition on the existing
 security-decision thread.
 
-The existing mount-configuration probe first records the eight util-linux binary
-packages' exact versions, architectures and source package/versions, then resolves
-and hashes `/usr/bin/mount`, `/usr/bin/umount`, `/usr/bin/nsenter` and the amd64
-`libmount.so.1` target. Path resolution, package-query or hashing failures remain
-nonzero observations; later help/configuration commands cannot hide them. This
-keeps the same 16-probe and timeout bounds. These are hashes observed inside the
-scanned image, not authenticated Debian package comparisons or automatic evidence
-of absent vulnerable code. Compare them with independently authenticated exact
-published payloads before relying on a source/build applicability decision. No
-ignore selector or vulnerability gate is changed by recording these hashes.
+The mount-configuration probe records the full dpkg binary/source inventory,
+including exact versions and architectures, then resolves and hashes
+`/usr/bin/nsenter` and the amd64 `libmount.so.1` target. This does not require the
+removed `mount` package or claim its binaries were hashed. Path resolution,
+package-query or hashing failures remain nonzero observations; later help/configuration
+commands cannot hide them. An unavailable mount command is explicitly recorded,
+not treated as a package-absence or CVE test. This keeps the same 16-probe and
+timeout bounds. These are hashes observed inside the scanned image, not authenticated
+Debian package comparisons or automatic evidence of absent vulnerable code.
+Compare them with independently authenticated exact published payloads before
+relying on a source/build applicability decision. No ignore selector or
+vulnerability gate is changed by recording these hashes.
 
 ## Release and dry-run
 
@@ -234,6 +236,37 @@ this is not an external TLS handshake or a proof of application input reachabili
 Operator-configured upload hooks can invoke external wrappers, so source-only
 absence of direct utility calls is not a blanket compatibility or CVE waiver.
 
+### Guarded removal of the non-Essential mount package
+
+The amd64 runtime build uses `scripts/purge-runtime-mount.sh` to remove only
+Bookworm's `mount` binary package through ordinary apt purge. The script requires
+the exact stock `2.38.1-5+deb12u3` amd64 non-Essential installed tuple, checks the
+package database, and requires a simulated plan containing exactly one `Purg mount`
+action and no other purge/remove/install/configure action. Automatic removal is
+explicitly disabled. Missing/duplicate inventory records or failed queries fail
+before removal. After purge, every dpkg record except mount must remain identical
+(version, architecture, Essential flag and status), and `apt-get check` must pass.
+There is no forced dependency/Essential removal, package-database rewriting, apt
+repository update, distribution mixing or ignore entry. Changed base tuples/plans
+fail the build rather than silently broadening the removal.
+
+The successful full dependency observation from `51a6fac` lists mount as
+non-Essential and no direct installed Depends/Pre-Depends consumer of that package.
+Native apt's build-time simulation/checks, not that raw inventory observation alone,
+are the removal boundary. Essential util-linux still requires util-linux-extra and
+affected libraries; grep, Bash, coreutils and tar retain other affected dependencies.
+This removal does not fix those packages, waive source-family findings or make the
+image vulnerability gate green by itself. New-head CI must verify the build,
+post-purge inventories, payload observations, non-root startup/certificates,
+healthcheck and both vulnerability gates. Offline fake-tool tests are not native
+apt or image compatibility proof.
+
+The container image will no longer supply mount/umount command-line tools. The bot's
+fixed entrypoint/healthcheck do not invoke them; arbitrary operator upload wrappers
+are not covered by that statement and must not rely on those tools in this image.
+Host/systemd deployment packages are not changed. No production mount/privilege
+restriction, downstream image or injected utility guarantee is inferred.
+
 Distroless is a separate follow-up evaluation: assess TLS roots, non-root user,
 healthcheck executable, debug/incident workflow and binary compatibility before
 changing image family. This change deliberately keeps Bookworm.
@@ -245,6 +278,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-supply-chain.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-runtime-image-evidence.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-vulnerability-preflight.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-trivy-selector-probes.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-purge-runtime-mount.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_container_smoke.py
 python3 scripts/test-docker-deps.py
 python3 scripts/test-release-retry.py
