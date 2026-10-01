@@ -21,7 +21,7 @@ concurrency:
 jobs:
   advisories:
     name: nightly advisories
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,8 +36,11 @@ jobs:
 
   sweep:
     name: nightly ignored tests and docs
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 45
+    # Match check.yml: no service ports on the shared Docker host.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: '0'
@@ -54,8 +57,6 @@ jobs:
           POSTGRES_DB: agent_test
           # Disposable CI service only, matching the test-database guards.
           POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 127.0.0.1:5432:5432
         options: >-
           --health-cmd "pg_isready -U agent_test -d agent_test"
           --health-interval 5s
@@ -82,35 +83,44 @@ jobs:
             ${{ runner.os }}-nightly-cargo-
       - name: Prepare isolated test databases
         id: databases
-        env:
-          TEST_DB_CONTAINER: ${{ job.services.agent-testdb.id }}
         run: |
-          # Match the existing guards; never relax them or use a repository secret.
-          printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
-          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_tog10090_nightly
-          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_next_backup_nightly
-          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_next_backup_publication_nightly
+          # Match check.yml's job-private loopback for fixed-endpoint fixtures.
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends postgresql-client socat >/dev/null
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && break; sleep 1; done
+          pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test
+          createdb -h agent-testdb -U agent_test two_bot_test_tog10090_nightly
+          createdb -h agent-testdb -U agent_test two_next_backup_nightly
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_nightly
           mkdir -p "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
       # Serial execution prevents the ignored stores' shared tables/locks from
       # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
       # Channel moderation, feeds_store and legacy_verify_db require agent_test,
       # not the two_bot_test_* bootstrap used by TestDatabase suites. Skip only
-      # those tests here, then run ALL three suites below with their accepted URL.
+      # those tests here, then run all guarded suites below with their accepted URL.
       # No ignored suite is permanently excluded.
       - name: Full workspace sweep including ignored tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
         run: >-
           cargo test --workspace --all-features --locked -- --include-ignored --test-threads=1
-          --skip channel_moderation_store::tests::lockdown_round_trip_stores_and_restores_exact_masks
-          --skip channel_moderation_store::tests::repeated_lockdown_preserves_first_masks
-          --skip channel_moderation_store::tests::delayed_unlock_cleanup_cannot_delete_a_later_lockdown
-          --skip channel_moderation_store::tests::retried_cleanup_after_recreation_reports_stale
-          --skip channel_moderation_store::tests::claim_complete_replay_refuses_reuse
-          --skip channel_moderation_store::tests::release_returns_key_for_a_real_retry
-          --skip channel_moderation_store::tests::stale_claim_writes_cannot_affect_a_new_winner
-          --skip channel_moderation_store::tests::action_only_reuse_is_mismatch_in_flight_and_done
-          --skip channel_moderation_store::tests::audit_rows_are_written_once
+          --skip channel_moderation_store::
+          --skip defer_precedes_sql_and_effect_then_edits_original_with_no_mentions
+          --skip rejected_or_ambiguous_defer_never_claims_or_mutates
+          --skip failed_result_edit_never_repeats_a_completed_effect
+          --skip persistence_failure_edits_safe_reconciliation_reply_and_keeps_lane
+          --skip disabled_command_uses_ephemeral_lifecycle_and_other_slices_are_untouched
+          --skip shared_router_gates_bounds_and_required_reason_refuse_without_http
+          --skip purge_and_slowmode_success_audit_and_replay_without_repeating_effects
+          --skip repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks
+          --skip initially_absent_overwrite_is_deleted_only_after_recorded_lockdown
+          --skip ambiguous_unlock_retains_recovery_and_both_claims_across_all_keys
+          --skip rejected_first_lock_retires_only_its_seed_and_finishes_refusal
+          --skip audit_failure_retries_only_finalization_not_a_successful_discord_effect
+          --skip first_seed_and_durable_lane_exist_before_lock_put_is_accepted
+          --skip exhausted_audit_failure_retains_lane_and_cannot_redo_successful_effect
+          --skip stale_tickets_and_action_only_mismatch_never_admit_runtime_effects
           --skip feed_crud_audit_scope_and_timestamp_roundtrip
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
@@ -121,6 +131,14 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-core --all-features --lib --locked channel_moderation_store::
+          -- --include-ignored --test-threads=1
+      - name: Channel moderation runtime acceptance with its guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS cargo test -p two-bot-discord
+          --all-features --test channel_moderation_runtime --locked
           -- --include-ignored --test-threads=1
       - name: Feed store ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}

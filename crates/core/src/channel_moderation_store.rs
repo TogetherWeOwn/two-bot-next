@@ -290,7 +290,7 @@ impl ChannelModerationStore {
         .bind(channel_id)
         .bind(&ticket.guild_id)
         .bind(&ticket.idempotency_key)
-        .bind(&ticket.claim_token)
+        .bind(ticket.claim_token.expose())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -331,7 +331,7 @@ impl ChannelModerationStore {
         .bind(&row.created_at)
         .bind(&ticket.guild_id)
         .bind(&ticket.idempotency_key)
-        .bind(&ticket.claim_token)
+        .bind(ticket.claim_token.expose())
         .bind(&row.action)
         .execute(&mut *tx)
         .await?;
@@ -377,7 +377,7 @@ impl ChannelModerationStore {
         )
         .bind(&ticket.guild_id)
         .bind(&ticket.idempotency_key)
-        .bind(&ticket.claim_token)
+        .bind(ticket.claim_token.expose())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
