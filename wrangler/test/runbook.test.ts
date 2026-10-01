@@ -168,9 +168,18 @@ test("Wrangler runbook examples exist in npm scripts and pinned CLI help", () =>
   }
 });
 
+test("ownership runbook examples use only the covered staging control client", () => {
+  const commands = shellCommands(runbook).filter((line) => line.startsWith("node "));
+  assert.ok(commands.length >= 3, "must cover status, takeover and fence");
+  for (const line of commands) {
+    assert.match(line, /^node wrangler\/scripts\/ownership-control\.mjs (?:status|(?:takeover|fence) "\$\{CURRENT_OWNER_EPOCH\}")$/);
+  }
+  assert.ok(read("wrangler/scripts/ownership-control.mjs").includes("export async function control("));
+});
+
 test("shell fences contain only covered tools and one-line examples", () => {
   for (const line of shellCommands(runbook)) {
-    assert.match(line, /^(?:npm |curl |env -u TWO_RESTORE_URL two-bot |(?:TWO_DATABASE_URL=\S+ |TWO_RESTORE_URL=\S+ )?two-bot(?: |$))/);
+    assert.match(line, /^(?:npm |curl |node wrangler\/scripts\/ownership-control\.mjs |env -u TWO_RESTORE_URL two-bot |(?:TWO_DATABASE_URL=\S+ |TWO_RESTORE_URL=\S+ )?two-bot(?: |$))/);
     assert.doesNotMatch(line, /[|;]|&&|\\$/);
   }
 });

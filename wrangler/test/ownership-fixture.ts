@@ -11,6 +11,12 @@ export class OwnershipFixture extends DurableObject {
       try {
         const storage = input.readError ? {
           get: () => { throw new Error("synthetic read failure"); },
+        } as unknown as DurableObjectStorage : input.releaseWriteError ? {
+          get: this.ctx.storage.get.bind(this.ctx.storage),
+          put: async (entries: Record<string, { phase?: string }>) => {
+            if (entries[OWNER_KEY]?.phase === "active") throw new Error("synthetic release write failure");
+            await this.ctx.storage.put(entries);
+          },
         } as unknown as DurableObjectStorage : this.ctx.storage;
         const fence = new OwnershipFence(storage);
         switch (url.pathname) {

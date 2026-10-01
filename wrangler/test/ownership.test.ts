@@ -93,6 +93,24 @@ test("real DO storage: failed teardown persists denial across Worker/DO reload",
   assert.equal((await call("/change", { id: "B", epoch: 2 })).status, 200);
 });
 
+test("real DO storage: failed active write leaves a durable fence and stopped process", async (t) => {
+  const { mf, call } = await fixture(t);
+  await call("/change", { id: "A", epoch: 0 });
+  await call("/probe", { id: "A" });
+  const result = await call("/change", { id: "B", epoch: 1, releaseWriteError: true });
+  assert.equal(result.body.reason, "storage_unavailable");
+  await mf.setOptions(options("\n// failed release reload"));
+  const state = (await call("/state")).body;
+  assert.equal(state.owner.phase, "fenced");
+  assert.equal(state.owner.epoch, 2);
+  assert.equal(state.running, null);
+  assert.ok(state.audit[`${AUDIT_PREFIX}2:fenced`]);
+  assert.equal(state.audit[`${AUDIT_PREFIX}2:active`], undefined);
+  assert.equal((await call("/probe", { id: "A" })).status, 503);
+  assert.equal((await call("/probe", { id: "B" })).status, 503);
+  assert.deepEqual((await call("/state")).body.starts, ["A"]);
+});
+
 test("real DO storage: parking owner fences both deployments and survives reload", async (t) => {
   const { mf, call } = await fixture(t);
   await call("/change", { id: "A", epoch: 0 });

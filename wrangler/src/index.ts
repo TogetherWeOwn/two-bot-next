@@ -21,6 +21,9 @@
  */
 
 import { Container } from "@cloudflare/containers";
+// SDK 0.3.7 reattaches outbound callbacks even for an already-running process.
+// https://developers.cloudflare.com/containers/container-package/
+export { ContainerProxy } from "@cloudflare/containers";
 import {
   OwnershipFence, OwnershipRefused, CONTROL_PATH, DEPLOYMENT_HEADER,
   authenticated, deploymentId, readChange, refused,
@@ -262,10 +265,18 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override async onStart(): Promise<void> {
-    await this.owned(async () => {
-      console.log("two-bot container started");
-      await this.armKeepalive();
-    });
+    try {
+      await this.owned(async () => {
+        console.log("two-bot container started");
+        await this.armKeepalive();
+      });
+    } catch (error) {
+      // A read/write failure after native startup cannot leave an unconfirmed
+      // gateway running just because the HTTP request will fail closed.
+      try { await this.destroyInactive(); }
+      catch { this.recoveryFailed = true; }
+      throw error;
+    }
   }
 
   override onStop(): void {
