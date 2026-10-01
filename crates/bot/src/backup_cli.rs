@@ -441,11 +441,13 @@ async fn cmd_restore(args: &[String]) -> i32 {
                 );
             }
             if report.missing_member_ban_ownership {
-                eprintln!("restore: old v3 dump has no member-ban ownership; destination ownership cleared, acceptance not inferred");
+                eprintln!(
+                    "restore: old v3 dump has no member-ban ownership; acceptance not inferred"
+                );
             }
             if report.quarantined_unbans > 0 {
                 eprintln!(
-                    "restore: {} orphan expiries quarantined; moderation must remain off until authoritative reconciliation",
+                    "restore: {} imported expiries quarantined (including accepted snapshots); moderation must remain off until authoritative reconciliation",
                     report.quarantined_unbans
                 );
             }
@@ -485,13 +487,15 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
 
     println!("restore: --dry-run of {file}");
     println!("restore: dump taken {}", contents.manifest.created_at);
+    eprintln!("restore: apply refuses a destination with moderation history; preserve it and use a fresh migrated target");
+    eprintln!("restore: apply quarantines all executable imported expiries, even accepted snapshots; keep moderation off pending authoritative reconciliation of both histories");
     if !contents
         .manifest
         .tables
         .iter()
         .any(|table| table.name == "moderation_member_bans")
     {
-        eprintln!("restore: old v3 has no member-ban ownership; apply will clear target ownership and quarantine orphan expiries; keep moderation off pending reconciliation");
+        eprintln!("restore: old v3 has no member-ban ownership; apply does not infer acceptance; keep moderation off pending reconciliation");
     }
     println!(
         "restore: migrations in dump: {}",

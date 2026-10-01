@@ -46,20 +46,34 @@ All 23 bot-owned tables are dumped (see `DUMP_TABLES` in
 `crates/core/src/backup/dump_file.rs`); the website's tables are not ours.
 This includes `moderation_member_bans`: acceptance, insertion-order generation
 and prepared/rejected fences are read in the same repeatable-read snapshot as
-scheduled unbans and idempotency. Restore replaces destination ownership rather
-than merging it, then resets its generation sequence after the restored MAX
-(empty ownership restarts at 1). Stop the target consumer before a restore;
-a restored running claim remains uncertain, never automatically retried.
+scheduled unbans and idempotency. **Restore refuses any destination with member
+ban, scheduled-unban, audit, idempotency or warning history**, before truncation.
+It locks all replaced tables before checking so concurrent writes cannot slip
+through. Preserve the existing database; use a fresh migrated target, not a
+manual deletion of evidence to satisfy this precondition. This deliberately
+avoids guessing how to merge incompatible ownership generations or forgetting
+post-backup PUT/DELETE evidence. Other bot-owned tables are still replaced.
+Generation resumes after the restored MAX (empty ownership restarts at 1).
+
+Every imported staged, pending or running expiry is **quarantined**, including
+one with matching accepted ownership. A snapshot's accepted tempban cannot
+prove current Discord ownership: a newer permanent ban may have superseded it
+after the backup. The file keeps the original states; restored acceptance,
+generations, reasons and timestamps remain historical evidence, not remote
+reconciliation. Ordinary activation/recovery never re-enables quarantined rows.
+Imported running DELETEs keep their independent uncertainty fence, original
+claim token and timestamps. Resolving one DELETE does not authorize an expiry.
 
 The frozen 22-table v3 envelope remains readable without the additive ownership
-table. Restoring it **clears all destination ownership** and quarantines staged,
-pending or running expiries lacking matching ownership; it never invents
-acceptance or order from timestamps/request IDs. Imported running DELETEs keep
-their independent uncertainty fence, original claim token and timestamps through
-quarantine. The CLI warns on absent ownership and reports the quarantine count;
-row-count verification is data fidelity, **not** moderation-enable approval.
-Keep `TWO_MODERATION` off until authoritative reconciliation records the actual
-Discord outcomes. Every other v3 table remains mandatory.
+table. A fresh-target restore does not invent acceptance or order from
+request IDs or timestamps. The CLI warns in both dry-run and apply and reports
+the quarantine count; row-count verification is data fidelity, **not**
+moderation-enable approval. Stop consumers and keep `TWO_MODERATION` off until
+an authorized reconciliation considers the original snapshot **and preserved
+destination history**, proves the actual remote outcomes/order, and records
+expiry dispositions before any activation. Consumer shutdown alone is not
+remote reconciliation. No automatic release or destructive in-place override
+is provided by this slice. Every other v3 table remains mandatory.
 
 ## Nightly DB backup — daily 04:17
 

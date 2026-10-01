@@ -251,25 +251,48 @@ pub struct RestoreReport {
     pub manifest: DumpManifest,
     pub restored: BTreeMap<String, u64>,
     pub dropped_columns: BTreeMap<String, Vec<String>>,
-    /// Old v3 has no acceptance/generation evidence. Never reuse target rows.
+    /// Old v3 has no acceptance/generation evidence. Never infer acceptance.
     pub missing_member_ban_ownership: bool,
-    /// Orphan expiry rows retained but made non-executable for reconciliation.
+    /// All executable expiry rows made non-executable for reconciliation.
     pub quarantined_unbans: u64,
     pub ok: bool,
 }
 
 /// Replace the contents of the bot-owned tables with a dump.
 ///
-/// Destructive by design: the tables are truncated first, so a restore
-/// produces the database as it was, not a merge. It runs in one transaction,
-/// so a failure part way through leaves the target exactly as it was rather
-/// than half-wiped — the state you least want to discover during a recovery.
+/// Requires a target without moderation history: overwriting destination
+/// evidence could forget a post-backup PUT/DELETE or newer permanent ban.
+/// Other bot-owned tables are replaced, not merged. One transaction protects
+/// refusal/rollback, and every imported executable expiry is quarantined:
+/// snapshot acceptance is historical evidence, not current Discord ownership.
 pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbDumpError> {
     let contents: DumpContents = inspect(in_path)?;
     let manifest = contents.manifest;
     let mut dropped_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     let mut tx = pool.begin().await?;
+    // Hold the same locks TRUNCATE requires before checking the destination.
+    // No concurrent writer may add evidence between the refusal and replacement.
+    sqlx::query(audited(format!(
+        "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+        DUMP_TABLES.join(", ")
+    )))
+    .execute(&mut *tx)
+    .await?;
+    let has_history: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM moderation_member_bans)
+             OR EXISTS (SELECT 1 FROM moderation_scheduled_unbans)
+             OR EXISTS (SELECT 1 FROM moderation_audit)
+             OR EXISTS (SELECT 1 FROM moderation_idempotency)
+             OR EXISTS (SELECT 1 FROM moderation_warnings)",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_history {
+        return Err(DbDumpError::Refused(
+            "destination moderation history exists; restore into a fresh migrated target, preserve the destination and reconcile both histories before enabling moderation".into(),
+        ));
+    }
     // RESTART IDENTITY so the sequence does not carry over from whatever was
     // in the target before; it is set explicitly below.
     sqlx::query(audited(format!(
@@ -373,9 +396,10 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         }
     }
 
-    // As in migration 0111: unknown acceptance/order cannot be reconstructed
-    // from request IDs or timestamps. Retain orphan expiries for reconciliation,
-    // including the independent fence of any imported running DELETE.
+    // Even a matching accepted snapshot intent cannot prove current remote
+    // ownership: a permanent ban may have superseded it after the backup.
+    // Quarantine ALL executable imports; preserve states in the original file,
+    // ownership evidence, and the independent fence of imported running DELETEs.
     sqlx::query(
         "UPDATE moderation_scheduled_unbans SET dispatch_uncertain = TRUE
          WHERE state = 'running'
@@ -385,12 +409,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     .await?;
     let quarantined_unbans = sqlx::query(
         "UPDATE moderation_scheduled_unbans AS job SET state = 'quarantined'
-         WHERE job.state IN ('staged', 'pending', 'running')
-           AND NOT EXISTS (
-             SELECT 1 FROM moderation_member_bans AS intent
-             WHERE intent.request_id = job.request_id AND intent.guild_id = job.guild_id
-               AND intent.user_id = job.user_id
-           )",
+         WHERE job.state IN ('staged', 'pending', 'running')",
     )
     .execute(&mut *tx)
     .await?

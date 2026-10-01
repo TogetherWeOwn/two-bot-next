@@ -1754,6 +1754,102 @@ async fn postgres_legacy_text_timestamps_upgrade_without_reactivating_imports() 
 
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_staging_pool_timeout_is_mutation_free_in_both_paths() {
+    let (admin, pool, schema) = database().await;
+    let store = PgMemberModerationStore::new(pool.clone(), "guild");
+    for temporary in [false, true] {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(pool.acquire().await.unwrap());
+        }
+        let error = if temporary {
+            store
+                .stage_unban("guild", "member", DUE, "expiry", "pool-loss", NOW)
+                .await
+        } else {
+            store.stage_ban("guild", "member", "pool-loss", NOW).await
+        }
+        .expect_err("pool is deliberately exhausted before staging begins");
+        assert!(error.is_safe_pre_mutation());
+        assert!(error.message.contains("pool_timeout"));
+        drop(held);
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM moderation_member_bans) +
+                    (SELECT COUNT(*) FROM moderation_scheduled_unbans)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "acquisition failure leaves no intent or expiry");
+    }
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_read_only_staging_timeout_releases_service_key_and_retries() {
+    for action in [ModerationAction::Ban, ModerationAction::TempBan] {
+        let (admin, pool, schema) = database().await;
+        // Set the same timeout on every connection in this isolated pool.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let mut connection = pool.acquire().await.unwrap();
+            sqlx::query("SET statement_timeout = '250ms'")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            held.push(connection);
+        }
+        drop(held);
+        let mut locker = admin.begin().await.unwrap();
+        QueryBuilder::<Postgres>::new("LOCK TABLE ")
+            .push(&schema)
+            .push(".moderation_member_bans IN ACCESS EXCLUSIVE MODE")
+            .build()
+            .execute(&mut *locker)
+            .await
+            .unwrap();
+        let store = PgMemberModerationStore::new(pool.clone(), "100000000000000001");
+        let discord = MockMemberDiscord::new();
+        let svc =
+            MemberModerationService::new(discord.clone(), store, policy(), || 1_700_000_000_000);
+        let request = execution(action, "query-timeout");
+        let error = svc
+            .execute(&request)
+            .await
+            .expect_err("read-only uncertainty query times out");
+        assert!(
+            matches!(error, two_bot_core::member_moderation::MemberError::Store(ref e)
+            if e.is_safe_pre_mutation() && e.message.contains("57014"))
+        );
+        assert_eq!(discord.call_count("ban"), 0);
+        locker.rollback().await.unwrap();
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM moderation_member_bans) +
+                    (SELECT COUNT(*) FROM moderation_scheduled_unbans) +
+                    (SELECT COUNT(*) FROM moderation_idempotency)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 0,
+            "no-write error releases only the newly claimed key"
+        );
+        let result = svc
+            .execute(&request)
+            .await
+            .expect("same-key retry after transient read failure");
+        assert!(!result.replayed);
+        assert_eq!(discord.call_count("ban"), 1);
+        assert!(svc.execute(&request).await.unwrap().replayed);
+        assert_eq!(discord.call_count("ban"), 1);
+        cleanup(admin, pool, schema).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
 async fn postgres_pre_dispatch_rollback_retries_and_completion_loss_keeps_audit() {
     let (admin, pool, schema) = database().await;
     let store = PgMemberModerationStore::new(pool.clone(), "100000000000000001");

@@ -104,6 +104,8 @@ async fn moderation_snapshot(pool: &PgPool) -> Vec<String> {
         "moderation_member_bans",
         "moderation_scheduled_unbans",
         "moderation_idempotency",
+        "moderation_audit",
+        "moderation_warnings",
     ] {
         let values: Vec<String> =
             QueryBuilder::<Postgres>::new("SELECT row_to_json(t)::text FROM ")
@@ -120,7 +122,7 @@ async fn moderation_snapshot(pool: &PgPool) -> Vec<String> {
 
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or CI Postgres service"]
-async fn ownership_round_trip_replaces_stale_rows_and_resets_generation() {
+async fn ownership_round_trip_quarantines_expiries_and_preserves_destination_history() {
     let (admin, source, schema) = backup_database().await;
     seed(&source).await;
     let snapshot = moderation_snapshot(&source).await;
@@ -140,8 +142,8 @@ async fn ownership_round_trip_replaces_stale_rows_and_resets_generation() {
         let (target_admin, target, target_schema) = backup_database().await;
         let store = PgMemberModerationStore::new(target.clone(), "guild");
         if stale_destination {
-            // Stale accepted ownership on the SAME member must be replaced,
-            // not left to suppress the restored expiry.
+            // An older snapshot must not discard a newer permanent ban or
+            // revive its superseded expiry. Refusal preserves the destination.
             sqlx::query("SELECT setval(pg_get_serial_sequence('moderation_member_bans', 'generation'), 50000, false)")
                 .execute(&target).await.unwrap();
             let attempt = store
@@ -153,10 +155,38 @@ async fn ownership_round_trip_replaces_stale_rows_and_resets_generation() {
                 .await
                 .unwrap();
         }
+        if stale_destination {
+            let destination = moderation_snapshot(&target).await;
+            let err = dump::restore(&target, &path).await.unwrap_err();
+            assert!(err.to_string().contains("destination moderation history"));
+            assert_eq!(moderation_snapshot(&target).await, destination);
+            assert!(store
+                .claim_due_unbans("guild", DUE, 25)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(ban_state(&target, "post-backup").await, "accepted");
+            cleanup(target_admin, target, target_schema).await;
+            continue;
+        }
         let report = dump::restore(&target, &path).await.unwrap();
         assert!(report.ok);
         assert_eq!(report.restored["moderation_member_bans"], 4);
-        assert_eq!(moderation_snapshot(&target).await, snapshot);
+        assert_eq!(report.quarantined_unbans, 1);
+        let quarantined_snapshot: Vec<_> = snapshot
+            .iter()
+            .map(|row| row.replace("\"state\":\"pending\"", "\"state\":\"quarantined\""))
+            .collect();
+        assert_eq!(moderation_snapshot(&target).await, quarantined_snapshot);
+        // The file retains the original accepted/pending evidence; applying it
+        // changes only executability, never acceptance or insertion order.
+        let contents = dump_file::inspect(&path).unwrap();
+        assert_eq!(
+            contents.buffers["moderation_scheduled_unbans"][0]["state"],
+            "pending"
+        );
+        assert_eq!(ban_state(&target, "temp").await, "accepted");
+        assert_eq!(unban_state(&target, "temp").await, "quarantined");
         assert_eq!(ban_state(&target, "prepared").await, "prepared");
         assert_eq!(ban_state(&target, "reject").await, "rejected");
         assert_eq!(
@@ -169,8 +199,19 @@ async fn ownership_round_trip_replaces_stale_rows_and_resets_generation() {
             }
         );
         let due = store.claim_due_unbans("guild", DUE, 25).await.unwrap();
-        assert_eq!(due.len(), 1, "restored accepted expiry remains executable");
-        assert_eq!(due[0].request_id, "temp");
+        assert!(
+            due.is_empty(),
+            "snapshot acceptance is not current remote ownership"
+        );
+        assert!(store
+            .activate_staged_unban("guild", "temporary", "temp", NOW)
+            .await
+            .is_err());
+        assert!(store
+            .claim_due_unbans("guild", DUE, 25)
+            .await
+            .unwrap()
+            .is_empty());
         store
             .stage_ban("guild", "fresh", "next", NOW)
             .await
@@ -179,6 +220,111 @@ async fn ownership_round_trip_replaces_stale_rows_and_resets_generation() {
             generation(&target, "next").await,
             9004,
             "sequence resumes after restored MAX, not after stale destination"
+        );
+        cleanup(target_admin, target, target_schema).await;
+    }
+    cleanup(admin, source, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn old_snapshot_cannot_revive_expiry_over_post_backup_permanent_ban() {
+    let (admin, pool, schema) = backup_database().await;
+    seed(&pool).await;
+    let path = archive_path();
+    dump::dump(&pool, &path).await.unwrap();
+    let store = PgMemberModerationStore::new(pool.clone(), "guild");
+    let attempt = store
+        .stage_ban("guild", "temporary", "new-permanent", DUE)
+        .await
+        .unwrap();
+    store
+        .confirm_ban_attempt("guild", "temporary", "new-permanent", attempt, DUE)
+        .await
+        .unwrap();
+    assert_eq!(unban_state(&pool, "temp").await, "superseded");
+    let before = moderation_snapshot(&pool).await;
+    let err = dump::restore(&pool, &path).await.unwrap_err();
+    assert!(err.to_string().contains("destination moderation history"));
+    assert_eq!(moderation_snapshot(&pool).await, before);
+    assert!(store
+        .claim_due_unbans("guild", DUE, 25)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(ban_state(&pool, "new-permanent").await, "accepted");
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn restore_refuses_each_destination_evidence_kind_without_writes() {
+    let (admin, source, schema) = backup_database().await;
+    seed(&source).await;
+    let path = archive_path();
+    dump::dump(&source, &path).await.unwrap();
+    for kind in [
+        "prepared",
+        "running",
+        "orphan",
+        "audit",
+        "idempotency",
+        "warning",
+    ] {
+        let (target_admin, target, target_schema) = backup_database().await;
+        let store = PgMemberModerationStore::new(target.clone(), "guild");
+        match kind {
+            "prepared" => {
+                store
+                    .stage_ban("guild", "member", "uncertain-put", NOW)
+                    .await
+                    .unwrap();
+            }
+            "running" => {
+                accepted_unban(&store, "guild", "member", "uncertain-delete", DUE, NOW).await;
+                assert_eq!(
+                    store
+                        .claim_due_unbans("guild", DUE, 25)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+            "orphan" => {
+                sqlx::query("INSERT INTO moderation_scheduled_unbans (request_id, guild_id, user_id, execute_at, reason, state, created_at, dispatch_uncertain) VALUES ('orphan', 'guild', 'member', $1::text::timestamptz, 'expiry', 'quarantined', $1::text::timestamptz, TRUE)")
+                    .bind(NOW).execute(&target).await.unwrap();
+            }
+            "audit" => {
+                sqlx::query("INSERT INTO moderation_audit (request_id, guild_id, actor_id, action, reason, outcome, idempotency_key, metadata_json, created_at) VALUES ('evidence', 'guild', 'actor', 'moderation.ban', 'reason', 'banned', 'key', '{}', $1::text::timestamptz)")
+                    .bind(NOW).execute(&target).await.unwrap();
+            }
+            "idempotency" => {
+                store
+                    .claim("guild", "key", "moderation.ban", "hash", NOW)
+                    .await
+                    .unwrap();
+            }
+            "warning" => {
+                sqlx::query("INSERT INTO moderation_warnings (id, guild_id, user_id, actor_id, reason, request_id, created_at) VALUES ('warning', 'guild', 'member', 'actor', 'reason', 'warn', $1::text::timestamptz)")
+                    .bind(NOW).execute(&target).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = moderation_snapshot(&target).await;
+        let err = dump::restore(&target, &path).await.unwrap_err();
+        assert!(
+            err.to_string().contains("destination moderation history"),
+            "{kind}: {err}"
+        );
+        assert_eq!(moderation_snapshot(&target).await, before, "{kind}");
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&target)
+            .await
+            .unwrap();
+        assert_eq!(
+            events, 0,
+            "refusal precedes replacement of unrelated tables"
         );
         cleanup(target_admin, target, target_schema).await;
     }
@@ -254,23 +400,26 @@ async fn old_v3_restore_quarantines_without_inventing_acceptance() {
     let legacy = archive_path();
     legacy_without_ownership(&modern, &legacy);
     dump_file::inspect(&legacy).expect("the old 22-table v3 envelope remains readable");
-    // In-place restore must clear even coincident matching ownership.
-    let report = dump::restore(&source, &legacy).await.unwrap();
+    // In-place restore is refused: absence of ownership in the file must not
+    // delete target PUT/DELETE evidence. A fresh target may import it safely.
+    let destination = moderation_snapshot(&source).await;
+    assert!(dump::restore(&source, &legacy).await.is_err());
+    assert_eq!(moderation_snapshot(&source).await, destination);
+    let (target_admin, target, target_schema) = backup_database().await;
+    let store = PgMemberModerationStore::new(target.clone(), "guild");
+    let report = dump::restore(&target, &legacy).await.unwrap();
     assert!(report.ok);
     assert!(report.missing_member_ban_ownership);
     assert_eq!(report.quarantined_unbans, 2);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM moderation_member_bans")
-        .fetch_one(&source)
+        .fetch_one(&target)
         .await
         .unwrap();
-    assert_eq!(
-        count, 0,
-        "never synthesize or retain acceptance absent from backup"
-    );
-    assert_eq!(unban_state(&source, "temp").await, "quarantined");
-    assert_eq!(unban_state(&source, "running").await, "quarantined");
+    assert_eq!(count, 0, "never synthesize acceptance absent from backup");
+    assert_eq!(unban_state(&target, "temp").await, "quarantined");
+    assert_eq!(unban_state(&target, "running").await, "quarantined");
     let fence: (bool, String) = sqlx::query_as("SELECT dispatch_uncertain, claim_token FROM moderation_scheduled_unbans WHERE request_id = 'running'")
-        .fetch_one(&source).await.unwrap();
+        .fetch_one(&target).await.unwrap();
     assert_eq!(fence, (true, original_token));
     assert!(store
         .claim_due_unbans("guild", DUE, 25)
@@ -289,10 +438,11 @@ async fn old_v3_restore_quarantines_without_inventing_acceptance() {
         .await
         .unwrap();
     assert_eq!(
-        generation(&source, "next").await,
+        generation(&target, "next").await,
         1,
         "empty restored ownership sequence restarts"
     );
+    cleanup(target_admin, target, target_schema).await;
     cleanup(admin, source, schema).await;
 }
 

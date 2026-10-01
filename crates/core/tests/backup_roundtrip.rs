@@ -304,9 +304,22 @@ async fn dump_inspect_restore_round_trip() {
         "no dropped columns on identical schema"
     );
 
-    // Contents identical.
-    let after = snapshot_all(&pool).await;
-    assert_eq!(before, after, "restored contents equal the dumped contents");
+    // Every cell remains faithful except executable moderation state, which
+    // must be quarantined even with matching snapshot acceptance evidence.
+    assert_eq!(report.quarantined_unbans, 1);
+    let restored_state: String =
+        sqlx::query_scalar("SELECT state FROM moderation_scheduled_unbans WHERE request_id = 'r1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(restored_state, "quarantined");
+    let mut after = snapshot_all(&pool).await;
+    let schedules = after
+        .iter_mut()
+        .find(|(table, _)| table == "moderation_scheduled_unbans")
+        .unwrap();
+    schedules.1[0] = schedules.1[0].replace("|quarantined|", "|pending|");
+    assert_eq!(before, after, "all other cells retain dump fidelity");
 
     // The events id sequence is past the restored high-water mark: the next
     // write must not collide with a row we just put back.
@@ -413,6 +426,9 @@ async fn dump_inspect_restore_round_trip() {
 
     // The actual frozen writer fixture uses the legacy events/risk-flag columns.
     // Other tables stay present but empty, as declared in this minimal fixture.
+    // This independent fixture starts with a fresh test target, not an
+    // in-place overwrite of the moderation evidence from the previous drill.
+    build_schema(&pool).await;
     sqlx::query("DROP TABLE events")
         .execute(&pool)
         .await
