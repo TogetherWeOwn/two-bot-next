@@ -76,11 +76,13 @@ pub enum StickyError {
     BadDebounce,
 }
 
-/// Validate a sticky body: 1–2000 UTF-16 units (legacy `requireBody`, no trim
-/// — whitespace-only bodies pass, matching legacy).
+/// Validate a sticky body: 1–2000 UTF-16 units, with sendable text after
+/// rendering. Never save an invisible-only body that cannot be re-posted.
 pub fn validate_body(body: &str) -> Result<(), StickyError> {
-    let len = body.encode_utf16().count();
-    if !(1..=MAX_BODY_CHARS).contains(&len) {
+    let len = crate::message_safety::text_len(body);
+    if !(1..=MAX_BODY_CHARS).contains(&len)
+        || !crate::message_safety::has_message_text(&crate::message_safety::content(body))
+    {
         return Err(StickyError::BodyLength);
     }
     Ok(())
@@ -652,6 +654,28 @@ mod tests {
         assert!(validate_body(&format!("{}😀", "é".repeat(1998))).is_ok());
         assert_eq!(
             validate_body(&format!("{}😀", "é".repeat(1999))),
+            Err(StickyError::BodyLength)
+        );
+    }
+
+    #[test]
+    fn sticky_setup_rejects_invisible_only_effective_bodies() {
+        for body in [
+            "\u{200b}",
+            "\u{200c}",
+            "\u{200d}",
+            "\u{feff}",
+            " \u{200b}\u{200c}\u{feff}\n",
+        ] {
+            assert_eq!(validate_body(body), Err(StickyError::BodyLength));
+            let rendered = crate::message_safety::render_template("{body}", &[("body", body)]);
+            assert_eq!(validate_body(&rendered), Err(StickyError::BodyLength));
+        }
+        assert!(validate_body("می\u{200c}روم").is_ok());
+        assert!(validate_body("@eve\u{200c}ryone").is_ok());
+        // Truncation can remove the only visible character even if raw input has one.
+        assert_eq!(
+            validate_body(&("\u{200b}".repeat(1999) + "😀")),
             Err(StickyError::BodyLength)
         );
     }

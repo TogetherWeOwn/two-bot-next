@@ -4,9 +4,9 @@
 //! 0001 (funnel) + 0300 (contract tables), then the store writes, then the
 //! `web_v1` views return legacy-shaped rows.
 //!
-//! Requires `TWO_TEST_DATABASE_URL` pointing at an isolated scratch database
-//! (sibling convention: `two_bot_test_tog10090`). The harness database is
-//! reset per run (full schema drop), so parallel slices cannot collide.
+//! Requires `TWO_TEST_DATABASE_URL` naming a disposable test bootstrap.
+//! Each test gets a unique database with the complete migrations, so parallel
+//! tests and invocations cannot collide or reset the bootstrap.
 //!
 //!mirrors the legacy acceptance in `test/unit.communitysnapshots.test.ts` and
 //! `test/unit.scheduledevents.test.ts`:
@@ -23,9 +23,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Pool, Postgres};
-use std::str::FromStr;
 use two_bot_core::{
     apply_web_contract, build_community_snapshot, build_counter_reading, match_rank_roles,
     normalize_events, read_raid_windows, replace_events, write_counter, write_rank_snapshot,
@@ -33,84 +31,32 @@ use two_bot_core::{
     RosterMember, ScheduledEvent, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
     RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS, WEB_CONTRACT_VIEWS,
 };
+use two_bot_testsupport::{guard_database_url, TestDatabase};
 
 const GUILD: &str = "326474832151838730";
 const OBSERVED_AT: &str = "2026-08-25T20:00:00.000Z";
 
-fn test_db_url() -> String {
-    std::env::var("TWO_TEST_DATABASE_URL").expect(
-        "TWO_TEST_DATABASE_URL is required (isolated scratch db, e.g. two_bot_test_tog10090)",
-    )
-}
-
-/// Serializes the DB tests: every test resets the shared scratch schema, so
-/// parallel resets race DDL ("tuple concurrently updated"). Each test holds
-/// this across reset + body.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-fn test_db_options(url: &str) -> Result<PgConnectOptions, &'static str> {
-    // An explicit empty password prevents sqlx from falling back to PG env or
-    // pgpass credentials. Reject query/fragment overrides rather than letting
-    // hostaddr, socket or options redirect the destructive reset.
-    if url.contains(['?', '#']) {
-        return Err("test URL must not have query parameters or a fragment");
-    }
-    let url = if let Some(rest) = url.strip_prefix("postgres://agent_test@") {
-        format!("postgres://agent_test:@{rest}")
-    } else if let Some(rest) = url.strip_prefix("postgresql://agent_test@") {
-        format!("postgresql://agent_test:@{rest}")
-    } else if url.starts_with("postgres://agent_test:@")
-        || url.starts_with("postgresql://agent_test:@")
-    {
-        url.to_owned()
-    } else {
-        return Err("test URL must explicitly use agent_test with an empty password");
-    };
-    // Inspect parsed fields, never substrings in credentials or URL parameters.
-    // https://docs.rs/sqlx/0.9.0/sqlx/postgres/struct.PgConnectOptions.html
-    let options = PgConnectOptions::from_str(&url).map_err(|_| "invalid test URL")?;
-    if options.get_host() != "agent-testdb"
-        || options.get_port() != 5432
-        || options.get_socket().is_some()
-        || options.get_username() != "agent_test"
-        || options.get_options().is_some()
-    {
-        return Err("test target must be agent-testdb:5432 without socket/startup overrides");
-    }
-    let database = options.get_database().ok_or("scratch database required")?;
-    let prefix = "two_bot_test_tog10090";
-    let allowed_name = database == prefix
-        || database
-            .strip_prefix(prefix)
-            .and_then(|s| s.strip_prefix('_'))
-            .is_some_and(|suffix| !suffix.is_empty());
-    if !allowed_name
-        || database.len() > 63
-        || !database
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-    {
-        return Err("database must be the isolated two_bot_test_tog10090 scratch target");
-    }
-    Ok(options)
-}
-
-async fn connect() -> Pool<Postgres> {
-    let options = test_db_options(&test_db_url()).expect("refusing non-test reset target");
-    PgPoolOptions::new()
-        .max_connections(5)
-        .connect_with(options)
+async fn connect() -> TestDatabase {
+    let url = std::env::var("TWO_TEST_DATABASE_URL")
+        .expect("TWO_TEST_DATABASE_URL is required (disposable test bootstrap)");
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
         .await
-        .expect("connect to agent-testdb scratch")
+        .expect("create migrated test database");
+    apply_web_contract(fixture.pool())
+        .await
+        .expect("apply web_v1 views");
+    fixture
 }
 
 #[test]
 fn reset_guard_allows_only_parsed_test_container_and_scratch_database() {
+    // The shared guard also refuses PG* overrides; these pure URL cases assume
+    // the same clean environment required by the database fixtures.
     for url in [
         "postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090",
-        "postgresql://agent_test@agent-testdb:5432/two_bot_test_tog10090_guard",
+        "postgresql://agent_test:@agent-testdb:5432/two_bot_test_tog10090_guard",
     ] {
-        assert!(test_db_options(url).is_ok());
+        assert!(guard_database_url(url).is_ok());
     }
     // Pure guard tests: none of these targets are ever contacted.
     for url in [
@@ -130,27 +76,14 @@ fn reset_guard_allows_only_parsed_test_container_and_scratch_database() {
         "postgres://agent_test:@production/real_data?application_name=test",
         "postgres://agent_test:@%2Fvar%2Frun%2Fpostgresql/two_bot_test_tog10090",
         "postgres://agent_test:unexpected@agent-testdb/two_bot_test_tog10090",
+        "postgresql://agent_test@agent-testdb:5432/two_bot_test_tog10090_guard",
         "postgres://agent_test:@agent-testdb/two_bot_test_tog10090#test",
         "postgres://agent_test:@agent-testdb/",
         "postgres://agent-testdb/two_bot_test_tog10090",
         "not a URL",
     ] {
-        assert!(test_db_options(url).is_err(), "unsafe target accepted");
+        assert!(guard_database_url(url).is_err(), "unsafe target accepted");
     }
-}
-
-/// Reset the harness schema and apply 0001 + 0300 + web_v1.
-async fn reset(pool: &Pool<Postgres>) {
-    // Drop everything this slice owns, then rebuild from the migrations.
-    // `web_v1._ts/_iso/_json` helpers are functions, dropped with CASCADE.
-    sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-        .execute(pool)
-        .await
-        .expect("reset schema");
-    // Path is relative to the core crate root (CARGO_MANIFEST_DIR).
-    let migrator = sqlx::migrate!("../cutover/migrations");
-    migrator.run(pool).await.expect("apply migrations");
-    apply_web_contract(pool).await.expect("apply web_v1 views");
 }
 
 fn role_ids() -> std::collections::HashMap<RankKey, String> {
@@ -252,9 +185,8 @@ async fn intervals_are_the_contract_values() {
 
 #[tokio::test]
 async fn migrations_seed_ladder_version_and_views() {
-    let _serial = SERIAL.lock().await;
-    let pool = connect().await;
-    reset(&pool).await;
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
 
     let ladder_rows: Vec<(String, String, i32)> = sqlx::query_as(
         "SELECT rank_key, rank_label, rank_order FROM rank_ladder ORDER BY rank_order",
@@ -288,14 +220,13 @@ async fn migrations_seed_ladder_version_and_views() {
     expected.sort();
     assert_eq!(views, expected);
 
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
 }
 
 #[tokio::test]
 async fn isolated_contracts_keep_their_own_tables_and_leave_public_untouched() {
-    let _serial = SERIAL.lock().await;
-    let public = connect().await;
-    reset(&public).await;
+    let fixture = connect().await;
+    let public = fixture.pool().clone();
     sqlx::raw_sql(
         "DROP SCHEMA IF EXISTS tog10090_a_web_v1 CASCADE;
          DROP SCHEMA IF EXISTS tog10090_b_web_v1 CASCADE;
@@ -314,12 +245,8 @@ async fn isolated_contracts_keep_their_own_tables_and_leave_public_untouched() {
 
     let mut isolated = Vec::new();
     for (schema, count) in [("tog10090_a", 111), ("tog10090_b", 222)] {
-        let options = test_db_options(&test_db_url())
-            .expect("safe test target")
-            .options([("search_path", schema)]);
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
+        let pool = fixture
+            .pool_with_search_path(schema)
             .await
             .expect("isolated pool");
         let migrator = sqlx::migrate!("../cutover/migrations");
@@ -373,14 +300,13 @@ async fn isolated_contracts_keep_their_own_tables_and_leave_public_untouched() {
     .execute(&public)
     .await
     .expect("remove isolated scratch schemas");
-    public.close().await;
+    fixture.close().await.expect("drop test database");
 }
 
 #[tokio::test]
 async fn contract_refuses_a_missing_or_unsafe_current_schema_before_ddl() {
-    let _serial = SERIAL.lock().await;
-    let public = connect().await;
-    reset(&public).await;
+    let fixture = connect().await;
+    let public = fixture.pool().clone();
     sqlx::raw_sql(
         "DROP SCHEMA IF EXISTS tog10090_missing CASCADE;
          DROP SCHEMA IF EXISTS \"tog10090-unsafe\" CASCADE;
@@ -390,12 +316,8 @@ async fn contract_refuses_a_missing_or_unsafe_current_schema_before_ddl() {
     .await
     .expect("prepare unsafe and absent scratch schemas");
     for schema in ["tog10090_missing", "\"tog10090-unsafe\""] {
-        let options = test_db_options(&test_db_url())
-            .expect("safe test target")
-            .options([("search_path", schema)]);
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
+        let pool = fixture
+            .pool_with_search_path(schema)
             .await
             .expect("scratch pool");
         let error = apply_web_contract(&pool).await.expect_err("refuse schema");
@@ -420,16 +342,15 @@ async fn contract_refuses_a_missing_or_unsafe_current_schema_before_ddl() {
         .execute(&public)
         .await
         .expect("cleanup unsafe scratch schema");
-    public.close().await;
+    fixture.close().await.expect("drop test database");
 }
 
 #[tokio::test]
 async fn ungrounded_raid_history_writes_nothing() {
     // Legacy `raid_history_not_grounded`: no funnel history → the counter
     // tick skips and both cache tables stay empty.
-    let _serial = SERIAL.lock().await;
-    let pool = connect().await;
-    reset(&pool).await;
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
 
     let windows = read_raid_windows(&pool, GUILD).await.expect("read windows");
     assert_eq!(windows, None, "no joins on file → ungrounded");
@@ -441,14 +362,13 @@ async fn ungrounded_raid_history_writes_nothing() {
         .expect("audit empty");
     assert!(audit.is_none());
 
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
 }
 
 #[tokio::test]
 async fn counter_tick_publishes_same_reading_to_both_tables() {
-    let _serial = SERIAL.lock().await;
-    let pool = connect().await;
-    reset(&pool).await;
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
     ground_raids(&pool).await;
 
     let windows = read_raid_windows(&pool, GUILD)
@@ -509,14 +429,13 @@ async fn counter_tick_publishes_same_reading_to_both_tables() {
             .expect("live_counts fresh");
     assert_eq!((live.0, live.1.as_deref()), (Some(7), Some(fresh.as_str())));
 
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
 }
 
 #[tokio::test]
 async fn rank_tick_writes_ladder_ranks_and_exclusions_atomically() {
-    let _serial = SERIAL.lock().await;
-    let pool = connect().await;
-    reset(&pool).await;
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
     ground_raids(&pool).await;
 
     let windows = read_raid_windows(&pool, GUILD)
@@ -646,14 +565,13 @@ async fn rank_tick_writes_ladder_ranks_and_exclusions_atomically() {
     );
     assert!(view_members.contains(&"prospect".to_owned()));
 
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
 }
 
 #[tokio::test]
 async fn non_nested_ladder_is_a_finding_and_writes_nothing() {
-    let _serial = SERIAL.lock().await;
-    let pool = connect().await;
-    reset(&pool).await;
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
     ground_raids(&pool).await;
 
     let windows = read_raid_windows(&pool, GUILD)
@@ -681,14 +599,13 @@ async fn non_nested_ladder_is_a_finding_and_writes_nothing() {
     assert!(ranks.is_empty());
     assert!(read_counter(&pool).await.is_none());
 
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
 }
 
 #[tokio::test]
 async fn events_mirror_swaps_atomically_and_keeps_last_good_on_failure() {
-    let _serial = SERIAL.lock().await;
-    let pool = connect().await;
-    reset(&pool).await;
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
 
     let gate = JobGate::default();
 
@@ -794,7 +711,7 @@ async fn events_mirror_swaps_atomically_and_keeps_last_good_on_failure() {
         .expect("next view");
     assert_eq!(next_row.map(|(id,)| id), Some("old".to_owned()));
 
-    pool.close().await;
+    fixture.close().await.expect("drop test database");
 }
 
 #[tokio::test]

@@ -76,12 +76,34 @@ function resolveNotesBody(visibleBody, fetchNotesFile) {
 function migrateReleaseNotes(changelog, body) {
   assert(changelog.startsWith('# Changelog\n\n'), 'Missing changelog title');
   if (/^## Unreleased\s*$/m.test(changelog)) {
-    const marker = '\n## Changelog\n\n## Unreleased\n';
-    const boundary = changelog.indexOf(marker);
-    assert(boundary >= 0, 'Unexpected bootstrap changelog layout');
-    assert.equal(changelog.indexOf(marker, boundary + marker.length), -1, 'Duplicate bootstrap notes');
-    const original = changelog.slice('# Changelog\n\n'.length, boundary).trim();
-    const manual = changelog.slice(boundary + marker.length).trim();
+    let original;
+    let manual;
+    let history = '';
+    const unreleasedPrefix = '# Changelog\n\n## Unreleased\n';
+    if (changelog.startsWith(unreleasedPrefix)) {
+      // After the bootstrap release, native 17.6.0 retains a newly written
+      // Unreleased prefix ABOVE its generated release. Fold only that prefix
+      // into the latest release; published history stays byte-for-byte intact.
+      assert.equal((changelog.match(/^## Unreleased\s*$/gm) || []).length, 1, 'Duplicate unreleased notes');
+      const entries = [...changelog.matchAll(releaseHeading)];
+      assert(entries.length > 0, 'Missing versioned changelog entry');
+      const start = entries[0].index;
+      const end = entries[1]?.index ?? changelog.length;
+      manual = changelog.slice(unreleasedPrefix.length, start).trim();
+      // Native can insert the generated entry INSIDE a pending code fence
+      // before a version-shaped example. Regex boundaries cannot prove those
+      // notes complete, so fenced pending notes require manual reconciliation.
+      assert(!/^\s*(?:`{3,}|~{3,})/m.test(manual), 'Ambiguous fenced Unreleased notes');
+      original = changelog.slice(start, end).trim();
+      history = changelog.slice(end);
+    } else {
+      const marker = '\n## Changelog\n\n## Unreleased\n';
+      const boundary = changelog.indexOf(marker);
+      assert(boundary >= 0, 'Unexpected bootstrap changelog layout');
+      assert.equal(changelog.indexOf(marker, boundary + marker.length), -1, 'Duplicate bootstrap notes');
+      original = changelog.slice('# Changelog\n\n'.length, boundary).trim();
+      manual = changelog.slice(boundary + marker.length).trim();
+    }
     assert.match(original, /^##? \[?v?\d+\.\d+\.\d+/);
     assert.equal((original.match(/^##? /gm) || []).length, 1, 'Expected one bootstrap release');
     assert(!/^##? /m.test(manual), 'Unexpected historical release in bootstrap notes');
@@ -106,7 +128,7 @@ function migrateReleaseNotes(changelog, body) {
     const header = collect(original, false);
     collect(manual, true);
     const migrated = [header, ...[...sections].map(([heading, notes]) => `### ${heading}\n\n${notes}`)].join('\n\n');
-    changelog = `# Changelog\n\n${migrated}\n`;
+    changelog = `# Changelog\n\n${migrated}\n${history ? `\n${history}` : ''}`;
   }
 
   const releases = [...changelog.matchAll(releaseHeading)];
