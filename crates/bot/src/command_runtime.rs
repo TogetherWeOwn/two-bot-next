@@ -7,7 +7,7 @@
 //! every Discord side effect, and each feature's domain + sqlx store owns
 //! its validation and mutation. No competing interaction listener, private
 //! dispatcher, or Discord client exists: gateway events arrive via
-//! [`Self::dispatch`] and are handled entirely through those interfaces.
+//! [`CommandRuntime::dispatch`] and are handled entirely through those interfaces.
 //!
 //! Served slices:
 //! - sticky (`/sticky`, `/sticky-remove` + the accepted-message re-post hook;
