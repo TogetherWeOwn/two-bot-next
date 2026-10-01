@@ -39,6 +39,10 @@ fail-closed retention auditing, `/home` available-byte alarms and the Operator r
   writes on rollback. Planned tools are explicitly marked; this is not cutover approval.
 - [Staging soak](docs/staging-soak.md) and [gateway recovery](docs/gateway-recovery.md).
 
+Migration changes must pass the [numbering and checksum guard](docs/migrations.md).
+Add new SQL files and their `migrations.lock` entries together; existing migration
+edits require a fresh justification against the PR base, not just a new checksum.
+
 ## License
 
 Business Source License 1.1, converting to MIT three years after each release. See [LICENSE](LICENSE).

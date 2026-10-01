@@ -6,12 +6,15 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod backup_cli;
+mod database_roles_cli;
 mod gateway;
+mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
 mod jobs;
 #[cfg(test)]
 mod lifecycle_tests;
+mod metrics_http;
 mod preflight;
 mod server;
 mod sticky_runtime;
@@ -106,9 +109,11 @@ async fn main() {
             let state = Arc::clone(&state);
             Some(tokio::spawn(async move {
                 let result: Result<(), sqlx::Error> = async {
+                    // Runtime is DML-only; the operator migrates before startup.
                     let db =
-                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
+                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, true)
                             .await?;
+                    metrics_http::register_pool(db.pool().clone());
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
                         db.pool().clone(),
                         guild_id.to_string(),

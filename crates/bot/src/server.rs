@@ -30,6 +30,8 @@ pub fn router_with_jobs(state: SharedState, jobs: crate::jobs::SharedStatus) -> 
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
         .with_state((state, jobs))
+        // Internal metrics live on the same listener (Worker never proxies it).
+        .merge(crate::metrics_http::router())
         .layer(TraceLayer::new_for_http())
 }
 
