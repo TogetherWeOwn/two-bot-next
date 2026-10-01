@@ -71,7 +71,12 @@ async fn spawn_with_shutdown(
             GUILD.parse().unwrap(),
             true,
         )),
-        shutdown,
+        async move {
+            match shutdown {
+                Some(receiver) => crate::server::shutdown_requested(receiver).await,
+                None => std::future::pending().await,
+            }
+        },
     ))
 }
 
@@ -146,6 +151,7 @@ async fn queued_commands(
     slow_database: bool,
     checkpoint_failure: Option<CheckpointFailure>,
     graceful_shutdown: bool,
+    overflow: bool,
 ) {
     let db = TestDb::new().await;
     let mut lock = if slow_database {
@@ -187,8 +193,10 @@ async fn queued_commands(
     ws.send(Message::text(interaction(3, "interested").to_string()))
         .await
         .unwrap();
-    // Exceed the read-ahead cap while the first acknowledged command is pending.
-    for sequence in 4..=68 {
+    // Overflow is fatal under the shared dispatcher. Error/shutdown cases stay
+    // below capacity so their original cause, not overflow, controls the drain.
+    let last = if overflow { 68 } else { 6 };
+    for sequence in 4..=last {
         ws.send(Message::text(leave(sequence).to_string()))
             .await
             .unwrap();
@@ -237,24 +245,9 @@ async fn queued_commands(
         None => {}
     }
     if slow_database {
-        // Cross the old cancellation deadline with an acknowledged, uncommitted
-        // SQL write. Keep the websocket alive until the deliberate lock releases.
-        let release = tokio::time::sleep(Duration::from_millis(30100));
-        tokio::pin!(release);
-        loop {
-            tokio::select! {
-                _ = &mut release => break,
-                message = ws.next() => {
-                    let message = message.unwrap().unwrap();
-                    if message.is_text() {
-                        let packet: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
-                        if packet["op"] == 1 {
-                            ws.send(Message::text("{\"op\":11,\"d\":null}".to_owned())).await.unwrap();
-                        }
-                    }
-                }
-            }
-        }
+        // Exceed the shared dispatch I/O deadline while an accepted SQL write
+        // is pending. The runner may fail, but must drain both accepted replies.
+        tokio::time::sleep(Duration::from_millis(30100)).await;
         lock.take().unwrap().rollback().await.unwrap();
     }
     let runner = if let Some(failure) = checkpoint_failure {
@@ -287,8 +280,22 @@ async fn queued_commands(
         assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 2);
         assert_eq!(db.count().await, 0);
         None
+    } else if overflow {
+        let error = tokio::time::timeout(Duration::from_secs(15), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        let expected = if slow_database {
+            "dispatch I/O deadline exceeded"
+        } else {
+            "dispatch backlog full"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(db.count().await, 0);
+        None
     } else {
-        wait_sequence(&db.store, 68).await;
+        wait_sequence(&db.store, 6).await;
         Some(runner)
     };
     let status: String = sqlx::query_scalar("SELECT status FROM event_rsvps")
@@ -317,11 +324,11 @@ async fn queued_commands(
         ws.send(Message::text(interaction(3, "going").to_string()))
             .await
             .unwrap();
-        ws.send(Message::text(leave(69).to_string())).await.unwrap();
-        wait_sequence(&db.store, 69).await;
+        ws.send(Message::text(leave(7).to_string())).await.unwrap();
+        wait_sequence(&db.store, 7).await;
         assert_eq!(rest.requests().len(), 8);
-        runner.abort();
-        let _ = runner.await;
+        shutdown.send_replace(true);
+        runner.await.unwrap().unwrap();
     }
     drop(ws);
     rest.shutdown().await;
@@ -330,32 +337,38 @@ async fn queued_commands(
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn queued_rsvp_is_deferred_within_three_seconds_and_drains_on_overflow() {
-    queued_commands(false, None, false).await;
+async fn queued_rsvp_completes_in_order_and_committed_replay_is_silent() {
+    queued_commands(false, None, false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
-async fn acknowledged_rsvp_survives_feature_deadline_and_backlog() {
-    queued_commands(true, None, false).await;
+async fn queued_rsvp_is_deferred_within_three_seconds_and_drains_on_overflow() {
+    queued_commands(false, None, false, true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn acknowledged_rsvp_drains_before_fatal_dispatch_deadline_returns() {
+    queued_commands(true, None, false, true).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn acknowledged_queue_drains_before_checkpoint_error_returns() {
-    queued_commands(false, Some(CheckpointFailure::Rejected), false).await;
+    queued_commands(false, Some(CheckpointFailure::Rejected), false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn acknowledged_queue_drains_before_checkpoint_timeout_returns() {
-    queued_commands(false, Some(CheckpointFailure::Timeout), false).await;
+    queued_commands(false, Some(CheckpointFailure::Timeout), false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn acknowledged_queue_drains_before_graceful_shutdown_returns() {
-    queued_commands(false, None, true).await;
+    queued_commands(false, None, true, false).await;
 }
 
 #[tokio::test]

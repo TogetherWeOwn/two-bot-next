@@ -89,7 +89,35 @@ pub fn moderation_audit_reason(
     };
     let token = moderation_audit_token(guild_id, idempotency_key);
     let mac = marker_mac(secret, guild_id, &token, action, actor_id);
-    format!("[two-audit:v1:{token}:{action}:{actor_id}:{mac}] {reason}")
+    let marker = format!("[two-audit:v1:{token}:{action}:{actor_id}:{mac}] ");
+    let budget = AUDIT_REASON_MAX_UTF16.saturating_sub(marker.encode_utf16().count());
+    format!("{marker}{}", truncate_utf16(reason, budget))
+}
+
+/// Discord's `X-Audit-Log-Reason` limit. Unit: UTF-16 code units, the same
+/// unit `require_moderation_reason` validates in (non-BMP chars count 2).
+pub const AUDIT_REASON_MAX_UTF16: usize = 512;
+
+/// Shorten only the human suffix to `budget` UTF-16 units, never splitting a
+/// scalar value; a shortened suffix ends in `…`. Fits unchanged otherwise.
+fn truncate_utf16(text: &str, budget: usize) -> String {
+    if text.encode_utf16().count() <= budget {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.len_utf16();
+        if used + w + 1 > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    if budget > 0 {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// A verified marker: the correlated service action and the acting moderator.
@@ -420,6 +448,54 @@ mod tests {
         let marker = parse_moderation_audit_reason(Some(&secret), GUILD, Some(&reason))
             .expect("unban_scheduled must verify");
         assert_eq!(marker.action, UNBAN_SCHEDULED_ACTION);
+    }
+
+    #[test]
+    fn signed_reason_fits_outbound_limit_and_still_verifies() {
+        let secret = moderation_test_vectors().remove(0).secret;
+        let units = |s: &str| s.encode_utf16().count();
+        let marker_len = units(&moderation_audit_reason(
+            Some(&secret),
+            GUILD,
+            "k",
+            "moderation.ban",
+            ACTOR,
+            "",
+        ));
+        let budget = AUDIT_REASON_MAX_UTF16 - marker_len;
+        let cases = [
+            "x".repeat(512),
+            "\u{1F600}".repeat(256),
+            "x".repeat(budget),     // exact boundary: unchanged
+            "x".repeat(budget + 1), // one over: shortened
+            "é".repeat(512),
+            String::new(),
+            "spam".to_owned(),
+        ];
+        for human in cases {
+            let out =
+                moderation_audit_reason(Some(&secret), GUILD, "k", "moderation.ban", ACTOR, &human);
+            assert!(units(&out) <= AUDIT_REASON_MAX_UTF16, "{}", units(&out));
+            let m = parse_moderation_audit_reason(Some(&secret), GUILD, Some(&out))
+                .expect("marker intact");
+            assert_eq!(m.token, moderation_audit_token(GUILD, "k"));
+            let suffix = out.split_once("] ").unwrap().1;
+            if units(&human) <= budget {
+                assert_eq!(suffix, human);
+            } else {
+                assert!(suffix.ends_with('\u{2026}'));
+                assert!(human.starts_with(suffix.trim_end_matches('\u{2026}')));
+            }
+        }
+        let long = moderation_audit_reason(
+            Some(&secret),
+            GUILD,
+            "k",
+            "moderation.ban",
+            ACTOR,
+            &"x".repeat(budget + 1),
+        );
+        assert_eq!(units(&long), AUDIT_REASON_MAX_UTF16);
     }
 
     #[test]
