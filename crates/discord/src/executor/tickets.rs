@@ -7,7 +7,11 @@ use super::*;
 use serde_json::{json, Value};
 use twilight_model::{
     channel::{
-        permission_overwrite::PermissionOverwrite as ChannelPermissionOverwrite, ChannelType,
+        permission_overwrite::{
+            PermissionOverwrite as ChannelPermissionOverwrite,
+            PermissionOverwriteType as ChannelPermissionOverwriteType,
+        },
+        ChannelType,
     },
     guild::Permissions,
 };
@@ -68,25 +72,25 @@ impl ActionExecutor {
         let overwrites = [
             overwrite(
                 guild.cast(),
-                PermissionOverwriteType::Role,
+                ChannelPermissionOverwriteType::Role,
                 Permissions::empty(),
                 Permissions::VIEW_CHANNEL,
             ),
             overwrite(
                 bot,
-                PermissionOverwriteType::Member,
+                ChannelPermissionOverwriteType::Member,
                 common | Permissions::MANAGE_CHANNELS,
                 Permissions::empty(),
             ),
             overwrite(
                 opener,
-                PermissionOverwriteType::Member,
+                ChannelPermissionOverwriteType::Member,
                 common,
                 Permissions::empty(),
             ),
             overwrite(
                 staff,
-                PermissionOverwriteType::Role,
+                ChannelPermissionOverwriteType::Role,
                 common,
                 Permissions::empty(),
             ),
