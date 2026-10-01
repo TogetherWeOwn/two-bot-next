@@ -21,9 +21,15 @@
 //! Redirects are manual: the legacy client never auto-follows, each hop is
 //! re-planned by [`redirect_target`] (same host, HTTPS only, bounded by
 //! [`MAX_REDIRECT_HOPS`]), and the previous response stream is dropped before
-//! the next dial. Response bodies are bounded twice — on the compressed wire
-//! and again decompressed into [`LimitedBody`] — before the caller ever sees
-//! parsed XML.
+//! the next dial. DNS names resolve from the parsed `Url::host()` so IPv6
+//! literals reach the resolver bracket-free; TLS identity still comes from
+//! the untouched URL. Response bodies are bounded twice — on the compressed
+//! wire and again decompressed into [`LimitedBody`] — before the caller ever
+//! sees parsed XML. Concatenated gzip members all decode; stacked
+//! `Content-Encoding` layers are refused; non-ASCII policy headers
+//! (content-type, content-encoding, location) fail closed while unrelated
+//! headers stay lenient. The absolute deadline also governs the blocking
+//! decode and is re-checked before success is returned.
 //!
 //! Tests inject [`FeedResolver`]/[`FeedConnector`] doubles; there is no seam
 //! that lets a caller dial an address `PublicRequest` did not approve.
@@ -38,7 +44,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -53,7 +59,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use thiserror::Error;
 use tower_service::Service;
-use url::Url;
+use url::{Host, Url};
 
 use crate::feeds_http::{
     redirect_target, validate_content_type, validate_source, FetchError, LimitedBody,
@@ -206,6 +212,32 @@ pub async fn fetch_feed(source: &str) -> Result<FetchedFeed, FeedConnectError> {
     .await
 }
 
+/// Absolute fetch deadline, derived once from [`FetchOptions`]. The outer
+/// `tokio::time::timeout` preempts pending DNS/body awaits, but synchronous
+/// decode cannot be polled — so the same instant is threaded into the body
+/// path and checked before success is returned.
+#[derive(Debug, Clone, Copy)]
+struct FetchDeadline {
+    at: Instant,
+    budget_ms: u64,
+}
+
+impl FetchDeadline {
+    fn new(deadline: Duration) -> Self {
+        Self {
+            at: Instant::now() + deadline,
+            budget_ms: deadline.as_millis() as u64,
+        }
+    }
+
+    fn check(&self) -> Result<(), FeedConnectError> {
+        if Instant::now() >= self.at {
+            return Err(FeedConnectError::Deadline(self.budget_ms));
+        }
+        Ok(())
+    }
+}
+
 /// Full fetch pipeline under one deadline: validate → resolve all answers →
 /// pin → GET → manual redirect loop → content-type → bounded compressed read
 /// → bounded decompress into [`LimitedBody`] → UTF-8.
@@ -219,15 +251,20 @@ where
     R: FeedResolver,
     C: FeedConnector,
 {
-    tokio::time::timeout(options.deadline, fetch_inner(resolver, connector, source))
-        .await
-        .map_err(|_| FeedConnectError::Deadline(options.deadline.as_millis() as u64))?
+    let deadline = FetchDeadline::new(options.deadline);
+    tokio::time::timeout(
+        options.deadline,
+        fetch_inner(resolver, connector, source, &deadline),
+    )
+    .await
+    .map_err(|_| FeedConnectError::Deadline(options.deadline.as_millis() as u64))?
 }
 
 async fn fetch_inner<R: FeedResolver, C: FeedConnector>(
     resolver: &R,
     connector: &C,
     source: &str,
+    deadline: &FetchDeadline,
 ) -> Result<FetchedFeed, FeedConnectError> {
     let mut request = plan_request(resolver, validate_source(source)?).await?;
     let mut hops = 0usize;
@@ -237,7 +274,11 @@ async fn fetch_inner<R: FeedResolver, C: FeedConnector>(
         if REDIRECT_STATUSES.contains(&status) {
             // Drop the hop body before planning the next request: the old
             // connection is cancelled, never drained into the pool.
-            let location = response.header("location").unwrap_or("").to_owned();
+            // A non-ASCII Location is a refused redirect, never a joined one.
+            let location = response
+                .policy_header("location", FetchError::RedirectRefused)?
+                .unwrap_or("")
+                .to_owned();
             let target = redirect_target(request.url(), &location, hops)?;
             request = plan_request(resolver, target).await?;
             hops += 1;
@@ -246,7 +287,7 @@ async fn fetch_inner<R: FeedResolver, C: FeedConnector>(
         return Ok(FetchedFeed {
             url: request.url().clone(),
             status,
-            body: read_body(response).await?,
+            body: read_body(response, deadline).await?,
         });
     }
 }
@@ -258,28 +299,49 @@ async fn plan_request<R: FeedResolver>(
     resolver: &R,
     url: Url,
 ) -> Result<PublicRequest, FeedConnectError> {
-    let host = url.host_str().ok_or(FetchError::InvalidSource)?;
+    // Resolve from the parsed `Url::host()`, never `host_str()`: the latter
+    // retains IPv6 brackets (`[2001:db8::1]`) which `lookup_host` rejects,
+    // while the parsed form is bracket-free. TLS identity still comes from
+    // the untouched URL.
+    let host = match url.host() {
+        Some(Host::Domain(domain)) => domain.to_owned(),
+        Some(Host::Ipv4(ip)) => ip.to_string(),
+        Some(Host::Ipv6(ip)) => ip.to_string(),
+        None => return Err(FetchError::InvalidSource.into()),
+    };
     let port = url
         .port_or_known_default()
         .ok_or(FetchError::InvalidSource)?;
     let resolved = resolver
-        .resolve(host, port)
+        .resolve(&host, port)
         .await
         .map_err(FeedConnectError::Resolve)?;
     Ok(PublicRequest::prepare(url, &resolved)?)
 }
 
 /// Content-type check first, then compressed-then-decompressed bounds.
-async fn read_body(response: FeedResponse) -> Result<String, FeedConnectError> {
-    validate_content_type(response.header("content-type"))?;
-    let advertised = content_length(response.header("content-length"));
-    let encoding = response.header("content-encoding").map(str::to_owned);
+///
+/// The decoded coding list is validated before the wire body is drained, so a
+/// hop declaring an unsupported coding fails without consuming the stream.
+async fn read_body(
+    response: FeedResponse,
+    deadline: &FetchDeadline,
+) -> Result<String, FeedConnectError> {
+    validate_content_type(
+        response.policy_header("content-type", FetchError::UnsupportedContentType)?,
+    )?;
+    // A malformed declared length grants nothing: ignore it and let the
+    // cumulative streaming cap stay authoritative.
+    let advertised = content_length(response.header("content-length").filter(|v| v.is_ascii()));
+    let coding = content_codings(&response)?;
     let mut limited = LimitedBody::new(advertised)?;
     let wire = read_wire(response.body).await?;
-    let decoded = decode_wire(&wire, encoding.as_deref())?;
+    let decoded = decode_later(coding, wire, deadline).await?;
     for chunk in decoded.chunks(8192) {
+        deadline.check()?;
         limited.push(chunk)?;
     }
+    deadline.check()?;
     Ok(limited.finish()?)
 }
 
@@ -302,24 +364,115 @@ async fn read_wire(mut stream: FeedBodyStream) -> Result<Vec<u8>, FeedConnectErr
     Ok(wire)
 }
 
+/// Headers that drive policy: content-type, content-encoding, redirect
+/// location. Non-ASCII bytes in these are a policy refusal — silently mapping
+/// them to empty would turn a declared `br` into `identity`, drop the
+/// content-type gate, or join a garbage redirect. The caller picks the
+/// matching [`FetchError`] so a bad Location reads as a refused redirect,
+/// not a bad body. All other headers stay lenient.
+impl FeedResponse {
+    fn policy_header(
+        &self,
+        name: &str,
+        refusal: FetchError,
+    ) -> Result<Option<&str>, FeedConnectError> {
+        self.header(name)
+            .map(|value| {
+                if value.is_ascii() {
+                    Ok(value)
+                } else {
+                    Err(FeedConnectError::Policy(refusal))
+                }
+            })
+            .transpose()
+    }
+}
+
+/// Coding declared on the wire, validated before any body byte is drained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireCoding {
+    Identity,
+    Gzip,
+    Deflate,
+}
+
+/// Parse **every** `Content-Encoding` header value in declared order and
+/// return the single validated coding. Stacked codings are refused: the
+/// decoder handles one layer, so a second layer would reach the XML layer
+/// half-decoded. Comma-separated lists are split so `Content-Encoding: gzip,
+/// br` cannot hide an unadvertised layer. Repeated `identity` (or empty token
+/// runs) collapse to identity; any other repeat is a stack and is refused.
+fn content_codings(response: &FeedResponse) -> Result<WireCoding, FeedConnectError> {
+    let mut coding: Option<WireCoding> = None;
+    for (_, value) in response
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+    {
+        let value = value
+            .is_ascii()
+            .then_some(value)
+            .ok_or_else(|| FeedConnectError::Policy(FetchError::UnsupportedContentType))?;
+        for layer in value.split(',') {
+            let layer = layer.trim().to_ascii_lowercase();
+            if layer.is_empty() {
+                continue;
+            }
+            let next = match layer.as_str() {
+                "identity" => WireCoding::Identity,
+                "gzip" | "x-gzip" => WireCoding::Gzip,
+                "deflate" => WireCoding::Deflate,
+                other => return Err(FeedConnectError::UnsupportedEncoding(other.to_owned())),
+            };
+            match (coding, next) {
+                (None, next) => coding = Some(next),
+                (Some(WireCoding::Identity), WireCoding::Identity) => {}
+                _ => {
+                    return Err(FeedConnectError::UnsupportedEncoding("stacked".to_owned()));
+                }
+            }
+        }
+    }
+    Ok(coding.unwrap_or(WireCoding::Identity))
+}
+
+/// Run the single validated decode off the async worker (`spawn_blocking`)
+/// under the absolute deadline: a slow `GzDecoder` cannot silently overrun
+/// the total budget the wrapper promises.
+async fn decode_later(
+    coding: WireCoding,
+    wire: Vec<u8>,
+    deadline: &FetchDeadline,
+) -> Result<Vec<u8>, FeedConnectError> {
+    let at = deadline.at;
+    let budget_ms = deadline.budget_ms;
+    tokio::time::timeout_at(
+        at.into(),
+        tokio::task::spawn_blocking(move || decode_wire(&wire, coding)),
+    )
+    .await
+    .map_err(|_| FeedConnectError::Deadline(budget_ms))?
+    .map_err(|err| FeedConnectError::Transport(format!("feed body decode failed: {err}")))?
+}
+
 /// Decode `Content-Encoding` bodies; decompressed output is capped at
 /// `MAX_FEED_BYTES` regardless of declared sizes, so a zip-bomb dies in the
 /// stream, not in the parser.
-fn decode_wire(wire: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, FeedConnectError> {
-    let encoding = encoding.unwrap_or("").trim().to_ascii_lowercase();
-    let decoded = match encoding.as_str() {
-        "" | "identity" => Ok(wire.to_vec()),
-        "gzip" | "x-gzip" => bounded_decode(flate2::read::GzDecoder::new(wire)),
+fn decode_wire(wire: &[u8], coding: WireCoding) -> Result<Vec<u8>, FeedConnectError> {
+    let decoded = match coding {
+        WireCoding::Identity => Ok(wire.to_vec()),
+        // `MultiGzDecoder` consumes concatenated gzip members: `GzDecoder`
+        // stops at the first member boundary and silently truncates the rest.
+        WireCoding::Gzip => bounded_decode(flate2::read::MultiGzDecoder::new(wire)),
         // `deflate` is ambiguous on the wire: try the zlib wrapper first,
         // then raw deflate (what undici tolerates). A decompressed overflow
         // is never retried — TooLarge is final.
-        "deflate" => {
+        WireCoding::Deflate => {
             bounded_decode(flate2::read::ZlibDecoder::new(wire)).or_else(|err| match err {
                 DecodeError::TooLarge => Err(DecodeError::TooLarge),
                 DecodeError::Io(_) => bounded_decode(flate2::read::DeflateDecoder::new(wire)),
             })
         }
-        other => return Err(FeedConnectError::UnsupportedEncoding(other.to_owned())),
     };
     decoded.map_err(|err| match err {
         DecodeError::TooLarge => FetchError::TooLarge.into(),
@@ -488,9 +641,13 @@ impl FeedResponse {
             .headers()
             .iter()
             .map(|(name, value)| {
+                // Lossy, never silent: `from_utf8_lossy` emits U+FFFD for
+                // non-ASCII bytes, so `policy_header` still sees and refuses
+                // malformed policy metadata instead of reading it as empty.
+                // Unrelated opaque headers keep their lossy value untouched.
                 (
                     name.as_str().to_ascii_lowercase(),
-                    value.to_str().unwrap_or("").to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
                 )
             })
             .collect();

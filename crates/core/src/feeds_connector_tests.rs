@@ -150,3 +150,91 @@ fn normalized_host_strips_case_dot_and_brackets() {
     assert_eq!(normalized_host("FEEDS.Example.ORG."), "feeds.example.org");
     assert_eq!(normalized_host("[2606:2800::1]"), "2606:2800::1");
 }
+
+/// The production conversion path (`from_hyper`) maps header bytes with
+/// `from_utf8_lossy`: non-ASCII bytes surface as U+FFFD rather than vanishing
+/// to empty, so the policy-header check refuses them instead of skipping the
+/// gate. This test drives the real gate with the exact lossy strings the
+/// conversion produces for obs-text bytes.
+#[test]
+fn malformed_policy_headers_fail_closed_through_the_production_gate() {
+    use http::HeaderValue;
+    // What `from_hyper` stores for `Content-Encoding: gzi\xffp` and
+    // `Content-Type: text/\xffhtml` on the wire.
+    let lossy_encoding =
+        String::from_utf8_lossy(HeaderValue::from_bytes(b"gzi\xffp").unwrap().as_bytes())
+            .into_owned();
+    let lossy_type = String::from_utf8_lossy(
+        HeaderValue::from_bytes(b"text/\xffhtml")
+            .unwrap()
+            .as_bytes(),
+    )
+    .into_owned();
+    assert!(
+        !lossy_encoding.is_ascii() && !lossy_type.is_ascii(),
+        "lossy conversion must keep the damage visible"
+    );
+    let response = FeedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".into(), lossy_type),
+            ("content-encoding".into(), lossy_encoding),
+            ("x-opaque".into(), "untouched".into()),
+        ],
+        body: Box::pin(futures_util::stream::empty()),
+    };
+    assert!(
+        response
+            .policy_header("content-type", FetchError::UnsupportedContentType)
+            .is_err(),
+        "malformed content-type must not read as permitted-empty"
+    );
+    assert!(
+        content_codings(&response).is_err(),
+        "malformed content-encoding must not read as identity"
+    );
+    // Opaque headers are untouched by the policy gate.
+    assert_eq!(response.header("x-opaque"), Some("untouched"));
+}
+
+/// The absolute deadline governs the synchronous decode path, not just
+/// pending DNS/body awaits. With an already-expired budget, decode must
+/// return `Deadline` — never a success past the budget. Deterministic: on
+/// the timeout's first poll the spawned decode cannot have completed (the
+/// polling thread never yields mid-poll), while the elapsed sleep is ready
+/// immediately, so the delay arm always wins.
+#[tokio::test]
+async fn expired_deadline_refuses_decode_instead_of_succeeding() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+    use std::io::Write as _;
+    enc.write_all(b"<rss/>").unwrap();
+    let wire = enc.finish().unwrap();
+
+    let expired = FetchDeadline::new(Duration::ZERO);
+    assert!(
+        matches!(expired.check(), Err(FeedConnectError::Deadline(0))),
+        "an expired budget must fail the pre-success check"
+    );
+    let err = decode_later(WireCoding::Gzip, wire, &expired)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, FeedConnectError::Deadline(0)),
+        "decode past the budget must be a deadline, got {err:?}"
+    );
+
+    // A live budget still decodes.
+    let live = FetchDeadline::new(Duration::from_secs(30));
+    live.check().expect("fresh budget is live");
+    let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(b"<rss/>").unwrap();
+    assert_eq!(
+        decode_later(WireCoding::Gzip, enc.finish().unwrap(), &live)
+            .await
+            .unwrap(),
+        b"<rss/>",
+    );
+}

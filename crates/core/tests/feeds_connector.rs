@@ -273,6 +273,36 @@ async fn empty_and_private_only_answers_are_refused() {
 }
 
 #[tokio::test]
+async fn ipv6_literal_sources_resolve_from_the_parsed_host() {
+    // `Url::host_str()` retains brackets (`[2001:db8::1]`), which the system
+    // resolver rejects. The connector resolves from the parsed `Host`, so a
+    // policy-valid IPv6 literal reaches `PublicRequest` intact and the mock
+    // sees the bracket-free name.
+    let ip: IpAddr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[ip])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(Canned::xml("<rss/>"))]);
+    let feed = fetch_feed_with(
+        &resolver,
+        &connector,
+        "https://[2606:2800:220:1:248:1893:25c8:1946]/feed.xml",
+        &fast(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resolver.calls(),
+        vec![("2606:2800:220:1:248:1893:25c8:1946".to_owned(), 443)],
+        "IPv6 literals resolve bracket-free"
+    );
+    assert_eq!(
+        connector.calls(),
+        vec![vec![pinned(ip, 443)]],
+        "the literal pins to itself"
+    );
+    assert_eq!(feed.status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn a_literal_ip_source_must_resolve_to_itself() {
     let connector = MockConnector::scripted(vec![Step::Respond(Canned::xml("<rss/>"))]);
     let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
@@ -516,6 +546,177 @@ fn raw_deflate(bytes: &[u8]) -> Bytes {
     let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
     enc.write_all(bytes).unwrap();
     enc.finish().unwrap().into()
+}
+
+fn multi_gzip(parts: &[&[u8]]) -> Bytes {
+    let mut out = Vec::new();
+    for part in parts {
+        out.extend_from_slice(&gzip(part));
+    }
+    out.into()
+}
+
+#[tokio::test]
+async fn concatenated_gzip_members_all_decode() {
+    // Servers concatenate gzip members (log rotation, middleware). A
+    // single-member decoder would silently truncate the feed after the
+    // first boundary.
+    let first = b"<rss><channel><title>a</title>";
+    let second = b"</channel></rss>";
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(
+        Canned::xml(multi_gzip(&[first, second])).header("content-encoding", "gzip"),
+    )]);
+    let feed = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+        .await
+        .unwrap();
+    let mut expected = Vec::new();
+    expected.extend_from_slice(first);
+    expected.extend_from_slice(second);
+    assert_eq!(
+        feed.body.as_bytes(),
+        expected.as_slice(),
+        "both gzip members must survive decoding"
+    );
+}
+
+#[tokio::test]
+async fn corruption_in_a_later_gzip_member_is_refused() {
+    let mut bad = gzip(b"<rss><channel>").to_vec();
+    bad.extend_from_slice(b"not a gzip member");
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(
+        Canned::xml(Bytes::from(bad)).header("content-encoding", "gzip"),
+    )]);
+    let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FeedConnectError::Transport(_)));
+}
+
+#[tokio::test]
+async fn oversized_concatenated_gzip_is_capped_in_aggregate() {
+    // Each member fits the wire cap, but together they exceed the
+    // decompressed ceiling.
+    let half = vec![b'z'; MAX_FEED_BYTES / 2 + 16];
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(
+        Canned::xml(multi_gzip(&[&half, &half])).header("content-encoding", "gzip"),
+    )]);
+    let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+        .await
+        .unwrap_err();
+    assert_eq!(policy(&err), FetchError::TooLarge);
+}
+
+#[tokio::test]
+async fn repeated_and_stacked_content_encodings_are_refused() {
+    // `identity` then `br`: reading only the first header would treat the
+    // body as identity and hand compressed bytes to the parser.
+    for encodings in [
+        vec![("content-encoding", "identity"), ("content-encoding", "br")],
+        vec![("content-encoding", "gzip, br")],
+        vec![("content-encoding", "gzip"), ("content-encoding", "gzip")],
+        vec![("content-encoding", "gzip, gzip")],
+    ] {
+        let mut canned = Canned::xml(gzip(b"<rss/>"));
+        for (name, value) in &encodings {
+            canned = canned.header(name, value);
+        }
+        let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+        let connector = MockConnector::scripted(vec![Step::Respond(canned)]);
+        let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FeedConnectError::UnsupportedEncoding(_)),
+            "encodings {encodings:?} must be refused, got {err:?}"
+        );
+    }
+
+    // Repeated `identity` stays identity — servers and proxies emit it.
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(
+        Canned::xml("<rss/>")
+            .header("content-encoding", "identity")
+            .header("content-encoding", "identity"),
+    )]);
+    let feed = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+        .await
+        .unwrap();
+    assert_eq!(feed.body, "<rss/>");
+}
+
+/// Header values with obs-text bytes: `str` literals cannot hold `\xff`, so
+/// build the lossy strings the production conversion path stores.
+fn lossy_header(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).into_owned()
+}
+
+#[tokio::test]
+async fn non_ascii_policy_headers_fail_closed() {
+    // A non-ASCII Content-Encoding must not collapse to identity.
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(Canned {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".into(), "application/rss+xml".into()),
+            ("content-encoding".into(), lossy_header(b"gzi\xffp")),
+        ],
+        chunks: vec![Bytes::from_static(b"<rss/>")],
+    })]);
+    let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+        .await
+        .unwrap_err();
+    assert_eq!(policy(&err), FetchError::UnsupportedContentType);
+
+    // A non-ASCII Content-Type must not collapse to the permitted empty type.
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(Canned {
+        status: StatusCode::OK,
+        headers: vec![("content-type".into(), lossy_header(b"text/\xffhtml"))],
+        chunks: vec![Bytes::from_static(b"<rss/>")],
+    })]);
+    let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+        .await
+        .unwrap_err();
+    assert_eq!(policy(&err), FetchError::UnsupportedContentType);
+
+    // A non-ASCII Location is a refused redirect, not a joined URL.
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(Canned {
+        status: StatusCode::FOUND,
+        headers: vec![("location".into(), lossy_header(b"/n\xffext"))],
+        chunks: Vec::new(),
+    })]);
+    let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+        .await
+        .unwrap_err();
+    assert_eq!(policy(&err), FetchError::RedirectRefused);
+}
+
+#[tokio::test]
+async fn malformed_content_length_grants_nothing() {
+    // A garbage declared length is ignored; the cumulative streaming cap
+    // stays authoritative in both directions.
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(
+        Canned::xml("<rss/>").header("content-length", "not-a-number"),
+    )]);
+    let feed = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+        .await
+        .unwrap();
+    assert_eq!(feed.body, "<rss/>");
+
+    let big = vec![b'a'; MAX_FEED_BYTES + 1];
+    let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+    let connector = MockConnector::scripted(vec![Step::Respond(
+        Canned::xml(big).header("content-length", "also-not-a-number"),
+    )]);
+    let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+        .await
+        .unwrap_err();
+    assert_eq!(policy(&err), FetchError::TooLarge);
 }
 
 #[tokio::test]

@@ -11,7 +11,6 @@
 ### Fixed
 
 - Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
->>>>>>> origin/main
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 

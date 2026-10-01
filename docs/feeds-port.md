@@ -63,8 +63,12 @@ it. `fetch_feed`/`fetch_feed_with` enforce the full contract:
 4. Content type and advertised length are checked, the compressed wire read is
    capped at `MAX_FEED_BYTES`, and decompressed output is capped again before
    `LimitedBody` and the UTF-8 check — a zip bomb dies in the stream, not the
-   parser. One total 15-second deadline (`FetchOptions::default`) covers DNS,
-   every hop and the body read.
+   parser. DNS names resolve from the parsed URL host (IPv6 literals stay
+   bracket-free); concatenated gzip members all decode; stacked
+   `Content-Encoding` layers are refused before the body drains; non-ASCII
+   content-type, content-encoding and location headers fail closed. One total
+   15-second deadline (`FetchOptions::default`) covers DNS, every hop, the
+   blocking decode and the body read, and is re-checked before success.
 5. The injected `FeedResolver`/`FeedConnector` seams prove the orchestration
    without opening sockets: pinned dials, all-answer validation, rebinding,
    cross-host/downgrade/credential redirects, the three-hop budget, the single
