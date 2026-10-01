@@ -1237,6 +1237,56 @@ pub fn validate_guild_add_member(body: &Map<String, Value>) -> Result<(), Action
     Ok(())
 }
 
+/// Resolved allowlisted role assignment. No caller can supply an arbitrary role ID.
+#[derive(Debug, Clone, Copy)]
+pub struct RoleAssignRequest<'a> {
+    discord_id: &'a str,
+    role_id: &'a str,
+}
+
+impl<'a> RoleAssignRequest<'a> {
+    pub fn validate(
+        body: &'a Map<String, Value>,
+        role_keys: &'a HashMap<String, String>,
+    ) -> Result<Self, ActionError> {
+        let role_id = validate_role_assign(body, role_keys)?;
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+            role_id,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    #[must_use]
+    pub fn role_id(&self) -> &str {
+        self.role_id
+    }
+}
+
+/// Validated member subject only. The OAuth token stays a separate transient argument.
+#[derive(Debug, Clone, Copy)]
+pub struct GuildAddMemberRequest<'a> {
+    discord_id: &'a str,
+}
+
+impl<'a> GuildAddMemberRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        validate_guild_add_member(body)?;
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+}
+
 /// `announcement.post` field validation: channel through the key map, body
 /// within Discord's ceiling. The message id comes back from Discord, so the
 /// stored idempotency result can still tell the website *which* message it has.

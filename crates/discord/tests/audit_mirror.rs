@@ -150,9 +150,13 @@ async fn post_mirror_sends_content_with_enforced_string_nonce() {
     assert_eq!(body["content"], "audit-event:42; · something happened");
     assert_eq!(body["nonce"], nonce, "nonce stays a string");
     assert_eq!(body["enforce_nonce"], true);
+    assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
+    // Empty allowlists and false replied_user may be explicit or omitted.
+    let mentions: twilight_model::channel::message::AllowedMentions =
+        serde_json::from_value(body["allowed_mentions"].clone()).unwrap();
     assert_eq!(
-        body["allowed_mentions"],
-        serde_json::json!({"parse": []}),
+        mentions,
+        twilight_model::channel::message::AllowedMentions::default(),
         "mentions are disabled on the wire"
     );
     mock.shutdown().await;

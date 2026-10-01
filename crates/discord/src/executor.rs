@@ -402,6 +402,9 @@ impl HyperTransport {
     }
 }
 
+#[path = "internal_exec/member.rs"]
+pub mod member;
+
 /// The S4 REST executor: paced lane + moderation lane over one transport.
 #[derive(Debug, Clone)]
 pub struct ActionExecutor {
@@ -1215,6 +1218,8 @@ impl ActionExecutor {
             body["nonce"] = n;
             body["enforce_nonce"] = serde_json::Value::Bool(true);
         }
+        crate::message_safety::sanitize_message(&mut body);
+        crate::message_safety::validate_create(&body)?;
         let body_bytes = serde_json::to_vec(&body)
             .map_err(|e| DiscordError::Rejected(format!("build message body: {e}")))?;
         let req = Request::builder(&Route::CreateMessage {
@@ -1300,6 +1305,28 @@ impl ActionExecutor {
         }
     }
 
+    /// Resolve the authenticated bot's application for a resumed startup
+    /// without READY. One bounded, paced read; no alternate client or guessed id.
+    pub async fn current_application_id(&self) -> Result<u64, DiscordError> {
+        let req = Self::request_of(self.inner.factory.current_user_application())?;
+        self.pace(false).await;
+        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
+            .await
+            .map_err(|_| DiscordError::Timeout)?
+            .map_err(DiscordError::Unavailable)?;
+        match res.status {
+            200..=299 => {
+                let body: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
+                    DiscordError::Unavailable("invalid application response".to_owned())
+                })?;
+                let id: Id<ApplicationMarker> = serde_json::from_value(body["id"].clone())
+                    .map_err(|_| DiscordError::Unavailable("invalid application id".to_owned()))?;
+                Ok(id.get())
+            }
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
     /// Publish the router's full guild command set in one send
     /// (`PUT /applications/{app}/guilds/{guild}/commands`).
     pub async fn publish_guild_commands(
@@ -1362,11 +1389,12 @@ impl ActionExecutor {
             Id::<InteractionMarker>::new_checked(interaction_id).ok_or_else(|| {
                 DiscordError::Rejected(format!("bad interaction id: {interaction_id}"))
             })?;
+        let response = crate::message_safety::interaction_response(response)?;
         let req = Self::request_of(
             self.inner
                 .factory
                 .interaction(Id::<ApplicationMarker>::new(1))
-                .create_response(interaction_id, interaction_token, response),
+                .create_response(interaction_id, interaction_token, &response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
         let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
@@ -1391,13 +1419,14 @@ impl ActionExecutor {
             Id::<ApplicationMarker>::new_checked(application_id).ok_or_else(|| {
                 DiscordError::Rejected(format!("bad application id: {application_id}"))
             })?;
+        let content = two_bot_core::message_safety::content(content);
         let mentions = AllowedMentions::default();
         let req = Self::request_of(
             self.inner
                 .factory
                 .interaction(application)
                 .update_response(interaction_token)
-                .content(Some(content))
+                .content(Some(&content))
                 .allowed_mentions(Some(&mentions)),
         )?;
         self.call_once_raw(req, &[200]).await.map(|_| ())
