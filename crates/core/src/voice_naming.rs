@@ -363,6 +363,10 @@ struct Cursor<'a> {
     src: &'a str,
     pos: usize,
     depth_exceeded: bool,
+    // Separator scans reuse construct parsing, recording only successful spans.
+    // Extension bodies are opaque in this mode, so scanning cannot recurse into
+    // conditional reservation scans or reinterpret raw styling delimiters.
+    balanced_ends: Option<Vec<Option<usize>>>,
 }
 
 impl<'a> Cursor<'a> {
@@ -371,6 +375,7 @@ impl<'a> Cursor<'a> {
             src,
             pos: 0,
             depth_exceeded: false,
+            balanced_ends: None,
         }
     }
 
@@ -464,6 +469,9 @@ fn parse_segments(cursor: &mut Cursor, stops: Stops, depth: usize) -> Vec<Segmen
             let start = cursor.pos;
             match $parse {
                 Some(seg) => {
+                    if let Some(ends) = &mut cursor.balanced_ends {
+                        ends[start] = Some(cursor.pos);
+                    }
                     flush(&mut segments, &mut literal);
                     segments.push(seg);
                 }
@@ -694,8 +702,12 @@ fn parse_conditional(cursor: &mut Cursor, outer_depth: usize) -> Option<Segment>
             depth -= 1;
             if depth == 0 {
                 let inner = &cursor.src[start + 2..cursor.pos - 2];
-                let branches = conditional_branch_sources(inner);
                 let mut body = Template(Vec::new());
+                let branches = if cursor.balanced_ends.is_some() {
+                    Vec::new()
+                } else {
+                    conditional_branch_sources(inner)
+                };
                 for branch in branches {
                     let mut branch_cursor = Cursor::new(branch);
                     for segment in parse_segments(&mut branch_cursor, Stops::NONE, outer_depth + 1)
@@ -735,31 +747,13 @@ fn conditional_branch_sources(inner: &str) -> Vec<&str> {
 }
 
 fn conditional_separator(input: &str, separator: &str) -> Option<usize> {
-    // Index balanced spans in linear passes, not repeated lookahead from each
-    // malformed opener. This retains the source-length × depth parsing bound.
-    let mut ends = vec![None; input.len()];
-    for (open, close) in [
-        ("{{", "}}"),
-        ("[[", "]]"),
-        ("<<", ">>"),
-        ("__", "__"),
-        ("\"\"", "\"\""),
-    ] {
-        let mut stack = Vec::new();
-        let mut pos = 0;
-        while pos < input.len() {
-            let rest = &input[pos..];
-            if rest.starts_with(close) && !stack.is_empty() {
-                ends[stack.pop().expect("nonempty stack")] = Some(pos + close.len());
-                pos += close.len();
-            } else if rest.starts_with(open) {
-                stack.push(pos);
-                pos += open.len();
-            } else {
-                pos += rest.chars().next().expect("nonempty suffix").len_utf8();
-            }
-        }
-    }
+    // One non-backtracking parser pass records balanced spans, including valid
+    // children of malformed parents. Reusing construct parsing keeps literal
+    // closers inside other constructs opaque (e.g. `>>` inside styled text).
+    let mut cursor = Cursor::new(input);
+    cursor.balanced_ends = Some(vec![None; input.len()]);
+    parse_segments(&mut cursor, Stops::NONE, 0);
+    let ends = cursor.balanced_ends.expect("separator scan records spans");
     let mut pos = 0;
     while pos < input.len() {
         let rest = &input[pos..];
@@ -798,9 +792,14 @@ fn parse_styled(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
     if !cursor.eat("\"\"") {
         return None;
     }
-    let mut body_cursor = Cursor::new(&cursor.src[body_start..end]);
-    let body = Template(parse_segments(&mut body_cursor, Stops::NONE, depth + 1));
-    cursor.depth_exceeded |= body_cursor.depth_exceeded;
+    let body = if cursor.balanced_ends.is_some() {
+        Template(Vec::new())
+    } else {
+        let mut body_cursor = Cursor::new(&cursor.src[body_start..end]);
+        let body = Template(parse_segments(&mut body_cursor, Stops::NONE, depth + 1));
+        cursor.depth_exceeded |= body_cursor.depth_exceeded;
+        body
+    };
     Some(Segment::Extension(Extension::Styled {
         source: cursor.src[start..cursor.pos].to_string(),
         modes,
@@ -1747,6 +1746,29 @@ mod tests {
     }
 
     #[test]
+    fn nested_styled_delimiters_preserve_skipped_conditional_slots() {
+        let input =
+            "<<{{LIVE ?? <<\"\"identity:>>\"\"/[[a/b]]//more>> // [[c/d]]}}/many>> · [[x/y]]";
+        let template = parse(input);
+        for seed in 0..100 {
+            let mut c = RoomContext {
+                seed,
+                live_count: 1,
+                member_count: 1,
+                ..ctx()
+            };
+            let active = render(&template, &c, &BranchExtensions);
+            c.member_count = 2;
+            let skipped = render(&template, &c, &BranchExtensions);
+            assert_eq!(
+                active.rsplit(" · ").next(),
+                skipped.rsplit(" · ").next(),
+                "seed {seed}: {active:?} versus {skipped:?}"
+            );
+        }
+    }
+
+    #[test]
     fn conditional_separators_ignore_balanced_nested_syntax() {
         for (yes, no) in [
             ("{{LIVE ?? [[a/b]] // [[c/d]]}}", "[[e/f]]"),
@@ -1755,6 +1777,13 @@ mod tests {
             ("<<a//b>>", "[[c/d]]"),
             ("__a//b__", "[[c/d]]"),
             ("\"\"identity:a//b\"\"", "[[c/d]]"),
+            ("<<\"\"identity:>>\"\"/[[a/b]]//more>>", "[[c/d]]"),
+            ("<<[[>>/a]]/[[a/b]]//more>>", "[[c/d]]"),
+            ("[[\"\"identity:]]\"\"/[[a/b]]//more]]", "[[c/d]]"),
+            ("[[<<]]/a>>/[[a/b]]//more]]", "[[c/d]]"),
+            ("<<[[list:>>]]/[[a/b]]//more>>", "[[c/d]]"),
+            ("__\"\"identity:__\"\"/[[a/b]]//more__", "[[c/d]]"),
+            ("\"\"identity:[[broken//more\"\"", "[[c/d]]"),
             ("é🎮 [[broken", "[[c/d]]"),
         ] {
             let inner = format!("LIVE ??{yes}//{no}");
