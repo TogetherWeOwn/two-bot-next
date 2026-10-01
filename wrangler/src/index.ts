@@ -55,9 +55,8 @@ export interface Env {
 const clickBuckets = new TokenBuckets();
 
 function redirectStore(env: Env): RedirectStore {
-  const snapshot = env.REDIRECT_MAPPINGS_JSON
-    ? parseMappingsSnapshot(env.REDIRECT_MAPPINGS_JSON)
-    : [];
+  const raw = env.REDIRECT_MAPPINGS_JSON;
+  const snapshot = raw === undefined || raw === "" ? [] : parseMappingsSnapshot(raw);
   // node-postgres ships inside the Worker via the `nodejs_compat` flag only
   // when S1 wires Hyperdrive; until then connect stays undefined and the
   // store serves the snapshot with clicks dropped (logged, never faked).

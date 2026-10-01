@@ -22,6 +22,7 @@ import {
   inviteUrl,
   isReservedInternal,
   isValidInviteCode,
+  isValidFallback,
   isValidSlug,
   type Campaign,
   type RedirectClick,
@@ -459,6 +460,60 @@ describe("configuration and campaign ingress fail closed", () => {
       assert.equal((await h.call(method, "/healthz?visitor=synthetic")).status, 503);
       assert.deepEqual(h.errors, ['invite_redirect_invalid_config {"errorClass":"invalid_fallback"}']);
     }
+  });
+
+  test("reserved prefixes reject malformed suffixes without configuration or throttle effects", async () => {
+    for (const path of [
+      "/healthz/%", "/metrics/%FF", "/%68ealthz/%", "/%6detrics/%FF",
+      "/HEALTHZ/%E0%A4", "//METRICS//%", "/%2fhealthz/%FF", "/%2F%6detrics%2F%",
+      "/healthz%2f%", "/metrics%2F%FF", "/healthz/%?visitor=synthetic",
+    ]) {
+      assert.ok(isReservedInternal(path), path);
+      for (const fallback of [FALLBACK, "has space"]) {
+        for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
+          const h = harness({ fallback });
+          h.deps.lookup = async () => { assert.fail("reserved prefixes must skip lookup"); };
+          h.deps.isThrottled = () => { assert.fail("reserved prefixes must skip throttling"); };
+          const res = await h.call(method, path);
+          assert.equal(res.status, 404, `${method} ${path}`);
+          assert.equal(res.headers.location, undefined);
+          assert.equal(res.click, undefined);
+          assert.equal(h.clicks.length, 0);
+          assert.deepEqual(h.errors, []);
+        }
+      }
+    }
+    for (const path of ["/healthz-campaign/%", "/metricsfoo/%FF", "/%252fhealthz/%", "/hea%FFlthz/%"]) {
+      assert.ok(!isReservedInternal(path), path);
+    }
+  });
+
+  test("fallback bindings reject non-string values without coercion", async () => {
+    for (const value of [123, 0, false, true, [], [FALLBACK], {}, { toString() { assert.fail("must not coerce fallback"); } }, Symbol("fixture")]) {
+      assert.equal(isValidFallback(value), false);
+      for (const path of ["/", "/reddit", "/healthz"]) {
+        const h = harness();
+        h.deps.fallbackInviteCode = value as string;
+        h.deps.lookup = async () => { assert.fail("invalid fallback must skip lookup"); };
+        h.deps.isThrottled = () => { assert.fail("invalid fallback must skip throttling"); };
+        const res = await h.call("GET", path);
+        assert.equal(res.status, 503);
+        assert.equal(res.headers.location, undefined);
+        assert.equal(res.click, undefined);
+        assert.equal(h.clicks.length, 0);
+        assert.deepEqual(h.errors, ['invite_redirect_invalid_config {"errorClass":"invalid_fallback"}']);
+      }
+    }
+    for (const value of [undefined, null, "", FALLBACK]) assert.ok(isValidFallback(value));
+  });
+
+  test("snapshot parser rejects non-string input without coercion", () => {
+    let coercions = 0;
+    const object = { toString() { coercions++; return "[]"; } };
+    for (const value of [undefined, null, false, 0, [], ["[]"], {}, object]) {
+      assert.throws(() => parseMappingsSnapshot(value), { message: "Invalid redirect mappings snapshot" });
+    }
+    assert.equal(coercions, 0);
   });
 
   test("healthz aliases cannot become a campaign, even with a polluted lookup", async () => {

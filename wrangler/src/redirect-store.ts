@@ -62,10 +62,11 @@ function rowToCampaign(row: CampaignRow): Campaign {
 }
 
 /** Parse the `REDIRECT_MAPPINGS_JSON` snapshot fallback (same row shape). */
-export function parseMappingsSnapshot(json: string): Campaign[] {
+export function parseMappingsSnapshot(json: unknown): Campaign[] {
   // Treat snapshots as configuration, not trusted database rows. Reject the
   // entire snapshot (including duplicates) rather than silently dropping rows.
   try {
+    if (typeof json !== "string") throw new Error();
     const rows: unknown = JSON.parse(json);
     if (!Array.isArray(rows)) throw new Error();
     const seen = new Set<string>();
