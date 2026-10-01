@@ -87,8 +87,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0160_rsvp.sql"),
         include_str!("../../cutover/migrations/0170_lfg.sql"),
         include_str!("../../cutover/migrations/0190_onboarding.sql"),
-        include_str!("../../cutover/migrations/0200_voice_rooms.sql"),
-        include_str!("../../cutover/migrations/0201_voice_inherit_limit.sql"),
+        include_str!("../../cutover/migrations/0200_self_roles.sql"),
+        include_str!("../../cutover/migrations/0210_voice_rooms.sql"),
+        include_str!("../../cutover/migrations/0211_voice_inherit_limit.sql"),
         include_str!("../../cutover/migrations/0300_website_contract.sql"),
         include_str!("../../cutover/migrations/0310_presence_probe.sql"),
         include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
@@ -131,6 +132,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     as_role(pool, &roles[1], "INSERT INTO public.voice_creators (guild_id, channel_id) VALUES ('100', '200'); SELECT * FROM public.voice_creators; UPDATE public.voice_creators SET default_limit = 5 WHERE guild_id = '100'; INSERT INTO public.voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at) VALUES ('100', '500', '200', '300', '300', '7', now()); SELECT * FROM public.voice_rooms; UPDATE public.voice_rooms SET owner_id = '301' WHERE guild_id = '100'; DELETE FROM public.voice_rooms WHERE guild_id = '100'; DELETE FROM public.voice_creators WHERE guild_id = '100'").await?;
     denied(pool, &roles[2], "SELECT * FROM public.voice_creators").await?;
     denied(pool, &roles[2], "SELECT * FROM public.voice_rooms").await?;
+    // Migration 0200 relations are runtime-operated: event claims and panel
+    // lane leases must work under the least-privilege login.
+    as_role(pool, &roles[1], "SELECT * FROM public.self_role_audit; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); UPDATE public.self_role_audit SET reason = 'probe' WHERE event_id = 'roles-probe'; DELETE FROM public.self_role_audit WHERE event_id = 'roles-probe'").await?;
+    as_role(pool, &roles[1], "SELECT * FROM public.self_role_panel_claims; INSERT INTO public.self_role_panel_claims (guild_id, member_id, panel_id, claim_token, claim_generation, processing_expires_at) VALUES ('g', 'm', 'p', 'tok', 1, now() + interval '1 minute'); UPDATE public.self_role_panel_claims SET latest_option_key = 'probe' WHERE guild_id = 'g' AND member_id = 'm' AND panel_id = 'p'; DELETE FROM public.self_role_panel_claims WHERE guild_id = 'g' AND member_id = 'm' AND panel_id = 'p'").await?;
     for view in [
         "contract_meta",
         "live_counts",
@@ -157,6 +162,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     for sql in [
         "SELECT * FROM public.members",
         "INSERT INTO public.members (member_id) VALUES ('test')",
+        "SELECT * FROM public.self_role_audit",
+        "SELECT * FROM public.self_role_panel_claims",
         "CREATE TABLE web_v1.reader_probe (id int)",
         "SELECT nextval('public.guild_settings_version_seq')",
     ] {

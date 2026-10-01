@@ -41,6 +41,10 @@
       "sha256": "dc3ead788a282166adf62fd5aa08366db5c4848f1fc633c420cc07a116e4ee9d",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0200_self_roles.sql": {
+      "sha256": "1e88d4300bea0c47c5ca37aaa1897314ecfa1677e43d7dcbbbfddf29344862df",
+      "justification": "Add reserved self-role audit and panel lease migration for TOG-10087; preserve legacy table and column names."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
@@ -69,17 +73,21 @@
       "sha256": "c291e8683b2afdeb23a985953a2afeba86519c06ec1deb8c6d2c5dd56d2f22bd",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0351_internal_action_roles.sql": {
+      "sha256": "889864e3d2768c5b95455b6b1e2071e20921cd65d5f8a017aad8668093b8f489",
+      "justification": "Pin the validated resolved role in internal-action intents and audits before REST for TOG-10861."
+    },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."
     },
-    "crates/cutover/migrations/0200_voice_rooms.sql": {
+    "crates/cutover/migrations/0210_voice_rooms.sql": {
       "sha256": "369accb6dacb308212282b37883a52579c3a168b8ab19b41027672878c0259d5",
-      "justification": "New V1 creator/room tables for TOG-10093; no existing migration touched."
+      "justification": "New V1 creator/room tables for TOG-10093; renumber unmerged migration to avoid main's 0200 self-role migration, SQL unchanged."
     },
-    "crates/cutover/migrations/0201_voice_inherit_limit.sql": {
+    "crates/cutover/migrations/0211_voice_inherit_limit.sql": {
       "sha256": "d1a9abe893e8b030db21452f29506a924d60bd7b880d7cef9debc53deb0dd4b4",
-      "justification": "New V1 nullable creator-limit inherit for TOG-10093; no existing migration touched."
+      "justification": "New V1 nullable creator-limit inherit for TOG-10093; follows renumbered 0210 voice schema, SQL unchanged."
     }
   }
 }
