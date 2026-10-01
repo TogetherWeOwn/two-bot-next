@@ -1569,8 +1569,7 @@ impl ActionExecutor {
     /// author checks or permission targets with a guessed identity.
     pub async fn current_bot_user_id(&self) -> Result<u64, DiscordError> {
         let req = Self::request_of(self.inner.factory.current_user())?;
-        self.pace(false).await;
-        let res = self.call_once_raw(req, &[200]).await?;
+        let res = self.call_once_raw_paced(req, &[200]).await?;
         let body: serde_json::Value = serde_json::from_slice(&res.body)
             .map_err(|_| DiscordError::Unavailable("invalid bot user response".into()))?;
         let id = body["id"]
