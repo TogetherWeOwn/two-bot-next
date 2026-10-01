@@ -25,7 +25,8 @@ import {
   TokenBuckets,
   handleRedirect,
   isReservedInternal,
-  type Campaign,
+  isValidFallback,
+  redirectErrorClass,
   type RedirectClick,
 } from "./redirect.ts";
 import { RedirectStore, parseMappingsSnapshot } from "./redirect-store.ts";
@@ -54,14 +55,8 @@ export interface Env {
 const clickBuckets = new TokenBuckets();
 
 function redirectStore(env: Env): RedirectStore {
-  let snapshot: Campaign[] = [];
-  try {
-    snapshot = env.REDIRECT_MAPPINGS_JSON
-      ? parseMappingsSnapshot(env.REDIRECT_MAPPINGS_JSON)
-      : [];
-  } catch {
-    snapshot = [];
-  }
+  const raw = env.REDIRECT_MAPPINGS_JSON;
+  const snapshot = raw === undefined || raw === "" ? [] : parseMappingsSnapshot(raw);
   // node-postgres ships inside the Worker via the `nodejs_compat` flag only
   // when S1 wires Hyperdrive; until then connect stays undefined and the
   // store serves the snapshot with clicks dropped (logged, never faked).
@@ -315,10 +310,9 @@ export default {
       return container.fetch(request);
     }
 
-    // Metrics are container-internal, never a public proxy or invite campaign.
-    // Canonicalized like the campaign lookup so /METRICS, /%6detrics,
-    // //metrics and /metrics/* cannot become a campaign redirect.
-    if (isReservedInternal(url.pathname)) {
+    // Internal metrics and healthz aliases never become invite campaigns.
+    // The exact /healthz redirect probe is handled below after config validation.
+    if (url.pathname !== "/healthz" && isReservedInternal(url.pathname)) {
       return new Response("not found", { status: 404 });
     }
 
@@ -326,7 +320,22 @@ export default {
     // the 302 via waitUntil — the visitor never waits on the database, and a
     // failed write costs a click, never a member. Record failures are logged
     // with slug only (never visitor data — see redirect.ts privacy note).
-    const store = redirectStore(env);
+    // Workers have no Node listen-port setting. Validate redirect configuration
+    // before serving campaigns or the redirect probe, without logging values.
+    const invalidConfig = (errorClass: string) => {
+      console.error(`invite_redirect_invalid_config ${JSON.stringify({ errorClass })}`);
+      return new Response("redirect service misconfigured\n", {
+        status: 503,
+        headers: { "content-type": "text/plain", "retry-after": "30" },
+      });
+    };
+    if (!isValidFallback(env.REDIRECT_FALLBACK_CODE)) return invalidConfig("invalid_fallback");
+    let store: RedirectStore;
+    try {
+      store = redirectStore(env);
+    } catch {
+      return invalidConfig("invalid_snapshot");
+    }
     const result = await handleRedirect(
       request.method,
       url.pathname,
@@ -346,7 +355,7 @@ export default {
       ctx.waitUntil(
         store.recordClick(click).catch((err: unknown) =>
           console.error(
-            `invite_click_record_failed ${JSON.stringify({ campaign: click.campaign, err: String(err) })}`,
+            `invite_click_record_failed ${JSON.stringify({ campaign: click.campaign, errorClass: redirectErrorClass(err) })}`,
           ),
         ),
       );
