@@ -94,6 +94,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0330_guild_settings.sql"),
         include_str!("../../cutover/migrations/0340_operational_audit.sql"),
         include_str!("../../cutover/migrations/0350_internal_actions.sql"),
+        include_str!("../../cutover/migrations/0360_gateway_onboarding_jobs.sql"),
     ] {
         sqlx::raw_sql(migration).execute(pool).await?;
     }
@@ -126,6 +127,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     )
     .await?;
     as_role(pool, &roles[1], "SELECT * FROM public.members; INSERT INTO public.guild_settings (guild_id, key, value, version, updated_by) VALUES ('test', 'test', '1', nextval('public.guild_settings_version_seq'), 'test'); UPDATE public.guild_settings SET value = '2' WHERE guild_id = 'test'; DELETE FROM public.guild_settings WHERE guild_id = 'test'").await?;
+    as_role(pool, &roles[1], "SELECT * FROM public.gateway_onboarding_jobs; INSERT INTO public.gateway_onboarding_jobs (guild_id, shard_id, session_id, seq, occurred_at_ms) VALUES ('roles', 0, 'roles', 1, 0); UPDATE public.gateway_onboarding_jobs SET state = 'running', attempts = attempts + 1 WHERE guild_id = 'roles'; DELETE FROM public.gateway_onboarding_jobs WHERE guild_id = 'roles'").await?;
     for view in [
         "contract_meta",
         "live_counts",
@@ -151,6 +153,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     }
     for sql in [
         "SELECT * FROM public.members",
+        "SELECT * FROM public.gateway_onboarding_jobs",
+        "INSERT INTO public.gateway_onboarding_jobs (guild_id, shard_id, session_id, seq, occurred_at_ms) VALUES ('reader', 0, 'reader', 1, 0)",
+        "SELECT nextval('public.gateway_onboarding_jobs_id_seq')",
         "INSERT INTO public.members (member_id) VALUES ('test')",
         "CREATE TABLE web_v1.reader_probe (id int)",
         "SELECT nextval('public.guild_settings_version_seq')",
@@ -167,6 +172,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         (format!("GRANT CREATE ON SCHEMA public TO {runtime}"),
          format!("REVOKE CREATE ON SCHEMA public FROM {runtime}")),
         (format!("GRANT {migrator} TO {reader}"), format!("REVOKE {migrator} FROM {reader}")),
+        (format!("REVOKE SELECT ON public.gateway_onboarding_jobs FROM {runtime}"),
+         format!("GRANT SELECT ON public.gateway_onboarding_jobs TO {runtime}")),
         (format!("REVOKE SELECT ON web_v1.members FROM {reader}"),
          format!("GRANT SELECT ON web_v1.members TO {reader}")),
         (format!("ALTER DEFAULT PRIVILEGES FOR ROLE {migrator} GRANT SELECT ON TABLES TO {reader}"),

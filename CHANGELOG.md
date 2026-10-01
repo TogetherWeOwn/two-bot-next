@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Include the onboarding recovery table and sequence in the reviewed runtime privilege matrix so DML-only gateway startup can recover pending jobs; preserve web-reader denial and verify queue grants through isolated role regressions.
 - Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)

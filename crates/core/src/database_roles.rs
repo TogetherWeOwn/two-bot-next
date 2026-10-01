@@ -62,6 +62,7 @@ mod tests {
             include_str!("../../cutover/migrations/0330_guild_settings.sql"),
             include_str!("../../cutover/migrations/0340_operational_audit.sql"),
             include_str!("../../cutover/migrations/0350_internal_actions.sql"),
+            include_str!("../../cutover/migrations/0360_gateway_onboarding_jobs.sql"),
         ] {
             let mut table = None;
             for line in migration.lines() {
@@ -72,9 +73,14 @@ mod tests {
                     table = Some(name);
                 } else {
                     let mut words = line.split_whitespace();
-                    if let (Some(column), Some("BIGSERIAL" | "SERIAL" | "SMALLSERIAL")) =
-                        (words.next(), words.next())
-                    {
+                    if let (Some(column), Some(_)) = (
+                        words.next(),
+                        words.next().filter(|kind| {
+                            ["BIGSERIAL", "SERIAL", "SMALLSERIAL"]
+                                .iter()
+                                .any(|serial| kind.eq_ignore_ascii_case(serial))
+                        }),
+                    ) {
                         let table = table.expect("serial column outside table");
                         assert!(MATRIX
                             .contains(&format!("'public', '{table}_{column}_seq', 'sequence'")));
