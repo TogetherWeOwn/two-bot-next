@@ -25,6 +25,7 @@ class DockerFixture:
         self.binary_size = 7 * smoke.MIB
         self.user = "two-bot"
         self.health_command = ["CMD", smoke.BINARY, "--healthcheck"]
+        self.ca_bundle = "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n"
         self.uid = "1000"
         self.live_health_exit = 0
         self.trust_bundle_exit = 0
@@ -60,6 +61,8 @@ class DockerFixture:
                 "Running": not self.stopped, "OOMKilled": self.oom,
                 "Health": {"Status": self.health_status},
             }}])
+        elif args[0] == "exec" and tuple(args[-2:]) == ("cat", smoke.CA_BUNDLE):
+            output = self.ca_bundle
         elif args[0] == "exec" and "cat" in args:
             output = "Name:\ttwo-bot\nUid:\t" + "\t".join([self.uid] * 4) + "\n"
         elif args[0] == "exec" and "grep" in args:
@@ -130,7 +133,7 @@ class RedirectReadyzHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.path == "/other":
-            json_reply(self, 503, b'{"components": [["process", "ready"], ["gateway", "down"]]}')
+            json_reply(self, 503, b'{"components": [["process", "ready"], ["gateway", "down"], ["database", "down"]]}')
         else:
             json_reply(self, 200, b'{"status": "ok"}')
 
@@ -166,7 +169,7 @@ PARKED_JOB = {"parked": True, "running": False, "last_start": None,
 
 
 def parked_readyz_body():
-    return {"components": [["process", "ready"], ["gateway", "down"]],
+    return {"components": [["process", "ready"], ["gateway", "down"], ["database", "down"]],
             "jobs": {name: dict(PARKED_JOB) for name in (
                 "counter", "rank", "scheduled_events", "presence_probe",
                 "community_scorecard", "inactivity",
@@ -257,6 +260,21 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assert_rejected("image exceeds size budget", image_max_bytes=1)
         self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
 
+    def test_ci_image_size_failure_keeps_default_budgets(self):
+        self.fixture.image_size = 142437143
+        self.fixture.binary_size = 10287160
+        self.assertEqual(smoke.IMAGE_MAX_BYTES, 112 * smoke.MIB)
+        self.assertEqual(smoke.BINARY_MAX_BYTES, 11 * smoke.MIB)
+        self.assert_rejected("image exceeds size budget")
+        self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
+
+    def test_runtime_ca_bundle_is_required(self):
+        for bundle in ("", "not PEM", "-----BEGIN CERTIFICATE-----\n"):
+            with self.subTest(bundle=bundle):
+                self.fixture.ca_bundle = bundle
+                self.assert_rejected("runtime CA bundle must contain PEM certificates")
+                self.assertTrue(self.fixture.removals())
+
     def test_binary_budget_is_enforced(self):
         self.assert_rejected("release binary exceeds size budget", binary_max_bytes=1)
 
@@ -315,11 +333,11 @@ class ContainerSmokeTests(unittest.TestCase):
         # The pre-jobs contract is deliberately superseded: an informational
         # jobs map is now always serialized, so a bare components body no
         # longer satisfies the smoke gate.
-        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"]]}) if url.endswith("/readyz") else (200, {"status": "ok"})
+        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"], ["database", "down"]]}) if url.endswith("/readyz") else (200, {"status": "ok"})
         self.assert_rejected("all six jobs parked")
 
     def test_readyz_without_jobs_map_fails(self):
-        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"]], "jobs": {}}) if url.endswith("/readyz") else (200, {"status": "ok"})
+        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"], ["database", "down"]], "jobs": {}}) if url.endswith("/readyz") else (200, {"status": "ok"})
         self.assert_rejected("all six jobs parked")
 
     def test_readyz_with_missing_job_fails(self):
@@ -357,6 +375,18 @@ class ContainerSmokeTests(unittest.TestCase):
         body["components"] = [["process", "ready"], ["gateway", "ready"]]
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
         self.assert_rejected("ready process and parked gateway")
+
+    def test_readyz_database_contract_is_enforced(self):
+        for components in (
+            [["process", "ready"], ["gateway", "down"]],
+            [["process", "ready"], ["gateway", "down"], ["database", "ready"]],
+            [["process", "ready"], ["gateway", "down"], ["database", "down"], ["extra", "down"]],
+        ):
+            with self.subTest(components=components):
+                body = parked_readyz_body()
+                body["components"] = components
+                self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+                self.assert_rejected("database down")
 
     def test_readyz_non_object_body_fails(self):
         self.http = lambda url: (503, []) if url.endswith("/readyz") else (200, {"status": "ok"})

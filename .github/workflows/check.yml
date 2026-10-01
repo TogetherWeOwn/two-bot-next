@@ -170,6 +170,14 @@ jobs:
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
+      - name: Docker dependency-layer manifests (offline)
+        run: python3 scripts/check-docker-manifests.py
+
+      - name: Store Postgres integration (isolated CI schemas)
+        env:
+          TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
+        run: cargo test -p two-bot-store --locked --test postgres -- --ignored
+
       - name: legacy copy acceptance (two owned databases on CI service only)
         run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
 
@@ -181,13 +189,16 @@ jobs:
       - name: channel moderation store clippy
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
 
-      # TWO_TEST_DATABASE_URL is scoped to this step only: the workspace suite
-      # above runs exactly as on main (RSVP store tests skip without it), and
-      # only this slice's tests activate their test-container guard here.
+      # Only this slice's tests activate their test-container guard here.
       - name: channel moderation domain and store tests
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
+
+      - name: Internal channel moderation executor (mock REST and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
 
       - name: Internal-member durable store regressions (CI service only)
         env:
@@ -252,7 +263,7 @@ jobs:
 
   container:
     name: container smoke
-    runs-on: [self-hosted, two-selfhosted]
+    runs-on: [self-hosted, two-ephemeral]
     timeout-minutes: 30
     env:
       IMAGE: two-bot-next:smoke-${{ github.run_id }}-${{ github.run_attempt }}
@@ -367,6 +378,45 @@ jobs:
       - run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - run: cargo test -p two-bot-core --features db --test feeds --locked
       - run: cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
+
+  tickets-postgres:
+    name: tickets postgres
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 15
+    # Service DNS stays inside this job's network; never publish a shared port.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    services:
+      agent-testdb:
+        image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TICKET_TEST_DB_HOST: agent-testdb
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        with:
+          toolchain: stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-tickets-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Ticket lifecycle and migration integration tests
+        run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
+      - name: Ticket shared router and mock Discord lifecycle acceptance
+        run: >-
+          cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored
 
   worker:
     name: worker check
