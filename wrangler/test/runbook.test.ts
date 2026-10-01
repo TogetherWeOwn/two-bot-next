@@ -4,7 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -166,6 +166,30 @@ test("Wrangler runbook examples exist in npm scripts and pinned CLI help", () =>
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+});
+
+function checkLocalLinks(markdown: string): number {
+  let checked = 0;
+  for (const match of markdown.matchAll(/\[[^\]]*\]\(([^)\s]+)\)/g)) {
+    const href = match[1];
+    if (/^https?:\/\//.test(href)) continue; // Offline check; not remote availability.
+    const [path, anchor] = href.split("#");
+    const target = new URL(path || "runbook.md", new URL("docs/", root));
+    assert.ok(existsSync(target), `missing local runbook link: ${href}`);
+    if (anchor && target.pathname.endsWith(".md")) {
+      const headings = [...readFileSync(target, "utf8").matchAll(/^#{1,6} (.+)$/gm)]
+        .map((heading) => heading[1].toLowerCase().replace(/[^\w\s-]/g, "").replace(/\s/g, "-"));
+      assert.ok(headings.includes(anchor), `missing runbook heading: ${href}`);
+    }
+    checked++;
+  }
+  return checked;
+}
+
+test("runbook local file links and Markdown heading anchors resolve", () => {
+  assert.ok(checkLocalLinks(runbook) > 20);
+  assert.throws(() => checkLocalLinks("[missing](does-not-exist.md)"), /missing local/);
+  assert.throws(() => checkLocalLinks("[missing](#does-not-exist)"), /missing runbook heading/);
 });
 
 test("shell fences contain only covered tools and one-line examples", () => {
