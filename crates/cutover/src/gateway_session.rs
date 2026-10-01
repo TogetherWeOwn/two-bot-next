@@ -4,11 +4,11 @@
 //! sqlx 0.9 transaction executor: <https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html>
 
 use sqlx::{PgConnection, PgPool};
-use two_bot_core::gateway_funnel::FunnelBatch;
+use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
 use two_bot_core::gateway_session::{dispatch_action, DispatchAction, GatewaySession};
 use two_bot_core::{format_iso_millis, idempotency_key, FunnelEvent};
 
-use crate::db::{advance_activity, project_event, FunnelWrite};
+use crate::db::{project_event, FunnelWrite};
 
 #[derive(Clone)]
 pub struct GatewaySessionStore {
@@ -80,6 +80,57 @@ impl GatewaySessionStore {
             tx.rollback().await?;
             return Ok(DispatchAction::Duplicate);
         }
+        for (guild_id, member_id) in batch.bots {
+            if guild_id.to_string() != self.guild_id {
+                return Err(sqlx::Error::InvalidArgument(
+                    "gateway bot belongs to another guild".into(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO members (guild_id, member_id, is_bot) VALUES ($1, $2, TRUE)
+                 ON CONFLICT (guild_id, member_id) DO UPDATE SET is_bot = TRUE",
+            )
+            .bind(&self.guild_id)
+            .bind(member_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
+        for snapshot in batch.snapshots {
+            let guild_id = match &snapshot {
+                SnapshotWrite::StoreAll(guild_id, _)
+                | SnapshotWrite::DeleteMissing(guild_id, _) => *guild_id,
+            };
+            if guild_id.to_string() != self.guild_id {
+                return Err(sqlx::Error::InvalidArgument(
+                    "gateway snapshot belongs to another guild".into(),
+                ));
+            }
+            match snapshot {
+                SnapshotWrite::StoreAll(_, states) => {
+                    for state in states {
+                        sqlx::query(
+                            "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
+                             VALUES ($1, $2, $3, $4, $5, to_timestamp($6::double precision / 1000))
+                             ON CONFLICT (guild_id, code) DO UPDATE SET uses = EXCLUDED.uses,
+                             inviter_id = EXCLUDED.inviter_id, channel_id = EXCLUDED.channel_id, updated_at = EXCLUDED.updated_at",
+                        ).bind(&self.guild_id).bind(state.code)
+                            .bind(i32::try_from(state.uses).map_err(|e| sqlx::Error::Decode(Box::new(e)))?)
+                            .bind(state.inviter_id.map(|id| id.to_string()))
+                            .bind(state.channel_id.map(|id| id.to_string()))
+                            .bind(session.updated_at_ms).execute(&mut *tx).await?;
+                    }
+                }
+                SnapshotWrite::DeleteMissing(_, live) => {
+                    sqlx::query(
+                        "DELETE FROM invite_snapshots WHERE guild_id = $1 AND code <> ALL($2)",
+                    )
+                    .bind(&self.guild_id)
+                    .bind(live.into_iter().collect::<Vec<_>>())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
         for event in batch.events {
             if event.guild_id.to_string() != self.guild_id {
                 return Err(sqlx::Error::InvalidArgument(
@@ -112,7 +163,11 @@ impl GatewaySessionStore {
                     "gateway activity belongs to another guild".into(),
                 ));
             }
-            advance_activity(&mut tx, &self.guild_id, &member_id.to_string(), &at).await?;
+            sqlx::query(
+                "INSERT INTO members (guild_id, member_id, last_active_at) VALUES ($1, $2, $3::timestamptz)
+                 ON CONFLICT (guild_id, member_id) DO UPDATE SET last_active_at = EXCLUDED.last_active_at
+                 WHERE members.last_active_at IS NULL OR members.last_active_at < EXCLUDED.last_active_at",
+            ).bind(&self.guild_id).bind(member_id.to_string()).bind(&at).execute(&mut *tx).await?;
         }
         for snapshot in batch.invite_snapshots {
             if snapshot.guild_id.to_string() != self.guild_id {
@@ -162,6 +217,31 @@ impl GatewaySessionStore {
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(DispatchAction::Apply)
+    }
+
+    pub async fn invite_snapshots(&self) -> Result<Vec<two_bot_core::InviteState>, sqlx::Error> {
+        let rows: Vec<(String, i32, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT code, uses, inviter_id, channel_id FROM invite_snapshots WHERE guild_id = $1",
+        )
+        .bind(&self.guild_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(code, uses, inviter_id, channel_id)| {
+                Ok(two_bot_core::InviteState {
+                    code,
+                    uses: u64::try_from(uses).map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                    inviter_id: inviter_id
+                        .map(|id| id.parse())
+                        .transpose()
+                        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                    channel_id: channel_id
+                        .map(|id| id.parse())
+                        .transpose()
+                        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                })
+            })
+            .collect()
     }
 
     /// The only durable read models the S3 funnel needs on a cold resume.
