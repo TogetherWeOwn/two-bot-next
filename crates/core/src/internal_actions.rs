@@ -1649,7 +1649,7 @@ mod tests {
             raw in proptest::collection::vec(any::<u8>(), 0..256),
         ) {
             if let Ok(keys) = parse_keys(&text) {
-                let normalized = keys.iter().map(|key| format!("{}:{}", key.id, String::from_utf8_lossy(&key.secret)))
+                let normalized = keys.iter().map(|key| format!("{}:{}", key.id, String::from_utf8_lossy(key.secret.expose())))
                     .collect::<Vec<_>>().join(",");
                 prop_assert_eq!(parse_keys(&normalized), Ok(keys));
             }
@@ -1668,7 +1668,7 @@ mod tests {
             let wire = entries.iter().map(|(id, secret)| format!(" {id} : {secret} "))
                 .collect::<Vec<_>>().join(",");
             let expected = entries.iter().map(|(id, secret)| SigningKey {
-                id: id.clone(), secret: secret.as_bytes().to_vec(),
+                id: id.clone(), secret: crate::Secret::new(secret.as_bytes().to_vec()),
             }).collect::<Vec<_>>();
             prop_assert_eq!(parse_keys(&wire), Ok(expected));
             for n in [0, 1, 31, 32, 33, length] {
@@ -3026,7 +3026,7 @@ mod tests {
         .expect("old key accepted during overlap");
         let rotated = KeyRing::new(vec![SigningKey {
             id: "web2".to_owned(),
-            secret: vec2().secret.as_bytes().to_vec(),
+            secret: crate::Secret::new(vec2().secret.as_bytes().to_vec()),
         }]);
         assert!(!rotated.verify(
             "web",

@@ -377,7 +377,7 @@ impl AuditStore {
              WHERE entry_id = $1 AND delivery_claim_token = $2 AND delivery_generation = $3
                AND delivery_state = 'delivering' AND delivery_lease_until > clock_timestamp()
                AND delivery_search_before IS NOT NULL AND mirror_message_id IS NULL",
-        ).bind(&claim.row.event.entry_id).bind(&claim.token).bind(claim.generation)
+        ).bind(&claim.row.event.entry_id).bind(claim.token.expose()).bind(claim.generation)
             .execute(&mut *tx).await?.rows_affected() == 1;
         tx.commit().await?;
         Ok(if updated {
