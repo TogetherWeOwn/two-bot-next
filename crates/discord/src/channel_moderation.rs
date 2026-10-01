@@ -274,8 +274,10 @@ impl ChannelModerationRuntime {
                     ChannelCallOutcome::OverwriteWritten | ChannelCallOutcome::OverwriteDeleted => {
                         ChannelOutcome::Unlocked
                     }
-                    ChannelCallOutcome::Posted { .. } => {
-                        unreachable!("channel moderation never posts")
+                    ChannelCallOutcome::Posted { .. } | ChannelCallOutcome::MessageDeleted => {
+                        unreachable!(
+                            "channel moderation never posts or uses single-message deletes"
+                        )
                     }
                 };
                 (
