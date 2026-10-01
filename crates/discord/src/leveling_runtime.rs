@@ -295,7 +295,8 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
         eligibility: MessageEligibility,
     ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
         let _dispatch = self.dispatch.lock().await;
-        self.pipeline.handle_at_with_eligibility(event, at, eligibility);
+        self.pipeline
+            .handle_at_with_eligibility(event, at, eligibility);
         let requests = self.pending.take();
         let mut results = Vec::with_capacity(requests.len());
         if let Some(runtime) = &self.runtime {
