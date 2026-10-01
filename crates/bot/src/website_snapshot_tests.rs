@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{guard_database_url, TestDatabase};
 
 use crate::discord_test_common::{MockRest, ScriptedResponse};
 
@@ -65,6 +65,8 @@ fn malformed_snapshots() -> Vec<Value> {
 /// A lazy pool never connects unless malformed/stopped work reaches storage.
 /// Its short acquire timeout bounds a regression, and only the test service is named.
 fn poison_pool() -> PgPool {
+    guard_database_url("postgres://agent_test:@agent-testdb:5432/two_bot_test_poison")
+        .expect("poison pool must reject ambient PostgreSQL connection settings");
     PgPoolOptions::new()
         .acquire_timeout(Duration::from_millis(20))
         .connect_lazy_with(
@@ -207,7 +209,9 @@ async fn mirror(pool: &PgPool) -> Vec<String> {
         "guild_counters",
         "counter_snapshots",
         "rank_snapshots",
+        "rank_ladder",
         "member_ranks",
+        "member_exclusions",
     ] {
         // Fixed fixture-only identifiers; include every field and timestamp.
         let sql = sqlx::AssertSqlSafe(format!(
@@ -399,6 +403,23 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
         .unwrap();
     }
     mock.shutdown().await;
+    let excluded: Vec<String> = sqlx::query_scalar(
+        "SELECT member_id FROM member_exclusions WHERE guild_id='2222' ORDER BY member_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        excluded,
+        (0..two_bot_core::RAID_ANOMALIES.len())
+            .map(|index| (9000 + index).to_string())
+            .collect::<Vec<_>>(),
+        "baseline must include every seeded raid exclusion"
+    );
+    assert!(
+        !excluded.is_empty(),
+        "exclusion preservation must not be vacuous"
+    );
     let before = mirror(pool).await;
 
     for (kind, script, expected_requests) in [
