@@ -278,8 +278,8 @@ async fn voice_startup_uses_dml_role_without_migration_ledger_access() {
         .execute(&restricted)
         .await;
     let config = two_bot_core::Config {
-        discord_token: Some(TOKEN.into()),
-        database_url: Some(url.to_string()),
+        discord_token: Some(two_bot_core::Secret::new(TOKEN.to_owned())),
+        database_url: Some(two_bot_core::Secret::new(url.to_string())),
         listen_addr: "127.0.0.1:0".to_owned(),
         guild_id: Some(100),
     };
