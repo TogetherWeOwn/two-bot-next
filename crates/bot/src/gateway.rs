@@ -154,6 +154,7 @@ struct Hello {
 
 /// Client-side bound from pool acquisition through COMMIT, including stalled
 /// responses on an acquired connection. Never restore readiness during drain.
+/// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
     generation: &AtomicU64,
@@ -220,6 +221,8 @@ enum ReceivedWork {
 /// Raw packets retain unmapped dispatch sequences too. Poll transport separately
 /// from the serial effects/checkpoint writer. Metadata may advance in reception;
 /// only the worker's successful transaction advances the durable replay cursor.
+/// Twilight owns transport, heartbeat and opcode-9 fallback.
+/// Source: <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html>
 ///
 /// The shared command runtime dispatches detached work at reception (after the
 /// replay guard), so slash acknowledgements do not queue behind slow funnel I/O.
