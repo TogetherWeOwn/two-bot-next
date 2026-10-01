@@ -87,7 +87,12 @@ fn guard_environment(mut is_set: impl FnMut(&str) -> bool) -> Result<()> {
     Ok(())
 }
 
-fn connect_options(raw: &str) -> Result<PgConnectOptions> {
+// Fixture pools keep a tight timeout; the admin connection only runs
+// CREATE/DROP DATABASE, which can legitimately exceed it on a loaded runner.
+const FIXTURE_STATEMENT_TIMEOUT: &str = "5000ms";
+const ADMIN_DDL_STATEMENT_TIMEOUT: &str = "120s";
+
+fn connect_options(raw: &str, statement_timeout: &str) -> Result<PgConnectOptions> {
     guard_database_url(raw)?;
     let url = Url::parse(raw).expect("guard already parsed URL");
     Ok(PgConnectOptions::new_without_pgpass()
@@ -97,7 +102,7 @@ fn connect_options(raw: &str) -> Result<PgConnectOptions> {
         .password("")
         .database(url.path().trim_start_matches('/'))
         .ssl_mode(PgSslMode::Disable)
-        .options([("statement_timeout", "5000ms")]))
+        .options([("statement_timeout", statement_timeout)]))
 }
 
 // CREATE/DROP DATABASE can wait for checkpoints. Queue fixture lifecycle DDL
@@ -158,11 +163,11 @@ pub struct TestDatabase {
 
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
-        let options = connect_options(raw)?;
+        let options = connect_options(raw, FIXTURE_STATEMENT_TIMEOUT)?;
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_with(options.clone())
+            .connect_with(connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?)
             .await
             .context("connect to test bootstrap database")?;
         let name = database_name();
