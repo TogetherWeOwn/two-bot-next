@@ -41,7 +41,7 @@ env:
 jobs:
   pr-lint:
     name: pr-lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 5
     steps:
       - name: Resolve PR title/body
