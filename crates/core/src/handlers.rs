@@ -119,14 +119,7 @@ impl MemStore {
 
 impl FunnelStore for MemStore {
     fn record(&self, event: FunnelEvent) -> RecordOutcome {
-        let row = StoredRow::from(&event);
-        let mut inner = self.inner.lock().expect("store lock");
-        if inner.keys.contains(&row.idempotency_key) {
-            return RecordOutcome { inserted: false };
-        }
-        inner.keys.insert(row.idempotency_key.clone());
-        inner.rows.push(row);
-        RecordOutcome { inserted: true }
+        crate::membership::MembershipStore::record_observed(self, event, None)
     }
 
     fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
@@ -184,6 +177,58 @@ impl FunnelStore for MemStore {
                     && row.member_id == Some(member_id)
                     && row.event_type == event_type
             })
+    }
+}
+
+impl crate::membership::MembershipStore for MemStore {
+    fn membership(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+    ) -> Option<crate::membership::Membership> {
+        let inner = self.inner.lock().expect("store lock");
+        crate::membership::project(
+            inner
+                .rows
+                .iter()
+                .filter(|r| r.guild_id == guild_id && r.member_id == Some(member_id)),
+        )
+    }
+
+    fn membership_rows(&self, guild_id: Snowflake, member_id: Snowflake) -> Vec<StoredRow> {
+        self.rows()
+            .into_iter()
+            .filter(|r| r.guild_id == guild_id && r.member_id == Some(member_id))
+            .collect()
+    }
+
+    fn record_observed(&self, event: FunnelEvent, observed_at: Option<&str>) -> RecordOutcome {
+        let mut row = StoredRow::from(&event);
+        let metadata_hint = row
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("membershipObservedAt"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let hint = observed_at.or(metadata_hint.as_deref());
+        let mut inner = self.inner.lock().expect("store lock");
+        if inner.keys.contains(&row.idempotency_key) {
+            if let Some(hint) = hint {
+                let existing = inner
+                    .rows
+                    .iter_mut()
+                    .find(|r| r.idempotency_key == row.idempotency_key)
+                    .expect("key has a row");
+                crate::membership::advance_observation(existing, hint);
+            }
+            return RecordOutcome { inserted: false };
+        }
+        if let Some(hint) = observed_at {
+            crate::membership::advance_observation(&mut row, hint);
+        }
+        inner.keys.insert(row.idempotency_key.clone());
+        inner.rows.push(row);
+        RecordOutcome { inserted: true }
     }
 }
 
