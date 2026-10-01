@@ -137,7 +137,7 @@ class SupplyChainTests(unittest.TestCase):
         self.assertIn("two-bot-next:scan-${{ github.run_id }}-${{ github.run_attempt }}", supply)
         self.assertEqual(supply.count("image-ref: ${{ env.IMAGE }}"), 2)
         self.assertIn('docker image rm "$IMAGE"', supply)
-        self.assertIn("TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache", supply)
+        self.assertIn('printf \'TRIVY_CACHE_DIR=%s/trivy-cache\\n\' "$RUNNER_TEMP" >> "$GITHUB_ENV"', supply)
         for name in ["check", "release", "supply-chain"]:
             path = ROOT / ".github/workflows" / f"{name}.yml"
             self.assertNotIn("ubuntu-latest", path.read_text(), str(path))

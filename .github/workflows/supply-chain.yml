@@ -19,7 +19,6 @@ jobs:
     env:
       # Runners share a Docker daemon; never scan or remove a sibling's tag.
       IMAGE: two-bot-next:scan-${{ github.run_id }}-${{ github.run_attempt }}
-      TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,6 +48,7 @@ jobs:
       - name: Prepare Rust lockfile inventory and image provenance
         run: |
           mkdir -p sbom "$RUNNER_TEMP/rust-workspace"
+          printf 'TRIVY_CACHE_DIR=%s/trivy-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           cp source/Cargo.lock "$RUNNER_TEMP/rust-workspace/Cargo.lock"
           git -C source rev-parse HEAD > sbom/source-sha.txt
           docker image inspect "$IMAGE" --format '{{.Id}}' > sbom/image-id.txt
