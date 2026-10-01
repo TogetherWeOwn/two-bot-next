@@ -54,6 +54,8 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'internal_idempotency_intent_id_seq', 'sequence'),
     ('public', 'internal_action_log_audit_id_seq', 'sequence'),
     ('public', 'guild_settings_version_seq', 'sequence'),
+    ('public', 'guild_settings_cas_seq', 'sequence'),
+    ('public', 'guild_settings_assign_version()', 'function'),
     ('public', 'guild_settings_advance_revision()', 'function'),
     ('public', 'guild_settings_audit_append_only()', 'function'),
     ('web_v1', 'contract_meta', 'view'),
