@@ -1599,7 +1599,106 @@ fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn property_signing_preserves_valid_request_framing_and_distinguishes_changes(
+            timestamp in 0u64..999_999_999_999_999,
+            nonce in "[0-9a-fA-F]{32}",
+            raw in proptest::collection::vec(any::<u8>(), 0..256),
+            secret in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            // Only POST /internal/actions is supported. Header validation excludes
+            // newlines; SHA-256 collision resistance is an assumption, not a proof.
+            let ts = timestamp.to_string();
+            let canonical = canonical_string(&ts, &nonce, &raw);
+            let fields = canonical.split('\n').collect::<Vec<_>>();
+            prop_assert_eq!(fields.len(), 5);
+            prop_assert_eq!(&fields[..4], &["POST", "/internal/actions", ts.as_str(), nonce.as_str()]);
+            prop_assert_eq!(fields[4], hex::encode(Sha256::digest(&raw)));
+            prop_assert!(within_skew(&ts, 0, timestamp));
+            prop_assert!(valid_nonce_format(&nonce));
+
+            let signature = sign(&secret, &ts, &nonce, &raw);
+            prop_assert!(signatures_match(&signature, &sign(&secret, &ts, &nonce, &raw)));
+            let changed_ts = (timestamp + 1).to_string();
+            let mut changed_nonce = nonce.clone();
+            changed_nonce.replace_range(..1, if nonce.starts_with('0') { "1" } else { "0" });
+            let mut changed_body = raw.clone();
+            changed_body.push(0);
+            for (other_ts, other_nonce, other_body) in [
+                (changed_ts.as_str(), nonce.as_str(), raw.as_slice()),
+                (ts.as_str(), changed_nonce.as_str(), raw.as_slice()),
+                (ts.as_str(), nonce.as_str(), changed_body.as_slice()),
+            ] {
+                prop_assert_ne!(&canonical, &canonical_string(other_ts, other_nonce, other_body));
+                prop_assert!(!signatures_match(&signature, &sign(&secret, other_ts, other_nonce, other_body)));
+            }
+        }
+
+        #[test]
+        fn property_key_parser_and_signer_never_panic(
+            text in proptest::collection::vec(any::<char>(), 0..256)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            raw in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            if let Ok(keys) = parse_keys(&text) {
+                let normalized = keys.iter().map(|key| format!("{}:{}", key.id, String::from_utf8_lossy(&key.secret)))
+                    .collect::<Vec<_>>().join(",");
+                prop_assert_eq!(parse_keys(&normalized), Ok(keys));
+            }
+            let signature = sign(&raw, &text, &text, &raw);
+            prop_assert_eq!(signature.len(), 71);
+            prop_assert!(signature.starts_with("sha256="));
+            let _ = within_skew(&text, SKEW_SECONDS, 0);
+            let _ = valid_nonce_format(&text);
+        }
+
+        #[test]
+        fn property_valid_key_specs_round_trip_and_enforce_the_minimum(
+            entries in proptest::collection::vec(("[a-z0-9_-]{1,16}", "[a-zA-Z0-9:]{32,80}"), 1..=8),
+            length in 0usize..=64,
+        ) {
+            let wire = entries.iter().map(|(id, secret)| format!(" {id} : {secret} "))
+                .collect::<Vec<_>>().join(",");
+            let expected = entries.iter().map(|(id, secret)| SigningKey {
+                id: id.clone(), secret: secret.as_bytes().to_vec(),
+            }).collect::<Vec<_>>();
+            prop_assert_eq!(parse_keys(&wire), Ok(expected));
+            for n in [0, 1, 31, 32, 33, length] {
+                let spec = format!("fixture:{}", "a".repeat(n));
+                prop_assert_eq!(parse_keys(&spec).is_ok(), n >= 32);
+            }
+        }
+
+        #[test]
+        fn property_moderation_numbers_match_inclusive_runtime_bounds(value in any::<i64>()) {
+            for (action, min, max) in [
+                (ModerationAction::TempBan, 60, 31_536_000),
+                (ModerationAction::Timeout, 60, 2_419_200),
+                (ModerationAction::Purge, 1, 100),
+                (ModerationAction::Slowmode, 0, 21_600),
+            ] {
+                // Every run exercises both exact edges, not only random i64s
+                // (which almost never fall inside the smaller accepted ranges).
+                for n in [min - 1, min, min + 1, max - 1, max, max + 1, value] {
+                    let number = json!(n);
+                    let result = validate_moderation_numbers(action, Some(&number), Some(&number), Some(&number));
+                    prop_assert_eq!(result.is_ok(), (min..=max).contains(&n));
+                    let string = json!(n.to_string());
+                    prop_assert!(validate_moderation_numbers(action, Some(&string), Some(&string), Some(&string)).is_err());
+                }
+                prop_assert!(validate_moderation_numbers(action, None, None, None).is_err());
+                for invalid in [Value::Null, json!(true), json!(1.5), json!([]), json!({})] {
+                    prop_assert!(validate_moderation_numbers(action, Some(&invalid), Some(&invalid), Some(&invalid)).is_err());
+                }
+            }
+        }
+    }
 
     use crate::settings::{classify_key, SETTING_CLASSES};
     use std::sync::OnceLock;

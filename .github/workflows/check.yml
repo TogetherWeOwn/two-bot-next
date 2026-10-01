@@ -114,6 +114,16 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --test '*' --features two-bot-core/db --locked
 
+      # Reuse the exact feature/target graph above so this measures execution,
+      # not a second compilation. Property tests are pure fixtures (64 cases).
+      - name: property tests stay under 30 seconds
+        run: |
+          start=$SECONDS
+          cargo test --workspace --lib --bins --test '*' --features two-bot-core/db --locked property_
+          elapsed=$((SECONDS - start))
+          printf 'Property suite: %s seconds (budget <30)\n' "$elapsed"
+          test "$elapsed" -lt 30
+
       - name: cargo test (docs)
         run: cargo test --workspace --doc --features two-bot-core/db --locked
 
