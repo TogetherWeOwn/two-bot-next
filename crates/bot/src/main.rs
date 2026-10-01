@@ -118,12 +118,13 @@ async fn main() {
             Some(tokio::spawn(async move {
                 let result: Result<(), sqlx::Error> = async {
                     // Runtime is DML-only; the operator migrates before startup.
+                    let gateway_db =
+                        two_bot_cutover::connect(&url, gateway::GATEWAY_POOL_MAX, true).await?;
                     let db =
-                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, true)
-                            .await?;
+                        two_bot_cutover::connect(&url, gateway::FEATURE_POOL_MAX, true).await?;
                     metrics_http::register_pool(db.pool().clone());
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
-                        db.pool().clone(),
+                        gateway_db.pool().clone(),
                         guild_id.to_string(),
                         0,
                     );

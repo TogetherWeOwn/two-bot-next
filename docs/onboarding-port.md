@@ -133,9 +133,17 @@ funnel batch and sequence. Workers claim committed rows, not an in-memory copy
 of a member cache. The original dispatch clock remains stable on retry. Session
 reset/expiry clears only the gateway session, never these delivery rows.
 
-A single shard owner may have at most 32 unfinished rows/workers. Queue capacity
-failure rolls back the dispatch, including its checkpoint. Worker errors/timeouts
-stop the essential runner, leaving the captured job for Container restart.
+A single shard owner may have at most 32 unfinished durable rows, but admits at
+most two onboarding workers before claim/settings acquisition. Production opens
+**distinct** pools within the existing five-connection gateway subsystem budget:
+one gateway-only connection for checkpoints, funnel batches and queue operations,
+and four feature connections shared by onboarding and sticky work. Pool clones do
+not provide isolation. Feature transactions and member locks still span REST;
+they cannot consume the gateway reservation. The separately supervised HTTP/jobs
+pool retains its existing budget; this partition does not increase it.
+
+Queue capacity failure rolls back the dispatch, including its checkpoint.
+Worker errors/timeouts stop the essential runner, leaving the captured job for Container restart.
 Restart reclaims interrupted workers, at most three attempts per job; exhaustion
 fails closed until an authorized correction addresses the cause and resets that
 specific failed job. Never substitute credentials or repeatedly restart to
@@ -162,9 +170,12 @@ ambiguity: neither the queue nor these transactions claims exactly-once sends
 across a crash in that window. Session goodbyes are at-least-once across such a
 crash; the legacy welcome marker suppresses retries after its successful commit.
 
-**Not review-ready:** the new recovery and deferred-error changes require exact
-head CI validation and independent review. Local Rust compilation has no
-certified bounded admission in this workspace; use the existing authorized CI
+**Not review-ready:** database reservation/admission and recovery changes require
+exact-head CI validation and independent review. Initial component acknowledgement
+still waits behind preceding gateway SQL and worker admission/settings: the
+receive-relative, bounded-ingress ACK repair and its regressions remain open.
+Database isolation alone does not establish Discord's three-second ACK budget.
+Local Rust compilation has no certified bounded admission in this workspace; use the existing authorized CI
 service containers, never a speculative local build or target-directory bypass.
 Do not enable this checkpoint as a live onboarding flow or claim deployment
 parity.

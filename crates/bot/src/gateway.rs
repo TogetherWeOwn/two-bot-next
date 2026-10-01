@@ -122,6 +122,14 @@ pub async fn load_boot_session(
     }
 }
 
+// Partition the existing five-connection gateway subsystem budget. These must
+// be distinct pools: feature transactions retain connections across Discord I/O.
+pub const GATEWAY_POOL_MAX: u32 = 1;
+pub const FEATURE_POOL_MAX: u32 = two_bot_cutover::DB_POOL_MAX_DEFAULT - GATEWAY_POOL_MAX;
+// Admission is independent of the 32-row durable queue. Leave feature capacity
+// for settings and sticky work; do not claim more jobs while these workers run.
+const ONBOARDING_WORKER_LIMIT: usize = 2;
+
 const CHECKPOINT_IO_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(serde::Deserialize)]
@@ -216,7 +224,7 @@ async fn run_loop(
         if let Some(runtime) = onboarding {
             // Poll Twilight between claims, rather than spend 32 consecutive
             // SQL deadlines without driving the shard's heartbeat machinery.
-            if queue_dirty && feature_jobs.len() < 32 {
+            if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT {
                 if let Some(saved) =
                     checkpoint_io(state, deadline, store.claim_onboarding_job()).await?
                 {
@@ -255,7 +263,7 @@ async fn run_loop(
         }
         let item = tokio::select! {
             item = shard.next() => item,
-            _ = queue_tick.tick(), if onboarding.is_some() && queue_dirty && feature_jobs.len() < 32 => {
+            _ = queue_tick.tick(), if onboarding.is_some() && queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT => {
                 continue;
             },
             result = feature_jobs.join_next(), if !feature_jobs.is_empty() => {

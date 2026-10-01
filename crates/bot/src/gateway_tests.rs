@@ -44,6 +44,10 @@ struct TestDb {
 
 impl TestDb {
     async fn new() -> Self {
+        Self::with_pool_max(3).await
+    }
+
+    async fn with_pool_max(pool_max: u32) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let options = database_guard::test_options();
         let admin = PgPoolOptions::new()
@@ -67,7 +71,7 @@ impl TestDb {
             .await
             .expect("create isolated schema");
         let pool = PgPoolOptions::new()
-            .max_connections(3)
+            .max_connections(pool_max)
             .connect_with(options.options([("search_path", schema.clone())]))
             .await
             .expect("scoped test pool");
@@ -82,6 +86,16 @@ impl TestDb {
             schema,
             store,
         }
+    }
+
+    async fn independent_pool(&self, pool_max: u32) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(pool_max)
+            .connect_with(
+                database_guard::test_options().options([("search_path", self.schema.clone())]),
+            )
+            .await
+            .expect("independent scoped test pool")
     }
 
     async fn close(self) {

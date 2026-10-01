@@ -32,6 +32,7 @@ const RECEIPT_AT: i64 = 1_790_780_400_000;
 struct Runner {
     task: JoinHandle<Result<(), sqlx::Error>>,
     pipeline: Arc<GatewayPipeline>,
+    state: Arc<RwLock<GatewayState>>,
 }
 
 impl Runner {
@@ -57,6 +58,7 @@ impl Drop for Runner {
 struct GatewayFixture {
     mock: MockGateway,
     dispatch: mpsc::Sender<Value>,
+    heartbeats: mpsc::Receiver<()>,
 }
 
 impl GatewayFixture {
@@ -74,16 +76,21 @@ impl Drop for GatewayFixture {
 /// Reuse the parent's MockGateway/authentication helper, but let each test
 /// choose dispatches and their sequence numbers. No live gateway discovery.
 async fn gateway(resume: bool) -> GatewayFixture {
+    gateway_with_heartbeat(resume, 45000).await
+}
+
+async fn gateway_with_heartbeat(resume: bool, heartbeat_interval: u64) -> GatewayFixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let ready_url = url.clone();
     let (auth_tx, auth) = mpsc::channel(4);
     let (dispatch, mut packets) = mpsc::channel::<Value>(8);
+    let (send_heartbeat, heartbeats) = mpsc::channel(16);
     let task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let (_, mut ws) = ServerBuilder::new().accept(stream).await.unwrap();
         ws.send(Message::text(
-            json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
+            json!({"op":10,"d":{"heartbeat_interval":heartbeat_interval}}).to_string(),
         ))
         .await
         .unwrap();
@@ -121,10 +128,13 @@ async fn gateway(resume: bool) -> GatewayFixture {
                     let Some(Ok(message)) = message else { return };
                     if message.is_text() {
                         let packet: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
-                        if packet["op"] == 1 && ws.send(Message::text(
-                            "{\"op\":11,\"d\":null}".to_owned(),
-                        )).await.is_err() {
-                            return;
+                        if packet["op"] == 1 {
+                            let _ = send_heartbeat.try_send(());
+                            if ws.send(Message::text(
+                                "{\"op\":11,\"d\":null}".to_owned(),
+                            )).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -134,6 +144,7 @@ async fn gateway(resume: bool) -> GatewayFixture {
     GatewayFixture {
         mock: MockGateway { url, auth, task },
         dispatch,
+        heartbeats,
     }
 }
 
@@ -143,6 +154,7 @@ enum PauseAt {
     Callback,
     UnavailableMember,
     UnavailableChannel,
+    HeldGameTransaction,
 }
 
 /// Delay before any channel POST (or before defer completion). Aborting the
@@ -197,9 +209,17 @@ async fn discord(paused: Arc<AtomicBool>, pause_at: PauseAt) -> MockRest {
         let pause = match pause_at {
             PauseAt::PermissionRead => request.method == "GET" && path == "/guilds/2222",
             PauseAt::Callback => request.method == "POST" && path.ends_with("/callback"),
-            PauseAt::UnavailableMember | PauseAt::UnavailableChannel => false,
+            PauseAt::UnavailableMember | PauseAt::UnavailableChannel | PauseAt::HeldGameTransaction => false,
         };
-        if pause && paused.load(Ordering::SeqCst) {
+        if matches!(pause_at, PauseAt::HeldGameTransaction)
+            && paused.load(Ordering::SeqCst)
+            && request.method == "GET"
+            && matches!(path, "/guilds/2222" | "/guilds/2222/roles")
+        {
+            // Game selection has already acquired its member transaction. Each
+            // read fits its evidence budget, but together hold SQL for >5s.
+            response.delayed(Duration::from_millis(3250))
+        } else if pause && paused.load(Ordering::SeqCst) {
             response.delayed(Duration::from_secs(30))
         } else {
             response
@@ -209,6 +229,16 @@ async fn discord(paused: Arc<AtomicBool>, pause_at: PauseAt) -> MockRest {
 }
 
 async fn spawn_onboarding(db: &TestDb, mock: &MockRest, url: &str, mode: &str) -> Runner {
+    spawn_onboarding_with_store(db, mock, url, mode, &db.store).await
+}
+
+async fn spawn_onboarding_with_store(
+    db: &TestDb,
+    mock: &MockRest,
+    url: &str,
+    mode: &str,
+    store: &GatewaySessionStore,
+) -> Runner {
     ensure_crypto_provider();
     let vars = HashMap::from([
         ("DISCORD_GUILD_ID".into(), GUILD.into()),
@@ -232,7 +262,7 @@ async fn spawn_onboarding(db: &TestDb, mock: &MockRest, url: &str, mode: &str) -
         )
         .unwrap(),
     );
-    let saved = load_boot_session(&db.store).await.unwrap();
+    let saved = load_boot_session(store).await.unwrap();
     let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
     let shard = Shard::with_config(
         ShardId::ONE,
@@ -241,17 +271,21 @@ async fn spawn_onboarding(db: &TestDb, mock: &MockRest, url: &str, mode: &str) -
             .build(),
     );
     // Both the runtime and cache are newly constructed, not reused at restart.
-    let pipeline = Arc::new(build_pipeline(db.store.milestones().await.unwrap()));
+    let pipeline = Arc::new(build_pipeline(store.milestones().await.unwrap()));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
     let task = tokio::spawn(run_shard(
         shard,
         pipeline.clone(),
-        state,
-        db.store.clone(),
+        state.clone(),
+        store.clone(),
         Some(runtime),
         None,
     ));
-    Runner { task, pipeline }
+    Runner {
+        task,
+        pipeline,
+        state,
+    }
 }
 
 fn joined_at_wire(millis: i64) -> String {
@@ -861,6 +895,182 @@ async fn onboarding_gateway_interrupted_callback_is_token_free_and_requires_rese
         runner.stop().await;
     })
     .await;
+    cleanup(db, Some(mock), result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
+async fn onboarding_gateway_feature_pool_exhaustion_preserves_checkpoint_and_heartbeat() {
+    let db = TestDb::with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
+    let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
+    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
+    let mock = discord(Arc::new(AtomicBool::new(false)), PauseAt::PermissionRead).await;
+    let result = bounded(async {
+        assert_eq!(
+            db.pool.options().get_max_connections() + gateway_pool.options().get_max_connections(),
+            two_bot_cutover::DB_POOL_MAX_DEFAULT,
+        );
+        let mut ws = gateway_with_heartbeat(false, 2000).await;
+        let runner = spawn_onboarding_with_store(&db, &mock, &ws.mock.url, "legacy", &store).await;
+        assert_eq!(ws.mock.authentication().await["op"], 2);
+        wait_sequence(&store, 1).await;
+        ws.heartbeats.recv().await.expect("connected heartbeat");
+
+        let mut guards = Vec::new();
+        for member in 100..100 + crate::gateway::FEATURE_POOL_MAX {
+            guards.push(
+                two_bot_core::onboarding_store::begin_prompt(&db.pool, GUILD, &member.to_string())
+                    .await
+                    .unwrap()
+                    .expect("distinct unprompted member"),
+            );
+        }
+        assert_eq!(db.pool.size(), crate::gateway::FEATURE_POOL_MAX);
+        assert_eq!(db.pool.num_idle(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), db.pool.acquire())
+                .await
+                .is_err()
+        );
+
+        // Hold actual onboarding transactions longer than the gateway's full
+        // five-second SQL budget, without borrowing feature capacity to observe.
+        let held_at = tokio::time::Instant::now();
+        ws.send(resumed(2)).await;
+        tokio::time::timeout(Duration::from_secs(1), wait_sequence(&store, 2))
+            .await
+            .unwrap();
+        while held_at.elapsed() < Duration::from_secs(6) {
+            tokio::time::timeout(Duration::from_secs(3), ws.heartbeats.recv())
+                .await
+                .expect("heartbeat while feature pool exhausted")
+                .expect("heartbeat fixture remains alive");
+            assert!(!runner.task.is_finished());
+        }
+        ws.send(resumed(3)).await;
+        tokio::time::timeout(Duration::from_secs(1), wait_sequence(&store, 3))
+            .await
+            .unwrap();
+        assert_eq!(*runner.state.read().await, GatewayState::Connected);
+        assert_eq!(db.pool.num_idle(), 0, "feature transactions are still held");
+        assert!(
+            mock.requests().is_empty(),
+            "no fabricated welcome acceptance"
+        );
+        drop(guards);
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), db.pool.acquire())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(event_count(&db, EVENT_ONBOARDING_PROMPTED).await, 0);
+        runner.stop().await;
+    })
+    .await;
+    tokio::time::timeout(DEADLINE, gateway_pool.close())
+        .await
+        .unwrap();
+    cleanup(db, Some(mock), result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
+async fn onboarding_gateway_worker_admission_bounds_held_game_transactions() {
+    let db = TestDb::with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
+    let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
+    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
+    let mock = discord(
+        Arc::new(AtomicBool::new(true)),
+        PauseAt::HeldGameTransaction,
+    )
+    .await;
+    let result = bounded(async {
+        let mut ws = gateway_with_heartbeat(false, 2000).await;
+        let runner = spawn_onboarding_with_store(&db, &mock, &ws.mock.url, "legacy", &store).await;
+        assert_eq!(ws.mock.authentication().await["op"], 2);
+        wait_sequence(&store, 1).await;
+        // Saturate admission with distinct members, not waiters on one lock.
+        for seq in 2..=7 {
+            let mut click = component(seq, &(4000 + seq).to_string(), "admission-test-token");
+            click["d"]["member"]["user"]["id"] = json!((75 + seq).to_string());
+            click["d"]["data"]["custom_id"] = json!(GAME_SELECT_ID);
+            click["d"]["data"]["values"] = json!([GAME_PICKS[0].key]);
+            ws.send(click).await;
+        }
+        wait_sequence(&store, 7).await;
+        loop {
+            let reads = mock
+                .requests()
+                .iter()
+                .filter(|request| request.method == "GET" && request.path == "/api/v10/guilds/2222")
+                .count();
+            if reads == 2 {
+                break;
+            }
+            assert!(reads < 2, "more than two workers admitted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // These GETs occur only after the transaction/member lock is acquired.
+        // Two paced 3.25s reads keep both transactions held for >5s, but within
+        // the evidence deadline. The other four commands must remain unclaimed.
+        while ws.heartbeats.try_recv().is_ok() {}
+        let held_at = tokio::time::Instant::now();
+        ws.send(resumed(8)).await;
+        tokio::time::timeout(Duration::from_secs(1), wait_sequence(&store, 8))
+            .await
+            .unwrap();
+        let until = tokio::time::sleep_until(held_at + Duration::from_millis(5250));
+        tokio::pin!(until);
+        let mut beats = 0;
+        loop {
+            tokio::select! {
+                _ = &mut until => break,
+                beat = ws.heartbeats.recv() => {
+                    beat.expect("heartbeat during held game transactions");
+                    beats += 1;
+                }
+            }
+        }
+        assert!(held_at.elapsed() > Duration::from_secs(5));
+        assert!(
+            beats >= 2,
+            "heartbeats keep progressing, not just buffered before the locks"
+        );
+        let states: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT state, count(*) FROM gateway_onboarding_jobs GROUP BY state ORDER BY state",
+        )
+        .fetch_all(&gateway_pool)
+        .await
+        .unwrap();
+        assert_eq!(states, vec![("pending".into(), 4), ("running".into(), 2)]);
+        let callbacks = mock
+            .requests()
+            .iter()
+            .filter(|request| request.method == "POST" && request.path.ends_with("/callback"))
+            .count();
+        assert_eq!(
+            callbacks, 2,
+            "pending commands never start settings or REST work"
+        );
+        assert!(!mock
+            .requests()
+            .iter()
+            .any(|request| matches!(request.method.as_str(), "PUT" | "DELETE")));
+        assert_eq!(event_count(&db, EVENT_GAME_ROLES_SELECTED).await, 0);
+        assert_eq!(event_count(&db, EVENT_CHANNEL_ROUTED).await, 0);
+        ws.send(resumed(9)).await;
+        tokio::time::timeout(Duration::from_secs(1), wait_sequence(&store, 9))
+            .await
+            .unwrap();
+        assert!(!runner.task.is_finished());
+        assert_eq!(*runner.state.read().await, GatewayState::Connected);
+        runner.stop().await;
+    })
+    .await;
+    tokio::time::timeout(DEADLINE, gateway_pool.close())
+        .await
+        .unwrap();
     cleanup(db, Some(mock), result).await;
 }
 
