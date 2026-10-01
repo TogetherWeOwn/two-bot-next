@@ -88,6 +88,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0170_lfg.sql"),
         include_str!("../../cutover/migrations/0190_onboarding.sql"),
         include_str!("../../cutover/migrations/0200_self_roles.sql"),
+        include_str!("../../cutover/migrations/0210_tickets.sql"),
         include_str!("../../cutover/migrations/0300_website_contract.sql"),
         include_str!("../../cutover/migrations/0310_presence_probe.sql"),
         include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
@@ -189,6 +190,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // lane leases must work under the least-privilege login.
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_audit; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); UPDATE public.self_role_audit SET reason = 'probe' WHERE event_id = 'roles-probe'; DELETE FROM public.self_role_audit WHERE event_id = 'roles-probe'").await?;
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_panel_claims; INSERT INTO public.self_role_panel_claims (guild_id, member_id, panel_id, claim_token, claim_generation, processing_expires_at) VALUES ('g', 'm', 'p', 'tok', 1, now() + interval '1 minute'); UPDATE public.self_role_panel_claims SET latest_option_key = 'probe' WHERE guild_id = 'g' AND member_id = 'm' AND panel_id = 'p'; DELETE FROM public.self_role_panel_claims WHERE guild_id = 'g' AND member_id = 'm' AND panel_id = 'p'").await?;
+    // Migration 0210 relations require runtime CRUD, including the transcript's
+    // ticket foreign key. Delete the transcript before its parent ticket.
+    as_role(pool, &roles[1], "INSERT INTO public.tickets (id, guild_id, channel_id, opener_id, status, created_at) VALUES ('ticket-probe', 'g', 'c', 'm', 'open', '2026-01-01T00:00:00Z'); SELECT * FROM public.tickets; UPDATE public.tickets SET claimed_by = 'staff' WHERE id = 'ticket-probe'; INSERT INTO public.ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at, purge_after) VALUES ('ticket-probe', 'g', 'c', 'm', 'staff', 'probe', 1, '2026-01-01T00:00:00Z', '2026-04-01T00:00:00Z'); SELECT * FROM public.ticket_transcripts; UPDATE public.ticket_transcripts SET content = 'updated probe' WHERE ticket_id = 'ticket-probe'; DELETE FROM public.ticket_transcripts WHERE ticket_id = 'ticket-probe'; DELETE FROM public.tickets WHERE id = 'ticket-probe'").await?;
     for view in [
         "contract_meta",
         "live_counts",
@@ -208,6 +212,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "CREATE TEMP TABLE runtime_probe (id int)",
         "ALTER TABLE public.members ADD COLUMN forbidden int",
         "TRUNCATE public.members",
+        "ALTER TABLE public.tickets ADD COLUMN forbidden int",
+        "TRUNCATE public.tickets",
+        "ALTER TABLE public.ticket_transcripts ADD COLUMN forbidden int",
+        "TRUNCATE public.ticket_transcripts",
         "SELECT * FROM public._sqlx_migrations",
         "SELECT setval('public.guild_settings_cas_seq', -1)",
         "SELECT public.guild_settings_assign_version()",
@@ -219,6 +227,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "INSERT INTO public.members (member_id) VALUES ('test')",
         "SELECT * FROM public.self_role_audit",
         "SELECT * FROM public.self_role_panel_claims",
+        "SELECT * FROM public.tickets",
+        "INSERT INTO public.tickets (id, guild_id, channel_id, opener_id, status, created_at) VALUES ('reader-probe', 'g', 'c', 'm', 'open', '2026-01-01T00:00:00Z')",
+        "SELECT * FROM public.ticket_transcripts",
+        "INSERT INTO public.ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, content, message_count, created_at, purge_after) VALUES ('reader-probe', 'g', 'c', 'm', 'probe', 1, '2026-01-01T00:00:00Z', '2026-04-01T00:00:00Z')",
         "CREATE TABLE web_v1.reader_probe (id int)",
         "SELECT nextval('public.guild_settings_version_seq')",
         "SELECT nextval('public.guild_settings_cas_seq')",
@@ -240,6 +252,14 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         (format!("GRANT {migrator} TO {reader}"), format!("REVOKE {migrator} FROM {reader}")),
         (format!("REVOKE SELECT ON web_v1.members FROM {reader}"),
          format!("GRANT SELECT ON web_v1.members TO {reader}")),
+        (format!("REVOKE UPDATE ON public.tickets FROM {runtime}"),
+         format!("GRANT UPDATE ON public.tickets TO {runtime}")),
+        (format!("REVOKE DELETE ON public.ticket_transcripts FROM {runtime}"),
+         format!("GRANT DELETE ON public.ticket_transcripts TO {runtime}")),
+        (format!("GRANT SELECT ON public.tickets TO {reader}"),
+         format!("REVOKE SELECT ON public.tickets FROM {reader}")),
+        (format!("GRANT SELECT ON public.ticket_transcripts TO {reader}"),
+         format!("REVOKE SELECT ON public.ticket_transcripts FROM {reader}")),
         (format!("ALTER DEFAULT PRIVILEGES FOR ROLE {migrator} GRANT SELECT ON TABLES TO {reader}"),
          format!("ALTER DEFAULT PRIVILEGES FOR ROLE {migrator} REVOKE SELECT ON TABLES FROM {reader}")),
         (format!("GRANT SELECT ON web_v1.members TO {reader} WITH GRANT OPTION"),
