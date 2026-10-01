@@ -39,7 +39,12 @@ Recognize `X-RateLimit-Global: true`, `X-RateLimit-Scope: global`, JSON
 `global: true`, or JSON `scope: "global"` on a 429. Store one shared monotonic
 deadline from body `retry_after` seconds (wins over a valid `Retry-After` header)
 plus **250 ms** padding. Global headers install a pause **before reading the
-body**: header timing when usable, otherwise a provisional full-window pause.
+body**, atomically with invalid-response accounting and before notifying waiters:
+header timing when usable, otherwise a provisional full-window pause.
+All response-body reads have a **5-second** deadline, including paced GET/kick.
+Expiry automatically drops response accounting and clears its pending entry,
+committing the header-anchored timing or conservative full-window fallback;
+GET/kick handle the body error within their existing transport retry budget.
 Admission stays closed until all global-header bodies resolve (or are cancelled),
 **even if provisional header timing expires first**. Body timing replaces only
 that response's provisional pause; it cannot shorten another response's
@@ -61,7 +66,11 @@ made in that case: return `DiscordError::Guard(GuardError::AdmissionTimeout)`,
 which is safe pre-mutation and does not increment the executor's wire counter.
 Once dispatch starts, expiry remains uncertain `DiscordError::Timeout`. The
 5-second budget includes admission and wire time, not two separate budgets. No
-additional automatic moderation retries are introduced.
+additional automatic moderation retries are introduced. Idempotent command-publish
+sync instead waits for paced admission **outside** its 5-second wire deadline, so
+long global pauses do not abort a retry. Fatal/breaker refusals still interrupt
+that wait promptly. Kick results count only dispatched HTTP attempts: pre-wire
+build/guard refusals report zero, and a refusal after one exchange reports one.
 
 ## Fatal bot token and readiness
 

@@ -485,6 +485,22 @@ impl MockRest {
         default: ScriptedResponse,
         body_delay: Duration,
     ) -> Self {
+        Self::start_with_body_mode(script, default, Some(body_delay)).await
+    }
+
+    /// Send headers but never finish a nonempty body; clients must time out.
+    pub async fn start_with_stalled_bodies(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+    ) -> Self {
+        Self::start_with_body_mode(script, default, None).await
+    }
+
+    async fn start_with_body_mode(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+        body_delay: Option<Duration>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -525,7 +541,7 @@ async fn rest_task(
     recorded: Arc<Mutex<Vec<RestRequest>>>,
     queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
     default: ScriptedResponse,
-    body_delay: Duration,
+    body_delay: Option<Duration>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -545,7 +561,7 @@ async fn handle_rest(
     recorded: Arc<Mutex<Vec<RestRequest>>>,
     queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
     default: ScriptedResponse,
-    body_delay: Duration,
+    body_delay: Option<Duration>,
 ) {
     let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
         return;
@@ -576,8 +592,16 @@ async fn handle_rest(
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
-    if !next.body.is_empty() && !body_delay.is_zero() {
-        tokio::time::sleep(body_delay).await;
+    if !next.body.is_empty() {
+        let Some(body_delay) = body_delay else {
+            // Retain the socket without delivering bytes until the client
+            // disconnects. No timer/server-side completion can rescue the test.
+            let _ = stream.read(&mut [0u8; 1]).await;
+            return;
+        };
+        if !body_delay.is_zero() {
+            tokio::time::sleep(body_delay).await;
+        }
     }
     let _ = stream.write_all(&next.body).await;
 }

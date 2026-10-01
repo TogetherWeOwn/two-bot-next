@@ -65,6 +65,9 @@ pub const PACE_INTERVAL_MS: u64 = 110;
 pub const KICK_INTERVAL_MS: u64 = 350;
 /// Per-call abort for moderation verbs, ms (legacy `timeoutMs ?? 5000`).
 pub const MODERATION_TIMEOUT_MS: u64 = 5_000;
+/// Bound response-body collection, including the otherwise untimed GET/kick
+/// lanes, so a stalled global response cannot retain pending admission forever.
+pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
 /// Legacy audit-log-reason header bound (`X-Audit-Log-Reason`, latin-1,
 /// percent-encoded; twilight validates ≤512 chars).
 pub const MAX_AUDIT_REASON_CHARS: usize = 512;
@@ -368,11 +371,15 @@ impl HyperTransport {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let collected = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| format!("read body: {e}"))?;
+        // Expiry drops accounting, resolving the pending header restriction to
+        // its header-anchored timing/fallback without opening admission early.
+        let collected = tokio::time::timeout(
+            Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS),
+            response.into_body().collect(),
+        )
+        .await
+        .map_err(|_| "read body timed out".to_owned())?
+        .map_err(|e| format!("read body: {e}"))?;
         let response = RawResponse {
             status,
             retry_after_header,
@@ -713,7 +720,6 @@ impl ActionExecutor {
         };
         let mut attempts: u32 = 0;
         loop {
-            attempts += 1;
             let request = match self.kick_request(&path_guild, &path_user, &reason) {
                 Ok(r) => r,
                 Err(detail) => {
@@ -725,16 +731,19 @@ impl ActionExecutor {
                     }
                 }
             };
-            let (res, global) = match self.send_paced(&request, true).await {
+            if let Err(error) = self.admit(&request, Some(true)).await {
+                return KickResult {
+                    outcome: KickOutcome::Failed,
+                    status: None,
+                    detail: error.to_string(),
+                    attempts,
+                };
+            }
+            // Build/admission refusals spend no HTTP attempt. Count only once
+            // dispatch starts, including failed transports and body timeouts.
+            attempts += 1;
+            let (res, global) = match self.send_admitted(&request).await {
                 Ok(r) => r,
-                Err(DiscordError::Guard(error)) => {
-                    return KickResult {
-                        outcome: KickOutcome::Failed,
-                        status: None,
-                        detail: error.to_string(),
-                        attempts,
-                    };
-                }
                 Err(detail) => {
                     if attempts > MAX_HTTP_TRIES - 1 {
                         return KickResult {
@@ -1261,7 +1270,13 @@ impl ActionExecutor {
         // back off within the same budget as kicks.
         let mut attempts: u32 = 0;
         loop {
-            let (res, global) = self.send_with_timeout(&req, Some(false)).await?;
+            // Idempotent sync may wait out any global pause; the five-second
+            // wire budget starts after paced admission, unlike moderation.
+            self.admit(&req, Some(false)).await?;
+            let (res, global) =
+                tokio::time::timeout(self.inner.moderation_timeout, self.send_admitted(&req))
+                    .await
+                    .map_err(|_| DiscordError::Timeout)??;
             match res.status {
                 200..=299 => return Ok(()),
                 429 => {

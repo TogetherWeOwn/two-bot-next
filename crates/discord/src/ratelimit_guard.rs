@@ -170,8 +170,24 @@ impl RateLimitGuard {
             return;
         }
         let mut state = self.state.lock().expect("Discord guard state");
-        let now = Instant::now();
-        self.refresh(&mut state, now);
+        self.observe_status_locked(&mut state, status, bot_authenticated, Instant::now());
+        drop(state);
+        // Recheck fatal/breaker admission immediately, not at the end of an
+        // unrelated global cooldown or unresolved response body.
+        self.changed.notify_waiters();
+    }
+
+    fn observe_status_locked(
+        &self,
+        state: &mut State,
+        status: u16,
+        bot_authenticated: bool,
+        now: Instant,
+    ) {
+        if !matches!(status, 401 | 403 | 429) {
+            return;
+        }
+        self.refresh(state, now);
         state.counters.invalid_requests_total += 1;
         state.invalid.push_back(now);
         if status == 401 && bot_authenticated && !state.counters.token_invalid {
@@ -181,11 +197,7 @@ impl RateLimitGuard {
                 "Discord refused the bot token; REST disabled until restart"
             );
         }
-        self.refresh(&mut state, now);
-        drop(state);
-        // Recheck fatal/breaker admission immediately, not at the end of an
-        // unrelated global cooldown or unresolved response body.
-        self.changed.notify_waiters();
+        self.refresh(state, now);
     }
 
     /// Extend (never shorten) a global pause. Missing/invalid timing fails
@@ -217,10 +229,19 @@ impl RateLimitGuard {
     }
 
     fn begin_global(&self, timing: Option<f64>, observed_at: Instant) -> u64 {
-        let until = self.global_until(timing, observed_at);
         let mut state = self.state.lock().expect("Discord guard state");
-        self.refresh(&mut state, observed_at);
-        if state.pending_global.is_empty() && Self::global_deadline(&state, observed_at).is_none() {
+        self.begin_global_locked(&mut state, timing, observed_at)
+    }
+
+    fn begin_global_locked(
+        &self,
+        state: &mut State,
+        timing: Option<f64>,
+        observed_at: Instant,
+    ) -> u64 {
+        let until = self.global_until(timing, observed_at);
+        self.refresh(state, observed_at);
+        if state.pending_global.is_empty() && Self::global_deadline(state, observed_at).is_none() {
             state.counters.global_pauses_total += 1;
             tracing::warn!(
                 event = "discord_global_pause",
@@ -298,18 +319,23 @@ impl<'a> ResponseAccounting<'a> {
         headers: &http::HeaderMap,
         bot_authenticated: bool,
     ) -> Self {
-        guard.observe_status(status, bot_authenticated);
         let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
         let global_header = status == 429
             && (header("x-ratelimit-global").is_some_and(|v| v.eq_ignore_ascii_case("true"))
                 || header("x-ratelimit-scope").is_some_and(|v| v.eq_ignore_ascii_case("global")));
         let retry_after_header = header("retry-after").and_then(|v| v.parse::<f64>().ok());
         let observed_at = Instant::now();
-        // Install the restriction before awaiting any body bytes. With no usable
-        // header timing, hold a provisional full-window pause until body timing
-        // is known (or Drop commits the conservative fallback).
-        let global_header =
-            global_header.then(|| guard.begin_global(retry_after_header, observed_at));
+        // Status and the pending restriction are one transition: a notified
+        // waiter must never see the invalid response without its global pause.
+        // With no usable header timing, Drop commits a full-window fallback.
+        let mut state = guard.state.lock().expect("Discord guard state");
+        guard.observe_status_locked(&mut state, status, bot_authenticated, observed_at);
+        let global_header = global_header
+            .then(|| guard.begin_global_locked(&mut state, retry_after_header, observed_at));
+        drop(state);
+        if matches!(status, 401 | 403 | 429) {
+            guard.changed.notify_waiters();
+        }
         Self {
             guard,
             global_header,
@@ -562,6 +588,56 @@ mod tests {
                     essential.abort();
                 }
                 assert_eq!(Instant::now(), now, "must not wait for the cooldown timer");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_header_notification_exposes_the_complete_transition() {
+        for iteration in 0..128 {
+            let guard = Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap());
+            // The old header estimate expired, but its body still holds admission.
+            let old_at = Instant::now() - Duration::from_secs(1);
+            let old_id = guard.begin_global(Some(0.0), old_at);
+            let (ready, registered) = tokio::sync::oneshot::channel();
+            let observer = tokio::spawn({
+                let guard = guard.clone();
+                async move {
+                    let changed = guard.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    ready.send(()).unwrap();
+                    changed.await;
+                    let snapshot = guard.snapshot();
+                    assert_eq!(snapshot.invalid_requests_total, 1);
+                    assert_eq!(
+                        snapshot.pending_global_responses, 2,
+                        "status notification exposed an incomplete header transition"
+                    );
+                }
+            });
+            registered.await.unwrap();
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-ratelimit-global", http::HeaderValue::from_static("true"));
+            headers.insert("retry-after", http::HeaderValue::from_static("0"));
+            let accounting = ResponseAccounting::new(&guard, 429, &headers, true);
+            observer.await.unwrap();
+            if iteration == 0 {
+                let waiter = tokio::spawn({
+                    let guard = guard.clone();
+                    async move { guard.admit(false).await }
+                });
+                guard.finish_global(old_id, Some(0.0), old_at);
+                // Expiring the new provisional estimate must not release its body.
+                tokio::time::sleep(Duration::from_millis(260)).await;
+                assert!(!waiter.is_finished());
+                drop(accounting);
+                tokio::time::timeout(Duration::from_secs(1), waiter)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(guard.snapshot().pending_global_responses, 0);
             }
         }
     }
