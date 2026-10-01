@@ -57,6 +57,8 @@ use two_bot_discord::{
     publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
 };
 
+use crate::activation::BootActivation;
+
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
 /// free-text reason; kept short — `audit_reason` caps at 512 chars).
 const RETIRE_REASON: &str = "sticky re-post";
@@ -106,6 +108,8 @@ pub struct CommandRuntime {
     router: InteractionRouter,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
+    /// Token-derived identity; READY/REST cannot substitute a different app.
+    application_id: Option<u64>,
     /// `TWO_AUTOMATIONS=1`: fast-path gate for the message hook (the router
     /// still answers `/sticky*` refusals when it is off).
     automations: bool,
@@ -123,7 +127,12 @@ impl CommandRuntime {
     /// boots — when gate parsing or executor construction fails, so bad
     /// env cannot take the shard down.
     #[must_use]
-    pub fn from_env(pool: Pool<Postgres>, token: &str, guild_id: u64) -> Option<Arc<Self>> {
+    pub fn from_env(
+        pool: Pool<Postgres>,
+        token: &str,
+        guild_id: u64,
+        activation: &BootActivation,
+    ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
             Err(err) => {
@@ -144,15 +153,6 @@ impl CommandRuntime {
             &moderation,
             SurfaceFlags::default(),
         );
-        let mut router = InteractionRouter::new(gates);
-        router.register(Box::new(StickyHandler));
-        for id in [
-            HandlerId::FeedAdd,
-            HandlerId::FeedRemove,
-            HandlerId::FeedList,
-        ] {
-            router.register(Box::new(FeedHandler(id)));
-        }
         let proxy = std::env::var("DISCORD_API_BASE")
             .ok()
             .filter(|value| !value.is_empty());
@@ -163,15 +163,35 @@ impl CommandRuntime {
                 return None;
             }
         };
-        Some(Arc::new(Self {
+        Some(Self::from_gates(pool, executor, gates, activation))
+    }
+
+    /// Composition seam shared by boot and mock-Discord tests. Only narrowed
+    /// gates reach registration, publication and the accepted-message hook.
+    pub(crate) fn from_gates(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        gates: RouterGates,
+        activation: &BootActivation,
+    ) -> Arc<Self> {
+        let gates = activation.constrain_router(gates);
+        Arc::new(Self {
             pool,
             executor,
-            router,
-            guild_id,
-            automations: features.automations,
+            router: router_with_commands(gates),
+            guild_id: gates
+                .configured_guild
+                .expect("boot supplies configured guild"),
+            application_id: activation.application_id(),
+            automations: gates.automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
-        }))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn router(&self) -> &InteractionRouter {
+        &self.router
     }
 
     /// Test constructor: skips env gate reads so tests inject their own
@@ -189,6 +209,7 @@ impl CommandRuntime {
             executor,
             router,
             guild_id,
+            application_id: Some(1111),
             automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
@@ -258,6 +279,13 @@ impl CommandRuntime {
                 }
             },
         };
+        if Some(application_id) != self.application_id {
+            warn!(
+                application_id,
+                "application identity differs from boot token; publish skipped"
+            );
+            return;
+        }
         let defs = match self.router.publish_set(&[]) {
             Ok(defs) => defs,
             Err(err) => {
@@ -916,18 +944,20 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
         })
 }
 
-/// The runtime's router for tests that bypass `from_env`'s env reads:
-/// sticky + feed handler markers, matching `from_env`'s registrations.
-#[cfg(test)]
+/// Register only the capability handlers enabled by the effective boot gates.
 pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
-    router.register(Box::new(StickyHandler));
-    for id in [
-        HandlerId::FeedAdd,
-        HandlerId::FeedRemove,
-        HandlerId::FeedList,
-    ] {
-        router.register(Box::new(FeedHandler(id)));
+    if gates.automations {
+        router.register(Box::new(StickyHandler));
+    }
+    if gates.announcements {
+        for id in [
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedList,
+        ] {
+            router.register(Box::new(FeedHandler(id)));
+        }
     }
     router
 }

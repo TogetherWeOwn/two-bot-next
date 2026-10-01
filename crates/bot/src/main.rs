@@ -5,6 +5,7 @@
 //! `GUILD_ID` the shard stays parked and `/readyz` reports `gateway: down`
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
+mod activation;
 mod backup_cli;
 mod command_runtime;
 #[cfg(test)]
@@ -84,6 +85,10 @@ async fn main() {
         }
     });
 
+    // Evaluate all five capabilities once, before any handler registration.
+    // Refusals narrow the command surface, not liveness or analytics jobs.
+    let activation = activation::BootActivation::from_config(&config);
+    activation.log_refusals();
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
     let listener = server::bind(&config.listen_addr)
         .await
@@ -134,6 +139,7 @@ async fn main() {
                         db.pool().clone(),
                         &token,
                         guild_id,
+                        &activation,
                     );
                     let shard = build_shard(
                         token,

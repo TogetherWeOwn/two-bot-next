@@ -455,6 +455,166 @@ async fn wait_for<F: Fn() -> bool>(predicate: F, what: &str) {
 // Units (no database)
 // ---------------------------------------------------------------------------
 
+/// Exercises the same narrowed composition as `from_env`, with no env races,
+/// database connection, or external Discord calls.
+fn activation_runtime(guild: u64, token: &str, origin: String) -> Arc<CommandRuntime> {
+    let activation = crate::activation::BootActivation::from_token(Some(guild), Some(token));
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .expect("unused lazy test pool");
+    let executor = ActionExecutor::with_proxy(token.to_owned(), Some(origin)).unwrap();
+    let requested = RouterGates {
+        configured_guild: Some(guild),
+        automations: true,
+        announcements: true,
+        moderation: true,
+        self_roles: true,
+        ..gates(false, false)
+    };
+    CommandRuntime::from_gates(pool, executor, requested, &activation)
+}
+
+#[tokio::test]
+async fn activation_boot_publishes_only_permitted_capabilities() {
+    use two_bot_core::{
+        activation::LiveCapability, announcement_commands, automation_commands,
+        moderation_commands, ComponentHandler, ComponentOutcome, HandlerId,
+    };
+    const STAGING: u64 = 1545644954272137297;
+    const LIVE: u64 = 326474832151838730;
+    // Public ids encoded in synthetic credentials for the local double only.
+    const STAGING_TOKEN: &str = "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature";
+    const LIVE_TOKEN: &str = "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature";
+    const THIRD_TOKEN: &str = "MTU1NTU1NTU1NTU1NTU1NTU1Ng.mock.signature";
+    for (guild, token, app, staging, self_roles) in [
+        (STAGING, STAGING_TOKEN, 1469137636663758888, true, true),
+        (LIVE, LIVE_TOKEN, 1539711683898118154, false, true),
+        (LIVE, STAGING_TOKEN, 1469137636663758888, false, false),
+        (STAGING, LIVE_TOKEN, 1539711683898118154, false, false),
+        (
+            1555555555555555555,
+            STAGING_TOKEN,
+            1469137636663758888,
+            false,
+            false,
+        ),
+        (STAGING, THIRD_TOKEN, 1555555555555555556, false, false),
+    ] {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = activation_runtime(guild, token, origin);
+        runtime.publish_registry(Some(app)).await;
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "one full replacement, guild={guild}");
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(
+            requests[0].path,
+            format!("/api/v10/applications/{app}/guilds/{guild}/commands")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let names: Vec<_> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        for definition in automation_commands()
+            .into_iter()
+            .chain(announcement_commands())
+            .chain(moderation_commands())
+        {
+            assert_eq!(
+                names.contains(&definition.name.as_str()),
+                staging,
+                "capability command {}, guild={guild}, app={app}",
+                definition.name
+            );
+        }
+        for handler in [
+            HandlerId::AutomationAdmin,
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedList,
+        ] {
+            assert_eq!(runtime.router().handler_for(&handler).is_some(), staging);
+        }
+        assert_eq!(
+            runtime
+                .router()
+                .route_component("two:self-role:fixture", Some(guild)),
+            if self_roles {
+                ComponentOutcome::Handled {
+                    handler: ComponentHandler::SelfRole,
+                }
+            } else {
+                ComponentOutcome::Ignore
+            }
+        );
+        let activation = crate::activation::BootActivation::from_token(Some(guild), Some(token));
+        assert_eq!(activation.permitted(LiveCapability::Automod), staging);
+        if !staging {
+            // Even old sticky state cannot trigger the message hook. A lazy
+            // test pool proves the hook exits before any database access.
+            let msg = message(4444, CHANNEL, false, Some(guild));
+            assert_eq!(runtime.on_message(&msg).await, ActivityOutcome::None);
+            assert_eq!(mock.requests().len(), 1, "no sticky side effect");
+        }
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn activation_boot_invalid_token_and_ready_identity_cannot_publish() {
+    for token in ["not-a-token", "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature"] {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = activation_runtime(1545644954272137297, token, origin);
+        runtime.publish_registry(Some(1539711683898118154)).await;
+        assert!(
+            mock.requests().is_empty(),
+            "no PUT using an untrusted application id"
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
+    for app in [1539711683898118154u64, 1469137636663758888u64] {
+        let (mock, origin) = MockRest::start_script(vec![RestResponse {
+            status: 200,
+            body: Some(format!("{{\"id\":\"{app}\"}}")),
+            delay: Duration::ZERO,
+        }])
+        .await;
+        let runtime = activation_runtime(
+            326474832151838730,
+            "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+            origin,
+        );
+        runtime.publish_registry(None).await;
+        let requests = mock.requests();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests.len(),
+            if app == 1539711683898118154 { 2 } else { 1 }
+        );
+        if requests.len() == 2 {
+            let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+            let names: Vec<_> = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|command| command["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["rank", "leaderboard"],
+                "unrelated core commands remain; uncleared surfaces are replaced"
+            );
+        }
+        mock.shutdown().await;
+    }
+}
+
 #[test]
 fn sticky_options_extract_body_and_debounce() {
     let interaction = slash(
