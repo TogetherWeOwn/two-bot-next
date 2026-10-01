@@ -1,6 +1,8 @@
-# Tickets domain and persistence
+# Tickets domain, persistence and runtime integration
 
-This slice supplies `two_bot_core::tickets` and `two_bot_cutover::tickets::TicketStore`, plus migration `0210_tickets.sql` in the S6 migration directory. It does **not** enable live ticket interactions, Ready hooks, or timers. Wiring must use the shared S4 interaction router and REST action executor once they merge; there is no private dispatcher or HTTP client here. Temporary voice rooms are unrelated and unchanged.
+The merged domain/store supplies `two_bot_core::tickets`, `two_bot_cutover::tickets::TicketStore`, and migration `0210_tickets.sql`. The runtime-integration draft adds `bot::ticket_runtime` to the **existing** S4 `CommandRuntime` router/executor composition: exact button IDs, guild/member authorization, deferred ephemeral replies, lifecycle orchestration, panel/control ensure, and Ready recovery/purge. All ticket REST verbs live on the shared `ActionExecutor`; there is no private dispatcher or HTTP client. Temporary voice rooms are unrelated and unchanged.
+
+**Draft checkpoint, not accepted runtime parity:** periodic 300-second recovery / 3,600-second purge supervision, managed shutdown, and combined PostgreSQL/mock-Discord lifecycle acceptance remain unfinished. Mock test definitions cover channel metadata, permission preservation, controlled mentions, typed absence, single-attempt creation, complete pagination, partial-history rejection, the UTF-16 cap, and panel idempotency, but compiling verification has not run locally: the bounded Cargo wrapper refused the missing pool. Independent exact-head security/code review and green CI are still required before merge. No deployment, staging/live execution, ownership transfer or soak acceptance is claimed; those holds remain separate.
 
 ## Verified legacy sources
 
@@ -38,6 +40,8 @@ Framework-specific references: [sqlx 0.9 transactions](https://docs.rs/sqlx/0.9.
 cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- clippy -p two-bot-cutover --all-targets --locked -- -D warnings
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --locked tickets::
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --locked --test ticket_executor
+python3 scripts/cargo_cache.py run -- test -p two-bot --locked --bin two-bot ticket_runtime::
 python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --locked --test tickets_store -- --ignored
 ```
 

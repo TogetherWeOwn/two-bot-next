@@ -51,8 +51,8 @@ use two_bot_core::{
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
     tickets::TicketAction,
-    ComponentHandler, ComponentOutcome, FeatureGates, HandlerId, InteractionHandler, InteractionRouter,
-    ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
+    ComponentHandler, ComponentOutcome, FeatureGates, HandlerId, InteractionHandler,
+    InteractionRouter, ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
     publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
@@ -145,7 +145,10 @@ impl CommandRuntime {
             Some(guild_id),
             &features,
             &moderation,
-            SurfaceFlags { tickets: ticket_config.is_some(), ..SurfaceFlags::default() },
+            SurfaceFlags {
+                tickets: ticket_config.is_some(),
+                ..SurfaceFlags::default()
+            },
         );
         let mut router = InteractionRouter::new(gates);
         router.register(Box::new(StickyHandler));
@@ -167,7 +170,11 @@ impl CommandRuntime {
             }
         };
         let tickets = match ticket_config {
-            Some(config) => match crate::ticket_runtime::TicketRuntime::new(pool.clone(), executor.clone(), config) {
+            Some(config) => match crate::ticket_runtime::TicketRuntime::new(
+                pool.clone(),
+                executor.clone(),
+                config,
+            ) {
                 Ok(runtime) => Some(Arc::new(runtime)),
                 Err(_) => return None,
             },
@@ -308,15 +315,24 @@ impl CommandRuntime {
         let routed = route_interaction(&self.router, interaction, None);
         if let RoutedInteraction::Component {
             custom_id,
-            outcome: ComponentOutcome::Handled { handler: ComponentHandler::Tickets },
+            outcome:
+                ComponentOutcome::Handled {
+                    handler: ComponentHandler::Tickets,
+                },
             ..
-        } = &routed {
-            if let (Some(tickets), Some(action)) = (&self.tickets, TicketAction::from_custom_id(custom_id)) {
-                self.on_ticket_interaction(tickets, interaction, action).await;
+        } = &routed
+        {
+            if let (Some(tickets), Some(action)) =
+                (&self.tickets, TicketAction::from_custom_id(custom_id))
+            {
+                self.on_ticket_interaction(tickets, interaction, action)
+                    .await;
             }
             return;
         }
-        let RoutedInteraction::Slash { name, outcome } = routed else { return; };
+        let RoutedInteraction::Slash { name, outcome } = routed else {
+            return;
+        };
         if let Some(response) = response_for_slash(&outcome) {
             self.answer(interaction, response).await;
             return;
@@ -375,11 +391,22 @@ impl CommandRuntime {
             self.answer(interaction, ephemeral(error.to_string())).await;
             return;
         }
-        if self.executor.answer_interaction(interaction.id.get(), &interaction.token,
-            &InteractionResponse {
-                kind: InteractionResponseType::DeferredChannelMessageWithSource,
-                data: Some(InteractionResponseData { flags: Some(MessageFlags::EPHEMERAL), ..Default::default() }),
-            }).await.is_err() {
+        if self
+            .executor
+            .answer_interaction(
+                interaction.id.get(),
+                &interaction.token,
+                &InteractionResponse {
+                    kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                    data: Some(InteractionResponseData {
+                        flags: Some(MessageFlags::EPHEMERAL),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .is_err()
+        {
             warn!("ticket defer failed; no state mutated");
             return;
         }
@@ -390,7 +417,12 @@ impl CommandRuntime {
                 error.reply()
             }
         };
-        if self.executor.edit_interaction_response(interaction.application_id.get(), &interaction.token, &reply).await.is_err() {
+        if self
+            .executor
+            .edit_interaction_response(interaction.application_id.get(), &interaction.token, &reply)
+            .await
+            .is_err()
+        {
             warn!("ticket response edit failed; durable state retained");
         }
     }

@@ -1,6 +1,7 @@
 //! Explicit outbound policy, applied before Twilight validates message payloads.
-//! No current sending action opts into notifications. Never trust caller-supplied
-//! `allowed_mentions`, including for interaction message updates.
+//! Never trust caller-supplied `allowed_mentions`, including interaction updates.
+//! The fixed ticket-controls template alone opts into a validated opener-id
+//! notification AFTER this sanitizer; arbitrary messages never opt in.
 
 use serde_json::{json, Value};
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};

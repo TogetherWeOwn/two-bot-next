@@ -43,8 +43,13 @@ impl ActionExecutor {
         let opener = snowflake(input.opener_id)?;
         let staff = snowflake(input.staff_role_id)?;
         let bot = snowflake(input.bot_id)?;
-        if input.reservation_id.is_empty() || input.guild_id == input.staff_role_id || input.bot_id == input.opener_id {
-            return Err(DiscordError::Rejected("invalid ticket reservation or permission targets".into()));
+        if input.reservation_id.is_empty()
+            || input.guild_id == input.staff_role_id
+            || input.bot_id == input.opener_id
+        {
+            return Err(DiscordError::Rejected(
+                "invalid ticket reservation or permission targets".into(),
+            ));
         }
         let common = Permissions::VIEW_CHANNEL
             | Permissions::SEND_MESSAGES
@@ -56,15 +61,37 @@ impl ActionExecutor {
             deny: Some(deny),
         };
         let overwrites = [
-            overwrite(guild.cast(), PermissionOverwriteType::Role, Permissions::empty(), Permissions::VIEW_CHANNEL),
-            overwrite(bot, PermissionOverwriteType::Member, common | Permissions::MANAGE_CHANNELS, Permissions::empty()),
-            overwrite(opener, PermissionOverwriteType::Member, common, Permissions::empty()),
-            overwrite(staff, PermissionOverwriteType::Role, common, Permissions::empty()),
+            overwrite(
+                guild.cast(),
+                PermissionOverwriteType::Role,
+                Permissions::empty(),
+                Permissions::VIEW_CHANNEL,
+            ),
+            overwrite(
+                bot,
+                PermissionOverwriteType::Member,
+                common | Permissions::MANAGE_CHANNELS,
+                Permissions::empty(),
+            ),
+            overwrite(
+                opener,
+                PermissionOverwriteType::Member,
+                common,
+                Permissions::empty(),
+            ),
+            overwrite(
+                staff,
+                PermissionOverwriteType::Role,
+                common,
+                Permissions::empty(),
+            ),
         ];
         let name = ticket_channel_name(input.username);
         let topic = format!("two-ticket:{}", input.reservation_id);
         let req = Self::request_of(
-            self.inner.factory.create_guild_channel(guild, &name)
+            self.inner
+                .factory
+                .create_guild_channel(guild, &name)
                 .kind(ChannelType::GuildText)
                 .parent_id(category)
                 .topic(&topic)
@@ -73,15 +100,21 @@ impl ActionExecutor {
         self.pace(false).await;
         let res = self.call_once_raw(req, &[200, 201]).await?;
         let doc = ticket_json(&res)?;
-        let id = doc.get("id").and_then(Value::as_str)
+        let id = doc
+            .get("id")
+            .and_then(Value::as_str)
             .ok_or_else(|| DiscordError::Unavailable("ticket create omitted channel id".into()))?;
         // Missing/malformed success evidence is uncertain, never a safe retry.
-        snowflake::<ChannelMarker>(id).map_err(|_| DiscordError::Unavailable("invalid ticket channel id".into()))?;
+        snowflake::<ChannelMarker>(id)
+            .map_err(|_| DiscordError::Unavailable("invalid ticket channel id".into()))?;
         Ok(id.to_owned())
     }
 
     /// A successful guild-wide query is required before orphan absence is inferred.
-    pub async fn fetch_ticket_guild_channels(&self, guild_id: &str) -> Result<Vec<Value>, DiscordError> {
+    pub async fn fetch_ticket_guild_channels(
+        &self,
+        guild_id: &str,
+    ) -> Result<Vec<Value>, DiscordError> {
         let req = Self::request_of(self.inner.factory.guild_channels(snowflake(guild_id)?))?;
         self.pace(false).await;
         let res = self.call_once_raw(req, &[200]).await?;
@@ -89,7 +122,10 @@ impl ActionExecutor {
             .map_err(|_| DiscordError::Unavailable("invalid guild channel list".into()))
     }
 
-    pub async fn fetch_ticket_channel(&self, channel_id: &str) -> Result<ChannelPresence<Value>, DiscordError> {
+    pub async fn fetch_ticket_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<ChannelPresence<Value>, DiscordError> {
         let req = Self::request_of(self.inner.factory.channel(snowflake(channel_id)?))?;
         self.pace(false).await;
         // Accept 404 only to inspect its structured code; generic 404 is NOT absence.
@@ -103,7 +139,9 @@ impl ActionExecutor {
         }
         let doc = ticket_json(&res)?;
         if !doc.is_object() {
-            return Err(DiscordError::Unavailable("invalid ticket channel document".into()));
+            return Err(DiscordError::Unavailable(
+                "invalid ticket channel document".into(),
+            ));
         }
         Ok(ChannelPresence::Present(doc))
     }
@@ -132,15 +170,31 @@ impl ActionExecutor {
         let overwrite = PermissionOverwrite {
             id: snowflake(opener_id)?,
             kind: PermissionOverwriteType::Member,
-            allow: Some(Permissions::from_bits_retain(if enabled { allow | bit } else { allow & !bit })),
-            deny: Some(Permissions::from_bits_retain(if enabled { deny & !bit } else { deny | bit })),
+            allow: Some(Permissions::from_bits_retain(if enabled {
+                allow | bit
+            } else {
+                allow & !bit
+            })),
+            deny: Some(Permissions::from_bits_retain(if enabled {
+                deny & !bit
+            } else {
+                deny | bit
+            })),
         };
-        let req = Self::request_of(self.inner.factory.update_channel_permission(snowflake(channel_id)?, &overwrite))?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .update_channel_permission(snowflake(channel_id)?, &overwrite),
+        )?;
         self.pace(false).await;
         self.call_once(req, &[200, 204]).await.map(|_| ())
     }
 
-    pub async fn post_ticket_message(&self, channel_id: &str, message: TicketMessage<'_>) -> Result<String, DiscordError> {
+    pub async fn post_ticket_message(
+        &self,
+        channel_id: &str,
+        message: TicketMessage<'_>,
+    ) -> Result<String, DiscordError> {
         let (content, buttons, opener) = match message {
             TicketMessage::Panel => (
                 PANEL_TEXT.to_owned(),
@@ -167,25 +221,36 @@ impl ActionExecutor {
             body["allowed_mentions"]["users"] = json!([opener]);
         }
         crate::message_safety::validate_create(&body)?;
-        let bytes = serde_json::to_vec(&body).map_err(|_| DiscordError::Rejected("invalid ticket message".into()))?;
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|_| DiscordError::Rejected("invalid ticket message".into()))?;
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
-        let req = Request::builder(&Route::CreateMessage { channel_id: channel.get() })
-            .body(bytes).build().map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
+        let req = Request::builder(&Route::CreateMessage {
+            channel_id: channel.get(),
+        })
+        .body(bytes)
+        .build()
+        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
         self.pace(false).await;
         let res = self.call_once_raw(req, &[200, 201]).await?;
         let doc = ticket_json(&res)?;
-        let id = doc.get("id").and_then(Value::as_str)
+        let id = doc
+            .get("id")
+            .and_then(Value::as_str)
             .ok_or_else(|| DiscordError::Unavailable("ticket message omitted id".into()))?;
-        snowflake::<MessageMarker>(id).map_err(|_| DiscordError::Unavailable("invalid ticket message id".into()))?;
+        snowflake::<MessageMarker>(id)
+            .map_err(|_| DiscordError::Unavailable("invalid ticket message id".into()))?;
         Ok(id.to_owned())
     }
 }
 
 fn ticket_json(res: &RawResponse) -> Result<Value, DiscordError> {
-    serde_json::from_slice(&res.body).map_err(|_| DiscordError::Unavailable("invalid ticket response JSON".into()))
+    serde_json::from_slice(&res.body)
+        .map_err(|_| DiscordError::Unavailable("invalid ticket response JSON".into()))
 }
 
 fn unknown_channel(res: &RawResponse) -> bool {
-    serde_json::from_slice::<Value>(&res.body).ok()
-        .and_then(|body| body.get("code").and_then(Value::as_u64)) == Some(10003)
+    serde_json::from_slice::<Value>(&res.body)
+        .ok()
+        .and_then(|body| body.get("code").and_then(Value::as_u64))
+        == Some(10003)
 }
