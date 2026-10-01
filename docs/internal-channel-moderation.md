@@ -47,8 +47,16 @@ and channel release happen in one transaction.
 Proven pre-mutation failures release the request/channel reservation atomically
 with a refused audit. Channel/history GET failures (including timeouts and rate
 limits) and read-only recovery lookup errors abort before any Discord mutation;
-recovery-read errors preserve the original seed. Purge's history and deletion
-phases are separate so history failures are retryable, not uncertain deletions.
+recovery-read errors preserve the original seed. A definitive recovery-write SQL
+rejection also releases reservations without deleting recovery state: SQLSTATE
+classes 22/23/42, serialization failure, deadlock and query cancellation prove the
+statement aborted. Unknown completion (including 40003), transport failures and
+unrecognized SQLSTATEs remain fenced because a seed may have committed.
+Purge's history and deletion phases are separate so history failures are retryable,
+not uncertain deletions. The entire history body must be a JSON array of rows with
+canonical nonzero u64 string IDs; unreadable bodies or any malformed ID reject the
+whole read before deletion or success persistence. A valid empty array succeeds
+with zero affected messages.
 Rejected first lockdown also removes only its newly created seed; rejected
 repeated lockdown keeps the original seed. Build-time validation and confirmed
 HTTP 400/401/403/404/405 rejections are safe; per-verb accepted statuses still
@@ -82,6 +90,8 @@ Unicode reason bounds, permission/guild refusals, exact mask/absence restoration
 both overlap directions across independent pools, uncertain/rejected writes,
 stale request/recovery generations, and atomic rollback after a terminal audit
 failure. Regressions cover ambiguous PUT/DELETE permission responses, fault-injected
-recovery reads with same-key retry, purge history 503/429/408/timeout recovery,
-and single/bulk-delete uncertainty without weakening same-key/distinct-key fences.
+recovery reads with same-key retry, rejected first/repeated recovery writes,
+SQLSTATE uncertainty classification, purge history 503/429/408/timeout and malformed
+body/ID recovery, valid empty history, and single/bulk-delete uncertainty without
+weakening same-key/distinct-key fences.
 CI runs the suite against its existing disposable service container.

@@ -1170,15 +1170,23 @@ impl ActionExecutor {
             .try_into()
             .map_err(|_| DiscordError::Rejected(format!("purge out of range: {count}")))?;
         let list_req = Self::request_of(self.inner.factory.channel_messages(channel).limit(limit))?;
-        let listed = self.call_once(list_req, &[200]).await?.unwrap_or_default();
-        Ok(listed
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let res = self.call_once_raw(list_req, &[200]).await?;
+        let unreadable =
+            || DiscordError::Unavailable(format!("unreadable channel {channel_id} purge history"));
+        let listed: Vec<serde_json::Value> =
+            serde_json::from_slice(&res.body).map_err(|_| unreadable())?;
+        listed
             .iter()
-            .filter_map(|row| row.get("id")?.as_str()?.parse::<u64>().ok())
-            .filter_map(Id::new_checked)
-            .collect())
+            .map(|row| {
+                let value = row.get("id").and_then(serde_json::Value::as_str);
+                let value = value.ok_or_else(unreadable)?;
+                let id: Id<MessageMarker> = snowflake(value).map_err(|_| unreadable())?;
+                if id.to_string() != value {
+                    return Err(unreadable());
+                }
+                Ok(id)
+            })
+            .collect()
     }
 
     /// Single deletion phase; uncertain wire failures must retain caller fences.

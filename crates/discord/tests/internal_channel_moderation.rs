@@ -493,8 +493,85 @@ async fn recovery_read_failures_release_both_fences_and_preserve_original_seed()
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service container"]
+async fn rejected_recovery_writes_release_reservations_without_discord_mutation() {
+    for repeated in [false, true] {
+        let db = TestDb::new().await;
+        let original = if repeated {
+            Some(seed_lockdown(&db, Some("3072")).await)
+        } else {
+            None
+        };
+        // NOT VALID preserves the existing seed but rejects both INSERT and
+        // ON CONFLICT UPDATE. This is a definitive server rejection, not a
+        // simulated connection loss with an unknown commit outcome.
+        sqlx::query(
+            "ALTER TABLE moderation_lockdowns ADD CONSTRAINT reject_recovery_write \
+             CHECK (reason <> 'cleanup') NOT VALID",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mock = MockRest::start(
+            vec![
+                channel(Some("3072"), "8192"),
+                channel(Some("3072"), "8192"),
+                ScriptedResponse::status(204),
+                channel(None, "0"),
+                ScriptedResponse::json(200, json!({})),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let exec = executor(db.pool.clone(), &mock);
+        let req = request("moderation.lockdown", json!({}));
+        assert_eq!(
+            exec.execute(&req, &actor(), "write-rejected", "write-rejected-key", TIME)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+        assert_eq!(mock.requests().len(), 1);
+        assert_eq!(mock.requests()[0].method, "GET");
+        assert_reservations(&db, 0).await;
+        assert_eq!(db.store().get_lockdown(CHANNEL).await.unwrap(), original);
+        assert_audit(&db, "moderation.lockdown", "refused", "cleanup", None).await;
+        sqlx::query("ALTER TABLE moderation_lockdowns DROP CONSTRAINT reject_recovery_write")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let result = exec
+            .execute(&req, &actor(), "write-retry", "write-rejected-key", TIME)
+            .await
+            .unwrap();
+        assert!(!result.replayed);
+        assert_eq!(result.outcome, "locked_down");
+        if let Some(original) = original {
+            assert_eq!(
+                db.store().get_lockdown(CHANNEL).await.unwrap(),
+                Some(original)
+            );
+        }
+        exec.execute(
+            &request("moderation.slowmode", json!({"seconds":0})),
+            &actor(),
+            "after-write-retry",
+            "after-write-retry-key",
+            TIME,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock.requests().len(), 5);
+        assert_eq!(mock.requests()[2].method, "PUT");
+        mock.shutdown().await;
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
 async fn purge_history_failures_are_retryable_without_any_deletion() {
-    for (failure, code) in [
+    let mut failures = vec![
         (ScriptedResponse::status(503), ErrorCode::DiscordUnavailable),
         (ScriptedResponse::status(429), ErrorCode::RateLimited),
         (ScriptedResponse::status(408), ErrorCode::DiscordUnavailable),
@@ -504,7 +581,35 @@ async fn purge_history_failures_are_retryable_without_any_deletion() {
             )),
             ErrorCode::UpstreamTimeout,
         ),
+        (ScriptedResponse::status(200), ErrorCode::DiscordUnavailable),
+        (
+            ScriptedResponse {
+                body: b"[{".to_vec(),
+                ..ScriptedResponse::status(200)
+            },
+            ErrorCode::DiscordUnavailable,
+        ),
+    ];
+    for malformed in [
+        json!(null),
+        json!({}),
+        json!("history"),
+        json!([{}]),
+        json!([null]),
+        json!([{"id":null}]),
+        json!([{"id":555555555555555555u64}]),
+        json!([{"id":"0"}]),
+        json!([{"id":"invalid"}]),
+        json!([{"id":"18446744073709551616"}]),
+        json!([{"id":"0555555555555555555"}]),
+        json!([{"id":"555555555555555555"}, {"id":"invalid"}]),
     ] {
+        failures.push((
+            ScriptedResponse::json(200, malformed),
+            ErrorCode::DiscordUnavailable,
+        ));
+    }
+    for (failure, code) in failures {
         let db = TestDb::new().await;
         let mock = MockRest::start(
             vec![

@@ -330,7 +330,7 @@ impl InternalChannelExecutor {
                         "recovery state belongs to another guild",
                     ));
                 }
-                let record = self
+                let record = match self
                     .store
                     .record_lockdown(
                         &request.channel_id,
@@ -340,7 +340,23 @@ impl InternalChannelExecutor {
                         now,
                     )
                     .await
-                    .map_err(database_error)?;
+                {
+                    Ok(record) => record,
+                    Err(failure) => {
+                        // Only definitive SQL rejections prove no seed commit;
+                        // transport/unknown-completion errors remain fenced.
+                        // No Discord PUT was sent. Preserve any original seed.
+                        if let sqlx::Error::Database(db) = &failure {
+                            if db
+                                .code()
+                                .is_some_and(|code| definitive_sql_rejection(&code))
+                            {
+                                self.abort(&ticket, &audit, None).await?;
+                            }
+                        }
+                        return Err(database_error(failure));
+                    }
+                };
                 if existing.is_none() {
                     clear_on_rejection = Some(record.recovery_generation);
                 }
@@ -509,6 +525,17 @@ fn bounded_audit_reason(
 fn error(code: ErrorCode, message: impl Into<String>) -> ActionError {
     ActionError::new(code, message, "internal_channel_moderation")
 }
+// Data/integrity/syntax-access rejection, serialization failure, deadlock and
+// cancellation abort the statement. Do not include class 08, 40003 (statement
+// completion unknown), shutdowns, or unrecognized/missing SQLSTATEs.
+fn definitive_sql_rejection(code: &str) -> bool {
+    code.len() == 5
+        && (code.starts_with("22")
+            || code.starts_with("23")
+            || code.starts_with("42")
+            || matches!(code, "40001" | "40P01" | "57014"))
+}
+
 fn database_error(_: sqlx::Error) -> ActionError {
     error(
         ErrorCode::Internal,
@@ -529,4 +556,23 @@ fn discord_error(failure: DiscordError) -> ActionError {
         DiscordError::Unavailable(_) => ErrorCode::DiscordUnavailable,
     };
     error(code, failure.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::definitive_sql_rejection;
+
+    #[test]
+    fn recovery_sql_rejection_excludes_unknown_completion() {
+        for code in [
+            "22003", "23502", "23505", "23514", "42501", "42703", "40001", "40P01", "57014",
+        ] {
+            assert!(definitive_sql_rejection(code), "{code}");
+        }
+        for code in [
+            "", "23", "08006", "08007", "40003", "57P01", "XX000", "ZZZZZ",
+        ] {
+            assert!(!definitive_sql_rejection(code), "{code}");
+        }
+    }
 }
