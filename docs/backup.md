@@ -127,8 +127,8 @@ regressions remain in `backup_roundtrip` and `backup_dump_publication`.
 1. Parse `TWO_BACKUP_KEEP` **before** dumping — a malformed value aborts the
    run while it is still a no-op (a typo must never prune everything).
 2. Dump to `TWO_BACKUP_DIR/two-funnel-<stamp>.ndjson.gz` (default 14 kept).
-   Empty event log → exit non-zero after upload: a backup that quietly
-   reports zero events is worse than none.
+   Empty event log → exit non-zero **before retention/upload**, preserving
+   previous archives: a backup that quietly reports zero events is worse than none.
 3. Prune to the newest `TWO_BACKUP_KEEP` files (by mtime).
 4. Run `TWO_BACKUP_UPLOAD_CMD` with the file path as its **last** argument
    (the `uploadCmd` contract: suits `cp -t DIR FILE`; point wrapper-needing
@@ -290,9 +290,10 @@ cutover plan and gates separately; these examples are scratch-only.
 
 ## S6 hook (Founding Engineer)
 
-`cmd_restore` does **not** run migrations: two-bot-next migrations land
-under S6, so the target must already carry the schema and `dump()` refuses
-with a named table when it does not. S6 plugs `migrate()` in at the marked
-`NOTE` in `crates/bot/src/backup_cli.rs` (same position legacy
-`pg-restore.ts` ran it). The dump reader already tolerates dumps whose
-columns the target lacks (`droppedColumns` report, target types win).
+`cmd_restore` does **not** run migrations. Provision the target with the current
+`crates/cutover/migrations` schema through the separately authorized cutover path;
+backup/restore refuses a missing required table rather than migrating implicitly.
+The reader tolerates archived columns the target lacks (`dropped_columns` report,
+target types win), but it never silently drops nonempty archived legacy tables
+that have no target. Cutover execution and production restore remain separately
+gated; this table-coverage slice grants neither authority.

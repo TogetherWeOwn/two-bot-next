@@ -261,6 +261,34 @@ async fn cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dum
     for path in orphaned {
         assert!(path.exists(), "retention must ignore crash temporaries");
     }
+    // Empty events still refuse semantic acceptance, retaining every previous
+    // archive and never reaching upload, even though the envelope is valid v4.
+    let empty_backups = dir.join("empty-events");
+    std::fs::create_dir(&empty_backups).unwrap();
+    for name in ["first", "second", "third"] {
+        std::fs::write(
+            empty_backups.join(format!("two-funnel-{name}.ndjson.gz")),
+            &saved,
+        )
+        .unwrap();
+    }
+    let empty_baseline = candidates(&empty_backups);
+    let empty_marker = dir.join("empty-upload-invoked");
+    sqlx::query("TRUNCATE events").execute(&pool).await.unwrap();
+    let empty = cli(&binary, &url, &empty_backups, &empty_marker, "none");
+    save_output(&dir, "empty-events", &empty);
+    assert_eq!(empty.status.code(), Some(1), "{empty:?}");
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("event log is empty"));
+    assert!(!empty_marker.exists(), "empty events cannot reach upload");
+    for path in empty_baseline {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            saved,
+            "no retention on refusal"
+        );
+    }
+    assert_eq!(candidates(&empty_backups).len(), 4);
+    std::fs::remove_dir_all(empty_backups).unwrap();
     pool.close().await;
     // Keep the bounded textual evidence above; remove only test backup files.
     std::fs::remove_dir_all(backups).unwrap();

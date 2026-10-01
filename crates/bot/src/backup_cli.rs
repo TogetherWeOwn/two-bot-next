@@ -416,9 +416,9 @@ async fn cmd_restore(args: &[String]) -> i32 {
             return 1;
         }
     };
-    // NOTE: two-bot-next migrations land under S6 (Founding Engineer). Until
-    // then the target must already carry the schema; dump()/restore() refuse
-    // with a named table when it does not. S6 plugs migrate() in here.
+    // Restore deliberately does not apply migrations. The independently
+    // provisioned target must already carry the current cutover schema;
+    // dump()/restore() refuse with a named table when it does not.
     match dump::restore(&pool, Path::new(&file)).await {
         Ok(report) => {
             println!("restore: dump taken {}", report.manifest.created_at);

@@ -492,6 +492,8 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         }
     }
 
+    // Preserve origin/always/replica/disabled modes, not just enabled vs disabled.
+    // https://www.postgresql.org/docs/16/catalog-pg-trigger.html
     for (table, trigger, state) in suspended {
         let action = match state.as_str() {
             "O" => "ENABLE",
