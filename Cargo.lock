@@ -2370,6 +2370,7 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "two-bot-core",
+ "two-bot-testsupport",
 ]
 
 [[package]]
