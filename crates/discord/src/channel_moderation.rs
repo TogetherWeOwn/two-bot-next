@@ -465,9 +465,14 @@ impl ChannelModerationRuntime {
     }
 }
 
+#[allow(deprecated)]
 fn request(interaction: &Interaction, action: ModerationAction) -> Option<Request> {
     let guild_id = interaction.guild_id?.to_string();
-    let channel_id = interaction.channel.as_ref()?.id.to_string();
+    let channel_id = interaction
+        .channel
+        .as_ref()
+        .map(|channel| channel.id.to_string())
+        .or_else(|| interaction.channel_id.map(|id| id.to_string()))?;
     let actor_id = interaction.member.as_ref()?.user.as_ref()?.id.to_string();
     let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
         return None;
@@ -552,3 +557,7 @@ fn integer_option(data: &CommandData, name: &str) -> Result<Option<u64>, String>
         _ => Err(format!("\"{name}\" is required exactly once")),
     }
 }
+
+#[cfg(test)]
+#[path = "channel_moderation_tests.rs"]
+mod tests;

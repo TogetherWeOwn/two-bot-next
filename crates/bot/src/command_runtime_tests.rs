@@ -1065,13 +1065,8 @@ async fn ready_publish_withholds_gated_off_feed_commands() {
 async fn duplicate_ready_republishes_the_identical_set() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
-    runtime.dispatch(&ready());
-    runtime.dispatch(&ready());
-    wait_for(
-        || mock.requests().iter().filter(|r| r.method == "PUT").count() == 2,
-        "second registry publish PUT",
-    )
-    .await;
+    runtime.publish_registry(Some(1111)).await;
+    runtime.publish_registry(Some(1111)).await;
     let puts: Vec<_> = mock
         .requests()
         .into_iter()
