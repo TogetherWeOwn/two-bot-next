@@ -200,6 +200,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         db.store.clone(),
         None,
         Some(voice.clone()),
+        None,
     ));
     let resume = mock.authentication().await;
     assert_eq!(resume["op"], 6);

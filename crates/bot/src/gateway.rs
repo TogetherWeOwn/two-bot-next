@@ -181,17 +181,30 @@ pub async fn run_shard(
     store: GatewaySessionStore,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
     voice: Option<Arc<dyn VoiceEventSink>>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(
-        &mut shard,
-        &pipeline,
-        &state,
-        &store,
-        runtime.as_ref(),
-        voice.as_ref(),
-    )
-    .await;
+    let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
+    let result = tokio::select! {
+        biased;
+        _ = async {
+            match shutdown {
+                Some(receiver) => crate::server::shutdown_requested(receiver).await,
+                None => std::future::pending().await,
+            }
+        } => Ok(()),
+        result = run_loop(
+            &mut shard,
+            &pipeline,
+            &state,
+            &store,
+            runtime.as_ref(),
+            voice.as_ref(),
+        ) => result,
+    };
     *state.write().await = GatewayState::Armed;
+    if let Some(tickets) = tickets {
+        tickets.shutdown().await;
+    }
     result
 }
 

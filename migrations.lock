@@ -21,6 +21,10 @@
       "sha256": "0b326330725f301066f24f3c5ffaadb7db020e326ac89095afe28d2a968fe766",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0123_channel_execution_fence.sql": {
+      "sha256": "404e6e97fce3bafa5ab20fd7623f2174287ce2435b179dc50c1a576e5c9b6555",
+      "justification": "Add durable per-channel execution fencing for website moderation actions in TOG-10864; preserve shared lockdown recovery ordering."
+    },
     "crates/cutover/migrations/0150_sticky_messages.sql": {
       "sha256": "17d867f772c9f37325c50be959d9f184958e1a632eb47a000ac9ec13b9c30f57",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
@@ -44,6 +48,10 @@
     "crates/cutover/migrations/0200_self_roles.sql": {
       "sha256": "1e88d4300bea0c47c5ca37aaa1897314ecfa1677e43d7dcbbbfddf29344862df",
       "justification": "Add reserved self-role audit and panel lease migration for TOG-10087; preserve legacy table and column names."
+    },
+    "crates/cutover/migrations/0210_tickets.sql": {
+      "sha256": "950da1329b8943173ef0472681fd104049a622d2bacaf88d7afd31d242ca1a08",
+      "justification": "Correct unmerged TOG-10088 ticket migration to clamp populated legacy expiry to 2160 elapsed UTC hours without extending shorter deadlines; transcript bodies remain unchanged."
     },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
@@ -97,13 +105,13 @@
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."
     },
-    "crates/cutover/migrations/0210_voice_rooms.sql": {
+    "crates/cutover/migrations/0220_voice_rooms.sql": {
       "sha256": "369accb6dacb308212282b37883a52579c3a168b8ab19b41027672878c0259d5",
-      "justification": "New V1 creator/room tables for TOG-10093; renumber unmerged migration to avoid main's 0200 self-role migration, SQL unchanged."
+      "justification": "New V1 creator/room tables for TOG-10093; renumber unmerged migration to avoid main's 0210 tickets migration, SQL unchanged."
     },
-    "crates/cutover/migrations/0211_voice_inherit_limit.sql": {
+    "crates/cutover/migrations/0221_voice_inherit_limit.sql": {
       "sha256": "d1a9abe893e8b030db21452f29506a924d60bd7b880d7cef9debc53deb0dd4b4",
-      "justification": "New V1 nullable creator-limit inherit for TOG-10093; follows renumbered 0210 voice schema, SQL unchanged."
+      "justification": "New V1 nullable creator-limit inherit for TOG-10093; follows renumbered 0220 voice schema, SQL unchanged."
     }
   }
 }

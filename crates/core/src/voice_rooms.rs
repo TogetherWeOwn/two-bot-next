@@ -7,7 +7,7 @@
 //! Discord. These decisions alone do not execute V1: the twilight executor
 //! and gateway hookup must apply them and verify live occupancy/access.
 //!
-//! Schema: `crates/cutover/migrations/0210_voice_rooms.sql` mirrors
+//! Schema: `crates/cutover/migrations/0220_voice_rooms.sql` mirrors
 //! [`CreatorChannel`] / [`VoiceRoom`] in the shared migration history.
 //! [`RoomStore`] is a synchronous domain snapshot seam for tests/replay;
 //! production persistence needs an asynchronous sqlx adapter.
