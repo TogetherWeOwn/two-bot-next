@@ -181,7 +181,7 @@ impl ActionExecutor {
     }
 
     /// PUT /guilds/{g}/members/{u}. The token is a function argument and wire
-    /// body only. Source: https://docs.discord.com/developers/resources/guild#add-guild-member
+    /// body only. Source: <https://docs.discord.com/developers/resources/guild#add-guild-member>
     pub async fn add_internal_member(
         &self,
         guild_id: &str,
@@ -213,7 +213,7 @@ impl ActionExecutor {
     }
 
     /// A resolved allowlisted role, with an authoritative hierarchy read before
-    /// mutation. Source: https://docs.discord.com/developers/topics/permissions#permission-hierarchy
+    /// mutation. Source: <https://docs.discord.com/developers/topics/permissions#permission-hierarchy>
     pub async fn assign_internal_role(
         &self,
         guild_id: &str,

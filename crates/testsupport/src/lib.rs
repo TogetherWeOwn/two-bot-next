@@ -87,7 +87,16 @@ fn guard_environment(mut is_set: impl FnMut(&str) -> bool) -> Result<()> {
     Ok(())
 }
 
-fn connect_options(raw: &str) -> Result<PgConnectOptions> {
+// CREATE/DROP can wait for a checkpoint on the disposable CI service. Keep a
+// finite administrative budget without extending fixture query deadlines.
+fn admin_statement_timeout(github_actions: Option<&str>) -> &'static str {
+    match github_actions {
+        Some("true") => "30000ms",
+        _ => "5000ms",
+    }
+}
+
+fn connect_options(raw: &str, statement_timeout: &str) -> Result<PgConnectOptions> {
     guard_database_url(raw)?;
     let url = Url::parse(raw).expect("guard already parsed URL");
     Ok(PgConnectOptions::new_without_pgpass()
@@ -97,7 +106,7 @@ fn connect_options(raw: &str) -> Result<PgConnectOptions> {
         .password("")
         .database(url.path().trim_start_matches('/'))
         .ssl_mode(PgSslMode::Disable)
-        .options([("statement_timeout", "5000ms")]))
+        .options([("statement_timeout", statement_timeout)]))
 }
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -147,11 +156,12 @@ pub struct TestDatabase {
 
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
-        let options = connect_options(raw)?;
+        let options = connect_options(raw, "5000ms")?;
+        let github_actions = std::env::var("GITHUB_ACTIONS").ok();
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_with(options.clone())
+            .connect_with(connect_options(raw, admin_statement_timeout(github_actions.as_deref()))?)
             .await
             .context("connect to test bootstrap database")?;
         let name = database_name();
@@ -246,6 +256,54 @@ mod tests {
     use super::*;
 
     const SAFE: &str = "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard";
+
+    #[test]
+    fn admin_deadline_is_bounded_and_ci_only() {
+        assert_eq!(admin_statement_timeout(Some("true")), "30000ms");
+        for value in [None, Some("false"), Some("TRUE"), Some("1"), Some("")] {
+            assert_eq!(admin_statement_timeout(value), "5000ms");
+        }
+        let workload = connect_options(SAFE, "5000ms").unwrap();
+        let admin = connect_options(SAFE, admin_statement_timeout(Some("true"))).unwrap();
+        assert_eq!(workload.get_options(), Some("-c statement_timeout=5000ms"));
+        assert_eq!(admin.get_options(), Some("-c statement_timeout=30000ms"));
+        assert_eq!(admin.get_host(), workload.get_host());
+        assert_eq!(admin.get_username(), workload.get_username());
+        assert_eq!(admin.get_database(), workload.get_database());
+    }
+
+    #[tokio::test]
+    async fn admin_and_workload_deadlines_are_applied_to_connections() {
+        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return,
+            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+        };
+        let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
+            .await
+            .unwrap();
+        let admin = &fixture.cleanup.as_ref().unwrap().admin;
+        let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(admin)
+            .await
+            .unwrap();
+        let expected = if std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true") {
+            "30s"
+        } else {
+            "5s"
+        };
+        assert_eq!(timeout, expected);
+        let peer = fixture.independent_pool().await.unwrap();
+        for pool in [fixture.pool(), &peer] {
+            let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(timeout, "5s");
+        }
+        peer.close().await;
+        fixture.close().await.unwrap();
+    }
 
     #[test]
     fn accepts_only_explicit_test_connections() {
