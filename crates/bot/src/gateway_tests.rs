@@ -420,6 +420,7 @@ async fn spawn_runner(
         state.clone(),
         db.store.clone(),
         None,
+        None,
     ));
     (task, state)
 }
