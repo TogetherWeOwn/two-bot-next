@@ -97,7 +97,11 @@ async fn exercise(pool: &PgPool) -> TestResult {
     .await?;
     let rows = [row("a", 10), row("b", 20)];
     assert!(store_counters(pool, "g1", &rows, NEW).await.is_err());
-    assert_eq!(snapshot(pool).await?, before, "failed checkpoint must roll back fully");
+    assert_eq!(
+        snapshot(pool).await?,
+        before,
+        "failed checkpoint must roll back fully"
+    );
 
     // Retry succeeds once the fault is gone.
     sqlx::raw_sql("DROP TRIGGER fail_b ON invite_snapshots")
