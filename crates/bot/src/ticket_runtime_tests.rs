@@ -1,4 +1,5 @@
 //! Mock-only proofs; lazy testdb pool never connects in these tests.
+//! Timer proofs use Tokio's paused clock, not elapsed wall time.
 use super::*;
 use crate::discord_test_common::{MockRest, ScriptedResponse};
 use serde_json::json;

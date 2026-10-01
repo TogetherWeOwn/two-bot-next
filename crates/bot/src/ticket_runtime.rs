@@ -3,12 +3,21 @@
 
 use std::{
     collections::HashSet,
-    sync::atomic::{AtomicU64, Ordering},
+    future::Future,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex as TaskMutex,
+    },
+    time::Duration,
 };
 
 use serde_json::Value;
 use sqlx::PgPool;
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{watch, Mutex},
+    task::{JoinHandle, JoinSet},
+    time::{Instant, MissedTickBehavior},
+};
 use twilight_model::{application::interaction::Interaction, guild::Permissions};
 use two_bot_core::{
     funnel::{now_millis_for_test, parse_iso_millis},
@@ -20,7 +29,88 @@ use two_bot_discord::{
     ActionExecutor, DiscordError,
 };
 
-use crate::jobs::ErrorClass;
+use crate::jobs::{ErrorClass, JobAction};
+
+const RECOVERY_CADENCE: Duration = Duration::from_secs(RECOVERY_INTERVAL_SECONDS);
+const PURGE_CADENCE: Duration = Duration::from_secs(PURGE_INTERVAL_SECONDS);
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(240);
+const PURGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The gateway owns this scope. Dropping a cancelled shard also cancels all
+/// ticket work; normal shutdown additionally joins it before returning.
+pub(crate) struct TicketSupervisor {
+    runtime: Arc<TicketRuntime>,
+    shutdown: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl TicketSupervisor {
+    pub async fn shutdown(self) {
+        self.runtime.stop_tasks();
+        self.shutdown.send_replace(true);
+        // Await by reference because Drop remains the cancellation fallback.
+        let mut this = self;
+        let _ = (&mut this.task).await;
+        let mut tasks = {
+            let mut tasks = this.runtime.tasks.lock().expect("ticket task scope");
+            std::mem::take(&mut *tasks)
+        };
+        tasks.shutdown().await;
+    }
+}
+
+impl Drop for TicketSupervisor {
+    fn drop(&mut self) {
+        self.runtime.stop_tasks();
+        self.shutdown.send_replace(true);
+        self.task.abort();
+    }
+}
+
+async fn maintenance_loop(
+    name: &'static str,
+    action: JobAction,
+    cadence: Duration,
+    timeout: Duration,
+    mut ready: watch::Receiver<u64>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval_at(Instant::now() + cadence, cadence);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut completed_at = None;
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow_and_update() { return; }
+                continue;
+            }
+            changed = ready.changed() => {
+                if changed.is_err() { return; }
+                ready.borrow_and_update();
+            }
+            deadline = interval.tick() => {
+                // Do not replay ticks that elapsed during a slow action.
+                if completed_at.is_some_and(|end| deadline < end) { continue; }
+            }
+        }
+        // Work is inline, not detached, so shutdown/drop cancels its future.
+        let result = tokio::select! {
+            biased;
+            _ = crate::server::shutdown_requested(shutdown.clone()) => return,
+            result = tokio::time::timeout(timeout, async { action().await }) => {
+                result.unwrap_or(Err(ErrorClass::Timeout))
+            }
+        };
+        completed_at = Some(Instant::now());
+        if let Err(class) = result {
+            tracing::warn!(job = name, error_class = ?class, "ticket maintenance deferred");
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct TicketConfig {
@@ -71,6 +161,10 @@ pub(crate) struct TicketRuntime {
     // slow Discord I/O cannot postpone the privacy ceiling.
     lane: Mutex<()>,
     purge_lane: Mutex<()>,
+    ready: watch::Sender<u64>,
+    started: AtomicBool,
+    stopping: AtomicBool,
+    tasks: TaskMutex<JoinSet<()>>,
 }
 
 pub(crate) enum Failure {
@@ -122,7 +216,78 @@ impl TicketRuntime {
             bot_id: AtomicU64::new(0),
             lane: Mutex::new(()),
             purge_lane: Mutex::new(()),
+            ready: watch::channel(0).0,
+            started: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            tasks: TaskMutex::new(JoinSet::new()),
         })
+    }
+
+    pub fn start(self: &Arc<Self>) -> Option<TicketSupervisor> {
+        if self.started.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let (shutdown, receiver) = watch::channel(false);
+        let recovery = Arc::clone(self);
+        let purge = Arc::clone(self);
+        let recovery_ready = self.ready.subscribe();
+        let purge_ready = self.ready.subscribe();
+        let task = tokio::spawn(async move {
+            tokio::join!(
+                maintenance_loop(
+                    "ticket_recovery",
+                    Arc::new(move || {
+                        let runtime = Arc::clone(&recovery);
+                        Box::pin(async move { runtime.recover().await })
+                    }),
+                    RECOVERY_CADENCE,
+                    RECOVERY_TIMEOUT,
+                    recovery_ready,
+                    receiver.clone(),
+                ),
+                maintenance_loop(
+                    "ticket_purge",
+                    Arc::new(move || {
+                        let runtime = Arc::clone(&purge);
+                        Box::pin(async move { runtime.purge().await })
+                    }),
+                    PURGE_CADENCE,
+                    PURGE_TIMEOUT,
+                    purge_ready,
+                    receiver,
+                ),
+            );
+        });
+        Some(TicketSupervisor {
+            runtime: Arc::clone(self),
+            shutdown,
+            task,
+        })
+    }
+
+    pub fn on_ready(&self, bot_id: u64) {
+        self.set_bot_id(bot_id);
+        self.ready
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    pub fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock().expect("ticket task scope");
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        while let Some(result) = tasks.try_join_next() {
+            if result.is_err() {
+                tracing::warn!("ticket task stopped; durable state retained");
+            }
+        }
+        tasks.spawn(task);
+    }
+
+    fn stop_tasks(&self) {
+        let mut tasks = self.tasks.lock().expect("ticket task scope");
+        self.stopping.store(true, Ordering::Release);
+        tasks.abort_all();
     }
 
     pub fn set_bot_id(&self, id: u64) {
@@ -657,3 +822,7 @@ fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
 #[cfg(test)]
 #[path = "ticket_runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ticket_timer_tests.rs"]
+mod timer_tests;

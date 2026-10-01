@@ -214,6 +214,10 @@ impl CommandRuntime {
         })
     }
 
+    pub(crate) fn start_tickets(&self) -> Option<crate::ticket_runtime::TicketSupervisor> {
+        self.tickets.as_ref().and_then(|tickets| tickets.start())
+    }
+
     /// Detached dispatch for one gateway event. Clones the payload and spawns
     /// so the shard loop never awaits runtime work; the DB claims tolerate
     /// the reorder/crash windows spawning opens.
@@ -234,21 +238,24 @@ impl CommandRuntime {
             Event::InteractionCreate(interaction) => {
                 let runtime = Arc::clone(self);
                 let interaction = interaction.0.clone();
-                drop(tokio::spawn(async move {
-                    runtime.on_interaction(&interaction).await;
-                }));
+                let is_ticket = matches!(
+                    interaction.data.as_ref(),
+                    Some(twilight_model::application::interaction::InteractionData::MessageComponent(component))
+                        if TicketAction::from_custom_id(&component.custom_id).is_some()
+                );
+                if let Some(tickets) = self.tickets.as_ref().filter(|_| is_ticket) {
+                    tickets.spawn(async move {
+                        runtime.on_interaction(&interaction).await;
+                    });
+                } else {
+                    drop(tokio::spawn(async move {
+                        runtime.on_interaction(&interaction).await;
+                    }));
+                }
             }
             Event::Ready(ready) => {
                 if let Some(tickets) = &self.tickets {
-                    tickets.set_bot_id(ready.user.id.get());
-                    let tickets = Arc::clone(tickets);
-                    drop(tokio::spawn(async move {
-                        // Privacy work does not wait for a Discord recovery scan.
-                        let (purge, recovery) = tokio::join!(tickets.purge(), tickets.recover());
-                        if purge.is_err() || recovery.is_err() {
-                            warn!("ticket Ready work incomplete; durable state retained");
-                        }
-                    }));
+                    tickets.on_ready(ready.user.id.get());
                 }
                 let runtime = Arc::clone(self);
                 let application_id = ready.application.id.get();
