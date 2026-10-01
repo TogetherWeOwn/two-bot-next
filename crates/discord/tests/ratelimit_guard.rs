@@ -22,6 +22,89 @@ fn executor(mock: &MockRest, guard: &Arc<RateLimitGuard>) -> ActionExecutor {
     .unwrap()
 }
 
+#[tokio::test]
+async fn audit_global_admission_precedes_the_late_authorization() {
+    use two_bot_core::audit_mirror::AuditMirror;
+
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!({"id": "640"})),
+    )
+    .await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    guard.observe_global(Some(0.4));
+    let started = Instant::now();
+    let result = exec
+        .post_mirror_checked("4444", "audit test", "oa_fixture", async {
+            assert!(started.elapsed() >= Duration::from_millis(600));
+            assert_eq!(guard.snapshot().global_pause_remaining, Duration::ZERO);
+            Ok::<(), ()>(())
+        })
+        .await;
+    assert_eq!(result, Ok(Ok("640".to_owned())));
+    assert_eq!(mock.requests().len(), 1);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn audit_guard_closure_during_authorization_refuses_without_waiting_or_dispatch() {
+    use two_bot_core::audit_mirror::{AuditMirror, MirrorError};
+
+    for restriction in ["global", "breaker", "token"] {
+        let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+        let guard = Arc::new(
+            RateLimitGuard::new(GuardConfig {
+                invalid_request_threshold: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let exec = executor(&mock, &guard);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            exec.post_mirror_checked("4444", "audit test", "oa_fixture", async {
+                match restriction {
+                    "global" => guard.observe_global(Some(600.0)),
+                    "breaker" => guard.observe_status(403, true),
+                    "token" => guard.observe_status(401, true),
+                    _ => unreachable!(),
+                }
+                Ok::<(), ()>(())
+            }),
+        )
+        .await
+        .expect("no admission sleep is allowed after authorization")
+        .unwrap();
+        assert!(matches!(result, Err(MirrorError::Rejected(_))));
+        assert_eq!(mock.requests().len(), 0);
+        assert_eq!(exec.requests(), 0);
+        assert_eq!(guard.snapshot().rejected_requests_total, 1);
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn interaction_webhook_401_counts_invalid_without_latching_the_bot_token() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(401)],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    assert!(matches!(
+        exec.edit_interaction_response(5555, "callback-fixture-token", "test")
+            .await,
+        Err(DiscordError::Rejected(_))
+    ));
+    assert_eq!(guard.snapshot().invalid_requests_total, 1);
+    assert!(!guard.snapshot().token_invalid);
+    ban(&exec).await.unwrap();
+    assert_eq!(mock.requests().len(), 2);
+    mock.shutdown().await;
+}
+
 async fn ban(executor: &ActionExecutor) -> Result<(), DiscordError> {
     executor.ban("2222", "3333", "guard test").await
 }

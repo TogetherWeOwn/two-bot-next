@@ -1,0 +1,1120 @@
+{
+  "version": 1,
+  "source": {
+    "repository": "TogetherWeOwn/two-bot",
+    "revision": "96777468472f23a02a1e97a43ffab3912fe5df2a",
+    "hashes": {
+      "src/analytics/communityClassifier.ts": "61cd972a4667c6f426b74890d28875f588f7b3e5c010911ada9d6b5a4dd90982",
+      "src/core/inviteTracker.ts": "2cbe843832e62924a7b4e28fabc04de29598edfef1b3fe9987f4b5850be16419",
+      "src/analytics/communityFacts.ts": "d2b8a24ef88611f9f4a83e88ee5bc7c4c4df6bbebfec7e7621093bf9de9a8b99",
+      "src/core/handlers.ts": "ec5a9d97947bfb0a3257aa758a5b1e09028dcb0d5deaeece8123dc1dfcb0127a",
+      "src/core/events.ts": "4c7ea39081aeb24ab3f8af62a77488c1f4d54dc9bfaca6b6d6dbfca0b4a5ec2f",
+      "src/core/voiceSessions.ts": "9f966b84c2dec505e7bc2a3e432d307c819556b0f0f100b997c489f57fdc9262",
+      "src/core/log.ts": "0900342c2ecd61a099b0fa111cf52f82fde488c573bd8274a85649498bac70c5",
+      "test/fixtures/funnel-attribution-golden.json": "1d0606849dbbe3c1a53a14f6b195e3344d8f736d82233487b9c9171c76fa94bf"
+    }
+  },
+  "env": {
+    "TWO_COMMUNITY_CLASSIFIER_VERSION": "community-test-v1",
+    "TWO_COMMUNITY_AUTOMATION_ACTOR_IDS": "staff-bot",
+    "TWO_COMMUNITY_RAID_ACTOR_IDS": "raid-user",
+    "TWO_COMMUNITY_STAGING_GUILD_IDS": "staging-guild",
+    "TWO_COMMUNITY_STAGING_ACTOR_IDS": "staging-user",
+    "TWO_COMMUNITY_TEST_ACTOR_IDS": "test-user"
+  },
+  "community": [
+    {
+      "id": "bot-precedes-webhook",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "x",
+        "isBot": true,
+        "webhookId": "w"
+      },
+      "expect": {
+        "classification": "bot",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "discord_bot"
+      }
+    },
+    {
+      "id": "webhook",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "x",
+        "webhookId": "w"
+      },
+      "expect": {
+        "classification": "webhook",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "discord_webhook"
+      }
+    },
+    {
+      "id": "automation",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "staff-bot"
+      },
+      "expect": {
+        "classification": "staff_automation",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_automation_actor"
+      }
+    },
+    {
+      "id": "raid",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "raid-user"
+      },
+      "expect": {
+        "classification": "raid",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_raid_actor"
+      }
+    },
+    {
+      "id": "staging-guild",
+      "input": {
+        "guildId": "staging-guild",
+        "actorId": "x"
+      },
+      "expect": {
+        "classification": "staging",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_staging_scope"
+      }
+    },
+    {
+      "id": "test-actor",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "test-user"
+      },
+      "expect": {
+        "classification": "test",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_test_actor"
+      }
+    },
+    {
+      "id": "attendance-human",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "human-1"
+      },
+      "expect": {
+        "classification": "eligible_human",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "no_exclusion_matched"
+      }
+    },
+    {
+      "id": "attendance-bot",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "bot-1",
+        "isBot": true
+      },
+      "expect": {
+        "classification": "bot",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "discord_bot"
+      }
+    },
+    {
+      "id": "staging-actor",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "staging-user"
+      },
+      "expect": {
+        "classification": "staging",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_staging_scope"
+      }
+    },
+    {
+      "id": "explicit-automation",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "x",
+        "isStaffAutomation": true
+      },
+      "expect": {
+        "classification": "staff_automation",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_automation_actor"
+      }
+    },
+    {
+      "id": "explicit-raid",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "x",
+        "isRaid": true
+      },
+      "expect": {
+        "classification": "raid",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_raid_actor"
+      }
+    },
+    {
+      "id": "explicit-staging",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "x",
+        "isStaging": true
+      },
+      "expect": {
+        "classification": "staging",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_staging_scope"
+      }
+    },
+    {
+      "id": "explicit-test",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "x",
+        "isTest": true
+      },
+      "expect": {
+        "classification": "test",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_test_actor"
+      }
+    },
+    {
+      "id": "empty-webhook-human",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "human-1",
+        "webhookId": ""
+      },
+      "expect": {
+        "classification": "eligible_human",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "no_exclusion_matched"
+      }
+    },
+    {
+      "id": "all-exclusions-bot-wins",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "test-user",
+        "isBot": true,
+        "webhookId": "w",
+        "isStaffAutomation": true,
+        "isRaid": true,
+        "isStaging": true,
+        "isTest": true
+      },
+      "expect": {
+        "classification": "bot",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "discord_bot"
+      }
+    },
+    {
+      "id": "automation-precedes-raid",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "raid-user",
+        "isStaffAutomation": true
+      },
+      "expect": {
+        "classification": "staff_automation",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_automation_actor"
+      }
+    },
+    {
+      "id": "raid-precedes-staging",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "staging-user",
+        "isRaid": true
+      },
+      "expect": {
+        "classification": "raid",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_raid_actor"
+      }
+    },
+    {
+      "id": "staging-precedes-test",
+      "input": {
+        "guildId": "guild-a",
+        "actorId": "test-user",
+        "isStaging": true
+      },
+      "expect": {
+        "classification": "staging",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "configured_staging_scope"
+      }
+    }
+  ],
+  "invites": [
+    {
+      "id": "unknown-offline-join",
+      "title": "Join while the bot was down reads unknown, never a guess",
+      "why": "Discord replays the member on reconnect but the invite delta is lost (EVENTS.md limit 3). The honest answer is unknown.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "aaa": 5
+        },
+        "currentUses": [
+          {
+            "code": "aaa",
+            "uses": 5
+          }
+        ],
+        "joinCount": 1,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "unknown"
+        ],
+        "exact": [
+          false
+        ]
+      },
+      "expectCategory": "unknown",
+      "growth": {}
+    },
+    {
+      "id": "unknown-discovery-several",
+      "title": "Several offline joins are all unknown",
+      "why": "Nothing moved, so there is no code to name - not one guess per member, unknown per member.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "a": 2,
+          "b": 7
+        },
+        "currentUses": [
+          {
+            "code": "a",
+            "uses": 2
+          },
+          {
+            "code": "b",
+            "uses": 7
+          }
+        ],
+        "joinCount": 3,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "unknown",
+          "unknown",
+          "unknown"
+        ],
+        "exact": [
+          false,
+          false,
+          false
+        ]
+      },
+      "expectCategory": "unknown",
+      "growth": {}
+    },
+    {
+      "id": "vanity-control",
+      "title": "No movement with a vanity URL is vanity, not unknown",
+      "why": "Control for the unknown boundary: 'no code moved' alone does not mean unknown - the vanity URL is the probable path.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "a": 2
+        },
+        "currentUses": [
+          {
+            "code": "a",
+            "uses": 2
+          }
+        ],
+        "joinCount": 2,
+        "guildHasVanity": true
+      },
+      "expect": {
+        "sources": [
+          "vanity",
+          "vanity"
+        ],
+        "exact": [
+          false,
+          false
+        ]
+      },
+      "expectCategory": "vanity",
+      "growth": {}
+    },
+    {
+      "id": "ambiguous-two-codes-no-close",
+      "title": "Two codes moved but the arithmetic does not close: ambiguous",
+      "why": "Counters say 3 arrivals, the member list gained 2 - somebody joined and left inside the window. Any per-code split would be a guess printed as a number.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "aaa": 5,
+          "bbb": 1
+        },
+        "currentUses": [
+          {
+            "code": "aaa",
+            "uses": 7
+          },
+          {
+            "code": "bbb",
+            "uses": 2
+          }
+        ],
+        "joinCount": 2,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "ambiguous:aaa+bbb",
+          "ambiguous:aaa+bbb"
+        ],
+        "exact": [
+          false,
+          false
+        ]
+      },
+      "expectCategory": "ambiguous",
+      "growth": {
+        "aaa": 2,
+        "bbb": 1
+      }
+    },
+    {
+      "id": "ambiguous-three-codes",
+      "title": "Three codes moved without closing: one ambiguous string, not three guesses",
+      "why": "The failure mode this guards: splitting 3 members across a+2/b+1/c+1 when only 3 arrived. The codes join with + in sorted order.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "a": 0,
+          "b": 0,
+          "c": 0
+        },
+        "currentUses": [
+          {
+            "code": "a",
+            "uses": 2
+          },
+          {
+            "code": "b",
+            "uses": 1
+          },
+          {
+            "code": "c",
+            "uses": 1
+          }
+        ],
+        "joinCount": 3,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "ambiguous:a+b+c",
+          "ambiguous:a+b+c",
+          "ambiguous:a+b+c"
+        ],
+        "exact": [
+          false,
+          false,
+          false
+        ]
+      },
+      "expectCategory": "ambiguous",
+      "growth": {
+        "a": 2,
+        "b": 1,
+        "c": 1
+      }
+    },
+    {
+      "id": "split-exact-counts-not-ambiguous",
+      "title": "Two codes moved and the arithmetic closes: per-code counts, NOT ambiguous",
+      "why": "The TOG-5681 distinction. A +2 / B +1 with 3 arrivals is fully determined in aggregate - quoting it as ambiguous would throw away the campaign's per-code join counts.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "aaa": 5,
+          "bbb": 1
+        },
+        "currentUses": [
+          {
+            "code": "aaa",
+            "uses": 7
+          },
+          {
+            "code": "bbb",
+            "uses": 2
+          }
+        ],
+        "joinCount": 3,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "invite:aaa",
+          "invite:aaa",
+          "invite:bbb"
+        ],
+        "exact": [
+          false,
+          false,
+          false
+        ]
+      },
+      "expectCategory": "invite-placed",
+      "growth": {
+        "aaa": 2,
+        "bbb": 1
+      }
+    },
+    {
+      "id": "single-code-exact",
+      "title": "One code moved and the count closes: the only exact case",
+      "why": "Exactly one code gained exactly the arrivals observed. This - and only this - is proof a member came through that code.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "aB3xY9": 4
+        },
+        "currentUses": [
+          {
+            "code": "aB3xY9",
+            "uses": 5
+          }
+        ],
+        "joinCount": 1,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "invite:aB3xY9"
+        ],
+        "exact": [
+          true
+        ]
+      },
+      "expectCategory": "invite-exact",
+      "growth": {
+        "aB3xY9": 1
+      }
+    },
+    {
+      "id": "single-code-best-guess",
+      "title": "One code moved but two arrived: best guess, not proof",
+      "why": "Behaviour is unchanged - the code is still stamped on both - but exact stays false: one of the two did not come through it.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "aB3xY9": 4
+        },
+        "currentUses": [
+          {
+            "code": "aB3xY9",
+            "uses": 5
+          }
+        ],
+        "joinCount": 2,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "invite:aB3xY9",
+          "invite:aB3xY9"
+        ],
+        "exact": [
+          false,
+          false
+        ]
+      },
+      "expectCategory": "invite-placed",
+      "growth": {
+        "aB3xY9": 1
+      }
+    },
+    {
+      "id": "new-code-single-no-close",
+      "title": "A code created inside the window still claims its uses on the best-guess path",
+      "why": "The newest invite is usually the one a growth push is handing out. Fresh has +3 against 1 arrival: single code, no close, so best guess - but the code is named, not dropped.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "old": 4
+        },
+        "currentUses": [
+          {
+            "code": "old",
+            "uses": 4
+          },
+          {
+            "code": "fresh",
+            "uses": 3
+          }
+        ],
+        "joinCount": 1,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "invite:fresh"
+        ],
+        "exact": [
+          false
+        ]
+      },
+      "expectCategory": "invite-placed",
+      "growth": {
+        "fresh": 3
+      }
+    },
+    {
+      "id": "counter-reset-clamp-feeds-exact",
+      "title": "A reset code cannot cancel a real rise out of exactness",
+      "why": "Deleted-and-recreated codes reset to zero. Unclamped, the -9 would swallow real's +1 and this arrival would read unknown. Clamped, it is the ordinary exact case.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "reset": 9,
+          "real": 1
+        },
+        "currentUses": [
+          {
+            "code": "reset",
+            "uses": 0
+          },
+          {
+            "code": "real",
+            "uses": 2
+          }
+        ],
+        "joinCount": 1,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "invite:real"
+        ],
+        "exact": [
+          true
+        ]
+      },
+      "expectCategory": "invite-exact",
+      "growth": {
+        "real": 1
+      }
+    },
+    {
+      "id": "no-members-no-events",
+      "title": "Counters moved but nobody arrived: no attributions at all",
+      "why": "Uses can move without joins (bot restarts, recounts). A window with no new members emits nothing, whatever the counters did.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "a": 2
+        },
+        "currentUses": [
+          {
+            "code": "a",
+            "uses": 9
+          }
+        ],
+        "joinCount": 0,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [],
+        "exact": []
+      },
+      "expectCategory": "invite-placed",
+      "growth": {
+        "a": 7
+      }
+    },
+    {
+      "id": "seven-code-campaign",
+      "title": "Seven listing codes in one window keep their own counts",
+      "why": "The campaign shape: before the multi-code split this whole window recorded as one ambiguous:a+b+c+... string and launches had to be staggered to get readable numbers.",
+      "kind": "window",
+      "scenario": {
+        "prevUses": {
+          "c1": 0,
+          "c2": 0,
+          "c3": 0,
+          "c4": 0,
+          "c5": 0,
+          "c6": 0,
+          "c7": 0
+        },
+        "currentUses": [
+          {
+            "code": "c1",
+            "uses": 3
+          },
+          {
+            "code": "c2",
+            "uses": 0
+          },
+          {
+            "code": "c3",
+            "uses": 1
+          },
+          {
+            "code": "c4",
+            "uses": 0
+          },
+          {
+            "code": "c5",
+            "uses": 2
+          },
+          {
+            "code": "c6",
+            "uses": 0
+          },
+          {
+            "code": "c7",
+            "uses": 4
+          }
+        ],
+        "joinCount": 10,
+        "guildHasVanity": false
+      },
+      "expect": {
+        "sources": [
+          "invite:c1",
+          "invite:c1",
+          "invite:c1",
+          "invite:c3",
+          "invite:c5",
+          "invite:c5",
+          "invite:c7",
+          "invite:c7",
+          "invite:c7",
+          "invite:c7"
+        ],
+        "exact": [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "expectCategory": "invite-placed",
+      "growth": {
+        "c1": 3,
+        "c3": 1,
+        "c5": 2,
+        "c7": 4
+      }
+    },
+    {
+      "id": "legacy-two-grew",
+      "title": "Legacy path: two codes grew in one instant is ambiguous",
+      "why": "The live-bot single-join path (InviteTracker.attribute) has no magnitudes to split - two growers is genuinely unknowable and stays ambiguous:a+b.",
+      "kind": "legacy-attribute",
+      "scenario": {
+        "grew": [
+          "a",
+          "b"
+        ],
+        "guildHasVanity": false
+      },
+      "expect": {
+        "source": "ambiguous:a+b"
+      },
+      "expectCategory": "ambiguous"
+    },
+    {
+      "id": "legacy-none-no-vanity",
+      "title": "Legacy path: nothing grew and no vanity URL is unknown",
+      "why": "Discovery, or a code created while the bot was offline. Reported as itself, never folded into a real code.",
+      "kind": "legacy-attribute",
+      "scenario": {
+        "grew": [],
+        "guildHasVanity": false
+      },
+      "expect": {
+        "source": "unknown"
+      },
+      "expectCategory": "unknown"
+    },
+    {
+      "id": "legacy-none-vanity",
+      "title": "Legacy path: nothing grew with a vanity URL is vanity",
+      "why": "Control mirroring the window vanity case on the legacy path.",
+      "kind": "legacy-attribute",
+      "scenario": {
+        "grew": [],
+        "guildHasVanity": true
+      },
+      "expect": {
+        "source": "vanity"
+      },
+      "expectCategory": "vanity"
+    },
+    {
+      "id": "legacy-one-grew",
+      "title": "Legacy path: exactly one code grew names that code",
+      "why": "The ordinary live-bot case. Exactness is not recorded on this path - that flag belongs to the windowed attributeJoins path.",
+      "kind": "legacy-attribute",
+      "scenario": {
+        "grew": [
+          "aB3xY9"
+        ],
+        "guildHasVanity": false
+      },
+      "expect": {
+        "source": "invite:aB3xY9"
+      },
+      "expectCategory": "invite-placed"
+    }
+  ],
+  "categories": [
+    {
+      "source": "unknown",
+      "expect": "unknown"
+    },
+    {
+      "source": "ambiguous",
+      "expect": "ambiguous"
+    },
+    {
+      "source": "ambiguous:aaa+bbb",
+      "expect": "ambiguous"
+    },
+    {
+      "source": "vanity",
+      "expect": "other"
+    },
+    {
+      "source": "invite:aaa",
+      "expect": "other"
+    },
+    {
+      "source": "invite:aB3xY9",
+      "expect": "other"
+    },
+    {
+      "source": "invite:abc123",
+      "expect": "other"
+    },
+    {
+      "source": "web:one_click",
+      "expect": "other"
+    },
+    {
+      "source": "backfill:log:member-join",
+      "expect": "other"
+    },
+    {
+      "source": "backfill:member_list",
+      "expect": "other"
+    },
+    {
+      "source": "unknown:other",
+      "expect": "other"
+    }
+  ],
+  "splits": [
+    {
+      "input": [
+        {
+          "source": "invite:aaa",
+          "n": 5
+        },
+        {
+          "source": "ambiguous:aaa+bbb",
+          "n": 3
+        },
+        {
+          "source": "ambiguous:ccc+ddd",
+          "n": 2
+        },
+        {
+          "source": "unknown",
+          "n": 7
+        },
+        {
+          "source": "vanity",
+          "n": 1
+        }
+      ],
+      "expect": {
+        "ambiguous": 5,
+        "unknown": 7
+      }
+    },
+    {
+      "input": [],
+      "expect": {
+        "ambiguous": 0,
+        "unknown": 0
+      }
+    },
+    {
+      "input": [
+        {
+          "source": "invite:cutoff-0",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-1",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-2",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-3",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-4",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-5",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-6",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-7",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-8",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-9",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-10",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-11",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-12",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-13",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-14",
+          "n": "2"
+        },
+        {
+          "source": "unknown",
+          "n": "1"
+        },
+        {
+          "source": "ambiguous:a+b",
+          "n": "1"
+        }
+      ],
+      "expect": {
+        "ambiguous": 1,
+        "unknown": 1
+      }
+    },
+    {
+      "input": [
+        {
+          "source": "invite:cutoff-0",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-1",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-2",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-3",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-4",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-5",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-6",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-7",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-8",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-9",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-10",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-11",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-12",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-13",
+          "n": "2"
+        },
+        {
+          "source": "invite:cutoff-14",
+          "n": "2"
+        },
+        {
+          "source": "unknown",
+          "n": "40"
+        },
+        {
+          "source": "ambiguous:a+b",
+          "n": "10"
+        },
+        {
+          "source": "ambiguous",
+          "n": "1"
+        },
+        {
+          "source": "ambiguous:c+d",
+          "n": "1"
+        },
+        {
+          "source": "vanity",
+          "n": "1"
+        },
+        {
+          "source": "unknown:other",
+          "n": "1"
+        }
+      ],
+      "expect": {
+        "ambiguous": 12,
+        "unknown": 40
+      }
+    }
+  ],
+  "attendance": {
+    "input": {
+      "guildId": "guild-a",
+      "actorId": "human-1",
+      "eventOccurrenceId": "event-1",
+      "occurredAt": "2026-09-02T10:00:00.000Z",
+      "proof": "host_checkin"
+    },
+    "expect": {
+      "guildId": "guild-a",
+      "eventType": "event_attended",
+      "sourceEventId": "event-1:human-1",
+      "actorId": "human-1",
+      "occurredAt": "2026-09-02T10:00:00.000Z",
+      "source": "event:event-1",
+      "idempotencyKey": "event-attended:event-1:human-1",
+      "classification": {
+        "classification": "eligible_human",
+        "classifierVersion": "community-test-v1",
+        "matchedRule": "no_exclusion_matched"
+      },
+      "metadata": "{\"eventOccurrenceId\":\"event-1\",\"proof\":\"host_checkin\"}"
+    }
+  },
+  "voiceMetadata": [
+    {
+      "input": {
+        "startKnown": true,
+        "startedAt": "2026-09-20T12:10:00.000Z",
+        "durationSeconds": 600
+      },
+      "expect": "{\"startKnown\":true,\"startedAt\":\"2026-09-20T12:10:00.000Z\",\"durationSeconds\":600}"
+    },
+    {
+      "input": {
+        "startKnown": false,
+        "startedAt": null,
+        "durationSeconds": null
+      },
+      "expect": "{\"startKnown\":false,\"startedAt\":null,\"durationSeconds\":null}"
+    }
+  ],
+  "unsupported": {
+    "reason": "Legacy isUnknownBucket includes backfill history; no equivalent public runtime helper in Next. Report arithmetic is intentionally dropped, but these classification expectations must not be replaced by attributionCategory (which correctly returns other for backfill).",
+    "source": "test/unit.unknownattribution.test.ts:23-32",
+    "cases": [
+      {
+        "source": "unknown",
+        "expect": true
+      },
+      {
+        "source": "backfill:log:member-join",
+        "expect": true
+      },
+      {
+        "source": "backfill:member_list",
+        "expect": true
+      },
+      {
+        "source": "ambiguous:aaa+bbb",
+        "expect": false
+      },
+      {
+        "source": "vanity",
+        "expect": false
+      },
+      {
+        "source": "invite:abc123",
+        "expect": false
+      },
+      {
+        "source": "web:one_click",
+        "expect": false
+      }
+    ]
+  }
+}

@@ -38,6 +38,8 @@ pub enum GuardError {
     TokenInvalid,
     #[error("discord admission timed out before any wire attempt")]
     AdmissionTimeout,
+    #[error("discord global admission closed after authorization")]
+    GlobalPaused,
 }
 
 /// Low-cardinality counters/gauges for a metrics exporter; no tokens, routes,
@@ -161,6 +163,28 @@ impl RateLimitGuard {
                 None => return Ok(()),
             }
         }
+    }
+
+    /// A late DB authorization must never be followed by another admission
+    /// sleep. Refuse locally if a restriction arrived during that authorization.
+    pub(crate) fn check_now(&self, essential: bool) -> Result<(), GuardError> {
+        let mut state = self.state.lock().expect("Discord guard state");
+        let now = Instant::now();
+        self.refresh(&mut state, now);
+        let error = if state.counters.token_invalid {
+            Some(GuardError::TokenInvalid)
+        } else if state.counters.breaker_open && !essential {
+            Some(GuardError::CircuitOpen)
+        } else if !state.pending_global.is_empty() || Self::global_deadline(&state, now).is_some() {
+            Some(GuardError::GlobalPaused)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            state.counters.rejected_requests_total += 1;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Account as soon as headers arrive, even if the response body fails or

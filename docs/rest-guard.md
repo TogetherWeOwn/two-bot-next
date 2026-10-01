@@ -72,12 +72,20 @@ long global pauses do not abort a retry. Fatal/breaker refusals still interrupt
 that wait promptly. Kick results count only dispatched HTTP attempts: pre-wire
 build/guard refusals report zero, and a refusal after one exchange reports one.
 
+Audit mirror posts retain their paced lane through late DB authorization and the
+bounded send. All admission waits precede authorization. If a global restriction
+arrives during authorization, the final no-wait check returns
+`GuardError::GlobalPaused` before dispatch; breaker/fatal closures likewise refuse
+locally. The audit adapter maps these guard refusals to provably-unsent `Rejected`,
+never the uncertain result used for post-dispatch timeouts.
+
 ## Fatal bot token and readiness
 
 A 401 on a bot-authenticated endpoint permanently latches `token_invalid` for
 this process. New REST attempts, including essential acknowledgements, return
-`GuardError::TokenInvalid`. A 401 on an interaction callback instead identifies
-its short-lived interaction token: it counts as invalid but does **not** condemn
+`GuardError::TokenInvalid`. A 401 on an interaction callback or original-response
+webhook edit instead identifies its short-lived interaction token: it counts as
+invalid but does **not** condemn
 the bot token. `/readyz` adds the `token_invalid` component (status `down` on
 fatal, `ready` otherwise), so fatal token state returns **503** even if the gateway
 is connected. `/health` stays 200 while the process can answer.

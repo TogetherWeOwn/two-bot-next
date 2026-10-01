@@ -238,6 +238,11 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
         Self { store }
     }
 
+    /// Seed a created invite without discarding unrelated live codes.
+    pub fn seed(&self, guild_id: Snowflake, state: InviteState) {
+        self.store.store_all(guild_id, &[state]);
+    }
+
     /// Replace the stored snapshot; return the codes that grew. New codes are
     /// stored but never count as growth live (only the window path,
     /// [`invite_growth`], credits those).
