@@ -9,6 +9,7 @@
   repeat-history expiration, and replay-safe delivery claims with the
   legacy-compatible once-per-message violation ledger. Shared executor/shard
   activation is not enabled by this slice. (TOG-10089)
+- Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and
