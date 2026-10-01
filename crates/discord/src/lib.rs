@@ -14,6 +14,7 @@ mod executor_metrics;
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
+mod message_safety;
 pub mod pipeline;
 
 pub use adapter::event_to_core;

@@ -14,7 +14,9 @@ license.workspace = true
 # path): cargo-deny `wildcards = "deny"` rejects version-less deps.
 
 [dependencies]
-two-bot-core = { version = "0.2.0", path = "../core" }
+# `db` for the shared redacting `database_url::connect_options` parse helper.
+# sqlx is already a direct dependency, so no new driver burden.
+two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
 hex = { workspace = true }
 serde = { workspace = true }
 # Preserve JSON syntax kinds and exact numeric tokens during parity checks.

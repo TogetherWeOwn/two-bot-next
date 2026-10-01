@@ -85,10 +85,10 @@ The existing CI unit/binary test step supplies the guarded service database.
 ## Presence probe, community scorecard, and inactivity flagging
 
 This slice ports the three S5 community jobs as framework-free domain logic in
-`two-bot-core` plus sqlx stores and migrations. It does **not** register live
-handlers, instantiate a Discord HTTP client, or start a scheduler. It stays
-independently testable until the shared S4 interaction router and REST
-executor merge.
+`two-bot-core` plus sqlx stores and migrations. The `bot::community_jobs`
+module registers them on the job supervisor inside `bot::website_jobs::serve`
+(TOG-10897), so the shipped binary drives them on their legacy cadences under
+the env gates below.
 
 ## Modules
 
@@ -130,6 +130,12 @@ executor merge.
 - The presence series is never published: no `web_v1` view may read
   `presence_probe`. The only reader is an operator trend report over
   `read_series` + `evaluate_trigger`.
+- Runtime registration (`bot::community_jobs::register`, invoked from
+  `bot::website_jobs::serve`) resolves the env gates once at boot. A gated-off
+  or misconfigured job logs `job_disabled` (warn on `invalid_config`), produces
+  no supervised job, and is marked parked in the `/readyz` status map alongside
+  the website jobs. The supervisor's status map therefore always lists all six
+  job names.
 
 ## Verification
 
