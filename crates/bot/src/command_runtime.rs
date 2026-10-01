@@ -6,8 +6,8 @@
 //! command the runtime serves, the shared REST executor (TOG-10076) performs
 //! every Discord side effect, and each feature's domain + sqlx store owns
 //! its validation and mutation. No competing interaction listener, private
-//! dispatcher, or Discord client exists: gateway events arrive via the bounded
-//! [`crate::interactions::InteractionDispatch`] and use those interfaces.
+//! dispatcher, or Discord client exists: gateway events arrive via
+//! [`CommandRuntime::dispatch`] and are handled entirely through those interfaces.
 //!
 //! Served slices:
 //! - LFG (`/lfg`, `/lfg-close`, `two:lfg:` selects; TOG-10260), composed
@@ -33,7 +33,6 @@ use std::sync::{
 
 use sqlx::{Pool, Postgres};
 use tracing::warn;
-#[cfg(test)]
 use twilight_gateway::Event;
 use twilight_model::{
     application::interaction::{application_command::CommandOptionValue, Interaction},
@@ -54,8 +53,8 @@ use two_bot_core::{
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
     tickets::TicketAction,
-    ComponentHandler, ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter,
-    RouterGates, SlashOutcome,
+    ComponentHandler, ComponentOutcome, FeatureGates, HandlerId, InteractionHandler,
+    InteractionRouter, ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
     publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
@@ -160,6 +159,68 @@ impl CommandRuntime {
         self.application_id.store(application_id, Ordering::Relaxed);
     }
 
+    /// Build the runtime from process env gates + the optional
+    /// `DISCORD_API_BASE` proxy override. Returns `None` (gateway still boots)
+    /// when gate parsing or executor construction fails.
+    #[must_use]
+    pub fn from_env(pool: Pool<Postgres>, token: &str, guild_id: u64) -> Option<Arc<Self>> {
+        let features = match FeatureGates::from_env() {
+            Ok(features) => features,
+            Err(err) => {
+                warn!(error = %err, "feature gates invalid; command runtime disabled");
+                return None;
+            }
+        };
+        let moderation = match ModerationGates::from_env() {
+            Ok(moderation) => moderation,
+            Err(err) => {
+                warn!(error = %err, "moderation gates invalid; command runtime disabled");
+                return None;
+            }
+        };
+        let ticket_config = crate::ticket_runtime::TicketConfig::from_env(guild_id);
+        let gates = RouterGates::from_slices(
+            Some(guild_id),
+            &features,
+            &moderation,
+            SurfaceFlags {
+                tickets: ticket_config.is_some(),
+                ..SurfaceFlags::default()
+            },
+        );
+        let proxy = std::env::var("DISCORD_API_BASE")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let executor = match ActionExecutor::with_proxy(token.to_owned(), proxy) {
+            Ok(executor) => executor,
+            Err(err) => {
+                warn!(error = %err, "REST executor failed to build; command runtime disabled");
+                return None;
+            }
+        };
+        let tickets = match ticket_config {
+            Some(config) => match crate::ticket_runtime::TicketRuntime::new(
+                pool.clone(),
+                executor.clone(),
+                config,
+            ) {
+                Ok(runtime) => Some(Arc::new(runtime)),
+                Err(_) => return None,
+            },
+            None => None,
+        };
+        // No custom-command store exists on main yet: an empty slice is the
+        // authoritative baseline (same as before LFG).
+        Some(Self::build(
+            pool,
+            executor,
+            router_with_commands(gates),
+            guild_id,
+            Some(Vec::new()),
+            tickets,
+        ))
+    }
+
     /// Test constructor: skips env gate reads so tests inject their own
     /// router, executor (mock REST), and automations flag directly.
     #[cfg(test)]
@@ -215,7 +276,6 @@ impl CommandRuntime {
     ///
     /// READY replaces the full merged set; a first RESUMED also synchronizes
     /// this process's definitions/gates, even without a preceding READY.
-    #[cfg(test)]
     pub fn dispatch(self: &Arc<Self>, event: &Event) {
         match event {
             Event::MessageCreate(message) => {
@@ -246,6 +306,7 @@ impl CommandRuntime {
                 }
             }
             Event::Ready(ready) => {
+                self.set_identity(ready.user.id.get(), ready.application.id.get());
                 if let Some(tickets) = &self.tickets {
                     tickets.on_ready(ready.user.id.get());
                 }
@@ -256,6 +317,10 @@ impl CommandRuntime {
                 }));
             }
             Event::Resumed => {
+                let identity = Arc::clone(self);
+                drop(tokio::spawn(async move {
+                    identity.resolve_identity().await;
+                }));
                 if let Some(tickets) = &self.tickets {
                     let runtime = Arc::clone(self);
                     // Saved sessions emit RESUMED without READY. Resolve the
@@ -276,40 +341,13 @@ impl CommandRuntime {
         }
     }
 
-    pub(crate) fn ticket_ready(&self, bot_id: u64) {
-        if let Some(tickets) = &self.tickets {
-            tickets.on_ready(bot_id);
+    /// Resume boots receive no READY user: resolve both ids through the shared
+    /// executor so LFG nonce recovery and the application fence are armed.
+    async fn resolve_identity(&self) {
+        match self.executor.current_identity().await {
+            Ok((bot_user_id, application_id)) => self.set_identity(bot_user_id, application_id),
+            Err(_) => warn!("bot identity lookup failed; LFG identity unset"),
         }
-    }
-
-    /// Saved sessions emit RESUMED without READY: resolve the bot user through
-    /// the shared executor inside the ticket shutdown scope.
-    pub(crate) fn spawn_ticket_resume(self: &Arc<Self>) {
-        if let Some(tickets) = &self.tickets {
-            let runtime = Arc::clone(self);
-            tickets.spawn(async move {
-                runtime.ready_tickets_after_resume().await;
-            });
-        }
-    }
-
-    /// Ticket component clicks run in the ticket shutdown scope; returns false
-    /// for every other interaction.
-    pub(crate) fn spawn_if_ticket(self: &Arc<Self>, interaction: &Interaction) -> bool {
-        let is_ticket = matches!(
-            interaction.data.as_ref(),
-            Some(twilight_model::application::interaction::InteractionData::MessageComponent(component))
-                if TicketAction::from_custom_id(&component.custom_id).is_some()
-        );
-        let Some(tickets) = self.tickets.as_ref().filter(|_| is_ticket) else {
-            return false;
-        };
-        let runtime = Arc::clone(self);
-        let interaction = interaction.clone();
-        tickets.spawn(async move {
-            runtime.on_interaction(&interaction).await;
-        });
-        true
     }
 
     async fn ready_tickets_after_resume(&self) {
@@ -346,7 +384,7 @@ impl CommandRuntime {
         if application_id.is_none() && *synced {
             return Ok(());
         }
-        let Some(defs) = crate::interactions::publication_definitions(
+        let Some(defs) = publication_definitions(
             &self.interactions.router,
             self.interactions.router.gates(),
             self.custom_commands.as_deref(),
@@ -1165,3 +1203,20 @@ pub(crate) fn sticky_options(interaction: &Interaction) -> (Option<String>, Opti
 #[cfg(test)]
 #[path = "command_runtime_resumed_tests.rs"]
 mod resumed_tests;
+
+/// Full-set publication: a bulk replace needs an authoritative custom-command
+/// row load, so an unknown store defers instead of deleting Discord commands.
+pub(crate) fn publication_definitions(
+    router: &InteractionRouter,
+    gates: RouterGates,
+    custom: Option<&[two_bot_core::CustomCommand]>,
+) -> Result<Option<Vec<two_bot_core::CommandDefinition>>, sqlx::Error> {
+    if gates.automations && custom.is_none() {
+        warn!("registry publication deferred: custom-command store unavailable");
+        return Ok(None);
+    }
+    router
+        .publish_set(custom.unwrap_or_default())
+        .map(Some)
+        .map_err(|_| sqlx::Error::InvalidArgument("command registry invalid".into()))
+}
