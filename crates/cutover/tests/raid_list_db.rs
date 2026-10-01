@@ -188,6 +188,45 @@ async fn flags_are_guild_scoped_half_open_deduplicated_and_activity_protected() 
     sqlx::query("INSERT INTO events (guild_id,member_id,event_type,occurred_at,source,idempotency_key) VALUES ('100000000000000010','100000000000000007','first_message',now(),'test','test-key')").execute(&pool).await.unwrap();
     // Historical funnel evidence without a members projection must also protect.
     sqlx::query("INSERT INTO events (guild_id,member_id,event_type,occurred_at,source,idempotency_key) VALUES ('100000000000000010','100000000000000008','first_voice_session',now(),'test','voice-test-key')").execute(&pool).await.unwrap();
+    // Each event can be the only surviving participation evidence: no first
+    // milestone or members projection may be assumed to exist alongside it.
+    for (i, event_type) in [
+        "first_message",
+        "second_message",
+        "third_message",
+        "first_voice_session",
+        "first_voice",
+        "voice_session_start",
+        "voice_session_end",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let member = format!("1000000000000001{i:02}");
+        sqlx::query("INSERT INTO join_risk_flags VALUES ($1,'100000000000000010',$2,'2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','unknown',3,'[]',false,true,'2026-09-01T00:00:00Z')")
+            .bind(format!("only-{event_type}"))
+            .bind(&member)
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO events (guild_id,member_id,event_type,occurred_at,source,idempotency_key) VALUES ('100000000000000010',$1,$2,now(),'test',$3)")
+            .bind(&member).bind(event_type).bind(format!("only-{event_type}"))
+            .execute(&pool).await.unwrap();
+    }
+    // Partial projections also protect, with both first milestones NULL.
+    for (i, evidence) in ["third-message", "last-active", "bot", "left"]
+        .into_iter()
+        .enumerate()
+    {
+        let member = format!("1000000000000002{i:02}");
+        sqlx::query("INSERT INTO join_risk_flags VALUES ($1,'100000000000000010',$2,'2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','unknown',3,'[]',false,true,'2026-09-01T00:00:00Z')")
+            .bind(format!("projected-{evidence}"))
+            .bind(&member)
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO members (guild_id,member_id,third_message_at,last_active_at,is_bot,left_at) VALUES ('100000000000000010',$1,CASE WHEN $2='third-message' THEN now() END,CASE WHEN $2='last-active' THEN now() END,$2='bot',CASE WHEN $2='left' THEN now() END)")
+            .bind(&member).bind(evidence).execute(&pool).await.unwrap();
+    }
+    // Other-guild activity and non-participation milestones must not suppress A.
+    sqlx::query("INSERT INTO events (guild_id,member_id,event_type,occurred_at,source,idempotency_key) VALUES ('100000000000000011','100000000000000001','voice_session_end',now(),'test','other-guild-activity'),('100000000000000010','100000000000000001','gate_cleared',now(),'test','gate-only')")
+        .execute(&pool).await.unwrap();
     let rows = list_flagged(
         &pool,
         "100000000000000010",

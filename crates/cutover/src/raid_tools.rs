@@ -52,9 +52,10 @@ pub async fn list_flagged(
          WHERE r.guild_id = $1 AND r.flagged AND NOT r.bulk_join_window
            AND r.joined_at::timestamptz >= $2::timestamptz AND r.joined_at::timestamptz < $3::timestamptz
            AND NOT EXISTS (SELECT 1 FROM members m WHERE m.guild_id = r.guild_id AND m.member_id = r.member_id
-             AND (m.is_bot OR m.left_at IS NOT NULL OR m.first_message_at IS NOT NULL OR m.first_voice_at IS NOT NULL))
+             AND (m.is_bot OR m.left_at IS NOT NULL OR m.first_message_at IS NOT NULL OR m.third_message_at IS NOT NULL
+               OR m.first_voice_at IS NOT NULL OR m.last_active_at IS NOT NULL))
            AND NOT EXISTS (SELECT 1 FROM events e WHERE e.guild_id = r.guild_id AND e.member_id = r.member_id
-             AND e.event_type IN ('first_message', 'third_message', 'first_voice_session', 'first_voice', 'voice_session_start'))
+             AND e.event_type IN ('first_message', 'second_message', 'third_message', 'first_voice_session', 'first_voice', 'voice_session_start', 'voice_session_end'))
          ORDER BY r.member_id, r.joined_at::timestamptz, r.event_id"
     ).bind(guild).bind(from).bind(to).fetch_all(pool).await?;
     rows.iter()
@@ -279,14 +280,6 @@ async fn target_state(
             .await
             .map_err(|_| "Discord safety read failed; stop and check authorized access".to_owned())
     };
-    let Some(member) = get(format!("/guilds/{guild}/members/{id}")).await? else {
-        return Ok(TargetState::Missing);
-    };
-    let user = member.get("user").ok_or("missing target user")?;
-    if required(user, "id")? != id {
-        return Err("target identity mismatch".into());
-    }
-    let is_bot = user.get("bot").and_then(Value::as_bool).unwrap_or(false);
     let guild_info = get(format!("/guilds/{guild}"))
         .await?
         .ok_or("guild missing")?;
@@ -300,6 +293,16 @@ async fn target_state(
     let bot_member = get(format!("/guilds/{guild}/members/{bot_id}"))
         .await?
         .ok_or("bot membership missing")?;
+    // Target membership is the final network read: no metadata exchange or
+    // pacing may intervene between these role facts and the guarded DELETE.
+    let Some(member) = get(format!("/guilds/{guild}/members/{id}")).await? else {
+        return Ok(TargetState::Missing);
+    };
+    let user = member.get("user").ok_or("missing target user")?;
+    if required(user, "id")? != id {
+        return Err("target identity mismatch".into());
+    }
+    let is_bot = user.get("bot").and_then(Value::as_bool).unwrap_or(false);
     let role_ids = |m: &Value| -> Result<Vec<String>, String> {
         m.get("roles")
             .and_then(Value::as_array)

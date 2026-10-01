@@ -704,7 +704,13 @@ impl ActionExecutor {
             };
             authorize(attempts).await?;
             attempts += 1;
-            let res = match self.send(&request).await {
+            // A deadline covers both headers and body, not just connection
+            // setup. A timeout is ambiguous: retry only after fresh safety
+            // authorization, and report failure if the bounded budget runs out.
+            let exchange = tokio::time::timeout(self.inner.moderation_timeout, self.send(&request))
+                .await
+                .unwrap_or_else(|_| Err("DELETE timed out; mutation may have applied".into()));
+            let res = match exchange {
                 Ok(r) => r,
                 Err(detail) => {
                     if attempts > MAX_HTTP_TRIES - 1 {
