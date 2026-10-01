@@ -326,11 +326,16 @@ impl<
 
     /// Snapshot invite counters for a guild; returns the codes that grew.
     /// A failed read (`None`) keeps the old snapshot and returns empty, so
-    /// the join still records with source `unknown`.
+    /// the join still records with source `unknown` (TOG-11716: never blocks
+    /// the join). A baseline older than
+    /// [`two_bot_core::INVITE_SNAPSHOT_STALENESS_BOUND_MS`] is re-seeded,
+    /// not diffed: the fresh counters are stored, nothing is credited, and
+    /// this window files `vanity`/`unknown` instead of drift.
     fn snapshot_invites(&self, guild_id: Snowflake, observed_at: &str) -> Vec<String> {
         match self.invite_source.current(guild_id) {
             Some(current) => {
-                let grew = self.invites.diff_and_store(guild_id, &current);
+                let now_ms = two_bot_core::parse_iso_millis(observed_at);
+                let grew = self.invites.diff_and_store_at(guild_id, &current, now_ms);
                 self.handlers.store().stage_invite_snapshot(
                     two_bot_core::gateway_funnel::InviteSnapshotWrite {
                         guild_id,
