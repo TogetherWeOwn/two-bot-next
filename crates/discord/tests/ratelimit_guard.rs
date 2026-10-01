@@ -208,6 +208,81 @@ async fn ban(executor: &ActionExecutor) -> Result<(), DiscordError> {
 }
 
 #[tokio::test]
+async fn single_attempt_roster_get_preserves_wire_budget_and_shared_global_pause() {
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(429, serde_json::json!({"retry_after": 0.2, "global": true})),
+            ScriptedResponse::json(200, serde_json::json!([])),
+            ScriptedResponse::status(500),
+        ],
+        ScriptedResponse::status(200),
+    )
+    .await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let first = executor(&mock, &guard);
+    let second = executor(&mock, &guard);
+    let path = "/guilds/2222/members?limit=1000";
+
+    assert_eq!(first.get_json_once(path).await.unwrap(), None);
+    assert_eq!(first.requests(), 1);
+    assert_eq!(mock.requests().len(), 1, "a 429 must not retry the page");
+    assert_eq!(
+        second.get_json_once(path).await.unwrap(),
+        Some(serde_json::json!([]))
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .received_at
+            .duration_since(requests[0].received_at)
+            >= Duration::from_millis(425),
+        "the next page must honor the process-wide pause"
+    );
+    assert_eq!(second.get_json_once(path).await.unwrap(), None);
+    assert_eq!(second.requests(), 2);
+    assert_eq!(mock.requests().len(), 3, "a 5xx must not retry the page");
+    assert_eq!(guard.snapshot().global_pauses_total, 1);
+    assert_eq!(guard.snapshot().invalid_requests_total, 1);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn single_attempt_roster_get_refuses_before_wire_and_recovers_after_cooldown() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(403)],
+        ScriptedResponse::json(200, serde_json::json!([])),
+    )
+    .await;
+    let guard = Arc::new(
+        RateLimitGuard::new(GuardConfig {
+            invalid_request_threshold: 1,
+            window: Duration::from_millis(300),
+        })
+        .unwrap(),
+    );
+    let exec = executor(&mock, &guard);
+    let path = "/guilds/2222/members?limit=1000";
+    assert_eq!(exec.get_json_once(path).await.unwrap(), None);
+    assert!(guard.snapshot().breaker_open);
+    assert_eq!(
+        exec.get_json_once(path).await.unwrap_err(),
+        GuardError::CircuitOpen.to_string()
+    );
+    assert_eq!(exec.requests(), 1);
+    assert_eq!(mock.requests().len(), 1);
+    tokio::time::sleep(Duration::from_millis(320)).await;
+    assert_eq!(
+        exec.get_json_once(path).await.unwrap(),
+        Some(serde_json::json!([]))
+    );
+    assert_eq!(exec.requests(), 2);
+    assert_eq!(mock.requests().len(), 2);
+    assert!(!guard.snapshot().breaker_open);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn global_429_pauses_independent_executors_concurrently_once() {
     for signal in ["body", "global-header", "scope-header", "scope-body"] {
         let mut response = ScriptedResponse::json(
