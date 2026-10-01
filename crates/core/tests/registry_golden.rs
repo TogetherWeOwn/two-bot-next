@@ -25,9 +25,9 @@ fn fixture_and_exception_list_are_pinned_to_the_parity_matrix() {
     assert_eq!(snapshot["source"], "TogetherWeOwn/two-bot");
     assert_eq!(
         snapshot["revision"],
-        "d5d1179348feb9157bcac8c875de9399d4f5c76a"
+        "dbee695b95aabf9234cad28a6b24692e2d07314d"
     );
-    assert!(matrix.contains("`main` @ `d5d11793`"));
+    assert!(matrix.contains("`registrySnapshot` = `dbee695`"));
     let table = matrix
         .split("## Registry golden exceptions")
         .nth(1)
