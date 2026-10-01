@@ -22,7 +22,8 @@ async fn resolves_bot_and_application_without_gateway_ready() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].method, "GET");
     assert_eq!(requests[0].path, "/api/v10/users/@me");
-    assert_eq!(requests[1].path, "/api/v10/oauth2/applications/@me");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(requests[1].path, "/api/v10/applications/@me");
     mock.shutdown().await;
 }
 
