@@ -96,17 +96,20 @@ appears. A live-network scratch deploy was not possible from this sandbox
 ## Rust runtime image PR gate
 
 The independent `container smoke` job in `.github/workflows/check.yml` builds
-this repository's Dockerfile on hosted `linux/amd64`, loads it into local Docker,
-and uses BuildKit's `gha` cache. It never pushes an image or receives deployment
-credentials. It also runs on `main` and workflow dispatch (including release
-check dispatches). The existing required `check` job is unchanged.
+this repository's Dockerfile on `[self-hosted, two-selfhosted]` for `linux/amd64`,
+loads it into local Docker, and uses BuildKit's `gha` cache. It never pushes an
+image or receives deployment credentials. It also runs on `main` and workflow
+dispatch (including release check dispatches). Every image check and both
+negative-budget tests use the build output's immutable image ID; a per-run tag
+avoids sibling jobs replacing a shared tag. The DB test gates are unchanged.
 
-`scripts/container-smoke.py` prints both sizes in bytes and MiB to the log and
-job summary and fails above these calibrated ceilings:
+`scripts/container-smoke.py` prints the uncompressed history-layer sum and binary
+size in bytes and MiB to the log and job summary, plus inspect `Size` as the local
+image-store footprint (diagnostic only), and fails above these calibrated ceilings:
 
 | Artifact | Definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|
-| Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
+| Runtime image | Sum of numeric `docker history --no-trunc --human=false --format '{{.Size}}'` layer bytes, excluding packed content | Historical classic-store calibration: 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | Historical: 24.81 MiB / 28.4% |
 | Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 10 MiB / 10,485,760 bytes | 2.99 MiB / 42.7% |
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
@@ -114,9 +117,28 @@ at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
 25% image growth rounded up to the next 8 MiB, and roughly 40% binary growth
 rounded up to the next MiB. Base-image/toolchain changes must remeasure and
 justify any future budget increase. Docker is not available in the controller
-workspace; offline fixture sizes are not measurements.
+workspace; offline fixture sizes are not measurements or a fresh headroom receipt.
 
-The hosted parked-mode contract passed, including SIGTERM exit 0 in 0.095 s.
+The old inspect-`Size` label was backend-dependent: [classic Moby inspect](https://raw.githubusercontent.com/moby/moby/master/daemon/images/image_inspect.go)
+uses the rootFS layer size, while [containerd inspect](https://raw.githubusercontent.com/moby/moby/master/daemon/containerd/image_inspect.go)
+uses manifest `Size.Total`, which includes both packed content and unpacked
+snapshots ([size definitions](https://raw.githubusercontent.com/moby/moby/master/api/types/image/manifest.go)).
+The correction reuses [PR #145](https://github.com/TogetherWeOwn/two-bot-next/pull/145)
+and retains both ceilings. [Docker's history formatter](https://raw.githubusercontent.com/docker/cli/master/cli/command/image/formatter_history.go)
+with `--human=false` emits integer byte sizes, not rounded CLI units.
+
+The gate rejects empty/all-zero history, non-integer/negative/rounded rows,
+fewer history entries than rootFS layers, missing/invalid rootFS metadata,
+Docker errors/timeouts and CLI warnings. There is no inspect-size fallback or
+compression estimate. Zero-byte entries are permitted: configuration entries
+and genuinely empty filesystem layers can contribute zero. This validates the
+CLI measurement, **not** every daemon snapshot: [containerd history](https://raw.githubusercontent.com/moby/moby/master/daemon/containerd/image_history.go)
+can log a missing-snapshot warning server-side and emit zero without a client
+error. Fresh exact-ID CI history/metadata, successful runtime execution and the
+negative gates remain necessary; neither mocks nor upstream source prove the
+current built image fits the budget or that runner storage is restored.
+
+The historical hosted parked-mode contract passed, including SIGTERM exit 0 in 0.095 s.
 Manual log verification confirmed both deliberate one-byte-budget invocations
 failed with the corresponding `exceeds size budget` error and that the CI
 negative-test step passed. This exercises real measured artifacts, not mocks.
@@ -135,15 +157,20 @@ Reproduce on an authorized Docker-capable development machine (not the
 controller host):
 
 ```sh
-docker buildx build --load --platform linux/amd64 -t two-bot:ci .
-python3 scripts/container-smoke.py two-bot:ci
+# Use your run-owned scratch directory for the iidfile, not a shared tag.
+docker buildx build --load --platform linux/amd64 --iidfile "$RUNNER_TEMP/runtime-image-id" .
+image=$(<"$RUNNER_TEMP/runtime-image-id")
+python3 scripts/container-smoke.py "$image"
 # Deliberate breakage: each invocation must fail with "exceeds size budget".
-python3 scripts/container-smoke.py two-bot:ci --image-max-bytes 1
-python3 scripts/container-smoke.py two-bot:ci --binary-max-bytes 1
+python3 scripts/container-smoke.py "$image" --image-max-bytes 1
+python3 scripts/container-smoke.py "$image" --binary-max-bytes 1
 ```
 
 The CI job exercises those two deliberately broken budgets against the real
-image and fails if either violation is accepted. Offline Python fixtures also
+image and fails if either violation is accepted. Offline Python fixtures model
+packed+unpacked store totals above budget with an accepted uncompressed sum,
+uncompressed-over-budget rejection before runtime start, exact ceilings,
+invalid/missing/incomplete numeric history and immutable-ID use. They also
 cover missing binary, root runtime, unhealthy/false-ready endpoints, broken
 healthcheck, OOM, shutdown exit/timeout failures, startup transport retries
 (early-close loopback peer), redirect rejection (live `/readyz` 302 → `/other`

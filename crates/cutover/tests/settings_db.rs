@@ -2,6 +2,7 @@
 //! GitHub Actions. No app DB URL, credentials, migrations in public, or Discord.
 //! Run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -26,6 +27,21 @@ fn assert_cas_token(token: i64) {
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type AuditRow = (Option<Value>, Option<Value>);
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "settings_test_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
 
 struct TestDb {
     admin: Pool<Postgres>,
@@ -74,12 +90,8 @@ impl TestDb {
             .acquire_timeout(Duration::from_secs(5))
             .connect_with(options.clone())
             .await?;
-        let schema = format!(
-            "settings_test_{}_{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        );
-        // Identifier is a constant prefix plus numeric process/time IDs only.
+        let schema = schema_name_at(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos());
+        // Identifier is a constant prefix plus numeric process/sequence/time IDs only.
         QueryBuilder::<Postgres>::new("CREATE SCHEMA ")
             .push(&schema)
             .build()

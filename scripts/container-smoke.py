@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 from urllib.parse import urlsplit
@@ -58,13 +59,46 @@ def http_response(url):
         connection.close()
 
 
+def uncompressed_image_bytes(image, metadata):
+    # Reuse PR #145's numeric history measurement, not inspect Size: containerd
+    # includes packed content in the latter. --human=false emits decimal bytes.
+    # https://raw.githubusercontent.com/docker/cli/master/cli/command/image/formatter_history.go
+    rootfs = metadata.get("RootFS")
+    require(isinstance(rootfs, dict) and rootfs.get("Type") == "layers",
+            "image RootFS layer metadata is missing")
+    layers = rootfs.get("Layers")
+    require(isinstance(layers, list) and layers and all(
+        isinstance(layer, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", layer)
+        for layer in layers
+    ), "image RootFS layers are missing or invalid")
+    history = docker("history", "--no-trunc", "--human=false", "--format", "{{.Size}}", image)
+    require(not history.stderr.strip(), "image history reported a measurement warning")
+    rows = history.stdout.splitlines()
+    require(rows and all(re.fullmatch(r"[0-9]+", row) for row in rows),
+            "image history sizes must be non-negative integer bytes")
+    # History includes zero-byte configuration entries as well as filesystem
+    # layers (which can also be empty). Fewer rows than DiffIDs is incomplete;
+    # do not mistake an empty/failed response or all-zero sizes for a tiny image.
+    require(len(rows) >= len(layers), "image history is incomplete for RootFS layers")
+    size = sum(int(row) for row in rows)
+    require(size > 0, "image history has no measured layer bytes")
+    return size
+
+
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
-    metadata = json.loads(docker("image", "inspect", image).stdout)[0]
-    # Sum of uncompressed layer sizes. With the containerd image store (the
-    # self-hosted runners) `inspect .Size` also counts the compressed content
-    # blobs; the layer sum equals the classic overlay2 Size on both stores.
-    history = docker("history", "--no-trunc", "--human=false", "--format", "{{.Size}}", image).stdout
-    image_bytes = sum(int(line) for line in history.split())
+    inspected = json.loads(docker("image", "inspect", image).stdout)
+    require(isinstance(inspected, list) and len(inspected) == 1 and isinstance(inspected[0], dict),
+            "image inspect must return exactly one image")
+    metadata = inspected[0]
+    image = metadata.get("Id")
+    require(isinstance(image, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", image),
+            "image inspect must return an immutable image ID")
+    store_bytes = metadata.get("Size")
+    require(type(store_bytes) is int and store_bytes >= 0,
+            "image inspect Size must be non-negative integer bytes")
+    image_bytes = uncompressed_image_bytes(image, metadata)
+    report(f"image {image}; local image-store footprint (inspect Size): "
+           f"{store_bytes} bytes ({store_bytes / MIB:.2f} MiB); not the uncompressed budget metric")
     # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
     # orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex
@@ -77,7 +111,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     finally:
         docker("rm", "--force", measure, check=False)
     for label, size, limit in (
-        ("image (uncompressed Docker Size)", image_bytes, image_max_bytes),
+        ("image (uncompressed history layer sum)", image_bytes, image_max_bytes),
         ("release binary", binary_bytes, binary_max_bytes),
     ):
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")

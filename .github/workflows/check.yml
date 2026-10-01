@@ -80,6 +80,9 @@ jobs:
       - name: offline build-cache safety regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
 
+      - name: Offline CI wait-observer regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_db_waits.py' -v
+
       - name: parity soak checklist coverage (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
@@ -125,17 +128,25 @@ jobs:
       - name: Prepare isolated test databases
         run: createdb -h agent-testdb -U agent_test two_bot_test_ci
 
+      - name: Prepare CI database wait evidence
+        run: mkdir -p "$RUNNER_TEMP/ci-db-waits"
+
       # Preserve cargo test's default unit/binary, integration and doc targets.
+      # Observe early teardown failures too; do not change concurrency or bounds.
       # Migrated suites create/drop unique databases; this bootstrap is not reset.
       - name: cargo test (unit and binary, including RSVP store)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
+        run: >-
+          python3 scripts/ci-db-waits.py --log "$RUNNER_TEMP/ci-db-waits/unit-db-waits.jsonl" --
+          cargo test --workspace --lib --bins --features two-bot-core/db --locked
 
       - name: cargo test (integration, including website acceptance)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test --workspace --test '*' --features two-bot-core/db --locked
+        run: >-
+          python3 scripts/ci-db-waits.py --log "$RUNNER_TEMP/ci-db-waits/integration-db-waits.jsonl" --
+          cargo test --workspace --test '*' --features two-bot-core/db --locked
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -190,7 +201,20 @@ jobs:
       - name: Internal-member durable store regressions (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
+        run: >-
+          python3 scripts/ci-db-waits.py --log "$RUNNER_TEMP/ci-db-waits/internal-member-db-waits.jsonl" --
+          cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
+
+      - name: Preserve CI database wait evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ci-db-waits-${{ github.run_id }}-${{ github.run_attempt }}
+          # One path is translated into the job container; multiline absolute
+          # paths leave all but the first pointing at inaccessible host paths.
+          path: ${{ runner.temp }}/ci-db-waits
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
@@ -262,6 +286,7 @@ jobs:
       - name: Set up BuildKit
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Build runtime image (local only)
+        id: runtime-image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -269,17 +294,36 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: two-bot:ci
+          tags: two-bot:ci-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=two-bot-runtime-amd64
           cache-to: type=gha,mode=max,scope=two-bot-runtime-amd64
+      # The runners share a Docker daemon. Observe and test the build's exact
+      # immutable ID, never a tag that a sibling job can replace between steps.
+      - name: Exact runtime image evidence
+        env:
+          RUNTIME_IMAGE: ${{ steps.runtime-image.outputs.imageid }}
+        run: |
+          set -eu
+          test -n "$RUNTIME_IMAGE"
+          docker info --format '{{json .DriverStatus}}'
+          docker image inspect --format '{{json .}}' "$RUNTIME_IMAGE"
+          docker history --no-trunc --human=false --format '{{json .}}' "$RUNTIME_IMAGE"
+          name="two-bot-packages-${{ github.run_id }}-${{ github.run_attempt }}"
+          trap 'docker rm --force "$name" >/dev/null 2>&1 || true' EXIT
+          timeout 30s docker run --name "$name" --memory 256m --network none \
+            --entrypoint dpkg-query "$RUNTIME_IMAGE" -W '-f=${Package}\t${Version}\t${Installed-Size}\n'
       - name: Runtime contract and size budgets
-        run: python3 scripts/container-smoke.py two-bot:ci
+        env:
+          RUNTIME_IMAGE: ${{ steps.runtime-image.outputs.imageid }}
+        run: python3 scripts/container-smoke.py "$RUNTIME_IMAGE"
       - name: Prove deliberate budget breakage fails
+        env:
+          RUNTIME_IMAGE: ${{ steps.runtime-image.outputs.imageid }}
         run: |
           set -euo pipefail
           for budget in image binary; do
             log="$RUNNER_TEMP/container-negative-$budget.log"
-            if python3 scripts/container-smoke.py two-bot:ci "--$budget-max-bytes" 1 >"$log" 2>&1; then
+            if python3 scripts/container-smoke.py "$RUNTIME_IMAGE" "--$budget-max-bytes" 1 >"$log" 2>&1; then
               printf 'FAIL: deliberate %s budget violation was accepted\n' "$budget"
               exit 1
             fi
