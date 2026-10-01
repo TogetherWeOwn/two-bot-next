@@ -1,0 +1,76 @@
+name: staging-migrate
+
+# Manual, staging-only SQLx migration runner (TOG-11572). Never runs
+# automatically and has no production path. Refuses before any DDL unless the
+# operator names an independently reviewed source SHA that is already on main,
+# the verified non-secret staging identity, and the recovery/ACL references.
+# The migrator binding TWO_BOT_STAGING_MIGRATOR_DATABASE_URL must already
+# exist; this workflow never creates or changes credentials.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: plan (read-only) or apply
+        type: choice
+        options: [plan, apply]
+        default: plan
+      source_sha:
+        description: Full 40-char reviewed commit on main
+        required: true
+      staging_host:
+        description: Verified staging database host (non-secret)
+        required: true
+      staging_database:
+        description: Verified staging database name (must contain "staging")
+        required: true
+      recovery_evidence_ref:
+        description: Reference to approved recovery evidence (card/document, no URL secrets)
+        required: true
+      acl_plan_ref:
+        description: Reference to the reviewed ACL sequence
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-migrate
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: staging-migrate (${{ inputs.mode }})
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 30
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+      - name: Source SHA must be exact and reachable from main
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git fetch origin main
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+      - name: Build runner
+        run: cargo build -p two-bot-cutover --bin staging-migrate --locked
+      - name: Run
+        env:
+          # Must already exist as a repository/environment secret; absent means refusal.
+          TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}
+          MODE: ${{ inputs.mode }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          STAGING_HOST: ${{ inputs.staging_host }}
+          STAGING_DATABASE: ${{ inputs.staging_database }}
+          RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
+          ACL_REF: ${{ inputs.acl_plan_ref }}
+        run: |
+          ./target/debug/staging-migrate "--$MODE" --source-sha "$SOURCE_SHA" \
+            --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
+            --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
+            | tee staging-migrate-manifest.json

@@ -66,3 +66,7 @@ path = "src/bin/dedupe_events.rs"
 [[bin]]
 name = "legacy_copy"
 path = "src/bin/legacy_copy.rs"
+
+[[bin]]
+name = "staging-migrate"
+path = "src/bin/staging_migrate.rs"
