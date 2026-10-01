@@ -212,29 +212,26 @@ export async function handleRedirect(
   callerKey: string,
   deps: RedirectDeps,
 ): Promise<RedirectResult> {
+  // Query strings are dropped, not parsed: they are the identifying data this
+  // service promises not to collect.
+  const bare = path.split("?")[0] ?? "/";
+
+  // Reserved paths reject every method before configuration, logging or lookup.
+  // Only the exact probe is exempt; aliases/subpaths never become campaigns.
+  if (bare !== "/healthz" && isReservedInternal(path)) {
+    return text(404, "not found\n");
+  }
+
   const error = deps.onError ?? (() => undefined);
   if (!isValidFallback(deps.fallbackInviteCode)) {
     error("invite_redirect_invalid_config", { errorClass: "invalid_fallback" });
     return text(503, "redirect service misconfigured\n", { "retry-after": "30" });
   }
 
-  // Query strings are dropped, not parsed: they are the identifying data this
-  // service promises not to collect.
-  const bare = path.split("?")[0] ?? "/";
-
-  // Only the exact probe is served; aliases remain reserved, never campaigns.
   if (bare === "/healthz") {
     return method === "GET" || method === "HEAD"
       ? text(200, "ok\n")
       : text(405, "", { allow: "GET, HEAD" });
-  }
-
-  // Reserved internal slugs first, for every method (including POST, which
-  // otherwise reports 405): `/%6detrics`, `/METRICS`, `//metrics` and
-  // `/metrics/*` can never become a configured invite redirect. No DB touch,
-  // never a click.
-  if (isReservedInternal(path)) {
-    return text(404, "not found\n");
   }
 
   if (method !== "GET" && method !== "HEAD") {

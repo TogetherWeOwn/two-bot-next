@@ -436,6 +436,31 @@ describe("configuration and campaign ingress fail closed", () => {
     assert.equal((await harness({ fallback: null }).call("GET", "/healthz")).status, 200);
   });
 
+  test("reserved paths reject every method before invalid fallback configuration", async () => {
+    for (const path of [
+      "/metrics", "/METRICS", "/%6detrics", "//metrics", "/metrics/", "/metrics/extra",
+      "/HEALTHZ", "/%68ealthz", "//healthz", "/healthz/", "/%2fhealthz", "/healthz/extra",
+      "/healthz/?visitor=synthetic",
+    ]) {
+      for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
+        const h = harness({ fallback: "has space" });
+        h.deps.lookup = async () => { assert.fail("reserved paths must skip lookup"); };
+        h.deps.isThrottled = () => { assert.fail("reserved paths must skip rate limiting"); };
+        const res = await h.call(method, path);
+        assert.equal(res.status, 404, `${method} ${path}`);
+        assert.equal(res.headers.location, undefined);
+        assert.equal(res.click, undefined);
+        assert.equal(h.clicks.length, 0);
+        assert.deepEqual(h.errors, []);
+      }
+    }
+    for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
+      const h = harness({ fallback: "has space" });
+      assert.equal((await h.call(method, "/healthz?visitor=synthetic")).status, 503);
+      assert.deepEqual(h.errors, ['invite_redirect_invalid_config {"errorClass":"invalid_fallback"}']);
+    }
+  });
+
   test("healthz aliases cannot become a campaign, even with a polluted lookup", async () => {
     for (const path of ["/healthz", "/HEALTHZ", "/%68ealthz", "//healthz", "/healthz/", "/%2fhealthz", "/healthz/extra"]) {
       for (const method of ["GET", "HEAD", "POST"]) {
