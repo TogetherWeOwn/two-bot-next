@@ -62,7 +62,9 @@ pub const SKEW_SECONDS: u64 = 120;
 /// [`within_skew`] compares in whole seconds, so a signed timestamp stays
 /// fresh up to a second past its nominal skew distance, and a nonce burned at
 /// delivery must still be live then. 241 s is the smallest TTL that covers
-/// every accepted instant for the default skew.
+/// every accepted instant for the default skew while the clocks advance together
+/// without rollback. Expiry followed by wall-clock rollback can reopen freshness;
+/// the receiver needs an explicit clock policy (see `docs/threat-model.md`, F8).
 pub const NONCE_TTL_SECONDS: u64 = 241;
 /// Diagnostic cutoff for `in_flight` idempotency claims (legacy
 /// `CLAIM_STALE_SECONDS`). Durable stale claims require reconciliation, never
@@ -147,14 +149,14 @@ pub fn signatures_match(a: &str, b: &str) -> bool {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SigningKey {
     pub id: String,
-    pub secret: Vec<u8>,
+    pub secret: crate::Secret<Vec<u8>>,
 }
 
 impl std::fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SigningKey")
             .field("id", &self.id)
-            .field("secret_len", &self.secret.len())
+            .field("secret_len", &self.secret.expose().len())
             .finish()
     }
 }
@@ -190,7 +192,7 @@ pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
         }
         out.push(SigningKey {
             id: id.to_owned(),
-            secret: secret.as_bytes().to_vec(),
+            secret: crate::Secret::new(secret.as_bytes().to_vec()),
         });
     }
     if out.is_empty() {
@@ -209,8 +211,8 @@ pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
 /// impl lists only the key ids, which already travel in request headers.
 #[derive(Clone)]
 pub struct KeyRing {
-    keys: HashMap<String, Vec<u8>>,
-    decoy: [u8; 32],
+    keys: HashMap<String, crate::Secret<Vec<u8>>>,
+    decoy: crate::Secret<[u8; 32]>,
 }
 
 impl std::fmt::Debug for KeyRing {
@@ -229,7 +231,7 @@ impl KeyRing {
     pub fn new(keys: Vec<SigningKey>) -> Self {
         Self {
             keys: keys.into_iter().map(|k| (k.id, k.secret)).collect(),
-            decoy: rand::random(),
+            decoy: crate::Secret::new(rand::random()),
         }
     }
 
@@ -259,7 +261,9 @@ impl KeyRing {
     ) -> bool {
         let secret = self.keys.get(key_id);
         let expected = sign(
-            secret.map_or(self.decoy.as_slice(), Vec::as_slice),
+            secret.map_or(self.decoy.expose().as_slice(), |key| {
+                key.expose().as_slice()
+            }),
             timestamp,
             nonce,
             raw,
@@ -316,6 +320,10 @@ pub fn valid_nonce_format(nonce: &str) -> bool {
 /// constructor below enforces `ttl >= 2 * skew + 1` and fails loudly
 /// otherwise. Expiry is exclusive on both paths (`offer` and `sweep`),
 /// keeping them consistent: a nonce is live while `now - seen <= ttl`.
+/// This coverage assumes expiry and freshness clocks advance together without
+/// rollback. Saturating subtraction protects retained entries, not entries already
+/// swept; wall-clock rollback can make an expired capture fresh again. The receiver
+/// must supply a clock policy rather than treating TTL coverage as unconditional.
 #[derive(Debug, Clone)]
 pub struct NonceCache {
     seen: HashMap<String, u64>,
@@ -459,7 +467,9 @@ impl TokenBuckets {
         bucket.tokens = spec
             .capacity
             .min(bucket.tokens + elapsed * spec.refill_per_second);
-        bucket.updated_ms = now_ms;
+        // A backwards wall clock must not let its recovery credit the same
+        // elapsed interval twice. Keep the last observed high-water mark.
+        bucket.updated_ms = bucket.updated_ms.max(now_ms);
 
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -468,7 +478,10 @@ impl TokenBuckets {
                 retry_after_secs: 0,
             };
         }
-        let wait = ((1.0 - bucket.tokens) / spec.refill_per_second).ceil() as u64;
+        // Refill cannot resume until a rolled-back clock reaches the high-water
+        // mark. Retry-After must include that recovery as well as the token wait.
+        let recovery = bucket.updated_ms.saturating_sub(now_ms) as f64 / 1000.0;
+        let wait = (recovery + (1.0 - bucket.tokens) / spec.refill_per_second).ceil() as u64;
         BucketDecision {
             allowed: false,
             retry_after_secs: wait.max(1),
@@ -1220,6 +1233,56 @@ pub fn validate_guild_add_member(body: &Map<String, Value>) -> Result<(), Action
     Ok(())
 }
 
+/// Resolved allowlisted role assignment. No caller can supply an arbitrary role ID.
+#[derive(Debug, Clone, Copy)]
+pub struct RoleAssignRequest<'a> {
+    discord_id: &'a str,
+    role_id: &'a str,
+}
+
+impl<'a> RoleAssignRequest<'a> {
+    pub fn validate(
+        body: &'a Map<String, Value>,
+        role_keys: &'a HashMap<String, String>,
+    ) -> Result<Self, ActionError> {
+        let role_id = validate_role_assign(body, role_keys)?;
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+            role_id,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    #[must_use]
+    pub fn role_id(&self) -> &str {
+        self.role_id
+    }
+}
+
+/// Validated member subject only. The OAuth token stays a separate transient argument.
+#[derive(Debug, Clone, Copy)]
+pub struct GuildAddMemberRequest<'a> {
+    discord_id: &'a str,
+}
+
+impl<'a> GuildAddMemberRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        validate_guild_add_member(body)?;
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+}
+
 /// `announcement.post` field validation: channel through the key map, body
 /// within Discord's ceiling. The message id comes back from Discord, so the
 /// stored idempotency result can still tell the website *which* message it has.
@@ -1588,7 +1651,106 @@ fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn property_signing_preserves_valid_request_framing_and_distinguishes_changes(
+            timestamp in 0u64..999_999_999_999_999,
+            nonce in "[0-9a-fA-F]{32}",
+            raw in proptest::collection::vec(any::<u8>(), 0..256),
+            secret in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            // Only POST /internal/actions is supported. Header validation excludes
+            // newlines; SHA-256 collision resistance is an assumption, not a proof.
+            let ts = timestamp.to_string();
+            let canonical = canonical_string(&ts, &nonce, &raw);
+            let fields = canonical.split('\n').collect::<Vec<_>>();
+            prop_assert_eq!(fields.len(), 5);
+            prop_assert_eq!(&fields[..4], &["POST", "/internal/actions", ts.as_str(), nonce.as_str()]);
+            prop_assert_eq!(fields[4], hex::encode(Sha256::digest(&raw)));
+            prop_assert!(within_skew(&ts, 0, timestamp));
+            prop_assert!(valid_nonce_format(&nonce));
+
+            let signature = sign(&secret, &ts, &nonce, &raw);
+            prop_assert!(signatures_match(&signature, &sign(&secret, &ts, &nonce, &raw)));
+            let changed_ts = (timestamp + 1).to_string();
+            let mut changed_nonce = nonce.clone();
+            changed_nonce.replace_range(..1, if nonce.starts_with('0') { "1" } else { "0" });
+            let mut changed_body = raw.clone();
+            changed_body.push(0);
+            for (other_ts, other_nonce, other_body) in [
+                (changed_ts.as_str(), nonce.as_str(), raw.as_slice()),
+                (ts.as_str(), changed_nonce.as_str(), raw.as_slice()),
+                (ts.as_str(), nonce.as_str(), changed_body.as_slice()),
+            ] {
+                prop_assert_ne!(&canonical, &canonical_string(other_ts, other_nonce, other_body));
+                prop_assert!(!signatures_match(&signature, &sign(&secret, other_ts, other_nonce, other_body)));
+            }
+        }
+
+        #[test]
+        fn property_key_parser_and_signer_never_panic(
+            text in proptest::collection::vec(any::<char>(), 0..256)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            raw in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            if let Ok(keys) = parse_keys(&text) {
+                let normalized = keys.iter().map(|key| format!("{}:{}", key.id, String::from_utf8_lossy(key.secret.expose())))
+                    .collect::<Vec<_>>().join(",");
+                prop_assert_eq!(parse_keys(&normalized), Ok(keys));
+            }
+            let signature = sign(&raw, &text, &text, &raw);
+            prop_assert_eq!(signature.len(), 71);
+            prop_assert!(signature.starts_with("sha256="));
+            let _ = within_skew(&text, SKEW_SECONDS, 0);
+            let _ = valid_nonce_format(&text);
+        }
+
+        #[test]
+        fn property_valid_key_specs_round_trip_and_enforce_the_minimum(
+            entries in proptest::collection::vec(("[a-z0-9_-]{1,16}", "[a-zA-Z0-9:]{32,80}"), 1..=8),
+            length in 0usize..=64,
+        ) {
+            let wire = entries.iter().map(|(id, secret)| format!(" {id} : {secret} "))
+                .collect::<Vec<_>>().join(",");
+            let expected = entries.iter().map(|(id, secret)| SigningKey {
+                id: id.clone(), secret: crate::Secret::new(secret.as_bytes().to_vec()),
+            }).collect::<Vec<_>>();
+            prop_assert_eq!(parse_keys(&wire), Ok(expected));
+            for n in [0, 1, 31, 32, 33, length] {
+                let spec = format!("fixture:{}", "a".repeat(n));
+                prop_assert_eq!(parse_keys(&spec).is_ok(), n >= 32);
+            }
+        }
+
+        #[test]
+        fn property_moderation_numbers_match_inclusive_runtime_bounds(value in any::<i64>()) {
+            for (action, min, max) in [
+                (ModerationAction::TempBan, 60, 31_536_000),
+                (ModerationAction::Timeout, 60, 2_419_200),
+                (ModerationAction::Purge, 1, 100),
+                (ModerationAction::Slowmode, 0, 21_600),
+            ] {
+                // Every run exercises both exact edges, not only random i64s
+                // (which almost never fall inside the smaller accepted ranges).
+                for n in [min - 1, min, min + 1, max - 1, max, max + 1, value] {
+                    let number = json!(n);
+                    let result = validate_moderation_numbers(action, Some(&number), Some(&number), Some(&number));
+                    prop_assert_eq!(result.is_ok(), (min..=max).contains(&n));
+                    let string = json!(n.to_string());
+                    prop_assert!(validate_moderation_numbers(action, Some(&string), Some(&string), Some(&string)).is_err());
+                }
+                prop_assert!(validate_moderation_numbers(action, None, None, None).is_err());
+                for invalid in [Value::Null, json!(true), json!(1.5), json!([]), json!({})] {
+                    prop_assert!(validate_moderation_numbers(action, Some(&invalid), Some(&invalid), Some(&invalid)).is_err());
+                }
+            }
+        }
+    }
 
     use crate::settings::{classify_key, SETTING_CLASSES};
     use std::sync::OnceLock;
@@ -1643,11 +1805,11 @@ mod tests {
         KeyRing::new(vec![
             SigningKey {
                 id: "web".to_owned(),
-                secret: vec1().secret.as_bytes().to_vec(),
+                secret: crate::Secret::new(vec1().secret.as_bytes().to_vec()),
             },
             SigningKey {
                 id: "web2".to_owned(),
-                secret: vec2().secret.as_bytes().to_vec(),
+                secret: crate::Secret::new(vec2().secret.as_bytes().to_vec()),
             },
         ])
     }
@@ -1756,7 +1918,7 @@ mod tests {
         let keys = ring();
         let vector = vec1();
         let signature = sign(
-            &keys.decoy,
+            keys.decoy.expose(),
             &vector.timestamp,
             &vector.nonce,
             vector.body.as_bytes(),
@@ -1790,7 +1952,7 @@ mod tests {
         let keys = KeyRing::new(Vec::new());
         let vector = vec1();
         let signature = sign(
-            &keys.decoy,
+            keys.decoy.expose(),
             &vector.timestamp,
             &vector.nonce,
             vector.body.as_bytes(),
@@ -1946,6 +2108,52 @@ mod tests {
         // One second refills one token at 1/s.
         assert!(buckets.take("k", DEFAULT_BUCKET, 1_000).allowed);
         assert!(!buckets.take("k", DEFAULT_BUCKET, 1_000).allowed);
+    }
+
+    #[test]
+    fn buckets_clock_rollback_does_not_refill_spent_tokens_twice() {
+        for spec in [DEFAULT_BUCKET, ADD_MEMBER_BUCKET] {
+            let mut buckets = TokenBuckets::new();
+            for _ in 0..spec.capacity as usize {
+                assert!(buckets.take("k", spec, 10_000).allowed);
+            }
+            assert!(!buckets.take("k", spec, 9_000).allowed);
+            assert!(!buckets.take("k", spec, 10_000).allowed);
+            let refill_ms = (1000.0 / spec.refill_per_second) as u64;
+            assert!(!buckets.take("k", spec, 10_000 + refill_ms - 1).allowed);
+            assert!(buckets.take("k", spec, 10_000 + refill_ms).allowed);
+            assert!(!buckets.take("k", spec, 10_000 + refill_ms).allowed);
+        }
+    }
+
+    #[test]
+    fn buckets_retry_after_includes_clock_recovery_and_refill() {
+        for (spec, empty_wait, partial_wait) in [(DEFAULT_BUCKET, 2, 1), (ADD_MEMBER_BUCKET, 3, 2)]
+        {
+            for rollback_ms in [9_000, 9_250, 9_999] {
+                let mut buckets = TokenBuckets::new();
+                for _ in 0..spec.capacity as usize {
+                    assert!(buckets.take("k", spec, 10_000).allowed);
+                }
+                let denied = buckets.take("k", spec, rollback_ms);
+                assert!(!denied.allowed);
+                assert_eq!(denied.retry_after_secs, empty_wait);
+                let retry_ms = rollback_ms + denied.retry_after_secs * 1000;
+                assert!(buckets.take("k", spec, retry_ms).allowed);
+            }
+
+            // Round the combined recovery/refill interval, not each separately.
+            let mut buckets = TokenBuckets::new();
+            for _ in 0..spec.capacity as usize {
+                assert!(buckets.take("k", spec, 10_000).allowed);
+            }
+            assert!(!buckets.take("k", spec, 10_500).allowed);
+            let denied = buckets.take("k", spec, 10_250);
+            assert!(!denied.allowed);
+            assert_eq!(denied.retry_after_secs, partial_wait);
+            let retry_ms = 10_250 + denied.retry_after_secs * 1000;
+            assert!(buckets.take("k", spec, retry_ms).allowed);
+        }
     }
 
     #[test]
@@ -2451,7 +2659,7 @@ mod tests {
         let secret: Vec<u8> = (0..32u8).collect();
         let key = SigningKey {
             id: "web".to_owned(),
-            secret,
+            secret: crate::Secret::new(secret),
         };
         assert_eq!(
             format!("{key:?}"),
@@ -2556,6 +2764,380 @@ mod tests {
             timestamp: ts,
             nonce,
             signature: sig,
+        }
+    }
+
+    fn authorize_for_test(
+        headers: &AuthHeaders<'_>,
+        raw: &[u8],
+        now_ms: u64,
+        nonces: &mut NonceCache,
+        buckets: &mut TokenBuckets,
+    ) -> Result<AuthDecision, ActionError> {
+        authorize(
+            headers,
+            raw,
+            &ring(),
+            &InternalFlags::from_map(&HashMap::new()),
+            true,
+            true,
+            SKEW_SECONDS,
+            now_ms / 1000,
+            now_ms,
+            nonces,
+            buckets,
+        )
+    }
+
+    #[test]
+    fn signing_preserves_header_values_and_raw_body_bytes() {
+        let vector = vec1();
+        let keys = ring();
+        let changed_timestamp = format!("0{}", vector.timestamp);
+        let changed_nonce = vector.nonce.to_uppercase();
+        assert_ne!(changed_nonce, vector.nonce);
+        let changed_signature = format!(" {}", vector.signature);
+        let changed_body = format!("{}\n", vector.body);
+        // HTTP header names are case-insensitive; signed values are not.
+        // Even JSON-equivalent whitespace must not be reserialized away.
+        for (id, timestamp, nonce, signature, raw) in [
+            (
+                "WEB",
+                &vector.timestamp,
+                &vector.nonce,
+                &vector.signature,
+                vector.body.as_bytes(),
+            ),
+            (
+                "web",
+                &changed_timestamp,
+                &vector.nonce,
+                &vector.signature,
+                vector.body.as_bytes(),
+            ),
+            (
+                "web",
+                &vector.timestamp,
+                &changed_nonce,
+                &vector.signature,
+                vector.body.as_bytes(),
+            ),
+            (
+                "web",
+                &vector.timestamp,
+                &vector.nonce,
+                &changed_signature,
+                vector.body.as_bytes(),
+            ),
+            (
+                "web",
+                &vector.timestamp,
+                &vector.nonce,
+                &vector.signature,
+                changed_body.as_bytes(),
+            ),
+        ] {
+            assert!(!keys.verify(id, signature, timestamp, nonce, raw));
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&vector.body).expect("fixture JSON"),
+            serde_json::from_str::<Value>(&changed_body).expect("same JSON")
+        );
+    }
+
+    #[test]
+    fn pipeline_signed_skew_edges_and_malformed_timestamps_do_not_burn() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        for (timestamp, accepted) in [
+            ("1719999880", true),
+            ("1720000120", true),
+            ("1719999879", false),
+            ("1720000121", false),
+            ("+1720000000", false),
+            ("1720000000.0", false),
+            ("1720000000 ", false),
+            ("１７２０００００００", false),
+        ] {
+            let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+            let mut buckets = TokenBuckets::new();
+            let nonce = test_nonce();
+            let sig = sign(
+                vector.secret.as_bytes(),
+                timestamp,
+                &nonce,
+                vector.body.as_bytes(),
+            );
+            let headers = signed_headers("web", timestamp, &nonce, &sig);
+            let result = authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+            );
+            if accepted {
+                assert!(result.is_ok(), "{timestamp}");
+                assert_eq!(nonces.len(), 1);
+            } else {
+                let err = result.expect_err("signed but not fresh");
+                assert_eq!(err.code, ErrorCode::StaleRequest, "{timestamp}");
+                assert!(nonces.is_empty());
+                assert!(buckets.buckets.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_clock_rollback_after_nonce_expiry_reopens_capture() {
+        // Characterize the clock-policy gap, not a deployed replay guarantee:
+        // once swept, a nonce cannot guard a capture made fresh by wall rollback.
+        let vector = vec1();
+        let seen_ms = 1_720_000_000_000;
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        for explicit_sweep in [true, false] {
+            let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+            let mut buckets = TokenBuckets::new();
+            authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                seen_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect("first delivery accepted");
+            let err = authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                seen_ms - 1_000,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect_err("rollback cannot bypass an entry still in memory");
+            assert_eq!(err.code, ErrorCode::Replayed);
+
+            let expired_ms = seen_ms + NONCE_TTL_SECONDS * 1000 + 1;
+            let err = authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                expired_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect_err("old capture is stale before rollback");
+            assert_eq!(err.code, ErrorCode::StaleRequest);
+            if explicit_sweep {
+                nonces.sweep(expired_ms);
+            } else {
+                let nonce = test_nonce();
+                let timestamp = (expired_ms / 1000).to_string();
+                let sig = sign(
+                    vector.secret.as_bytes(),
+                    &timestamp,
+                    &nonce,
+                    vector.body.as_bytes(),
+                );
+                let fresh = signed_headers("web", &timestamp, &nonce, &sig);
+                authorize_for_test(
+                    &fresh,
+                    vector.body.as_bytes(),
+                    expired_ms,
+                    &mut nonces,
+                    &mut buckets,
+                )
+                .expect("another fresh request sweeps expired entries via offer");
+            }
+            assert!(!nonces.seen.contains_key(&vector.nonce));
+            authorize_for_test(
+                &headers,
+                vector.body.as_bytes(),
+                seen_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect("known gap: expiry then rollback makes the capture acceptable again");
+        }
+    }
+
+    #[test]
+    fn pipeline_body_cap_is_inclusive_and_oversize_burns_nonce() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut raw = br#"{"action":"role.assign"}"#.to_vec();
+        raw.resize(MAX_BODY_BYTES, b' ');
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let nonce = test_nonce();
+        let sig = sign(vector.secret.as_bytes(), &vector.timestamp, &nonce, &raw);
+        let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+        assert!(authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets).is_ok());
+
+        raw.push(b' ');
+        let nonce = test_nonce();
+        let sig = sign(vector.secret.as_bytes(), &vector.timestamp, &nonce, &raw);
+        let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+        let err = authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets)
+            .expect_err("one byte over cap");
+        assert_eq!(err.code, ErrorCode::Malformed);
+        assert_eq!(err.log_reason, "body_too_large");
+        let err = authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets)
+            .expect_err("oversized request already burned its nonce");
+        assert_eq!(err.code, ErrorCode::Replayed);
+        assert_eq!(nonces.len(), 2);
+    }
+
+    #[test]
+    fn pipeline_bad_signatures_cannot_poison_nonces_or_key_buckets() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let wrong = signed_headers("web", &vector.timestamp, &vector.nonce, &vec2().signature);
+        let unknown = signed_headers(
+            "unknown",
+            &vector.timestamp,
+            &vector.nonce,
+            &vector.signature,
+        );
+        for _ in 0..=DEFAULT_BUCKET.capacity as usize {
+            let wrong_err = authorize_for_test(
+                &wrong,
+                vector.body.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect_err("wrong signature");
+            let unknown_err = authorize_for_test(
+                &unknown,
+                vector.body.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+            )
+            .expect_err("unknown caller");
+            assert_eq!(wrong_err, unknown_err);
+            assert_eq!(wrong_err.code, ErrorCode::Unauthorized);
+        }
+        assert!(nonces.is_empty());
+        assert!(buckets.buckets.is_empty());
+        let valid = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        assert!(authorize_for_test(
+            &valid,
+            vector.body.as_bytes(),
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn pipeline_rejected_json_is_secret_safe_and_cannot_be_replayed() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let marker = "synthetic-oauth-body-marker";
+        let raw = format!("{{\"access_token\":\"{marker}\",\"action\":");
+        let nonce = test_nonce();
+        let sig = sign(
+            vector.secret.as_bytes(),
+            &vector.timestamp,
+            &nonce,
+            raw.as_bytes(),
+        );
+        let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+        let err = authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
+            .expect_err("malformed JSON");
+        assert_eq!(err.code, ErrorCode::Malformed);
+        assert_eq!(err.log_reason, "bad_json");
+        assert!(!format!("{err:?}").contains(marker));
+        assert!(!format!("{err}").contains(marker));
+        let err = authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
+            .expect_err("rejected JSON still burned its nonce");
+        assert_eq!(err.code, ErrorCode::Replayed);
+    }
+
+    #[test]
+    fn rotation_removes_old_key_without_forgetting_replay_state() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        authorize_for_test(
+            &headers,
+            vector.body.as_bytes(),
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+        )
+        .expect("old key accepted during overlap");
+        let rotated = KeyRing::new(vec![SigningKey {
+            id: "web2".to_owned(),
+            secret: crate::Secret::new(vec2().secret.as_bytes().to_vec()),
+        }]);
+        assert!(!rotated.verify(
+            "web",
+            &vector.signature,
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes(),
+        ));
+        let sig = sign(
+            vec2().secret.as_bytes(),
+            &vector.timestamp,
+            &vector.nonce,
+            vector.body.as_bytes(),
+        );
+        let headers = signed_headers("web2", &vector.timestamp, &vector.nonce, &sig);
+        let err = authorize(
+            &headers,
+            vector.body.as_bytes(),
+            &rotated,
+            &InternalFlags::from_map(&HashMap::new()),
+            true,
+            true,
+            SKEW_SECONDS,
+            now_ms / 1000,
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+        )
+        .expect_err("rotation must not reset global replay memory");
+        assert_eq!(err.code, ErrorCode::Replayed);
+    }
+
+    #[test]
+    fn bind_guard_checks_mapped_ipv6_and_private_range_edges() {
+        // Expanded mapped forms exercise the IPv6 parser's mapped-v4 path,
+        // rather than the normalizer's dotted-v4 prefix stripping.
+        for host in [
+            "0:0:0:0:0:ffff:ac10:1",
+            "[0:0:0:0:0:ffff:c0a8:1]",
+            "172.16.0.1",
+            "172.31.255.254",
+            "100.64.0.1",
+            "100.127.255.254",
+            "febf::1",
+        ] {
+            assert!(assert_private_bind(host).is_ok(), "{host}");
+        }
+        for host in [
+            "::ffff:808:808",
+            "[::ffff:0:0]",
+            "0:0:0:0:0:ffff:808:808",
+            "[0:0:0:0:0:ffff:0:0]",
+            "172.15.255.254",
+            "172.32.0.1",
+            "100.63.255.254",
+            "100.128.0.1",
+            "fec0::1",
+            "ff02::1",
+            "10.0.0.1:8080",
+        ] {
+            assert!(assert_private_bind(host).is_err(), "{host}");
         }
     }
 

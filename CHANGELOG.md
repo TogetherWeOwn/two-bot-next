@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Self-role domain and storage:** framework-free button/select/reaction plans,
+  configuration and live-role safety validation, hierarchy refusals, and
+  legacy-compatible audit/panel tables (migration 0200). Shared event and
+  exclusive-panel leases support renewal, expiry recovery, immutable mutation
+  intent, fencing, and atomic audit/target settlement. Lease checks use database
+  wall time after lock waits; recovery preserves cumulative attempted/compensated
+  evidence. Generated events have cross-worker tie-breakers, and controls enforce
+  UTF-16 and Discord size limits. The isolated Postgres lease regression test
+  runs in CI and gates the required `check` job.
+  Runtime router/REST wiring remains deferred; this does not enable Discord
+  role mutations.
+- Wire `/feed-add`, `/feed-remove` and `/feed-list` through the same command runtime, router and REST executor as sticky commands. Defer ephemerally before guild-scoped CRUD and audit writes, preserve the invoking channel, and publish the complete gated command registry on Ready. Isolated Postgres and mock REST acceptance cover feed commands and sticky coexistence; announcements remain off by default, with no fetching, polling or relay posts.
+- Wire `/sticky` and `/sticky-remove` through the shared interaction router and drive accepted-message re-posts through the shared REST executor. The runtime claims one re-post window atomically per burst, validates and records the replacement id before retiring the previous sticky (best-effort), releases the claim and audits `post_failed` on REST failure, and deletes an orphaned replacement when the claim moved on. Commands defer ephemerally before I/O and edit the original reply; refusals are limited to owned sticky commands. `TWO_AUTOMATIONS` gates both surfaces; ManageGuild is required, and `/sticky` validates a 1–2000 UTF-16 body with a 1–300 s debounce (default 5 s). Covered by isolated Postgres and mock REST acceptance tests.
+- Add the audit mirror delivery service over the shared REST executor: record-before-deliver, private guild-fenced destinations, enforced nonce/mention suppression, kill-switch enforcement, crash-safe marker reconciliation and quarantine. Revalidate prepared ownership after shared transport pacing, preserve interrupted dedup adoption evidence, treat malformed history as uncertain, and run service fault-injection regressions in CI. Runtime wiring and activation remain deferred.
+- Add the pinned-address HTTPS feed connector (`feeds_connector`). `fetch_feed` validates the source through `feeds_http`, resolves all A/AAAA answers once, pins them into a `PublicRequest`, and dials only those addresses through a per-request hyper/rustls client whose resolver answers only the pinned host. TLS SNI, certificate verification and the Host header keep the URL hostname; every redirect hop re-validates and re-pins under a three-hop, same-host, HTTPS-only budget, one 15 s total deadline, `Owen/1.0 (+https://two.gg)` identity, and compressed-then-decompressed `MAX_FEED_BYTES` bounds before XML parsing. Injected resolver/connector seams keep every test hermetic; the private-fixture constructor exists only under `#[cfg(test)]`.
+
 - Add a durable channel-mutation lane that blocks different request keys after
   ambiguous outcomes, plus atomic claim completion, audit insertion and confirmed
   unlock recovery cleanup (migration 0123).
@@ -16,6 +32,12 @@
 
 ### Fixed
 
+- Answer published but unwired commands ephemerally instead of timing out, preserving the existing router refusals and complete registry. Synchronize the registry on resumed process startup as well as Ready, without blocking gateway polling.
+- Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
+- Grant the least-privilege runtime role CRUD on the self-role audit and panel-claim relations (migration 0200), cover 0200 in the role-matrix tests, and prove runtime claim access with continued web-reader denial.
+- Record late result/compensation evidence for superseded self-role events under their still-current token/generation without reopening settlement or panel publication, with regression coverage.
+- Reject the guild @everyone role as a self-role mutation target during catalogue validation and unconditionally at dispatch.
+- Hold self-role claim fencing tokens in `Secret` so derived `Debug` redacts them; the raw value is exposed only at the SQL fencing comparisons.
 - Align channel/member shared audit and idempotency timestamps with an additive,
   row-preserving migration and explicit SQL timestamp casts (migration 0124).
 
@@ -67,6 +89,7 @@
 - Port join-burst detection, join-risk scoring and mention-suppressed staff alert proposals to the Rust domain core, with occurrence/processing clock boundaries and mock acceptance. No gateway, durable store, alert delivery or anti-nuke activation is added.
 - Port game/session picker decisions, legacy/session/anchor welcome modes, rules-gate prompt eligibility and mention-free session goodbyes to the Rust domain core. Preserve legacy funnel rows with a sqlx prompt guard, migration 0190 and isolated agent-testdb/mock delivery tests. Runtime router/REST wiring remains a follow-up.
 - Port sticky-message domain logic, debounce claims and PostgreSQL persistence, with a legacy timestamp upgrade and UTF-16-compatible body limits. Discord command and REST wiring remains in the S4 integration slices.
+- Feed command and polling plans, bounded RSS/YouTube/Twitch XML parsing, public-IP/redirect fetch policy, and guild-scoped, fenced delivery storage with crash-reconciliation outcomes. Runtime transport wiring remains default-off pending the shared router and REST executor.
 - RSVP domain logic and database store for going, interested and declined responses, namespaced attendance totals, and ManageEvents-gated host check-in facts, with legacy-compatible tables and replies.
 - Port website-contract counter, rank and scheduled-events domain logic and transactional storage, with legacy-shaped read views. Runtime job wiring remains deferred.
 - Port the guild-settings catalogue, 15-second poll contract, cache, sqlx store, and migration to Rust. Runtime ticker and interaction integration remain follow-up work.

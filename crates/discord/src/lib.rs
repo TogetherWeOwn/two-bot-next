@@ -6,9 +6,12 @@
 //! without a gateway connection.
 
 pub mod adapter;
+pub mod audit_mirror;
+pub mod channel_access;
 #[cfg(feature = "db")]
 pub mod channel_moderation;
 pub mod executor;
+mod executor_metrics;
 
 #[cfg(feature = "db")]
 pub use channel_moderation::{
@@ -17,6 +20,8 @@ pub use channel_moderation::{
 };
 pub mod intents;
 pub mod interactions;
+pub mod internal_actions;
+mod message_safety;
 pub mod pipeline;
 
 pub use adapter::event_to_core;
