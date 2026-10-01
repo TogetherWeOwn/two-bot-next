@@ -125,6 +125,10 @@ impl PgMemberModerationStore {
     // Either direction of unresolved HTTP mutation fences this member. A
     // late DELETE can undo a new PUT; a late PUT can outlive a newer expiry.
     // Generations order local ownership, not unfinished remote effects.
+    // This is a read-only fence query: a failure here precedes any write
+    // for the request, so it is classified mutation-free (safe to release a
+    // newly claimed key). Ambiguous commits and post-dispatch failures keep
+    // their fenced classification at their own sites.
     async fn refuse_uncertain_effects(
         executor: impl sqlx::Executor<'_, Database = Postgres>,
         guild: &str,
@@ -144,7 +148,7 @@ impl PgMemberModerationStore {
         .bind(user)
         .fetch_one(executor)
         .await
-        .map_err(db_error)?;
+        .map_err(rolled_back_error)?;
         if uncertain {
             return Err(StoreError::rolled_back(
                 "member has an uncertain ban or unban; resolve it before banning",
@@ -350,7 +354,10 @@ impl MemberModerationStore for PgMemberModerationStore {
         now: &str,
     ) -> Result<(), StoreError> {
         self.ensure_guild(guild)?;
-        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        // No transaction, intent, schedule or dispatch exists yet: a
+        // begin failure is provably mutation-free, so the new key may be
+        // released. Ambiguous commits stay fenced at their own site below.
+        let mut tx = self.pool.begin().await.map_err(rolled_back_error)?;
         Self::refuse_uncertain_effects(&mut *tx, &self.guild_id, user).await?;
         // A fresh intent that survives the fence must itself fence; every
         // staging path owns the member queue, so the check-then-insert is
@@ -431,7 +438,9 @@ impl MemberModerationStore for PgMemberModerationStore {
         now: &str,
     ) -> Result<(), StoreError> {
         self.ensure_guild(guild)?;
-        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        // As in `stage_ban`: no transaction, intent, schedule or dispatch
+        // exists yet, so a begin failure is provably mutation-free.
+        let mut tx = self.pool.begin().await.map_err(rolled_back_error)?;
         Self::refuse_uncertain_effects(&mut *tx, &self.guild_id, user).await?;
         // As in `stage_ban`: `prepare` failures precede any write for this
         // request, so the rolled-back transaction stays mutation-free.
