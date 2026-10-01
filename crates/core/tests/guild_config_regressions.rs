@@ -12,12 +12,12 @@ use two_bot_core::backup::{
 
 fn snapshot() -> Map<String, Value> {
     serde_json::from_value(json!({
-        "version": 1, "guildId": "g", "guild": {
+        "version": 1, "guildId": "1545644954272137297", "guild": {
             "name": "Guild", "system_channel_id": null, "rules_channel_id": null,
             "public_updates_channel_id": null, "afk_channel_id": null
         },
         "roles": [
-            {"id": "g", "name": "@everyone", "managed": false, "permissions": "0", "position": 0},
+            {"id": "1545644954272137297", "name": "@everyone", "managed": false, "permissions": "0", "position": 0},
             {"id": "r1", "name": "Member", "managed": false, "permissions": "0", "position": 1}
         ],
         "channels": [
@@ -106,9 +106,9 @@ async fn write(
         state.next_id += 1;
         let id = format!("created-{}", state.next_id);
         let field = match path {
-            "/guilds/g/roles" => "roles",
-            "/guilds/g/channels" => "channels",
-            "/guilds/g/emojis" => "emojis",
+            "/guilds/1545644954272137297/roles" => "roles",
+            "/guilds/1545644954272137297/channels" => "channels",
+            "/guilds/1545644954272137297/emojis" => "emojis",
             _ => panic!("unexpected POST {path}"),
         };
         let mut created = body;
@@ -125,10 +125,12 @@ async fn write(
         state.snapshot[field].as_array_mut().unwrap().push(created);
         return response(json!({"id": id}));
     }
-    if path == "/guilds/g" {
+    if path == "/guilds/1545644954272137297" {
         let guild = state.snapshot.get_mut("guild").unwrap();
         merge(guild, &body);
-    } else if path == "/guilds/g/roles" || path == "/guilds/g/channels" {
+    } else if path == "/guilds/1545644954272137297/roles"
+        || path == "/guilds/1545644954272137297/channels"
+    {
         let field = if path.ends_with("roles") {
             "roles"
         } else {
@@ -144,11 +146,12 @@ async fn write(
             merge(target, position);
         }
     } else {
-        let (field, id) = if let Some(id) = path.strip_prefix("/guilds/g/roles/") {
+        let (field, id) = if let Some(id) = path.strip_prefix("/guilds/1545644954272137297/roles/")
+        {
             ("roles", id)
         } else if let Some(id) = path.strip_prefix("/channels/") {
             ("channels", id)
-        } else if let Some(id) = path.strip_prefix("/guilds/g/emojis/") {
+        } else if let Some(id) = path.strip_prefix("/guilds/1545644954272137297/emojis/") {
             ("emojis", id)
         } else {
             panic!("unexpected PATCH {path}");
@@ -183,7 +186,7 @@ async fn fake(live: Map<String, Value>) -> FakeDiscord {
         Some(&base),
         "not-a-token".into(),
         "bot".into(),
-        "g".into(),
+        "1545644954272137297".into(),
     )
     .unwrap();
     FakeDiscord { api, state, task }
@@ -229,7 +232,7 @@ async fn duplicate_surviving_role_names_preserve_membership_identity() {
     let mut live = source.clone();
     live["roles"][1]["permissions"] = json!("1");
     let plan = converge(&source, live).await;
-    assert_eq!(paths(&plan), ["/guilds/g/roles/r1"]);
+    assert_eq!(paths(&plan), ["/guilds/1545644954272137297/roles/r1"]);
 }
 
 #[tokio::test]
@@ -245,7 +248,13 @@ async fn renamed_and_swapped_roles_patch_their_surviving_ids() {
     let plan = converge(&source, live).await;
     assert_eq!(plan.known_ids.roles["r1"], "r1");
     assert_eq!(plan.known_ids.roles["r2"], "r2");
-    assert_eq!(paths(&plan), ["/guilds/g/roles/r1", "/guilds/g/roles/r2"]);
+    assert_eq!(
+        paths(&plan),
+        [
+            "/guilds/1545644954272137297/roles/r1",
+            "/guilds/1545644954272137297/roles/r2"
+        ]
+    );
 }
 
 #[test]
@@ -444,7 +453,10 @@ async fn everyone_permission_drift_converges_without_creation_or_position() {
     assert_eq!(plan.operations.len(), 1);
     let op = &plan.operations[0];
     assert_eq!(op.method, "PATCH");
-    assert_eq!(paths(&plan), ["/guilds/g/roles/g"]);
+    assert_eq!(
+        paths(&plan),
+        ["/guilds/1545644954272137297/roles/1545644954272137297"]
+    );
     assert_eq!(op.body, json!({"permissions": "0"}));
     assert!(op.capture_id.is_none());
 }
@@ -459,7 +471,7 @@ fn literal_role_member_and_everyone_overwrite_sets_are_idempotent_and_order_inde
     let overwrites = json!([
         {"id": "r1", "type": 0, "allow": "1024", "deny": "0"},
         {"id": "member1", "type": 1, "allow": "0", "deny": "2048"},
-        {"id": "g", "type": 0, "allow": "0", "deny": "1024"}
+        {"id": "1545644954272137297", "type": 0, "allow": "0", "deny": "1024"}
     ]);
     for channel in source["channels"].as_array_mut().unwrap() {
         channel["permission_overwrites"] = overwrites.clone();
@@ -630,6 +642,225 @@ async fn assert_refused_without_writes(
 }
 
 #[tokio::test]
+async fn malformed_snapshot_structure_refuses_before_any_write() {
+    use two_bot_core::backup::guild_config::{seal_snapshot, verify_snapshot_integrity};
+
+    let cases = [
+        ("/roles", json!({}), "roles"),
+        ("/channels", json!(null), "channels"),
+        ("/emojis", json!(false), "emojis"),
+        ("/roles/1", json!("private-fixture-marker"), "roles[1]"),
+        ("/channels/1", json!(null), "channels[1]"),
+        ("/emojis", json!([42]), "emojis[0]"),
+        ("/guild", json!([]), "guild"),
+        (
+            "/channels/0/permission_overwrites",
+            json!({}),
+            "permission_overwrites",
+        ),
+        (
+            "/channels/0/permission_overwrites",
+            json!([null]),
+            "permission_overwrites[0]",
+        ),
+    ];
+    for sealed in [false, true] {
+        for (pointer, value, defect) in &cases {
+            let mut source = Value::Object(snapshot());
+            *source.pointer_mut(pointer).unwrap() = value.clone();
+            let source = source.as_object().unwrap().clone();
+            let source = if sealed {
+                seal_snapshot(source)
+            } else {
+                source
+            };
+            if sealed {
+                verify_snapshot_integrity(&source).unwrap();
+            }
+            let mut live = snapshot();
+            live["roles"][1]["permissions"] = json!("1");
+            let err = plan_restore(&source, &live).unwrap_err();
+            assert!(!err.0.contains("private-fixture-marker"));
+            assert_refused_without_writes(source, live, defect).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_guild_identity_refuses_even_when_both_inputs_match() {
+    use two_bot_core::backup::guild_config::seal_snapshot;
+
+    for invalid in [
+        json!(null),
+        json!(42),
+        json!(""),
+        json!(" "),
+        json!("g"),
+        json!("0"),
+        json!("-1"),
+        json!("1/roles"),
+        json!("18446744073709551616"),
+    ] {
+        for target_only in [false, true] {
+            let mut source = snapshot();
+            let mut live = source.clone();
+            live["guildId"] = invalid.clone();
+            if !target_only {
+                source["guildId"] = invalid.clone();
+            }
+            let defect = if target_only {
+                "Target.guildId"
+            } else {
+                "Snapshot.guildId"
+            };
+            assert_refused_without_writes(seal_snapshot(source), live, defect).await;
+        }
+    }
+    let mut source = snapshot();
+    source.remove("guildId");
+    let mut live = source.clone();
+    live["roles"][1]["permissions"] = json!("1");
+    assert_refused_without_writes(source, live, "Snapshot.guildId").await;
+}
+
+#[tokio::test]
+async fn malformed_resource_fields_and_live_shapes_refuse_before_any_write() {
+    for (pointer, invalid) in [
+        ("/roles/1/id", json!("")),
+        ("/roles/1/name", json!(false)),
+        ("/roles/1/managed", json!("false")),
+        ("/roles/1/position", json!("1")),
+        ("/channels/0/id", json!(null)),
+        ("/channels/0/type", json!("0")),
+        ("/channels/0/type", json!(-1)),
+        ("/channels/0/parent_id", json!(42)),
+        ("/guild/system_channel_id", json!(false)),
+        (
+            "/channels/0/permission_overwrites",
+            json!([{"id": "r1", "type": 2, "allow": "0", "deny": "0"}]),
+        ),
+    ] {
+        for target_only in [false, true] {
+            let mut malformed = Value::Object(snapshot());
+            *malformed.pointer_mut(pointer).unwrap() = invalid.clone();
+            let malformed = malformed.as_object().unwrap().clone();
+            let (source, live) = if target_only {
+                (snapshot(), malformed)
+            } else {
+                (malformed, snapshot())
+            };
+            let prefix = if target_only { "Target." } else { "Snapshot." };
+            assert_refused_without_writes(source, live, prefix).await;
+        }
+    }
+    for roles in [json!({}), json!([null]), json!([""])] {
+        let mut source = snapshot();
+        source["emojis"] = json!([{"id": "e1", "name": "wave", "managed": true, "roles": roles}]);
+        assert_refused_without_writes(source, snapshot(), "emojis[0].roles").await;
+    }
+}
+
+#[tokio::test]
+async fn legacy_and_sealed_masks_and_additive_fields_still_restore() {
+    use two_bot_core::backup::guild_config::seal_snapshot;
+
+    for sealed in [false, true] {
+        let mut source = snapshot();
+        source.insert("futureMetadata".into(), json!({"opaque": [false, null]}));
+        source["roles"][1]["futureRoleField"] = json!({"x": 1});
+        source["channels"][0]["futureChannelField"] = json!(true);
+        source["channels"][0]["permission_overwrites"] = json!([
+            {"id": "1545644954272137297", "type": 0, "allow": "0", "deny": "1024", "futureField": null},
+            {"id": "member", "type": 1, "allow": "18446744073709551616", "deny": "340282366920938463463374607431768211455"}
+        ]);
+        // Omitted optional legacy lists retain the empty/default interpretation.
+        source.remove("emojis");
+        source["channels"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("permission_overwrites");
+        let mut live = source.clone();
+        live["roles"][1]["permissions"] = json!("1");
+        live["channels"][0]["permission_overwrites"] = json!([]);
+        let source = if sealed {
+            seal_snapshot(source)
+        } else {
+            source
+        };
+        let plan = plan_restore(&source, &live).unwrap();
+        let overwrite = plan
+            .operations
+            .iter()
+            .find(|op| op.label == "restore overwrites alpha")
+            .unwrap();
+        assert_eq!(
+            overwrite.body["permission_overwrites"][1]["allow"],
+            "18446744073709551616"
+        );
+        let mut fake = fake(live).await;
+        apply_restore_plan(&mut fake.api, &plan).await.unwrap();
+        assert_eq!(fake.api.writes as usize, plan.operations.len());
+    }
+    let minimal = serde_json::from_value(json!({
+        "guildId": "1545644954272137297", "guild": {
+            "system_channel_id": null, "rules_channel_id": null,
+            "public_updates_channel_id": null, "afk_channel_id": null
+        }
+    }))
+    .unwrap();
+    assert_eq!(
+        plan_restore(&minimal, &minimal).unwrap().counts.operations,
+        0
+    );
+}
+
+#[tokio::test]
+async fn malformed_overwrite_fields_refuse_before_any_write() {
+    use two_bot_core::backup::guild_config::seal_snapshot;
+
+    for (field, invalid) in [
+        ("id", json!(null)),
+        ("id", json!("")),
+        ("id", json!(42)),
+        ("type", json!(null)),
+        ("type", json!("0")),
+        ("type", json!(2)),
+        ("type", json!(-1)),
+        ("type", json!(0.5)),
+        ("type", json!(true)),
+        ("allow", json!(null)),
+        ("allow", json!(0)),
+        ("allow", json!("")),
+        ("allow", json!("-1")),
+        ("allow", json!("+1")),
+        ("allow", json!(" 1")),
+        ("allow", json!("1.5")),
+        ("allow", json!("0x400")),
+        ("allow", json!("340282366920938463463374607431768211456")),
+        ("deny", json!("secret-fixture-marker")),
+    ] {
+        for missing in [false, true] {
+            let mut source = snapshot();
+            let mut overwrite =
+                json!({"id": "1545644954272137297", "type": 0, "allow": "1024", "deny": "0"});
+            if missing {
+                overwrite.as_object_mut().unwrap().remove(field);
+            } else {
+                overwrite[field] = invalid.clone();
+            }
+            source["channels"][0]["permission_overwrites"] = json!([overwrite]);
+            let source = seal_snapshot(source);
+            let mut live = snapshot();
+            live["roles"][1]["permissions"] = json!("1");
+            let defect = format!("channels[0].permission_overwrites[0].{field}");
+            let err = plan_restore(&source, &live).unwrap_err();
+            assert!(!err.0.contains("secret-fixture-marker"));
+            assert_refused_without_writes(source, live, &defect).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn missing_managed_and_unknown_overwrite_roles_refuse_before_member_patch() {
     for managed in [false, true] {
         let mut source = snapshot();
@@ -720,7 +951,7 @@ async fn supplied_plan_with_invalid_later_dependency_refuses_before_first_write(
         assert_eq!(plan.operations[0].label, "patch role Member");
         plan.operations.push(RestoreOperation {
             label: "bad later operation".into(), method: "PATCH".into(),
-            path: if bad_path { RestorePath::Channel("ghost".into()) } else { RestorePath::Literal("/guilds/g".into()) },
+            path: if bad_path { RestorePath::Channel("ghost".into()) } else { RestorePath::Literal("/guilds/1545644954272137297".into()) },
             body: json!({"system_channel_id": {"restoreReference": "channel", "sourceId": "ghost"}}),
             capture_id: None,
         });
@@ -775,7 +1006,7 @@ async fn ordered_new_role_category_channel_settings_and_emoji_dependencies_resol
         .iter()
         .find(|(method, path, body)| {
             method == "POST"
-                && path == "/guilds/g/channels"
+                && path == "/guilds/1545644954272137297/channels"
                 && body.get("name").and_then(Value::as_str) == Some("alpha")
         })
         .map(|(_, _, body)| body)
@@ -804,7 +1035,7 @@ async fn unsupported_create_capture_refuses_before_an_earlier_valid_patch() {
     let mut plan = plan_restore(&source, &live).unwrap();
     assert_eq!(plan.operations[0].label, "patch role Member");
     assert_eq!(plan.operations[1].label, "create role New");
-    plan.operations[1].path = RestorePath::Literal("/guilds/g/emojis".into());
+    plan.operations[1].path = RestorePath::Literal("/guilds/1545644954272137297/emojis".into());
     let mut fake = fake(live).await;
     assert!(apply_restore_plan(&mut fake.api, &plan)
         .await
@@ -828,7 +1059,7 @@ async fn malformed_or_unsupported_public_references_refuse_before_any_write() {
         plan.operations.push(RestoreOperation {
             label: "bad reference".into(),
             method: "PATCH".into(),
-            path: RestorePath::Literal("/guilds/g".into()),
+            path: RestorePath::Literal("/guilds/1545644954272137297".into()),
             body: json!({"system_channel_id": reference}),
             capture_id: None,
         });

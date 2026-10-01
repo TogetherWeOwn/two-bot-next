@@ -177,6 +177,162 @@ fn channel_core_body(channel: &Map<String, Value>, parent_id: Value) -> Value {
     Value::Object(body)
 }
 
+fn shape_error(path: &str, expected: &str) -> RestorePlanError {
+    RestorePlanError(format!("{path} must be {expected}."))
+}
+
+fn nonempty_string(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn decimal_mask(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|s| {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u128>().is_ok()
+    })
+}
+
+fn validate_guild_id<'a>(
+    input: &'a Map<String, Value>,
+    label: &str,
+) -> Result<&'a str, RestorePlanError> {
+    let id = input.get("guildId").and_then(Value::as_str).filter(|s| {
+        !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && s.parse::<u64>().is_ok_and(|id| id != 0)
+    });
+    id.ok_or_else(|| {
+        shape_error(
+            &format!("{label}.guildId"),
+            "a nonzero decimal guild ID string",
+        )
+    })
+}
+
+// A valid seal proves integrity, not shape. Validate both inputs before the
+// forgiving legacy accessors can turn malformed data into empty/default values.
+// Absent optional collections retain their legacy meaning; present ones must
+// have the documented shape. Unknown additive fields are intentionally ignored.
+fn validate_input_shape(input: &Map<String, Value>, label: &str) -> Result<(), RestorePlanError> {
+    let guild = input
+        .get("guild")
+        .and_then(Value::as_object)
+        .ok_or_else(|| shape_error(&format!("{label}.guild"), "an object"))?;
+    for field in GUILD_CONFIG_FIELDS
+        .iter()
+        .filter(|f| f.ends_with("_channel_id"))
+    {
+        if let Some(value) = guild.get(*field) {
+            if !value.is_null() && !nonempty_string(Some(value)) {
+                return Err(shape_error(
+                    &format!("{label}.guild.{field}"),
+                    "null or a nonempty ID string",
+                ));
+            }
+        }
+    }
+    for collection in ["roles", "channels", "emojis"] {
+        let Some(value) = input.get(collection) else {
+            continue;
+        };
+        let rows = value
+            .as_array()
+            .ok_or_else(|| shape_error(&format!("{label}.{collection}"), "an array"))?;
+        for (index, value) in rows.iter().enumerate() {
+            let path = format!("{label}.{collection}[{index}]");
+            let row = value
+                .as_object()
+                .ok_or_else(|| shape_error(&path, "an object"))?;
+            if !nonempty_string(row.get("id")) {
+                return Err(shape_error(&format!("{path}.id"), "a nonempty ID string"));
+            }
+            // Discord can return a null name for unavailable managed emojis.
+            if collection != "emojis" && !nonempty_string(row.get("name")) {
+                return Err(shape_error(&format!("{path}.name"), "a nonempty string"));
+            }
+            for field in ["managed", "hoist", "mentionable"] {
+                if let Some(value) = row.get(field) {
+                    if !value.is_boolean() {
+                        return Err(shape_error(&format!("{path}.{field}"), "a boolean"));
+                    }
+                }
+            }
+            if let Some(value) = row.get("position") {
+                if value.as_i64().is_none() {
+                    return Err(shape_error(&format!("{path}.position"), "an integer"));
+                }
+            }
+            if collection == "channels" {
+                if !row
+                    .get("type")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|t| t >= 0)
+                {
+                    return Err(shape_error(
+                        &format!("{path}.type"),
+                        "a nonnegative integer",
+                    ));
+                }
+                if let Some(value) = row.get("parent_id") {
+                    if !value.is_null() && !nonempty_string(Some(value)) {
+                        return Err(shape_error(
+                            &format!("{path}.parent_id"),
+                            "null or a nonempty ID string",
+                        ));
+                    }
+                }
+                if let Some(value) = row.get("permission_overwrites") {
+                    let path = format!("{path}.permission_overwrites");
+                    let overwrites = value
+                        .as_array()
+                        .ok_or_else(|| shape_error(&path, "an array"))?;
+                    for (index, value) in overwrites.iter().enumerate() {
+                        let path = format!("{path}[{index}]");
+                        let overwrite = value
+                            .as_object()
+                            .ok_or_else(|| shape_error(&path, "an object"))?;
+                        if !nonempty_string(overwrite.get("id")) {
+                            return Err(shape_error(&format!("{path}.id"), "a nonempty ID string"));
+                        }
+                        if !matches!(overwrite.get("type").and_then(Value::as_i64), Some(0 | 1)) {
+                            return Err(shape_error(
+                                &format!("{path}.type"),
+                                "integer 0 (role) or 1 (member)",
+                            ));
+                        }
+                        for field in ["allow", "deny"] {
+                            if !decimal_mask(overwrite.get(field)) {
+                                return Err(shape_error(
+                                    &format!("{path}.{field}"),
+                                    "an unsigned decimal permission mask string",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if collection == "emojis" {
+                if let Some(value) = row.get("roles") {
+                    let path = format!("{path}.roles");
+                    let roles = value
+                        .as_array()
+                        .ok_or_else(|| shape_error(&path, "an array"))?;
+                    for (index, value) in roles.iter().enumerate() {
+                        if !nonempty_string(Some(value)) {
+                            return Err(shape_error(
+                                &format!("{path}[{index}]"),
+                                "a nonempty role ID string",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Diff a snapshot against the live guild. Refuses guild mismatch, ambiguous
 /// duplicate channels, references to unknown roles, and unrestorable emoji —
 /// before any write, so a bad plan is a refusal, not a half-applied restore.
@@ -185,13 +341,15 @@ pub fn plan_restore(
     current: &Map<String, Value>,
 ) -> Result<RestorePlan, RestorePlanError> {
     let fail = |m: String| RestorePlanError(m);
-    let snapshot_guild = str_field(snapshot, "guildId");
-    let current_guild = str_field(current, "guildId");
+    let snapshot_guild = validate_guild_id(snapshot, "Snapshot")?;
+    let current_guild = validate_guild_id(current, "Target")?;
     if snapshot_guild != current_guild {
         return Err(fail(format!(
             "Snapshot guild {snapshot_guild} does not match target guild {current_guild}."
         )));
     }
+    validate_input_shape(snapshot, "Snapshot")?;
+    validate_input_shape(current, "Target")?;
     let current_guild_owned = current_guild.to_owned();
 
     let mut role_ids: BTreeMap<String, String> =
