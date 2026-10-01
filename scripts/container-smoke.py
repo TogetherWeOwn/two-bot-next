@@ -12,7 +12,9 @@ import uuid
 
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
-BINARY_MAX_BYTES = 10 * MIB
+# Raised from 10 MiB: the durable store runtime plus the ticket runtime from main
+# measured 10.01 MiB under opt-level z/LTO/strip; image budget unchanged.
+BINARY_MAX_BYTES = 11 * MIB
 BINARY = "/home/two-bot/two-bot"
 CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
