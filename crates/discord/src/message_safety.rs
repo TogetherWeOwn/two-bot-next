@@ -55,31 +55,12 @@ pub(crate) fn sanitize_message(body: &mut Value) {
                 }
             }
             for key in ["title", "description"] {
-                if embed
-                    .get(key)
-                    .is_some_and(|value| value.as_str() == Some(""))
-                {
+                if embed.get(key).is_some() && !nonempty(embed, key) {
                     embed.as_object_mut().expect("embed object").remove(key);
                 }
             }
         }
-        embeds.retain(|embed| {
-            [
-                "title",
-                "description",
-                "author",
-                "footer",
-                "image",
-                "thumbnail",
-                "fields",
-            ]
-            .iter()
-            .any(|key| match embed.get(key) {
-                Some(Value::Array(values)) => !values.is_empty(),
-                Some(Value::Null) | None => false,
-                Some(_) => true,
-            })
-        });
+        embeds.retain(has_embed_payload);
     }
 }
 
@@ -108,17 +89,44 @@ fn nonempty(value: &Value, key: &str) -> bool {
     value
         .get(key)
         .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty())
+}
+
+fn has_text(value: &Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(Value::as_str)
         .is_some_and(text::has_message_text)
+}
+
+// Placeholder labels are structurally valid; sendability belongs to the whole
+// embed, not each label/value. Wholly invisible embeds still supply no payload.
+fn has_embed_payload(embed: &Value) -> bool {
+    has_text(embed, "title")
+        || has_text(embed, "description")
+        || embed
+            .get("author")
+            .is_some_and(|author| has_text(author, "name"))
+        || embed
+            .get("footer")
+            .is_some_and(|footer| has_text(footer, "text"))
+        || embed
+            .get("fields")
+            .and_then(Value::as_array)
+            .is_some_and(|fields| {
+                fields
+                    .iter()
+                    .any(|field| has_text(field, "name") || has_text(field, "value"))
+            })
+        || ["image", "thumbnail"]
+            .iter()
+            .any(|key| embed.get(key).is_some_and(Value::is_object))
 }
 
 fn bound_text(value: &mut Value, key: &str, limit: usize, remaining: &mut usize) {
     if let Some(field) = value.get_mut(key) {
         if let Some(raw) = field.as_str() {
-            let mut bounded =
-                text::truncate(&text::neutralize_mentions(raw), limit.min(*remaining));
-            if !text::has_message_text(&bounded) {
-                bounded.clear();
-            }
+            let bounded = text::truncate(&text::neutralize_mentions(raw), limit.min(*remaining));
             *remaining -= text::text_len(&bounded);
             *field = Value::String(bounded);
         }
@@ -285,6 +293,30 @@ mod tests {
             }
         }
         assert!(total <= text::EMBED_TOTAL_LIMIT);
+        let safe = body.clone();
+        sanitize_message(&mut body);
+        assert_eq!(body, safe);
+    }
+
+    #[test]
+    fn placeholder_field_names_consume_budget_without_losing_visible_values() {
+        let mut body = json!({"embeds": [{
+            "title": "界".repeat(256),
+            "description": "界".repeat(4096),
+            "footer": {"text": "界".repeat(1646)},
+            "fields": [{"name": "\u{200b}", "value": "界".repeat(10)}],
+        }]});
+        sanitize_message(&mut body);
+        let field = &body["embeds"][0]["fields"][0];
+        assert_eq!(field["name"], "\u{200b}");
+        assert_eq!(field["value"], "界");
+        let total = 256
+            + 4096
+            + 1646
+            + text::text_len(field["name"].as_str().unwrap())
+            + text::text_len(field["value"].as_str().unwrap());
+        assert_eq!(total, text::EMBED_TOTAL_LIMIT);
+        assert!(validate_create(&body).is_ok());
         let safe = body.clone();
         sanitize_message(&mut body);
         assert_eq!(body, safe);

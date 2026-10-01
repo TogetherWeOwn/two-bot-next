@@ -264,6 +264,59 @@ async fn embeds_deferred_callbacks_and_clearing_edits_remain_valid() {
 }
 
 #[tokio::test]
+async fn placeholder_embed_labels_preserve_visible_values_on_create_and_update() {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let exec = ActionExecutor::with_proxy("fixture-token".to_owned(), Some(mock.origin())).unwrap();
+    for kind in [4, 7] {
+        let response: InteractionResponse = serde_json::from_value(json!({
+            "type": kind,
+            "data": {"embeds": [{"type": "rich", "fields": [
+                {"name": "\u{200b}", "value": "Important result", "inline": false},
+                {"name": "@everyone", "value": "\u{200b}", "inline": false},
+            ]}]},
+        }))
+        .unwrap();
+        exec.answer_interaction(5555, "fixture-interaction-token", &response)
+            .await
+            .unwrap();
+    }
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    for (request, kind) in requests.iter().zip([4, 7]) {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["type"], kind);
+        assert_safe(&body["data"]);
+        let fields = body["data"]["embeds"][0]["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0]["name"], "\u{200b}");
+        assert_eq!(fields[0]["value"], "Important result");
+        assert_eq!(fields[1]["name"], "@\u{200b}everyone");
+        assert_eq!(fields[1]["value"], "\u{200b}");
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn invisible_only_embed_fields_do_not_supply_a_create_payload() {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let exec = ActionExecutor::with_proxy("fixture-token".to_owned(), Some(mock.origin())).unwrap();
+    let response: InteractionResponse = serde_json::from_value(json!({
+        "type": 4,
+        "data": {"embeds": [{"type": "rich", "fields": [
+            {"name": "\u{200b}", "value": "\u{200b}", "inline": false},
+        ]}]},
+    }))
+    .unwrap();
+    assert!(matches!(
+        exec.answer_interaction(5555, "fixture-interaction-token", &response)
+            .await,
+        Err(DiscordError::Rejected(_))
+    ));
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn meaningful_unicode_is_preserved_at_create_and_edit_boundaries() {
     let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "99"}))).await;
     let exec = ActionExecutor::with_proxy("fixture-token".to_owned(), Some(mock.origin())).unwrap();
