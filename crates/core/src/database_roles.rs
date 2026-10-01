@@ -45,9 +45,10 @@ mod tests {
     }
 
     #[test]
-    fn matrix_covers_every_migrated_table_and_contract_view() {
-        // A new table/view must be deliberately included rather than silently
-        // receiving wildcard permissions. No database connection is needed.
+    fn matrix_covers_every_migrated_object_and_contract_view() {
+        // New tables, sequences and trigger functions must be deliberately
+        // included rather than silently receiving wildcard permissions.
+        // No database connection is needed.
         for migration in [
             include_str!("../../cutover/migrations/0001_funnel.sql"),
             include_str!("../../cutover/migrations/0002_leveling.sql"),
@@ -60,6 +61,10 @@ mod tests {
             include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
             include_str!("../../cutover/migrations/0320_gateway_sessions.sql"),
             include_str!("../../cutover/migrations/0330_guild_settings.sql"),
+            include_str!("../../cutover/migrations/0331_guild_settings_versions.sql"),
+            include_str!("../../cutover/migrations/0332_guild_settings_allocator.sql"),
+            include_str!("../../cutover/migrations/0333_guild_settings_revision.sql"),
+            include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
             include_str!("../../cutover/migrations/0340_operational_audit.sql"),
             include_str!("../../cutover/migrations/0350_internal_actions.sql"),
         ] {
@@ -70,6 +75,13 @@ mod tests {
                     let name = rest.split_whitespace().next().unwrap();
                     assert!(MATRIX.contains(&format!("'public', '{name}', 'table'")));
                     table = Some(name);
+                } else if let Some(rest) = line.strip_prefix("CREATE SEQUENCE ") {
+                    let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+                    let name = rest.split_whitespace().next().unwrap();
+                    assert!(MATRIX.contains(&format!("'public', '{name}', 'sequence'")));
+                } else if let Some(rest) = line.strip_prefix("CREATE OR REPLACE FUNCTION ") {
+                    let name = rest.split_whitespace().next().unwrap();
+                    assert!(MATRIX.contains(&format!("'public', '{name}', 'function'")));
                 } else {
                     let mut words = line.split_whitespace();
                     if let (Some(column), Some("BIGSERIAL" | "SERIAL" | "SMALLSERIAL")) =
