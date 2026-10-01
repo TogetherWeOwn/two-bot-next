@@ -658,8 +658,15 @@ async fn unknown_command_replies_ephemerally_without_other_effects() {
         reply["data"]["content"],
         two_bot_core::router::replies::UNKNOWN_INTERACTION_REPLY
     );
-    assert_eq!(reply["data"]["allowed_mentions"]["parse"], serde_json::json!([]));
-    assert_eq!(mock.requests().len(), 1, "only the unknown-command callback");
+    assert_eq!(
+        reply["data"]["allowed_mentions"]["parse"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "only the unknown-command callback"
+    );
     mock.shutdown().await;
 }
 
