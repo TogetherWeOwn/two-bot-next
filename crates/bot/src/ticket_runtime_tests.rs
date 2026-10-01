@@ -34,6 +34,17 @@ fn message(id: u64) -> Value {
     })
 }
 
+#[test]
+fn ordinary_messages_without_optional_components_do_not_block_panel_ensure() {
+    let messages = panels(vec![
+        json!({"author":{"id":"500"},"content":"ordinary message"}),
+    ])
+    .ok()
+    .expect("ordinary Discord message");
+    assert!(panel_needed("400", &messages));
+    assert!(panels(vec![json!({"author":{"id":"500"},"components":{}})]).is_err());
+}
+
 #[tokio::test]
 async fn ticket_history_fetches_all_pages_and_keeps_attachments_and_total_count() {
     let first: Vec<_> = (901..=1000).rev().map(message).collect();

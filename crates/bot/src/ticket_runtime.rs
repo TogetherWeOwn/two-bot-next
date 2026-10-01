@@ -798,10 +798,11 @@ fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
                 .ok_or(Failure::InvalidEvidence)?
                 .to_owned();
             let mut custom_ids = Vec::new();
-            for row in message["components"]
-                .as_array()
-                .ok_or(Failure::InvalidEvidence)?
-            {
+            let rows = match message.get("components") {
+                None => &[][..],
+                Some(value) => value.as_array().ok_or(Failure::InvalidEvidence)?.as_slice(),
+            };
+            for row in rows {
                 for button in row["components"]
                     .as_array()
                     .ok_or(Failure::InvalidEvidence)?
@@ -826,3 +827,7 @@ mod tests;
 #[cfg(test)]
 #[path = "ticket_timer_tests.rs"]
 mod timer_tests;
+
+#[cfg(test)]
+#[path = "ticket_acceptance_tests.rs"]
+mod acceptance_tests;

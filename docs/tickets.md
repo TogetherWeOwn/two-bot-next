@@ -2,7 +2,7 @@
 
 The merged domain/store supplies `two_bot_core::tickets`, `two_bot_cutover::tickets::TicketStore`, and migration `0210_tickets.sql`. The runtime-integration draft adds `bot::ticket_runtime` to the **existing** S4 `CommandRuntime` router/executor composition: exact button IDs, guild/member authorization, deferred ephemeral replies, lifecycle orchestration, panel/control ensure, and Ready recovery/purge. All ticket REST verbs live on the shared `ActionExecutor`; there is no private dispatcher or HTTP client. Temporary voice rooms are unrelated and unchanged.
 
-**Draft checkpoint, not accepted runtime parity:** periodic 300-second recovery / 3,600-second purge supervision and managed shutdown are implemented; combined PostgreSQL/mock-Discord lifecycle acceptance remains unfinished. Mock and paused-clock test definitions cover channel metadata, permission preservation, controlled mentions, typed absence, single-attempt creation, complete pagination, partial-history rejection, the UTF-16 cap, panel idempotency, Ready/timer cadence, nonoverlap, timeout cancellation and shutdown, but compiling verification has not run locally: the bounded Cargo wrapper refused the missing pool. Independent exact-head security/code review and green CI are still required before merge. No deployment, staging/live execution, ownership transfer or soak acceptance is claimed; those holds remain separate.
+**Draft checkpoint, not accepted runtime parity:** periodic 300-second recovery / 3,600-second purge supervision and managed shutdown are implemented. Combined PostgreSQL/shared-mock test definitions now cover routed lifecycle replies, races, pagination, transaction-before-delete ordering, partial/failed capture, uncertain creation, failed cleanup, Ready ensure/purge, restart reconciliation and member erasure; execution and acceptance remain unverified. Mock and paused-clock test definitions cover channel metadata, permission preservation, controlled mentions, typed absence, single-attempt creation, complete pagination, partial-history rejection, the UTF-16 cap, panel idempotency, Ready/timer cadence, nonoverlap, timeout cancellation and shutdown, but compiling verification has not run locally: the bounded Cargo wrapper refused the missing pool. Independent exact-head security/code review and green CI are still required before merge. No deployment, staging/live execution, ownership transfer or soak acceptance is claimed; those holds remain separate.
 
 ## Verified legacy sources
 
@@ -41,7 +41,7 @@ cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- clippy -p two-bot-cutover --all-targets --locked -- -D warnings
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --locked tickets::
 python3 scripts/cargo_cache.py run -- test -p two-bot-discord --locked --test ticket_executor
-python3 scripts/cargo_cache.py run -- test -p two-bot --locked --bin two-bot ticket_runtime::
+python3 scripts/cargo_cache.py run -- test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored
 python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --locked --test tickets_store -- --ignored
 ```
 

@@ -214,6 +214,30 @@ impl CommandRuntime {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_tickets(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        tickets: Arc<crate::ticket_runtime::TicketRuntime>,
+    ) -> Arc<Self> {
+        let router = InteractionRouter::new(RouterGates {
+            configured_guild: Some(100),
+            tickets: true,
+            scorecard: false,
+            automations: false,
+            announcements: false,
+            moderation: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        });
+        let mut runtime = Self::new(pool, executor, router, 100, false);
+        Arc::get_mut(&mut runtime)
+            .expect("unshared test runtime")
+            .tickets = Some(tickets);
+        runtime
+    }
+
     pub(crate) fn start_tickets(&self) -> Option<crate::ticket_runtime::TicketSupervisor> {
         self.tickets.as_ref().and_then(|tickets| tickets.start())
     }
