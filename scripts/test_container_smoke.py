@@ -1,6 +1,8 @@
 """Offline fixtures for the container gate; no Docker or Cargo needed."""
 
 import contextlib
+import gzip
+import hashlib
 import importlib.util
 import io
 import json
@@ -8,6 +10,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -17,11 +20,15 @@ spec = importlib.util.spec_from_file_location("container_smoke", Path(__file__).
 smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 
+from docker_image_size import archive_image_bytes, image_bytes
+
 
 class DockerFixture:
     def __init__(self):
         self.calls = []
         self.image_size = 110 * smoke.MIB
+        self.daemon_size = 140 * smoke.MIB
+        self.image_id = "sha256:" + "a" * 64
         self.binary_size = 7 * smoke.MIB
         self.user = "two-bot"
         self.health_command = ["CMD", smoke.BINARY, "--healthcheck"]
@@ -42,7 +49,8 @@ class DockerFixture:
         output = ""
         code = 0
         if args[:2] == ("image", "inspect"):
-            output = json.dumps([{"Size": self.image_size, "Config": {
+            output = json.dumps([{"Id": self.image_id, "Size": self.daemon_size,
+                                  "FixtureLayerBytes": self.image_size, "Config": {
                 "User": self.user, "Healthcheck": {"Test": self.health_command},
             }}])
         elif args[0] == "run" and "stat" in args:
@@ -129,6 +137,203 @@ class RedirectReadyzHandler(BaseHTTPRequestHandler):
             json_reply(self, 200, b'{"status": "ok"}')
 
 
+def tar_bytes(objects):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w") as archive:
+        for path, body in objects:
+            member = tarfile.TarInfo(path)
+            member.size = len(body)
+            archive.addfile(member, io.BytesIO(body))
+    return output.getvalue()
+
+
+def image_archive_fixture(compressed=False, shared=False, oci=False):
+    lower = tar_bytes([("removed.txt", b"lower-layer content" * 1000)])
+    upper = tar_bytes([(".wh.removed.txt", b""), ("binary", b"runtime")])
+    layers = [lower, upper, lower] if shared else [lower, upper]
+    diff_ids = ["sha256:" + hashlib.sha256(layer).hexdigest() for layer in layers]
+    config = json.dumps({"os": "linux", "architecture": "amd64",
+                         "rootfs": {"type": "layers", "diff_ids": diff_ids}}).encode()
+    config_digest = hashlib.sha256(config).hexdigest()
+    config_path = "blobs/sha256/" + config_digest if oci else config_digest + ".json"
+    objects = {}
+    paths = []
+    for i, layer in enumerate(layers):
+        encoded = gzip.compress(layer, mtime=0) if compressed else layer
+        path = "blobs/sha256/" + hashlib.sha256(encoded).hexdigest() if oci else f"layer{i}/layer.tar"
+        objects[path] = encoded
+        paths.append(path)
+    objects[config_path] = config
+    objects["manifest.json"] = json.dumps([{"Config": config_path, "Layers": paths}]).encode()
+    metadata = {"Id": "sha256:" + config_digest, "Os": "linux", "Architecture": "amd64",
+                "RootFS": {"Type": "layers", "Layers": diff_ids}}
+    return objects, metadata, len(lower) + len(upper)
+
+
+class ImageArchiveTests(unittest.TestCase):
+    def measure(self, objects, metadata):
+        return archive_image_bytes(io.BytesIO(tar_bytes(list(objects.items()))), metadata)
+
+    def test_plain_and_gzip_layouts_count_unique_uncompressed_layers(self):
+        for compressed in (False, True):
+            for oci in (False, True):
+                for shared in (False, True):
+                    with self.subTest(compressed=compressed, oci=oci, shared=shared):
+                        objects, metadata, expected = image_archive_fixture(compressed, shared, oci)
+                        self.assertEqual(self.measure(objects, metadata), expected)
+                        self.assertGreater(expected, len(objects["manifest.json"]))
+
+    def test_whiteout_does_not_remove_lower_layer_bytes(self):
+        objects, metadata, expected = image_archive_fixture()
+        upper = objects["layer1/layer.tar"]
+        self.assertGreater(expected, len(upper))
+        self.assertEqual(self.measure(objects, metadata), expected)
+
+    def test_missing_layer_is_refused(self):
+        objects, metadata, _ = image_archive_fixture()
+        del objects["layer0/layer.tar"]
+        with self.assertRaisesRegex(RuntimeError, "missing image layer"):
+            self.measure(objects, metadata)
+
+    def test_changed_layer_bytes_are_refused(self):
+        objects, metadata, _ = image_archive_fixture()
+        objects["layer0/layer.tar"] += b"changed"
+        with self.assertRaisesRegex(RuntimeError, "layer digest mismatch"):
+            self.measure(objects, metadata)
+
+    def test_descriptor_digest_mismatch_is_refused(self):
+        objects, metadata, _ = image_archive_fixture(True, oci=True)
+        path = next(iter(objects))
+        objects["blobs/sha256/" + "0" * 64] = objects.pop(path)
+        with self.assertRaisesRegex(RuntimeError, "descriptor digest mismatch"):
+            self.measure(objects, metadata)
+
+    def test_wrong_config_image_platform_and_rootfs_are_refused(self):
+        for key, value, error in (
+            ("Id", "sha256:" + "0" * 64, "config digest mismatch"),
+            ("Architecture", "arm64", "platform mismatch"),
+            ("RootFS", {"Type": "layers", "Layers": []}, "inspected image layer mismatch"),
+        ):
+            with self.subTest(key=key):
+                objects, metadata, _ = image_archive_fixture()
+                metadata[key] = value
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self.measure(objects, metadata)
+
+    def test_missing_and_ambiguous_manifests_are_refused(self):
+        for manifest in (None, [], [{}, {}], [None]):
+            with self.subTest(manifest=manifest):
+                objects, metadata, _ = image_archive_fixture()
+                if manifest is None:
+                    del objects["manifest.json"]
+                else:
+                    objects["manifest.json"] = json.dumps(manifest).encode()
+                with self.assertRaisesRegex(RuntimeError, "manifest"):
+                    self.measure(objects, metadata)
+
+    def test_missing_config_is_refused(self):
+        objects, metadata, _ = image_archive_fixture()
+        path = json.loads(objects["manifest.json"])[0]["Config"]
+        del objects[path]
+        with self.assertRaisesRegex(RuntimeError, "missing image config"):
+            self.measure(objects, metadata)
+
+    def test_invalid_metadata_is_refused(self):
+        objects, metadata, _ = image_archive_fixture()
+        objects["manifest.json"] = b"invalid JSON"
+        with self.assertRaises(ValueError):
+            self.measure(objects, metadata)
+
+    def test_complete_members_without_tar_terminator_are_refused(self):
+        objects, metadata, _ = image_archive_fixture()
+        # Also exercise a final payload whose own tar terminator is all zero:
+        # those bytes cannot substitute for the outer archive's terminator.
+        entries = list(objects.items())
+        entries.append(("extra/layer.tar", objects["layer0/layer.tar"]))
+        for members in (list(objects.items()), entries):
+            with self.subTest(extra_layer=len(members) > len(objects)):
+                data = tar_bytes(members)
+                content_end = sum(512 + ((len(body) + 511) // 512) * 512 for _, body in members)
+                with self.assertRaisesRegex(RuntimeError, "truncated image archive"):
+                    archive_image_bytes(io.BytesIO(data[:content_end]), metadata)
+
+    def test_failed_decode_kills_and_reaps_export(self):
+        objects, metadata, _ = image_archive_fixture()
+        process = unittest.mock.Mock()
+        process.stdout = io.BytesIO(b"not an archive")
+        process.poll.return_value = None
+        with patch("docker_image_size.subprocess.Popen", return_value=process), \
+                patch("docker_image_size.threading.Timer") as timer:
+            with self.assertRaisesRegex(RuntimeError, "invalid Docker image archive"):
+                image_bytes(metadata)
+        process.kill.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5)
+        timer.return_value.cancel.assert_called_once()
+        self.assertTrue(process.stdout.closed)
+
+    def test_duplicate_objects_are_refused(self):
+        objects, metadata, _ = image_archive_fixture()
+        entries = list(objects.items()) + [("manifest.json", objects["manifest.json"])]
+        with self.assertRaisesRegex(RuntimeError, "duplicate image archive object"):
+            archive_image_bytes(io.BytesIO(tar_bytes(entries)), metadata)
+
+    def test_truncated_archive_and_gzip_are_refused(self):
+        objects, metadata, _ = image_archive_fixture(True)
+        archive = tar_bytes(list(objects.items()))
+        with self.assertRaises((RuntimeError, tarfile.TarError)):
+            archive_image_bytes(io.BytesIO(archive[:1000]), metadata)
+        objects["layer0/layer.tar"] = objects["layer0/layer.tar"][:-4]
+        with self.assertRaises((EOFError, OSError)):
+            self.measure(objects, metadata)
+
+    def test_unsafe_paths_and_symlinks_are_refused(self):
+        objects, metadata, _ = image_archive_fixture()
+        objects["../escape"] = b"no extraction"
+        with self.assertRaisesRegex(RuntimeError, "unsafe image archive path"):
+            self.measure(objects, metadata)
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            link = tarfile.TarInfo("manifest.json")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "/other"
+            archive.addfile(link)
+        with self.assertRaisesRegex(RuntimeError, "unsupported image archive object"):
+            archive_image_bytes(io.BytesIO(output.getvalue()), metadata)
+
+    def test_metadata_and_decompression_are_bounded(self):
+        objects, metadata, _ = image_archive_fixture(True)
+        with patch("docker_image_size.ARCHIVE_MAX_BYTES", 1024):
+            with self.assertRaisesRegex(RuntimeError, "measurement bound"):
+                self.measure(objects, metadata)
+        archive = tar_bytes(list(objects.items()))
+        with patch("docker_image_size.ARCHIVE_MAX_BYTES", len(archive)):
+            with self.assertRaisesRegex(RuntimeError, "uncompressed image exceeds measurement bound"):
+                archive_image_bytes(io.BytesIO(archive), metadata)
+        with patch("docker_image_size.METADATA_MAX_BYTES", 2):
+            with self.assertRaisesRegex(RuntimeError, "oversized image metadata"):
+                self.measure(objects, metadata)
+
+    def test_export_is_pinned_and_cleaned_up_even_on_failure(self):
+        objects, metadata, expected = image_archive_fixture(True, oci=True)
+        for code in (0, 1):
+            with self.subTest(code=code):
+                process = unittest.mock.Mock()
+                process.stdout = io.BytesIO(tar_bytes(list(objects.items())))
+                process.wait.return_value = code
+                process.poll.return_value = code
+                with patch("docker_image_size.subprocess.Popen", return_value=process) as launch, \
+                        patch("docker_image_size.threading.Timer") as timer:
+                    if code == 0:
+                        self.assertEqual(image_bytes(metadata), expected)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "export failed"):
+                            image_bytes(metadata)
+                self.assertEqual(launch.call_args.args[0], ["docker", "image", "save", metadata["Id"]])
+                self.assertEqual(timer.call_args.args[0], 120)
+                timer.return_value.cancel.assert_called_once()
+                self.assertTrue(process.stdout.closed)
+
+
 class HttpHelperTests(unittest.TestCase):
     def tearDown(self):
         FlakyHealthHandler.unanswered = True
@@ -184,6 +389,7 @@ class ContainerSmokeTests(unittest.TestCase):
             http_patcher = patch.object(
                 smoke, "http_response", side_effect=lambda url: self.http(url))
         with patch.object(smoke, "docker", self.fixture), \
+                patch.object(smoke, "image_bytes", side_effect=lambda metadata: metadata["FixtureLayerBytes"]), \
                 http_patcher, \
                 patch.object(smoke.time, "monotonic", side_effect=self.tick), \
                 patch.object(smoke.time, "sleep"), \
@@ -205,11 +411,20 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assertEqual(args[:2], ("rm", "--force"))
         run = next(args for args, _ in self.fixture.calls if "--detach" in args)
         self.assertIn("256m", run)
+        self.assertIn(self.fixture.image_id, run)
         self.assertIn("127.0.0.1::8080", run)
         self.assertNotIn("-e", run)
         self.assertNotIn("--env-file", run)
         wait = next(kwargs for args, kwargs in self.fixture.calls if args[0] == "wait")
         self.assertLessEqual(wait["timeout"], 10)
+
+    def test_measurement_failure_never_falls_back_to_daemon_size(self):
+        self.fixture.daemon_size = 1
+        with patch.object(smoke, "docker", self.fixture), \
+                patch.object(smoke, "image_bytes", side_effect=RuntimeError("invalid archive")):
+            with self.assertRaisesRegex(RuntimeError, "invalid archive"):
+                smoke.smoke("two-bot:fixture")
+        self.assertFalse(any(args[0] == "run" for args, _ in self.fixture.calls))
 
     def test_image_budget_is_enforced_before_runtime_start(self):
         self.assert_rejected("image exceeds size budget", image_max_bytes=1)

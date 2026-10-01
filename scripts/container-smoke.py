@@ -10,6 +10,8 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
+from docker_image_size import image_bytes
+
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
 BINARY_MAX_BYTES = 10 * MIB
@@ -60,7 +62,9 @@ def http_response(url):
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
     metadata = json.loads(docker("image", "inspect", image).stdout)[0]
-    image_bytes = metadata["Size"]
+    image = metadata["Id"]
+    measured_image_bytes = image_bytes(metadata)
+    report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")
     # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
     # orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex
@@ -73,11 +77,11 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     finally:
         docker("rm", "--force", measure, check=False)
     for label, size, limit in (
-        ("image (uncompressed Docker Size)", image_bytes, image_max_bytes),
+        ("image (unique uncompressed layer tar bytes)", measured_image_bytes, image_max_bytes),
         ("release binary", binary_bytes, binary_max_bytes),
     ):
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")
-    require(image_bytes <= image_max_bytes, "image exceeds size budget")
+    require(measured_image_bytes <= image_max_bytes, "image exceeds size budget")
     require(binary_bytes <= binary_max_bytes, "release binary exceeds size budget")
     config = metadata["Config"]
     require(config.get("User") not in (None, "", "root", "0", "0:0"), "image must specify a non-root user")
