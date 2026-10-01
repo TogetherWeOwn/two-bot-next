@@ -2,9 +2,11 @@
 //!
 //! Ports `src/discord/rest.ts` onto twilight-http. Semantics preserved: a
 //! 110ms pacing floor between requests (Discord allows 50/s globally; the
-//! tools use far less), 403/404 → `None` (an unreadable channel is a normal
-//! condition, not an abort), 429 backs off, 5xx retries with exponential
-//! backoff (≤4 attempts). `requests` counts calls so each run reports its
+//! tools use far less), 403/404 are unreadable (not an abort), 429 backs
+//! off, 5xx retries with exponential backoff (four retries). History scans
+//! retain partial pages and an explicit completion reason; other callers
+//! keep their legacy `None` on unreadable/exhausted pages.
+//! `requests` counts calls so each run reports its
 //! own Discord cost.
 //!
 //! `proxy_url` overrides the API host (twilight's `ClientBuilder::proxy`,
@@ -99,20 +101,19 @@ impl RestClient {
     // twilight surfaces the Discord `retry-after` via the ratelimiter, which
     // the tools bypass for one-shot pacing; 429s wait 1s + 250ms.
 
-    /// Classify a request error: `RetryKind::GiveUpNone` for 403/404 and
-    /// 5xx past the attempt budget, `RetryKind::Sleep` to retry after the
-    /// delay, `RetryKind::Fail` for anything else.
+    /// Classify a request error without confusing an unreadable/exhausted
+    /// page with a successfully read empty page.
     fn classify(&self, kind: &ErrorType, attempt: u32) -> RetryKind {
         match kind {
             ErrorType::Response { status, .. } => {
                 let code = status.get();
                 if code == 403 || code == 404 {
-                    RetryKind::GiveUpNone
+                    RetryKind::GiveUp(ScanCompletion::Unreadable)
                 } else if code == 429 {
                     RetryKind::Sleep(Duration::from_millis(1250))
                 } else if code >= 500 {
                     if attempt >= 4 {
-                        RetryKind::GiveUpNone
+                        RetryKind::GiveUp(ScanCompletion::RetryExhausted)
                     } else {
                         RetryKind::Sleep(backoff_duration(attempt))
                     }
@@ -133,7 +134,7 @@ impl RestClient {
     /// Run one list request with legacy retry semantics. `make` builds the
     /// twilight request builder each attempt (builders are consumed by
     /// `IntoFuture`, so they cannot be reused across retries).
-    async fn exec_list<T, F, Fut>(&self, make: F) -> Result<Option<Vec<T>>, RestError>
+    async fn exec_list<T, F, Fut>(&self, make: F) -> Result<ListPage<T>, RestError>
     where
         // `Unpin` is satisfied by every concrete twilight model; the bound
         // exists because `ModelFuture` awaits the deserialized value by value.
@@ -151,13 +152,13 @@ impl RestClient {
             self.pace().await;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
             match make().await {
-                Ok(resp) => return Ok(Some(resp.models().await?)),
+                Ok(resp) => return Ok(ListPage::Read(resp.models().await?)),
                 Err(e) => match self.classify(e.kind(), attempt) {
                     RetryKind::Sleep(delay) => {
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                     }
-                    RetryKind::GiveUpNone => return Ok(None),
+                    RetryKind::GiveUp(reason) => return Ok(ListPage::Interrupted(reason)),
                     RetryKind::Fail => return Err(RestError::Twilight(e)),
                 },
             }
@@ -182,7 +183,7 @@ impl RestClient {
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                     }
-                    RetryKind::GiveUpNone => return Ok(None),
+                    RetryKind::GiveUp(_) => return Ok(None),
                     RetryKind::Fail => return Err(RestError::Twilight(e)),
                 },
             }
@@ -199,7 +200,7 @@ impl RestClient {
         let mut out = Vec::new();
         let mut after: Option<Id<UserMarker>> = None;
         loop {
-            let page: Option<Vec<Member>> = self
+            let page: ListPage<Member> = self
                 .exec_list(|| {
                     let client = &self.inner.client;
                     let mut req = client.guild_members(guild_id).limit(1000);
@@ -209,7 +210,7 @@ impl RestClient {
                     async move { req.await }
                 })
                 .await?;
-            let Some(batch) = page else {
+            let ListPage::Read(batch) = page else {
                 return Ok(None);
             };
             if batch.is_empty() {
@@ -236,6 +237,7 @@ impl RestClient {
             async move { client.guild_invites(guild_id).await }
         })
         .await
+        .map(ListPage::into_option)
     }
 
     /// Guild channels (backfill candidate scan / message-ladder targets).
@@ -248,6 +250,7 @@ impl RestClient {
             async move { client.guild_channels(guild_id).await }
         })
         .await
+        .map(ListPage::into_option)
     }
 
     /// Guild fetch (vanity-URL presence for attribution).
@@ -296,40 +299,27 @@ impl RestClient {
         let mut messages: Vec<Message> = Vec::new();
         let mut before: Option<Id<MessageMarker>> = None;
         let mut pages = 0usize;
-        let mut truncated = false;
-
-        loop {
+        let completion = loop {
             if pages >= max_pages {
-                truncated = true;
-                break;
+                break ScanCompletion::PageCap;
             }
-            let batch: Option<Vec<Message>> = match before {
-                Some(b) => {
-                    self.exec_list(|| {
-                        let client = &self.inner.client;
-                        async move {
-                            client
-                                .channel_messages(channel_id)
-                                .limit(100)
-                                .before(b)
-                                .await
-                        }
-                    })
-                    .await?
-                }
-                None => {
-                    self.exec_list(|| {
-                        let client = &self.inner.client;
-                        async move { client.channel_messages(channel_id).limit(100).await }
-                    })
-                    .await?
-                }
-            };
-            let Some(batch) = batch else {
-                break;
+            let page = self
+                .exec_list(|| {
+                    let mut req = self.inner.client.channel_messages(channel_id).limit(100);
+                    if let Some(b) = before {
+                        req = req.before(b);
+                    }
+                    async move { req.await }
+                })
+                .await;
+            let batch: Vec<Message> = match page {
+                Ok(ListPage::Read(batch)) => batch,
+                Ok(ListPage::Interrupted(reason)) => break reason,
+                Err(RestError::Body(_)) => break ScanCompletion::InvalidResponse,
+                Err(RestError::Twilight(_)) => break ScanCompletion::RequestFailed,
             };
             if batch.is_empty() {
-                break;
+                break ScanCompletion::EndOfHistory;
             }
             pages += 1;
             let short = batch.len() < 100;
@@ -340,16 +330,21 @@ impl RestClient {
                     .is_some_and(|m| timestamp_ms(&m.timestamp) < bound)
             });
             messages.extend(batch);
-            if short || past_stop {
-                break;
+            // A short page proves history ended, even if it also crosses the bound.
+            if short {
+                break ScanCompletion::EndOfHistory;
             }
-        }
+            if past_stop {
+                break ScanCompletion::TimeBoundary;
+            }
+        };
 
         let scanned_back_to = messages.last().map(|m| m.timestamp.iso_8601().to_string());
         Ok(ScanPage {
             messages,
             scanned_back_to,
-            truncated,
+            truncated: completion == ScanCompletion::PageCap,
+            completion,
         })
     }
 }
@@ -357,8 +352,24 @@ impl RestClient {
 /// Retry outcome for one failed attempt.
 enum RetryKind {
     Sleep(Duration),
-    GiveUpNone,
+    GiveUp(ScanCompletion),
     Fail,
+}
+
+/// A failed list page is not an empty list. Non-history callers retain their
+/// legacy optional result at the boundary, not inside the retry executor.
+enum ListPage<T> {
+    Read(Vec<T>),
+    Interrupted(ScanCompletion),
+}
+
+impl<T> ListPage<T> {
+    fn into_option(self) -> Option<Vec<T>> {
+        match self {
+            Self::Read(batch) => Some(batch),
+            Self::Interrupted(_) => None,
+        }
+    }
 }
 
 fn backoff_duration(attempt: u32) -> Duration {
@@ -379,10 +390,49 @@ pub fn timestamp_ms(ts: &twilight_model::util::datetime::Timestamp) -> i64 {
     ts.as_micros() / 1000
 }
 
-/// One channel walk outcome (legacy `ScanResult`).
+/// Why a history walk stopped. A time boundary completes the requested window,
+/// not necessarily the entire history; a page cap or interruption is incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScanCompletion {
+    EndOfHistory,
+    TimeBoundary,
+    PageCap,
+    Unreadable,
+    RetryExhausted,
+    RequestFailed,
+    InvalidResponse,
+}
+
+impl ScanCompletion {
+    #[must_use]
+    pub fn interrupted(self) -> bool {
+        matches!(
+            self,
+            Self::Unreadable | Self::RetryExhausted | Self::RequestFailed | Self::InvalidResponse
+        )
+    }
+}
+
+impl std::fmt::Display for ScanCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EndOfHistory => "end-of-history",
+            Self::TimeBoundary => "time-boundary",
+            Self::PageCap => "page-cap",
+            Self::Unreadable => "unreadable",
+            Self::RetryExhausted => "retry-exhausted",
+            Self::RequestFailed => "request-failed",
+            Self::InvalidResponse => "invalid-response",
+        })
+    }
+}
+
+/// One channel walk outcome (legacy `ScanResult` plus explicit completion).
 #[derive(Debug, Clone)]
 pub struct ScanPage {
     pub messages: Vec<Message>,
     pub scanned_back_to: Option<String>,
+    /// Legacy page-cap flag only; interruptions are described by `completion`.
     pub truncated: bool,
+    pub completion: ScanCompletion,
 }
