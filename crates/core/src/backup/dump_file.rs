@@ -36,11 +36,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-/// Everything the bot owns. The website's own tables are not ours to back up.
-///
-/// The moderation tables are here because losing them is not cosmetic: a lost
-/// scheduled unban is a tempban that became permanent, and a lost warn ledger
-/// is a moderation history the staff cannot see (TOG-1659 High 5).
+/// Durable bot-owned tables, parents before children. The first 22 names are
+/// frozen v3 coverage; append new tables after that prefix. Tables retired from
+/// the Rust migration set remain supported when present on a legacy target.
+/// The bot-owned website-contract backing tables ARE included; derived views
+/// and the website service's own database are not application data here.
 pub const DUMP_TABLES: &[&str] = &[
     "events",
     "members",
@@ -64,6 +64,67 @@ pub const DUMP_TABLES: &[&str] = &[
     "automod_processed_messages",
     "self_role_audit",
     "self_role_panel_claims",
+    "member_levels",
+    "xp_awards",
+    "level_role_rewards",
+    "level_import_runs",
+    "event_rsvps",
+    "announcements_audit_log",
+    "community_facts",
+    "lfg_posts",
+    "lfg_roles",
+    "lfg_signups",
+    "feed_relays",
+    "feed_deliveries",
+    "web_contract_meta",
+    "guild_counters",
+    "rank_ladder",
+    "rank_snapshots",
+    "member_ranks",
+    "scheduled_events",
+    "counter_snapshots",
+    "member_exclusions",
+    "presence_probe",
+    "community_stream_heartbeats",
+    "community_scorecard_runs",
+    "community_scorecard_alerts",
+    "gateway_sessions",
+    "guild_settings_revision",
+    "guild_settings",
+    "guild_settings_audit",
+    "audit_kill_switch",
+    "internal_nonces",
+    "internal_idempotency",
+    "internal_action_log",
+    "internal_discord_events",
+];
+
+/// Frozen v3 tables no longer created by cutover migrations. Keep their data
+/// when they exist, but do not require nonexistent legacy subsystems on Rust.
+pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
+    "moderation_warnings",
+    "moderation_scheduled_unbans",
+    "containment_events",
+    "containment_incidents",
+    "join_risk_flags",
+    "automation_commands",
+    "scheduled_messages",
+    "tickets",
+    "ticket_transcripts",
+    "automod_violations",
+    "automod_processed_messages",
+];
+
+/// Explicit migrated-schema exclusions, checked by the schema coverage test.
+pub const EXCLUDED_TABLES: &[&str] = &[
+    // Short-lived XP award throttles, not XP totals/history. Never replay a
+    // pre-restore cooldown into a recovered process.
+    "xp_cooldowns",
+    // Migration ledgers describe target DDL; replacing them would falsely mark
+    // unapplied migrations as applied. Legacy schema_migrations is diagnostic
+    // manifest metadata only, never restored application data.
+    "_sqlx_migrations",
+    "schema_migrations",
 ];
 
 /// Write the complete-schema envelope; the reader also accepts frozen v3.
@@ -110,6 +171,7 @@ impl DumpManifest {
         DUMP_TABLES
             .iter()
             .copied()
+            .filter(|name| !OPTIONAL_LEGACY_TABLES.contains(name))
             .filter(|name| !self.tables.iter().any(|t| t.name == *name))
             .collect()
     }
@@ -704,6 +766,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
         .take(required)
+        .filter(|name| required == 22 || !OPTIONAL_LEGACY_TABLES.contains(name))
         .filter(|name| !names.contains(**name))
         .copied()
         .collect();
@@ -1056,6 +1119,18 @@ mod tests {
         .unwrap();
         let contents = inspect_bytes(&finish_gzip(enc).unwrap()).unwrap();
         assert_eq!(contents.rows, 2);
+        assert_eq!(contents.manifest.version, 3);
+        let legacy_names: std::collections::BTreeSet<_> = contents
+            .manifest
+            .tables
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(legacy_names, DUMP_TABLES.iter().take(22).copied().collect());
+        assert_eq!(
+            contents.manifest.missing_tables().len(),
+            DUMP_TABLES.len() - 22
+        );
         assert!(contents
             .manifest
             .tables
@@ -1070,6 +1145,29 @@ mod tests {
             contents.buffers["join_risk_flags"][0]["flagged"],
             serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn v3_requires_its_original_tables_but_v4_requires_complete_coverage() {
+        let legacy: Value = serde_json::from_str(
+            include_str!("../../tests/fixtures/legacy-v3-native.ndjson")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut missing_v3 = legacy.clone();
+        missing_v3["tables"].as_array_mut().unwrap().remove(0);
+        assert!(validate_manifest(&missing_v3)
+            .unwrap_err()
+            .to_string()
+            .contains("missing tables"));
+        let mut incomplete_v4 = legacy;
+        incomplete_v4["version"] = serde_json::json!(4);
+        assert!(validate_manifest(&incomplete_v4)
+            .unwrap_err()
+            .to_string()
+            .contains("missing tables"));
     }
 
     #[test]

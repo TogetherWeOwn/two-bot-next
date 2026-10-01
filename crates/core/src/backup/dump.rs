@@ -30,7 +30,7 @@ use thiserror::Error;
 
 use super::dump_file::{
     cell_input, inspect, is_dump_table, DumpContents, DumpError, DumpManifest, DumpTableInfo,
-    DumpWriter, DUMP_TABLES, DUMP_VERSION,
+    DumpWriter, DUMP_TABLES, DUMP_VERSION, OPTIONAL_LEGACY_TABLES,
 };
 use super::guild_config::unix_now_iso;
 
@@ -118,6 +118,59 @@ async fn count_of(
     Ok(row.0)
 }
 
+/// Restart transactionally rather than using setval (which survives rollback).
+/// Catalog identifiers are quoted by Postgres; restart values are checked i64s.
+/// https://www.postgresql.org/docs/16/sql-altersequence.html
+async fn restart_sequence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+    column: &str,
+    sequence: &str,
+) -> Result<(), DbDumpError> {
+    let (quoted_sequence, start, increment, min, max): (String, i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
+             s.seqstart, s.seqincrement, s.seqmin, s.seqmax \
+             FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE s.seqrelid = $1::regclass",
+        )
+        .bind(sequence)
+        .fetch_one(&mut **tx)
+        .await?;
+    let column = format!("\"{}\"", column.replace('"', "\"\""));
+    let aggregate = if increment > 0 { "MAX" } else { "MIN" };
+    let (edge,): (Option<i64>,) = sqlx::query_as(audited(format!(
+        "SELECT {aggregate}({column})::bigint FROM {table}"
+    )))
+    .fetch_one(&mut **tx)
+    .await?;
+    let next = match edge {
+        None => start,
+        Some(edge) => {
+            let next = edge.checked_add(increment).ok_or_else(|| {
+                DbDumpError::Refused(format!("{table}.{column}: restored sequence exhausted"))
+            })?;
+            if increment > 0 {
+                next.max(start)
+            } else {
+                next.min(start)
+            }
+        }
+    };
+    if !(min..=max).contains(&next) {
+        return Err(DbDumpError::Refused(format!(
+            "{table}.{column}: restored sequence exhausted"
+        )));
+    }
+    sqlx::query(audited(format!(
+        "ALTER SEQUENCE {quoted_sequence} RESTART WITH {next}"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Write every bot-owned table to `out_path` as one consistent snapshot.
 pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDumpError> {
     let mut tx = pool.begin().await?;
@@ -133,6 +186,9 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         }
         let cols = columns_of(&mut tx, name).await?;
         if cols.is_empty() {
+            if OPTIONAL_LEGACY_TABLES.contains(name) {
+                continue;
+            }
             return Err(DbDumpError::Refused(format!(
                 "table {name} does not exist in the target — run migrations first (S6 owns the schema)"
             )));
@@ -226,6 +282,8 @@ pub struct RestoreReport {
     pub manifest: DumpManifest,
     pub restored: BTreeMap<String, u64>,
     pub dropped_columns: BTreeMap<String, Vec<String>>,
+    /// Schema-required baseline rows initialized when absent from an old dump.
+    pub initialized_tables: BTreeMap<String, u64>,
     pub ok: bool,
 }
 
@@ -240,19 +298,77 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     let manifest = contents.manifest;
     let missing = manifest.missing_tables();
     if !missing.is_empty() {
-        tracing::warn!(version = manifest.version, tables = ?missing, "old dump lacks tables; restore leaves them empty");
+        tracing::warn!(version = manifest.version, tables = ?missing, "old dump lacks tables; restore clears them (settings revision singleton resets to zero)");
     }
     let mut dropped_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     let mut tx = pool.begin().await?;
-    // RESTART IDENTITY so the sequence does not carry over from whatever was
-    // in the target before; it is set explicitly below.
+    let mut target_tables = Vec::new();
+    for name in DUMP_TABLES {
+        if columns_of(&mut tx, name).await?.is_empty() {
+            let count = manifest
+                .tables
+                .iter()
+                .find(|t| t.name == *name)
+                .map_or(0, |t| t.count);
+            if !OPTIONAL_LEGACY_TABLES.contains(name) || count != 0 {
+                return Err(DbDumpError::Refused(format!(
+                    "table {name} is absent from target; refusing to lose {count} archived rows — provision the matching schema first"
+                )));
+            }
+        } else {
+            target_tables.push(*name);
+        }
+    }
+    // Lock before changing guards. Only two named application triggers are
+    // suspended, never FK/check constraints or session_replication_role. ALTER
+    // TABLE is transactional: error/cancellation rolls back data AND guards.
+    // https://www.postgresql.org/docs/16/sql-altertable.html
     sqlx::query(audited(format!(
-        "TRUNCATE {} RESTART IDENTITY",
-        DUMP_TABLES.join(", ")
+        "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+        target_tables.join(", ")
     )))
     .execute(&mut *tx)
     .await?;
+    let mut suspended = Vec::new();
+    for (table, trigger) in [
+        ("guild_settings", "trg_guild_settings_revision"),
+        (
+            "guild_settings_audit",
+            "trg_guild_settings_audit_append_only",
+        ),
+    ] {
+        let enabled: Option<(String,)> = sqlx::query_as(
+            "SELECT tgenabled::text FROM pg_trigger \
+             WHERE tgrelid = to_regclass($1) AND tgname = $2 AND NOT tgisinternal",
+        )
+        .bind(table)
+        .bind(trigger)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((state,)) = enabled {
+            sqlx::query(audited(format!(
+                "ALTER TABLE {table} DISABLE TRIGGER {trigger}"
+            )))
+            .execute(&mut *tx)
+            .await?;
+            suspended.push((table, trigger, state));
+        }
+    }
+    // A single explicit truncate covers all FK dependencies, without CASCADE
+    // touching foreign/website tables. RESTART IDENTITY is transactional.
+    sqlx::query(audited(format!(
+        "TRUNCATE {} RESTART IDENTITY",
+        target_tables.join(", ")
+    )))
+    .execute(&mut *tx)
+    .await?;
+    // Cooldowns are intentionally not archived; discard stale target throttles.
+    if !columns_of(&mut tx, "xp_cooldowns").await?.is_empty() {
+        sqlx::query("TRUNCATE xp_cooldowns")
+            .execute(&mut *tx)
+            .await?;
+    }
 
     // Never trust manifest order: a legacy or reordered file can put children
     // before parents. The same allowlist controls dump and restore FK order.
@@ -358,11 +474,43 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         }
     }
 
+    // v3 predates the required singleton. Clearing stale target data is not
+    // enough: settings writes would subsequently fail without this baseline.
+    // Never synthesize application settings/history or replace an archived row.
+    let mut initialized_tables = BTreeMap::new();
+    if missing.contains(&"guild_settings_revision") {
+        let columns = columns_of(&mut tx, "guild_settings_revision").await?;
+        if columns.iter().any(|(name, _)| name == "singleton")
+            && columns.iter().any(|(name, _)| name == "revision")
+        {
+            sqlx::query(
+                "INSERT INTO guild_settings_revision (singleton, revision) VALUES (TRUE, 0)",
+            )
+            .execute(&mut *tx)
+            .await?;
+            initialized_tables.insert("guild_settings_revision".to_owned(), 1);
+        }
+    }
+
+    for (table, trigger, state) in suspended {
+        let action = match state.as_str() {
+            "O" => "ENABLE",
+            "A" => "ENABLE ALWAYS",
+            "R" => "ENABLE REPLICA",
+            "D" => "DISABLE",
+            _ => return Err(DbDumpError::Refused("unknown trigger state".to_owned())),
+        };
+        sqlx::query(audited(format!(
+            "ALTER TABLE {table} {action} TRIGGER {trigger}"
+        )))
+        .execute(&mut *tx)
+        .await?;
+    }
+
     // Discover owned serial AND identity sequences, including columns not
-    // named `id`. Empty tables restart at 1 with is_called=false.
+    // named `id`. Empty tables restart at the target sequence's configured start.
     // https://www.postgresql.org/docs/16/functions-info.html
-    // https://www.postgresql.org/docs/16/functions-sequence.html
-    for table in DUMP_TABLES {
+    for table in &target_tables {
         let sequences: Vec<(String, String)> = sqlx::query_as(
             "SELECT column_name, pg_get_serial_sequence(\
              quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) \
@@ -375,21 +523,29 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         .fetch_all(&mut *tx)
         .await?;
         for (column, sequence) in sequences {
-            let column = format!("\"{}\"", column.replace('"', "\"\""));
-            sqlx::query(audited(format!(
-                "SELECT setval($1::regclass, GREATEST(COALESCE(MAX({column}), 1), 1), \
-                 MAX({column}) IS NOT NULL) FROM {table}"
-            )))
-            .bind(sequence)
-            .execute(&mut *tx)
-            .await?;
+            restart_sequence(&mut tx, table, &column, &sequence).await?;
         }
+    }
+    // Settings versions use a standalone sequence, not OWNED BY a column.
+    // Its allocation must also resume past restored versions.
+    let (has_settings_sequence,): (bool,) =
+        sqlx::query_as("SELECT to_regclass('guild_settings_version_seq') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await?;
+    if has_settings_sequence {
+        restart_sequence(
+            &mut tx,
+            "guild_settings",
+            "version",
+            "guild_settings_version_seq",
+        )
+        .await?;
     }
     tx.commit().await?;
 
     let mut restored = BTreeMap::new();
     let mut ok = true;
-    for table in DUMP_TABLES {
+    for table in &target_tables {
         let row: (i64,) = sqlx::query_as(audited(format!("SELECT COUNT(*) FROM {table}")))
             .fetch_one(pool)
             .await?;
@@ -398,7 +554,10 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             .tables
             .iter()
             .find(|t| t.name == *table)
-            .map_or(0, |t| t.count);
+            .map_or_else(
+                || initialized_tables.get(*table).copied().unwrap_or(0),
+                |t| t.count,
+            );
         if count != expected {
             ok = false;
         }
@@ -409,6 +568,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         manifest,
         restored,
         dropped_columns,
+        initialized_tables,
         ok,
     })
 }

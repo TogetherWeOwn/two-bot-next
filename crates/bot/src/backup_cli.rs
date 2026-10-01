@@ -441,6 +441,9 @@ async fn cmd_restore(args: &[String]) -> i32 {
                     if got == table.count { "ok" } else { "MISMATCH" }
                 );
             }
+            for (table, count) in &report.initialized_tables {
+                eprintln!("restore: WARNING: {table}: initialized {count} schema-required baseline row(s), not archived data");
+            }
             for (table, cols) in &report.dropped_columns {
                 eprintln!(
                     "restore: {table}: columns in the dump the target does not have: {}",
@@ -467,7 +470,7 @@ fn warn_missing_dump_tables(manifest: &dump_file::DumpManifest) {
     let missing = manifest.missing_tables();
     if !missing.is_empty() {
         eprintln!(
-            "restore: WARNING: v{} dump lacks tables that will be left empty: {}",
+            "restore: WARNING: v{} dump lacks tables that will be cleared (settings revision singleton resets to zero): {}",
             manifest.version,
             missing.join(", ")
         );
