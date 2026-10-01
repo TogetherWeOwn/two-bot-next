@@ -13,7 +13,9 @@ HIGH/CRITICAL in OS and library dependencies, **including unfixed findings**.
 A fresh vulnerability DB is downloaded/updated by Trivy (the daily cache does
 not skip updates). Scanner errors also fail; no `continue-on-error` or blanket
 `ignore-unfixed` is allowed. SBOMs and JSON findings remain in the `supply-chain`
-Actions artifact for 14 days, including on a vulnerability failure.
+Actions artifact for 14 days, including on a vulnerability failure. The existing
+required `check` depends on this scan job and explicitly rejects failed, skipped
+or cancelled results, so scan failure cannot leave that merge check green.
 
 ## Exceptions
 
@@ -50,6 +52,12 @@ bound. Docker inspection does not record image environment values.
 
 Nonzero exits, unavailable tools and timeouts are retained explicitly; they are
 not absence proof. For example, missing `getcap` leaves capabilities unresolved.
+Each probe retains its original result separately from cleanup. Only the daemon's
+exact missing-container response for that probe's UUID confirms absence after a
+startup failure; other cleanup errors/timeouts stop further probes and fail the
+job. The report is saved incrementally and checksummed even on cleanup failure,
+with `complete: false` and an explicit collection error. `complete: true` means
+all probes were attempted, not that their commands or vulnerability gates passed.
 Module absence and linkage observations still need package/CVE-specific analysis
 and source/caller evidence. CI kernel, mounts and inspection privileges do not
 prove production kernel, namespace restrictions or exploit reachability. Keep
@@ -59,10 +67,14 @@ security-decision thread.
 
 ## Release and dry-run
 
-On release-please publication, `release.yml` checks out the published `vX.Y.Z`
-tag, rebuilds/scans it and attaches `rust-workspace.cdx.json`,
+On release-please publication, `release.yml` resolves the explicit Git tag ref
+`refs/tags/vX.Y.Z` through the read-only Git API, peels annotated tags, and
+checks out the resulting commit SHA, never an ambiguous same-named branch. It
+rebuilds/scans that commit and attaches `rust-workspace.cdx.json`,
 `container-image.cdx.json`, `SHA256SUMS`, `source-sha.txt` and `image-id.txt` to
 that GitHub Release **only if both gates and inventory validation succeed**.
+Before upload, checksums and source SHA must match the selected commit, and the
+release tag is resolved again: a moved tag fails rather than receiving stale BOMs.
 The source SHA and local image ID bind the files to this build. They do not
 claim this image is the deployment's digest (there is no image push here).
 An asset failure does not erase the published release; inspect the failed run

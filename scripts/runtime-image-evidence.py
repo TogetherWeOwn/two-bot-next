@@ -40,29 +40,43 @@ def docker(*args, timeout=30):
     )
 
 
+def observation(*args, timeout):
+    try:
+        result = docker(*args, timeout=timeout)
+        return {"returncode": result.returncode, "stdout": result.stdout,
+                "stderr": result.stderr, "timed_out": False}
+    except subprocess.TimeoutExpired as error:
+        def text(value):
+            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+        return {"returncode": None, "stdout": text(error.stdout),
+                "stderr": text(error.stderr) + f"\nDocker command exceeded {timeout} seconds",
+                "timed_out": True}
+    except OSError as error:
+        return {"returncode": None, "stdout": "", "stderr": str(error), "timed_out": False}
+
+
 def probe(image_id, command):
     # Name before starting: a timed-out Docker client must not orphan a container
     # on the shared daemon. No mounts, host environment, ports or network access.
     name = "two-bot-inspect-" + uuid.uuid4().hex
     try:
-        try:
-            result = docker(
-                "run", "--name", name, "--read-only", "--no-healthcheck",
-                "--network", "none", "--cap-drop", "ALL",
-                "--security-opt", "no-new-privileges", "--user", "0:0",
-                "--pids-limit", "32", "--memory", "128m", "--memory-swap", "128m",
-                "--cpus", "0.5", "--entrypoint", "/bin/sh", image_id, "-c", command,
-                timeout=20,
-            )
-            return {"returncode": result.returncode, "stdout": result.stdout,
-                    "stderr": result.stderr, "timed_out": False}
-        except subprocess.TimeoutExpired:
-            return {"returncode": None, "stdout": "", "stderr": "probe exceeded 20 seconds",
-                    "timed_out": True}
+        result = observation(
+            "run", "--name", name, "--read-only", "--no-healthcheck",
+            "--network", "none", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges", "--user", "0:0",
+            "--pids-limit", "32", "--memory", "128m", "--memory-swap", "128m",
+            "--cpus", "0.5", "--entrypoint", "/bin/sh", image_id, "-c", command,
+            timeout=20,
+        )
     finally:
-        cleanup = docker("rm", "--force", name)
-        if cleanup.returncode != 0:
-            raise RuntimeError(f"Inspection container cleanup failed: {cleanup.stderr}")
+        cleanup = observation("rm", "--force", name, timeout=30)
+    status = "removed" if cleanup["returncode"] == 0 else "failed"
+    # Accept only the daemon's exact absence response for this UUID name, not
+    # arbitrary cleanup errors. Preserve both the startup and removal results.
+    if cleanup["returncode"] == 1 and cleanup["stderr"].strip() == f"Error response from daemon: No such container: {name}" and not cleanup["stdout"]:
+        status = "absent"
+    result["cleanup"] = {"status": status, **cleanup}
+    return result
 
 
 def collect(image, directory):
@@ -79,8 +93,9 @@ def collect(image, directory):
     if metadata["Id"] != image_id:
         raise ValueError("Image identity differs from the scanned image provenance")
     config = metadata["Config"]
-    return {
+    report = {
         "schema_version": 1,
+        "complete": False,
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "source_sha": source_sha,
         "image_id": image_id,
@@ -96,9 +111,20 @@ def collect(image, directory):
             "Mount/kernel output describes an isolated CI container, not production kernel, fstab or namespace restrictions.",
             "Package files, ldd and module presence do not establish application input reachability.",
         ],
-        "probes": {key: {"command": command, **probe(image_id, command)}
-                   for key, command in PROBES.items()},
+        "probes": {},
     }
+    destination = directory / "runtime-image-evidence.json"
+    destination.write_text(json.dumps(report, indent=2) + "\n")
+    for key, command in PROBES.items():
+        result = probe(image_id, command)
+        report["probes"][key] = {"command": command, **result}
+        if result["cleanup"]["status"] == "failed":
+            report["collection_error"] = "Inspection container cleanup failed; further probes stopped"
+        report["complete"] = len(report["probes"]) == len(PROBES) and "collection_error" not in report
+        destination.write_text(json.dumps(report, indent=2) + "\n")
+        if "collection_error" in report:
+            break
+    return report
 
 
 def main():
@@ -107,7 +133,8 @@ def main():
     parser.add_argument("directory", type=Path)
     args = parser.parse_args()
     report = collect(args.image, args.directory)
-    (args.directory / "runtime-image-evidence.json").write_text(json.dumps(report, indent=2) + "\n")
+    if not report["complete"]:
+        raise SystemExit(report["collection_error"])
 
 
 if __name__ == "__main__":

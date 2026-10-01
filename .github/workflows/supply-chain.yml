@@ -117,8 +117,10 @@ jobs:
       - name: Collect exact-image applicability evidence
         if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
         run: |
-          python3 scripts/runtime-image-evidence.py "$IMAGE" sbom
+          status=0
+          python3 scripts/runtime-image-evidence.py "$IMAGE" sbom || status=$?
           (cd sbom && sha256sum runtime-image-evidence.json > runtime-image-evidence.sha256)
+          exit "$status"
       - name: Retain SBOMs and findings even when the gate fails
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
