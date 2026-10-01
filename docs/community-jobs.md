@@ -1,4 +1,88 @@
-# Presence probe, community scorecard, and inactivity flagging
+# Community jobs
+
+## Website-contract runtime supervisor
+
+The `two-bot` binary registers these named jobs in `bot::website_jobs`, using
+`bot::jobs` as the reusable supervisor:
+
+| Job | Cadence | Attempt timeout |
+| --- | --- | --- |
+| `counter` | 60 seconds | 45 seconds |
+| `rank` | 10 minutes | 120 seconds |
+| `scheduled_events` | 10 minutes | 120 seconds |
+
+Each job gets one random startup offset in `[0, min(cadence, 5 seconds)]`.
+The first attempt runs at that offset and subsequent deadlines keep the same
+phase. A busy deadline is discarded, not queued: there is at most one active
+attempt **per named job**, including REST reads and the database transaction.
+Missed deadlines are skipped, so an overrun never creates a catch-up burst.
+Timeout drops the job future; panics are isolated by Tokio task boundaries.
+The release profile uses unwinding (not `panic=abort`) for the same guarantee
+in the deployed binary. Jobs must remain asynchronous/cooperative; this is not
+a preemption mechanism for blocking code.
+
+Counter and rank also share one observation/publication lane: it is held from
+raid-history and roster reads through the database commit because both ticks
+write the denominator. A delayed rank tick cannot overwrite a newer counter
+roster. Waiting for this lane consumes the attempt's timeout; cancellation
+releases it. Scheduled events remain independent. Publication timestamps reuse
+core `now_iso`, the fixed `YYYY-MM-DDTHH:mm:ss.sssZ` website contract.
+
+The jobs park when `DISCORD_TOKEN`, `DATABASE_URL` or nonzero `GUILD_ID` is
+missing. They share a paced REST executor and a lazily initialized pool; the
+existing cutover migrations and `web_v1` contract are applied before the first
+publication. Initialization errors are retried on the next attempt, never
+logged with a database URL. Guild members are fully paginated; rank-role names
+come from the guild object's `roles` array. Domain/store semantics are unchanged:
+
+- Counter and rank ticks publish nothing when historical raid windows cannot
+  be grounded in imported funnel history. A deliberate skip is a successful
+  attempt, not evidence that a fresh snapshot was written.
+- Missing/ambiguous ladder roles or nonnested ranks refuse rank publication.
+- Failed or malformed scheduled-event reads keep the previous mirror. Only a
+  valid empty event array clears it.
+
+`/readyz` retains its existing `components` array and adds an informational
+`jobs` object keyed by the three names. Each entry carries `parked`, `running`,
+`last_start`, `last_success` (Unix milliseconds), `last_error_class`, and
+`consecutive_failures`. Successful attempts clear the error/streak. Error
+classes are fixed identifiers, not SQL errors, REST bodies or panic payloads.
+Job failures **never** change the HTTP readiness code; the gateway remains the
+essential readiness gate. SIGTERM/SIGINT broadcasts cancellation before HTTP
+drains; shutdown aborts and joins in-flight attempts and starts no more work.
+An HTTP bind failure or gateway termination also signals cancellation. Gateway
+termination allows HTTP up to five seconds to drain after cancellation, then
+returns the restart error once the job supervisor's abort-and-join cleanup is
+complete. Only the inner HTTP future has a drain deadline: expiry drops it but
+never abandons the independent job join. SIGTERM/SIGINT uses the same bound;
+a stalled drain returns a fixed timeout error. The HTTP-first path aborts and
+joins the gateway. Cancellation remains sticky even before the HTTP future's
+first poll, and a job awaiting the status lock cannot schedule a post-stop attempt.
+
+Cadences cannot be overridden in a deployed binary. Test builds alone accept
+positive `TWO_TEST_COUNTER_INTERVAL_MS`, `TWO_TEST_RANK_INTERVAL_MS`, and
+`TWO_TEST_EVENTS_INTERVAL_MS` values. Paused-time regressions cover phase,
+jitter bounds, overrun skips, timeouts, panic isolation and shutdown. The REST
+adapter integration test uses the existing mock double and shared strict
+`two-bot-testsupport` fixture, applying migrations in a unique disposable database
+without migrating or resetting the bootstrap. Teardown is awaited. Run it
+with an explicitly disposable database only. On the persistent controller, use
+the bounded-cache wrapper (see [build-cache.md](build-cache.md)); refusal is not
+permission to fall back to direct Cargo:
+
+```sh
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090 \
+  python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot website_jobs::
+python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot jobs::
+python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot server::
+python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot lifecycle_tests::
+```
+
+Without `TWO_TEST_DATABASE_URL`, the database test explicitly skips locally
+(and refuses missing configuration in CI). It never consumes `DATABASE_URL`.
+The existing CI unit/binary test step supplies the guarded service database.
+
+## Presence probe, community scorecard, and inactivity flagging
 
 This slice ports the three S5 community jobs as framework-free domain logic in
 `two-bot-core` plus sqlx stores and migrations. It does **not** register live
