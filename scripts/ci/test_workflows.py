@@ -9,7 +9,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
-    "check.yml": {"check", "self-role-store", "container", "community-db", "feeds-db", "worker"},
+    "check.yml": {"check", "self-role-store", "container", "community-db", "feeds-db", "tickets-postgres", "worker"},
     "deploy-staging.yml": {"deploy"},
     "nightly.yml": {"advisories", "sweep"},
     "pr-lint.yml": {"pr-lint"},
@@ -117,7 +117,9 @@ class WorkflowTests(unittest.TestCase):
         for name, workflow in self.workflows.items():
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
-                    self.assertEqual(job["runs-on"], ["self-hosted", "two-selfhosted"])
+                    # container smoke runs on the ephemeral VM runner (main #161).
+                    runner = "two-ephemeral" if (name, job_id) == ("check.yml", "container") else "two-selfhosted"
+                    self.assertEqual(job["runs-on"], ["self-hosted", runner])
                     if job.get("services"):
                         self.assertIn("container", job)
                         for service in job["services"].values():
