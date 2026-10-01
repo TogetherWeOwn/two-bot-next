@@ -211,7 +211,12 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   effects/outcome/claims or the panel target. A received 5xx is response provenance,
   not a no-effect verdict; cancellation/timeouts leave the ticket pending.
   Pending tickets also gate aggregate checkpoint clearing and both settlement/
-  terminal-completion paths. Legacy pending work is never assigned synthetic
+  terminal-completion paths. Aggregate writes acquire the audit lock before the
+  statement that reads pending tickets, so a pre-wait snapshot cannot erase a
+  concurrently committed journal. They union unresolved role/direction IDs from
+  pending tickets rather than trusting a replacement effect snapshot. Lock-wait
+  source fixtures cover processing/terminal checkpoints and post-wait journal
+  expiry. Legacy pending work is never assigned synthetic
   provenance. Receipt completion alone does not clear aggregate uncertainty or
   establish convergence: current-owner incorporation and runtime ticket wiring
   remain follow-up work. Boot stays disabled. Isolated source fixtures cover

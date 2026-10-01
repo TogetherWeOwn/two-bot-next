@@ -403,6 +403,105 @@ async fn terminal_exchange_receipts_survive_generation_transfer(pool: &PgPool) -
     Ok(())
 }
 
+async fn exchange_journal_and_checkpoint_lock_waits(pool: &PgPool) -> TestResult {
+    for terminal in [false, true] {
+        let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+        let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+        let id = if terminal {
+            "exchange-wait-terminal"
+        } else {
+            "exchange-wait-processing"
+        };
+        let (audit, claim) = if terminal {
+            terminal_seed(&store, id, id, false).await?
+        } else {
+            let mut audit = row(id, id);
+            audit.panel_id = id.into();
+            let claim = store.claim_audit(&audit).await?.unwrap();
+            (audit, claim)
+        };
+        let mut holder = pool.begin().await?;
+        sqlx::query("SELECT event_id FROM self_role_audit WHERE event_id=$1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *holder)
+            .await?;
+        let effects = AuditEffects::default();
+        let checkpoint = async {
+            if terminal {
+                store
+                    .record_superseded_exchange(&claim, &effects, Some(false))
+                    .await
+            } else {
+                store
+                    .checkpoint_exchange(&claim, &effects, false, Some(false))
+                    .await
+            }
+        };
+        tokio::pin!(checkpoint);
+        tokio::select! {
+            result = &mut checkpoint => panic!("checkpoint did not wait: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        // Model a journal that commits after the checkpoint has started waiting.
+        // Only this owned fixture transaction may write the test ticket directly.
+        sqlx::query("INSERT INTO self_role_exchanges(event_id,origin_generation,role_id,adding,compensating) VALUES ($1,$2,'101',true,FALSE)")
+            .bind(id).bind(claim.generation).execute(&mut *holder).await?;
+        sqlx::query("UPDATE self_role_audit SET exchange_pending=TRUE WHERE event_id=$1")
+            .bind(id)
+            .execute(&mut *holder)
+            .await?;
+        holder.commit().await?;
+        assert!(checkpoint.await?);
+        let (pending,): (bool,) =
+            sqlx::query_as("SELECT exchange_pending FROM self_role_audit WHERE event_id=$1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+        assert!(pending);
+        assert_eq!(
+            stored_effects(pool, id).await?.unresolved_added_role_ids,
+            ["101"]
+        );
+        if !terminal {
+            assert!(matches!(
+                store.finish_owned_audit(&audit, &claim).await,
+                Err(StoreError::PendingExchange)
+            ));
+        }
+    }
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    let mut audit = row("exchange-journal-expiry", "0001");
+    audit.panel_id = audit.event_id.clone();
+    let claim = store.claim_audit(&audit).await?.unwrap();
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: true,
+        compensating: false,
+    };
+    let mut holder = pool.begin().await?;
+    sqlx::query("SELECT event_id FROM self_role_audit WHERE event_id=$1 FOR UPDATE")
+        .bind(&audit.event_id)
+        .fetch_one(&mut *holder)
+        .await?;
+    let journal = store.journal_role_exchange(&claim, None, &intent);
+    tokio::pin!(journal);
+    tokio::select! {
+        result = &mut journal => panic!("journal did not wait: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    clock.fetch_add(301, Ordering::SeqCst);
+    holder.commit().await?;
+    assert!(journal.await?.is_none());
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM self_role_exchanges WHERE event_id=$1")
+            .bind(&audit.event_id)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
 async fn terminal_seed(
     store: &SelfRoleStore,
     id: &str,
@@ -1050,6 +1149,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     sqlx::raw_sql(exchange_migration).execute(pool).await?;
     exchange_receipts_survive_generation_transfer(pool).await?;
     terminal_exchange_receipts_survive_generation_transfer(pool).await?;
+    exchange_journal_and_checkpoint_lock_waits(pool).await?;
     terminal_discovery_and_claim_race(pool).await?;
     terminal_repair_fences_and_completion(pool).await?;
     terminal_repair_lock_waits(pool).await?;

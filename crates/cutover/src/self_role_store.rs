@@ -657,14 +657,17 @@ impl SelfRoleStore {
         exchange_pending: bool,
     ) -> Result<bool, StoreError> {
         let effects = claim.preserve_unknown(effects);
-        let mut conn = self.pool.acquire().await?;
-        record_terminal_exchange(
-            &mut conn,
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, &claim.event).await?;
+        let changed = record_terminal_exchange(
+            &mut tx,
             &claim.event,
             &effects,
             Some(exchange_pending || claim.exchange_pending()),
         )
-        .await
+        .await?;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Acknowledge externally verified convergence, NOT success of the old event.
@@ -1367,6 +1370,10 @@ impl SelfRoleStore {
         compensating: bool,
         exchange_pending: Option<bool>,
     ) -> Result<bool, StoreError> {
+        // Read pending tickets only after the audit lock wait. A statement begun
+        // before a journal commits must not clear it using a pre-wait snapshot.
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, claim).await?;
         let mut query = sqlx::query(
             "UPDATE self_role_audit SET added_role_ids=$1,removed_role_ids=$2,
              attempted_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
@@ -1377,7 +1384,14 @@ impl SelfRoleStore {
                  FROM jsonb_array_elements_text(compensated_added_role_ids::jsonb || $5::jsonb)),
              compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
                  FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
-             unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8,
+             unresolved_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM (SELECT value FROM jsonb_array_elements_text($7::jsonb)
+                       UNION SELECT role_id FROM self_role_exchanges
+                       WHERE event_id=$9 AND disposition='pending' AND adding) pending),
+             unresolved_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+                 FROM (SELECT value FROM jsonb_array_elements_text($8::jsonb)
+                       UNION SELECT role_id FROM self_role_exchanges
+                       WHERE event_id=$9 AND disposition='pending' AND NOT adding) pending),
              compensating=compensating OR $12,
              exchange_pending=COALESCE($13,exchange_pending) OR EXISTS
                  (SELECT 1 FROM self_role_exchanges WHERE event_id=$9 AND disposition='pending')
@@ -1387,16 +1401,18 @@ impl SelfRoleStore {
         for effect in effects.encoded() {
             query = query.bind(effect);
         }
-        Ok(query
+        let changed = query
             .bind(&claim.event_id)
             .bind(claim.token.expose())
             .bind(claim.generation)
             .bind(compensating)
             .bind(exchange_pending)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Record late result/compensation evidence for a superseded event under
@@ -1422,8 +1438,11 @@ impl SelfRoleStore {
         effects: &AuditEffects,
         exchange_pending: Option<bool>,
     ) -> Result<bool, StoreError> {
-        let mut conn = self.pool.acquire().await?;
-        record_terminal_exchange(&mut conn, claim, effects, exchange_pending).await
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, claim).await?;
+        let changed = record_terminal_exchange(&mut tx, claim, effects, exchange_pending).await?;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Explicit claim is required (no unsafe implicit lookup of another worker's
@@ -1433,8 +1452,11 @@ impl SelfRoleStore {
         row: &SelfRoleAudit,
         claim: &EventClaim,
     ) -> Result<(), StoreError> {
-        let mut conn = self.pool.acquire().await?;
-        finish_audit(&mut conn, row, claim).await
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, claim).await?;
+        finish_audit(&mut tx, row, claim).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Runtime settlement, unlike late evidence, requires a live event and no
@@ -1672,7 +1694,14 @@ async fn record_terminal_exchange(
              FROM jsonb_array_elements_text(compensated_added_role_ids::jsonb || $5::jsonb)),
          compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
              FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
-         unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8,
+         unresolved_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM (SELECT value FROM jsonb_array_elements_text($7::jsonb)
+                   UNION SELECT role_id FROM self_role_exchanges
+                   WHERE event_id=$9 AND disposition='pending' AND adding) pending),
+         unresolved_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM (SELECT value FROM jsonb_array_elements_text($8::jsonb)
+                   UNION SELECT role_id FROM self_role_exchanges
+                   WHERE event_id=$9 AND disposition='pending' AND NOT adding) pending),
          exchange_pending=COALESCE($12,exchange_pending) OR EXISTS
              (SELECT 1 FROM self_role_exchanges WHERE event_id=$9 AND disposition='pending'),
          repair_complete=FALSE

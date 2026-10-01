@@ -52,8 +52,10 @@
   Add distinct per-send journal tickets and idempotent response/no-send receipts
   (migration 0205) that survive generation transfer without former-worker audit
   or target authority. Pending tickets gate settlement and cannot be erased by
-  aggregate checkpoint clearing. Add processing/terminal provenance and role-matrix
-  source fixtures; runtime ticket wiring/current-owner incorporation are deferred.
+  aggregate checkpoint clearing. Read ticket evidence only after audit lock waits
+  and preserve unresolved role/direction IDs from pending tickets. Add processing/
+  terminal provenance, lock-wait and role-matrix source fixtures; runtime ticket
+  wiring/current-owner incorporation are deferred.
   Production boot remains disabled until approved shared boot configuration,
   unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
