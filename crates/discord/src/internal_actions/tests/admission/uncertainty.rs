@@ -53,6 +53,11 @@ async fn assert_unknown_fences_restart(db: &TestDatabase, mock: &MockDiscord) {
 async fn admission_action_uncertain_status_and_invalid_receipts_keep_cross_pool_fence() {
     for (status, body) in [
         (500, r#"{"message":"uncertain"}"#),
+        (408, r#"{"message":"uncertain"}"#),
+        (409, r#"{"message":"uncertain"}"#),
+        (425, r#"{"message":"uncertain"}"#),
+        (302, r#"{"message":"uncertain"}"#),
+        (202, r#"{"id":"123"}"#),
         (200, "not JSON"),
         (201, "{}"),
         (201, r#"{"id":"0"}"#),
@@ -81,6 +86,11 @@ async fn admission_action_uncertain_status_and_invalid_receipts_keep_cross_pool_
 async fn admission_backup_uncertain_status_and_invalid_receipts_keep_cross_transport_fence() {
     for (status, body) in [
         (500, r#"{"message":"uncertain"}"#),
+        (408, r#"{"message":"uncertain"}"#),
+        (409, r#"{"message":"uncertain"}"#),
+        (425, r#"{"message":"uncertain"}"#),
+        (302, r#"{"message":"uncertain"}"#),
+        (202, r#"{"id":"123"}"#),
         (200, "not JSON"),
         (201, "{}"),
         (201, r#"{"id":"0"}"#),

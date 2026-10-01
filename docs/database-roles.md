@@ -58,7 +58,7 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 43 ordinary bot tables plus the restricted admission lane,
+current migrations' 45 ordinary bot tables plus the restricted admission lane,
 SQLx ledger, eight named SERIAL sequences and
 `guild_settings_version_seq`, nine web views and five functions. A detached SERIAL
 sequence remains required even after `OWNED BY NONE`. New relations/sequences need
@@ -152,5 +152,8 @@ URL). Without CI or `TWO_ROLES_TEST_DATABASE_URL`, the offline suite makes no
 connection; configured failures are never skipped. Tests apply every real migration
 and the actual view contract, apply the plan twice, exercise allowed DML/DDL/view
 reads and denied runtime CREATE/ALTER/TRUNCATE/temporary-table and reader base-table
-operations, then inject and restore privilege drift. Offline tests also cover CLI
-execution-flag rejection and matrix coverage.
+operations, then inject and restore privilege drift. Ticket and transcript tests
+exercise valid runtime CRUD, deny reader SELECT/INSERT and runtime ALTER/TRUNCATE,
+and detect missing runtime and excess reader privileges on both tables, restoring
+a clean matrix after each drift. Offline tests also cover CLI execution-flag
+rejection and matrix coverage, including migration 0210.

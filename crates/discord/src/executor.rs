@@ -72,9 +72,9 @@ pub const MAX_MESSAGE_CHARS: usize = 2000;
 /// Discord failure modes (legacy `ModerationDiscord` `ActionError` codes).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiscordError {
-    /// Discord refused the request (non-429 4xx): provably no mutation
-    /// happened, so the claim is safe to release (legacy `discord_rejected`).
-    /// This is the ONLY retry-safe failure.
+    /// A build-time failure or confirmed HTTP rejection proves no mutation
+    /// happened, so the claim is safe to release (`discord_rejected`).
+    /// Ambiguous statuses, including 408 and unexpected 2xx/3xx, never map here.
     #[error("discord refused the request: {0}")]
     Rejected(String),
     /// Discord did not answer in time (legacy `upstream_timeout`): the
@@ -468,7 +468,7 @@ impl HyperTransport {
         // Reads cannot mutate; a complete failure may be retried independently.
         // Mutation success needs its caller's validated receipt. 5xx, redirects
         // and request-timeout responses remain uncertain even with a full body.
-        if request.method() == Method::Get || (400..500).contains(&status) && status != 408 {
+        if request.method() == Method::Get || matches!(status, 400 | 401 | 403 | 404 | 405 | 429) {
             res.complete().await;
         }
         Ok(res)
@@ -984,6 +984,27 @@ impl ActionExecutor {
         channel_id: &str,
         guild_id: &str,
     ) -> Result<Option<EveryoneOverwrite>, DiscordError> {
+        self.read_everyone_overwrite(channel_id, guild_id, false)
+            .await
+    }
+
+    /// Resolve a website moderation channel inside the configured guild. Fail
+    /// closed on unreadable identity/type before a claim can mutate another guild.
+    pub async fn get_guild_channel_overwrite(
+        &self,
+        channel_id: &str,
+        guild_id: &str,
+    ) -> Result<Option<EveryoneOverwrite>, DiscordError> {
+        self.read_everyone_overwrite(channel_id, guild_id, true)
+            .await
+    }
+
+    async fn read_everyone_overwrite(
+        &self,
+        channel_id: &str,
+        guild_id: &str,
+        enforce_guild: bool,
+    ) -> Result<Option<EveryoneOverwrite>, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
         // The requested guild identity is validated with the same snowflake
         // rules the PUT target uses, before any I/O: the read must compare
@@ -1004,6 +1025,24 @@ impl ActionExecutor {
         let doc: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
             DiscordError::Rejected(format!("unreadable channel {channel_id}: body is not JSON"))
         })?;
+        if enforce_guild {
+            let doc_channel = doc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|id| snowflake::<ChannelMarker>(id).ok());
+            let doc_guild = doc
+                .get("guild_id")
+                .and_then(|v| v.as_str())
+                .and_then(|id| snowflake::<GuildMarker>(id).ok());
+            if doc_channel != Some(channel)
+                || doc_guild != Some(target)
+                || !matches!(doc.get("type").and_then(|v| v.as_u64()), Some(0 | 5))
+            {
+                return Err(DiscordError::Rejected(
+                    "channel is not a text channel in the configured guild".to_owned(),
+                ));
+            }
+        }
         let overwrites = doc.get("permission_overwrites").ok_or_else(|| {
             DiscordError::Rejected(format!(
                 "unreadable channel {channel_id}: missing permission_overwrites"
@@ -1222,22 +1261,52 @@ impl ActionExecutor {
         count: u64,
         reason: &str,
     ) -> Result<u64, DiscordError> {
+        // Keep reason validation before any I/O for the combined public call.
+        audit_reason(reason)?;
+        let ids = self.list_purge_messages(channel_id, count).await?;
+        self.purge_messages(channel_id, &ids, reason).await
+    }
+
+    /// Read-only purge phase. Even a timeout here proves no deletion was sent.
+    pub(crate) async fn list_purge_messages(
+        &self,
+        channel_id: &str,
+        count: u64,
+    ) -> Result<Vec<Id<MessageMarker>>, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
-        let reason = audit_reason(reason)?;
         let limit: u16 = count
             .clamp(1, 100)
             .try_into()
             .map_err(|_| DiscordError::Rejected(format!("purge out of range: {count}")))?;
         let list_req = Self::request_of(self.inner.factory.channel_messages(channel).limit(limit))?;
-        let listed = self.call_once(list_req, &[200]).await?.unwrap_or_default();
-        let ids: Vec<Id<MessageMarker>> = listed
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let res = self.call_once_raw(list_req, &[200]).await?;
+        let unreadable =
+            || DiscordError::Unavailable(format!("unreadable channel {channel_id} purge history"));
+        let listed: Vec<serde_json::Value> =
+            serde_json::from_slice(&res.body).map_err(|_| unreadable())?;
+        listed
             .iter()
-            .filter_map(|row| row.get("id")?.as_str()?.parse::<u64>().ok())
-            .filter_map(Id::new_checked)
-            .collect();
+            .map(|row| {
+                let value = row.get("id").and_then(serde_json::Value::as_str);
+                let value = value.ok_or_else(unreadable)?;
+                let id: Id<MessageMarker> = snowflake(value).map_err(|_| unreadable())?;
+                if id.to_string() != value {
+                    return Err(unreadable());
+                }
+                Ok(id)
+            })
+            .collect()
+    }
+
+    /// Single deletion phase; uncertain wire failures must retain caller fences.
+    pub(crate) async fn purge_messages(
+        &self,
+        channel_id: &str,
+        ids: &[Id<MessageMarker>],
+        reason: &str,
+    ) -> Result<u64, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let reason = audit_reason(reason)?;
         if ids.is_empty() {
             return Ok(0);
         }
@@ -1255,7 +1324,7 @@ impl ActionExecutor {
         let req = Self::request_of(
             self.inner
                 .factory
-                .delete_messages(channel, &ids)
+                .delete_messages(channel, ids)
                 .reason(&reason),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
@@ -1728,16 +1797,16 @@ fn mutation_receipt_id(body: &[u8]) -> Result<String, DiscordError> {
     }
 }
 
-/// Only a definitive non-429 4xx refusal is retry-safe. Unexpected successes,
-/// redirects, request timeouts and 5xx are uncertain mutation outcomes.
+/// Only documented no-effect rejections are retry-safe. An unexpected success,
+/// redirect, timeout status or other ambiguous response may follow a mutation.
 #[must_use]
 pub fn throw_for_status(res: &RawResponse) -> DiscordError {
-    if res.status == 429 {
-        DiscordError::RateLimited
-    } else if !(400..500).contains(&res.status) || res.status == 408 {
-        DiscordError::Unavailable(format!("Discord returned {}", res.status))
-    } else {
-        DiscordError::Rejected(format!("Discord refused the request with {}", res.status))
+    match res.status {
+        429 => DiscordError::RateLimited,
+        400 | 401 | 403 | 404 | 405 => {
+            DiscordError::Rejected(format!("Discord refused the request with {}", res.status))
+        }
+        _ => DiscordError::Unavailable(format!("Discord returned {}", res.status)),
     }
 }
 
@@ -2146,7 +2215,7 @@ mod tests {
     }
 
     #[test]
-    fn throw_for_status_maps_like_legacy() {
+    fn throw_for_status_releases_only_confirmed_rejections() {
         let rl = RawResponse {
             status: 429,
             retry_after_header: None,
@@ -2164,13 +2233,32 @@ mod tests {
             throw_for_status(&down),
             DiscordError::Unavailable(_)
         ));
-        let no = RawResponse {
-            status: 403,
-            retry_after_header: None,
-            body: Vec::new(),
-            completion: None,
-        };
-        assert!(throw_for_status(&no).is_safe_pre_mutation());
+        for status in [400, 401, 403, 404, 405] {
+            let no = RawResponse {
+                status,
+                retry_after_header: None,
+                body: Vec::new(),
+                completion: None,
+            };
+            assert!(throw_for_status(&no).is_safe_pre_mutation(), "{status}");
+        }
+        for status in [100, 200, 202, 204, 301, 302, 307, 408, 409, 425, 500, 503] {
+            let uncertain = RawResponse {
+                status,
+                retry_after_header: None,
+                body: Vec::new(),
+                completion: None,
+            };
+            assert!(matches!(
+                throw_for_status(&uncertain),
+                DiscordError::Unavailable(_)
+            ));
+            assert!(
+                !throw_for_status(&uncertain).is_safe_pre_mutation(),
+                "{status}"
+            );
+        }
+        assert!(DiscordError::Rejected("build: invalid request".to_owned()).is_safe_pre_mutation());
         assert!(!DiscordError::Timeout.is_safe_pre_mutation());
         assert!(!DiscordError::RateLimited.is_safe_pre_mutation());
     }

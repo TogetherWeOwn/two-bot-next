@@ -176,7 +176,7 @@ impl GuildConfigDiscordApi {
             // A full mutation 5xx/redirect or unusable success receipt is still
             // uncertain. Dropping its permit retains durable occupancy.
             let definite = method == HttpMethod::GET
-                || (400..500).contains(&status) && status != 408
+                || matches!(status, 400 | 401 | 403 | 404 | 405 | 429)
                 || mutation_receipt_is_definite(&method, path, status, response.as_ref());
             if let Some(permit) = permit.filter(|_| definite) {
                 let cooldown = (status == 429).then(|| {

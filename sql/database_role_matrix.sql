@@ -44,6 +44,8 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'self_role_audit', 'table'),
     ('public', 'self_role_panel_claims', 'table'),
     ('public', 'discord_send_admission', 'admission'),
+    ('public', 'tickets', 'table'),
+    ('public', 'ticket_transcripts', 'table'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),
     ('public', 'xp_awards_id_seq', 'sequence'),

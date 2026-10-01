@@ -47,6 +47,8 @@ installed by this change.
    empty id for an unreadable receipt. Guild-config restore validates its
    resource-id receipt before release. Reads have an explicit separate policy:
    a fully collected read-only failure may release admission and be retried.
+   Mutation refusals release only on documented no-effect statuses
+   400/401/403/404/405/429, not arbitrary 4xx responses.
 
 Finite deadlines use the database clock. All Discord channel/bucket cooldowns
 are conservatively promoted to the whole token. Both header and body timing are
