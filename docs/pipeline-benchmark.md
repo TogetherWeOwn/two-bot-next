@@ -40,7 +40,7 @@ exact test hostname/port/user, explicit empty password, test DB prefix, no URL
 query/fragment or libpq environment overrides. No `DATABASE_URL` fallback exists.
 The driver creates and migrates a uniquely named disposable database and verifies
 its drop before emitting a success report. It never migrates/resets the bootstrap
-DB. On timeout/error the fixture still schedules cleanup; hosted service teardown
+DB. On timeout/error the fixture still schedules cleanup; CI service teardown
 is the final containment. No connection credentials are created or substituted.
 
 Default parameters (all integer-valued) are equivalent to:
@@ -110,7 +110,7 @@ Offline comparator tests:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench.py' -v
 ```
 
-Driver fixture/percentile/bounds tests and database guard tests run on hosted CI:
+Driver fixture/percentile/bounds tests and database guard tests run in CI job containers:
 
 ```sh
 cargo test -p two-bot-discord --example pipeline_bench --locked
