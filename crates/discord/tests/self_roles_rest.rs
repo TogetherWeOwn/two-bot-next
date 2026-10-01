@@ -286,13 +286,13 @@ async fn lost_post_call_ownership_retains_accepted_effect() {
     .await;
     let exchange = executor(&mock)
         .self_role_step(GUILD, USER, ROLE, true, || async {
-            Ok(checks.fetch_add(1, Ordering::SeqCst) == 0)
+            Ok(checks.fetch_add(1, Ordering::SeqCst) < 2)
         })
         .await
         .unwrap();
     assert_eq!(exchange.result, Ok(()));
     assert!(!exchange.owned_after);
-    assert_eq!(checks.load(Ordering::SeqCst), 2);
+    assert_eq!(checks.load(Ordering::SeqCst), 3);
     assert_eq!(mock.requests().len(), 1);
     mock.shutdown().await;
 }
@@ -322,6 +322,40 @@ async fn late_fence_is_evaluated_after_shared_pacing_wait() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(mock.requests().len(), 1);
     mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_journal_or_ownership_lost_during_journal_prevents_send() {
+    for failed_journal in [true, false] {
+        let checks = AtomicUsize::new(0);
+        let journals = AtomicUsize::new(0);
+        let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+        let result = executor(&mock)
+            .self_role_step_journaled(
+                GUILD,
+                USER,
+                ROLE,
+                true,
+                || async { Ok(checks.fetch_add(1, Ordering::SeqCst) == 0) },
+                || async {
+                    journals.fetch_add(1, Ordering::SeqCst);
+                    if failed_journal {
+                        Err(SelfRoleRestError::StaleClaim)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        assert_eq!(result.unwrap_err(), SelfRoleRestError::StaleClaim);
+        assert_eq!(journals.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            if failed_journal { 1 } else { 2 }
+        );
+        assert!(mock.requests().is_empty());
+        mock.shutdown().await;
+    }
 }
 
 #[tokio::test]

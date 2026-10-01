@@ -296,6 +296,29 @@ impl ActionExecutor {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<bool, SelfRoleRestError>>,
     {
+        self.self_role_step_journaled(guild_id, member_id, role_id, add, owns, || async { Ok(()) })
+            .await
+    }
+
+    /// The runtime journals send intent inside the shared paced reservation.
+    /// A failed checkpoint prevents the send; ownership is rechecked after the
+    /// database wait. Cancellation after the checkpoint leaves unresolved intent
+    /// for authoritative recovery, never an invented successful exchange.
+    pub async fn self_role_step_journaled<F, Fut, J, Journal>(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        role_id: &str,
+        add: bool,
+        owns: F,
+        journal: J,
+    ) -> Result<RoleExchange, SelfRoleRestError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<bool, SelfRoleRestError>>,
+        J: FnOnce() -> Journal,
+        Journal: Future<Output = Result<(), SelfRoleRestError>>,
+    {
         let guild = numeric_id(guild_id)?.cast();
         let member = numeric_id(member_id)?.cast();
         let role = numeric_id(role_id)?.cast();
@@ -315,6 +338,10 @@ impl ActionExecutor {
         }
         .map_err(|_| SelfRoleRestError::InvalidId)?;
         let mut lane = self.paced_lane(false).await;
+        if !owns().await? {
+            return Err(SelfRoleRestError::StaleClaim);
+        }
+        journal().await?;
         if !owns().await? {
             return Err(SelfRoleRestError::StaleClaim);
         }

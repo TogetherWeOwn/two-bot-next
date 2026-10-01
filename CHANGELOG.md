@@ -11,9 +11,12 @@
   runtime admission, concurrent cancellation-safe renewal of both leases, and
   one-time fenced intent initialization (migration 0201). Recovery preserves
   intentionally empty snapshots and computes remaining work from freshly fetched
-  member state. Add isolated Postgres/mock REST admission regressions to CI.
-  Execution, compensation and gateway registration remain disabled until the
-  runtime follow-up is complete.
+  member state. Add durable paced send journaling, fresh-policy singular execution,
+  effect checkpoints, and a monotonic compensation phase (migration 0202) that
+  survives restart without retrying rejected intent. Add isolated Postgres/mock
+  REST regressions for partial/ambiguous failures and compensation recovery.
+  Gateway registration remains disabled until stale-worker repair, atomic final
+  settlement and the runtime follow-up are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

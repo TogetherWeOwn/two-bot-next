@@ -147,6 +147,50 @@ async fn pending_intent_initialization(pool: &PgPool) -> TestResult {
     Ok(())
 }
 
+async fn compensation_phase_recovery(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    let audit = row("compensation-phase", "compensation-order");
+    let original = store.claim_audit(&audit).await?.unwrap();
+    assert!(!original.compensating);
+    let effects = AuditEffects {
+        attempted_added_role_ids: vec!["role-a".into()],
+        removed_role_ids: vec!["role-b".into()],
+        attempted_removed_role_ids: vec!["role-b".into()],
+        unresolved_added_role_ids: vec!["role-a".into()],
+        ..AuditEffects::default()
+    };
+    assert!(
+        store
+            .checkpoint_execution(&original, &effects, true)
+            .await?
+    );
+    assert!(store.update_audit_effects(&original, &effects).await?);
+    clock.store(TEST_NOW_MS + 300, Ordering::SeqCst);
+    let recovered = store.claim_audit(&audit).await?.unwrap();
+    assert!(recovered.compensating);
+    assert_eq!(recovered.effects, effects);
+    assert_eq!(recovered.desired_role_ids, audit.desired_role_ids);
+    assert_eq!(recovered.pre_mutation_role_ids, audit.pre_mutation_role_ids);
+    assert!(
+        !store
+            .checkpoint_execution(&original, &AuditEffects::default(), false)
+            .await?
+    );
+    assert!(
+        store
+            .checkpoint_execution(&recovered, &effects, false)
+            .await?
+    );
+    let (compensating,): (bool,) = sqlx::query_as(
+        "SELECT compensating FROM self_role_audit WHERE event_id='compensation-phase'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(compensating); // neither recovery nor an applying checkpoint resets rollback
+    Ok(())
+}
+
 async fn exercise(pool: &PgPool) -> TestResult {
     let migration = include_str!("../migrations/0200_self_roles.sql");
     sqlx::raw_sql(migration).execute(pool).await?;
@@ -164,7 +208,13 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0202_self_role_compensation_phase.sql"
+    ))
+    .execute(pool)
+    .await?;
     pending_intent_initialization(pool).await?;
+    compensation_phase_recovery(pool).await?;
 
     let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
     let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;

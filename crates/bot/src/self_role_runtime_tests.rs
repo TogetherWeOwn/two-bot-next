@@ -194,10 +194,205 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0202_self_role_compensation_phase.sql"
+    ))
+    .execute(pool)
+    .await?;
+    execution_and_compensation(pool).await?;
     recovery_and_renewal(pool).await?;
     empty_select_recovery(pool).await?;
     reaction_partial_and_duplicate(pool).await?;
     exclusive_lane_before_reads(pool).await?;
+    Ok(())
+}
+
+#[test]
+fn effect_snapshots_do_not_invent_unattempted_changes_or_erase_history() {
+    let mut effects = AuditEffects::default();
+    mark_attempt(&mut effects, OLD_ROLE, false);
+    mark_attempt(&mut effects, NEW_ROLE, true);
+    mark_attempt(&mut effects, NEW_ROLE, true);
+    assert_eq!(effects.attempted_added_role_ids, [NEW_ROLE]);
+    assert_eq!(effects.unresolved_added_role_ids, [NEW_ROLE]);
+    let held = [NEW_ROLE.into(), OTHER.into()].into_iter().collect();
+    observe_effects(&mut effects, &[OLD_ROLE.into()], &held);
+    assert_eq!(effects.added_role_ids, [NEW_ROLE]);
+    assert_eq!(effects.removed_role_ids, [OLD_ROLE]);
+    assert!(effects.unresolved_added_role_ids.is_empty());
+    push_role(&mut effects.compensated_added_role_ids, OLD_ROLE);
+    push_role(&mut effects.compensated_removed_role_ids, NEW_ROLE);
+    let held = [OLD_ROLE.into(), OTHER.into()].into_iter().collect();
+    observe_effects(&mut effects, &[OLD_ROLE.into()], &held);
+    assert!(effects.added_role_ids.is_empty());
+    assert!(effects.removed_role_ids.is_empty());
+    assert_eq!(effects.attempted_added_role_ids, [NEW_ROLE]);
+    assert_eq!(effects.compensated_added_role_ids, [OLD_ROLE]);
+    assert_eq!(effects.compensated_removed_role_ids, [NEW_ROLE]);
+    // Differences on other roles do not become this event's observed effects.
+    observe_effects(&mut effects, &[OTHER.into()], &held);
+    assert!(!effects.added_role_ids.contains(&OLD_ROLE.into()));
+}
+
+async fn execution_and_compensation(pool: &PgPool) -> TestResult {
+    for status in [204, 403, 503] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut script = snapshot(&[OLD_ROLE, OTHER]); // prepare
+        script.extend(snapshot(&[OLD_ROLE, OTHER])); // before DELETE
+        script.push(ScriptedResponse::status(204));
+        script.extend(snapshot(&[OTHER])); // before PUT
+        script.push(ScriptedResponse::status(status));
+        if status == 204 {
+            script.extend(snapshot(&[NEW_ROLE, OTHER])); // final observed target
+        } else {
+            if status == 503 {
+                // An ambiguous PUT may have applied. Rollback removes it before
+                // restoring the old selection, and preserves attempted history.
+                script.extend(snapshot(&[NEW_ROLE, OTHER]));
+                script.push(ScriptedResponse::status(204));
+            }
+            script.extend(snapshot(&[OTHER]));
+            script.push(ScriptedResponse::status(204)); // compensation PUT old
+            script.extend(snapshot(&[OLD_ROLE, OTHER]));
+        }
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let runtime = runtime(pool, &clock, &mock);
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("execution-{status}");
+        let request = request(
+            &format!("execution-{status}"),
+            Selection::Select {
+                option_keys: vec!["new".into()],
+            },
+        );
+        let mut prepared = ready(runtime.prepare(&request, &panel).await.unwrap());
+        let execution = runtime.execute(&mut prepared, &panel).await.unwrap();
+        assert_eq!(
+            execution,
+            if status == 204 {
+                Execution::Applied
+            } else {
+                Execution::Compensated
+            }
+        );
+        assert_eq!(prepared.event.desired_role_ids, [NEW_ROLE]);
+        assert_eq!(prepared.event.pre_mutation_role_ids, [OLD_ROLE]);
+        assert!(prepared.snapshot.member_role_ids.contains(OTHER));
+        assert!(prepared
+            .audit
+            .effects
+            .attempted_added_role_ids
+            .contains(&NEW_ROLE.into()));
+        assert!(prepared
+            .audit
+            .effects
+            .attempted_removed_role_ids
+            .contains(&OLD_ROLE.into()));
+        assert!(prepared.audit.effects.unresolved_added_role_ids.is_empty());
+        if status == 204 {
+            assert_eq!(prepared.audit.effects.added_role_ids, [NEW_ROLE]);
+            assert_eq!(prepared.audit.effects.removed_role_ids, [OLD_ROLE]);
+        } else {
+            assert!(prepared.event.compensating);
+            assert!(prepared.audit.effects.added_role_ids.is_empty());
+            assert!(prepared.audit.effects.removed_role_ids.is_empty());
+            assert_eq!(
+                prepared.audit.effects.compensated_added_role_ids,
+                [OLD_ROLE]
+            );
+            assert_eq!(
+                prepared.audit.effects.compensated_removed_role_ids,
+                if status == 503 {
+                    vec![NEW_ROLE.to_owned()]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        let mutations: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.method != "GET")
+            .collect();
+        assert_eq!(mutations[0].method, "DELETE");
+        assert!(mutations[0].path.ends_with(OLD_ROLE));
+        assert_eq!(mutations[1].method, "PUT");
+        assert!(mutations[1].path.ends_with(NEW_ROLE));
+        assert!(mutations
+            .iter()
+            .all(|r| !r.path.ends_with(OTHER) && r.body.is_empty()));
+        let (phase, outcome): (bool, String) =
+            sqlx::query_as("SELECT compensating,outcome FROM self_role_audit WHERE event_id=$1")
+                .bind(&request.event_id)
+                .fetch_one(pool)
+                .await?;
+        assert_eq!(phase, status != 204);
+        assert_eq!(outcome, "processing"); // execute is NOT final settlement
+        drop(prepared);
+        mock.shutdown().await;
+    }
+    compensation_restart(pool).await?;
+    Ok(())
+}
+
+async fn compensation_restart(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mut script = snapshot(&[OLD_ROLE, OTHER]);
+    script.extend(snapshot(&[OLD_ROLE, OTHER]));
+    script.push(ScriptedResponse::status(204)); // remove old
+    script.extend(snapshot(&[OTHER]));
+    script.push(ScriptedResponse::status(403)); // add new refused
+    script.extend(snapshot(&[OTHER]));
+    script.push(ScriptedResponse::status(403)); // restoring old also refused
+                                                // A crash/restart must finish restoring the immutable before, NOT add new.
+    script.extend(snapshot(&[OTHER])); // recovered prepare
+    script.extend(snapshot(&[OTHER]));
+    script.push(ScriptedResponse::status(204)); // restore old
+    script.extend(snapshot(&[OLD_ROLE, OTHER]));
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let runtime = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Button);
+    panel.id = "compensation-restart".into();
+    let request = request(
+        "compensation-restart",
+        Selection::Button {
+            option_key: "new".into(),
+        },
+    );
+    let mut prepared = ready(runtime.prepare(&request, &panel).await.unwrap());
+    assert!(matches!(
+        runtime.execute(&mut prepared, &panel).await,
+        Err(RuntimeError::Rest(SelfRoleRestError::Rejected(403)))
+    ));
+    assert!(prepared.event.compensating);
+    drop(prepared);
+    clock.store(NOW + 500, Ordering::SeqCst);
+    let mut recovered = ready(runtime.prepare(&request, &panel).await.unwrap());
+    assert!(recovered.event.compensating);
+    assert_eq!(recovered.remaining.add_role_ids, [OLD_ROLE]);
+    assert_eq!(
+        runtime.execute(&mut recovered, &panel).await.unwrap(),
+        Execution::Compensated
+    );
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|r| r.method == "PUT" && r.path.ends_with(NEW_ROLE))
+            .count(),
+        1
+    );
+    assert!(recovered
+        .audit
+        .effects
+        .attempted_added_role_ids
+        .contains(&NEW_ROLE.into()));
+    assert_eq!(
+        recovered.audit.effects.compensated_added_role_ids,
+        [OLD_ROLE]
+    );
+    assert!(recovered.audit.effects.removed_role_ids.is_empty());
+    drop(recovered);
+    mock.shutdown().await;
     Ok(())
 }
 

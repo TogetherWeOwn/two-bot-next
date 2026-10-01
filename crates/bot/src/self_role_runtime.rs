@@ -213,6 +213,14 @@ impl PreparedSelfRole {
     }
 }
 
+/// Execution alone is not settlement. The caller must still atomically publish
+/// the final audit/target, or reconcile a stale exclusive worker before replying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Execution {
+    Applied,
+    Compensated,
+}
+
 struct PreparedPlans {
     snapshot: SelfRoleSnapshot,
     original: SelfRolePlan,
@@ -227,6 +235,188 @@ pub(crate) struct SelfRoleRuntime {
 }
 
 impl SelfRoleRuntime {
+    /// Bounded convergence using singular operations. All reads and sends share
+    /// the existing executor. A recovered rollback never resumes the old target.
+    /// Keep processing claims on infrastructure/stale failures for recovery.
+    pub async fn execute(
+        &self,
+        prepared: &mut PreparedSelfRole,
+        panel: &SelfRolePanel,
+    ) -> Result<Execution, RuntimeError> {
+        if prepared.audit.guild_id != self.guild_id
+            || prepared.audit.panel_id != panel.id
+            || prepared.audit.source_id != panel.message_id
+            || !prepared.event.intent_initialized
+        {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        // At most one remove and add per option in each phase. A moving external
+        // target cannot keep an event in an unbounded mutation/retry loop.
+        for _ in 0..(panel.options.len() * 4 + 2) {
+            if !prepared.owns().await? {
+                return Err(RuntimeError::Stale);
+            }
+            let snapshot = self
+                .executor
+                .fetch_self_role_snapshot(&self.guild_id, &prepared.audit.member_id, &self.bot_id)
+                .await
+                .map_err(RuntimeError::Rest)?;
+            if !prepared.owns().await? {
+                return Err(RuntimeError::Stale);
+            }
+            observe_effects(
+                &mut prepared.audit.effects,
+                &prepared.event.pre_mutation_role_ids,
+                &snapshot.member_role_ids,
+            );
+            self.checkpoint(prepared).await?;
+            let offered: Vec<_> = panel.options.iter().map(|o| o.role_id.clone()).collect();
+            if snapshot.member_is_bot
+                || snapshot.validate(&self.guild_id, panel, &offered).is_some()
+            {
+                prepared.event.compensating = true;
+                self.checkpoint(prepared).await?;
+                return Err(RuntimeError::Rest(SelfRoleRestError::Snapshot));
+            }
+            let target = if prepared.event.compensating {
+                &prepared.event.pre_mutation_role_ids
+            } else {
+                &prepared.event.desired_role_ids
+            };
+            if target.iter().any(|id| !offered.contains(id)) {
+                return Err(RuntimeError::InvalidSnapshot);
+            }
+            let remaining = plan_select_delta(panel, &snapshot.member_role_ids, target)
+                .map_err(|_| RuntimeError::InvalidSnapshot)?;
+            prepared.remaining = remaining;
+            prepared.snapshot = snapshot;
+            let next = prepared
+                .remaining
+                .remove_role_ids
+                .first()
+                .map(|id| (id.clone(), false))
+                .or_else(|| {
+                    prepared
+                        .remaining
+                        .add_role_ids
+                        .first()
+                        .map(|id| (id.clone(), true))
+                });
+            let Some((role, add)) = next else {
+                return Ok(if prepared.event.compensating {
+                    Execution::Compensated
+                } else {
+                    Execution::Applied
+                });
+            };
+            self.execute_step(prepared, &role, add).await?;
+        }
+        prepared.event.compensating = true;
+        self.checkpoint(prepared).await?;
+        Err(RuntimeError::Rest(SelfRoleRestError::Ambiguous))
+    }
+
+    async fn checkpoint(&self, prepared: &mut PreparedSelfRole) -> Result<(), RuntimeError> {
+        let stored = store_io(self.store.checkpoint_execution(
+            &prepared.event,
+            &prepared.audit.effects,
+            prepared.event.compensating,
+        ))
+        .await?;
+        if !stored {
+            // A later panel event may have rejected this audit while its remote
+            // exchange was in flight. Evidence is allowed; more sends are not.
+            store_io(
+                self.store
+                    .record_superseded_effects(&prepared.event, &prepared.audit.effects),
+            )
+            .await?;
+            return Err(RuntimeError::Stale);
+        }
+        prepared.event.effects = prepared.audit.effects.clone();
+        Ok(())
+    }
+
+    async fn execute_step(
+        &self,
+        prepared: &mut PreparedSelfRole,
+        role: &str,
+        add: bool,
+    ) -> Result<(), RuntimeError> {
+        let compensating = prepared.event.compensating;
+        let mut attempted = prepared.audit.effects.clone();
+        mark_attempt(&mut attempted, role, add);
+        // This checkpoint runs AFTER pacing, before send, with a fresh ownership
+        // check after its DB wait. An interrupted attempt remains unresolved.
+        let exchange = self
+            .executor
+            .self_role_step_journaled(
+                &self.guild_id,
+                &prepared.audit.member_id,
+                role,
+                add,
+                || async {
+                    prepared
+                        .owns()
+                        .await
+                        .map_err(|_| SelfRoleRestError::StaleClaim)
+                },
+                || async {
+                    if !store_io(self.store.checkpoint_execution(
+                        &prepared.event,
+                        &attempted,
+                        compensating,
+                    ))
+                    .await
+                    .map_err(|_| SelfRoleRestError::StaleClaim)?
+                    {
+                        return Err(SelfRoleRestError::StaleClaim);
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(RuntimeError::Rest)?;
+        prepared.audit.effects = attempted;
+        match exchange.result {
+            Ok(()) => {
+                if add {
+                    prepared.snapshot.member_role_ids.insert(role.into());
+                } else {
+                    prepared.snapshot.member_role_ids.remove(role);
+                }
+                observe_effects(
+                    &mut prepared.audit.effects,
+                    &prepared.event.pre_mutation_role_ids,
+                    &prepared.snapshot.member_role_ids,
+                );
+                if compensating {
+                    let restored = if add {
+                        &mut prepared.audit.effects.compensated_added_role_ids
+                    } else {
+                        &mut prepared.audit.effects.compensated_removed_role_ids
+                    };
+                    push_role(restored, role);
+                }
+            }
+            Err(SelfRoleRestError::Ambiguous) => {} // leave send intent unresolved
+            Err(_) => clear_unresolved(&mut prepared.audit.effects, role, add),
+        }
+        // Failure and rollback decision commit together. If ownership was lost,
+        // do NOT decide to restore the old before snapshot over a newer target.
+        if exchange.owned_after && exchange.result.is_err() {
+            prepared.event.compensating = true;
+        }
+        self.checkpoint(prepared).await?;
+        if !exchange.owned_after || !prepared.owns().await? {
+            return Err(RuntimeError::Stale);
+        }
+        if compensating {
+            exchange.result.map_err(RuntimeError::Rest)?;
+        }
+        Ok(())
+    }
+
     /// Claim first, exclusive lane second, authoritative policy/member last.
     /// No gateway/cache role set or permission mask participates in planning.
     pub async fn prepare(
@@ -438,9 +628,13 @@ impl SelfRoleRuntime {
         if panel_roles(panel, &intended) != event.desired_role_ids {
             return Err(RuntimeError::InvalidSnapshot);
         }
-        let remaining =
-            plan_select_delta(panel, &snapshot.member_role_ids, &event.desired_role_ids)
-                .map_err(|_| RuntimeError::InvalidSnapshot)?;
+        let recovery_target = if event.compensating {
+            &event.pre_mutation_role_ids
+        } else {
+            &event.desired_role_ids
+        };
+        let remaining = plan_select_delta(panel, &snapshot.member_role_ids, recovery_target)
+            .map_err(|_| RuntimeError::InvalidSnapshot)?;
         audit.option_key = plan.option_key.clone();
         audit.role_id = plan.role_id.clone();
         audit.operation = plan.operation;
@@ -471,6 +665,56 @@ impl SelfRoleRuntime {
         result?;
         Ok(Admission::Rejected(code))
     }
+}
+
+fn push_role(ids: &mut Vec<String>, role: &str) {
+    if !ids.iter().any(|id| id == role) {
+        ids.push(role.into());
+    }
+}
+
+fn mark_attempt(effects: &mut AuditEffects, role: &str, add: bool) {
+    let (attempts, unresolved) = if add {
+        (
+            &mut effects.attempted_added_role_ids,
+            &mut effects.unresolved_added_role_ids,
+        )
+    } else {
+        (
+            &mut effects.attempted_removed_role_ids,
+            &mut effects.unresolved_removed_role_ids,
+        )
+    };
+    push_role(attempts, role);
+    push_role(unresolved, role);
+}
+
+fn clear_unresolved(effects: &mut AuditEffects, role: &str, add: bool) {
+    let unresolved = if add {
+        &mut effects.unresolved_added_role_ids
+    } else {
+        &mut effects.unresolved_removed_role_ids
+    };
+    unresolved.retain(|id| id != role);
+}
+
+/// Evidence is the net state of ATTEMPTED panel roles versus immutable before,
+/// not a guess that every difference on Discord was caused by this event.
+fn observe_effects(effects: &mut AuditEffects, before: &[String], held: &HashSet<String>) {
+    effects.added_role_ids = effects
+        .attempted_added_role_ids
+        .iter()
+        .filter(|id| !before.contains(id) && held.contains(*id))
+        .cloned()
+        .collect();
+    effects.removed_role_ids = effects
+        .attempted_removed_role_ids
+        .iter()
+        .filter(|id| before.contains(id) && !held.contains(*id))
+        .cloned()
+        .collect();
+    effects.unresolved_added_role_ids.clear();
+    effects.unresolved_removed_role_ids.clear();
 }
 
 fn panel_roles(panel: &SelfRolePanel, roles: &HashSet<String>) -> Vec<String> {

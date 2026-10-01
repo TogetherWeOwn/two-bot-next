@@ -142,8 +142,34 @@ planning on the same executor:
   arrays, and separately computes remaining work against current roles. Changed
   catalogue/input intent fails closed; unrelated roles are not mutation targets.
 
-This checkpoint does **not** register handlers or enable role mutations. Actual
-execution, compensation, stale-worker committed-target repair, staging/dry-run
+The execution checkpoint adds durable, bounded role convergence, still **not**
+registered with the gateway:
+
+- `self_role_step_journaled` persists attempted/unresolved send intent inside the
+  shared paced reservation, after a live fence, and checks ownership again after
+  the database wait. Failed journaling prevents the send. Cancellation after
+  journaling is unresolved intent, not proof that Discord received a request.
+- Each execution step fetches and validates fresh member/hierarchy/permission
+  state, removes before adding, and targets only configured panel roles. A 204
+  records an observed exchange; definite rejection and ambiguous exchanges are
+  distinguished. Late results can update evidence but authorize no more sends.
+- Migration `0202_self_role_compensation_phase.sql` adds a monotonic rollback
+  boolean (29 audit columns after upgrade). Failed exchange evidence and the
+  rollback decision checkpoint atomically; neither a retry nor an applying
+  checkpoint can reset it. Recovery restores the immutable before target, not
+  the original desired target. Compensation retains attempted and confirmed
+  restoration history while net observed deltas follow authoritative reads.
+- `Execution::Applied`/`Compensated` are provisional convergence results, **not**
+  final audits or user success. A transport timeout cannot prove a remote call
+  has stopped. Stale-worker/late-exchange committed-target repair and atomic
+  final settlement are still required before these results can be published.
+- Isolated DB/mock regressions cover remove-then-add, partial rejection,
+  an ambiguously applied addition, failed compensation and restart into rollback.
+  Store coverage proves phase/evidence recovery and stale-generation refusal;
+  REST coverage proves failed journaling and post-journal loss prevent sends.
+
+This checkpoint does **not** register handlers or enable live role mutations.
+Stale-worker committed-target repair, atomic final settlement, staging/dry-run
 gates and gateway integration remain on the same follow-up. The REST regression
 target is `two-bot-discord --test self_roles_rest`; admission coverage is
 `two-bot self_role_runtime:: -- --include-ignored --test-threads=1`, opted in by

@@ -108,6 +108,9 @@ pub struct EventClaim {
     /// False only for admission before the authoritative REST snapshot. Once
     /// initialized, even an empty desired/pre-mutation set is immutable.
     pub intent_initialized: bool,
+    /// Monotonic rollback phase. Recovery must never retry the original target
+    /// after a failed exchange has committed the decision to compensate.
+    pub compensating: bool,
     /// Persisted effect snapshot at acquisition; attempts/compensations remain
     /// cumulative in storage while observed/unresolved fields are replaceable.
     pub effects: AuditEffects,
@@ -302,19 +305,20 @@ impl SelfRoleStore {
                 generation: 1,
                 recovered: false,
                 intent_initialized: initialized,
+                compensating: false,
                 effects: row.effects.clone(),
                 desired_role_ids: row.desired_role_ids.clone(),
                 pre_mutation_role_ids: row.pre_mutation_role_ids.clone(),
                 renew_after_ms: self_role_renew_after_ms(self.lease_ms),
             })
         } else {
-            type RecoveryRow = (i32, String, String, OffsetDateTime, Vec<String>, bool);
+            type RecoveryRow = (i32, String, String, OffsetDateTime, Vec<String>, bool, bool);
             let prior: Option<RecoveryRow> = sqlx::query_as(
                 "SELECT claim_generation, desired_role_ids, pre_mutation_role_ids,
                  processing_expires_at, ARRAY[added_role_ids,removed_role_ids,
                  attempted_added_role_ids,attempted_removed_role_ids,
                  compensated_added_role_ids,compensated_removed_role_ids,
-                 unresolved_added_role_ids,unresolved_removed_role_ids], intent_initialized
+                 unresolved_added_role_ids,unresolved_removed_role_ids], intent_initialized, compensating
                  FROM self_role_audit WHERE event_id=$1 AND outcome='processing'
                  AND guild_id=$2 AND member_id=$3 AND panel_id=$4 AND source_id=$5
                  AND source=$6 AND event_order IS NOT DISTINCT FROM $7
@@ -334,8 +338,15 @@ impl SelfRoleStore {
             .fetch_optional(&mut *tx)
             .await?;
             let now = self.now(&mut tx).await?;
-            if let Some((generation, desired, before, _, effects, intent_initialized)) =
-                prior.filter(|p| p.3 <= now)
+            if let Some((
+                generation,
+                desired,
+                before,
+                _,
+                effects,
+                intent_initialized,
+                compensating,
+            )) = prior.filter(|p| p.3 <= now)
             {
                 let effects = AuditEffects::decoded(&effects)?;
                 let next = generation
@@ -360,6 +371,7 @@ impl SelfRoleStore {
                     generation: next,
                     recovered: true,
                     intent_initialized,
+                    compensating,
                     effects,
                     desired_role_ids,
                     pre_mutation_role_ids,
@@ -664,6 +676,18 @@ impl SelfRoleStore {
         claim: &EventClaim,
         effects: &AuditEffects,
     ) -> Result<bool, StoreError> {
+        self.checkpoint_execution(claim, effects, false).await
+    }
+
+    /// Atomically retain exchange evidence and the monotonic rollback decision.
+    /// Like late effects this is token/generation fenced, not REST authorization.
+    /// A false phase never clears a persisted rollback, including after recovery.
+    pub async fn checkpoint_execution(
+        &self,
+        claim: &EventClaim,
+        effects: &AuditEffects,
+        compensating: bool,
+    ) -> Result<bool, StoreError> {
         let mut query = sqlx::query(
             "UPDATE self_role_audit SET added_role_ids=$1,removed_role_ids=$2,
              attempted_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
@@ -674,8 +698,10 @@ impl SelfRoleStore {
                  FROM jsonb_array_elements_text(compensated_added_role_ids::jsonb || $5::jsonb)),
              compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
                  FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
-             unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8
-             WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11 AND outcome='processing'",
+             unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8,
+             compensating=compensating OR $12
+             WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11 AND outcome='processing'
+             AND (NOT $12 OR intent_initialized)",
         );
         for effect in effects.encoded() {
             query = query.bind(effect);
@@ -684,6 +710,7 @@ impl SelfRoleStore {
             .bind(&claim.event_id)
             .bind(claim.token.expose())
             .bind(claim.generation)
+            .bind(compensating)
             .execute(&self.pool)
             .await?
             .rows_affected()

@@ -49,6 +49,10 @@
       "sha256": "04213c4ccd98ec47878fa2a52ffb0949943fe18dddfa8e9a9b5800a7c4e75cdf",
       "justification": "Distinguish pending admission from immutable empty snapshots for the TOG-10292 runtime; preserve existing intent and all legacy names."
     },
+    "crates/cutover/migrations/0202_self_role_compensation_phase.sql": {
+      "sha256": "3659d8b3d2bbbdc9a4aca6b4d2518dbdc204a9f6d381c8d7a9f6bc28a64ef0c4",
+      "justification": "Persist the monotonic self-role rollback phase alongside effects for TOG-10292; recovery must not resume a rejected original target. Preserve legacy names."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
