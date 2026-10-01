@@ -70,6 +70,9 @@ jobs:
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
         run: |
+          # On hosted/overflow runners the job container's root does not own the
+          # runner-owned checkout, so Git refuses it as dubious ownership.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
           # Tests that pin 127.0.0.1/localhost:5432 reach the service through
