@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "generator_channel_id": "101",
+  "category_id": "200",
+  "known_channels": [
+    {"id": "101", "kind": "voice"},
+    {"id": "102", "kind": "voice"},
+    {"id": "103", "kind": "voice"},
+    {"id": "200", "kind": "category"},
+    {"id": "300", "kind": "text"}
+  ],
+  "protected_channel_ids": ["102", "103"]
+}
