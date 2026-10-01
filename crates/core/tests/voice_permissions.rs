@@ -336,8 +336,7 @@ proptest! {
             source
                 .iter()
                 .find(|o| o.id == id && o.kind == kind)
-                .map(|o| o.allow)
-                .unwrap_or(0)
+                .map_or(0, |o| o.allow)
         };
         let required = use_required.then_some(500u64);
         let input = RoomPermissionInput {
@@ -384,9 +383,8 @@ proptest! {
         let owner_source = source
             .iter()
             .find(|o| o.id == OWNER && o.kind == OverrideKind::Member);
-        let (src_allow, src_deny) = owner_source
-            .map(|o| (o.allow, o.deny))
-            .unwrap_or((0, 0));
+        let (src_allow, src_deny) =
+            owner_source.map_or((0, 0), |o| (o.allow, o.deny));
         prop_assert_eq!(owner_out.allow, (src_allow | grant) & !src_deny);
         prop_assert_eq!(owner_out.allow & PERM_MANAGE_ROLES, 0);
         prop_assert_eq!(owner_out.allow & PERM_ADMINISTRATOR, 0);
