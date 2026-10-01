@@ -78,6 +78,8 @@ pub trait FunnelStore: Send + Sync {
         at: &str,
     ) -> Option<EventType>;
     fn has_event(&self, guild_id: Snowflake, member_id: Snowflake, event_type: EventType) -> bool;
+    /// Optional durable invite seam; in-memory replay already owns its tracker.
+    fn stage_invite_snapshot(&self, _snapshot: crate::gateway_funnel::InviteSnapshotWrite) {}
 }
 
 /// In-memory [`FunnelStore`] for tests and the replay harness.

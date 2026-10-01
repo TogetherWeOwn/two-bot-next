@@ -1,7 +1,8 @@
 //! Opt-in database + gateway tests. Never inherit the runtime DATABASE_URL.
 //! Only agent-testdb or CI's loopback service, as agent_test, is accepted.
 
-use std::str::FromStr;
+#[path = "../tests/common/database_guard.rs"]
+mod database_guard;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{json, Value};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
@@ -27,6 +28,7 @@ use crate::gateway::{
 };
 
 mod deadline;
+mod member_journey;
 mod recovery;
 
 const GUILD: &str = "2222";
@@ -42,15 +44,7 @@ struct TestDb {
 impl TestDb {
     async fn new() -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let url = std::env::var("TWO_GATEWAY_TEST_DATABASE_URL")
-            .expect("set the dedicated test URL; runtime DATABASE_URL is never used");
-        let options = PgConnectOptions::from_str(&url).expect("test URL");
-        assert!(matches!(
-            options.get_host(),
-            "agent-testdb" | "localhost" | "127.0.0.1"
-        ));
-        assert_eq!(options.get_username(), "agent_test");
-        assert_eq!(options.get_database(), Some("agent_test"));
+        let options = database_guard::test_options();
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(options.clone())
@@ -388,7 +382,13 @@ async fn spawn_runner(
         db.store.milestones().await.expect("milestones"),
     ));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
-    let task = tokio::spawn(run_shard(shard, pipeline, state.clone(), db.store.clone()));
+    let task = tokio::spawn(run_shard(
+        shard,
+        pipeline,
+        state.clone(),
+        db.store.clone(),
+        None,
+    ));
     (task, state)
 }
 
