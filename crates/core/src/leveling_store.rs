@@ -239,7 +239,7 @@ pub async fn current_award(
 
 /// Full read model for `/rank` (legacy `profile`): XP split, 1-based rank
 /// with ties broken by member id ascending, member count, next-level floor.
-/// A member with no row reads zero XP, ranked below higher-XP members.
+/// A member with no row reads zero XP and no rank; stored zero-XP rows rank.
 ///
 /// One statement, so XP, rank and member count share a single snapshot: an
 /// award committing between separate SELECTs would otherwise compare the new
@@ -256,7 +256,7 @@ pub async fn profile(
         i64,
         i64,
         i64,
-        i64,
+        Option<i64>,
         i64,
     ) = sqlx::query_as(
         "SELECT
@@ -264,10 +264,11 @@ pub async fn profile(
            COALESCE(m.message_xp, 0),
            COALESCE(m.voice_xp, 0),
            COALESCE(m.imported_xp, 0),
-           (SELECT COUNT(*) FROM member_levels
-            WHERE guild_id = $1
-              AND (xp > COALESCE(m.xp, 0)
-                   OR (xp = COALESCE(m.xp, 0) AND member_id < $2))),
+           CASE WHEN m.member_id IS NULL THEN NULL
+                ELSE (SELECT COUNT(*) + 1 FROM member_levels
+                      WHERE guild_id = $1
+                        AND (xp > m.xp OR (xp = m.xp AND member_id < $2)))
+           END,
            (SELECT COUNT(*) FROM member_levels WHERE guild_id = $1)
          FROM (SELECT 1) AS one
          LEFT JOIN member_levels m
@@ -292,7 +293,7 @@ pub async fn profile(
         message_xp,
         voice_xp,
         imported_xp,
-        rank: rank as u64 + 1,
+        rank: rank.map(|rank| rank as u64),
         member_count: member_count as u64,
         next_level_xp: super::leveling::total_xp_for_level(level + 1),
     })
