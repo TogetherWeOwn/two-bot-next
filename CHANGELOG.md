@@ -29,7 +29,14 @@
   execution and lost acknowledgments remain fenced. Recurring scratch restore
   drills allocate fresh migrated test-only targets and retain prior databases,
   private archive copies and stage receipts instead of overwriting moderation
-  history. The direct-restore safety guard and moderation default-off are unchanged.
+  history. Scratch-only pinned legacy DDL prepares seven archive tables not yet
+  shipped by S6; receipts retain dropped-column diagnostics and sync the retained
+  directory entry before allocation. Archive hashing uses a bounded read buffer
+  instead of allocating the entire compressed file. Restore explicitly locks/checks the newer
+  channel FK child and truncates it only when empty, without CASCADE. Destination
+  history protection and moderation default-off remain enforced. CI uses separate
+  guarded databases for backup round-trip and actual-CLI publication faults;
+  runbook command-drift checks follow the drill's real confirmation parser.
 - Resolve historical member-ban acceptance only with exact-attempt acceptance
   and ordering evidence, atomically audited without taking newer ownership or
   clearing dispatched DELETE uncertainty. Moderation activation remains deferred.

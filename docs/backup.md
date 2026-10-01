@@ -47,10 +47,12 @@ All 23 bot-owned tables are dumped (see `DUMP_TABLES` in
 This includes `moderation_member_bans`: acceptance, insertion-order generation
 and prepared/rejected fences are read in the same repeatable-read snapshot as
 scheduled unbans and idempotency. **Restore refuses any destination with member
-ban, scheduled-unban, audit, idempotency or warning history**, before truncation.
-It locks all replaced tables before checking so concurrent writes cannot slip
-through. Preserve the existing database; use a fresh migrated target, not a
-manual deletion of evidence to satisfy this precondition. This deliberately
+ban, scheduled-unban, audit, idempotency, warning or channel-execution history**,
+before truncation. When the newer `moderation_channel_executions` FK child exists,
+it is explicitly locked, checked for history and included in the same truncation
+only when empty; no `CASCADE` bypass removes unrelated evidence. It locks all
+replaced tables before checking so concurrent writes cannot slip through.
+Preserve the existing database; use a fresh migrated target, not a manual deletion of evidence to satisfy this precondition. This deliberately
 avoids guessing how to merge incompatible ownership generations or forgetting
 post-backup PUT/DELETE evidence. Other bot-owned tables are still replaced.
 Generation resumes after the restored MAX (empty ownership restarts at 1).
@@ -155,31 +157,48 @@ mismatch → exit 1 with the residual operations listed.
 `deploy/two-bot-next-restore-drill.{service,timer}` invokes `restore-drill`
 for the newest published backup and requires `RESTORE VERIFIED`. **Every run
 allocates a distinct fresh scratch database**, applies the same embedded S6
-migrations, then performs the normal guarded restore. It never reuses or drops
-previous targets. A destination with moderation history still refuses direct
-restore, even with `--force`; do not erase history to pass that guard.
+migrations, then prepares seven still-unported legacy archive tables using the
+full preserved DDL pinned by an offline provenance regression. This private
+scratch-only compatibility layer is not a production migration, feature
+initializer or consumer; it adds no roles, grants or backfill. Future S6-owned
+schemas remain authoritative (`IF NOT EXISTS`). It then performs the normal
+guarded restore and never reuses or drops previous targets. A destination with
+moderation history still refuses direct restore, even with `--force`; do not erase
+history to pass that guard.
 
 The currently authorized provisioning path is only the disposable
 `agent-testdb:5432` service, explicitly empty-password `agent_test` and bootstrap
 `postgres`. Production/staging, arbitrary hosts, runtime credentials, URL query
 options and inherited libpq `PG*` settings refuse before allocation. No login,
-role, runtime grant or Discord consumer is created. Extending this binding to
-another environment requires separate authorization and review, not a URL edit.
+role, membership or Discord consumer is created. Ordinary shipped S6 migrations
+can apply their existing scoped grants to an already-present runtime group in
+this new test database; the drill adds no special runtime grants or credentials
+and changes no existing database. Extending this binding to another environment
+requires separate authorization and review, not a URL edit.
 
 Operator installation must provide protected `/etc/two-bot-next/restore-drill.env`
 with `TWO_RESTORE_DRILL_BOOTSTRAP_URL=postgres://agent_test:@agent-testdb:5432/postgres`.
 The unit does not read shared `backup.env`, source or upload credentials. Its
-`StateDirectory` supplies `/var/lib/two-bot-next-restore-drills`, writable under
-the unit sandbox. No service installation/execution is authorized by this PR.
+`StateDirectory` supplies protected `/var/lib/two-bot-next-restore-drills`,
+writable under the unit sandbox. The absolute evidence root must already exist;
+manual operators must provision a protected retained directory first. The drill
+syncs its new child directory entry before database allocation. No service
+installation/execution is authorized by this PR.
 
-Each run retains a private archive copy and exclusive `planned`, `allocated`,
+Each run retains a private archive copy, hashes it with a bounded 32 KiB read
+buffer rather than loading the whole compressed archive, and writes exclusive
+`planned`, `allocated`,
 `migrated` and `verified` JSON receipts as those stages complete. A provisioning,
 migration or restore failure records a `failed` classification without raw SQL
 errors or credentials; any partially allocated target and completed evidence
 remain. Archive-validation failures allocate no database and preserve the private
 copy for diagnosis. No prior target, archive or receipt is overwritten or pruned.
-Capacity/retention decisions require a separate authorized evidence-preservation
-policy; do not clear drill history to free a build cache or make the next run pass.
+The verified receipt includes `dropped_columns` and warns when any archive
+columns are absent from the target. `RESTORE VERIFIED` proves per-table row counts,
+not that every source column survived; inspect these diagnostics and the retained
+archive before accepting data fidelity. Neither receipt nor counts authorize
+moderation activation. Capacity/retention decisions require a separate authorized
+evidence-preservation policy; do not clear drill history to free a build cache or make the next run pass.
 
 Manual drill (with that explicit scratch authority, no production restore):
 

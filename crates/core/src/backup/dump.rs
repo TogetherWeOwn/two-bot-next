@@ -271,11 +271,21 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     let mut dropped_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     let mut tx = pool.begin().await?;
+    // The newer channel fence references moderation_idempotency. Include it
+    // explicitly only when present; never CASCADE through unrelated history.
+    let has_channel_fence: bool =
+        sqlx::query_scalar("SELECT to_regclass('moderation_channel_executions') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await?;
+    let mut replaced_tables = DUMP_TABLES.to_vec();
+    if has_channel_fence {
+        replaced_tables.push("moderation_channel_executions");
+    }
     // Hold the same locks TRUNCATE requires before checking the destination.
     // No concurrent writer may add evidence between the refusal and replacement.
     sqlx::query(audited(format!(
         "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
-        DUMP_TABLES.join(", ")
+        replaced_tables.join(", ")
     )))
     .execute(&mut *tx)
     .await?;
@@ -288,7 +298,14 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     )
     .fetch_one(&mut *tx)
     .await?;
-    if has_history {
+    let has_channel_history = if has_channel_fence {
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM moderation_channel_executions)")
+            .fetch_one(&mut *tx)
+            .await?
+    } else {
+        false
+    };
+    if has_history || has_channel_history {
         return Err(DbDumpError::Refused(
             "destination moderation history exists; restore into a fresh migrated target, preserve the destination and reconcile both histories before enabling moderation".into(),
         ));
@@ -297,7 +314,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // in the target before; it is set explicitly below.
     sqlx::query(audited(format!(
         "TRUNCATE {} RESTART IDENTITY",
-        DUMP_TABLES.join(", ")
+        replaced_tables.join(", ")
     )))
     .execute(&mut *tx)
     .await?;

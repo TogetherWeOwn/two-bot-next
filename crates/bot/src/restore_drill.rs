@@ -104,6 +104,13 @@ async fn restore_fresh(
         two_bot_cutover::db::migrate_pool(&target)
             .await
             .map_err(|_| "scratch migration failed; target retained")?;
+        // S6 has not yet ported seven legacy archive tables. Rehearsal uses
+        // their pinned full legacy DDL only in this new disposable target,
+        // never as a foreign-feature migration or runtime initializer.
+        sqlx::raw_sql(include_str!("restore_drill_schema.sql"))
+            .execute(&target)
+            .await
+            .map_err(|_| "scratch archive compatibility failed; target retained")?;
         receipt(dir, "migrated", identity)?;
         let report = dump::restore(&target, archive)
             .await
@@ -116,6 +123,7 @@ async fn restore_fresh(
             "target_database": name,
             "archive": identity["archive"],
             "restored": report.restored,
+            "dropped_columns": report.dropped_columns,
             "quarantined_unbans": report.quarantined_unbans,
             "missing_member_ban_ownership": report.missing_member_ban_ownership,
         }))
@@ -139,7 +147,11 @@ async fn run(file: &Path, evidence_root: &Path) -> Result<PathBuf, &'static str>
         return Err("drill archive exceeds compressed size budget");
     }
     let name = format!("two_next_restore_drill_{:032x}", rand::random::<u128>());
-    std::fs::create_dir_all(evidence_root).map_err(|_| "cannot create drill evidence root")?;
+    if !evidence_root.is_dir() {
+        return Err(
+            "drill evidence root must already exist; provision a protected retained directory",
+        );
+    }
     let dir = evidence_root.join(&name);
     DirBuilder::new()
         .mode(0o700)
@@ -168,16 +180,31 @@ async fn run(file: &Path, evidence_root: &Path) -> Result<PathBuf, &'static str>
     let manifest = dump_file::inspect(&archive)
         .map_err(|_| "invalid drill archive; no database provisioned")?
         .manifest;
-    let archive_hash =
-        s3::sha256_hex(&std::fs::read(&archive).map_err(|_| "cannot hash retained archive")?);
+    let archive_hash = s3::sha256_reader_hex(
+        std::fs::File::open(&archive).map_err(|_| "cannot open retained archive for hashing")?,
+    )
+    .map_err(|_| "cannot hash retained archive")?;
     let identity = json!({
         "target_database": name,
         "scratch_service": "agent-testdb:5432",
         "archive": {"sha256": archive_hash, "bytes": bytes, "created_at": manifest.created_at},
     });
     receipt(&dir, "planned", &identity)?;
+    // Make the child directory's entry durable before CREATE DATABASE can
+    // commit. The protected evidence root is pre-provisioned, never invented.
+    std::fs::File::open(evidence_root)
+        .and_then(|root| root.sync_all())
+        .map_err(|_| "cannot sync retained drill directory entry; no database provisioned")?;
     match restore_fresh(&name, &archive, &dir, &identity).await {
-        Ok(verified) => receipt(&dir, "verified", &verified)?,
+        Ok(verified) => {
+            if verified["dropped_columns"]
+                .as_object()
+                .is_some_and(|columns| !columns.is_empty())
+            {
+                eprintln!("restore-drill: archive columns were dropped; inspect retained receipt");
+            }
+            receipt(&dir, "verified", &verified)?;
+        }
         Err(classification) => {
             receipt(
                 &dir,

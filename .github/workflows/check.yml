@@ -80,6 +80,9 @@ jobs:
       - name: offline build-cache safety regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
 
+      - name: Scratch drill schema provenance (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_restore_drill_schema.py' -v
+
       - name: parity soak checklist coverage (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
@@ -126,6 +129,7 @@ jobs:
         run: |
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
           printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
@@ -142,7 +146,18 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
-        run: cargo test --workspace --test '*' --features two-bot-core/db --locked
+        # The publication regression has its own guarded DB and actual binary
+        # in the dedicated step below; never feed it the round-trip fixture URL.
+        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump
+
+      - name: Backup publication faults (actual CLI, dedicated CI service database)
+        env:
+          TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_publication_ci
+          TWO_BOT_TEST_BACKUP_BIN: ${{ github.workspace }}/target/debug/two-bot
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-publication-tests
+        run: |
+          cargo build -p two-bot --locked
+          cargo test -p two-bot-core --features db --locked --test backup_dump_publication -- --nocapture
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -209,6 +224,8 @@ jobs:
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
 
       - name: Consecutive retained restore drills (actual CLI, CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).

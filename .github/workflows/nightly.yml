@@ -100,6 +100,7 @@ jobs:
       - name: Full workspace sweep including ignored tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
         run: >-
           cargo test --workspace --all-features --locked -- --include-ignored --test-threads=1
           --skip channel_moderation_store::tests::lockdown_round_trip_stores_and_restores_exact_masks
@@ -115,6 +116,7 @@ jobs:
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance
+          --skip dump_inspect_restore_round_trip
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:

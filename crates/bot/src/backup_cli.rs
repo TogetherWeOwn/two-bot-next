@@ -124,10 +124,12 @@ two-bot operator commands
       `RESTORE VERIFIED` on the last line, and exit 0, is the only success.
 
   two-bot restore-drill <backup.ndjson.gz> --confirm-scratch
-      Allocate a fresh agent-testdb scratch database, migrate and restore it.
+      Allocate a fresh agent-testdb scratch database, apply shipped migrations
+      plus pinned scratch-only legacy archive DDL, then guarded restore.
       Retain prior targets, archives and exclusive receipts; never reuse/drop.
+      Inspect dropped_columns in the receipt: verification proves row counts.
       Env: TWO_RESTORE_DRILL_BOOTSTRAP_URL (explicit empty-password test binding),
-           TWO_RESTORE_DRILL_EVIDENCE_DIR (absolute retained directory).
+           TWO_RESTORE_DRILL_EVIDENCE_DIR (pre-existing protected absolute directory).
       No TWO_RESTORE_URL/source credentials or live Discord are used.
 
   two-bot backup-upload <dump.ndjson.gz>

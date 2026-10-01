@@ -14,6 +14,7 @@ const read = (path: string) => readFileSync(new URL(path, root), "utf8");
 const runbook = read("docs/runbook.md");
 const main = read("crates/bot/src/main.rs");
 const backup = read("crates/bot/src/backup_cli.rs");
+const drill = read("crates/bot/src/restore_drill.rs");
 const scripts: Record<string, string> = JSON.parse(read("wrangler/package.json")).scripts;
 
 function shellCommands(markdown: string): string[] {
@@ -22,16 +23,16 @@ function shellCommands(markdown: string): string[] {
   );
 }
 
-function rustFunction(name: string): string {
-  const start = backup.search(new RegExp(`^(?:pub )?(?:async )?fn ${name}\\(`, "m"));
+function rustFunction(name: string, source = backup): string {
+  const start = source.search(new RegExp(`^(?:pub )?(?:async )?fn ${name}\\(`, "m"));
   assert.ok(start >= 0, `missing binary parser: ${name}`);
-  const rest = backup.slice(start);
+  const rest = source.slice(start);
   const next = rest.slice(1).search(/^(?:(?:pub )?(?:async )?fn |mod |#\[cfg\(test\)\])/m);
   return next < 0 ? rest : rest.slice(0, next + 1);
 }
 
 function checkBinaryCommands(markdown: string): string[] {
-  const dispatch = new Map([...backup.matchAll(/^\s*"([a-z-]+)" => (cmd_[a-z_]+)\(([^)]*)\)/gm)]
+  const dispatch = new Map([...backup.matchAll(/^\s*"([a-z-]+)" => (cmd_[a-z_]+|crate::restore_drill::dispatch)\(([^)]*)\)/gm)]
     .map((m) => [m[1], { handler: m[2], args: m[3] }]));
   assert.ok(main.includes('backup_cli::dispatch(&cli_args)'), "backup dispatch must remain wired");
   const seen: string[] = [];
@@ -51,12 +52,14 @@ function checkBinaryCommands(markdown: string): string[] {
       // No-argument dispatch arms ignore trailing flags: never advertise those
       // as controls. For restore, follow the handler into its actual parser.
       if (arm.args) {
-        let parser = rustFunction(arm.handler);
+        let parser = arm.handler === "crate::restore_drill::dispatch"
+          ? rustFunction("dispatch", drill)
+          : rustFunction(arm.handler);
         if (arm.handler === "cmd_restore") {
           assert.ok(parser.includes("parse_restore_args(args)"));
           parser = rustFunction("parse_restore_args");
         }
-        for (const option of parser.matchAll(/==\s*"(--[a-z-]+)"|"(--[a-z-]+)"\s*=>/g)) {
+        for (const option of parser.matchAll(/(?:==|!=)\s*"(--[a-z-]+)"|"(--[a-z-]+)"\s*=>/g)) {
           options.add(option[1] ?? option[2]);
         }
       }
@@ -137,10 +140,10 @@ test("operations runbook links readiness guidance without case-colliding filenam
 // Intentional typo fixtures prove this test does not silently skip new commands.
 test("binary runbook examples grep the selected dispatcher/parser, not help prose", () => {
   const commands = checkBinaryCommands(runbook);
-  for (const command of ["gateway", "--help", "--healthcheck", "backup", "restore", "backup-upload", "guild-config-snapshot", "guild-config-restore"]) {
+  for (const command of ["gateway", "--help", "--healthcheck", "backup", "restore", "restore-drill", "backup-upload", "guild-config-snapshot", "guild-config-restore"]) {
     assert.ok(commands.includes(command), `missing operator example: ${command}`);
   }
-  for (const command of ["restart", "restore file --dryrun", "backup --dry-run", "guild-config-snapshot --apply", "backup-upload file --force", "restore file --apply", "guild-config-restore --snapshot file --dry-run"]) {
+  for (const command of ["restart", "restore file --dryrun", "backup --dry-run", "guild-config-snapshot --apply", "backup-upload file --force", "restore-drill file --force", "restore-drill file --dry-run", "restore file --apply", "guild-config-restore --snapshot file --dry-run"]) {
     assert.throws(() => checkBinaryCommands(`\`\`\`bash\ntwo-bot ${command}\n\`\`\``), /unimplemented/);
   }
 });
@@ -182,7 +185,7 @@ test("Wrangler runbook examples exist in npm scripts and pinned CLI help", () =>
 
 test("shell fences contain only covered tools and one-line examples", () => {
   for (const line of shellCommands(runbook)) {
-    assert.match(line, /^(?:npm |curl |env -u TWO_RESTORE_URL two-bot |(?:TWO_DATABASE_URL=\S+ |TWO_RESTORE_URL=\S+ )?two-bot(?: |$))/);
+    assert.match(line, /^(?:npm |curl |env -u TWO_RESTORE_URL two-bot |(?:TWO_DATABASE_URL=\S+ |TWO_RESTORE_URL=\S+ |TWO_RESTORE_DRILL_BOOTSTRAP_URL=\S+ TWO_RESTORE_DRILL_EVIDENCE_DIR=\S+ )?two-bot(?: |$))/);
     assert.doesNotMatch(line, /[|;]|&&|\\$/);
   }
 });
