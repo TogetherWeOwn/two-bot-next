@@ -1,0 +1,6 @@
+/target/
+/artifacts/
+/coverage/
+# Keep only reviewed seeds; libFuzzer writes generated cases into its first corpus.
+/corpus/*/*
+!/corpus/*/seed-*
