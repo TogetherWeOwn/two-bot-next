@@ -292,7 +292,7 @@ impl OnboardingRuntime {
                 }
                 let channel = self
                     .first_postable(&config, &config.goodbye_channel_ids)
-                    .await;
+                    .await?;
                 if let Some(GoodbyeEffect::Post {
                     channel_id,
                     content,
@@ -322,18 +322,31 @@ impl OnboardingRuntime {
         }
     }
 
-    async fn first_postable(&self, config: &OnboardingConfig, channels: &[u64]) -> Option<String> {
+    async fn first_postable(
+        &self,
+        config: &OnboardingConfig,
+        channels: &[u64],
+    ) -> Result<Option<String>, RuntimeError> {
         if channels.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let access = MemberAccess::load(&self.executor, config.guild_id, self.bot_id).await?;
+        let Some(access) = MemberAccess::load(&self.executor, config.guild_id, self.bot_id)
+            .await
+            .map_err(|_| RuntimeError::Discord)?
+        else {
+            return Ok(None);
+        };
         for channel in channels {
             let channel = channel.to_string();
-            if access.permits(&self.executor, &channel, true).await {
-                return Some(channel);
+            if access
+                .permits(&self.executor, &channel, true)
+                .await
+                .map_err(|_| RuntimeError::Discord)?
+            {
+                return Ok(Some(channel));
             }
         }
-        None
+        Ok(None)
     }
 
     async fn welcome(
@@ -360,7 +373,7 @@ impl OnboardingRuntime {
         } else {
             config.landing_channel_ids.clone()
         };
-        let Some(channel) = self.first_postable(config, &channels).await else {
+        let Some(channel) = self.first_postable(config, &channels).await? else {
             return Ok(());
         };
         let WelcomeEffect::Post {
@@ -423,8 +436,7 @@ impl OnboardingRuntime {
             moderation: false,
             tickets: false,
             self_roles: false,
-            onboarding_picker: config.gates.mode != OnboardingMode::Session
-                && !config.landing_channel_ids.is_empty(),
+            onboarding_picker: config.gates.mode != OnboardingMode::Session,
             session_picker: config.gates.mode == OnboardingMode::Session,
         });
         let RoutedInteraction::Component {
@@ -513,12 +525,14 @@ impl OnboardingRuntime {
         if handler == ComponentHandler::SessionPicker {
             let access = MemberAccess::load(&self.executor, config.guild_id, member_id)
                 .await
+                .map_err(|_| RuntimeError::Member)?
                 .ok_or(RuntimeError::Member)?;
             let mut visible = HashSet::new();
             for pick in &config.session_picks {
                 if access
                     .permits(&self.executor, &pick.channel_id, false)
                     .await
+                    .map_err(|_| RuntimeError::Member)?
                 {
                     visible.insert(pick.channel_id.clone());
                 }
@@ -560,10 +574,11 @@ impl OnboardingRuntime {
         let roles = if config.gates.dry_run {
             vec![]
         } else {
-            match MemberAccess::load(&self.executor, config.guild_id, member_id).await {
-                Some(access) => access.role_ids,
-                None => return Err(RuntimeError::Member),
-            }
+            MemberAccess::load(&self.executor, config.guild_id, member_id)
+                .await
+                .map_err(|_| RuntimeError::Member)?
+                .ok_or(RuntimeError::Member)?
+                .role_ids
         };
         let role_refs: Vec<_> = roles.iter().map(String::as_str).collect();
         let Some(outcome) = adjudicate_game_select(
@@ -596,6 +611,7 @@ impl OnboardingRuntime {
         }
         let access = MemberAccess::load(&self.executor, config.guild_id, member_id)
             .await
+            .map_err(|_| RuntimeError::Member)?
             .ok_or(RuntimeError::Member)?;
         let mut visible = HashSet::new();
         let channels: HashSet<_> = keys
@@ -608,7 +624,11 @@ impl OnboardingRuntime {
             })
             .collect();
         for channel in channels {
-            if access.permits(&self.executor, channel, false).await {
+            if access
+                .permits(&self.executor, channel, false)
+                .await
+                .map_err(|_| RuntimeError::Member)?
+            {
                 visible.insert(channel.to_owned());
             }
         }

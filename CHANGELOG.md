@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Preserve unavailable onboarding permission evidence for bounded durable recovery instead of consuming unsent welcome/goodbye jobs; distinguish visible forum routing from plain-message posting and keep existing game pickers usable without landing channels, including anchor-only configuration. Add shaped forum, hot-removal and mock-shard transient-read restart regressions; validation and the independent review gate remain pending.
 - Include the onboarding recovery table and sequence in the reviewed runtime privilege matrix so DML-only gateway startup can recover pending jobs; preserve web-reader denial and verify queue grants through isolated role regressions.
 - Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
 

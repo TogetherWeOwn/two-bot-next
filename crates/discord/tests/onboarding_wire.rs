@@ -15,6 +15,51 @@ fn executor(mock: &MockRest) -> ActionExecutor {
 }
 
 #[tokio::test]
+async fn onboarding_permission_evidence_distinguishes_unavailable_from_denied() {
+    use serde_json::json;
+    use two_bot_discord::onboarding_permissions::{AccessUnavailable, MemberAccess};
+
+    let mock = MockRest::start(vec![], ScriptedResponse::status(503)).await;
+    assert!(executor(&mock)
+        .get_json_checked("/guilds/22")
+        .await
+        .is_err());
+    assert!(matches!(
+        MemberAccess::load(&executor(&mock), 22, 44).await,
+        Err(AccessUnavailable)
+    ));
+    mock.shutdown().await;
+
+    let mock = MockRest::start(vec![], ScriptedResponse::status(403)).await;
+    assert!(MemberAccess::load(&executor(&mock), 22, 44)
+        .await
+        .unwrap()
+        .is_none());
+    mock.shutdown().await;
+
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id":"22", "owner_id":"99"})),
+            ScriptedResponse::json(200, json!([{"id":"22", "permissions":"3072"}])),
+            ScriptedResponse::json(200, json!({"user":{"id":"44"}, "roles":[]})),
+            ScriptedResponse::status(404),
+        ],
+        ScriptedResponse::status(503),
+    )
+    .await;
+    let access = MemberAccess::load(&executor(&mock), 22, 44)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!access.permits(&executor(&mock), "12", true).await.unwrap());
+    assert_eq!(
+        access.permits(&executor(&mock), "12", true).await,
+        Err(AccessUnavailable)
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn shared_executor_renders_each_mode_and_goodbye_without_extra_messages() {
     let mock = MockRest::start(
         vec![],

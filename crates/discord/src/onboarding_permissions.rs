@@ -15,6 +15,10 @@ fn snowflake(value: &Value) -> Option<u64> {
     value.as_str()?.parse().ok().filter(|id| *id != 0)
 }
 
+/// No usable REST evidence was obtained. This is not a proven permission denial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessUnavailable;
+
 /// One live member/role snapshot. Build another after role writes; never infer
 /// permissions from the old interaction payload or only @everyone's overwrite.
 #[derive(Debug)]
@@ -64,34 +68,47 @@ impl MemberAccess {
 
     /// A fresh REST read, bounded as a group so a rate-limit loop cannot hold
     /// the feature worker indefinitely. Missing/malformed data never grants access.
-    pub async fn load(executor: &ActionExecutor, guild_id: u64, user_id: u64) -> Option<Self> {
+    pub async fn load(
+        executor: &ActionExecutor,
+        guild_id: u64,
+        user_id: u64,
+    ) -> Result<Option<Self>, AccessUnavailable> {
         tokio::time::timeout(Duration::from_secs(10), async {
-            let guild = executor
-                .get_json(&format!("/guilds/{guild_id}"))
-                .await
-                .ok()??;
-            let roles = executor
-                .get_json(&format!("/guilds/{guild_id}/roles"))
-                .await
-                .ok()??;
-            let member = executor
-                .get_json(&format!("/guilds/{guild_id}/members/{user_id}"))
-                .await
-                .ok()??;
-            Self::from_json(guild_id, user_id, &guild, &roles, &member)
+            let mut evidence = Vec::new();
+            for path in [
+                format!("/guilds/{guild_id}"),
+                format!("/guilds/{guild_id}/roles"),
+                format!("/guilds/{guild_id}/members/{user_id}"),
+            ] {
+                let Some(value) = executor
+                    .get_json_checked(&path)
+                    .await
+                    .map_err(|_| AccessUnavailable)?
+                else {
+                    return Ok(None);
+                };
+                evidence.push(value);
+            }
+            Ok(Self::from_json(
+                guild_id,
+                user_id,
+                &evidence[0],
+                &evidence[1],
+                &evidence[2],
+            ))
         })
         .await
-        .ok()
-        .flatten()
+        .map_err(|_| AccessUnavailable)?
     }
 
     fn channel_permissions(&self, channel: &Value) -> Option<u64> {
         if snowflake(&channel["guild_id"])? != self.guild_id {
             return None;
         }
-        // Only ordinary guild text/news and voice-text surfaces. DMs, forums,
-        // media and threads have different creation/membership requirements.
-        if !matches!(channel["type"].as_u64()?, 0 | 2 | 5 | 13) {
+        // Guild forum/media visibility uses the same overwrites. Whether the
+        // executor can post a plain message is a separate check in permits.
+        // DMs and threads still require different membership evidence.
+        if !matches!(channel["type"].as_u64()?, 0 | 2 | 5 | 13 | 15 | 16) {
             return None;
         }
         let mut everyone = (0, 0);
@@ -128,27 +145,34 @@ impl MemberAccess {
 
     /// Validate the requested identity too: a proxy/cache returning another
     /// channel must not make a configured destination appear safe.
-    pub async fn permits(&self, executor: &ActionExecutor, channel_id: &str, post: bool) -> bool {
+    pub async fn permits(
+        &self,
+        executor: &ActionExecutor,
+        channel_id: &str,
+        post: bool,
+    ) -> Result<bool, AccessUnavailable> {
         let Some(expected) = channel_id.parse::<u64>().ok().filter(|id| *id != 0) else {
-            return false;
+            return Ok(false);
         };
         let channel = tokio::time::timeout(
             Duration::from_secs(5),
-            executor.get_json(&format!("/channels/{expected}")),
+            executor.get_json_checked(&format!("/channels/{expected}")),
         )
         .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten();
+        .map_err(|_| AccessUnavailable)?
+        .map_err(|_| AccessUnavailable)?;
         let Some(channel) = channel else {
-            return false;
+            return Ok(false);
         };
-        if snowflake(&channel["id"]) != Some(expected) {
-            return false;
+        if snowflake(&channel["id"]) != Some(expected)
+            || (post && !matches!(channel["type"].as_u64(), Some(0 | 2 | 5 | 13)))
+        {
+            return Ok(false);
         }
         let needed = VIEW_CHANNEL | if post { SEND_MESSAGES } else { 0 };
-        self.channel_permissions(&channel)
-            .is_some_and(|bits| bits & needed == needed)
+        Ok(self
+            .channel_permissions(&channel)
+            .is_some_and(|bits| bits & needed == needed))
     }
 }
 

@@ -820,6 +820,21 @@ impl ActionExecutor {
     /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
     /// is refused without I/O, never silently rewritten (finding 2).
     pub async fn get_json(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
+        self.read_json(path, false).await
+    }
+
+    /// Permission evidence must distinguish denied/absent (403/404) from an
+    /// unavailable or unreadable response. Keep the shared paced read policy,
+    /// but never let a transient failure look like a proven delivery skip.
+    pub async fn get_json_checked(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
+        self.read_json(path, true).await
+    }
+
+    async fn read_json(
+        &self,
+        path: &str,
+        checked: bool,
+    ) -> Result<Option<serde_json::Value>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
         loop {
@@ -837,19 +852,38 @@ impl ActionExecutor {
                 }
             };
             match res.status {
-                200..=299 => return Ok(serde_json::from_slice(&res.body).ok()),
+                200..=299 => {
+                    let value = serde_json::from_slice(&res.body);
+                    return if checked {
+                        value
+                            .map(Some)
+                            .map_err(|_| "unreadable Discord evidence".to_owned())
+                    } else {
+                        Ok(value.ok())
+                    };
+                }
                 429 => {
                     tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
                 }
                 403 | 404 => return Ok(None),
                 500..=599 => {
                     if attempt >= MAX_HTTP_TRIES - 1 {
-                        return Ok(None);
+                        return if checked {
+                            Err("Discord evidence unavailable".to_owned())
+                        } else {
+                            Ok(None)
+                        };
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
                     attempt += 1;
                 }
-                _ => return Ok(None),
+                _ => {
+                    return if checked {
+                        Err("Discord evidence unavailable".to_owned())
+                    } else {
+                        Ok(None)
+                    }
+                }
             }
         }
     }

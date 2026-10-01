@@ -35,6 +35,13 @@ struct Runner {
 }
 
 impl Runner {
+    async fn failed(mut self) {
+        (&mut self.task)
+            .await
+            .expect("shard must not panic")
+            .expect_err("failed permission evidence must retain work for bounded recovery");
+    }
+
     async fn stop(mut self) {
         self.task.abort();
         let _ = (&mut self.task).await;
@@ -134,6 +141,8 @@ async fn gateway(resume: bool) -> GatewayFixture {
 enum PauseAt {
     PermissionRead,
     Callback,
+    UnavailableMember,
+    UnavailableChannel,
 }
 
 /// Delay before any channel POST (or before defer completion). Aborting the
@@ -142,6 +151,14 @@ enum PauseAt {
 async fn discord(paused: Arc<AtomicBool>, pause_at: PauseAt) -> MockRest {
     MockRest::with_responder(move |request| {
         let path = request.path.strip_prefix("/api/v10").unwrap();
+        let unavailable = match pause_at {
+            PauseAt::UnavailableMember => path == "/guilds/2222/members/999",
+            PauseAt::UnavailableChannel => path.starts_with("/channels/"),
+            _ => false,
+        };
+        if unavailable && request.method == "GET" && paused.load(Ordering::SeqCst) {
+            return ScriptedResponse::status(503);
+        }
         let response = match (request.method.as_str(), path) {
             ("GET", "/guilds/2222") => {
                 ScriptedResponse::json(200, json!({"id":GUILD,"owner_id":"888"}))
@@ -180,6 +197,7 @@ async fn discord(paused: Arc<AtomicBool>, pause_at: PauseAt) -> MockRest {
         let pause = match pause_at {
             PauseAt::PermissionRead => request.method == "GET" && path == "/guilds/2222",
             PauseAt::Callback => request.method == "POST" && path.ends_with("/callback"),
+            PauseAt::UnavailableMember | PauseAt::UnavailableChannel => false,
         };
         if pause && paused.load(Ordering::SeqCst) {
             response.delayed(Duration::from_secs(30))
@@ -650,6 +668,94 @@ async fn onboarding_gateway_session_goodbye_restart_keeps_captured_joined_at() {
     })
     .await;
     cleanup(db, Some(mock), result).await;
+}
+
+async fn unavailable_permission_restart(goodbye: bool, failure: PauseAt) {
+    let db = TestDb::new().await;
+    let unavailable = Arc::new(AtomicBool::new(true));
+    let mock = discord(unavailable.clone(), failure).await;
+    let result = bounded(async {
+        let mode = if goodbye { "session" } else { "legacy" };
+        let mut first = gateway(false).await;
+        let runner = spawn_onboarding(&db, &mock, &first.mock.url, mode).await;
+        assert_eq!(first.mock.authentication().await["op"], 2);
+        wait_sequence(&db.store, 1).await;
+        first
+            .send(member_add(2, goodbye, &joined_at_wire(RECEIPT_AT)))
+            .await;
+        let seq = if goodbye {
+            wait_sequence(&db.store, 2).await;
+            wait_receipt(&db, 2, "completed").await;
+            first.send(leave(3)).await;
+            3
+        } else {
+            2
+        };
+        wait_sequence(&db.store, seq).await;
+        tokio::time::timeout(DEADLINE, async {
+            while !runner.task.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transient evidence failure stops the owner for bounded recovery");
+        let saved = receipt(&db, seq as i64).await;
+        assert_eq!((saved.0.as_str(), saved.1), ("running", 1));
+        assert!(
+            saved.2.is_some(),
+            "unavailable evidence must retain captured delivery"
+        );
+        assert!(
+            posts(&mock).is_empty(),
+            "no send on uncertain permission evidence"
+        );
+        assert_eq!(event_count(&db, EVENT_ONBOARDING_PROMPTED).await, 0);
+        runner.failed().await;
+        drop(first);
+
+        unavailable.store(false, Ordering::SeqCst);
+        let mut second = gateway(true).await;
+        repoint_resume(&db, &second.mock).await;
+        let runner = spawn_onboarding(&db, &mock, &second.mock.url, mode).await;
+        assert_eq!(second.mock.authentication().await["op"], 6);
+        second.send(resumed(seq + 1)).await;
+        wait_sequence(&db.store, seq + 1).await;
+        let delivered = wait_receipt(&db, seq as i64, "completed").await;
+        assert_eq!(delivered.1, 2, "exactly one bounded recovery claim");
+        assert!(delivered.2.is_none());
+        assert_eq!(delivered.3, saved.3);
+        let messages = posts(&mock);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].path,
+            if goodbye {
+                "/api/v10/channels/13/messages"
+            } else {
+                "/api/v10/channels/12/messages"
+            }
+        );
+        assert_eq!(
+            event_count(&db, EVENT_ONBOARDING_PROMPTED).await,
+            i64::from(!goodbye)
+        );
+        assert_eq!(event_count(&db, "member_join").await, 1);
+        assert!(!runner.task.is_finished());
+        runner.stop().await;
+    })
+    .await;
+    cleanup(db, Some(mock), result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
+async fn onboarding_gateway_unavailable_member_evidence_retains_welcome_for_restart() {
+    unavailable_permission_restart(false, PauseAt::UnavailableMember).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
+async fn onboarding_gateway_unavailable_channel_evidence_retains_goodbye_for_restart() {
+    unavailable_permission_restart(true, PauseAt::UnavailableChannel).await;
 }
 
 #[tokio::test]

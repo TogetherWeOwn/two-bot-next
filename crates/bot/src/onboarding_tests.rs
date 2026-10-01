@@ -112,6 +112,7 @@ impl TestSchema {
 #[derive(Default)]
 struct DiscordState {
     roles: HashSet<String>,
+    dark_primary: bool,
     reject_next_post: bool,
     reject_roles: bool,
     member_reads: usize,
@@ -146,7 +147,9 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
             }
             ("GET", path) if path.starts_with("/channels/") => {
                 let id = path.strip_prefix("/channels/").unwrap();
-                let overwrites = if id == GAME_PICKS[0].primary_channel_id.unwrap() {
+                let overwrites = if state.dark_primary && GAME_PICKS.iter().any(|pick| pick.primary_channel_id == Some(id)) {
+                    json!([{"id":"44","type":1,"allow":"0","deny":"1024"}])
+                } else if id == GAME_PICKS[0].primary_channel_id.unwrap() {
                     json!([
                         {"id":"22","type":0,"allow":"0","deny":"1024"},
                         {"id":GAME_PICKS[0].role_id,"type":0,"allow":"1024","deny":"0"}
@@ -154,7 +157,7 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
                 } else if id == "17" {
                     json!([{"id":"999","type":1,"allow":"0","deny":"2048"}])
                 } else { json!([]) };
-                ScriptedResponse::json(200, json!({"id":id,"guild_id":if id == "15" { "23" } else { "22" }, "type":if id == "16" { 1 } else if matches!(id, "11" | "14") { 2 } else { 0 },"permission_overwrites":overwrites}))
+                ScriptedResponse::json(200, json!({"id":id,"guild_id":if id == "15" { "23" } else { "22" }, "type":if id == GAME_HUB_CHANNEL_ID { 15 } else if id == "16" { 1 } else if matches!(id, "11" | "14") { 2 } else { 0 },"permission_overwrites":overwrites}))
             }
             ("PUT" | "DELETE", path) if path.contains("/roles/") => {
                 if state.reject_roles { return ScriptedResponse::status(403); }
@@ -416,6 +419,105 @@ async fn onboarding_runtime_game_role_match_post_grant_routing_clear_and_dry_run
         let reply: Value = serde_json::from_slice(&after.last().unwrap().body).unwrap();
         assert_eq!(reply["content"], PICKER_DRY_RUN_REPLY);
         assert!(posts(&mock).is_empty());
+    })
+    .catch_unwind()
+    .await;
+    db.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_forum_fallback_and_anchor_picker_without_landing() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let state = Arc::new(Mutex::new(DiscordState {
+            dark_primary: true,
+            ..Default::default()
+        }));
+        let mock = discord(Arc::clone(&state)).await;
+        let mut deployment = vars("anchor", false);
+        deployment.remove("DISCORD_LANDING_CHANNEL_IDS");
+        let live = runtime(&db.pool, &mock, &deployment);
+        let hub_only = GAME_PICKS
+            .iter()
+            .find(|pick| pick.primary_channel_id.is_none())
+            .unwrap();
+        for (index, pick) in [hub_only, &GAME_PICKS[0]].into_iter().enumerate() {
+            live.handle(component(GAME_SELECT_ID, &[pick.key]), NOW + index as i64)
+                .await
+                .unwrap();
+            assert!(state.lock().unwrap().roles.contains(pick.role_id));
+            let reply: Value =
+                serde_json::from_slice(&replies(&mock).last().unwrap().body).unwrap();
+            assert!(reply["content"]
+                .as_str()
+                .unwrap()
+                .contains(GAME_HUB_CHANNEL_ID));
+        }
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .filter(|request| request.path.ends_with("/callback"))
+                .count(),
+            2
+        );
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 2);
+        // Hot removal of previously configured landing destinations also must
+        // not disable an existing menu; deleting the override restores absence.
+        SettingsStore::new(&db.pool)
+            .set(
+                "22",
+                "DISCORD_LANDING_CHANNEL_IDS",
+                Some(json!(["12"])),
+                "test",
+            )
+            .await
+            .unwrap();
+        live.handle(component(GAME_SELECT_ID, &["shooters"]), NOW + 2)
+            .await
+            .unwrap();
+        SettingsStore::new(&db.pool)
+            .set("22", "DISCORD_LANDING_CHANNEL_IDS", None, "test")
+            .await
+            .unwrap();
+        live.handle(component(GAME_SELECT_ID, &[]), NOW + 3)
+            .await
+            .unwrap();
+        assert!(!state.lock().unwrap().roles.contains(GAME_PICKS[0].role_id));
+        assert_eq!(replies(&mock).len(), 4);
+        assert!(
+            posts(&mock).is_empty(),
+            "existing picker never creates an anchor welcome"
+        );
+    })
+    .catch_unwind()
+    .await;
+    db.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_forum_is_not_a_plain_welcome_surface() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mock = discord(Arc::new(Mutex::new(DiscordState::default()))).await;
+        let mut deployment = vars("legacy", false);
+        deployment.insert(
+            "DISCORD_LANDING_CHANNEL_IDS".into(),
+            GAME_HUB_CHANNEL_ID.into(),
+        );
+        runtime(&db.pool, &mock, &deployment)
+            .handle(welcome(44), NOW)
+            .await
+            .unwrap();
+        assert!(posts(&mock).is_empty());
+        assert_eq!(db.count(EVENT_ONBOARDING_PROMPTED).await, 0);
     })
     .catch_unwind()
     .await;

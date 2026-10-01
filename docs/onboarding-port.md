@@ -110,7 +110,12 @@ immutable deployment fields. Effective channel access is resolved from fresh
 guild/member/role reads and channel overwrites, in Discord overwrite order.
 Foreign guilds, DMs, malformed evidence and unpostable destinations fail closed.
 Game role changes are serialized per member and routing reads fresh roles after
-all changes; unavailable fallback hubs are never linked.
+all changes; unavailable fallback hubs are never linked. View-only game routing
+accepts the hub's forum type, but a plain welcome cannot post to a forum. Existing
+game submissions are gated by mode, not by destinations for posting new menus.
+Permission reads preserve unavailable REST evidence separately from proven
+403/404 absence or permission denial: an unsent welcome/goodbye stays in the
+bounded recovery queue on transient failure instead of clearing its payload.
 
 Combined `onboarding_tests` exercise these adapters through actual mock HTTP
 requests and isolated agent-testdb schemas, including two independent pools for
