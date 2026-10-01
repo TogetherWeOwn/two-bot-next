@@ -37,13 +37,16 @@ ALTER TABLE ticket_transcripts ADD COLUMN IF NOT EXISTS purge_after TEXT;
 -- Elapsed 90 days in UTC: INTERVAL '90 days' on timestamptz advances
 -- session-local calendar days, which drifts across DST (e.g. +1h under
 -- America/New_York). 2160 hours is the exact retention ceiling, and the
--- AT TIME ZONE 'UTC' only formats the already-shifted instant.
+-- AT TIME ZONE 'UTC' only formats the already-shifted instant. Legacy
+-- 0014 also formatted session-local time with a literal Z: clamp populated
+-- deadlines to the ceiling, but never extend an earlier erasure deadline.
 UPDATE ticket_transcripts
   SET purge_after = to_char(
     (created_at::timestamptz + INTERVAL '2160 hours') AT TIME ZONE 'UTC',
     'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
   )
-  WHERE purge_after IS NULL;
+  WHERE purge_after IS NULL
+     OR purge_after::timestamptz > created_at::timestamptz + INTERVAL '2160 hours';
 ALTER TABLE ticket_transcripts ALTER COLUMN purge_after SET NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ticket_transcripts_guild ON ticket_transcripts (guild_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_ticket_transcripts_purge ON ticket_transcripts (purge_after);

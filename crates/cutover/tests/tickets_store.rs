@@ -22,12 +22,9 @@ struct TestDb {
 impl TestDb {
     async fn new(legacy: bool) -> Self {
         let host = match std::env::var("TICKET_TEST_DB_HOST").as_deref() {
-            Ok("127.0.0.1") if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => {
-                "127.0.0.1"
-            }
             Ok("agent-testdb") | Err(_) => "agent-testdb",
             _ => panic!(
-                "ticket DB tests permit only agent-testdb or the GitHub Actions service container"
+                "ticket DB tests permit only agent-testdb (local or job-container service)"
             ),
         };
         let options = PgConnectOptions::new()
@@ -433,16 +430,91 @@ async fn cooldown_orders_legacy_offsets_by_instant_not_text() {
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or a CI service container"]
+async fn full_legacy_upgrade_clamps_populated_expiry_without_extending_shorter_deadlines() {
+    for timezone in ["UTC", "Asia/Tokyo", "America/New_York"] {
+        let db = TestDb::new(false).await;
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('TimeZone', $1, true)")
+            .bind(timezone)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // Replace only this test's fresh schema with the frozen legacy path.
+        sqlx::raw_sql("DROP TABLE ticket_transcripts; DROP TABLE tickets;")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("fixtures/legacy_migrations/0013_tickets.sql"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for id in ["legacy", "shorter", "offset"] {
+            sqlx::query("INSERT INTO tickets (id, guild_id, channel_id, opener_id, status, created_at) VALUES ($1, 'guild', $1, $1, 'closed', '2026-09-08T12:00:00.000Z')")
+                .bind(id).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, content, message_count, created_at) VALUES ($1, 'guild', $1, $1, 'existing transcript', 1, '2026-09-08T12:00:00.000Z')")
+                .bind(id).execute(&mut *tx).await.unwrap();
+        }
+        sqlx::raw_sql(include_str!("fixtures/legacy_migrations/0014_ticket_safety.sql"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // A shorter deadline is intentional and must never be extended.
+        sqlx::query("UPDATE ticket_transcripts SET purge_after = '2026-12-07T08:00:00.000Z' WHERE ticket_id = 'shorter'")
+            .execute(&mut *tx).await.unwrap();
+        // Compare instants, not TEXT: this deadline is nine hours too late.
+        sqlx::query("UPDATE ticket_transcripts SET purge_after = '2026-12-08T00:00:00.000+03:00' WHERE ticket_id = 'offset'")
+            .execute(&mut *tx).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0210_tickets.sql"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // Legacy's New York formatting yielded an earlier deadline; keep it.
+        let legacy_expiry = if timezone == "America/New_York" {
+            "2026-12-07T08:00:00.000Z"
+        } else {
+            "2026-12-07T12:00:00.000Z"
+        };
+        for (id, expected) in [
+            ("legacy", legacy_expiry),
+            ("shorter", "2026-12-07T08:00:00.000Z"),
+            ("offset", "2026-12-07T12:00:00.000Z"),
+        ] {
+            let (content, expiry): (String, String) = sqlx::query_as(
+                "SELECT content, purge_after FROM ticket_transcripts WHERE ticket_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            assert_eq!(content, "existing transcript");
+            assert_eq!(expiry, expected, "{timezone}: {id}");
+        }
+        tx.commit().await.unwrap();
+        let expiry = 1_788_868_800_000_i64 + TRANSCRIPT_RETENTION_MS;
+        let store = db.store("guild");
+        let early_count = if timezone == "America/New_York" { 2 } else { 1 };
+        assert_eq!(store.purge_expired(expiry - 1).await.unwrap(), early_count);
+        assert_eq!(
+            store.transcript_exists("legacy").await.unwrap(),
+            timezone != "America/New_York"
+        );
+        assert!(store.transcript_exists("offset").await.unwrap());
+        assert_eq!(store.purge_expired(expiry).await.unwrap(), 3 - early_count);
+        db.close().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or a CI service container"]
 async fn migration_backfill_uses_elapsed_hours_across_dst() {
     // Reproduces the review repro: TimeZone=America/New_York with a
     // DST-crossing created_at must still backfill the exact elapsed-90-day
     // retention ceiling, not a calendar-day shift (+1h). Single session so
     // the SET applies to the migration statements.
     let host = match std::env::var("TICKET_TEST_DB_HOST").as_deref() {
-        Ok("127.0.0.1") if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => "127.0.0.1",
         Ok("agent-testdb") | Err(_) => "agent-testdb",
         _ => panic!(
-            "ticket DB tests permit only agent-testdb or the GitHub Actions service container"
+            "ticket DB tests permit only agent-testdb (local or job-container service)"
         ),
     };
     let options = PgConnectOptions::new()

@@ -1,5 +1,5 @@
 //! Pure REST permission resolution, ported from legacy `src/discord/channelAccess.ts`.
-//! Source: https://docs.discord.com/developers/topics/permissions#permission-overwrites
+//! Source: <https://docs.discord.com/developers/topics/permissions#permission-overwrites>
 
 use twilight_model::{
     channel::permission_overwrite::{PermissionOverwrite, PermissionOverwriteType},

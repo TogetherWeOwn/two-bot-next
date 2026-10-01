@@ -36,11 +36,11 @@ Framework-specific references: [sqlx 0.9 transactions](https://docs.rs/sqlx/0.9.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
+python3 scripts/cargo_cache.py run -- clippy -p two-bot-cutover --all-targets --locked -- -D warnings
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --locked tickets::
+python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --locked --test tickets_store -- --ignored
 ```
 
-The last command opts into **agent-testdb** (`agent_test` user/database, empty password), not `DATABASE_URL`. Only `agent-testdb` is accepted locally. GitHub Actions may use `127.0.0.1` with its dedicated CI service container. Tests create and drop their own numeric-pid/counter schemas, never existing application tables. `tickets postgres` runs these tests in CI so they are not silently omitted by the default ignored-test behavior.
+On the persistent controller, all compiling commands use the [bounded cache wrapper](build-cache.md); do not bypass a refused lease. The last command opts into **agent-testdb** (`agent_test` user/database, empty password), not `DATABASE_URL`. Only the `agent-testdb` hostname is accepted, locally and in CI. The `tickets postgres` job uses `[self-hosted, two-selfhosted]`, a pinned Rust job container and an `agent-testdb` service without published host ports. Tests create and drop their own numeric-pid/counter schemas, never existing application tables, and CI executes the opt-in proofs so they are not silently omitted by the default ignored-test behavior.
 
-Integration proofs cover concurrent reservation/claim/close winners, the cooldown boundary, restart loading, stale-close fencing, transactional rollback on rejected transcript INSERT, interrupted create, legacy saved-close recovery, inclusive retention, guild isolation, erasure cascade, and upgrading the original legacy schema without dropping transcripts.
+Integration proofs cover concurrent reservation/claim/close winners, the cooldown boundary, restart loading, stale-close fencing, transactional rollback on rejected transcript INSERT, interrupted create, legacy saved-close recovery, inclusive retention, guild isolation, erasure cascade, and legacy upgrades without dropping transcripts. The frozen `0013 → 0014 → 0210` path is tested under UTC, Asia/Tokyo and America/New_York: populated overlong deadlines are clamped to capture + 2160 elapsed hours, offset-bearing deadlines are compared by instant, and shorter deadlines are never extended. The shared database-role matrix grants runtime CRUD on both ticket tables and excludes the website reader; role acceptance tests exercise those rights and denials.
