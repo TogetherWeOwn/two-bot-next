@@ -63,7 +63,11 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   global event digest. Use a namespaced identity stable across redelivery; do not
   generate an ID per delivery. This is a dedup guard, not a retryable event queue.
 
-`AuditSubject` accepts optional `DiscordId` values for guild, actor and target.
+`AuditSubject` accepts optional `DiscordId` values for guild, actor, target and
+`resolved_role_id`. Role executors pin the allowlist-resolved role in the same
+committed intent/audit transaction before REST. Every later audit copies that
+original scalar, not a newly evaluated role map. Migration `0351` adds nullable
+columns; older intents remain NULL and must not be guessed from current config.
 `TerminalResponse` is `Success { resource_id: Option<DiscordId>, affected: u32 }`
 (HTTP 200) or `Failure(TerminalFailure)` with fixed codes/statuses:
 `Malformed`/400, `ActionNotAllowed`/403, `DiscordRejected`/422, `NoEffect`/502.
