@@ -85,6 +85,11 @@ jobs:
       - name: Verify Docker dependency layer
         run: python3 scripts/test-docker-deps.py --cargo
 
+      - name: Prevent raw secrets under derived Debug
+        run: |
+          python3 scripts/check-secret-debug.py --test
+          python3 scripts/check-secret-debug.py
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -167,8 +172,8 @@ jobs:
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
-      - name: Sticky runtime acceptance tests (CI service only)
-        run: cargo test -p two-bot --locked sticky_runtime_tests -- --ignored --test-threads=1
+      - name: Command runtime acceptance tests (sticky and feeds, CI service only)
+        run: cargo test -p two-bot --locked command_runtime_tests -- --ignored --test-threads=1
 
       - name: Real binary lifecycle acceptance (CI service only, under 60 s)
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
