@@ -20,10 +20,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  startup-diagnostic:
+    name: credentialed startup diagnostic (immutable 33594fc)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 20
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    env:
+      TWO_GATEWAY_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove unchanged immutable application and lockfile
+        run: |
+          git diff --exit-code 33594fca024e31f65073cbc56e58a80beca9df58 -- crates/bot/src crates/core/src crates/discord/src crates/cutover/src Cargo.toml Cargo.lock
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-startup-diagnostic-${{ hashFiles('Cargo.lock') }}
+      - name: Run actual credentialed binary matrix (last case is expected red)
+        run: cargo test -p two-bot --locked --test alive startup_diagnostic_credentialed_optional_configuration -- --ignored --nocapture --test-threads=1
+
   check:
     name: check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
       TWO_LFG_TESTDB_CI: '1'
@@ -37,8 +79,6 @@ jobs:
           # Ephemeral CI service only; tests explicitly use an empty password.
           # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 127.0.0.1:5432:5432
         options: >-
           --health-cmd "pg_isready -U agent_test -d agent_test"
           --health-interval 5s
@@ -49,6 +89,14 @@ jobs:
         with:
           # The migration guard reads PR base/push-before blobs, including the lock.
           fetch-depth: 0
+
+      - name: Job-container prerequisites (loopback forward to agent-testdb)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
 
       - name: Check migration numbering and immutability
         env:
@@ -99,13 +147,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Prepare isolated test databases
-        env:
-          TEST_DB_CONTAINER: ${{ job.services.agent-testdb.id }}
-        run: |
-          # Host-runner steps reach only this job's published service port.
-          # Keep the test guards' required hostname instead of weakening them.
-          printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
-          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_ci
+        run: createdb -h agent-testdb -U agent_test two_bot_test_ci
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
       # Migrated suites create/drop unique databases; this bootstrap is not reset.
@@ -182,7 +224,7 @@ jobs:
 
   container:
     name: container smoke
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -221,22 +263,22 @@ jobs:
 
   community-db:
     name: community db
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 15
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     services:
-      postgres:
+      agent-testdb:
         image: postgres:17
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: postgres
           POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U agent_test -d postgres"
           --health-interval 10s --health-timeout 5s --health-retries 5
     env:
-      TWO_TEST_DATABASE_URL: postgres://agent_test@localhost:5432/postgres
+      TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/postgres
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -253,8 +295,10 @@ jobs:
 
   feeds-db:
     name: feeds db check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 15
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
     services:
@@ -264,7 +308,6 @@ jobs:
           POSTGRES_USER: agent_test
           POSTGRES_DB: agent_test
           POSTGRES_HOST_AUTH_METHOD: trust
-        ports: [5432:5432]
         options: >-
           --health-cmd "pg_isready -U agent_test -d agent_test"
           --health-interval 5s --health-timeout 5s --health-retries 10
@@ -274,15 +317,13 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - name: Map test-container-only hostname on runner
-        run: printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
       - run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - run: cargo test -p two-bot-core --features db --test feeds --locked
       - run: cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
 
   worker:
     name: worker check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 10
     defaults:
       run:

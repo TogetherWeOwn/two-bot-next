@@ -114,8 +114,20 @@ struct Bot {
 
 impl Bot {
     fn spawn(db: &TestDb, addr: SocketAddr, gateway: &str, api: &str, logs: &Logs) -> Self {
+        Self::spawn_with_env(db, addr, gateway, api, logs, &[])
+    }
+
+    fn spawn_with_env(
+        db: &TestDb,
+        addr: SocketAddr,
+        gateway: &str,
+        api: &str,
+        logs: &Logs,
+        extra: &[(&str, std::ffi::OsString)],
+    ) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_two-bot"))
             .env_clear()
+            .envs(extra.iter().map(|(key, value)| (*key, value)))
             .env("LISTEN_ADDR", addr.to_string())
             .env("DISCORD_TOKEN", "alive-synthetic-token")
             .env("GUILD_ID", GUILD)
@@ -333,9 +345,13 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<String>>>) {
                 .unwrap_or("")
                 .to_owned();
             recorded.lock().await.push(path.clone());
-            // The fixture grounds no raid windows, so only the events mirror
-            // reads; anything else fails closed without touching the gateway.
-            let (status, body): (&str, &[u8]) = if path.contains("scheduled-events") {
+            // Route-aware replies tolerate concurrently scheduled website and
+            // community jobs without an ordered response script.
+            let (status, body): (&str, &[u8]) = if path == "/api/v10/guilds/2222?with_counts=true" {
+                ("200 OK", b"{\"approximate_presence_count\":7}")
+            } else if path == "/api/v10/guilds/2222/members?limit=1000&after=0"
+                || path.starts_with("/api/v10/guilds/2222/scheduled-events")
+            {
                 ("200 OK", b"[]")
             } else {
                 (
@@ -554,4 +570,124 @@ async fn real_binary_is_alive_and_resumes_after_sigterm() {
         }
     }
     assert!(started.elapsed() < Duration::from_secs(60));
+}
+
+async fn diagnostic_boot(
+    db: &TestDb,
+    discord: &mut MockDiscord,
+    bots: &mut Vec<Bot>,
+    logs: &Logs,
+    extra: &[(&str, std::ffi::OsString)],
+    parked: [bool; 3],
+) {
+    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved);
+    bots.push(Bot::spawn_with_env(
+        db, addr, &discord.url, &discord.api, logs, extra,
+    ));
+    let bot = bots.last_mut().unwrap();
+    wait_http(bot, addr, "/healthz", 200).await;
+    let before = wait_http(bot, addr, "/readyz", 503).await;
+    assert!(before.contains("\"gateway\",\"starting\""));
+    let report: Value = serde_json::from_str(before.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    for (name, expected) in ["presence_probe", "community_scorecard", "inactivity"]
+        .into_iter()
+        .zip(parked)
+    {
+        assert_eq!(report["jobs"][name]["parked"], expected, "{name}");
+        if expected {
+            assert!(report["jobs"][name]["last_start"].is_null());
+            assert!(report["jobs"][name]["last_success"].is_null());
+        }
+    }
+    discord.release.send(()).await.unwrap();
+    assert_eq!(discord.authentication().await["op"], 2);
+    wait_http(bot, addr, "/readyz", 503).await;
+    discord.release.send(()).await.unwrap();
+    checkpoint(db, 2).await;
+    wait_http(bot, addr, "/readyz", 200).await;
+    if !parked[0] {
+        timeout(Duration::from_secs(12), async {
+            loop {
+                let response = wait_http(bot, addr, "/readyz", 200).await;
+                let report: Value = serde_json::from_str(
+                    response.split("\r\n\r\n").nth(1).unwrap(),
+                )
+                .unwrap();
+                if report["jobs"]["presence_probe"]["last_success"].is_number() {
+                    assert!(report["jobs"]["presence_probe"]["last_error_class"].is_null());
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("successful presence tick, not merely a live HTTP listener");
+        let requests = discord.rest_requests.lock().await;
+        assert!(requests.iter().any(|p| p == "/api/v10/guilds/2222?with_counts=true"));
+        assert!(requests.iter().any(|p| p == "/api/v10/guilds/2222/members?limit=1000&after=0"));
+    }
+    bot.terminate().await;
+}
+
+/// Diagnostic overlay on immutable 33594fc: ordinary missing/invalid Unicode
+/// gates must boot, and malformed optional configuration must not kill HTTP.
+/// The last case is intentionally expected to FAIL on the pinned bad source;
+/// it is not evidence that staging carried the same malformed environment.
+#[tokio::test]
+#[ignore = "requires explicit test DB and synthetic REST/gateway; diagnostic bad-revision counterexample"]
+async fn startup_diagnostic_credentialed_optional_configuration() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    let cases: Vec<(&str, Vec<(&str, OsString)>, [bool; 3])> = vec![
+        ("missing_optional_env", vec![], [false, true, false]),
+        (
+            "invalid_optional_unicode_env",
+            vec![
+                ("TWO_PRESENCE_PROBE", "0".into()),
+                ("TWO_COMMUNITY_SCORECARD", "1".into()),
+                ("TWO_COMMUNITY_CORRECTION_CYCLES", "not-an-integer".into()),
+                ("TWO_INACTIVITY_DAYS", "not-an-integer".into()),
+            ],
+            [true, true, true],
+        ),
+        (
+            "invalid_optional_nonunicode_env",
+            vec![("TWO_INACTIVITY_DAYS", OsString::from_vec(vec![0xff]))],
+            [false, true, true],
+        ),
+    ];
+    for (name, extra, parked) in cases {
+        eprintln!("START startup diagnostic case: {name}");
+        let db = TestDb::new().await;
+        let mut discord = MockDiscord::new().await;
+        let logs = Logs::default();
+        let mut bots = Vec::new();
+        let result = AssertUnwindSafe(timeout(
+            TOTAL,
+            diagnostic_boot(&db, &mut discord, &mut bots, &logs, &extra, parked),
+        ))
+        .catch_unwind()
+        .await;
+        for bot in &mut bots {
+            bot.cleanup().await;
+        }
+        discord.task.abort();
+        discord.rest_task.abort();
+        let _ = discord.task.await;
+        let _ = discord.rest_task.await;
+        db.close().await;
+        match result {
+            Ok(Ok(())) => eprintln!("PASS startup diagnostic case: {name}"),
+            other => {
+                eprintln!("FAIL startup diagnostic case: {name}");
+                eprintln!("=== synthetic child logs ===\n{}=== end child logs ===", logs.lock().await);
+                match other {
+                    Err(panic) => std::panic::resume_unwind(panic),
+                    _ => panic!("startup diagnostic case {name} exceeded {TOTAL:?}"),
+                }
+            }
+        }
+    }
 }
