@@ -306,11 +306,13 @@ impl RestClient {
             }
             let page = self
                 .exec_list(|| {
-                    let mut req = self.inner.client.channel_messages(channel_id).limit(100);
-                    if let Some(b) = before {
-                        req = req.before(b);
+                    let req = self.inner.client.channel_messages(channel_id);
+                    async move {
+                        match before {
+                            Some(b) => req.limit(100).before(b).await,
+                            None => req.limit(100).await,
+                        }
                     }
-                    async move { req.await }
                 })
                 .await;
             let batch: Vec<Message> = match page {
