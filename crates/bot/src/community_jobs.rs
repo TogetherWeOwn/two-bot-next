@@ -6,11 +6,10 @@
 //! produces no [`Job`]; its name comes back parked for the readyz status map
 //! and it writes nothing.
 //!
-//! The scorecard consumes each Monday attempt before the run starts, so one
-//! process fires at most once per ISO week. A restart re-fires the tick but
-//! `community_scorecard_runs` claims the same idempotency key, so the second
-//! run is reused rather than duplicated. Inactivity is read-only by
-//! construction: the outcome type carries no channel/message/DM field.
+//! The scorecard reserves up to three attempts, five minutes apart, inside
+//! Monday's window. Reservations and completion live beside the scorecard
+//! runs in Postgres, so restarting cannot reset the budget. Inactivity is
+//! read-only by construction: its outcome carries no channel/message/DM field.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -34,6 +33,9 @@ use crate::{
 };
 
 pub const NAMES: [&str; 3] = ["presence_probe", "community_scorecard", "inactivity"];
+
+#[path = "community_scorecard_retry.rs"]
+mod scorecard_retry;
 
 #[cfg(test)]
 #[path = "community_jobs_tests.rs"]
@@ -68,10 +70,9 @@ pub(crate) struct State {
     gates: ScorecardGates,
     /// `TWO_INACTIVITY_DAYS`; unreachable when the inactivity job is parked.
     inactivity_days: u64,
-    /// `YYYY-MM-DD` of the consumed Monday attempt. `scorecard_tick` enforces
-    /// at-most-once per ISO week per process; the runs-table claim dedupes
-    /// restarts.
-    last_attempted_week: Mutex<Option<String>>,
+    /// Held across a scorecard attempt; cancellation drops the guard. Durable
+    /// budget/backoff/completion are stored in `community_scorecard_attempts`.
+    scorecard_lane: Mutex<()>,
 }
 
 /// A job the env gates refuse to register.
@@ -168,7 +169,7 @@ pub(crate) fn register(context: Arc<Context>) -> Registration {
             correction_cycles: 0,
         }),
         inactivity_days: gates.inactivity_days.unwrap_or(0),
-        last_attempted_week: Mutex::new(None),
+        scorecard_lane: Mutex::new(()),
     });
     let mut out = Vec::new();
     for (name, kind, enabled) in [
@@ -294,41 +295,109 @@ async fn presence_tick(
     Ok(())
 }
 
-/// Consume this Monday's attempt, returning the week key to run. `None` when
-/// out of window or this process already attempted this Monday. The attempt is
-/// consumed before the run so a mid-run failure cannot refire inside one boot.
-async fn consume_attempt(state: &State, now_ms: i64) -> Option<String> {
-    let mut attempted = state.last_attempted_week.lock().await;
-    let key = scorecard_tick(now_ms, attempted.as_deref())?;
-    *attempted = Some(key.clone());
-    Some(key)
+/// Serialize reservations across processes and commit before coverage/scoring.
+/// A failed reservation starts no work. A lost commit acknowledgement can waste
+/// a slot, but cannot grant an extra one after restart.
+async fn reserve_attempt(
+    pool: &PgPool,
+    guild: &str,
+    now_ms: i64,
+) -> Result<Option<String>, sqlx::Error> {
+    let Some(week_key) = scorecard_tick(now_ms, None) else {
+        return Ok(None);
+    };
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO community_scorecard_attempts (guild_id, week_key)
+         VALUES ($1, $2) ON CONFLICT (guild_id, week_key) DO NOTHING",
+    )
+    .bind(guild)
+    .bind(&week_key)
+    .execute(&mut *tx)
+    .await?;
+    let (attempts, next_attempt_at, completed): (i32, i64, bool) = sqlx::query_as(
+        "SELECT attempts, next_attempt_at, completed FROM community_scorecard_attempts
+         WHERE guild_id=$1 AND week_key=$2 FOR UPDATE",
+    )
+    .bind(guild)
+    .bind(&week_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    // A run may have committed before cancellation or a failed completion
+    // write. Reconcile it before retrying, even if the watermark/classifier
+    // changed. An incomplete scorecard is also a successful persisted output.
+    let (_, week_end) = previous_closed_week(now_ms);
+    let published: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM community_scorecard_runs
+         WHERE guild_id=$1 AND week_end=$2)",
+    )
+    .bind(guild)
+    .bind(&week_end)
+    .fetch_one(&mut *tx)
+    .await?;
+    let current = scorecard_retry::AttemptState {
+        week_key: week_key.clone(),
+        attempts,
+        next_attempt_at,
+        completed: completed || published,
+    };
+    let decision = scorecard_retry::decide(&current, now_ms);
+    let (next, claimed) = match decision {
+        scorecard_retry::Decision::Attempt(next) => (next, Some(week_key)),
+        scorecard_retry::Decision::Wait | scorecard_retry::Decision::Skip => (current, None),
+    };
+    sqlx::query(
+        "UPDATE community_scorecard_attempts
+         SET attempts=$3, next_attempt_at=$4, completed=$5
+         WHERE guild_id=$1 AND week_key=$2",
+    )
+    .bind(guild)
+    .bind(&next.week_key)
+    .bind(next.attempts)
+    .bind(next.next_attempt_at)
+    .bind(next.completed)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(claimed)
 }
 
-/// One scorecard tick (legacy `startCommunityScorecardJob`): at most one
-/// attempt per ISO week, coverage marked from the process's capture start
-/// before scoring, the runs table deduping any restart re-fire.
+/// One eligible tick: up to three attempts per Monday, spaced five minutes
+/// apart. Only successful scoring completes the week; failures keep the
+/// durable reservation for the next eligible tick (including after restart).
 async fn scorecard_once(
     pool: &PgPool,
     guild: &str,
     state: &State,
     now_ms: i64,
 ) -> Result<(), ErrorClass> {
-    let Some(week_key) = consume_attempt(state, now_ms).await else {
+    let Ok(_lane) = state.scorecard_lane.try_lock() else {
+        return Ok(());
+    };
+    let Some(week_key) = reserve_attempt(pool, guild, now_ms)
+        .await
+        .map_err(|_| ErrorClass::Database)?
+    else {
         return Ok(());
     };
     let (week_start, week_end) = previous_closed_week(now_ms);
     let generated_at = format_iso_millis(now_ms);
-    for stream in COMMUNITY_FACT_TYPES {
-        mark_stream_coverage(
-            pool,
-            guild,
-            stream,
-            &state.capture_started_at,
-            &week_end,
-            &generated_at,
-        )
-        .await
-        .map_err(|_| ErrorClass::Database)?;
+    // A Monday boot captured none of the closed week. Do not insert an
+    // inverted coverage interval or invent coverage: the builder fails closed
+    // on missing heartbeats while retaining any honestly persisted coverage.
+    if state.capture_started_at <= week_end {
+        for stream in COMMUNITY_FACT_TYPES {
+            mark_stream_coverage(
+                pool,
+                guild,
+                stream,
+                &state.capture_started_at,
+                &week_end,
+                &generated_at,
+            )
+            .await
+            .map_err(|_| ErrorClass::Database)?;
+        }
     }
     let (_json, reused, alert_emitted) = run_closed_week(
         pool,
@@ -350,6 +419,15 @@ async fn scorecard_once(
         }
         CommunityStoreError::Db(_) => ErrorClass::Database,
     })?;
+    sqlx::query(
+        "UPDATE community_scorecard_attempts SET completed=TRUE
+         WHERE guild_id=$1 AND week_key=$2",
+    )
+    .bind(guild)
+    .bind(&week_key)
+    .execute(pool)
+    .await
+    .map_err(|_| ErrorClass::Database)?;
     tracing::info!(
         job = "community_scorecard",
         week = week_key,

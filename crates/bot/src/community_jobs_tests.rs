@@ -7,6 +7,9 @@ use super::*;
 
 use crate::discord_test_common::{MockRest, ScriptedResponse};
 
+#[path = "community_scorecard_retry_db_tests.rs"]
+mod retry_db;
+
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
     ActionExecutor::with_proxy("synthetic-job-test-token".to_owned(), Some(mock.origin())).unwrap()
@@ -30,7 +33,7 @@ fn fresh_state(gates: ScorecardGates, inactivity_days: u64) -> State {
         classifier_version: "community-v1".to_owned(),
         gates,
         inactivity_days,
-        last_attempted_week: Mutex::new(None),
+        scorecard_lane: Mutex::new(()),
     }
 }
 
@@ -82,72 +85,211 @@ fn gates_follow_legacy_env_semantics() {
     );
 }
 
+use scorecard_retry::{decide, AttemptState, Decision, RETRY_DELAY_MS};
+
+fn at(iso: &str) -> i64 {
+    parse_iso_millis(iso).unwrap()
+}
+
+fn reserve(state: &mut AttemptState, now: i64) -> bool {
+    match decide(state, now) {
+        Decision::Attempt(next) => {
+            *state = next;
+            true
+        }
+        Decision::Wait | Decision::Skip => false,
+    }
+}
+
+// Legacy retry cases use a fake clock and synthetic coverage/scoring failures,
+// without timers, credentials, a database or a network.
+fn transient_then_success(fail_coverage: bool) {
+    let monday = at("2026-09-07T06:15:00.000Z");
+    let mut state = AttemptState::default();
+    let mut coverage_calls = 0;
+    let mut scoring_calls = 0;
+    let mut published = 0;
+    for (now, succeeds) in [
+        (monday, false),
+        (monday + RETRY_DELAY_MS - 1, true),
+        (monday + RETRY_DELAY_MS, true),
+        (at("2026-09-07T06:59:00.000Z"), true),
+        (at("2026-09-07T06:59:00.000Z"), true),
+    ] {
+        if !reserve(&mut state, now) {
+            continue;
+        }
+        coverage_calls += 1;
+        if !succeeds && fail_coverage {
+            continue;
+        }
+        scoring_calls += 1;
+        if succeeds {
+            published += 1;
+            state.completed = true;
+        }
+    }
+    assert_eq!(coverage_calls, 2);
+    assert_eq!(scoring_calls, if fail_coverage { 1 } else { 2 });
+    assert_eq!(published, 1);
+    assert_eq!(state.attempts, 2);
+    assert_eq!(state.week_key, "2026-09-07");
+    assert_eq!(
+        previous_closed_week(monday),
+        (
+            "2026-08-31T00:00:00.000Z".to_owned(),
+            "2026-09-07T00:00:00.000Z".to_owned(),
+        )
+    );
+}
+
+#[test]
+fn scorecard_retries_transient_coverage_then_suppresses_duplicates() {
+    transient_then_success(true);
+}
+
+#[test]
+fn scorecard_retries_transient_scoring_then_suppresses_duplicates() {
+    transient_then_success(false);
+}
+
+#[test]
+fn scorecard_three_spaced_failures_and_new_monday_budget() {
+    let monday = at("2026-09-07T06:15:00.000Z");
+    let mut state = AttemptState::default();
+    for minute in 15..=59 {
+        for _ in 0..2 {
+            reserve(&mut state, monday + (minute - 15) * 60_000);
+            assert_eq!(
+                state.attempts,
+                if minute < 20 {
+                    1
+                } else if minute < 25 {
+                    2
+                } else {
+                    3
+                }
+            );
+        }
+    }
+    assert_eq!(decide(&state, monday + 600_000), Decision::Skip);
+    assert!(reserve(&mut state, monday + 7 * 86_400_000));
+    assert_eq!(state.attempts, 1);
+    assert_eq!(state.week_key, "2026-09-14");
+}
+
+#[test]
+fn scorecard_retry_never_catches_up_outside_monday_window() {
+    let mut state = AttemptState::default();
+    assert_eq!(
+        decide(&state, at("2026-09-07T06:14:59.999Z")),
+        Decision::Skip
+    );
+    assert!(reserve(&mut state, at("2026-09-07T06:59:59.999Z")));
+    for now in [
+        "2026-09-07T07:00:00.000Z",
+        "2026-09-07T07:04:00.000Z",
+        "2026-09-08T06:20:00.000Z",
+        "2026-09-14T06:14:00.000Z",
+    ] {
+        assert_eq!(decide(&state, at(now)), Decision::Skip);
+        assert_eq!(state.attempts, 1);
+    }
+    assert!(reserve(&mut state, at("2026-09-14T06:15:00.000Z")));
+    assert_eq!(state.attempts, 1);
+}
+
 #[tokio::test]
-async fn scorecard_attempt_is_once_per_monday_per_process() {
-    // 2026-09-28 is a Monday; the window opens at 06:15 UTC.
-    let monday = parse_iso_millis("2026-09-28T06:15:00.000Z").unwrap();
+async fn scorecard_eligible_ticks_do_not_overlap_even_across_weeks() {
     let state = fresh_state(enabled_gates(), 14);
-    assert_eq!(
-        consume_attempt(&state, monday).await.as_deref(),
-        Some("2026-09-28")
-    );
-    assert_eq!(
-        consume_attempt(&state, monday + 60_000).await,
-        None,
-        "same process consumes a Monday once"
-    );
-    // A restart rebuilds State: the tick refires and the runs-table claim
-    // dedupes the row (asserted in the integration test below).
-    let restarted = fresh_state(enabled_gates(), 14);
-    assert_eq!(
-        consume_attempt(&restarted, monday + 1_800_000)
+    let _in_flight = state.scorecard_lane.lock().await;
+    // A lazy pool deliberately has no listener. The busy lane must return
+    // before any database access, just as the supervisor skips busy deadlines.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .unwrap();
+    for now in [
+        "2026-09-07T06:15:00.000Z",
+        "2026-09-07T06:20:00.000Z",
+        "2026-09-14T06:15:00.000Z",
+    ] {
+        scorecard_once(&pool, "guild-a", &state, at(now))
             .await
-            .as_deref(),
-        Some("2026-09-28")
-    );
+            .unwrap();
+    }
+    pool.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn scorecard_stop_cancels_future_retry_ticks() {
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use tokio::sync::watch;
+
+    let monday = at("2026-09-07T06:15:00.000Z");
+    let clock = Arc::new(AtomicI64::new(monday));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let saved = Arc::new(Mutex::new(AttemptState::default()));
+    let action = {
+        let clock = clock.clone();
+        let attempts = attempts.clone();
+        let saved = saved.clone();
+        Arc::new(move || {
+            let clock = clock.clone();
+            let attempts = attempts.clone();
+            let saved = saved.clone();
+            Box::pin(async move {
+                if reserve(&mut *saved.lock().await, clock.load(Ordering::SeqCst)) {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    return Err(ErrorClass::Database);
+                }
+                Ok(())
+            }) as jobs::JobFuture
+        })
+    };
+    let (stop, shutdown) = watch::channel(false);
+    let task = tokio::spawn(jobs::supervise(
+        vec![Job {
+            name: "community_scorecard",
+            cadence: cadence(Kind::Scorecard),
+            startup_jitter: Duration::ZERO,
+            timeout: Duration::from_secs(120),
+            action,
+        }],
+        jobs::statuses(&["community_scorecard"], false),
+        shutdown,
+    ));
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    clock.store(monday + RETRY_DELAY_MS, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(300)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn scorecard_reloaded_reservation_preserves_backoff_and_crash_budget() {
+    let monday = at("2026-09-07T06:15:00.000Z");
+    let mut persisted = AttemptState::default();
+    for attempt in 1..=3 {
+        let now = monday + (i64::from(attempt) - 1) * RETRY_DELAY_MS;
+        assert!(reserve(&mut persisted, now));
+        assert_eq!(persisted.attempts, attempt);
+        let restarted = persisted.clone();
+        assert_eq!(
+            decide(&restarted, now + RETRY_DELAY_MS - 1),
+            if attempt == 3 {
+                Decision::Skip
+            } else {
+                Decision::Wait
+            }
+        );
+    }
     assert_eq!(
-        consume_attempt(&restarted, monday + 7 * 86_400_000)
-            .await
-            .as_deref(),
-        Some("2026-10-05"),
-        "the next Monday is a fresh key"
-    );
-    let last_minute = fresh_state(enabled_gates(), 14);
-    assert_eq!(
-        consume_attempt(
-            &last_minute,
-            parse_iso_millis("2026-09-28T06:59:59.999Z").unwrap()
-        )
-        .await
-        .as_deref(),
-        Some("2026-09-28"),
-        "06:59:59.999 is still inside the window"
-    );
-    // Outside the window nothing is consumed.
-    let fresh = fresh_state(enabled_gates(), 14);
-    assert_eq!(
-        consume_attempt(
-            &fresh,
-            parse_iso_millis("2026-09-28T07:00:00.000Z").unwrap()
-        )
-        .await,
-        None,
-        "07:00 is outside the window"
-    );
-    assert!(fresh.last_attempted_week.lock().await.is_none());
-    assert_eq!(
-        consume_attempt(&fresh, monday - 1_000).await,
-        None,
-        "06:14:59 is before the window"
-    );
-    assert_eq!(
-        consume_attempt(
-            &fresh,
-            parse_iso_millis("2026-09-29T06:15:00.000Z").unwrap()
-        )
-        .await,
-        None,
-        "Tuesday never fires"
+        decide(&persisted.clone(), monday + 3 * RETRY_DELAY_MS),
+        Decision::Skip
     );
 }
 
@@ -222,9 +364,8 @@ async fn community_ticks_write_rows_and_stay_gated() {
     .unwrap();
     assert_eq!(rows, vec![(42, Some(2)), (43, None)]);
 
-    // Monday 06:15 UTC: six stream heartbeats then one run row. A second tick
-    // in the same process is consumed; a fresh State (restart) refires the
-    // tick but the runs-table idempotency key dedupes the row.
+    // Monday 06:15 UTC: six stream heartbeats then one run row. Completion
+    // suppresses later ticks, including with a fresh process State.
     let monday = parse_iso_millis("2026-09-28T06:15:00.000Z").unwrap();
     run_once(Kind::Scorecard, &pool, &rest, guild, &state, monday)
         .await
