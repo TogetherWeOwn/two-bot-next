@@ -16,10 +16,13 @@
 //! - raid-window skip (ungrounded history publishes nothing; grounded raids
 //!   leave the denominator and the `members` view)
 //! - `web_v1` views return legacy-shaped rows.
+//! - funnel views count leavers and projection-less joins without placeholders
+//! - upcoming/next serve scheduled+active only, as UTC millis instants
+//! - contract_meta pins the implemented version (bump on any shape change).
 
 #![cfg(feature = "db")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -29,7 +32,8 @@ use two_bot_core::{
     normalize_events, read_raid_windows, replace_events, write_counter, write_rank_snapshot,
     CommunitySnapshot, EventStatus, JobGate, RaidWindow, RankKey, RankRole, RawScheduledEvent,
     RosterMember, ScheduledEvent, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
-    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS, WEB_CONTRACT_VIEWS,
+    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS, WEB_CONTRACT_VERSION,
+    WEB_CONTRACT_VIEWS,
 };
 use two_bot_testsupport::{guard_database_url, TestDatabase};
 
@@ -148,10 +152,19 @@ async fn read_counter(pool: &Pool<Postgres>) -> Option<(Option<i32>, Option<Stri
     .expect("read counter")
 }
 
+/// ISO-8601 UTC millis `hours` from now (negative = past).
+fn offset_iso_hours(hours: i64) -> String {
+    let t = time::OffsetDateTime::now_utc() + time::Duration::hours(hours);
+    format_iso_utc(t)
+}
+
 /// ISO-8601 UTC millis `days` in the future (stays inside the views'
 /// 24h / 90d freshness windows, unlike the fixed OBSERVED_AT fixture).
 fn future_iso(days: i64) -> String {
-    let t = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+    offset_iso_hours(days * 24)
+}
+
+fn format_iso_utc(t: time::OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         t.year(),
@@ -710,6 +723,403 @@ async fn events_mirror_swaps_atomically_and_keeps_last_good_on_failure() {
         .await
         .expect("next view");
     assert_eq!(next_row.map(|(id,)| id), Some("old".to_owned()));
+
+    fixture.close().await.expect("drop test database");
+}
+
+/// Seed one funnel `events` row (mirrors the cutover `record_event` column
+/// list; `occurred_at` binds as text and casts to timestamptz).
+async fn seed_funnel_event(
+    pool: &Pool<Postgres>,
+    event_type: &str,
+    member_id: &str,
+    occurred_at: &str,
+    source: &str,
+    key: &str,
+) {
+    sqlx::query(
+        "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
+         VALUES ($1, $2, $3, $4::timestamptz, $5, NULL, $6)",
+    )
+    .bind(event_type)
+    .bind(member_id)
+    .bind(GUILD)
+    .bind(occurred_at)
+    .bind(source)
+    .bind(key)
+    .execute(pool)
+    .await
+    .expect("seed funnel event");
+}
+
+/// Seed one `members` projection row. `left_at` None = current member.
+async fn seed_member(pool: &Pool<Postgres>, member_id: &str, bot: bool, left_at: Option<&str>) {
+    sqlx::query(
+        "INSERT INTO members (guild_id, member_id, joined_at, left_at, is_bot)
+         VALUES ($1, $2, '2026-09-20T12:00:00.000Z'::timestamptz, $3::timestamptz, $4)",
+    )
+    .bind(GUILD)
+    .bind(member_id)
+    .bind(left_at)
+    .bind(bot)
+    .execute(pool)
+    .await
+    .expect("seed member");
+}
+
+#[tokio::test]
+async fn funnel_views_count_leavers_without_inventing_placeholders() {
+    // B4 website-read contract: the growth dashboard reads aggregates, never
+    // member ids. A join counts even when the projector never wrote a member
+    // row; a leaver counts as both a join and a leave. The members view shows
+    // leavers as non-current but never invents a row for a member it never saw.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+
+    seed_member(&pool, "m1", false, Some("2026-09-21T18:00:00.000Z")).await;
+    seed_member(&pool, "m2", false, Some("2026-09-20T18:00:00.000Z")).await;
+    seed_member(&pool, "bot1", true, None).await;
+    // m3 and m4 join but never get a projection row: no placeholder allowed.
+
+    let day_a = "2026-09-20";
+    let day_b = "2026-09-21";
+    seed_funnel_event(
+        &pool,
+        "member_join",
+        "m1",
+        "2026-09-20T12:00:00.000Z",
+        "abc123",
+        "tog11721-k1",
+    )
+    .await;
+    seed_funnel_event(
+        &pool,
+        "member_join",
+        "m2",
+        "2026-09-20T12:05:00.000Z",
+        "abc123",
+        "tog11721-k2",
+    )
+    .await;
+    seed_funnel_event(
+        &pool,
+        "member_join",
+        "m3",
+        "2026-09-20T12:10:00.000Z",
+        "unknown",
+        "tog11721-k3",
+    )
+    .await;
+    seed_funnel_event(
+        &pool,
+        "member_join",
+        "bot1",
+        "2026-09-20T12:15:00.000Z",
+        "abc123",
+        "tog11721-k7",
+    )
+    .await;
+    seed_funnel_event(
+        &pool,
+        "member_leave",
+        "m2",
+        "2026-09-20T18:00:00.000Z",
+        "abc123",
+        "tog11721-k4",
+    )
+    .await;
+    seed_funnel_event(
+        &pool,
+        "first_message",
+        "m1",
+        "2026-09-20T13:00:00.000Z",
+        "abc123",
+        "tog11721-k5",
+    )
+    .await;
+    seed_funnel_event(
+        &pool,
+        "first_voice_session",
+        "m1",
+        "2026-09-20T14:00:00.000Z",
+        "abc123",
+        "tog11721-k6",
+    )
+    .await;
+    seed_funnel_event(
+        &pool,
+        "member_join",
+        "m4",
+        "2026-09-21T12:00:00.000Z",
+        "abc123",
+        "tog11721-k8",
+    )
+    .await;
+    seed_funnel_event(
+        &pool,
+        "member_leave",
+        "m1",
+        "2026-09-21T18:00:00.000Z",
+        "abc123",
+        "tog11721-k9",
+    )
+    .await;
+
+    type DailyRow = (String, i64, i64, i64, i64, i64);
+    let daily: Vec<DailyRow> = sqlx::query_as(
+        "SELECT day, joins, leaves, first_messages, first_voice_sessions, net_change
+         FROM web_v1.funnel_daily ORDER BY day",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("funnel_daily");
+    assert_eq!(
+        daily,
+        vec![
+            (day_a.to_owned(), 3, 1, 1, 1, 2),
+            (day_b.to_owned(), 1, 1, 0, 0, 0),
+        ]
+    );
+
+    // 'unknown' renders as itself, never folded into a real invite code; the
+    // bot join is excluded from every source bucket.
+    type SourceRow = (String, String, i64);
+    let by_source: Vec<SourceRow> = sqlx::query_as(
+        "SELECT day, source, joins FROM web_v1.funnel_by_source ORDER BY day, source",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("funnel_by_source");
+    assert_eq!(
+        by_source,
+        vec![
+            (day_a.to_owned(), "abc123".to_owned(), 2),
+            (day_a.to_owned(), "unknown".to_owned(), 1),
+            (day_b.to_owned(), "abc123".to_owned(), 1),
+        ]
+    );
+
+    // Leavers stay visible as non-current; the projection-less joiners and
+    // the bot get no profile row at all.
+    let members: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT member_id, is_current_member FROM web_v1.members ORDER BY member_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("members view");
+    assert_eq!(
+        members,
+        vec![("m1".to_owned(), false), ("m2".to_owned(), false),]
+    );
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn upcoming_and_next_serve_scheduled_and_active_only_as_utc() {
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+    let gate = JobGate::default();
+
+    // Fixed-offset input proves the contract publishes UTC instants: a wall
+    // clock in +01:00 renders back as the same instant in Z.
+    let instant = time::OffsetDateTime::now_utc() + time::Duration::hours(72);
+    let wall = instant + time::Duration::hours(1);
+    let offset_input = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}+01:00",
+        wall.year(),
+        u8::from(wall.month()),
+        wall.day(),
+        wall.hour(),
+        wall.minute(),
+        wall.second(),
+        wall.nanosecond() / 1_000_000
+    );
+    let offset_utc = format_iso_utc(instant);
+
+    let active_start = offset_iso_hours(-2);
+    let sched_start = future_iso(2);
+    let rows = normalize_events(&[
+        raw_event("active-started", &active_start, 2),
+        raw_event("sched-future", &sched_start, 1),
+        raw_event("offset-zone", &offset_input, 1),
+        raw_event("done", &future_iso(5), 3),
+        raw_event("nix", &future_iso(5), 4),
+        raw_event("far", &future_iso(100), 1),
+        raw_event("stale-sched", &offset_iso_hours(-2), 1),
+    ])
+    .expect("mirror normalizes");
+    {
+        let _guard = gate.try_acquire().expect("acquire");
+        replace_events(&pool, GUILD, OBSERVED_AT, &rows)
+            .await
+            .expect("swap mirror");
+    }
+
+    // Completed, cancelled, beyond-90d and past-but-still-scheduled rows are
+    // hidden; the started-but-active event still leads in start order.
+    type UpcomingRow = (String, String, String, Option<String>, Option<String>);
+    let upcoming: Vec<UpcomingRow> = sqlx::query_as(
+        "SELECT event_id, name, starts_at, channel_id, description
+         FROM web_v1.upcoming_events",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("upcoming view");
+    assert_eq!(upcoming.len(), 3);
+    assert_eq!(upcoming[0].0, "active-started");
+    assert_eq!(upcoming[0].2, active_start);
+    assert_eq!(upcoming[1].0, "sched-future");
+    assert_eq!(upcoming[1].2, sched_start);
+    assert_eq!(
+        upcoming[2],
+        (
+            "offset-zone".to_owned(),
+            "Event offset-zone".to_owned(),
+            offset_utc,
+            Some("voice-1".to_owned()),
+            None,
+        )
+    );
+    for row in &upcoming {
+        assert!(
+            row.2.ends_with('Z') && row.2.contains('T'),
+            "non-UTC instant served: {}",
+            row.2
+        );
+    }
+
+    let next: Option<(String,)> = sqlx::query_as("SELECT event_id FROM web_v1.next_event")
+        .fetch_optional(&pool)
+        .await
+        .expect("next view");
+    assert_eq!(next.map(|(id,)| id), Some("active-started".to_owned()));
+
+    // Zero rows is a correct answer: the empty state stays reachable and no
+    // placeholder is ever invented.
+    {
+        let _guard = gate.try_acquire().expect("acquire");
+        replace_events(&pool, GUILD, OBSERVED_AT, &[])
+            .await
+            .expect("empty swap");
+    }
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM web_v1.upcoming_events")
+        .fetch_one(&pool)
+        .await
+        .expect("upcoming count");
+    assert_eq!(count.0, 0);
+    let next: Option<(String,)> = sqlx::query_as("SELECT event_id FROM web_v1.next_event")
+        .fetch_optional(&pool)
+        .await
+        .expect("next empty");
+    assert!(next.is_none());
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn contract_meta_pins_version_and_view_shapes() {
+    // Any view-shape change is a contract version bump: update
+    // WEB_CONTRACT_VERSION (website_store.rs), the 0300 seed default, and
+    // this table together — or ship the change as a web_v2 schema instead.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+
+    assert_eq!(WEB_CONTRACT_VERSION, "1.0");
+    let (version, _guild): (String, Option<String>) =
+        sqlx::query_as("SELECT contract_version, guild_id FROM web_contract_meta")
+            .fetch_one(&pool)
+            .await
+            .expect("meta row");
+    assert_eq!(version, WEB_CONTRACT_VERSION);
+
+    // The served meta row carries the same version, with no guild invented
+    // before the bot records one.
+    let meta: (String, Option<String>) =
+        sqlx::query_as("SELECT contract_version, guild_id FROM web_v1.contract_meta")
+            .fetch_one(&pool)
+            .await
+            .expect("contract_meta");
+    assert_eq!(meta, ("1.0".to_owned(), None));
+
+    // Exact column shapes in ordinal order. CREATE OR REPLACE VIEW already
+    // refuses renames/removes/retypes at deploy time; this pins appends too.
+    let cols: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_name, column_name FROM information_schema.columns
+         WHERE table_schema = 'web_v1' ORDER BY table_name, ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("view columns");
+    let mut by_view: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (view, col) in &cols {
+        by_view.entry(view.as_str()).or_default().push(col.as_str());
+    }
+    let expected: &[(&str, &[&str])] = &[
+        ("contract_meta", &["contract_version", "guild_id"]),
+        ("funnel_by_source", &["day", "source", "joins"]),
+        (
+            "funnel_daily",
+            &[
+                "day",
+                "joins",
+                "leaves",
+                "first_messages",
+                "first_voice_sessions",
+                "net_change",
+            ],
+        ),
+        (
+            "live_counts",
+            &[
+                "human_member_count",
+                "online_count",
+                "counts_updated_at",
+                "online_updated_at",
+            ],
+        ),
+        (
+            "member_milestones",
+            &["member_id", "milestone", "occurred_at", "detail"],
+        ),
+        (
+            "members",
+            &[
+                "member_id",
+                "joined_at",
+                "tenure_days",
+                "rank_key",
+                "is_current_member",
+            ],
+        ),
+        (
+            "next_event",
+            &["event_id", "name", "starts_at", "channel_id", "description"],
+        ),
+        (
+            "rank_counts",
+            &[
+                "rank_key",
+                "rank_label",
+                "rank_order",
+                "member_count",
+                "holders_count",
+                "snapshot_at",
+            ],
+        ),
+        (
+            "upcoming_events",
+            &["event_id", "name", "starts_at", "channel_id", "description"],
+        ),
+    ];
+    assert_eq!(by_view.len(), expected.len(), "view count drift");
+    for &(view, columns) in expected {
+        assert_eq!(
+            by_view.get(view),
+            Some(&columns.to_vec()),
+            "shape drift: {view}"
+        );
+    }
 
     fixture.close().await.expect("drop test database");
 }
