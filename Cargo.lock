@@ -2268,6 +2268,7 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "futures-util",
+ "hex",
  "rand 0.10.3",
  "rustls",
  "serde",
