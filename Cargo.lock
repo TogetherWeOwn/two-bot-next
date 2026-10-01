@@ -2200,6 +2200,7 @@ dependencies = [
  "tracing-subscriber",
  "twilight-cache-inmemory",
  "twilight-gateway",
+ "twilight-http",
  "twilight-model",
  "two-bot-core",
  "two-bot-cutover",
@@ -2256,6 +2257,7 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "two-bot-core",
+ "url",
 ]
 
 [[package]]

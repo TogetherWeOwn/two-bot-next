@@ -25,6 +25,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
         .with_state(state)
+        .merge(crate::metrics_http::router())
         .layer(TraceLayer::new_for_http())
 }
 

@@ -6,11 +6,15 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod backup_cli;
+mod database_roles_cli;
 mod gateway;
+mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+mod metrics_http;
+mod preflight;
 mod server;
 mod sticky_runtime;
 #[cfg(test)]
@@ -30,6 +34,10 @@ use server::serve;
 #[tokio::main]
 async fn main() {
     ensure_crypto_provider();
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_args.first().is_some_and(|arg| arg == "preflight") {
+        std::process::exit(preflight::dispatch(&cli_args[1..]).await);
+    }
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot
     // rot behind an HTTP-client upgrade.
@@ -40,7 +48,6 @@ async fn main() {
     // Operator CLI (TOG-9881): backup/restore + sealed guild-config snapshot.
     // No subcommand falls through to the gateway path below. sqlx is linked
     // (core `db` feature) so these paths can open Postgres directly.
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if !cli_args.is_empty() && cli_args[0] != "--help" && cli_args[0] != "-h" {
         let code = backup_cli::dispatch(&cli_args).await;
         // 100 = not a backup subcommand: fall through to serve.
@@ -100,9 +107,11 @@ async fn main() {
             let state = Arc::clone(&state);
             Some(tokio::spawn(async move {
                 let result: Result<(), sqlx::Error> = async {
+                    // Runtime is DML-only; the operator migrates before startup.
                     let db =
-                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
+                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, true)
                             .await?;
+                    metrics_http::register_pool(db.pool().clone());
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
                         db.pool().clone(),
                         guild_id.to_string(),
@@ -165,6 +174,7 @@ async fn main() {
 
 /// `--help` covers both the gateway server and the backup CLI.
 async fn print_backup_help_and_exit() -> ! {
+    println!("{}", preflight::USAGE);
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
 }
