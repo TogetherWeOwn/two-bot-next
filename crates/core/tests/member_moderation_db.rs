@@ -289,12 +289,18 @@ async fn postgres_historical_acceptance_requires_exact_ordering_and_atomic_audit
             usize::from(temporary)
         );
         assert_eq!(discord.call_count("unban"), usize::from(temporary));
+        discord.clear_failure("ban");
         let fresh_id = format!("historical-fresh-{user}");
         let mut fresh = execution(ModerationAction::Ban, &fresh_id);
         fresh.target.as_mut().unwrap().user_id = user.into();
-        svc.execute(&fresh)
-            .await
-            .expect("only older uncertainty was resolved");
+        assert!(
+            !svc.execute(&fresh)
+                .await
+                .expect("only older uncertainty was resolved")
+                .replayed
+        );
+        assert_eq!(discord.call_count("ban"), 2);
+        assert_eq!(ban_state(&pool, &fresh_id).await, "accepted");
     }
     cleanup(admin, pool, schema).await;
 }

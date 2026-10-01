@@ -1421,6 +1421,19 @@ impl MemInner {
                 .get(request)
                 .is_some_and(|row| row.state == BanState::Accepted)
     }
+
+    // Historical PUT acceptance does not resolve another in-flight DELETE.
+    fn accepted_unfenced_unban(&self, request: &str) -> bool {
+        self.accepted_current_ban(request)
+            && self.unbans.get(request).is_some_and(|row| {
+                !self.unbans.iter().any(|(id, other)| {
+                    id != request
+                        && other.guild_id == row.guild_id
+                        && other.user_id == row.user_id
+                        && other.state == UnbanState::Running
+                })
+            })
+    }
 }
 
 /// Local FIFO queues, shared by store clones. Like the legacy service, one
@@ -1773,7 +1786,7 @@ impl MemberModerationStore for MemMemberStore {
         completed_at: &str,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock();
-        if !inner.accepted_current_ban(request_id)
+        if !inner.accepted_unfenced_unban(request_id)
             || !inner.unbans.get(request_id).is_some_and(|row| {
                 row.state == UnbanState::Staged
                     && row.guild_id == guild_id
@@ -1837,7 +1850,7 @@ impl MemberModerationStore for MemMemberStore {
                 .filter(|(id, r)| {
                     r.guild_id == guild_id
                         && r.state == UnbanState::Staged
-                        && inner.accepted_current_ban(id)
+                        && inner.accepted_unfenced_unban(id)
                 })
                 .map(|(id, r)| {
                     (
@@ -1854,7 +1867,7 @@ impl MemberModerationStore for MemMemberStore {
             self.serialize_member(&guild_id, &user_id, || async {
                 let eligible = {
                     let inner = self.lock();
-                    inner.accepted_current_ban(&id)
+                    inner.accepted_unfenced_unban(&id)
                         && inner
                             .unbans
                             .get(&id)
@@ -1877,7 +1890,7 @@ impl MemberModerationStore for MemMemberStore {
                     r.guild_id == guild_id
                         && r.state == UnbanState::Pending
                         && r.execute_at.as_str() <= now
-                        && inner.accepted_current_ban(id)
+                        && inner.accepted_unfenced_unban(id)
                 })
                 .map(|(id, r)| (id.clone(), r.clone()))
                 .collect()
@@ -1894,7 +1907,7 @@ impl MemberModerationStore for MemMemberStore {
             let job = self
                 .serialize_member(&row.guild_id, &row.user_id, || async {
                     let mut inner = self.lock();
-                    if !inner.accepted_current_ban(&id)
+                    if !inner.accepted_unfenced_unban(&id)
                         || !inner.unbans.get(&id).is_some_and(|r| {
                             r.state == UnbanState::Pending && r.execute_at.as_str() <= now
                         })
@@ -2386,10 +2399,42 @@ mod tests {
             .await
             .is_err());
         assert!(store
-            .claim_due_unbans(GUILD, NOW, 25)
+            .activate_staged_unban(GUILD, TARGET_ID, "later", NOW)
             .await
-            .unwrap()
-            .is_empty());
+            .is_err());
+        for state in [UnbanState::Staged, UnbanState::Pending] {
+            let later_before = {
+                let mut inner = store.lock();
+                let job = inner.unbans.get_mut("later").unwrap();
+                job.state = state;
+                job.clone()
+            };
+            assert!(store
+                .claim_due_unbans(GUILD, NOW, 25)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(store.lock().unbans["older"], before);
+            assert_eq!(store.lock().unbans["later"], later_before);
+        }
+        // This member's uncertain DELETE must not block unrelated expiries.
+        for (guild, user, request) in [
+            (GUILD, "other-user", "other-user-expiry"),
+            ("other-guild", TARGET_ID, "other-guild-expiry"),
+        ] {
+            let attempt = store
+                .stage_unban(guild, user, NOW, "expiry", request, NOW)
+                .await
+                .unwrap();
+            store
+                .confirm_ban_attempt(guild, user, request, attempt, NOW)
+                .await
+                .unwrap();
+            let jobs = store.claim_due_unbans(guild, NOW, 25).await.unwrap();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].request_id, request);
+            assert_eq!(store.lock().unbans["older"], before);
+        }
     }
 
     fn service(
