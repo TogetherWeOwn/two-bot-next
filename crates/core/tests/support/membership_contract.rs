@@ -530,6 +530,59 @@ pub fn dispatch_and_rest<S: MembershipStore>(make: &impl Fn() -> S) {
     // by crates/discord/tests/membership_observation.rs, not a fake store no-op.
 }
 
+pub fn observation_boundaries<S: MembershipStore>(make: &impl Fn() -> S) {
+    // Source: two-bot@bffccf3 src/store/eventStore.ts:91-176 (explicit hints, metadata-only duplicate maximum).
+    const BEFORE: &str = "2026-09-30T00:00:00.000001Z";
+    const BETWEEN: &str = "2026-09-30T00:15:00.000001Z";
+    for hint in [BEFORE, REJOIN] {
+        for duplicate in [false, true] {
+            let s = make();
+            s.record(leave(BETWEEN));
+            let original = join(REJOIN, "invite:original");
+            if duplicate {
+                assert!(s.record(original.clone()).inserted);
+            }
+            assert_eq!(s.record_observed(original, Some(hint)).inserted, !duplicate);
+            assert_eq!(observed(&s, EventType::MemberJoin), hint);
+            expect(
+                &s,
+                Some(REJOIN),
+                Some("invite:original"),
+                (hint == BEFORE).then_some(BETWEEN),
+                None,
+            );
+            let original_row = row(&s, EventType::MemberJoin);
+            let mut replay = join(REJOIN, "unknown");
+            replay.metadata = Some(serde_json::json!({
+                "membershipObservedAt": RESUMED,
+                "unrelated": "must not replace original metadata"
+            }));
+            assert!(!s.record_observed(replay.clone(), None).inserted);
+            assert_eq!(
+                row(&s, EventType::MemberJoin).metadata,
+                original_row.metadata
+            );
+            assert!(!s.record_observed(replay, Some(BEFORE)).inserted);
+            assert_eq!(observed(&s, EventType::MemberJoin), hint);
+            let current = row(&s, EventType::MemberJoin);
+            assert_eq!(current.idempotency_key, original_row.idempotency_key);
+            assert_eq!(current.source, original_row.source);
+            assert_eq!(current.occurred_at, original_row.occurred_at);
+        }
+    }
+
+    let s = make();
+    let original = join(REJOIN, "invite:original");
+    s.record(original.clone());
+    let mut replay = original.clone();
+    replay.metadata = Some(serde_json::json!({"membershipObservedAt": RESUMED}));
+    s.record_observed(replay, None);
+    assert!(row(&s, EventType::MemberJoin).metadata.is_none());
+    s.record_observed(original.clone(), Some(BEFORE));
+    s.record_observed(original, Some(BETWEEN));
+    assert_eq!(observed(&s, EventType::MemberJoin), BETWEEN);
+}
+
 pub fn clock() {
     // Source: two-bot@bffccf3 test/unit.membership-clock.test.ts:5.
     let clock = MembershipClock::default();
@@ -550,5 +603,6 @@ pub fn run<S: MembershipStore>(make: impl Fn() -> S) {
     replay(&make);
     concurrent(&make);
     dispatch_and_rest(&make);
+    observation_boundaries(&make);
     clock();
 }

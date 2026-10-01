@@ -30,6 +30,10 @@ fn dispatch_and_rest_completion_do_not_reverse_observation_order() {
     contract::dispatch_and_rest(&MemStore::new);
 }
 #[test]
+fn explicit_observation_maximum_is_independent_of_occurrence() {
+    contract::observation_boundaries(&MemStore::new);
+}
+#[test]
 fn same_tick_and_backward_clock_keep_occurrence_and_observation_separate() {
     contract::clock();
 }
@@ -123,4 +127,5 @@ fn timestamp_normalization_retains_microseconds_without_rounding() {
     );
     assert!(normalize_timestamp("2026-02-30T00:00:00.000Z").is_none());
     assert!(normalize_timestamp("2026-08-01T00:00:00.0000001Z").is_none());
+    assert!(normalize_timestamp("2026-08-01T00:00:00+0é0").is_none());
 }

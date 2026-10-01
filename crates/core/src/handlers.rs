@@ -204,16 +204,9 @@ impl crate::membership::MembershipStore for MemStore {
 
     fn record_observed(&self, event: FunnelEvent, observed_at: Option<&str>) -> RecordOutcome {
         let mut row = StoredRow::from(&event);
-        let metadata_hint = row
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("membershipObservedAt"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let hint = observed_at.or(metadata_hint.as_deref());
         let mut inner = self.inner.lock().expect("store lock");
         if inner.keys.contains(&row.idempotency_key) {
-            if let Some(hint) = hint {
+            if let Some(hint) = observed_at {
                 let existing = inner
                     .rows
                     .iter_mut()
@@ -224,7 +217,7 @@ impl crate::membership::MembershipStore for MemStore {
             return RecordOutcome { inserted: false };
         }
         if let Some(hint) = observed_at {
-            crate::membership::advance_observation(&mut row, hint);
+            crate::membership::set_observation(&mut row, hint);
         }
         inner.keys.insert(row.idempotency_key.clone());
         inner.rows.push(row);

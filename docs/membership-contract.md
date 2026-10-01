@@ -14,6 +14,10 @@ report CLIs, deployment, or a live Discord journey.
 - Reconfirmation advances observation monotonically but preserves the stored
   identity, occurrence, source, inviter and unrelated metadata. It does not
   count as a genuine rejoin or clear inactivity after that actual join.
+  Explicit valid hints may precede occurrence: duplicate maxima compare only
+  prior metadata hints, not the occurrence fallback. A duplicate without an
+  explicit hint never updates stored metadata from its incoming payload.
+  The page-start/join maximum is capture policy, not a store-wide floor.
 - An actual join at/after the inactivity flag clears it, even if a leave wins
   presence. First-message and other milestones remain immutable.
 - Comparisons normalize UTC to six fractional digits; database text/session

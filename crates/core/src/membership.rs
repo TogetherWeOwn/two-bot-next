@@ -52,6 +52,9 @@ impl MembershipClock {
 /// Source: https://docs.rs/time/0.3.55/time/struct.OffsetDateTime.html#method.parse
 pub fn normalize_timestamp(value: &str) -> Option<String> {
     let mut input = value.trim().to_owned();
+    if !input.is_ascii() {
+        return None;
+    }
     if input.as_bytes().get(10) == Some(&b' ') {
         input.replace_range(10..11, "T");
     }
@@ -108,20 +111,32 @@ pub(crate) fn is_membership(kind: EventType) -> bool {
     matches!(kind, EventType::MemberJoin | EventType::MemberLeave)
 }
 
-pub(crate) fn observation(row: &StoredRow) -> Option<String> {
+fn metadata_observation(row: &StoredRow) -> Option<String> {
     row.metadata
         .as_ref()
         .and_then(|m| m.get("membershipObservedAt"))
         .and_then(serde_json::Value::as_str)
         .and_then(valid_observation)
-        .or_else(|| normalize_timestamp(&row.occurred_at))
+}
+
+pub(crate) fn observation(row: &StoredRow) -> Option<String> {
+    metadata_observation(row).or_else(|| normalize_timestamp(&row.occurred_at))
 }
 
 pub(crate) fn advance_observation(row: &mut StoredRow, hint: &str) {
     let Some(new) = valid_observation(hint) else {
         return;
     };
-    if !is_membership(row.event_type) || observation(row).is_some_and(|old| old >= new) {
+    // An event without an observation may acquire one even before its actual
+    // occurrence. Only prior observation hints participate in the maximum.
+    if metadata_observation(row).is_some_and(|old| old >= new) {
+        return;
+    }
+    set_observation(row, hint);
+}
+
+pub(crate) fn set_observation(row: &mut StoredRow, hint: &str) {
+    if !is_membership(row.event_type) || valid_observation(hint).is_none() {
         return;
     }
     if !row
