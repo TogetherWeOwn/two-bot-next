@@ -349,7 +349,7 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<String>>>) {
             // community jobs without an ordered response script.
             let (status, body): (&str, &[u8]) = if path == "/api/v10/guilds/2222?with_counts=true" {
                 ("200 OK", b"{\"approximate_presence_count\":7}")
-            } else if path == "/api/v10/guilds/2222/members?limit=1000&after=0"
+            } else if path == "/api/v10/guilds/2222/members?after=0&limit=1000"
                 || path.starts_with("/api/v10/guilds/2222/scheduled-events")
             {
                 ("200 OK", b"[]")
@@ -584,7 +584,12 @@ async fn diagnostic_boot(
     let addr = reserved.local_addr().unwrap();
     drop(reserved);
     bots.push(Bot::spawn_with_env(
-        db, addr, &discord.url, &discord.api, logs, extra,
+        db,
+        addr,
+        &discord.url,
+        &discord.api,
+        logs,
+        extra,
     ));
     let bot = bots.last_mut().unwrap();
     wait_http(bot, addr, "/healthz", 200).await;
@@ -611,10 +616,8 @@ async fn diagnostic_boot(
         timeout(Duration::from_secs(12), async {
             loop {
                 let response = wait_http(bot, addr, "/readyz", 200).await;
-                let report: Value = serde_json::from_str(
-                    response.split("\r\n\r\n").nth(1).unwrap(),
-                )
-                .unwrap();
+                let report: Value =
+                    serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                 if report["jobs"]["presence_probe"]["last_success"].is_number() {
                     assert!(report["jobs"]["presence_probe"]["last_error_class"].is_null());
                     break;
@@ -625,8 +628,16 @@ async fn diagnostic_boot(
         .await
         .expect("successful presence tick, not merely a live HTTP listener");
         let requests = discord.rest_requests.lock().await;
-        assert!(requests.iter().any(|p| p == "/api/v10/guilds/2222?with_counts=true"));
-        assert!(requests.iter().any(|p| p == "/api/v10/guilds/2222/members?limit=1000&after=0"));
+        assert!(requests
+            .iter()
+            .any(|p| p == "/api/v10/guilds/2222?with_counts=true"));
+        assert!(requests
+            .iter()
+            .any(|p| p == "/api/v10/guilds/2222/members?after=0&limit=1000"));
+        assert!(
+            !logs.lock().await.contains("presence_probe_bot_floor_failed"),
+            "presence bot-floor read must succeed against the synthetic REST double"
+        );
     }
     bot.terminate().await;
 }
@@ -683,7 +694,10 @@ async fn startup_diagnostic_credentialed_optional_configuration() {
             Ok(Ok(())) => eprintln!("PASS startup diagnostic case: {name}"),
             other => {
                 eprintln!("FAIL startup diagnostic case: {name}");
-                eprintln!("=== synthetic child logs ===\n{}=== end child logs ===", logs.lock().await);
+                eprintln!(
+                    "=== synthetic child logs ===\n{}=== end child logs ===",
+                    logs.lock().await
+                );
                 match other {
                     Err(panic) => std::panic::resume_unwind(panic),
                     _ => panic!("startup diagnostic case {name} exceeded {TOTAL:?}"),
