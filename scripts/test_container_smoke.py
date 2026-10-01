@@ -25,6 +25,7 @@ class DockerFixture:
         self.binary_size = 7 * smoke.MIB
         self.user = "two-bot"
         self.health_command = ["CMD", smoke.BINARY, "--healthcheck"]
+        self.ca_bundle = "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n"
         self.uid = "1000"
         self.live_health_exit = 0
         self.dead_health_exit = 1
@@ -56,6 +57,8 @@ class DockerFixture:
                 "Running": not self.stopped, "OOMKilled": self.oom,
                 "Health": {"Status": self.health_status},
             }}])
+        elif args[0] == "exec" and args[-1] == smoke.CA_BUNDLE:
+            output = self.ca_bundle
         elif args[0] == "exec" and "cat" in args:
             output = "Name:\ttwo-bot\nUid:\t" + "\t".join([self.uid] * 4) + "\n"
         elif args[0] == "exec":
@@ -214,6 +217,21 @@ class ContainerSmokeTests(unittest.TestCase):
     def test_image_budget_is_enforced_before_runtime_start(self):
         self.assert_rejected("image exceeds size budget", image_max_bytes=1)
         self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
+
+    def test_ci_image_size_failure_keeps_default_budgets(self):
+        self.fixture.image_size = 142437143
+        self.fixture.binary_size = 10287160
+        self.assertEqual(smoke.IMAGE_MAX_BYTES, 112 * smoke.MIB)
+        self.assertEqual(smoke.BINARY_MAX_BYTES, 10 * smoke.MIB)
+        self.assert_rejected("image exceeds size budget")
+        self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
+
+    def test_runtime_ca_bundle_is_required(self):
+        for bundle in ("", "not PEM", "-----BEGIN CERTIFICATE-----\n"):
+            with self.subTest(bundle=bundle):
+                self.fixture.ca_bundle = bundle
+                self.assert_rejected("runtime CA bundle must contain PEM certificates")
+                self.assertTrue(self.fixture.removals())
 
     def test_binary_budget_is_enforced(self):
         self.assert_rejected("release binary exceeds size budget", binary_max_bytes=1)

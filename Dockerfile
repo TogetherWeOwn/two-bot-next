@@ -35,11 +35,16 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
 COPY . .
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS certificates
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+FROM debian:bookworm-slim AS runtime
+
+# rustls needs the trust bundle, not the package's OpenSSL dependencies.
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # Non-root user: the bot never needs container root.
 RUN useradd --create-home --shell /usr/sbin/nologin two-bot

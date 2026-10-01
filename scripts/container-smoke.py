@@ -14,6 +14,7 @@ MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
 BINARY_MAX_BYTES = 10 * MIB
 BINARY = "/home/two-bot/two-bot"
+CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 
 def require(condition, message):
@@ -96,6 +97,10 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         port = docker("port", name, "8080/tcp").stdout.strip()
         require(port.startswith("127.0.0.1:"), f"unexpected published port: {port}")
         url = "http://" + port
+        bundle = docker("exec", name, "cat", CA_BUNDLE).stdout
+        require("-----BEGIN CERTIFICATE-----" in bundle and
+                "-----END CERTIFICATE-----" in bundle,
+                "runtime CA bundle must contain PEM certificates")
         deadline = time.monotonic() + 30
         while True:
             code, body = http_response(url + "/health")
