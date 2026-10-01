@@ -11,7 +11,7 @@ import uuid
 PACKAGES = (
     "zlib1g libtinfo6 ncurses-base ncurses-bin perl-base libsystemd0 libudev1 "
     "gzip bsdutils libblkid1 libmount1 libsmartcols1 libuuid1 mount util-linux "
-    "util-linux-extra libacl1 libssl3 openssl"
+    "util-linux-extra libacl1 libpcre2-8-0 libssl3 openssl"
 )
 BINARY = "/home/two-bot/two-bot"
 PROBES = {

@@ -63,6 +63,11 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(report["probes"]["perl_archive_tar"]["returncode"], 2)
             self.assertEqual(report["probes"]["perl_archive_tar"]["stderr"], "module missing")
 
+    def test_reported_pcre2_package_has_file_and_dependency_probes(self):
+        for label in ["affected_package_files", "package_dependencies"]:
+            with self.subTest(probe=label):
+                self.assertIn("libpcre2-8-0", evidence.PROBES[label].split())
+
     def test_fixed_probe_commands_parse_without_executing(self):
         self.assertEqual(len(evidence.PROBES), 16)
         for label, command in evidence.PROBES.items():
