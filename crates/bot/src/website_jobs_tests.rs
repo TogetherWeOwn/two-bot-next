@@ -5,6 +5,32 @@ use two_bot_testsupport::TestDatabase;
 
 use crate::discord_test_common::{MockRest, ScriptedResponse};
 
+#[path = "../../core/tests/support/tracing_capture.rs"]
+mod tracing_capture;
+
+#[test]
+fn admission_lazy_pool_rejects_query_secrets_before_sqlx_logging() {
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let error = admission_pool("postgres://fixture:fixture-password@127.0.0.1:1/fixture?api_key=fixture-admission-query-secret").unwrap_err();
+            assert_eq!(error, "invalid admission authority");
+            let pool = admission_pool("postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable").unwrap();
+            assert_eq!(pool.size(), 0);
+            pool.close().await;
+            tracing::warn!("website admission capture remains active");
+        });
+    });
+    let text = capture.text();
+    assert!(text.contains("website admission capture remains active"));
+    assert!(!text.contains("fixture-admission-query-secret"));
+    assert!(!text.contains("ignoring unrecognized connect parameter"));
+}
+
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
     ActionExecutor::with_proxy("synthetic-job-test-token".to_owned(), Some(mock.origin())).unwrap()

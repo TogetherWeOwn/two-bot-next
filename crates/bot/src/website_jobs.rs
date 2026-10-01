@@ -101,6 +101,14 @@ fn governed_executor(
     ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
 }
 
+fn admission_pool(url: &str) -> Result<PgPool, String> {
+    let options = two_bot_core::database_url::connect_options(url)
+        .map_err(|_| "invalid admission authority".to_owned())?;
+    Ok(sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(options))
+}
+
 pub async fn serve(
     config: &Config,
     listener: tokio::net::TcpListener,
@@ -112,13 +120,9 @@ pub async fn serve(
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
         // Lazy connection preserves parked/startup behavior; every wire attempt
         // still fails closed on this same runtime database authority.
-        let rest = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy(url)
-            .map_err(|_| "invalid admission authority".to_owned())
-            .and_then(|pool| {
-                governed_executor(token, std::env::var("DISCORD_API_BASE").ok(), pool)
-            });
+        let rest = admission_pool(url).and_then(|pool| {
+            governed_executor(token, std::env::var("DISCORD_API_BASE").ok(), pool)
+        });
         match rest {
             Ok(rest) => {
                 let context = Arc::new(Context {

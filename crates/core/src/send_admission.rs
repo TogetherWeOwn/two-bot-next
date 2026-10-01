@@ -2,8 +2,10 @@
 //!
 //! Acquire immediately before each wire attempt. A permit has no expiry and no
 //! drop-release: cancellation/crash leaves an occupied row pending reconciliation.
-//! Finish only after observing a complete exchange, installing any 429 cooldown
-//! before releasing admission. A permit is NOT an idempotency/execution lease.
+//! Complete only after proving a definite effect/no-effect at the mutation
+//! boundary, installing any 429 cooldown before releasing admission. A complete
+//! 5xx or invalid success receipt is still uncertain. Reads have no mutation
+//! effect. A permit is NOT an idempotency/execution lease.
 
 use sha2::{Digest, Sha256};
 use std::{fmt, future::Future, pin::Pin};
@@ -109,12 +111,12 @@ pub fn is_loopback_http(origin: &str) -> bool {
         && url.path() == "/"
         && url.query().is_none()
         && url.fragment().is_none()
-        && url.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        })
+        && match url.host() {
+            Some(url::Host::Domain(host)) => host == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        }
 }
 
 #[cfg(feature = "db")]
@@ -162,5 +164,18 @@ mod tests {
         assert!(!is_loopback_http("https://discord.com"));
         assert!(!is_loopback_http("http://localhost.evil:1234"));
         assert!(!is_loopback_http("http://secret@localhost:1234"));
+        assert!(is_loopback_http("http://[::1]:1234"));
+        assert!(is_loopback_http("http://localhost:1234"));
+        for origin in [
+            "http://[2001:db8::1]:1234",
+            "http://secret@[::1]:1234",
+            "http://user:secret@[::1]:1234",
+            "https://[::1]:1234",
+            "http://[::1]:1234/path",
+            "http://[::1]:1234?secret=fixture",
+            "http://[::1]:1234#fixture",
+        ] {
+            assert!(!is_loopback_http(origin));
+        }
     }
 }

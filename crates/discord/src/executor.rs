@@ -174,13 +174,14 @@ pub enum ChannelCall {
     },
 }
 
-/// One observed HTTP exchange: status plus parsed bodies the retry policy
-/// needs. The executor owns this transport so 429/5xx accounting is exact.
-#[derive(Clone)]
+/// One observed HTTP exchange. Successful mutations retain their consuming
+/// permit until the mutation boundary validates the receipt. Dropping an
+/// uncertain response intentionally leaves admission occupied.
 pub struct RawResponse {
     pub status: u16,
     pub retry_after_header: Option<String>,
     pub body: Vec<u8>,
+    pub(crate) completion: Option<two_bot_core::send_admission::AdmissionPermit>,
 }
 
 impl std::fmt::Debug for RawResponse {
@@ -194,6 +195,24 @@ impl std::fmt::Debug for RawResponse {
 }
 
 impl RawResponse {
+    /// Call only for a definite effect/no-effect, after validating any required
+    /// mutation receipt. A storage fault must not authorize effect replay.
+    pub(crate) async fn complete(&mut self) {
+        if let Some(permit) = self.completion.take() {
+            let cooldown = (self.status == 429).then(|| {
+                two_bot_core::send_admission::cooldown_from_delays(
+                    self.retry_after_header
+                        .as_deref()
+                        .and_then(|value| value.parse().ok()),
+                    self.body_retry_after_secs(),
+                )
+            });
+            if let Err(error) = permit.complete(cooldown).await {
+                tracing::warn!(%error, "Discord send admission completion failed; lane held");
+            }
+        }
+    }
+
     /// Body `retry_after` (seconds) when present and finite — wins over the
     /// header per legacy `kick.ts`.
     #[must_use]
@@ -362,6 +381,12 @@ impl HyperTransport {
     /// One governed wire attempt; no Twilight or pooled-connection resends.
     pub async fn send_request(&self, request: &Request) -> Result<RawResponse, String> {
         use http_body_util::BodyExt as _;
+        if request
+            .headers()
+            .is_some_and(|headers| headers.contains_key(hyper::header::AUTHORIZATION))
+        {
+            return Err("caller-supplied authorization is forbidden".to_owned());
+        }
         let method: http::Method = request
             .method()
             .name()
@@ -434,25 +459,17 @@ impl HyperTransport {
             Err(_) if status == 429 => Vec::new(),
             Err(_) => return Err("Discord response body unavailable".to_owned()),
         };
-        let res = RawResponse {
+        let mut res = RawResponse {
             status,
             retry_after_header,
             body,
+            completion: permit,
         };
-        if let Some(permit) = permit {
-            let cooldown = (status == 429).then(|| {
-                two_bot_core::send_admission::cooldown_from_delays(
-                    res.retry_after_header
-                        .as_deref()
-                        .and_then(|value| value.parse().ok()),
-                    res.body_retry_after_secs(),
-                )
-            });
-            if let Err(error) = permit.complete(cooldown).await {
-                tracing::warn!(%error, "Discord send admission completion failed; lane held");
-                // Preserve the known exchange, especially definitive 429:
-                // storage failure must not turn it into a transport retry.
-            }
+        // Reads cannot mutate; a complete failure may be retried independently.
+        // Mutation success needs its caller's validated receipt. 5xx, redirects
+        // and request-timeout responses remain uncertain even with a full body.
+        if request.method() == Method::Get || (400..500).contains(&status) && status != 408 {
+            res.complete().await;
         }
         Ok(res)
     }
@@ -622,8 +639,26 @@ impl ActionExecutor {
         request: Request,
         accepted: &[u16],
     ) -> Result<Option<serde_json::Value>, DiscordError> {
-        let res = self.call_once_raw(request, accepted).await?;
-        Ok(serde_json::from_slice(&res.body).ok())
+        let needs_object = request.method() == Method::Patch;
+        let mut res = self.call_once_raw(request, accepted).await?;
+        let body: Option<serde_json::Value> = serde_json::from_slice(&res.body).ok();
+        if needs_object
+            && !body.as_ref().is_some_and(|body| {
+                body.get("id")
+                    .or_else(|| body.pointer("/user/id"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .is_some_and(|id| id != 0)
+            })
+        {
+            return Err(DiscordError::Unavailable(
+                "invalid mutation receipt".to_owned(),
+            ));
+        }
+        // These verbs use their accepted status as the effect receipt; message
+        // creation instead validates its required id before consuming completion.
+        res.complete().await;
+        Ok(body)
     }
 
     /// Same single-attempt send as [`Self::call_once`], but returns the raw
@@ -788,7 +823,7 @@ impl ActionExecutor {
                     }
                 }
             };
-            let res = match self.send(&request).await {
+            let mut res = match self.send(&request).await {
                 Ok(r) => r,
                 Err(detail) => {
                     if attempts > MAX_HTTP_TRIES - 1 {
@@ -805,12 +840,13 @@ impl ActionExecutor {
             };
             match classify_kick_status(res.status) {
                 KickStatus::Removed => {
+                    res.complete().await;
                     return KickResult {
                         outcome: KickOutcome::Kicked,
                         status: Some(res.status),
                         detail: "removed".to_owned(),
                         attempts,
-                    }
+                    };
                 }
                 KickStatus::AlreadyGone => {
                     return KickResult {
@@ -1252,8 +1288,9 @@ impl ActionExecutor {
 
     /// Post a message with mention suppression (legacy
     /// `allowed_mentions: { parse: [] }`). Asserts the legacy 2000 UTF-16-unit
-    /// ceiling before sending; returns the message id (`""` when Discord
-    /// omits it). A numeric nonce is sent with `enforce_nonce: true` for
+    /// ceiling before sending; requires a valid message id receipt. An
+    /// unreadable receipt is uncertain, not an empty successful id. A numeric
+    /// nonce is sent with `enforce_nonce: true` for
     /// duplicate suppression.
     pub async fn post_message(
         &self,
@@ -1314,12 +1351,10 @@ impl ActionExecutor {
         .body(body_bytes)
         .build()
         .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
-        let answered = self.call_once(req, &[200, 201]).await?.unwrap_or_default();
-        Ok(answered
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned())
+        let mut res = self.call_once_raw(req, &[200, 201]).await?;
+        let message_id = mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(message_id)
     }
 
     /// Carry out one [`ChannelCall`].
@@ -1439,12 +1474,24 @@ impl ActionExecutor {
         let mut attempts: u32 = 0;
         loop {
             self.pace(false).await;
-            let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
+            let mut res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
                 .await
                 .map_err(|_| DiscordError::Timeout)?
                 .map_err(DiscordError::Unavailable)?;
             match res.status {
-                200..=299 => return Ok(()),
+                200 => {
+                    let published: Vec<twilight_model::application::command::Command> =
+                        serde_json::from_slice(&res.body).map_err(|_| {
+                            DiscordError::Unavailable("invalid command registry receipt".to_owned())
+                        })?;
+                    if published.len() != commands.len() {
+                        return Err(DiscordError::Unavailable(
+                            "incomplete command registry receipt".to_owned(),
+                        ));
+                    }
+                    res.complete().await;
+                    return Ok(());
+                }
                 429 => {
                     if attempts >= MAX_HTTP_TRIES - 1 {
                         return Err(DiscordError::RateLimited);
@@ -1483,12 +1530,20 @@ impl ActionExecutor {
                 .create_response(interaction_id, interaction_token, &response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
+        let mut res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
             .await
             .map_err(|_| DiscordError::Timeout)?
             .map_err(DiscordError::Unavailable)?;
         match res.status {
-            200..=299 => Ok(()),
+            200 => {
+                mutation_receipt_id(&res.body)?;
+                res.complete().await;
+                Ok(())
+            }
+            204 => {
+                res.complete().await;
+                Ok(())
+            }
             _ => Err(throw_for_status(&res)),
         }
     }
@@ -1515,7 +1570,10 @@ impl ActionExecutor {
                 .content(Some(&content))
                 .allowed_mentions(Some(&mentions)),
         )?;
-        self.call_once_raw(req, &[200]).await.map(|_| ())
+        let mut res = self.call_once_raw(req, &[200]).await?;
+        mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(())
     }
 
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
@@ -1658,13 +1716,25 @@ pub fn unlock_masks(current: Option<&EveryoneOverwrite>) -> (String, String) {
     )
 }
 
-/// Legacy `throwForStatus`: 429 → [`DiscordError::RateLimited`], 5xx →
-/// [`DiscordError::Unavailable`], anything else → [`DiscordError::Rejected`].
+fn mutation_receipt_id(body: &[u8]) -> Result<String, DiscordError> {
+    let body: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| DiscordError::Unavailable("invalid mutation receipt".to_owned()))?;
+    let id = body.get("id").and_then(serde_json::Value::as_str);
+    match id {
+        Some(id) if id.parse::<u64>().is_ok_and(|id| id != 0) => Ok(id.to_owned()),
+        _ => Err(DiscordError::Unavailable(
+            "invalid mutation receipt id".to_owned(),
+        )),
+    }
+}
+
+/// Only a definitive non-429 4xx refusal is retry-safe. Unexpected successes,
+/// redirects, request timeouts and 5xx are uncertain mutation outcomes.
 #[must_use]
 pub fn throw_for_status(res: &RawResponse) -> DiscordError {
     if res.status == 429 {
         DiscordError::RateLimited
-    } else if res.status >= 500 {
+    } else if !(400..500).contains(&res.status) || res.status == 408 {
         DiscordError::Unavailable(format!("Discord returned {}", res.status))
     } else {
         DiscordError::Rejected(format!("Discord refused the request with {}", res.status))
@@ -1980,6 +2050,7 @@ mod tests {
             status: 403,
             retry_after_header: Some("fixture-echoed-header-secret".to_owned()),
             body: b"fixture-echoed-body-secret".to_vec(),
+            completion: None,
         };
         for shown in [format!("{response:?}"), format!("{response:#?}")] {
             assert!(!shown.contains("fixture"));
@@ -2009,6 +2080,7 @@ mod tests {
             status: 429,
             retry_after_header: Some("5".to_owned()),
             body: br#"{"retry_after": 1.5, "global": false}"#.to_vec(),
+            completion: None,
         };
         assert_eq!(res.body_retry_after_secs(), Some(1.5));
         assert_eq!(res.retry_after_wait_ms(), 1750);
@@ -2020,24 +2092,28 @@ mod tests {
             status: 429,
             retry_after_header: Some("2".to_owned()),
             body: Vec::new(),
+            completion: None,
         };
         assert_eq!(header_only.retry_after_wait_ms(), 2250);
         let missing = RawResponse {
             status: 429,
             retry_after_header: None,
             body: Vec::new(),
+            completion: None,
         };
         assert_eq!(missing.retry_after_wait_ms(), 1250);
         let garbage = RawResponse {
             status: 429,
             retry_after_header: Some("soon".to_owned()),
             body: b"not json".to_vec(),
+            completion: None,
         };
         assert_eq!(garbage.retry_after_wait_ms(), 1250);
         let clamped = RawResponse {
             status: 429,
             retry_after_header: Some("86400".to_owned()),
             body: Vec::new(),
+            completion: None,
         };
         assert_eq!(clamped.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
     }
@@ -2075,12 +2151,14 @@ mod tests {
             status: 429,
             retry_after_header: None,
             body: Vec::new(),
+            completion: None,
         };
         assert_eq!(throw_for_status(&rl), DiscordError::RateLimited);
         let down = RawResponse {
             status: 503,
             retry_after_header: None,
             body: Vec::new(),
+            completion: None,
         };
         assert!(matches!(
             throw_for_status(&down),
@@ -2090,6 +2168,7 @@ mod tests {
             status: 403,
             retry_after_header: None,
             body: Vec::new(),
+            completion: None,
         };
         assert!(throw_for_status(&no).is_safe_pre_mutation());
         assert!(!DiscordError::Timeout.is_safe_pre_mutation());

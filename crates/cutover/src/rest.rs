@@ -84,9 +84,11 @@ impl RestClient {
         let url = std::env::var("TWO_DATABASE_URL").map_err(|_| {
             RestError::Wire("TWO_DATABASE_URL admission authority required".to_owned())
         })?;
+        let options = two_bot_core::database_url::connect_options(&url)
+            .map_err(|_| RestError::Wire("admission authority unavailable".to_owned()))?;
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
-            .connect(&url)
+            .connect_with(options)
             .await
             .map_err(|_| RestError::Wire("admission authority unavailable".to_owned()))?;
         let gate =

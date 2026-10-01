@@ -49,6 +49,8 @@ struct Recorded {
     method: String,
     path: String,
     user_agent: Option<String>,
+    #[cfg(feature = "db-tests")]
+    authorization: Option<String>,
     body: Value,
 }
 
@@ -104,6 +106,12 @@ impl MockDiscord {
                     user_agent: head.lines().find_map(|line| {
                         let (name, value) = line.split_once(':')?;
                         name.eq_ignore_ascii_case("user-agent")
+                            .then(|| value.trim().to_owned())
+                    }),
+                    #[cfg(feature = "db-tests")]
+                    authorization: head.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
                             .then(|| value.trim().to_owned())
                     }),
                     body: if content_length == 0 {

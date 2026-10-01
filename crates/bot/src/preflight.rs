@@ -516,9 +516,12 @@ async fn admission_transport(
 ) -> Result<HyperTransport, Check> {
     match std::env::var("TWO_DATABASE_URL") {
         Ok(url) => {
+            let options = two_bot_core::database_url::connect_options(&url).map_err(|_| {
+                Check::fail("send admission", "runtime admission authority unavailable")
+            })?;
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(2)
-                .connect(&url)
+                .connect_with(options)
                 .await
                 .map_err(|_| {
                     Check::fail("send admission", "runtime admission authority unavailable")
@@ -642,6 +645,28 @@ pub async fn dispatch(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_query_guard_child() {
+        if std::env::var_os("ADMISSION_BOOTSTRAP_PROBE").is_none() {
+            return;
+        }
+        crate::admission_test_support::capture_probe(async {
+            let error = admission_transport(
+                "fixture-token".to_owned(),
+                Some("http://127.0.0.1:1".to_owned()),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.detail, "runtime admission authority unavailable");
+        });
+    }
+
+    #[test]
+    fn admission_query_guard_redacts_dependency_logs() {
+        crate::admission_test_support::run_probe("preflight::tests::admission_query_guard_child");
+    }
 
     fn vars(guild: &str, mode: &str) -> HashMap<String, String> {
         [

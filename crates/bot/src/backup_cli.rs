@@ -712,9 +712,11 @@ async fn governed_guild_config_api(
         .map_err(|error| error.to_string());
     }
     let url = env_var("TWO_DATABASE_URL").ok_or("TWO_DATABASE_URL admission authority required")?;
+    let options = two_bot_core::database_url::connect_options(&url)
+        .map_err(|_| "Discord admission authority unavailable")?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
-        .connect(&url)
+        .connect_with(options)
         .await
         .map_err(|_| "Discord admission authority unavailable")?;
     let admission = two_bot_core::send_admission::PgSendAdmission::new(pool, &token)
@@ -1149,6 +1151,27 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{load_staging_token, prune_backups};
+
+    #[test]
+    fn admission_query_guard_child() {
+        if std::env::var_os("ADMISSION_BOOTSTRAP_PROBE").is_none() {
+            return;
+        }
+        crate::admission_test_support::capture_probe(async {
+            let error = super::governed_guild_config_api(
+                "fixture-token".to_owned(),
+                "fixture-guild".to_owned(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, "Discord admission authority unavailable");
+        });
+    }
+
+    #[test]
+    fn admission_query_guard_redacts_dependency_logs() {
+        crate::admission_test_support::run_probe("backup_cli::tests::admission_query_guard_child");
+    }
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

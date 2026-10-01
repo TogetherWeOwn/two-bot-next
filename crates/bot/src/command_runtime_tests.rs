@@ -117,7 +117,7 @@ impl MockRest {
                     rec.lock().expect("recorded").push(RestRequest {
                         method: request.0.clone(),
                         path: request.1.clone(),
-                        body: request.2,
+                        body: request.2.clone(),
                         received_at: std::time::Instant::now(),
                     });
                     let response = scr
@@ -132,6 +132,16 @@ impl MockRest {
                         {
                             let n = ctr.fetch_add(1, Ordering::Relaxed);
                             format!("{{\"id\":\"{}\"}}", 9_000_000_000_000_000_000u64 + n)
+                        } else if status == 200
+                            && request.0 == "PUT"
+                            && request.1.ends_with("/commands")
+                        {
+                            String::from_utf8(request.2).unwrap()
+                        } else if status == 200
+                            && (request.1.ends_with("/callback")
+                                || request.1.ends_with("/messages/@original"))
+                        {
+                            "{\"id\":\"99\"}".to_owned()
                         } else {
                             "{}".to_owned()
                         }

@@ -4,6 +4,8 @@ use crate::{ActionExecutor, DiscordError};
 use two_bot_core::send_admission::PgSendAdmission;
 use two_bot_testsupport::TestDatabase;
 
+mod uncertainty;
+
 async fn database() -> TestDatabase {
     let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test database URL required");
     TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))

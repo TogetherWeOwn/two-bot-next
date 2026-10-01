@@ -172,7 +172,13 @@ impl GuildConfigDiscordApi {
             let res =
                 http::request(method.clone(), &url, headers, payload, self.timeout_secs).await?;
             let status = res.status.as_u16();
-            if let Some(permit) = permit {
+            let response = res.json();
+            // A full mutation 5xx/redirect or unusable success receipt is still
+            // uncertain. Dropping its permit retains durable occupancy.
+            let definite = method == HttpMethod::GET
+                || (400..500).contains(&status) && status != 408
+                || mutation_receipt_is_definite(&method, path, status, response.as_ref());
+            if let Some(permit) = permit.filter(|_| definite) {
                 let cooldown = (status == 429).then(|| {
                     cooldown_from_delays(
                         res.header("retry-after")
@@ -190,8 +196,13 @@ impl GuildConfigDiscordApi {
                     return Err(error.into());
                 }
             }
+            if method != HttpMethod::GET && (200..300).contains(&status) && !definite {
+                return Err(GuildConfigApiError::Discord(
+                    "Discord mutation receipt unavailable.".to_owned(),
+                ));
+            }
             if status != 429 {
-                return Ok((status, res.json()));
+                return Ok((status, response));
             }
             let retry_after = res
                 .json()
@@ -720,6 +731,42 @@ impl GuildConfigDiscordApi {
     }
 }
 
+fn mutation_receipt_is_definite(
+    method: &HttpMethod,
+    path: &str,
+    status: u16,
+    body: Option<&Value>,
+) -> bool {
+    // Guild channel-position updates have a documented no-content receipt;
+    // role-position updates instead return the resource array.
+    let channel_positions = matches!(
+        path.split('/').collect::<Vec<_>>().as_slice(),
+        ["", "guilds", guild, "channels"] if !guild.is_empty()
+    );
+    if status == 204
+        && (*method == HttpMethod::DELETE || *method == HttpMethod::PATCH && channel_positions)
+    {
+        return true;
+    }
+    if !matches!(status, 200 | 201) {
+        return false;
+    }
+    let has_id = |value: &Value| {
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<u64>().ok())
+            .is_some_and(|id| id != 0)
+    };
+    body.is_some_and(|body| {
+        has_id(body)
+            || *method == HttpMethod::PATCH
+                && body
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty() && rows.iter().all(has_id))
+    })
+}
+
 /// Permission masks arrive as strings in sealed snapshots but the planned
 /// @everyone PATCH body passes the value through verbatim, so tolerate both.
 fn perm_mask(value: &Value) -> u128 {
@@ -793,6 +840,66 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_receipts_keep_uncertainty_and_explicit_no_content_contracts_separate() {
+        let resource = serde_json::json!({"id": "123"});
+        let roles = serde_json::json!([{"id": "123"}]);
+        assert!(mutation_receipt_is_definite(
+            &HttpMethod::POST,
+            "/guilds/1/roles",
+            201,
+            Some(&resource)
+        ));
+        assert!(mutation_receipt_is_definite(
+            &HttpMethod::PATCH,
+            "/guilds/1/roles",
+            200,
+            Some(&roles)
+        ));
+        assert!(mutation_receipt_is_definite(
+            &HttpMethod::PATCH,
+            "/guilds/1/channels",
+            204,
+            None
+        ));
+        assert!(mutation_receipt_is_definite(
+            &HttpMethod::DELETE,
+            "/channels/1",
+            204,
+            None
+        ));
+        assert!(!mutation_receipt_is_definite(
+            &HttpMethod::PATCH,
+            "/guilds/1/roles",
+            204,
+            None
+        ));
+        assert!(!mutation_receipt_is_definite(
+            &HttpMethod::POST,
+            "/guilds/1/channels",
+            204,
+            None
+        ));
+        assert!(!mutation_receipt_is_definite(
+            &HttpMethod::POST,
+            "/guilds/1/roles",
+            500,
+            Some(&resource)
+        ));
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"id": "0"}),
+            serde_json::json!({"id": "not-an-id"}),
+        ] {
+            assert!(!mutation_receipt_is_definite(
+                &HttpMethod::POST,
+                "/guilds/1/roles",
+                201,
+                Some(&body)
+            ));
+        }
+    }
 
     #[test]
     fn bases_default_to_discord_and_pin_tests_to_loopback() {

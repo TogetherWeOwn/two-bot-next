@@ -29,6 +29,8 @@ installed by this change.
    credential is high-entropy; its fingerprint is not a reversible secret.
    Neither raw credentials nor provider text/content are persisted. Debug
    output redacts the identity and authenticated transports' credentials.
+   Caller-supplied Authorization headers are rejected before admission or I/O;
+   the sensitive wire credential can only be the constructor-bound token.
 3. `admit().await` atomically commits an occupied generation before any HTTP.
    Busy, finite-held, or indefinite-held lanes return `AdmissionError::Blocked`;
    unavailable/missing storage returns `Storage`. This interface does not wait
@@ -37,6 +39,14 @@ installed by this change.
    the hold **and** releases occupancy, conditional on the exact generation.
    External `PgSendAdmission::extend` is monotonic and cannot release a claim.
    Completion never clears an existing indefinite or longer finite hold.
+   **A complete HTTP exchange is not a certain mutation.** Mutation 5xx,
+   redirects/request timeouts and malformed/missing required success receipts
+   retain occupancy. ActionExecutor carries a consuming permit in its raw
+   mutation response until the owning verb validates its accepted status and
+   any required resource id/JSON receipt. Message creation never substitutes an
+   empty id for an unreadable receipt. Guild-config restore validates its
+   resource-id receipt before release. Reads have an explicit separate policy:
+   a fully collected read-only failure may release admission and be retried.
 
 Finite deadlines use the database clock. All Discord channel/bucket cooldowns
 are conservatively promoted to the whole token. Both header and body timing are
@@ -94,6 +104,15 @@ until the durable hold allows it.
   Twilight retries. The explicit validated loopback-only fixture can run without
   a database; if an authority is supplied but unavailable, it is never bypassed.
 
+Admission database bootstraps parse only through
+`database_url::connect_options` before `connect_with`/`connect_lazy_with`. This
+rejects unsupported URL query keys before SQLx can log their values and suppresses
+malformed passfile diagnostics during parsing without disabling valid passfile
+credential lookup. Website admission remains lazy; no bootstrap migrates or
+grants privileges. Loopback fixture validation uses typed IPv4/IPv6 hosts;
+IPv6 `http://[::1]:port` is allowed, but nonloopback, userinfo, path/query/fragment
+and HTTPS ungoverned origins remain refused.
+
 Loopback fixture constructors are not an operational bypass: sticky and cutover
 bootstraps inject admission even when given a loopback proxy. Backup and preflight
 without authority can reach only their explicitly validated loopback fixtures;
@@ -150,3 +169,17 @@ indefinite blocking, per-retry checks, cancellation/restart safety, no pre-send
 I/O on storage/configuration failure, and definitive single-attempt 429 despite
 completion storage failure. Existing announcement tests retain the single-attempt,
 ten-second default, response-bound, scope and unknown-outcome contracts.
+
+Remediation regressions additionally cover fully collected mutation 5xx and
+malformed/missing/zero-id success receipts, then prove the persisted fence across
+fresh pools, sticky replacement nonces, backup and announcement transports.
+Positive valid-receipt cases prove release; read-only 5xx has a separate release
+control. The token A/B test holds B, rejects A's caller Authorization override
+without occupying A or sending, and observes normal A traffic's bound credential.
+Offline configuration tests capture dependency WARN logs with an active control
+warning, use only synthetic URL/passfile sentinels in env-cleared child probes,
+and prove valid passfile lookup and lazy zero-connection startup are preserved.
+A real-binary mock preflight test exercises IPv6 loopback; malformed/nonloopback
+origins remain negative controls. Hosted workspace tests run the offline probes
+and fixture compatibility tests; the service admission filter runs the new
+cross-pool uncertainty/credential-binding cases.

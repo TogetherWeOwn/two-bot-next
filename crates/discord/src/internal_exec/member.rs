@@ -195,7 +195,7 @@ impl ActionExecutor {
                 "missing_access_token",
             ));
         }
-        let response = self
+        let mut response = self
             .member_request(
                 self.inner.factory.add_guild_member(
                     numeric_id(guild_id)?.cast(),
@@ -205,11 +205,15 @@ impl ActionExecutor {
                 ADD_MEMBER_TIMEOUT_MS,
             )
             .await?;
-        Ok(if response.status == 201 {
-            MemberOutcome::Added
-        } else {
-            MemberOutcome::AlreadyMember
-        })
+        let outcome = match response.status {
+            201 => MemberOutcome::Added,
+            200 | 204 => MemberOutcome::AlreadyMember,
+            _ => return Err(unreadable()),
+        };
+        // This endpoint's accepted status distinguishes added/already present;
+        // no message/resource id is consumed by the caller.
+        response.complete().await;
+        Ok(outcome)
     }
 
     /// A resolved allowlisted role, with an authoritative hierarchy read before
@@ -272,14 +276,20 @@ impl ActionExecutor {
                 status: 403,
                 retry_after_header: None,
                 body: vec![],
+                completion: None,
             })
             .expect("403 is a refusal"));
         }
-        self.member_request(
-            self.inner.factory.add_guild_member_role(guild, user, role),
-            ROLE_TIMEOUT_MS,
-        )
-        .await?;
+        let mut response = self
+            .member_request(
+                self.inner.factory.add_guild_member_role(guild, user, role),
+                ROLE_TIMEOUT_MS,
+            )
+            .await?;
+        if response.status != 204 {
+            return Err(unreadable());
+        }
+        response.complete().await;
         Ok(MemberOutcome::Assigned)
     }
 }
