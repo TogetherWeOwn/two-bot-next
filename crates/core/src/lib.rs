@@ -81,6 +81,7 @@ pub mod tickets;
 pub mod voice;
 pub mod voice_config;
 pub mod voice_ownership;
+pub mod voice_permission_health;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
@@ -284,6 +285,13 @@ pub use voice::{
     known_voice_durations, parse_voice_end_metadata, resolve_voice_end, summarize_voice_durations,
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
+};
+pub use voice_permission_health::{
+    evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
+    NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,
+    PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS,
+    PERM_ADMINISTRATOR, PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS,
+    PERM_VIEW_CHANNEL,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
