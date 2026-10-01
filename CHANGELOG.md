@@ -37,6 +37,9 @@
   history protection and moderation default-off remain enforced. CI uses separate
   guarded databases for backup round-trip and actual-CLI publication faults;
   runbook command-drift checks follow the drill's real confirmation parser.
+  Nightly routes every guarded channel fixture, including shared timestamp
+  coverage, to the mandatory dedicated suite; offline regressions pin routing
+  and cutover reference autolinks without weakening strict rustdoc warnings.
 - Resolve historical member-ban acceptance only with exact-attempt acceptance
   and ordering evidence, atomically audited without taking newer ownership or
   clearing dispatched DELETE uncertainty. Moderation activation remains deferred.

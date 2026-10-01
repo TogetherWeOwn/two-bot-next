@@ -65,6 +65,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Guarded fixture routing and doc references (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -112,6 +114,7 @@ jobs:
           --skip channel_moderation_store::tests::stale_claim_writes_cannot_affect_a_new_winner
           --skip channel_moderation_store::tests::action_only_reuse_is_mismatch_in_flight_and_done
           --skip channel_moderation_store::tests::audit_rows_are_written_once
+          --skip channel_moderation_store::tests::shared_timestamp_schema_preserves_channel_claim_and_audit_instants
           --skip feed_crud_audit_scope_and_timestamp_roundtrip
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow

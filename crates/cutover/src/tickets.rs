@@ -3,9 +3,9 @@
 //! commit together, so a restart never reopens a ticket whose transcript saved.
 //!
 //! sqlx transaction executor and Drop rollback:
-//! https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html
+//! <https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html>
 //! Per-member reservation serialization uses transaction-level advisory locks:
-//! https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS
+//! <https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS>
 
 use sqlx::{PgConnection, PgPool, Row};
 use two_bot_core::funnel::{format_iso_millis, parse_iso_millis};
@@ -287,6 +287,32 @@ impl TicketStore {
     pub async fn queue_open_rollback(&self, id: &str, now: i64) -> Result<Ticket, StoreError> {
         self.transition(id, |ticket| ticket.queue_open_rollback(now))
             .await
+    }
+
+    /// Retire an open row only after typed channel absence. Lock and recheck
+    /// the channel/state so stale recovery cannot retire a racing close/capture.
+    /// No transcript is invented for a channel deleted outside the bot.
+    pub async fn retire_missing_open(
+        &self,
+        id: &str,
+        expected_channel: &str,
+        now: i64,
+    ) -> Result<Ticket, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let mut ticket = self.locked(&mut tx, id).await?;
+        let (saved,): (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM ticket_transcripts WHERE guild_id = $1 AND ticket_id = $2)")
+            .bind(&self.guild_id).bind(id).fetch_one(&mut *tx).await?;
+        if ticket.status != TicketStatus::Open
+            || ticket.channel_id.as_deref() != Some(expected_channel)
+            || saved
+        {
+            return Err(TicketError::InvalidTransition.into());
+        }
+        ticket.queue_open_rollback(now)?;
+        ticket.finish_cleanup(now)?;
+        Self::persist(&mut tx, &ticket).await?;
+        tx.commit().await?;
+        Ok(ticket)
     }
 
     /// Call only after confirmed deletion or code 10003, never any other error.
