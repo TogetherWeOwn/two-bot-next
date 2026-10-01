@@ -1,7 +1,9 @@
 //! Explicit outbound policy, applied before Twilight validates message payloads.
 //! Suppress notifications by default. Never trust caller-supplied
 //! `allowed_mentions`, including for interaction message updates. The shared
-//! component post accepts only onboarding's typed one-member welcome exception.
+//! component post accepts only onboarding's typed one-member welcome exception;
+//! the fixed ticket-controls template alone opts into a validated opener-id
+//! notification AFTER this sanitizer.
 
 use serde_json::{json, Value};
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};

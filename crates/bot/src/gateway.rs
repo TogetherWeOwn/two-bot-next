@@ -206,33 +206,50 @@ pub async fn run_shard(
     store: GatewaySessionStore,
     onboarding: Option<Arc<crate::onboarding::OnboardingRuntime>>,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), sqlx::Error> {
+    let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
     let (sender, mut packets) = tokio::sync::mpsc::channel(ingress::CAPACITY);
     let (saved, checkpoint) = tokio::sync::watch::channel(None);
     let generation = Arc::new(AtomicU64::new(0));
     // Both futures are cancellation-owned by the essential runner. SQL never
     // prevents ingress polling; failure drops ACK/feature JoinSets together.
-    let result = tokio::try_join!(
-        ingress::run(
-            &mut shard,
-            &state,
-            &generation,
-            onboarding.as_ref(),
-            sender,
-            checkpoint,
-        ),
-        run_loop(
-            &mut packets,
-            &pipeline,
-            &state,
-            &store,
-            onboarding.as_ref(),
-            runtime.as_ref(),
-            (&generation, saved),
-        ),
-    )
-    .map(|_| ());
+    let work = async {
+        tokio::try_join!(
+            ingress::run(
+                &mut shard,
+                &state,
+                &generation,
+                onboarding.as_ref(),
+                sender,
+                checkpoint,
+            ),
+            run_loop(
+                &mut packets,
+                &pipeline,
+                &state,
+                &store,
+                onboarding.as_ref(),
+                runtime.as_ref(),
+                (&generation, saved),
+            ),
+        )
+        .map(|_| ())
+    };
+    let result = tokio::select! {
+        biased;
+        _ = async {
+            match shutdown {
+                Some(receiver) => crate::server::shutdown_requested(receiver).await,
+                None => std::future::pending().await,
+            }
+        } => Ok(()),
+        result = work => result,
+    };
     *state.write().await = GatewayState::Armed;
+    if let Some(tickets) = tickets {
+        tickets.shutdown().await;
+    }
     result
 }
 

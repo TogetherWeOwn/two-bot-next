@@ -5,6 +5,7 @@
 ### Added
 
 - Add bounded component-bearing posts, member-role deltas and deferred-response edits to the shared Discord executor, with explicit onboarding mention/menu rendering and fail-closed per-guild configuration. Wire pre-update gateway capture and shared-router orchestration with live settings/permissions, guarded welcomes and post-role routing; verify through mock Discord and isolated testdb acceptance. Persist pre-pipeline welcome/goodbye jobs atomically with gateway checkpoints and bound restart attempts; retain token-free interrupted-component receipts instead of replaying uncertain role writes. Commit anchor marker/routing together and finish deferred processing errors with bounded honest replies. Recovery validation remains in progress; no live activation is claimed.
+- Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and
