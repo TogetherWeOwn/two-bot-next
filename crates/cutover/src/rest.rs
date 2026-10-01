@@ -287,15 +287,10 @@ impl RestClient {
         &self,
         channel_id: Id<ChannelMarker>,
     ) -> Result<Option<twilight_model::channel::thread::ThreadsListing>, RestError> {
-        Ok(
-            match self
-                .list_all_archived_threads(channel_id, DEFAULT_ARCHIVED_THREAD_PAGES)
-                .await?
-            {
-                None => None,
-                Some(outcome) => Some(outcome.into_listing()),
-            },
-        )
+        Ok(self
+            .list_all_archived_threads(channel_id, DEFAULT_ARCHIVED_THREAD_PAGES)
+            .await?
+            .map(|outcome| outcome.into_listing()))
     }
 
     /// Bounded archived-thread walk with explicit completion evidence.
