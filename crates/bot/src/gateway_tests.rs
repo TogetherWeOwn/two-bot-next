@@ -30,6 +30,7 @@ use crate::gateway::{
 mod deadline;
 mod member_journey;
 mod recovery;
+mod voice;
 
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";

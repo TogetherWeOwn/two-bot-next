@@ -2,6 +2,9 @@ use super::*;
 use serde_json::json;
 use std::sync::Mutex;
 
+#[path = "voice_rooms_sink_tests.rs"]
+mod sink;
+
 const GUILD: u64 = 100;
 const CREATOR: u64 = 200;
 const CATEGORY: u64 = 400;

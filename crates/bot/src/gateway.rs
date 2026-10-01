@@ -447,7 +447,7 @@ pub fn build_pipeline(milestones: Vec<FunnelEvent>) -> GatewayPipeline {
 /// Build the V1 voice sink, or `None` when voice stays off.
 ///
 /// Voice needs all three: the `TWO_VOICE=1` gate, a Discord token
-/// (single-attempt REST), and a Postgres URL (sqlx store + migrations).
+/// (single-attempt REST), and a Postgres URL for the pre-migrated sqlx store.
 /// Anything missing — or any construction failure — degrades to voice-off
 /// with a warn; the gateway and /readyz keep working. Secrets never appear
 /// in the logs.
