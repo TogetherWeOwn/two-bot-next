@@ -6,17 +6,27 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod backup_cli;
+mod community_jobs;
+mod database_roles_cli;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../discord/tests/common/mod.rs"]
+mod discord_test_common;
 mod gateway;
+mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod jobs;
 #[cfg(test)]
 mod lifecycle_tests;
 mod logging;
+mod metrics_http;
 mod preflight;
 mod server;
 mod sticky_runtime;
 #[cfg(test)]
 mod sticky_runtime_tests;
+mod website_jobs;
 
 use std::sync::Arc;
 
@@ -27,7 +37,7 @@ use two_bot_core::{ComponentStatus, Config};
 use gateway::{
     build_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard, GatewayState,
 };
-use server::serve;
+use website_jobs::serve;
 
 #[tokio::main]
 async fn main() {
@@ -103,9 +113,11 @@ async fn run() {
             let state = Arc::clone(&state);
             let task = async move {
                 let result: Result<(), sqlx::Error> = async {
+                    // Runtime is DML-only; the operator migrates before startup.
                     let db =
-                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
+                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, true)
                             .await?;
+                    metrics_http::register_pool(db.pool().clone());
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
                         db.pool().clone(),
                         guild_id.to_string(),
@@ -161,9 +173,10 @@ async fn run() {
         }
     };
 
-    let http = serve(listener, state);
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    let http = serve(&config, listener, state, shutdown.clone());
     let result = match gateway_task {
-        Some(task) => supervise_gateway(task, http).await,
+        Some(task) => supervise_gateway(task, http, shutdown).await,
         None => http.await,
     };
     if let Err(err) = result {
@@ -184,12 +197,14 @@ async fn print_backup_help_and_exit() -> ! {
 fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static str> {
     let token = config
         .discord_token
-        .as_deref()
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
         .filter(|token| !token.is_empty())
         .ok_or("DISCORD_TOKEN")?;
     let url = config
         .database_url
-        .as_deref()
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
         .filter(|url| !url.is_empty())
         .ok_or("DATABASE_URL")?;
     let guild_id = config.guild_id.filter(|id| *id != 0).ok_or("GUILD_ID")?;
@@ -203,15 +218,24 @@ fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static 
 async fn supervise_gateway(
     mut task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
     http: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<()> {
+    tokio::pin!(http);
     tokio::select! {
         biased;
         // Never expose task/SQL errors: they may contain connection secrets.
-        _ = &mut task => Err(std::io::Error::other(
-            "gateway task stopped; container restart required",
-        )),
-        result = http => {
+        _ = &mut task => {
+            // Sticky even if HTTP has not subscribed yet. Keep polling HTTP so
+            // its job supervisor can cancel and join every active action.
+            shutdown.send_replace(true);
+            let _ = http.await;
+            Err(std::io::Error::other(
+                "gateway task stopped; container restart required",
+            ))
+        },
+        result = &mut http => {
             task.abort();
+            let _ = task.await;
             result
         }
     }

@@ -87,6 +87,9 @@ tokio = { version = "1", features = [
     "process",
 ] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# hyper-util's DNS-pinned connector impls `tower_service::Service<Name>`;
+# already in the lockfile transitively (MIT, deny.toml-allowed).
+tower-service = "0.3"
 tower-http = { version = "0.7", default-features = false, features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
@@ -120,5 +123,6 @@ twilight-model = "0.17"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# Job tasks must unwind so the supervisor can isolate a panic in release too.
+panic = "unwind"
 strip = true

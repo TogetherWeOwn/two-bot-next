@@ -399,10 +399,17 @@ mod tests {
             .with_subscriber(dispatch.clone())
             .await
             .unwrap();
-        let serve = crate::server::serve_with_shutdown(listener, state, async {
-            tokio::task::yield_now().await;
-            tracing::info!(msg = "shutdown_started", signal = "test");
-        })
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let serve = crate::server::serve_with_shutdown(
+            listener,
+            state,
+            crate::jobs::statuses(&[], true),
+            shutdown,
+            async {
+                tokio::task::yield_now().await;
+                tracing::info!(msg = "shutdown_started", signal = "test");
+            },
+        )
         .instrument(run)
         .with_subscriber(dispatch);
         tokio::time::timeout(std::time::Duration::from_secs(2), serve)

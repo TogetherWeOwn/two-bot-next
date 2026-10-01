@@ -187,6 +187,7 @@ async fn run_loop(
     store: &GatewaySessionStore,
     sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
 ) -> Result<(), sqlx::Error> {
+    let mut observer = crate::gateway_metrics::Observer::default();
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
     info!(msg = "gateway_started", shard = ?ShardId::ONE, "gateway shard loop started");
@@ -212,6 +213,7 @@ async fn run_loop(
                 ))
             }
         };
+        observer.observe(&message, shard);
         let Message::Text(text) = message else {
             crate::logging::shard_closed(&message);
             *state.write().await = GatewayState::Armed;
@@ -290,6 +292,7 @@ async fn run_loop(
         {
             continue;
         }
+        let timer = crate::gateway_metrics::DispatchTimer::start();
         let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| {
             sqlx::Error::InvalidArgument(
                 "gateway dispatch parse failed; checkpoint unchanged".into(),
@@ -316,6 +319,7 @@ async fn run_loop(
             store.commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch()),
         )
         .await?;
+        timer.committed();
         committed = Some(checkpoint);
         if let Some(msg) = connected {
             *state.write().await = GatewayState::Connected;
@@ -414,7 +418,7 @@ mod tests {
 
     fn configured() -> Config {
         Config {
-            discord_token: Some("token".to_owned()),
+            discord_token: Some(two_bot_core::Secret::new("token".to_owned())),
             database_url: None,
             listen_addr: "0.0.0.0:8080".to_owned(),
             guild_id: None,
