@@ -112,14 +112,15 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         require(body.get("components") == [["process", "ready"], ["gateway", "down"]],
                 "/readyz body must report a ready process and parked gateway")
         # The runtime always reports informational job status alongside
-        # readiness; with no credentials all three jobs must be parked,
+        # readiness; with no credentials all four jobs must be parked,
         # non-running and never started. Jobs never flip the 503 above.
         parked = {"parked": True, "running": False, "last_start": None,
                   "last_success": None, "last_error_class": None,
                   "consecutive_failures": 0}
         require(body.get("jobs") == {"counter": dict(parked), "rank": dict(parked),
-                                     "scheduled_events": dict(parked)},
-                "/readyz body must report all three jobs parked, non-running, never started")
+                                     "scheduled_events": dict(parked),
+                                     "settings": dict(parked)},
+                "/readyz body must report all four jobs parked, non-running, never started")
         # Check PID 1, not merely Docker's configured user or an exec helper.
         status = docker("exec", name, "cat", "/proc/1/status").stdout
         uid = next(line.split()[1:] for line in status.splitlines() if line.startswith("Uid:"))

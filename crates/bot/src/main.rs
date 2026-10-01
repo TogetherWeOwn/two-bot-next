@@ -17,6 +17,7 @@ mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
 mod server;
+mod settings_jobs;
 mod sticky_runtime;
 #[cfg(test)]
 mod sticky_runtime_tests;

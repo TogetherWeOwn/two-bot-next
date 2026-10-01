@@ -1,4 +1,5 @@
-//! Runtime adapters for the three existing website-contract domains.
+//! Runtime adapters for the three existing website-contract domains, plus the
+//! `guild_settings` hot-reload poll registered alongside them (TOG-10898).
 
 use std::{sync::Arc, time::Duration};
 
@@ -18,7 +19,22 @@ use crate::{
     server,
 };
 
-pub const NAMES: [&str; 3] = ["counter", "rank", "scheduled_events"];
+/// Every supervised job name, in `/readyz` order. The settings poll needs
+/// only the database, so it is registered separately from the REST-backed
+/// domains in [`DOMAINS`].
+pub const NAMES: [&str; 4] = [
+    "counter",
+    "rank",
+    "scheduled_events",
+    crate::settings_jobs::NAME,
+];
+
+/// The REST-backed website-contract domains.
+const DOMAINS: [(&str, Kind); 3] = [
+    ("counter", Kind::Counter),
+    ("rank", Kind::Rank),
+    ("scheduled_events", Kind::Events),
+];
 
 #[cfg(test)]
 #[path = "website_jobs_tests.rs"]
@@ -99,6 +115,9 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
+        // The settings poll is DB-only: register it before REST construction
+        // so a bad DISCORD_API_BASE cannot park hot reload.
+        registered.push(crate::settings_jobs::job(url));
         match ActionExecutor::with_proxy(token.to_owned(), std::env::var("DISCORD_API_BASE").ok()) {
             Ok(rest) => {
                 let context = Arc::new(Context {
@@ -108,10 +127,7 @@ pub async fn serve(
                     guild: guild.to_string(),
                     observation: Mutex::new(()),
                 });
-                for (name, kind) in NAMES
-                    .into_iter()
-                    .zip([Kind::Counter, Kind::Rank, Kind::Events])
-                {
+                for (name, kind) in DOMAINS {
                     let context = context.clone();
                     let cadence = cadence(kind);
                     registered.push(Job {
@@ -144,7 +160,16 @@ pub async fn serve(
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let status = jobs::statuses(&NAMES, registered.is_empty());
+    // `parked` means "not registered this boot": every job starts parked and
+    // only registered names clear it, so a parked settings poll or a parked
+    // website domain is distinguishable on /readyz.
+    let status = jobs::statuses(&NAMES, true);
+    {
+        let mut statuses = status.write().await;
+        for job in &registered {
+            statuses.get_mut(job.name).expect("named job").parked = false;
+        }
+    }
     let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
     serve_jobs(registered, status, shutdown, http).await
 }

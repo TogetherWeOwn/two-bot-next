@@ -211,7 +211,7 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
         serde_json::json!([["process", "ready"], ["gateway", "down"]])
     );
 
-    for name in ["counter", "rank", "scheduled_events"] {
+    for name in ["counter", "rank", "scheduled_events", "settings"] {
         assert_eq!(report["jobs"][name]["parked"], true);
         assert_eq!(report["jobs"][name]["running"], false);
         assert_eq!(report["jobs"][name]["last_start"], serde_json::Value::Null);
