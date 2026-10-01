@@ -53,6 +53,7 @@ fn captured() -> (Capture, tracing::subscriber::DefaultGuard) {
     let subscriber = tracing_subscriber::fmt()
         .with_writer(capture.clone())
         .with_ansi(false)
+        .without_time() // Numeric cold-value assertions must not match timestamp fractions.
         .with_max_level(tracing::Level::TRACE)
         .finish();
     (capture, tracing::subscriber::set_default(subscriber))
