@@ -23,9 +23,9 @@ impl TestDb {
     async fn new(legacy: bool) -> Self {
         let host = match std::env::var("TICKET_TEST_DB_HOST").as_deref() {
             Ok("agent-testdb") | Err(_) => "agent-testdb",
-            _ => panic!(
-                "ticket DB tests permit only agent-testdb (local or job-container service)"
-            ),
+            _ => {
+                panic!("ticket DB tests permit only agent-testdb (local or job-container service)")
+            }
         };
         let options = PgConnectOptions::new()
             .host(host)
@@ -454,10 +454,12 @@ async fn full_legacy_upgrade_clamps_populated_expiry_without_extending_shorter_d
             sqlx::query("INSERT INTO ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, content, message_count, created_at) VALUES ($1, 'guild', $1, $1, 'existing transcript', 1, '2026-09-08T12:00:00.000Z')")
                 .bind(id).execute(&mut *tx).await.unwrap();
         }
-        sqlx::raw_sql(include_str!("fixtures/legacy_migrations/0014_ticket_safety.sql"))
-            .execute(&mut *tx)
-            .await
-            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "fixtures/legacy_migrations/0014_ticket_safety.sql"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
         // A shorter deadline is intentional and must never be extended.
         sqlx::query("UPDATE ticket_transcripts SET purge_after = '2026-12-07T08:00:00.000Z' WHERE ticket_id = 'shorter'")
             .execute(&mut *tx).await.unwrap();
@@ -513,9 +515,7 @@ async fn migration_backfill_uses_elapsed_hours_across_dst() {
     // the SET applies to the migration statements.
     let host = match std::env::var("TICKET_TEST_DB_HOST").as_deref() {
         Ok("agent-testdb") | Err(_) => "agent-testdb",
-        _ => panic!(
-            "ticket DB tests permit only agent-testdb (local or job-container service)"
-        ),
+        _ => panic!("ticket DB tests permit only agent-testdb (local or job-container service)"),
     };
     let options = PgConnectOptions::new()
         .host(host)
