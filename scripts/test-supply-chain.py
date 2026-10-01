@@ -123,6 +123,17 @@ class SupplyChainTests(unittest.TestCase):
         self.assertTrue(images[1].startswith("debian:bookworm-slim@"))
         self.assertIn("package-ecosystem: docker", (ROOT / ".github/dependabot.yml").read_text())
 
+    def test_runtime_copies_trust_store_without_installing_openssl_helpers(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        builder, runtime = dockerfile.split(" AS runtime", 1)
+        self.assertIn("apt-get install -y --no-install-recommends ca-certificates", builder)
+        self.assertNotIn("apt-get", runtime)
+        for path in ["/etc/ssl/certs", "/usr/share/ca-certificates"]:
+            self.assertIn(f"COPY --from=builder {path}/ {path}/", runtime)
+        self.assertIn("COPY --from=builder /usr/share/doc/ca-certificates/copyright", runtime)
+        self.assertNotIn("--force-depends", dockerfile)
+        self.assertNotIn("/var/lib/dpkg", dockerfile)
+
     def test_pr_dry_run_is_read_only_bounded_and_isolated(self):
         check = (ROOT / ".github/workflows/check.yml").read_text()
         supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()

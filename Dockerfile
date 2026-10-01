@@ -31,11 +31,19 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
 COPY . .
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
-
+# Bookworm certificate updates stay in the builder. The runtime needs trust
+# data, not ca-certificates' OpenSSL command/library dependency.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
+
+# Keep the bundle and hashed certificate links/targets, without copying the
+# builder's OpenSSL binaries or libraries. Debian package metadata is untouched.
+COPY --from=builder /etc/ssl/certs/ /etc/ssl/certs/
+COPY --from=builder /usr/share/ca-certificates/ /usr/share/ca-certificates/
+COPY --from=builder /usr/share/doc/ca-certificates/copyright /usr/share/doc/ca-certificates/copyright
 
 # Non-root user: the bot never needs container root.
 RUN useradd --create-home --shell /usr/sbin/nologin two-bot

@@ -98,8 +98,22 @@ Docker base tags remain Rust 1.94 Bookworm and Debian Bookworm slim, with
 multi-platform manifest SHA-256 pins resolved from Docker Hub. Dependabot's
 weekly `docker` updates maintain those digests alongside Cargo/Actions updates.
 The builder argument override was removed so a build arg cannot silently
-select an unpinned builder. Apt still fetches signed current Bookworm packages;
-digest-pinned bases are not a promise of byte-for-byte repeatable apt results.
+select an unpinned builder. Apt fetches signed current Bookworm certificate
+updates in the builder, not the runtime. Digest-pinned bases are not a promise
+of byte-for-byte repeatable apt results.
+
+Bookworm's [`ca-certificates` package](https://packages.debian.org/bookworm/ca-certificates)
+depends on `openssl`. The runtime instead copies the updated certificate bundle,
+hashed certificate links, their Mozilla certificate targets and licensing from
+the pinned Bookworm builder. It does not copy OpenSSL executables/libraries or
+change the runtime base's package metadata. This avoids introducing certificate
+maintenance helpers into a rustls runtime; it does not assert that every package
+already in the base is fixed or unnecessary. CI must verify the final inventory,
+linkage and runtime smoke test before treating this as successful remediation.
+The smoke gate checks that the non-root runtime can read PEM certificate data;
+this is not an external TLS handshake or a proof of application input reachability.
+Operator-configured upload hooks can invoke external wrappers, so source-only
+absence of direct utility calls is not a blanket compatibility or CVE waiver.
 
 Distroless is a separate follow-up evaluation: assess TLS roots, non-root user,
 healthcheck executable, debug/incident workflow and binary compatibility before
@@ -110,6 +124,7 @@ Offline regressions (no Cargo compile, Docker daemon or database access):
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-supply-chain.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-runtime-image-evidence.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_container_smoke.py
 python3 scripts/test-docker-deps.py
 python3 scripts/test-release-retry.py
 ```

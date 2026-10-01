@@ -27,6 +27,7 @@ class DockerFixture:
         self.health_command = ["CMD", smoke.BINARY, "--healthcheck"]
         self.uid = "1000"
         self.live_health_exit = 0
+        self.trust_bundle_exit = 0
         self.dead_health_exit = 1
         self.health_status = "healthy"
         self.exit_code = "0"
@@ -58,6 +59,8 @@ class DockerFixture:
             }}])
         elif args[0] == "exec" and "cat" in args:
             output = "Name:\ttwo-bot\nUid:\t" + "\t".join([self.uid] * 4) + "\n"
+        elif args[0] == "exec" and "grep" in args:
+            code = self.trust_bundle_exit
         elif args[0] == "exec":
             code = self.live_health_exit
         elif args[0] == "run" and "--healthcheck" in args:
@@ -210,6 +213,19 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assertNotIn("--env-file", run)
         wait = next(kwargs for args, kwargs in self.fixture.calls if args[0] == "wait")
         self.assertLessEqual(wait["timeout"], 10)
+
+    def test_runtime_trust_bundle_is_checked_as_configured_non_root_user(self):
+        self.run_smoke()
+        check = next(args for args, _ in self.fixture.calls if args[0] == "exec" and "grep" in args)
+        self.assertEqual(check[-4:], ("grep", "-q", "^-----BEGIN CERTIFICATE-----$", smoke.CA_BUNDLE))
+        self.assertNotIn("--user", check)
+
+    def test_missing_or_non_pem_trust_bundle_fails_and_cleans_up(self):
+        for exit_code in (1, 2):
+            with self.subTest(exit_code=exit_code):
+                self.fixture.trust_bundle_exit = exit_code
+                self.assert_rejected("trust bundle must contain PEM certificates")
+                self.assertEqual(self.fixture.calls[-1][0][:2], ("rm", "--force"))
 
     def test_image_budget_is_enforced_before_runtime_start(self):
         self.assert_rejected("image exceeds size budget", image_max_bytes=1)

@@ -14,6 +14,7 @@ MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
 BINARY_MAX_BYTES = 10 * MIB
 BINARY = "/home/two-bot/two-bot"
+CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 
 def require(condition, message):
@@ -123,6 +124,12 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                 "community_scorecard", "inactivity",
             )
         }, "/readyz body must report all six jobs parked, non-running, never started")
+        # Read as the configured runtime user; no network or OpenSSL helper is
+        # needed to verify that certificate data survived the stage boundary.
+        require(docker("exec", name, "grep", "-q", "^-----BEGIN CERTIFICATE-----$", CA_BUNDLE,
+                       timeout=5, check=False).returncode == 0,
+                "runtime trust bundle must contain PEM certificates")
+        report("PASS runtime trust bundle contains readable PEM certificate data")
         # Check PID 1, not merely Docker's configured user or an exec helper.
         status = docker("exec", name, "cat", "/proc/1/status").stdout
         uid = next(line.split()[1:] for line in status.splitlines() if line.startswith("Uid:"))
