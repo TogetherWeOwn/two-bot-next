@@ -763,7 +763,7 @@ async fn missing_open_channel_requires_typed_absence_and_releases_the_reservatio
         );
         assert!(matches!(
             runtime.store.reserve("blocked", "500", 1, 0).await.unwrap(),
-            OpenResult::Existing(_)
+            OpenResult::Refused(OpenDecision::Existing { .. })
         ));
         assert!(!runtime.store.transcript_exists("missing").await.unwrap());
     }
