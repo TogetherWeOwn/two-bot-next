@@ -1,0 +1,60 @@
+-- 0007_gate_cleared: make the rules gate a step in the funnel (TOG-76).
+--
+-- WHAT THIS IS
+-- ------------
+-- One nullable column on `members`, projected from a new `gate_cleared` event.
+--
+-- WHY
+-- ---
+-- TWO has Discord's membership screening on. A member behind it arrives with
+-- `pending: true` and can do nothing at all - not type, not react, not click.
+-- Until now `member_join` was the only thing we recorded, so "walked in" and
+-- "got through the door" were one blurred number.
+--
+-- They are not one number. Read live on 19 Aug 2026, of 84 humans on the
+-- server 53 had cleared the gate and 31 never had - and 30 of those 31 arrived
+-- in just three months (2025-07, 2025-09, 2025-12), which cleared at 8%, 0%
+-- and 6% while every trickle month around them cleared 100%. Those months look
+-- like ordinary growth in every chart we have ever drawn. They were not: they
+-- were three bursts of people who joined and never got in, and it took a year
+-- and a hand-run script to notice. That is the number this column exists to
+-- put in front of somebody the week it happens.
+--
+-- THE FIRST `ALTER TABLE` IN THIS DIRECTORY
+-- -----------------------------------------
+-- Every migration before this one creates. This one alters, which the README
+-- allows ("additive by default") and which is safe here for the usual reasons:
+-- the column is nullable with no default, so the rewrite is a catalogue-only
+-- change on any modern Postgres, no existing row moves, no existing query
+-- changes meaning, and every reader that does not know about the column keeps
+-- working. `IF NOT EXISTS` so re-running is a no-op - the SQLite bootstrap in
+-- src/store/schema.sql carries the same column and a database moved from
+-- SQLite to Postgres would otherwise try to add it twice.
+--
+-- WHAT NULL MEANS, WHICH IS THE WHOLE TRAP
+-- ----------------------------------------
+-- NULL is not "did not clear". It is "we have no clearing on file", and that
+-- covers two opposite situations which only `events` can tell apart:
+--
+--   member_join on file, no gate_cleared  -> stuck at the gate. Real signal.
+--   neither on file                       -> joined before the listener
+--                                            existed. No signal at all.
+--
+-- Do not write `WHERE gate_cleared_at IS NULL` and call the result "people who
+-- did not get in". src/analytics/dashboard.ts computes the conversion rate off
+-- the cohort that has a join event we actually observed, and reports the
+-- unobservable remainder on its own line rather than folding it in.
+--
+-- BACKFILL
+-- --------
+-- Discord's member object carries `pending` right now but keeps no history of
+-- when it flipped. So for an existing member we can know THAT they are through
+-- and never WHEN. scripts/backfill.ts writes those with
+-- source = 'backfill:member_list' and occurred_at set to the JOIN time, which
+-- is a placeholder and not a measurement: labelSource() already marks anything
+-- `backfill:` as unattributable, and the dashboard excludes backfilled
+-- clearings from any time-to-clear arithmetic. See docs/EVENTS.md, limit 6.
+
+ALTER TABLE members ADD COLUMN IF NOT EXISTS gate_cleared_at TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_members_gate ON members (guild_id, gate_cleared_at);
