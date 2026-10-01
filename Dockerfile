@@ -33,14 +33,23 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
 COPY . .
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS certificates
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user: the bot never needs container root.
-RUN useradd --create-home --shell /usr/sbin/nologin two-bot
+FROM debian:bookworm-slim AS runtime
+
+# Keep the trust store, not the certificate installation tools/dependencies.
+# Debian's hashed certificate links also need their shared-data targets.
+COPY --from=certificates /etc/ssl/certs/ /etc/ssl/certs/
+COPY --from=certificates /usr/share/ca-certificates/ /usr/share/ca-certificates/
+
+# Verify the copied trust store before creating the non-root bot user.
+RUN test -s /etc/ssl/certs/ca-certificates.crt \
+    && test -z "$(find -L /etc/ssl/certs -type l -print)" \
+    && useradd --create-home --shell /usr/sbin/nologin two-bot
 USER two-bot
 WORKDIR /home/two-bot
 
