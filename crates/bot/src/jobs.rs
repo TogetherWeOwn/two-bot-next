@@ -8,6 +8,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::{Instant, MissedTickBehavior},
 };
+use two_bot_core::metrics::{self, Metrics};
 
 pub type JobFuture = Pin<Box<dyn Future<Output = Result<(), ErrorClass>> + Send>>;
 pub type JobAction = Arc<dyn Fn() -> JobFuture + Send + Sync>;
@@ -71,7 +72,12 @@ pub async fn supervise(jobs: Vec<Job>, status: SharedStatus, shutdown: watch::Re
     let mut tasks = JoinSet::new();
     for job in jobs {
         assert!(!job.cadence.is_zero(), "job cadence must be nonzero");
-        tasks.spawn(run_job(job, Arc::clone(&status), shutdown.clone()));
+        tasks.spawn(run_job(
+            job,
+            Arc::clone(&status),
+            shutdown.clone(),
+            metrics::global(),
+        ));
     }
     while tasks.join_next().await.is_some() {}
 }
@@ -95,7 +101,12 @@ fn timestamp() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-async fn run_job(job: Job, status: SharedStatus, mut shutdown: watch::Receiver<bool>) {
+async fn run_job(
+    job: Job,
+    status: SharedStatus,
+    mut shutdown: watch::Receiver<bool>,
+    metrics: &Metrics,
+) {
     let mut interval = tokio::time::interval_at(Instant::now() + job.startup_jitter, job.cadence);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut active: Option<JoinHandle<Result<(), ErrorClass>>> = None;
@@ -113,13 +124,16 @@ async fn run_job(job: Job, status: SharedStatus, mut shutdown: watch::Receiver<b
                 current.running = false;
                 match result {
                     Ok(()) => {
-                        current.last_success = Some(timestamp());
+                        let completed = timestamp();
+                        current.last_success = Some(completed);
                         current.last_error_class = None;
                         current.consecutive_failures = 0;
+                        metrics.job_success(job.name, completed / 1_000);
                     }
                     Err(class) => {
                         current.last_error_class = Some(class);
                         current.consecutive_failures = current.consecutive_failures.saturating_add(1);
+                        metrics.job_failure(job.name);
                         tracing::warn!(job = job.name, error_class = ?class, "periodic job failed");
                     }
                 }

@@ -26,12 +26,41 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_db_pool_connections` | Current pool size |
 | `two_bot_db_pool_idle_connections` | Current idle connections |
 | `two_bot_db_pool_max_connections` | Configured maximum |
-| `two_bot_job_last_success_timestamp_seconds{job}` | Completion time, zero means never run; currently `session_checkpoint` records successful durable gateway commits |
+| `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
+| `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
+| `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
 
-`invite_snapshot` remains zero until a real scheduler calls `job_success` after
-completion. This card does not add jobs or wire otherwise-unconnected REST
-consumers into the bot. Executor calls automatically record metrics wherever the
-executor is used. Other REST clients are not silently claimed as covered.
+## Job coverage and outcomes
+
+The supervisor records all three job metrics centrally after each completed
+attempt. Individual periodic jobs need no instrumentation. The current scheduled
+labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
+`community_scorecard` and `inactivity` (the last two may be parked by configuration).
+All allowlisted series are exposed from process startup at zero, even before the
+first run. A zero success timestamp does not distinguish a parked, never-started,
+still-running or always-failing job; use `/readyz` job status for that distinction.
+
+Starts, skipped busy deadlines and shutdown cancellation are not completed
+outcomes. A returned `Ok(())` is a success even when the job is a gated/no-op tick;
+these counters measure scheduler health, not business events or changed rows.
+Failures preserve the previous success timestamp. The supervisor's `/readyz`
+status uses milliseconds; metrics convert the same completion sample to seconds.
+Errors and panic payloads are never labels.
+
+The fixed job allowlist also retains `session_checkpoint`, `invite_snapshot` and
+`other`. `session_checkpoint` records successful durable gateway commits through
+`job_success`, independently of the periodic supervisor; its success counter is
+not a scheduled-job count and its failures are not instrumented here.
+`invite_snapshot` remains zero until a real caller records a completion. Unknown
+job names share the `other` counters, timestamp and failure streak; an unknown
+success resets that shared streak. Add new scheduled names to the compile-time
+allowlist, never to a dynamic label map. The supervisor fixture checks the current
+website/community registration name catalogs against that allowlist.
+
+This change does not add a feed/roster scheduler or new jobs. Executor calls
+already record REST metrics wherever the executor is used; other REST clients
+are not silently claimed as covered. Off-container scraping and alerts remain
+separate work.
 
 ## Cardinality and memory
 
@@ -54,7 +83,13 @@ controller's bounded cache pool was missing at implementation time.
 ## Verification and sources
 
 - Core unit tests: cumulative histogram, unique series, finite label sets,
-  hostile labels, status groups and missing latency.
+  hostile labels, saturating job counters, status groups and missing latency.
+- Supervisor fixtures (paused Tokio time, local `Metrics` registries): first
+  success for every website/community registration, seconds conversion, returned
+  failures, preserved success timestamps, streak reset, timeout/future/factory
+  panics collapsing to `other`, and shutdown cancellation producing no outcome.
+  Paused timers follow Tokio's `advance` contract; tests yield between jumps:
+  <https://docs.rs/tokio/1.53.1/tokio/time/fn.advance.html>.
 - Server tests: the existing router returns `/metrics` 200 with the expected
   names/content type; lazy authorized test-pool bookkeeping requires no DB I/O.
 - Worker/DO fixture tests: GET/HEAD/POST metrics routes are 404, do not fetch/start
