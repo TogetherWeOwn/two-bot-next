@@ -566,7 +566,9 @@ mod tests {
         let t = InviteTracker::new(MemSnapshots::new());
         let t0 = 1_700_000_000_000_i64;
         // Baseline at t0.
-        assert!(t.diff_and_store_at(1, &[state("a", 5)], Some(t0)).is_empty());
+        assert!(t
+            .diff_and_store_at(1, &[state("a", 5)], Some(t0))
+            .is_empty());
         // Fresh read shortly after: growth credits normally.
         let grew = t.diff_and_store_at(1, &[state("a", 6)], Some(t0 + 60_000));
         assert_eq!(grew, vec!["a".to_owned()]);
