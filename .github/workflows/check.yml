@@ -22,7 +22,6 @@ concurrency:
 jobs:
   startup-diagnostic:
     name: credentialed startup diagnostic (immutable 33594fc)
-    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 20
     container:
@@ -44,9 +43,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Prove unchanged immutable application and lockfile
+      - name: Restore immutable application, preserving only the synthetic fixture
         run: |
-          git diff --exit-code 33594fca024e31f65073cbc56e58a80beca9df58 -- crates/bot/src crates/core/src crates/discord/src crates/cutover/src Cargo.toml Cargo.lock
+          cp crates/bot/tests/alive.rs "$RUNNER_TEMP/startup-fixture.rs"
+          git restore --source=33594fca024e31f65073cbc56e58a80beca9df58 --staged --worktree crates Cargo.toml Cargo.lock
+          cp "$RUNNER_TEMP/startup-fixture.rs" crates/bot/tests/alive.rs
+          git diff --exit-code 33594fca024e31f65073cbc56e58a80beca9df58 -- crates Cargo.toml Cargo.lock ':(exclude)crates/bot/tests/alive.rs'
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: stable
@@ -57,13 +59,21 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-startup-diagnostic-${{ hashFiles('Cargo.lock') }}
-      - name: Run actual credentialed binary matrix (last case is expected red)
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Run real credentialed binary matrix (last case is expected red on bad source)
         run: cargo test -p two-bot --locked --test alive startup_diagnostic_credentialed_optional_configuration -- --ignored --nocapture --test-threads=1
 
   check:
     name: check
+    needs: self-role-store
+    # A skipped dependency must not make the required check appear green.
+    if: ${{ always() }}
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
+    # Self-hosted runners share one Docker host, so a published 5432 collides
+    # across concurrent jobs. A job container gets its own network namespace:
+    # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
@@ -94,9 +104,15 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          # Tests that pin 127.0.0.1/localhost:5432 reach the service through
+          # this job-private forward.
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
+
+      - name: require self-role store tests to pass
+        if: needs.self-role-store.result != 'success'
+        run: exit 1
 
       - name: Check migration numbering and immutability
         env:
@@ -206,11 +222,16 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
 
+      - name: Internal-member durable store regressions (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
+
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
-      - name: Sticky runtime acceptance tests (CI service only)
-        run: cargo test -p two-bot --locked sticky_runtime_tests -- --ignored --test-threads=1
+      - name: Command runtime acceptance tests (sticky and feeds, CI service only)
+        run: cargo test -p two-bot --locked command_runtime_tests -- --ignored --test-threads=1
 
       - name: Real binary lifecycle acceptance (CI service only, under 60 s)
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
@@ -221,6 +242,36 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+
+  self-role-store:
+    name: self-role store leases
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 30
+    # A job container resolves service names directly. The test's fixed
+    # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    services:
+      agent-testdb:
+        image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        with:
+          toolchain: stable
+      - name: self-role claim, renewal, recovery and fencing tests
+        run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
 
   container:
     name: container smoke
@@ -265,6 +316,9 @@ jobs:
     name: community db
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 15
+    # Self-hosted runners share one Docker host, so a published 5432 collides
+    # across concurrent jobs. A job container gets its own network namespace:
+    # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     services:
@@ -297,6 +351,9 @@ jobs:
     name: feeds db check
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 15
+    # Self-hosted runners share one Docker host, so a published 5432 collides
+    # across concurrent jobs. A job container gets its own network namespace:
+    # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
@@ -343,7 +400,9 @@ jobs:
       # TOG-9907: named envs do not inherit bindings; fail if any [env.*]
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
       - name: check env bindings are explicit
-        run: python3 scripts/check-env-bindings.py wrangler.toml
+        run: |
+          python3 scripts/check-env-bindings.py wrangler.toml
+          python3 scripts/test-env-bindings.py
       - name: Verify frozen legacy registry export preconditions
         run: node --test ../scripts/test-export-legacy-registry.mjs
       - name: Verify PR lint event and dispatch paths

@@ -41,6 +41,10 @@
       "sha256": "dc3ead788a282166adf62fd5aa08366db5c4848f1fc633c420cc07a116e4ee9d",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0200_self_roles.sql": {
+      "sha256": "1e88d4300bea0c47c5ca37aaa1897314ecfa1677e43d7dcbbbfddf29344862df",
+      "justification": "Add reserved self-role audit and panel lease migration for TOG-10087; preserve legacy table and column names."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
@@ -61,6 +65,22 @@
       "sha256": "9addc4962a1a69062bb8886e7c6f33596c0a1cc7583a965c360376819b546ed0",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0331_guild_settings_versions.sql": {
+      "sha256": "316d249d0919aabf651910547a21894f6500dc63fa34443a96ae3decbe7b73c4",
+      "justification": "Add database-owned settings tokens for TOG-10863; unchanged historical migration, superseded for CAS by 0334."
+    },
+    "crates/cutover/migrations/0332_guild_settings_allocator.sql": {
+      "sha256": "4ed890d1779cdf93e2697b66598e433e63302852a1d889032168f2b4de602a4a",
+      "justification": "Bind historical settings allocation to the target schema for TOG-10863; unchanged SQL."
+    },
+    "crates/cutover/migrations/0333_guild_settings_revision.sql": {
+      "sha256": "96389fed46faf05e9aad246c9625b866078c2c0921eef2ed375a8b1236a72eb4",
+      "justification": "Bind revision locks to target schema for TOG-10863; unchanged historical allocator repair, retired from CAS by 0334."
+    },
+    "crates/cutover/migrations/0334_guild_settings_cas.sql": {
+      "sha256": "99df054037d2e8df35b414867f4573629093aa86236c51bf19ab0151bec7b9ae",
+      "justification": "Separate negative destination CAS tokens from copyable legacy versions for TOG-10863; invalidate historical tokens without a racy reseed."
+    },
     "crates/cutover/migrations/0340_operational_audit.sql": {
       "sha256": "045f005f212d9e38bc51c2c5b49ff541fff887251949a4dbbf34d4ceb574cac8",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
@@ -68,6 +88,10 @@
     "crates/cutover/migrations/0350_internal_actions.sql": {
       "sha256": "c291e8683b2afdeb23a985953a2afeba86519c06ec1deb8c6d2c5dd56d2f22bd",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0351_internal_action_roles.sql": {
+      "sha256": "889864e3d2768c5b95455b6b1e2071e20921cd65d5f8a017aad8668093b8f489",
+      "justification": "Pin the validated resolved role in internal-action intents and audits before REST for TOG-10861."
     },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",

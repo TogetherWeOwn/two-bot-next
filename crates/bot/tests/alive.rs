@@ -640,7 +640,8 @@ async fn diagnostic_boot(
 async fn startup_diagnostic_credentialed_optional_configuration() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
 
-    let cases: Vec<(&str, Vec<(&str, OsString)>, [bool; 3])> = vec![
+    type Env = Vec<(&'static str, OsString)>;
+    let cases: [(&str, Env, [bool; 3]); 3] = [
         ("missing_optional_env", vec![], [false, true, false]),
         (
             "invalid_optional_unicode_env",

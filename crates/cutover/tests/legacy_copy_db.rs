@@ -215,14 +215,94 @@ async fn scenarios(source: PgPool, target: PgPool) -> TestResult {
         .fetch_one(&target)
         .await?;
     assert!(revision_after > revision);
+    let settings_metadata: Vec<(String, i64)> =
+        sqlx::query_as("SELECT xmin::text, cas_version FROM guild_settings ORDER BY guild_id, key")
+            .fetch_all(&target)
+            .await?;
+    let cas_allocation: i64 = sqlx::query_scalar("SELECT last_value FROM guild_settings_cas_seq")
+        .fetch_one(&target)
+        .await?;
     let replay = copy(&source, &target, &tables, 1, true).await?;
     assert!(replay.iter().all(|r| r.changed == 0));
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT xmin::text, cas_version FROM guild_settings ORDER BY guild_id, key",
+        )
+        .fetch_all(&target)
+        .await?,
+        settings_metadata,
+        "no-op copy preserves tuple identity and destination CAS tokens"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT last_value FROM guild_settings_cas_seq")
+            .fetch_one(&target)
+            .await?,
+        cas_allocation,
+        "no-op copy does not allocate CAS tokens"
+    );
     let revision_replay: i64 = sqlx::query_scalar("SELECT revision FROM guild_settings_revision")
         .fetch_one(&target)
         .await?;
     assert_eq!(
         revision_after, revision_replay,
         "no-op replay issues no settings DML"
+    );
+
+    // A genuine import change must invalidate destination CAS even when the
+    // source retains the SAME legacy version. Preserve the existing mapping;
+    // do not weaken equality/parity checks to accommodate rewritten versions.
+    let settings = tables
+        .iter()
+        .find(|t| t.source == "guild_settings")
+        .unwrap();
+    let old_token: i64 = sqlx::query_scalar(
+        "SELECT cas_version FROM guild_settings WHERE guild_id='g1' AND key='TWO_RAID_JOIN_THRESHOLD'",
+    )
+    .fetch_one(&target)
+    .await?;
+    sqlx::query(
+        "UPDATE guild_settings SET value='4' WHERE guild_id='g1' AND key='TWO_RAID_JOIN_THRESHOLD'",
+    )
+    .execute(&source)
+    .await?;
+    let changed = copy(&source, &target, &[*settings], 1, true).await?;
+    assert_eq!(changed[0].changed, 1);
+    assert_eq!(
+        values(&source, settings, true).await?,
+        values(&target, settings, false).await?,
+        "genuine change preserves every mapped legacy column"
+    );
+    let (legacy_version, new_token): (i64, i64) = sqlx::query_as(
+        "SELECT version, cas_version FROM guild_settings WHERE guild_id='g1' AND key='TWO_RAID_JOIN_THRESHOLD'",
+    )
+    .fetch_one(&target)
+    .await?;
+    assert_eq!(legacy_version, 19);
+    assert!(new_token < old_token);
+    let store = two_bot_cutover::settings::SettingsStore::new(&target);
+    let marks = store.poll_marks().await?;
+    for value in [Some(serde_json::json!(5)), None] {
+        assert!(matches!(
+            store
+                .set_if_version(
+                    "g1",
+                    "TWO_RAID_JOIN_THRESHOLD",
+                    value,
+                    "fixture",
+                    Some(old_token)
+                )
+                .await,
+            Err(two_bot_cutover::settings::SettingsWriteError::VersionConflict)
+        ));
+    }
+    assert_eq!(store.poll_marks().await?, marks);
+    assert_eq!(
+        store.get("g1", "TWO_RAID_JOIN_THRESHOLD").await?,
+        Some((serde_json::json!(4), new_token))
+    );
+    assert_eq!(
+        copy(&source, &target, &[*settings], 1, true).await?[0].changed,
+        0
     );
 
     // Every preserved serial/version allocator must advance past copied IDs.
