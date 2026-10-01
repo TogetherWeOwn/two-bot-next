@@ -45,39 +45,15 @@ pub enum DbDumpError {
     Refused(String),
 }
 
-/// Stable read order, so two dumps of an unchanged database are comparable.
-/// (Port of legacy `orderFor`.)
-fn order_for(table: &str, columns: &[String]) -> String {
-    let order = match table {
-        "events" => "id",
-        "members" => "guild_id, member_id",
-        "invite_snapshots" => "guild_id, code",
-        "operational_audit_log" => "entry_id",
-        "moderation_warnings" => "created_at, id",
-        "moderation_scheduled_unbans" => "execute_at, request_id",
-        "moderation_audit" => "created_at, request_id",
-        "moderation_lockdowns" => "guild_id, channel_id",
-        "moderation_idempotency" => "guild_id, idempotency_key",
-        "containment_events" => "occurred_at, audit_entry_id",
-        "containment_incidents" => "started_at, id",
-        "join_risk_flags" => "joined_at, event_id",
-        "automation_commands" => "guild_id, name",
-        "scheduled_messages" => "guild_id, id",
-        "sticky_messages" => "guild_id, channel_id",
-        "automation_audit_log" => "created_at, id",
-        "tickets" => "created_at, id",
-        "ticket_transcripts" => "created_at, ticket_id",
-        "automod_violations" => "guild_id, user_id",
-        "automod_processed_messages" => "guild_id, message_id",
-        "self_role_audit" => "created_at, event_id",
-        "self_role_panel_claims" => "guild_id, member_id, panel_id",
-        _ => "",
-    };
-    if order.is_empty() {
-        columns.first().cloned().unwrap_or_else(|| "1".to_owned())
-    } else {
-        order.to_owned()
-    }
+/// Total, locale-independent order even for composite keys or tables without
+/// a primary key. Text output is the archive's representation; equal sort keys
+/// therefore mean identical archived rows (including JSON and binary columns).
+fn order_for(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("\"{}\"::text COLLATE \"C\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Postgres caps a statement at 65535 bound parameters. Stay well under.
@@ -209,7 +185,7 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
             .map(|c| format!("\"{}\"::text", c.replace('"', "\"\"")))
             .collect();
         let select_list = quoted.join(", ");
-        let order = order_for(&table.name, &table.columns);
+        let order = order_for(&table.columns);
         // Stream row-by-row: each row passes through the bounded writer
         // (8 MiB decoded-line cap, cumulative budgets) BEFORE the next row
         // is materialised. An early oversized row refuses before later rows
@@ -262,6 +238,10 @@ pub struct RestoreReport {
 pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbDumpError> {
     let contents: DumpContents = inspect(in_path)?;
     let manifest = contents.manifest;
+    let missing = manifest.missing_tables();
+    if !missing.is_empty() {
+        tracing::warn!(version = manifest.version, tables = ?missing, "old dump lacks tables; restore leaves them empty");
+    }
     let mut dropped_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     let mut tx = pool.begin().await?;
@@ -274,7 +254,12 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     .execute(&mut *tx)
     .await?;
 
-    for table in &manifest.tables {
+    // Never trust manifest order: a legacy or reordered file can put children
+    // before parents. The same allowlist controls dump and restore FK order.
+    for name in DUMP_TABLES {
+        let Some(table) = manifest.tables.iter().find(|t| t.name == *name) else {
+            continue;
+        };
         // Re-checked at the point of interpolation, not just at parse time:
         // this is the line that builds SQL from file-supplied text.
         if !is_dump_table(&table.name) {
@@ -336,7 +321,12 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         let batch = batch_size_for(kept.len());
         for page in rows.chunks(batch) {
             // One multi-row INSERT per page: VALUES ($1::t1, $2::t2), ...
-            let mut sql = format!("INSERT INTO {} ({quoted}) VALUES ", table.name);
+            // Identity GENERATED ALWAYS columns need explicit-value restore too.
+            // https://www.postgresql.org/docs/16/sql-insert.html
+            let mut sql = format!(
+                "INSERT INTO {} ({quoted}) OVERRIDING SYSTEM VALUE VALUES ",
+                table.name
+            );
             let mut params: Vec<Option<String>> = Vec::with_capacity(page.len() * kept.len());
             let mut placeholders: Vec<String> = Vec::with_capacity(page.len());
             let mut index = 1;
@@ -368,34 +358,51 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         }
     }
 
-    // Put the id sequence back past the restored high-water mark, or the
-    // first write after the restore collides with a row we just put back.
-    sqlx::query(
-        "SELECT setval(pg_get_serial_sequence('events', 'id'), \
-         GREATEST((SELECT COALESCE(MAX(id), 0) FROM events), 1), \
-         (SELECT COUNT(*) FROM events) > 0)",
-    )
-    .execute(&mut *tx)
-    .await?;
+    // Discover owned serial AND identity sequences, including columns not
+    // named `id`. Empty tables restart at 1 with is_called=false.
+    // https://www.postgresql.org/docs/16/functions-info.html
+    // https://www.postgresql.org/docs/16/functions-sequence.html
+    for table in DUMP_TABLES {
+        let sequences: Vec<(String, String)> = sqlx::query_as(
+            "SELECT column_name, pg_get_serial_sequence(\
+             quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) \
+             FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1 \
+             AND pg_get_serial_sequence(\
+             quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) IS NOT NULL",
+        )
+        .bind(*table)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (column, sequence) in sequences {
+            let column = format!("\"{}\"", column.replace('"', "\"\""));
+            sqlx::query(audited(format!(
+                "SELECT setval($1::regclass, GREATEST(COALESCE(MAX({column}), 1), 1), \
+                 MAX({column}) IS NOT NULL) FROM {table}"
+            )))
+            .bind(sequence)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
     tx.commit().await?;
 
     let mut restored = BTreeMap::new();
     let mut ok = true;
-    for table in &manifest.tables {
-        if !is_dump_table(&table.name) {
-            return Err(DbDumpError::Refused(format!(
-                "manifest table {:?} is not a dump table",
-                table.name
-            )));
-        }
-        let row: (i64,) = sqlx::query_as(audited(format!("SELECT COUNT(*) FROM {}", table.name)))
+    for table in DUMP_TABLES {
+        let row: (i64,) = sqlx::query_as(audited(format!("SELECT COUNT(*) FROM {table}")))
             .fetch_one(pool)
             .await?;
         let count = row.0 as u64;
-        if count != table.count {
+        let expected = manifest
+            .tables
+            .iter()
+            .find(|t| t.name == *table)
+            .map_or(0, |t| t.count);
+        if count != expected {
             ok = false;
         }
-        restored.insert(table.name.clone(), count);
+        restored.insert((*table).to_owned(), count);
     }
 
     Ok(RestoreReport {

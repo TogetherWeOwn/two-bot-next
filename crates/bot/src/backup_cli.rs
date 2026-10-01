@@ -422,6 +422,7 @@ async fn cmd_restore(args: &[String]) -> i32 {
     match dump::restore(&pool, Path::new(&file)).await {
         Ok(report) => {
             println!("restore: dump taken {}", report.manifest.created_at);
+            warn_missing_dump_tables(&report.manifest);
             println!(
                 "restore: migrations in dump: {}",
                 if report.manifest.schema_migrations.is_empty() {
@@ -462,6 +463,17 @@ async fn cmd_restore(args: &[String]) -> i32 {
     0
 }
 
+fn warn_missing_dump_tables(manifest: &dump_file::DumpManifest) {
+    let missing = manifest.missing_tables();
+    if !missing.is_empty() {
+        eprintln!(
+            "restore: WARNING: v{} dump lacks tables that will be left empty: {}",
+            manifest.version,
+            missing.join(", ")
+        );
+    }
+}
+
 async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
     // Nothing in this branch writes. A dry run must not be able to become
     // the outage it rehearses for.
@@ -476,6 +488,7 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
 
     println!("restore: --dry-run of {file}");
     println!("restore: dump taken {}", contents.manifest.created_at);
+    warn_missing_dump_tables(&contents.manifest);
     println!(
         "restore: migrations in dump: {}",
         if contents.manifest.schema_migrations.is_empty() {

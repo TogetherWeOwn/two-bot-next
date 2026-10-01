@@ -1,4 +1,4 @@
-//! The v3 backup envelope: manifest / rows / end marker, gzipped NDJSON.
+//! The v4 backup envelope (also reads v3): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -66,8 +66,8 @@ pub const DUMP_TABLES: &[&str] = &[
     "self_role_panel_claims",
 ];
 
-/// The backup format version. Must stay 3: the envelope is frozen.
-pub const DUMP_VERSION: u32 = 3;
+/// Write the complete-schema envelope; the reader also accepts frozen v3.
+pub const DUMP_VERSION: u32 = 4;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -100,6 +100,19 @@ pub struct DumpManifest {
     /// Which migrations the source had applied, for diagnosing an old backup.
     #[serde(rename = "schemaMigrations")]
     pub schema_migrations: Vec<String>,
+}
+
+impl DumpManifest {
+    /// Old v3 archives predate complete table coverage. Restore clears these
+    /// tables too, rather than silently retaining unrelated target contents.
+    #[must_use]
+    pub fn missing_tables(&self) -> Vec<&'static str> {
+        DUMP_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !self.tables.iter().any(|t| t.name == *name))
+            .collect()
+    }
 }
 
 /// Maximum compressed AND decoded bytes. Files are streamed rather than
@@ -522,9 +535,9 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     return Err(refuse("dump contains more than one manifest"));
                 }
                 let version = obj.get("version").and_then(Value::as_u64).unwrap_or(0);
-                if version != u64::from(DUMP_VERSION) {
+                if version != 3 && version != u64::from(DUMP_VERSION) {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -681,8 +694,16 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
+    // The first 22 entries are frozen v3 coverage, pinned by the checked-in
+    // legacy fixture. V3 may omit later additions; v4 must declare them all.
+    let required = if obj.get("version").and_then(Value::as_u64) == Some(3) {
+        22
+    } else {
+        DUMP_TABLES.len()
+    };
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
+        .take(required)
         .filter(|name| !names.contains(**name))
         .copied()
         .collect();
