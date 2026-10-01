@@ -17,6 +17,7 @@
 import {
   clickIdempotencyKey,
   isValidSlug,
+  isValidInviteCode,
   type Campaign,
   type RedirectClick,
 } from "./redirect.ts";
@@ -62,8 +63,34 @@ function rowToCampaign(row: CampaignRow): Campaign {
 
 /** Parse the `REDIRECT_MAPPINGS_JSON` snapshot fallback (same row shape). */
 export function parseMappingsSnapshot(json: string): Campaign[] {
-  const rows = JSON.parse(json) as CampaignRow[];
-  return rows.map(rowToCampaign);
+  // Treat snapshots as configuration, not trusted database rows. Reject the
+  // entire snapshot (including duplicates) rather than silently dropping rows.
+  try {
+    const rows: unknown = JSON.parse(json);
+    if (!Array.isArray(rows)) throw new Error();
+    const seen = new Set<string>();
+    return rows.map((row: unknown) => {
+      if (row === null || typeof row !== "object" || Array.isArray(row)) throw new Error();
+      const data = row as Record<string, unknown>;
+      if (
+        typeof data.slug !== "string" || !isValidSlug(data.slug) || seen.has(data.slug) ||
+        typeof data.invite_code !== "string" || !isValidInviteCode(data.invite_code) ||
+        (data.label !== undefined && typeof data.label !== "string") ||
+        (data.disabled_at != null && typeof data.disabled_at !== "string")
+      ) throw new Error();
+      seen.add(data.slug);
+      return {
+        slug: data.slug,
+        inviteCode: data.invite_code,
+        ...(typeof data.label === "string" ? { label: data.label } : {}),
+        ...(data.disabled_at === null || typeof data.disabled_at === "string"
+          ? { disabledAt: data.disabled_at } : {}),
+      };
+    });
+  } catch {
+    // JSON parse messages can contain fragments of the supplied config/secrets.
+    throw new Error("Invalid redirect mappings snapshot");
+  }
 }
 
 export class RedirectStore {
