@@ -1003,12 +1003,13 @@ async fn production_build_requires_authoritative_custom_rows_before_full_publica
 
 #[tokio::test]
 async fn boot_publication_failure_is_reported_and_remains_retryable() {
-    let (mock, origin) = MockRest::start(vec![
-        Scripted::json(
-            403,
-            serde_json::json!({"code": 50013, "message": "mock refusal"}),
-        ),
-        Scripted::json(200, serde_json::json!({"id": "1111"})),
+    let (mock, origin) = MockRest::start_script(vec![
+        RestResponse::status(403),
+        RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"1111"}"#.to_owned()),
+            delay: Duration::ZERO,
+        },
     ])
     .await;
     let runtime = runtime_without_db(gates(false, true), false, origin);
