@@ -1602,6 +1602,7 @@ async fn gateway_keeps_checkpointing_and_heartbeating_during_channel_rest_work()
         Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
         store.clone(),
         Some(Arc::clone(&runtime)),
+        None,
     ));
     wait_for(|| mock.requests().len() == 1, "READY publication").await;
     published_tx.send(()).unwrap();
