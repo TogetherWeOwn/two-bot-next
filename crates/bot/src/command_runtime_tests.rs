@@ -955,6 +955,7 @@ async fn production_build_requires_authoritative_custom_rows_before_full_publica
             router_with_commands(gates(true, true)),
             GUILD,
             custom_commands,
+            None,
         );
         runtime.set_identity(1111, 1111);
         runtime.publish_registry(Some(1111)).await;

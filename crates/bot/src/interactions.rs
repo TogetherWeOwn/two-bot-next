@@ -30,7 +30,9 @@ pub async fn initialize(
         two_bot_core::settings::SettingsCache::load(&snapshot)
             .env_snapshot(Some(&guild_id.to_string())),
     );
-    let gates = boot_gates(guild_id, &vars)?;
+    let mut gates = boot_gates(guild_id, &vars)?;
+    let ticket_config = crate::ticket_runtime::TicketConfig::from_env(guild_id);
+    gates.tickets = ticket_config.is_some();
     let proxy = std::env::var("DISCORD_API_BASE")
         .ok()
         .filter(|value| !value.is_empty());
@@ -42,8 +44,21 @@ pub async fn initialize(
         .await
         .map_err(|_| unavailable("interaction identity unavailable"))?;
     // TOG-10080 owns the custom-command store. None is unavailable, not zero rows.
-    let runtime =
-        CommandRuntime::build(pool, executor, router_with_commands(gates), guild_id, None);
+    let tickets = match ticket_config {
+        Some(config) => Some(Arc::new(
+            crate::ticket_runtime::TicketRuntime::new(pool.clone(), executor.clone(), config)
+                .map_err(|_| unavailable("ticket runtime initialization failed"))?,
+        )),
+        None => None,
+    };
+    let runtime = CommandRuntime::build(
+        pool,
+        executor,
+        router_with_commands(gates),
+        guild_id,
+        None,
+        tickets,
+    );
     runtime.set_identity(bot_user_id, application_id);
     runtime
         .publish_registry_checked(Some(application_id))
@@ -107,6 +122,10 @@ impl InteractionDispatch {
         }
     }
 
+    pub fn start_tickets(&self) -> Option<crate::ticket_runtime::TicketSupervisor> {
+        self.runtime.start_tickets()
+    }
+
     /// Never await paced REST/SQL on the shard's polling path. Admission is bounded;
     /// overload/panics fail before committing this dispatch rather than growing tasks.
     /// Dropping the JoinSet aborts tasks on shard failure (durable LFG state remains).
@@ -134,6 +153,7 @@ impl InteractionDispatch {
                 }
                 self.runtime
                     .set_identity(self.bot_user_id, self.application_id);
+                self.runtime.ticket_ready(ready.user.id.get());
                 let runtime = Arc::clone(&self.runtime);
                 let application_id = self.application_id;
                 self.tasks.spawn(async move {
@@ -141,6 +161,7 @@ impl InteractionDispatch {
                 });
             }
             Event::Resumed => {
+                self.runtime.spawn_ticket_resume();
                 let runtime = Arc::clone(&self.runtime);
                 self.tasks.spawn(async move {
                     runtime.publish_registry(None).await;
@@ -149,6 +170,9 @@ impl InteractionDispatch {
             Event::InteractionCreate(interaction) => {
                 let runtime = Arc::clone(&self.runtime);
                 let interaction = interaction.0.clone();
+                if runtime.spawn_if_ticket(&interaction) {
+                    return Ok(());
+                }
                 self.tasks.spawn(async move {
                     runtime.on_interaction(&interaction).await;
                 });
@@ -192,6 +216,7 @@ mod tests {
                 .unwrap(),
             router_with_commands(gates),
             22,
+            None,
             None,
         );
         runtime.set_identity(99, 11);
