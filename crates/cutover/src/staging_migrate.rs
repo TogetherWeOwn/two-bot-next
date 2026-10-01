@@ -21,7 +21,7 @@ use sha2::{Digest, Sha384};
 use sqlx::{
     migrate::Migrator,
     postgres::{PgConnection, PgPoolOptions},
-    Connection, Executor, PgPool, Row,
+    Executor, PgPool, Row,
 };
 
 /// Fixed binding name; the value is a secret and is never echoed.
