@@ -404,6 +404,8 @@ impl HyperTransport {
 
 #[path = "internal_exec/member.rs"]
 pub mod member;
+#[path = "self_roles_rest.rs"]
+pub mod self_roles;
 
 /// The S4 REST executor: paced lane + moderation lane over one transport.
 #[derive(Debug, Clone)]

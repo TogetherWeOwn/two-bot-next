@@ -102,11 +102,28 @@ or skip; the normal workspace test run alone still skips this opt-in test.
 The S4 interaction router and REST executor are now merged in
 [PR #57](https://github.com/TogetherWeOwn/two-bot-next/pull/57) and
 [PR #63](https://github.com/TogetherWeOwn/two-bot-next/pull/63), respectively.
-This PR remains domain/store-only as permitted by the slice contract.
-[TOG-10292](/TOG/issues/TOG-10292) owns the bounded runtime follow-up and
-still requires this slice to merge. It wires handlers, partial fetches and
-compensation through those shared seams, never a feature-private dispatcher
-or HTTP client.
+The domain/store slice [PR #43](https://github.com/TogetherWeOwn/two-bot-next/pull/43)
+is also merged. [TOG-10292](/TOG/issues/TOG-10292) owns the bounded runtime
+follow-up. Its first checkpoint adds `executor::self_roles` on the existing
+`ActionExecutor`, not a private dispatcher or HTTP client:
+
+- `fetch_self_role_snapshot` force-fetches target member, bot member, guild roles
+  and channels. Missing/duplicate identities, unknown member roles, invalid masks
+  and partial policy fail closed. The domain validator consumes the live snapshot
+  for hierarchy, deployment-mask drift and channel-overwrite checks.
+- `fetch_self_role_message` resolves reaction partials and validates the returned
+  message/channel identity. Member state still needs the authoritative fetch.
+- `self_role_step` uses one singular PUT or DELETE, one bounded exchange, and the
+  shared 110 ms pacing reservation. A caller-provided DB ownership check runs
+  after pacing and again after the call. No automatic retry can escape those
+  checks. A `RoleExchange` retains accepted/ambiguous effects even when the
+  post-call check loses ownership or fails. Only Discord's documented 204 is
+  accepted for a role mutation; other 2xx/3xx are uncertain.
+
+This checkpoint does **not** register handlers or enable role mutations. Durable
+claim orchestration, renewal, recovery/compensation, staging/dry-run gates and
+bot gateway integration remain on the same follow-up. The REST regression target
+is `two-bot-discord --test self_roles_rest`; no real token or guild is needed.
 
 A Common Changelog entry and Conventional Commit feature checkpoints provide
 release notes. The release standard owned by
