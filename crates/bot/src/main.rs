@@ -15,6 +15,7 @@ mod database_roles_cli;
 #[allow(dead_code)]
 #[path = "../../discord/tests/common/mod.rs"]
 mod discord_test_common;
+mod erasure_cli;
 mod gateway;
 mod gateway_metrics;
 #[cfg(test)]
@@ -184,6 +185,7 @@ async fn main() {
 /// `--help` covers both the gateway server and the backup CLI.
 async fn print_backup_help_and_exit() -> ! {
     println!("{}", preflight::USAGE);
+    print!("{}", erasure_cli::USAGE);
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
 }

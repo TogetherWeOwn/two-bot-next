@@ -31,6 +31,9 @@ twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 url = { workspace = true }
 
+[dev-dependencies]
+two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
+
 [[bin]]
 name = "legacy_verify"
 path = "src/bin/legacy_verify.rs"

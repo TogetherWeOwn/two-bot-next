@@ -26,6 +26,7 @@ pub mod legacy_verify;
 pub mod mee6_names;
 pub mod mee6_rewards;
 pub mod mee6_xp;
+pub mod member_erasure;
 pub mod message_scan;
 pub mod parse;
 pub mod rest;

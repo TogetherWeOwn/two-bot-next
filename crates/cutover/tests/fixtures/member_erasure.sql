@@ -1,0 +1,85 @@
+-- Two unrelated members in two guilds, across every erasure-plan table.
+-- Fixed fake snowflakes only. Never load this fixture into a runtime database.
+DO $$
+DECLARE
+  g TEXT;
+  u TEXT;
+  k TEXT;
+  intent BIGINT;
+BEGIN
+  FOR g IN SELECT unnest(ARRAY['1545644954272137297', '1545644954272137298']) LOOP
+    FOR u IN SELECT unnest(ARRAY['123456789012345678', '123456789012345679']) LOOP
+      k := g || ':' || u;
+      INSERT INTO members (guild_id, member_id) VALUES (g, u);
+      INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
+        VALUES ('member_join', u, g, now(), 'fixture', '{}', k);
+      INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, updated_at)
+        VALUES (g, u, 1, u, now());
+      INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
+        VALUES (g, u, 15, 15, now());
+      INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at)
+        VALUES (g, u, 'message', 15, now());
+      INSERT INTO xp_cooldowns (guild_id, member_id, source, last_awarded_at)
+        VALUES (g, u, 'message', now());
+      INSERT INTO moderation_audit
+        (request_id, guild_id, actor_id, action, target_id, reason, outcome, idempotency_key, metadata_json, created_at)
+        VALUES (k, g, u, 'warn', u, 'fixture', 'ok', k, '{}', '2026-10-01T00:00:00Z');
+      INSERT INTO moderation_idempotency
+        (guild_id, idempotency_key, action, request_hash, state, claimed_at, completed_at, result_json)
+        VALUES (g, k, 'warn', 'fixture', 'done', '2026-10-01T00:00:00Z', '2026-10-01T00:00:01Z', '{}');
+      INSERT INTO sticky_messages
+        (guild_id, channel_id, body, created_by, created_at, updated_by, updated_at)
+        VALUES (g, u, 'fixture', u, now(), u, now());
+      INSERT INTO automation_audit_log (id, guild_id, actor_id, action, outcome, created_at)
+        VALUES (k, g, u, 'sticky.create', 'ok', now());
+      INSERT INTO event_rsvps (guild_id, event_id, user_id, status, responded_at)
+        VALUES (g, '999999999999999999', u, 'going', now());
+      INSERT INTO announcements_audit_log (id, guild_id, actor_id, action, outcome, created_at)
+        VALUES (k, g, u, 'fixture', 'ok', now());
+      INSERT INTO community_facts
+        (guild_id, event_type, source_event_id, actor_id, occurred_at, source, classifier_version,
+         classification, matched_rule, metadata, idempotency_key)
+        VALUES (g, 'member_joined', k, u, '2026-10-01T00:00:00Z', 'fixture', 'fixture',
+          'eligible_human', 'fixture', '{}', k);
+      INSERT INTO community_scorecard_runs
+        (guild_id, week_start, week_end, classifier_version, watermark, input_count, input_hash,
+         idempotency_key, revision, run_status, coverage_state, evidence_state, scorecard_json,
+         intervention_code, generated_at)
+        VALUES (g, '2026-09-28T00:00:00Z', '2026-10-05T00:00:00Z', u, 1, 1, 'fixture', k,
+          1, 'completed', 'complete', 'sufficient', '{"fixture_user_id":"' || u || '"}',
+          'none', '2026-10-01T00:00:00Z');
+      INSERT INTO lfg_posts (id, guild_id, channel_id, title, starts_at, status, created_by, created_at)
+        VALUES (k, g, '999999999999999999', 'fixture', now(), 'open', u, now());
+      INSERT INTO lfg_roles (lfg_id, role_key, label, slots, position)
+        VALUES (k, 'tank', 'Tank', 2, 1);
+      INSERT INTO lfg_signups (lfg_id, user_id, role_key, joined_at)
+        VALUES (k, u, 'tank', now());
+      INSERT INTO feed_relays (id, guild_id, channel_id, kind, source, created_by, created_at, updated_at)
+        VALUES (k, g, u, 'rss', 'https://example.invalid/feed', u, now(), now());
+      INSERT INTO feed_deliveries (feed_id, item_key, nonce, state, first_seen_at)
+        VALUES (k, 'fixture', 'fixture', 'delivered', now());
+      INSERT INTO member_ranks (guild_id, member_id, updated_at)
+        VALUES (g, u, '2026-10-01T00:00:00Z');
+      INSERT INTO member_exclusions (guild_id, member_id, reason, updated_at)
+        VALUES (g, u, 'raid', '2026-10-01T00:00:00Z');
+      INSERT INTO operational_audit_log
+        (entry_id, event_kind, guild_id, occurred_at, actor_id, target_id, metadata_json, created_at)
+        VALUES (k, 'fixture', g, now(), u, u, '{}', now());
+      INSERT INTO internal_idempotency
+        (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id,
+         response_code, http_status, resource_id, affected)
+        VALUES (repeat(md5(k), 2), repeat(md5(k), 2), 'role.assign', repeat(md5(k), 2), 'completed',
+          g, u, u, 'success', 200, u, 1) RETURNING intent_id INTO intent;
+      INSERT INTO internal_action_log
+        (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, response_code, http_status)
+        VALUES (intent, 'terminal', repeat(md5(k), 2), 'role.assign', g, u, u, 'success', 200);
+      -- Explicit exceptions are seeded too: erasure must not change safety policy.
+      INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
+        VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);
+      INSERT INTO guild_settings_audit (guild_id, key, new_value, actor)
+        VALUES (g, 'fixture_' || u, to_jsonb(u), u);
+    END LOOP;
+  END LOOP;
+  INSERT INTO audit_kill_switch (id, engaged_at, engaged_by)
+    VALUES (1, now(), '123456789012345678');
+END $$;
