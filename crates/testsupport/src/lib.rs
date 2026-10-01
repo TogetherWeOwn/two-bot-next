@@ -161,7 +161,10 @@ impl TestDatabase {
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_with(connect_options(raw, admin_statement_timeout(github_actions.as_deref()))?)
+            .connect_with(connect_options(
+                raw,
+                admin_statement_timeout(github_actions.as_deref()),
+            )?)
             .await
             .context("connect to test bootstrap database")?;
         let name = database_name();
