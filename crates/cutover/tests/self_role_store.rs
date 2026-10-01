@@ -105,6 +105,48 @@ async fn leases_recovery_ordering_and_atomic_settlement() -> TestResult {
     result
 }
 
+async fn pending_intent_initialization(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    let mut pending = row("pending-intent", "pending-order");
+    pending.desired_role_ids.clear();
+    pending.pre_mutation_role_ids.clear();
+    let original = store.claim_pending_audit(&pending).await?.unwrap();
+    assert!(!original.intent_initialized);
+    // Admission can crash before any member fetch. Recovery must not treat
+    // placeholder [] as a committed empty target.
+    clock.store(TEST_NOW_MS + 300, Ordering::SeqCst);
+    let mut expired = original.clone();
+    assert!(!store.initialize_intent(&mut expired, &[], &[]).await?);
+    let mut recovered = store.claim_pending_audit(&pending).await?.unwrap();
+    assert!(recovered.recovered);
+    assert!(!recovered.intent_initialized);
+    assert!(!store.initialize_intent(&mut expired, &[], &[]).await?);
+    // Empty is a real initialized intent, not a signal to replan on retry.
+    assert!(store.initialize_intent(&mut recovered, &[], &[]).await?);
+    assert!(recovered.intent_initialized);
+    assert!(
+        !store
+            .initialize_intent(&mut recovered, &["role-new".into()], &[])
+            .await?
+    );
+    clock.store(TEST_NOW_MS + 600, Ordering::SeqCst);
+    let mut mismatched = pending.clone();
+    mismatched.member_id = "another-member".into();
+    assert!(store.claim_pending_audit(&mismatched).await?.is_none());
+    mismatched = pending.clone();
+    mismatched.event_order = Some("different-order".into());
+    assert!(store.claim_pending_audit(&mismatched).await?.is_none());
+    let recovered = store.claim_pending_audit(&pending).await?.unwrap();
+    assert!(recovered.intent_initialized);
+    assert!(recovered.desired_role_ids.is_empty());
+    assert!(recovered.pre_mutation_role_ids.is_empty());
+    let mut rejected = pending;
+    rejected.outcome = SettledOutcome::Rejected;
+    store.finish_audit(&rejected, &recovered).await?;
+    Ok(())
+}
+
 async fn exercise(pool: &PgPool) -> TestResult {
     let migration = include_str!("../migrations/0200_self_roles.sql");
     sqlx::raw_sql(migration).execute(pool).await?;
@@ -117,6 +159,12 @@ async fn exercise(pool: &PgPool) -> TestResult {
         "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='self_role_panel_claims'",
     ).fetch_one(pool).await?;
     assert_eq!((audit_columns, panel_columns), (27, 10));
+    sqlx::raw_sql(include_str!(
+        "../migrations/0201_self_role_intent_initialization.sql"
+    ))
+    .execute(pool)
+    .await?;
+    pending_intent_initialization(pool).await?;
 
     let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
     let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;

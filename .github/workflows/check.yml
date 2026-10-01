@@ -228,6 +228,8 @@ jobs:
           toolchain: stable
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
+      - name: self-role runtime admission and immutable snapshots (mock REST and isolated schema)
+        run: cargo test -p two-bot --locked self_role_runtime:: -- --include-ignored --test-threads=1
 
   container:
     name: container smoke

@@ -25,6 +25,10 @@ mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
 mod server;
+// TOG-10292 checkpoint: compile/test the claim service, but do not register
+// controls until execution, compensation and stale-target repair are complete.
+#[allow(dead_code)]
+mod self_role_runtime;
 mod website_jobs;
 
 use std::sync::Arc;

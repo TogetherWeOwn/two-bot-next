@@ -7,8 +7,13 @@
 - Add self-role reads and singular role operations to the shared REST executor:
   authoritative member/bot/role/channel policy snapshots, fetched reaction-message
   identity, paced single-attempt operations with pre/post ownership checks and
-  retained ambiguous or accepted-but-stale exchanges. Gateway registration and
-  durable claim orchestration remain disabled until the runtime follow-up lands.
+  retained ambiguous or accepted-but-stale exchanges. Add event-first/lane-first
+  runtime admission, concurrent cancellation-safe renewal of both leases, and
+  one-time fenced intent initialization (migration 0201). Recovery preserves
+  intentionally empty snapshots and computes remaining work from freshly fetched
+  member state. Add isolated Postgres/mock REST admission regressions to CI.
+  Execution, compensation and gateway registration remain disabled until the
+  runtime follow-up is complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

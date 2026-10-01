@@ -105,6 +105,9 @@ pub struct EventClaim {
     pub token: Secret<String>,
     pub generation: i32,
     pub recovered: bool,
+    /// False only for admission before the authoritative REST snapshot. Once
+    /// initialized, even an empty desired/pre-mutation set is immutable.
+    pub intent_initialized: bool,
     /// Persisted effect snapshot at acquisition; attempts/compensations remain
     /// cumulative in storage while observed/unresolved fields are replaceable.
     pub effects: AuditEffects,
@@ -225,8 +228,32 @@ impl SelfRoleStore {
             .ok_or(StoreError::InvalidLease)
     }
 
-    /// Insert-first deduplication, then generation-fenced expired recovery.
+    /// Insert-first deduplication with an already computed immutable intent.
     pub async fn claim_audit(&self, row: &SelfRoleAudit) -> Result<Option<EventClaim>, StoreError> {
+        self.claim_audit_inner(row, true).await
+    }
+
+    /// Runtime admission before lane acquisition and authoritative REST reads.
+    /// Supplied snapshot/effect fields must be empty; initialization is a
+    /// separate fenced write and is required before the first mutation.
+    pub async fn claim_pending_audit(
+        &self,
+        row: &SelfRoleAudit,
+    ) -> Result<Option<EventClaim>, StoreError> {
+        if !row.desired_role_ids.is_empty()
+            || !row.pre_mutation_role_ids.is_empty()
+            || row.effects != AuditEffects::default()
+        {
+            return Err(StoreError::StaleClaim);
+        }
+        self.claim_audit_inner(row, false).await
+    }
+
+    async fn claim_audit_inner(
+        &self,
+        row: &SelfRoleAudit,
+        initialized: bool,
+    ) -> Result<Option<EventClaim>, StoreError> {
         let mut tx = self.pool.begin().await?;
         let now = self.now(&mut tx).await?;
         let expires = self.expiry(now)?;
@@ -242,9 +269,9 @@ impl SelfRoleStore {
               compensated_added_role_ids, compensated_removed_role_ids,
               unresolved_added_role_ids, unresolved_removed_role_ids,
               desired_role_ids, pre_mutation_role_ids, claim_token, claim_generation,
-              processing_expires_at, created_at)
+              processing_expires_at, created_at, intent_initialized)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'processing',
-                     $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,gen_random_uuid()::text,1,$21,$22)
+                     $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,gen_random_uuid()::text,1,$21,$22,$23)
              ON CONFLICT (event_id) DO NOTHING RETURNING claim_token",
         )
         .bind(&row.event_id)
@@ -265,6 +292,7 @@ impl SelfRoleStore {
             .bind(ids_json(&row.pre_mutation_role_ids))
             .bind(expires)
             .bind(created)
+            .bind(initialized)
             .fetch_optional(&mut *tx)
             .await?;
         let claim = if let Some((token,)) = inserted {
@@ -273,26 +301,42 @@ impl SelfRoleStore {
                 token: Secret::new(token),
                 generation: 1,
                 recovered: false,
+                intent_initialized: initialized,
                 effects: row.effects.clone(),
                 desired_role_ids: row.desired_role_ids.clone(),
                 pre_mutation_role_ids: row.pre_mutation_role_ids.clone(),
                 renew_after_ms: self_role_renew_after_ms(self.lease_ms),
             })
         } else {
-            type RecoveryRow = (i32, String, String, OffsetDateTime, Vec<String>);
+            type RecoveryRow = (i32, String, String, OffsetDateTime, Vec<String>, bool);
             let prior: Option<RecoveryRow> = sqlx::query_as(
                 "SELECT claim_generation, desired_role_ids, pre_mutation_role_ids,
                  processing_expires_at, ARRAY[added_role_ids,removed_role_ids,
                  attempted_added_role_ids,attempted_removed_role_ids,
                  compensated_added_role_ids,compensated_removed_role_ids,
-                 unresolved_added_role_ids,unresolved_removed_role_ids]
-                 FROM self_role_audit WHERE event_id=$1 AND outcome='processing' FOR UPDATE",
+                 unresolved_added_role_ids,unresolved_removed_role_ids], intent_initialized
+                 FROM self_role_audit WHERE event_id=$1 AND outcome='processing'
+                 AND guild_id=$2 AND member_id=$3 AND panel_id=$4 AND source_id=$5
+                 AND source=$6 AND event_order IS NOT DISTINCT FROM $7
+                 AND option_key IS NOT DISTINCT FROM $8 AND role_id IS NOT DISTINCT FROM $9
+                 AND operation=$10 FOR UPDATE",
             )
             .bind(&row.event_id)
+            .bind(&row.guild_id)
+            .bind(&row.member_id)
+            .bind(&row.panel_id)
+            .bind(&row.source_id)
+            .bind(row.source.as_str())
+            .bind(&row.event_order)
+            .bind(&row.option_key)
+            .bind(&row.role_id)
+            .bind(row.operation.as_str())
             .fetch_optional(&mut *tx)
             .await?;
             let now = self.now(&mut tx).await?;
-            if let Some((generation, desired, before, _, effects)) = prior.filter(|p| p.3 <= now) {
+            if let Some((generation, desired, before, _, effects, intent_initialized)) =
+                prior.filter(|p| p.3 <= now)
+            {
                 let effects = AuditEffects::decoded(&effects)?;
                 let next = generation
                     .checked_add(1)
@@ -315,6 +359,7 @@ impl SelfRoleStore {
                     token: Secret::new(token),
                     generation: next,
                     recovered: true,
+                    intent_initialized,
                     effects,
                     desired_role_ids,
                     pre_mutation_role_ids,
@@ -336,6 +381,43 @@ impl SelfRoleStore {
         }
         tx.commit().await?;
         Ok(claim)
+    }
+
+    /// Initialize exactly once under the live event fence. A recovered intent
+    /// (including an empty target) can never be overwritten. Caller holds the
+    /// exclusive panel lane, when applicable, before fetching these snapshots.
+    pub async fn initialize_intent(
+        &self,
+        claim: &mut EventClaim,
+        desired: &[String],
+        before: &[String],
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
+        let changed = sqlx::query(
+            "UPDATE self_role_audit SET desired_role_ids=$4,pre_mutation_role_ids=$5,
+             intent_initialized=TRUE WHERE event_id=$1 AND claim_token=$2
+             AND claim_generation=$3 AND outcome='processing' AND NOT intent_initialized
+             AND processing_expires_at > $6",
+        )
+        .bind(&claim.event_id)
+        .bind(claim.token.expose())
+        .bind(claim.generation)
+        .bind(serde_json::to_string(desired)?)
+        .bind(serde_json::to_string(before)?)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        tx.commit().await?;
+        if changed {
+            claim.intent_initialized = true;
+            claim.desired_role_ids = desired.to_vec();
+            claim.pre_mutation_role_ids = before.to_vec();
+        }
+        Ok(changed)
     }
 
     pub async fn owns_claim(&self, claim: &EventClaim) -> Result<bool, StoreError> {

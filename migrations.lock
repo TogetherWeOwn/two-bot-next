@@ -45,6 +45,10 @@
       "sha256": "1e88d4300bea0c47c5ca37aaa1897314ecfa1677e43d7dcbbbfddf29344862df",
       "justification": "Add reserved self-role audit and panel lease migration for TOG-10087; preserve legacy table and column names."
     },
+    "crates/cutover/migrations/0201_self_role_intent_initialization.sql": {
+      "sha256": "04213c4ccd98ec47878fa2a52ffb0949943fe18dddfa8e9a9b5800a7c4e75cdf",
+      "justification": "Distinguish pending admission from immutable empty snapshots for the TOG-10292 runtime; preserve existing intent and all legacy names."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."

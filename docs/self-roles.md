@@ -120,10 +120,34 @@ follow-up. Its first checkpoint adds `executor::self_roles` on the existing
   post-call check loses ownership or fails. Only Discord's documented 204 is
   accepted for a role mutation; other 2xx/3xx are uncertain.
 
-This checkpoint does **not** register handlers or enable role mutations. Durable
-claim orchestration, renewal, recovery/compensation, staging/dry-run gates and
-bot gateway integration remain on the same follow-up. The REST regression target
-is `two-bot-discord --test self_roles_rest`; no real token or guild is needed.
+The next checkpoint adds `crates/bot/src/self_role_runtime.rs` admission and
+planning on the same executor:
+
+- Admission claims the event before REST, then acquires the exclusive lane with
+  a bounded 20-second wait. Duplicate and superseded inputs never fetch or plan.
+  Scoped recovery refuses a changed member, panel, source, order or operation.
+- Separate cancellation-safe renewal tasks keep both claims live during REST,
+  pacing and database waits. A renewal failure latches a stop flag. Dropping the
+  prepared operation stops both tasks; it does not pretend to cancel remote work.
+- Migration `0201_self_role_intent_initialization.sql` adds one boolean to the
+  existing audit table (28 columns after upgrade). Existing snapshots remain
+  initialized. Runtime admission explicitly records an uninitialized intent;
+  the first authoritative before/desired snapshot initializes exactly once under
+  a live token/generation fence. An intentionally empty target is immutable, not
+  a placeholder that a recovery worker may replan.
+- Reaction partials fetch the configured message; all surfaces force-fetch member
+  and policy after lane admission. A previously unknown lane may be seeded only
+  from a fresh, unambiguous held selection, never from incoming intent.
+- Recovery plans from immutable before/desired sets, retains all eight effect
+  arrays, and separately computes remaining work against current roles. Changed
+  catalogue/input intent fails closed; unrelated roles are not mutation targets.
+
+This checkpoint does **not** register handlers or enable role mutations. Actual
+execution, compensation, stale-worker committed-target repair, staging/dry-run
+gates and gateway integration remain on the same follow-up. The REST regression
+target is `two-bot-discord --test self_roles_rest`; admission coverage is
+`two-bot self_role_runtime:: -- --include-ignored --test-threads=1`, opted in by
+CI's isolated `self-role-store` service job. Neither needs a real token or guild.
 
 A Common Changelog entry and Conventional Commit feature checkpoints provide
 release notes. The release standard owned by
