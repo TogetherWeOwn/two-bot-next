@@ -31,6 +31,11 @@ static SECRET: LazyLock<String> = LazyLock::new(|| {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 });
 
+/// How long the mock holds the overlapping Discord write. The competing call on
+/// the other pool must reach its fence check inside this window; 250 ms lost
+/// that race on a loaded CI runner. Stays below the 5 s REST abort.
+const OVERLAP_HOLD: Duration = Duration::from_secs(2);
+
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service container"]
 async fn delayed_unlock_cannot_overwrite_a_later_lockdown_cycle() {
@@ -41,7 +46,7 @@ async fn delayed_unlock_cannot_overwrite_a_later_lockdown_cycle() {
             channel(Some("3072"), "8192"),
             ScriptedResponse::status(204),
             channel(Some("1024"), "10240"),
-            ScriptedResponse::status(204).delayed(Duration::from_millis(250)),
+            ScriptedResponse::status(204).delayed(OVERLAP_HOLD),
             channel(Some("3072"), "8192"),
             ScriptedResponse::status(204),
         ],
@@ -1414,7 +1419,7 @@ async fn concurrent_lock_and_unlock_are_ordered_across_independent_pools() {
     let mock = MockRest::start(
         vec![
             channel(Some("3072"), "8192"),
-            ScriptedResponse::status(204).delayed(Duration::from_millis(250)),
+            ScriptedResponse::status(204).delayed(OVERLAP_HOLD),
             channel(Some("1024"), "10240"),
             ScriptedResponse::status(204),
         ],
