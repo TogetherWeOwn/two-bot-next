@@ -165,7 +165,7 @@ struct Hello {
 /// Bound the entire SQL operation (pool acquire through COMMIT), not each query.
 /// Retain the quarter-heartbeat SQL budget even with independent ingress.
 /// A transport invalidation during SQL must not restore stale readiness.
-/// Source: https://docs.rs/tokio/1/tokio/time/fn.timeout.html
+/// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
     generation: &AtomicU64,
@@ -193,7 +193,7 @@ async fn checkpoint_io<T>(
 
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
-/// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
+/// fallback. Source: <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html>
 ///
 /// `runtime` is the shared command runtime (TOG-11020; S4 sticky slice was
 /// TOG-10309): `dispatch` spawns detached work. Independent ingress drives
