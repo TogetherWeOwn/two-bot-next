@@ -22,6 +22,7 @@ futures-util = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
+time = { workspace = true }
 axum = { workspace = true }
 # Sole rustls crypto provider (ring): twilight's Shard build panics without
 # exactly one provider feature enabled. Declared here (not on a lib) so the
@@ -36,7 +37,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
+twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
 [dev-dependencies]
+two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }

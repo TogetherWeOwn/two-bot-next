@@ -55,11 +55,20 @@ impl TestDb {
             .await
             .expect("isolated schema");
         // sqlx's to_url_lossy does NOT serialize options. Explicitly put the
-        // search_path in the URL so the separate binary migrates only our schema.
+        // search_path in the URL so the harness migration bootstrap and the
+        // child binary both stay inside our schema.
         let mut url = options.to_url_lossy();
         url.query_pairs_mut()
             .append_pair("options[search_path]", &schema);
         let child_url = url.to_string();
+        // The gateway binary is DML-only and never migrates: the harness
+        // performs the operator's migration step before spawning the child,
+        // exactly like the documented production bootstrap.
+        two_bot_cutover::connect(&child_url, 1, false)
+            .await
+            .expect("operator-equivalent migration bootstrap")
+            .close()
+            .await;
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .acquire_timeout(STEP)
@@ -80,13 +89,20 @@ impl TestDb {
 
     async fn close(self) {
         self.pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
-        )))
-        .execute(&self.admin)
-        .await
-        .expect("drop only our generated schema");
+        // Website jobs apply the companion contract schema (`<schema>_web_v1`)
+        // on first tick; drop both generated schemas so no companion schema
+        // or helper functions leak. Companion may not exist if jobs never fired.
+        for schema in [&self.schema, &format!("{}_web_v1", self.schema)] {
+            assert!(schema
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE"
+            )))
+            .execute(&self.admin)
+            .await
+            .expect("drop only our generated schemas");
+        }
         self.admin.close().await;
     }
 }
@@ -179,7 +195,9 @@ struct MockDiscord {
     api: String,
     auth: mpsc::Receiver<Value>,
     release: mpsc::Sender<()>,
+    rest_requests: Arc<Mutex<Vec<String>>>,
     task: JoinHandle<()>,
+    rest_task: JoinHandle<()>,
 }
 
 impl MockDiscord {
@@ -187,7 +205,12 @@ impl MockDiscord {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("ws://{addr}");
-        let api = format!("http://{addr}/api/v10");
+        // Dedicated REST socket: the binary's website jobs share DISCORD_API_BASE,
+        // and a job request queued on the gateway listener would consume a boot
+        // accept slot and break resume. No `/api/v10` suffix — the executor
+        // appends `/api/v{version}/` to the origin itself.
+        let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
         let (release, mut gates) = mpsc::channel(4);
         let resume_url = url.clone();
@@ -246,12 +269,19 @@ impl MockDiscord {
                 }
             }
         });
+        // Dedicated REST double: answers the website jobs' paced reads with
+        // valid payloads and records arrivals so the test can prove a job
+        // tick happened during the first boot before restart/resume.
+        let rest_requests: Arc<Mutex<Vec<String>>> = Arc::default();
+        let rest_task = tokio::spawn(serve_rest(rest_listener, rest_requests.clone()));
         Self {
             url,
             api,
             auth,
             release,
+            rest_requests,
             task,
+            rest_task,
         }
     }
 
@@ -260,6 +290,66 @@ impl MockDiscord {
             .await
             .expect("authentication deadline")
             .expect("authentication packet")
+    }
+}
+
+/// Dedicated REST double on its own socket: answers the binary's paced
+/// website-job reads and records every arrival. The gateway listener must
+/// never see a plain-HTTP connection — one queued job tick consumed its
+/// second accept slot and broke resume (exact-head CI: `Upgrade(
+/// MissingHeader("Upgrade"))` at accept, then `authentication packet`).
+async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
+        let recorded = recorded.clone();
+        tokio::spawn(async move {
+            let mut chunk = [0u8; 4096];
+            let mut head = Vec::new();
+            loop {
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&chunk[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if head.len() > 64 * 1024 {
+                    return;
+                }
+            }
+            let request_line = String::from_utf8_lossy(&head)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_owned();
+            recorded.lock().await.push(path.clone());
+            // The fixture grounds no raid windows, so only the events mirror
+            // reads; anything else fails closed without touching the gateway.
+            let (status, body): (&str, &[u8]) = if path.contains("scheduled-events") {
+                ("200 OK", b"[]")
+            } else {
+                (
+                    "404 Not Found",
+                    b"{\"message\":\"alive mock: unknown route\"}",
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        });
     }
 }
 
@@ -337,7 +427,8 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         assert!(before.contains("\"gateway\",\"starting\""));
         discord.release.send(()).await.unwrap(); // Health precedes HELLO.
         let auth = discord.authentication().await;
-        // The binary itself has now finished migration and checkpoint loading.
+        // The DML-only binary has now finished checkpoint loading against the
+        // harness-migrated schema.
         assert_eq!(
             db.store()
                 .load()
@@ -365,6 +456,30 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         checkpoint(db, if boot == 0 { 2 } else { 3 }).await;
         let ready = wait_http(bot, addr, "/readyz", 200).await;
         assert!(ready.contains("\"gateway\",\"ready\""));
+        if boot == 0 {
+            // Deterministic website-job coverage: the events mirror must tick
+            // on its own REST socket during the first boot, never the gateway
+            // listener. Jitter is bounded by min(cadence, 5s); STEP covers it.
+            let ticked = timeout(STEP, async {
+                loop {
+                    if discord
+                        .rest_requests
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|path| path.contains("scheduled-events"))
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                ticked.is_ok(),
+                "events job never hit REST during first boot"
+            );
+        }
         sleep(Duration::from_millis(100)).await;
         bot.assert_alive();
         bot.terminate().await;
@@ -421,7 +536,9 @@ async fn real_binary_is_alive_and_resumes_after_sigterm() {
         bot.cleanup().await;
     }
     discord.task.abort();
+    discord.rest_task.abort();
     let _ = discord.task.await;
+    let _ = discord.rest_task.await;
     db.close().await;
     match result {
         Ok(Ok(())) => eprintln!("real-binary lifecycle PASS in {:?}", started.elapsed()),
