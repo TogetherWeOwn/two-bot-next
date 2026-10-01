@@ -5,7 +5,7 @@ Only allowlisted provenance is persisted/printed. API configurations and error
 bodies can contain secrets: never print them, including in exception messages.
 """
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime
 import json
 import os
 from pathlib import Path
