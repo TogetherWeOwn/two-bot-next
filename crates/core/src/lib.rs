@@ -48,6 +48,7 @@ pub mod inactivity_store;
 #[cfg(feature = "db")]
 pub mod internal_action_store;
 pub mod internal_actions;
+pub mod internal_settings;
 pub mod invites;
 pub mod leveling;
 #[cfg(feature = "db")]
@@ -76,6 +77,7 @@ pub use secret::Secret;
 pub mod self_roles;
 pub mod settings;
 pub mod sticky;
+pub mod tickets;
 pub mod voice;
 pub mod voice_config;
 pub mod voice_ownership;
@@ -220,9 +222,9 @@ pub use onboarding_store::{
 };
 pub use presence::{
     bot_floor_due, daily_peaks, decide_probe_cycle, evaluate_trigger, latest_bot_floor,
-    sanitize_presence_count, DailyPeak, PresenceReading, ProbeDecision, TriggerOptions,
-    TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS, PRESENCE_PROBE_INTERVAL_MS,
-    REOPEN_PEAK_THRESHOLD,
+    sanitize_presence_count, BotFloorScan, DailyPeak, PresenceReading, ProbeDecision,
+    TriggerOptions, TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS,
+    PRESENCE_PROBE_INTERVAL_MS, REOPEN_PEAK_THRESHOLD,
 };
 pub use raid::{
     count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,

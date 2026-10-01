@@ -140,7 +140,7 @@ struct Hello {
 /// Bound the entire SQL operation (pool acquire through COMMIT), not each query.
 /// Twilight only drives heartbeats while polled, so use at most a quarter of
 /// HELLO's interval and fail closed instead of waiting through missed heartbeats.
-/// Source: https://docs.rs/tokio/1/tokio/time/fn.timeout.html
+/// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
     deadline: std::time::Duration,
@@ -163,7 +163,7 @@ async fn checkpoint_io<T>(
 
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
-/// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
+/// fallback. Source: <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html>
 ///
 /// `runtime` is the shared command runtime (TOG-11020; S4 sticky slice was
 /// TOG-10309): `dispatch` spawns detached work so this loop never awaits a
@@ -175,9 +175,23 @@ pub async fn run_shard(
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store, runtime.as_ref()).await;
+    let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
+    let result = tokio::select! {
+        biased;
+        _ = async {
+            match shutdown {
+                Some(receiver) => crate::server::shutdown_requested(receiver).await,
+                None => std::future::pending().await,
+            }
+        } => Ok(()),
+        result = run_loop(&mut shard, &pipeline, &state, &store, runtime.as_ref()) => result,
+    };
     *state.write().await = GatewayState::Armed;
+    if let Some(tickets) = tickets {
+        tickets.shutdown().await;
+    }
     result
 }
 
