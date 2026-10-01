@@ -227,12 +227,14 @@ async fn print_backup_help_and_exit() -> ! {
 fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static str> {
     let token = config
         .discord_token
-        .as_deref()
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
         .filter(|token| !token.is_empty())
         .ok_or("DISCORD_TOKEN")?;
     let url = config
         .database_url
-        .as_deref()
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
         .filter(|url| !url.is_empty())
         .ok_or("DATABASE_URL")?;
     let guild_id = config.guild_id.filter(|id| *id != 0).ok_or("GUILD_ID")?;
