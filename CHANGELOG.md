@@ -19,8 +19,12 @@
   interrupted remote send. Add isolated Postgres/mock REST regressions for
   partial/ambiguous failures, compensation recovery, stale in-flight repair,
   selected/empty targets, expiry rollback and unresolved settlement refusal.
-  Gateway registration remains disabled until shared handler gates/wiring,
-  unresolved-work continuation and the runtime follow-up are complete.
+  Add injectable shared component/reaction dispatch with source and input-type
+  validation, ephemeral defer-before-admission and final-settlement-only success
+  replies. Add fenced dry-run audits without role mutations or simulated target
+  publication, plus input and orchestration regressions. Production boot remains
+  disabled until approved staging configuration, unresolved-work continuation
+  and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

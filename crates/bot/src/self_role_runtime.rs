@@ -615,6 +615,55 @@ impl SelfRoleRuntime {
         Ok(outcome)
     }
 
+    /// Audit a simulation without executing or committing the proposed target.
+    /// A recovered mutation must never be disguised as a fresh dry run.
+    pub async fn settle_dry_run(
+        &self,
+        prepared: &mut PreparedSelfRole,
+        panel: &SelfRolePanel,
+    ) -> Result<(), RuntimeError> {
+        if prepared.audit.guild_id != self.guild_id
+            || prepared.audit.panel_id != panel.id
+            || prepared.audit.source_id != panel.message_id
+            || !prepared.event.intent_initialized
+            || (panel.exclusive != prepared.panel.is_some())
+            || prepared.event.compensating
+            || prepared.audit.effects != AuditEffects::default()
+        {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        if prepared.event.exchange_pending {
+            return Err(RuntimeError::PendingExchange);
+        }
+        if !prepared.owns().await? {
+            return Err(RuntimeError::Stale);
+        }
+        prepared.audit.outcome = SettledOutcome::Rejected;
+        prepared.audit.code = Some("dry_run".into());
+        store_io(
+            self.store
+                .finish_owned_audit(&prepared.audit, &prepared.event),
+        )
+        .await?;
+        // Keep the last actual committed target, not the simulated intention.
+        if let Some(lane) = &prepared.panel {
+            let _ = store_io(self.store.release_panel_claim(lane)).await;
+        }
+        prepared._event_keeper.0.abort();
+        prepared._panel_keeper.take();
+        Ok(())
+    }
+
+    /// Stop this owner without settling unresolved work. Fenced lane release
+    /// cannot retire a different worker; the processing audit remains durable.
+    pub async fn park(&self, prepared: &mut PreparedSelfRole) {
+        prepared._event_keeper.0.abort();
+        prepared._panel_keeper.take();
+        if let Some(lane) = &prepared.panel {
+            let _ = store_io(self.store.release_panel_claim(lane)).await;
+        }
+    }
+
     /// A stale worker may repair ONLY the last committed target under a new
     /// maintenance lane. Never restore its obsolete immutable before snapshot,
     /// reinterpret an uncommitted null as empty, or rewrite the winner's target.

@@ -29,12 +29,14 @@ use std::sync::{
     Arc,
 };
 
+use crate::self_role_handlers::SelfRoleService;
 use sqlx::{Pool, Postgres};
 use tracing::warn;
 use twilight_gateway::Event;
 use twilight_model::{
     application::interaction::{application_command::CommandOptionValue, Interaction},
     channel::message::{Message, MessageFlags},
+    gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
@@ -50,8 +52,8 @@ use two_bot_core::{
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
-    FeatureGates, HandlerId, InteractionHandler, InteractionRouter, ModerationGates, RouterGates,
-    SlashOutcome, SurfaceFlags,
+    ComponentHandler, ComponentOutcome, FeatureGates, HandlerId, InteractionHandler,
+    InteractionRouter, ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
     publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
@@ -104,6 +106,8 @@ pub struct CommandRuntime {
     pool: Pool<Postgres>,
     executor: ActionExecutor,
     router: InteractionRouter,
+    /// Shared self-role surface; production boot stays parked pending acceptance.
+    self_roles: Option<Arc<SelfRoleService>>,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
     /// `TWO_AUTOMATIONS=1`: fast-path gate for the message hook (the router
@@ -167,6 +171,7 @@ impl CommandRuntime {
             pool,
             executor,
             router,
+            self_roles: None,
             guild_id,
             automations: features.automations,
             registry_synced: tokio::sync::Mutex::new(false),
@@ -188,11 +193,28 @@ impl CommandRuntime {
             pool,
             executor,
             router,
+            self_roles: None,
             guild_id,
             automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_self_roles(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        router: InteractionRouter,
+        guild_id: u64,
+        automations: bool,
+        service: Arc<SelfRoleService>,
+    ) -> Arc<Self> {
+        let mut runtime = Self::new(pool, executor, router, guild_id, automations);
+        Arc::get_mut(&mut runtime)
+            .expect("new runtime is unshared")
+            .self_roles = Some(service);
+        runtime
     }
 
     /// Detached dispatch for one gateway event. Clones the payload and spawns
@@ -219,6 +241,8 @@ impl CommandRuntime {
                     runtime.on_interaction(&interaction).await;
                 }));
             }
+            Event::ReactionAdd(reaction) => self.dispatch_self_role_reaction(&reaction.0, false),
+            Event::ReactionRemove(reaction) => self.dispatch_self_role_reaction(&reaction.0, true),
             Event::Ready(ready) => {
                 let runtime = Arc::clone(self);
                 let application_id = ready.application.id.get();
@@ -234,6 +258,33 @@ impl CommandRuntime {
             }
             _ => {}
         }
+    }
+
+    fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) {
+        let Some(service) = self.self_roles.as_ref().cloned() else {
+            return;
+        };
+        let Some(input) = service.reaction_input(reaction, remove) else {
+            return;
+        };
+        drop(tokio::spawn(async move {
+            let _ = service.handle(&input).await;
+        }));
+    }
+
+    async fn self_role_component(&self, interaction: &Interaction) {
+        let Some(service) = &self.self_roles else {
+            return;
+        };
+        let Some(input) = service.component_input(interaction) else {
+            return;
+        };
+        if !self.defer(interaction, "self-role").await {
+            return;
+        }
+        let result = service.handle(&input).await;
+        self.finish(interaction, result.reply(input.panel.color))
+            .await;
     }
 
     /// Publish the ONE complete merged registry (legacy `CommandRegistry::sync`
@@ -277,15 +328,24 @@ impl CommandRuntime {
         }
     }
 
-    /// Route all slash commands through the shared router. Refusals get the
-    /// existing ephemeral text; accepted builtins without a wired slice get
-    /// an unavailable reply. Only the five implemented names defer and run
-    /// their slice. Router Ignore (unknown names/guild fence) stays silent.
+    /// Route interactions through the shared router. An injected self-role
+    /// service handles only its owned component surface. Slash refusals keep
+    /// their ephemeral text; unwired builtins get an unavailable reply. The
+    /// five implemented command names defer before work. Router Ignore stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
-        let RoutedInteraction::Slash { name, outcome } =
-            route_interaction(&self.router, interaction, None)
-        else {
-            return;
+        let (name, outcome) = match route_interaction(&self.router, interaction, None) {
+            RoutedInteraction::Component {
+                outcome:
+                    ComponentOutcome::Handled {
+                        handler: ComponentHandler::SelfRole,
+                    },
+                ..
+            } => {
+                self.self_role_component(interaction).await;
+                return;
+            }
+            RoutedInteraction::Slash { name, outcome } => (name, outcome),
+            _ => return,
         };
         if let Some(response) = response_for_slash(&outcome) {
             self.answer(interaction, response).await;
@@ -307,22 +367,7 @@ impl CommandRuntime {
         }
         // Acknowledge before any database wait or Discord cleanup. If the
         // acknowledgement fails, do not mutate state without a reply path.
-        if let Err(err) = self
-            .executor
-            .answer_interaction(
-                interaction.id.get(),
-                &interaction.token,
-                &InteractionResponse {
-                    kind: InteractionResponseType::DeferredChannelMessageWithSource,
-                    data: Some(InteractionResponseData {
-                        flags: Some(MessageFlags::EPHEMERAL),
-                        ..Default::default()
-                    }),
-                },
-            )
-            .await
-        {
-            warn!(interaction_id = %interaction.id.get(), command = %name, error = %err, "command defer failed");
+        if !self.defer(interaction, &name).await {
             return;
         }
         match name.as_str() {
@@ -751,6 +796,30 @@ impl CommandRuntime {
 
     /// Answer an interaction through the shared executor. The token never
     /// appears in logs — only the interaction id and error.
+    async fn defer(&self, interaction: &Interaction, command: &str) -> bool {
+        match self
+            .executor
+            .answer_interaction(
+                interaction.id.get(),
+                &interaction.token,
+                &InteractionResponse {
+                    kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                    data: Some(InteractionResponseData {
+                        flags: Some(MessageFlags::EPHEMERAL),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+        {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(interaction_id = %interaction.id.get(), command, error = %err, "command defer failed");
+                false
+            }
+        }
+    }
+
     async fn answer(&self, interaction: &Interaction, response: InteractionResponse) {
         if let Err(err) = self
             .executor

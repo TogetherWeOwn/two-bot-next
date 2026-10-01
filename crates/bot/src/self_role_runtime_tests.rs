@@ -204,10 +204,13 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    shared_component_orchestration(pool).await?;
+    dry_run_audits_without_mutation_or_target_publication(pool).await?;
     execution_and_compensation(pool).await?;
     stale_inflight_repairs_committed_target(pool).await?;
     interrupted_exchange_cannot_settle(pool).await?;
     unknown_target_is_not_empty(pool).await?;
+    dry_run_refuses_recovered_mutation(pool).await?;
     recovery_and_renewal(pool).await?;
     empty_select_recovery(pool).await?;
     reaction_partial_and_duplicate(pool).await?;
@@ -240,6 +243,246 @@ fn effect_snapshots_do_not_invent_unattempted_changes_or_erase_history() {
     // Differences on other roles do not become this event's observed effects.
     observe_effects(&mut effects, &[OTHER.into()], &held);
     assert!(!effects.added_role_ids.contains(&OLD_ROLE.into()));
+}
+
+async fn shared_component_orchestration(pool: &PgPool) -> TestResult {
+    use crate::{
+        command_runtime::CommandRuntime,
+        self_role_handlers::{tests::component, SelfRoleService},
+    };
+    use two_bot_core::self_roles::SelfRoleGates;
+    use two_bot_core::{InteractionRouter, RouterGates};
+
+    for (i, (enabled, dry_run, defer_status)) in [
+        (true, false, 204),
+        (true, true, 204),
+        (true, false, 403),
+        (false, false, 204),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut script = vec![];
+        if enabled {
+            script.push(ScriptedResponse::status(defer_status));
+            if defer_status == 204 {
+                script.extend(snapshot(&[OLD_ROLE, OTHER]));
+                if !dry_run {
+                    script.extend(snapshot(&[OLD_ROLE, OTHER]));
+                    script.push(ScriptedResponse::status(204));
+                    script.extend(snapshot(&[OTHER]));
+                    script.push(ScriptedResponse::status(204));
+                    script.extend(snapshot(&[NEW_ROLE, OTHER]));
+                    script.extend(snapshot(&[NEW_ROLE, OTHER]));
+                }
+                script.push(ScriptedResponse::json(200, json!({})));
+                // Re-delivery uses the same interaction id and never fetches or mutates.
+                script.push(ScriptedResponse::status(204));
+                script.push(ScriptedResponse::json(200, json!({})));
+            }
+        }
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let executor = feature.executor.clone();
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("handler-{i}");
+        let service = Arc::new(
+            SelfRoleService::new(
+                feature,
+                SelfRoleGates {
+                    panels: vec![panel.clone()],
+                    dry_run,
+                },
+                &[GUILD.to_owned()].into_iter().collect(),
+            )
+            .unwrap(),
+        );
+        let router = InteractionRouter::new(RouterGates {
+            configured_guild: Some(GUILD.parse()?),
+            scorecard: false,
+            automations: false,
+            announcements: false,
+            moderation: false,
+            tickets: false,
+            self_roles: enabled,
+            onboarding_picker: false,
+            session_picker: false,
+        });
+        let command = CommandRuntime::new_with_self_roles(
+            pool.clone(),
+            executor,
+            router,
+            GUILD.parse()?,
+            false,
+            service,
+        );
+        let id = 100_000_000_000_001_000 + i as u64;
+        let interaction = component(&panel, id, vec!["new".into()]);
+        command.on_interaction(&interaction).await;
+        let row: Option<(String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT outcome,code,exchange_pending FROM self_role_audit WHERE event_id=$1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?;
+        if enabled && defer_status == 204 {
+            let row = row.unwrap();
+            assert_eq!(row.0, if dry_run { "rejected" } else { "switched" });
+            assert_eq!(
+                row.1.as_deref(),
+                if dry_run { Some("dry_run") } else { None }
+            );
+            assert!(!row.2);
+            command.on_interaction(&interaction).await;
+            let calls = mock.requests();
+            let ack: serde_json::Value = serde_json::from_slice(&calls[0].body)?;
+            assert_eq!(ack["type"], 5);
+            assert_eq!(ack["data"]["flags"], 64);
+            let mutations: Vec<_> = calls
+                .iter()
+                .filter(|call| call.method == "PUT" || call.method == "DELETE")
+                .collect();
+            if dry_run {
+                assert!(mutations.is_empty());
+            } else {
+                assert_eq!(mutations.len(), 2);
+                assert_eq!(mutations[0].method, "DELETE");
+                assert_eq!(mutations[1].method, "PUT");
+            }
+            let reply: serde_json::Value = serde_json::from_slice(&calls.last().unwrap().body)?;
+            assert!(reply["content"].as_str().unwrap().contains("already"));
+        } else {
+            assert!(row.is_none());
+            assert_eq!(mock.requests().len(), usize::from(enabled));
+        }
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn dry_run_audits_without_mutation_or_target_publication(pool: &PgPool) -> TestResult {
+    for (i, (mode, selection)) in [
+        (
+            PanelMode::Button,
+            Selection::Button {
+                option_key: "new".into(),
+            },
+        ),
+        (
+            PanelMode::Select,
+            Selection::Select {
+                option_keys: vec!["new".into()],
+            },
+        ),
+        (
+            PanelMode::Select,
+            Selection::Select {
+                option_keys: vec![],
+            },
+        ),
+        (
+            PanelMode::Reaction,
+            Selection::Reaction {
+                option_key: "new".into(),
+                remove: false,
+            },
+        ),
+        (
+            PanelMode::Reaction,
+            Selection::Reaction {
+                option_key: "old".into(),
+                remove: true,
+            },
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut script = vec![];
+        if mode == PanelMode::Reaction {
+            script.push(ScriptedResponse::json(
+                200,
+                json!({"id":MESSAGE,"channel_id":CHANNEL}),
+            ));
+        }
+        script.extend(snapshot(&[OLD_ROLE, OTHER]));
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let runtime = runtime(pool, &clock, &mock);
+        let mut panel = panel(mode);
+        panel.id = format!("dry-run-{i}");
+        let request = request(&format!("dry-run-{i}"), selection);
+        let mut prepared = ready(runtime.prepare(&request, &panel).await.unwrap());
+        let desired = prepared.event.desired_role_ids.clone();
+        runtime.settle_dry_run(&mut prepared, &panel).await.unwrap();
+        let row: (String, String, String, String, String, String, bool) = sqlx::query_as(
+            "SELECT a.outcome,a.code,a.added_role_ids,a.attempted_added_role_ids,
+             a.desired_role_ids,p.latest_option_key,p.target_committed
+             FROM self_role_audit a JOIN self_role_panel_claims p
+             ON a.guild_id=p.guild_id AND a.member_id=p.member_id AND a.panel_id=p.panel_id
+             WHERE a.event_id=$1",
+        )
+        .bind(&request.event_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(row.0, "rejected");
+        assert_eq!(row.1, "dry_run");
+        assert_eq!(row.2, "[]");
+        assert_eq!(row.3, "[]");
+        assert_eq!(serde_json::from_str::<Vec<String>>(&row.4)?, desired);
+        assert_eq!(row.5, "old");
+        assert!(row.6);
+        assert!(matches!(
+            runtime.prepare(&request, &panel).await.unwrap(),
+            Admission::Duplicate
+        ));
+        assert!(mock.requests().iter().all(|call| call.method == "GET"));
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn dry_run_refuses_recovered_mutation(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mut script = snapshot(&[OLD_ROLE, OTHER]);
+    script.extend(snapshot(&[OLD_ROLE, OTHER]));
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let runtime = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Button);
+    panel.id = "dry-run-recovery".into();
+    let request = request(
+        "dry-run-recovery",
+        Selection::Button {
+            option_key: "new".into(),
+        },
+    );
+    let prepared = ready(runtime.prepare(&request, &panel).await.unwrap());
+    let mut effects = AuditEffects::default();
+    mark_attempt(&mut effects, NEW_ROLE, true);
+    assert!(
+        runtime
+            .store
+            .checkpoint_exchange(&prepared.event, &effects, false, Some(true))
+            .await?
+    );
+    drop(prepared);
+    clock.store(NOW + 301, Ordering::SeqCst);
+    let mut recovered = ready(runtime.prepare(&request, &panel).await.unwrap());
+    assert!(runtime
+        .settle_dry_run(&mut recovered, &panel)
+        .await
+        .is_err());
+    let row: (String, bool, String) = sqlx::query_as(
+        "SELECT outcome,exchange_pending,unresolved_added_role_ids FROM self_role_audit WHERE event_id=$1",
+    ).bind(&request.event_id).fetch_one(pool).await?;
+    assert_eq!(row.0, "processing");
+    assert!(row.1);
+    assert_eq!(serde_json::from_str::<Vec<String>>(&row.2)?, [NEW_ROLE]);
+    assert!(mock.requests().iter().all(|call| call.method == "GET"));
+    drop(recovered);
+    mock.shutdown().await;
+    Ok(())
 }
 
 async fn execution_and_compensation(pool: &PgPool) -> TestResult {

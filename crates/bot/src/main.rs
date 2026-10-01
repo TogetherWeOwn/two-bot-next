@@ -25,8 +25,10 @@ mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
 mod server;
-// TOG-10292 checkpoint: compile/test the claim service, but do not register
-// controls until execution, compensation and stale-target repair are complete.
+// TOG-10292: shared dispatch is injectable for acceptance, but boot keeps the
+// service parked until unresolved-work continuation and verification are complete.
+#[allow(dead_code)]
+mod self_role_handlers;
 #[allow(dead_code)]
 mod self_role_runtime;
 mod website_jobs;

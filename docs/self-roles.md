@@ -195,12 +195,38 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   exchange recovery, settlement of success/compensation, event-expiry rollback
   with a still-live panel, and REST timeout completion evidence.
 
-This checkpoint does **not** register handlers or enable live role mutations.
-Shared handler/reaction wiring, staging/dry-run gates, and end-to-end acceptance
-remain on the same follow-up. Interrupted remote work stays explicitly unresolved;
-its continuation/reconciliation lifecycle must be wired before activation, not
-silently cleared by a timer or member snapshot. Added Rust regressions remain
-unverified locally while the mandated bounded Cargo pool is unavailable.
+The handler checkpoint adds an **injectable**, still boot-disabled service:
+
+- `CommandRuntime` uses the existing shared self-role component outcome and
+  reaction add/remove gateway hooks, not another router or HTTP client. Input
+  validation requires the configured guild/channel/message and matching actual
+  button/text-select type. Modal input, unknown options, duplicate selections,
+  excess exclusive selections and bot identities fail closed. Empty selects are
+  valid. Reaction-remove partials and deleted custom emoji names use the shared
+  message/member/policy reads and custom emoji ID respectively.
+- Component work defers ephemerally through `ActionExecutor` before admission.
+  Failed acknowledgement performs no database admission or role mutation.
+  Replies distinguish final settlement, simulation, duplicate and unresolved
+  work; provisional execution or stale repair never produces a success reply.
+- `settle_dry_run` writes a live-event-fenced `rejected` audit with code `dry_run`
+  and immutable proposed intent, without role mutations or publishing a simulated
+  panel target. Recovered attempted effects, compensation and pending exchanges
+  cannot be relabeled as fresh simulations. Unresolved owners stop their keepers
+  and release only their own fenced lane, retaining the processing audit.
+- The service constructor requires a nonempty catalogue and its guild in an
+  injected approved staging allowlist. This is not process-level rollout wiring:
+  `CommandRuntime::from_env` still injects no service, and default router surface
+  flags remain disabled. Approved staging configuration and boot construction
+  are unfinished.
+- Added unit input tests and isolated mock/Postgres orchestration regressions
+  cover shared select replacement, duplicate delivery, dry-run, failed defer,
+  disabled routing and recovered-mutation dry-run refusal. These are source
+  coverage, not passed acceptance; reaction gateway acceptance remains unfinished.
+
+Interrupted remote work stays explicitly unresolved; its durable continuation/
+reconciliation lifecycle must be wired before activation, not silently cleared
+by a timer or member snapshot. Added Rust regressions remain unverified locally
+while the mandated bounded Cargo pool is unavailable.
 The REST regression
 target is `two-bot-discord --test self_roles_rest`; admission coverage is
 `two-bot self_role_runtime:: -- --include-ignored --test-threads=1`, opted in by
