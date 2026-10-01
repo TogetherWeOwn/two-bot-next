@@ -85,6 +85,7 @@
   These source fixtures remain uncompiled. Production boot remains disabled until
   approved shared boot configuration and compiled continuation acceptance are
   complete.
+- Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and
@@ -103,6 +104,8 @@
 
 ### Fixed
 
+- Fold the self-role runtime CI command so its Rust module selector is literal
+  text, not an invalid YAML mapping; retain the isolated mocked acceptance opt-in.
 - Answer published but unwired commands ephemerally instead of timing out, preserving the existing router refusals and complete registry. Synchronize the registry on resumed process startup as well as Ready, without blocking gateway polling.
 - Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
 - Grant the least-privilege runtime role CRUD on the self-role audit and panel-claim relations (migration 0200), cover 0200 in the role-matrix tests, and prove runtime claim access with continued web-reader denial.
