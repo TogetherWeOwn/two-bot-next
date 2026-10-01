@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "migrations": {
+    "crates/cutover/migrations/0001_funnel.sql": {
+      "sha256": "45d9bc7e665ac79f43e4e43ac6a87fcbeb877c5396fb4dcb5ca3d81a738d5158",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0002_leveling.sql": {
+      "sha256": "e257889e79beb83896f686fecd2116ca653ce0ef9392c622618f720ccd9b712c",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0120_channel_moderation.sql": {
+      "sha256": "a1e8df92e0c51e14447ff74dc6d08cb45b871cb53da2b40d7949472762637838",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0121_channel_claim_generation.sql": {
+      "sha256": "5460bb29b9cab32ba3dc8cafddca6433b11c3576266b0c663e862003a88f13f5",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0122_channel_lockdown_generation.sql": {
+      "sha256": "0b326330725f301066f24f3c5ffaadb7db020e326ac89095afe28d2a968fe766",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0150_sticky_messages.sql": {
+      "sha256": "17d867f772c9f37325c50be959d9f184958e1a632eb47a000ac9ec13b9c30f57",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0160_rsvp.sql": {
+      "sha256": "eabae51ee674b66dd2fb16d53b6e1d8c082905600588cea71e532d5dd7a3a02d",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0170_lfg.sql": {
+      "sha256": "fe10105a9532b6766ebff3f02d4dae8d3bc8ed3cc142cd7923c59fd8cae65462",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0180_feeds.sql": {
+      "sha256": "36ce73367633190a10dd41321ad4e4ca4abe6fff5572b06bbb187a3f8cf97331",
+      "justification": "Baseline feeds migration merged in PR #47 before this guard; no SQL changes."
+    },
+    "crates/cutover/migrations/0190_onboarding.sql": {
+      "sha256": "dc3ead788a282166adf62fd5aa08366db5c4848f1fc633c420cc07a116e4ee9d",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0300_website_contract.sql": {
+      "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0310_presence_probe.sql": {
+      "sha256": "6e6b53ec9c08af659a2596fb9c233b67b08a7a00ef17fafcb90c03222299e773",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0311_community_scorecard.sql": {
+      "sha256": "cae5eaf03794586465d2a1bbb25138cd5009ee0acfc8a01976c506e5a78a904c",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0320_gateway_sessions.sql": {
+      "sha256": "f6f39298deee84821f408c7b851b507debef7a22ef02ef3781528cd2b5111c83",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0330_guild_settings.sql": {
+      "sha256": "9addc4962a1a69062bb8886e7c6f33596c0a1cc7583a965c360376819b546ed0",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0340_operational_audit.sql": {
+      "sha256": "045f005f212d9e38bc51c2c5b49ff541fff887251949a4dbbf34d4ceb574cac8",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0350_internal_actions.sql": {
+      "sha256": "c291e8683b2afdeb23a985953a2afeba86519c06ec1deb8c6d2c5dd56d2f22bd",
+      "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
+      "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
+      "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."
+    }
+  }
+}
