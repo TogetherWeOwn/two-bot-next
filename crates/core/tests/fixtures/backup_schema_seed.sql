@@ -57,6 +57,8 @@ INSERT INTO moderation_idempotency
 VALUES ('100000000000000001', 'backup:moderation:key', 'lockdown', 'backup-request-hash',
         'completed', 'ok', '{"channelId":"100000000000000003"}',
         '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:01.000Z', 'backup-moderation-claim');
+INSERT INTO moderation_channel_executions (channel_id, guild_id, idempotency_key, claim_token)
+VALUES ('100000000000000003', '100000000000000001', 'backup:moderation:key', 'backup-channel-claim');
 
 INSERT INTO sticky_messages
     (guild_id, channel_id, body, debounce_seconds, enabled, last_message_id, last_posted_at,

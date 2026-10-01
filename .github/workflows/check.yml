@@ -175,6 +175,14 @@ jobs:
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
+      - name: Docker dependency-layer manifests (offline)
+        run: python3 scripts/check-docker-manifests.py
+
+      - name: Store Postgres integration (isolated CI schemas)
+        env:
+          TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
+        run: cargo test -p two-bot-store --locked --test postgres -- --ignored
+
       - name: legacy copy acceptance (two owned databases on CI service only)
         run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
 
@@ -186,9 +194,7 @@ jobs:
       - name: channel moderation store clippy
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
 
-      # TWO_TEST_DATABASE_URL is scoped to this step only: the workspace suite
-      # above runs exactly as on main (RSVP store tests skip without it), and
-      # only this slice's tests activate their test-container guard here.
+      # Only this slice's tests activate their test-container guard here.
       - name: channel moderation domain and store tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
