@@ -8,7 +8,7 @@
 
 Conventions: `src/…` paths are legacy `two-bot` files. Permissions are Discord permission flags unless noted.
 
-## 1. Slash / prefix commands (31 + dynamic)
+## 1. Slash / prefix commands (30 rows, including dynamic/prefix and one drop)
 
 Registry: `CORE_COMMAND_DATA` (always published) = leveling only; community/rota/automation/announcement/moderation slices merge via `additionalBuiltins` (`src/index.ts:660-666`, `src/discord/commandNames.ts`). All guild-only, DM off.
 
@@ -44,6 +44,56 @@ Registry: `CORE_COMMAND_DATA` (always published) = leveling only; community/rota
 | 28 | `/feed-add` | `kind` req (`rss`/`youtube`/`twitch`), `source` req | `ManageGuild` | **S4** |
 | 29 | `/feed-remove` | `id` req | `ManageGuild` | **S4** |
 | 30 | `/feed-list` | none | `ManageGuild` | **S4** |
+
+Runtime permission contract: `crates/core/src/command_permissions.rs` represents
+all 30 rows (27 retained builtins, the dropped rota command, custom slash commands,
+and prefix triggers). The router checks the invoking interaction's resolved
+`member.permissions`, not bot permissions or command-picker defaults, before
+returning a builtin handler. Missing restricted bits produce an ephemeral refusal
+and a metadata-only `command_permission_denied` tracing audit event (command,
+guild, required/resolved bits; no tokens, options or user text). This is a security
+log, not a claim of durable operational-audit-store or gateway-dispatch wiring.
+Member-target moderation retains its self-target, protected-role/owner/bot and
+hierarchy checks in `assert_moderation_allowed`. Dynamic/prefix feature gates and
+the dropped rota disposition are unchanged. Tests compare every row with this
+section and all published permission bitfields, including Twilight wire JSON.
+
+## Registry golden exceptions
+
+`crates/core/tests/fixtures/legacy_registry.json` captures the frozen source above,
+with every builtin enabled (including staging-only rota), no DB custom rows, and
+both colliding `attendance` definitions intact. The core router publish set and
+the actual Twilight guild bulk-set JSON are checked against that snapshot.
+
+| Intentional difference | Matrix reference | Exact allowance |
+|---|---|---|
+| `rsvp-attendance` | docs/parity.md §1 #12 / #25 | Rename only the RSVP-totals `attendance` (its option is `event-id`); scorecard keeps `attendance`. No option, choice, description or permission waiver. |
+| `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
+
+These are the complete behavioural exceptions, mirrored by the test allowlist.
+Only equivalent guild-API representation defaults are canonicalized: omitted
+command type = ChatInput (`1`), omitted command options = `[]`, optional
+`required` omitted = `false`, permission gate `null` = omitted, guild-only
+`dm_permission: false` = omitted (the guild endpoint cannot publish global/DM
+commands), and Twilight's server-assigned `version: "1"` placeholder = omitted.
+Non-default values and unknown fields are **not** discarded. Array order,
+option names/types/bounds, choices, descriptions and permission bitfields remain
+strict. Real unlisted drift fails with field paths and legacy/next values; file a
+follow-up instead of changing the fixture or expanding the exceptions to hide it.
+
+Regenerate only from a scratch clone (Node 24, no Discord/DB access):
+
+```sh
+git clone https://github.com/TogetherWeOwn/two-bot.git "$PAPERCLIP_RUN_SCRATCH_DIR/legacy"
+git -C "$PAPERCLIP_RUN_SCRATCH_DIR/legacy" checkout --detach d5d1179348feb9157bcac8c875de9399d4f5c76a
+npm ci --prefix "$PAPERCLIP_RUN_SCRATCH_DIR/legacy" --ignore-scripts --no-audit --no-fund
+node scripts/export-legacy-registry.mjs "$PAPERCLIP_RUN_SCRATCH_DIR/legacy" crates/core/tests/fixtures/legacy_registry.json
+cargo test -p two-bot-core -p two-bot-discord --test registry_golden --locked
+```
+
+The export script calls legacy `mergedCommandData` in `src/index.ts:660–666`
+feature order, then discord.js `ApplicationCommandManager.transformCommand`, the
+same transform used by `guild.commands.set`. It refuses any other legacy SHA.
 
 ## 2. Non-command interactions (buttons / selects / reactions)
 
@@ -170,7 +220,7 @@ Full catalogue: legacy `src/core/settingsCatalog.ts` (~90 keys in `env_only`/`co
 | Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete) | bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist | **S4** (staging gate until soak) |
 | Anti-nuke (default alerts-only; weights kick/ban/webhook=1, channel/role delete=3; quarantine strips dangerous perms below bot hierarchy; join-risk flag-only) | `containment_alert` always logged; `**Join burst**` raid alerts, no DMs/pings | **S4** (staging gate until soak) |
 | Onboarding modes (`legacy` catalog + hub routing / `session` roleless two-pick LIVE / anchor Sunday-Squad one-message) | no-DM, idempotent `onboarding_prompted`, dry-run aware | **S4** |
-| Operator scripts (82 files) | schedule/backfill/migration one-shots → **[TOG-9882](/TOG/issues/TOG-9882)** (MEE6 XP, rewards, history backfill, dedupe, message-milestone scan, join capture); backup/restore/snapshot → [TOG-9881](/TOG/issues/TOG-9881); read-only reports (funnel, gate, attribution, roster, dashboard, scorecard, presence-trend, growth-review, raid-list) → **DROP** as runtime (query Postgres/`web_v1` on demand); staging provision/verify/reset + e2e harness → **DROP** (replaced by mock-discord acceptance + **S6** cutover plan); `reconcile` → **DROP** (absent/broken upstream); guild-config snapshot/restore → [TOG-9881](/TOG/issues/TOG-9881); temp-voice → staging shape-check only, no runtime on legacy `main` (TOG-3471 unmerged) → port the check under **S6**, no runtime row |
+| Operator scripts (82 files) | schedule/backfill/migration one-shots → **[TOG-9882](/TOG/issues/TOG-9882)** (MEE6 XP, rewards, history backfill, dedupe, message-milestone scan, join capture); backup/restore/snapshot → [TOG-9881](/TOG/issues/TOG-9881); read-only reports (funnel, gate, attribution, roster, dashboard, scorecard, presence-trend, growth-review, raid-list) → **DROP** as runtime (query Postgres/`web_v1` on demand); staging provision/verify/reset + e2e harness → **DROP** (replaced by mock-discord acceptance + **S6** cutover plan); `reconcile` → **DROP** (absent/broken upstream); guild-config snapshot/restore → [TOG-9881](/TOG/issues/TOG-9881); temp-voice → staging shape-check only, no runtime on legacy `main` (TOG-3471 unmerged) → port the check under **S6**, no runtime row | **S6**, [TOG-9881](/TOG/issues/TOG-9881), [TOG-9882](/TOG/issues/TOG-9882) (mapped one-shots/shape-check only; runtime drops above) |
 
 ## 9. Drops (not ported, with reason)
 

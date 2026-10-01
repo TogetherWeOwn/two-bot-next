@@ -286,6 +286,54 @@ pub(crate) fn moderation_test_vectors() -> Vec<ModerationTestVector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn property_mac_parse_mint_round_trip_and_reject_tampering(
+            guild in "[0-9]{17,20}",
+            actor in "[0-9]{17,20}",
+            secret in "[a-zA-Z0-9]{1,64}",
+            key in proptest::collection::vec(any::<char>(), 0..64)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            reason in proptest::collection::vec(any::<char>(), 0..128)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            action_index in 0usize..10,
+        ) {
+            let action = ModerationAction::ALL.get(action_index)
+                .map_or(UNBAN_SCHEDULED_ACTION, |a| a.action_name());
+            let wire = moderation_audit_reason(Some(&secret), &guild, &key, action, &actor, &reason);
+            let marker = parse_moderation_audit_reason(Some(&secret), &guild, Some(&wire)).unwrap();
+            prop_assert_eq!(&marker, &ModerationMarker {
+                token: moderation_audit_token(&guild, &key), action: action.to_owned(), actor_id: actor.clone(),
+            });
+            // Reason prose is not MAC-authenticated; only the marker fields are.
+            let marker_only = wire.split("] ").next().unwrap().to_owned() + "]";
+            prop_assert_eq!(parse_moderation_audit_reason(Some(&secret), &guild, Some(&marker_only)), Some(marker));
+            let mut altered = wire.clone();
+            let last_mac_byte = marker_only.len() - 2;
+            let replacement = if altered.as_bytes()[last_mac_byte] == b'0' { "1" } else { "0" };
+            altered.replace_range(last_mac_byte..last_mac_byte + 1, replacement);
+            prop_assert!(parse_moderation_audit_reason(Some(&secret), &guild, Some(&altered)).is_none());
+            let changed_guild = format!("{guild}0");
+            prop_assert!(parse_moderation_audit_reason(Some(&secret), &changed_guild, Some(&wire)).is_none());
+        }
+
+        #[test]
+        fn property_mac_parser_never_panics_on_arbitrary_marker_text(
+            text in proptest::collection::vec(any::<char>(), 0..256)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            let secret = moderation_test_vectors().remove(0).secret;
+            let _ = parse_moderation_audit_reason(Some(&secret), GUILD, Some(&text));
+            let prefixed = format!("{MARKER_PREFIX}{text}] ");
+            let _ = parse_moderation_audit_reason(Some(&secret), GUILD, Some(&prefixed));
+            prop_assert_eq!(moderation_audit_reason(None, GUILD, &text, "moderation.ban", ACTOR, &text), text.clone());
+            prop_assert!(parse_moderation_audit_reason(None, GUILD, Some(&text)).is_none());
+        }
+    }
 
     const GUILD: &str = "123456789012345678";
     const ACTOR: &str = "987654321098765432";

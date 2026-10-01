@@ -31,6 +31,7 @@ url = { workspace = true }
 # Row-by-row dump streaming only (TryStreamExt::try_next); same locked
 # version the bot and discord crates already use.
 futures-util = { workspace = true }
+roxmltree = "=0.21.1"
 
 # Database access lives behind the `db` feature so unit tests for pure
 # domain logic never need a Postgres driver or a live database.
@@ -41,6 +42,9 @@ default = []
 db = ["dep:sqlx"]
 
 [dev-dependencies]
+two-bot-testsupport = { path = "../testsupport", version = "0.2.0" }
+# Pure, bounded properties: no fork/timeout helpers or temporary-file dependency.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 rand = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }

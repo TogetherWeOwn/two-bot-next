@@ -6,12 +6,21 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod backup_cli;
+mod database_roles_cli;
 mod gateway;
+mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod jobs;
 #[cfg(test)]
 mod lifecycle_tests;
+mod metrics_http;
+mod preflight;
 mod server;
+mod sticky_runtime;
+#[cfg(test)]
+mod sticky_runtime_tests;
+mod website_jobs;
 
 use std::sync::Arc;
 
@@ -22,11 +31,15 @@ use two_bot_core::{ComponentStatus, Config};
 use gateway::{
     build_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard, GatewayState,
 };
-use server::serve;
+use website_jobs::serve;
 
 #[tokio::main]
 async fn main() {
     ensure_crypto_provider();
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_args.first().is_some_and(|arg| arg == "preflight") {
+        std::process::exit(preflight::dispatch(&cli_args[1..]).await);
+    }
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot
     // rot behind an HTTP-client upgrade.
@@ -37,7 +50,6 @@ async fn main() {
     // Operator CLI (TOG-9881): backup/restore + sealed guild-config snapshot.
     // No subcommand falls through to the gateway path below. sqlx is linked
     // (core `db` feature) so these paths can open Postgres directly.
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if !cli_args.is_empty() && cli_args[0] != "--help" && cli_args[0] != "-h" {
         let code = backup_cli::dispatch(&cli_args).await;
         // 100 = not a backup subcommand: fall through to serve.
@@ -68,6 +80,27 @@ async fn main() {
     });
 
     let state = Arc::new(RwLock::new(GatewayState::new(&config)));
+    let listener = server::bind(&config.listen_addr)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::error!(error = %err, "container listener failed");
+            std::process::exit(1);
+        });
+    let gateway_url = match std::env::var("DISCORD_GATEWAY_URL") {
+        Ok(url) => Some(url),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::error!("DISCORD_GATEWAY_URL must be valid UTF-8");
+            std::process::exit(1);
+        }
+    };
+    if gateway_url
+        .as_deref()
+        .is_some_and(|url| !gateway::is_loopback_gateway(url))
+    {
+        tracing::error!("DISCORD_GATEWAY_URL must be a loopback mock websocket address");
+        std::process::exit(1);
+    }
 
     let gateway_task = match gateway_prerequisites(&config) {
         Ok((token, url, guild_id)) => {
@@ -76,9 +109,11 @@ async fn main() {
             let state = Arc::clone(&state);
             Some(tokio::spawn(async move {
                 let result: Result<(), sqlx::Error> = async {
+                    // Runtime is DML-only; the operator migrates before startup.
                     let db =
-                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, false)
+                        two_bot_cutover::connect(&url, two_bot_cutover::DB_POOL_MAX_DEFAULT, true)
                             .await?;
+                    metrics_http::register_pool(db.pool().clone());
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
                         db.pool().clone(),
                         guild_id.to_string(),
@@ -86,12 +121,25 @@ async fn main() {
                     );
                     let saved = gateway::load_boot_session(&store).await?;
                     let pipeline = Arc::new(build_pipeline(store.milestones().await?));
-                    let shard = build_shard(token, intents_from_env(), saved.as_ref());
+                    // S4 sticky runtime (TOG-10309): shared router + REST
+                    // executor over the same pool. `None` on bad env gates —
+                    // the shard still boots without the sticky surface.
+                    let sticky = sticky_runtime::StickyRuntime::from_env(
+                        db.pool().clone(),
+                        &token,
+                        guild_id,
+                    );
+                    let shard = build_shard(
+                        token,
+                        intents_from_env(),
+                        saved.as_ref(),
+                        gateway_url.as_deref(),
+                    );
                     info!(
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store).await
+                    run_shard(shard, pipeline, Arc::clone(&state), store, sticky).await
                 }
                 .await;
                 if result.is_err() {
@@ -115,9 +163,10 @@ async fn main() {
         }
     };
 
-    let http = serve(&config.listen_addr, state);
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    let http = serve(&config, listener, state, shutdown.clone());
     let result = match gateway_task {
-        Some(task) => supervise_gateway(task, http).await,
+        Some(task) => supervise_gateway(task, http, shutdown).await,
         None => http.await,
     };
     if let Err(err) = result {
@@ -128,6 +177,7 @@ async fn main() {
 
 /// `--help` covers both the gateway server and the backup CLI.
 async fn print_backup_help_and_exit() -> ! {
+    println!("{}", preflight::USAGE);
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
 }
@@ -158,15 +208,24 @@ fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static 
 async fn supervise_gateway(
     mut task: tokio::task::JoinHandle<Result<(), sqlx::Error>>,
     http: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<()> {
+    tokio::pin!(http);
     tokio::select! {
         biased;
         // Never expose task/SQL errors: they may contain connection secrets.
-        _ = &mut task => Err(std::io::Error::other(
-            "gateway task stopped; container restart required",
-        )),
-        result = http => {
+        _ = &mut task => {
+            // Sticky even if HTTP has not subscribed yet. Keep polling HTTP so
+            // its job supervisor can cancel and join every active action.
+            shutdown.send_replace(true);
+            let _ = http.await;
+            Err(std::io::Error::other(
+                "gateway task stopped; container restart required",
+            ))
+        },
+        result = &mut http => {
             task.abort();
+            let _ = task.await;
             result
         }
     }

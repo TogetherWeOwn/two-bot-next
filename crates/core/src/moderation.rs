@@ -98,23 +98,18 @@ impl ModerationAction {
     /// Discord permission gate (legacy `permissionFor` + builder flags).
     #[must_use]
     pub fn required_permission(self) -> u64 {
-        match self {
-            Self::Ban | Self::TempBan => PERM_BAN_MEMBERS,
-            Self::Kick => PERM_KICK_MEMBERS,
-            Self::Timeout | Self::Warn => PERM_MODERATE_MEMBERS,
-            Self::Purge => PERM_MANAGE_MESSAGES,
-            Self::Slowmode | Self::Lockdown | Self::Unlock => PERM_MANAGE_CHANNELS,
-        }
+        crate::command_permissions::command_permission(self.command_name())
+            .expect("moderation command has a permission row")
+            .required_permissions
     }
 
     /// Member-targeted verbs (legacy `TARGET_ACTIONS`). Channel verbs skip the
     /// target checks entirely in [`assert_moderation_allowed`].
     #[must_use]
     pub fn targets_member(self) -> bool {
-        matches!(
-            self,
-            Self::Ban | Self::TempBan | Self::Kick | Self::Timeout | Self::Warn
-        )
+        crate::command_permissions::command_permission(self.command_name()).is_some_and(|row| {
+            row.policy_hook == Some(crate::command_permissions::PolicyHook::MemberModeration)
+        })
     }
 }
 

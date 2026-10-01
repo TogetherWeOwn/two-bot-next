@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover"]
+members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/testsupport"]
 default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover"]
 
 # One native Rust release strategy versions the whole workspace. The root
@@ -120,5 +120,6 @@ twilight-model = "0.17"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# Job tasks must unwind so the supervisor can isolate a panic in release too.
+panic = "unwind"
 strip = true
