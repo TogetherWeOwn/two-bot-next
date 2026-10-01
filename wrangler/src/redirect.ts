@@ -188,7 +188,9 @@ export function isReservedInternal(path: string): boolean {
   }
   return (
     canonical === RESERVED_METRICS_SLUG ||
-    canonical.startsWith(`${RESERVED_METRICS_SLUG}/`)
+    canonical.startsWith(`${RESERVED_METRICS_SLUG}/`) ||
+    canonical === "internal/ownership" ||
+    canonical.startsWith("internal/ownership/")
   );
 }
 

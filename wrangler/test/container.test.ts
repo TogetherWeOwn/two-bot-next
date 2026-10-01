@@ -8,8 +8,24 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
+import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
+
+const ID = "deployment-A";
+const CONTROL_TOKEN = "synthetic-control-token-not-a-secret-12345";
+const ACTIVE_OWNER = {
+  deploymentId: ID, epoch: 1, phase: "active", actor: "fixture-operator",
+  timestamp: "2026-10-01T00:00:00.000Z", oldEpoch: 0, oldDeploymentId: null,
+};
+const KEEPALIVE = { startedAt: 0, deploymentId: ID, epoch: 1 };
+function probeRequest(input: string, init?: RequestInit): Request {
+  const req = new Request(input, init);
+  req.headers.set(DEPLOYMENT_HEADER, ID);
+  return req;
+}
 
 const WORKER_ENV = {
+  CF_VERSION_METADATA: { id: ID },
+  OWNERSHIP_CONTROL_TOKEN: CONTROL_TOKEN,
   DISCORD_TOKEN: "synthetic-discord-token",
   DATABASE_URL: "synthetic-database-value",
   GUILD_ID: "111222333444555666",
@@ -31,7 +47,9 @@ type StartConfig = {
   labels?: Record<string, string>;
 };
 
-async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV) {
+async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: {
+  owner?: unknown; readError?: boolean; stopError?: boolean; running?: boolean;
+} = {}) {
   const logs: string[] = [];
   for (const method of ["log", "warn", "error"] as const) {
     t.mock.method(console, method, (...args: unknown[]) => {
@@ -40,11 +58,17 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV) {
   }
   const starts: StartConfig[] = [];
   const requests: { pathname: string; port: number }[] = [];
-  const values = new Map<string, unknown>();
+  const values = new Map<string, unknown>([[OWNER_KEY, "owner" in options ? options.owner : ACTIVE_OWNER]]);
   const gates: Promise<unknown>[] = [];
   let listenerPort = 8080;
   const runtime = {
-    running: false,
+    running: options.running ?? false,
+    destroys: 0,
+    async destroy() {
+      this.destroys++;
+      if (options.stopError) throw new Error("synthetic shutdown failure");
+      this.running = false;
+    },
     start(options: StartConfig) {
       assert.equal(this.running, false, "must not start an already-running container");
       starts.push(structuredClone(options));
@@ -73,8 +97,15 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV) {
   const ctx = {
     container: runtime,
     storage: {
-      get: async (key: string) => values.get(key),
-      put: async (key: string, value: unknown) => { values.set(key, value); },
+      get: async (key: string) => {
+        if (key === OWNER_KEY && options.readError) throw new Error("synthetic storage error");
+        return values.get(key);
+      },
+      put: async (key: string | Record<string, unknown>, value?: unknown) => {
+        if (typeof key === "string") values.set(key, value);
+        else for (const [k, v] of Object.entries(key)) values.set(k, v);
+      },
+      delete: async (key: string) => values.delete(key),
       kv: { get: (key: string) => values.get(key) },
       // Scheduling persistence is outside this regression; the SDK still
       // executes its SQL, state transitions and alarm calls against this seam.
@@ -89,17 +120,17 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV) {
     },
   };
   const bot = new TwoBotContainer(
-    ctx as unknown as DurableObjectState,
-    env as Env,
+    ctx as unknown as DurableObjectState<{}>,
+    { CF_VERSION_METADATA: { id: ID }, OWNERSHIP_CONTROL_TOKEN: CONTROL_TOKEN, ...env } as Env,
   );
   await Promise.all(gates);
-  return { bot, runtime, starts, requests, logs };
+  return { bot, runtime, starts, requests, logs, values };
 }
 
 for (const path of ["/health", "/readyz"]) {
   test(`cold fetch ${path} passes Worker env through SDK auto-start`, async (t) => {
     const h = await harness(t);
-    const response = await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+    const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
     assert.equal(response.status, path === "/readyz" ? 503 : 200);
     assert.equal(h.starts.length, 1);
     assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV);
@@ -108,14 +139,14 @@ for (const path of ["/health", "/readyz"]) {
     assert.ok(h.logs.every((line) =>
       !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
 
-    await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+    await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
     assert.equal(h.starts.length, 1, "warm probe must not restart the container");
   });
 }
 
 test("cold keepalive passes env through the SDK's string-URL fetch path", async (t) => {
   const h = await harness(t);
-  await h.bot.keepalive({ startedAt: 0 });
+  await h.bot.keepalive(KEEPALIVE);
   assert.equal(h.starts.length, 1);
   assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV);
   assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
@@ -126,11 +157,11 @@ for (const port of ["9090", "1", "65535", "09090"]) {
     test(`cold ${path} uses BOT_PORT=${port} for both listener and SDK target`, async (t) => {
       const h = await harness(t, { ...WORKER_ENV, BOT_PORT: port });
       if (path === "keepalive") {
-        await h.bot.keepalive({ startedAt: 0 });
+        await h.bot.keepalive(KEEPALIVE);
         assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
         assert.ok(!h.logs.some((line) => line.includes("probe failed")));
       } else {
-        const response = await h.bot.fetch(new Request(`https://worker.invalid${path}`, {
+        const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`, {
           signal: AbortSignal.timeout(1000),
         }));
         assert.equal(response.status, path === "/readyz" ? 503 : 200);
@@ -161,7 +192,7 @@ test("missing optionals are omitted; token and guild work without DATABASE_URL",
     DISCORD_TOKEN: WORKER_ENV.DISCORD_TOKEN,
     GUILD_ID: WORKER_ENV.GUILD_ID,
   });
-  await h.bot.fetch(new Request("https://worker.invalid/health"));
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
   assert.deepEqual(h.starts[0]?.env, {
     DISCORD_TOKEN: WORKER_ENV.DISCORD_TOKEN,
     GUILD_ID: WORKER_ENV.GUILD_ID,
@@ -171,7 +202,7 @@ test("missing optionals are omitted; token and guild work without DATABASE_URL",
 
 test("health-only config never fabricates credentials or gateway readiness", async (t) => {
   const h = await harness(t, { DISCORD_TOKEN: "", DATABASE_URL: "", GUILD_ID: "" });
-  const response = await h.bot.fetch(new Request("https://worker.invalid/readyz"));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/readyz"));
   assert.equal(response.status, 503);
   assert.deepEqual(h.starts[0]?.env, { LISTEN_ADDR: "0.0.0.0:8080" });
 });
@@ -209,7 +240,7 @@ for (const path of ["/metrics", "/metrics?token=synthetic", "/metrics/", "/metri
   for (const method of ["GET", "HEAD", "POST"]) {
     test(`${method} ${path} is never publicly routed or sent to the container`, async (t) => {
       const h = await harness(t);
-      const request = new Request(`https://worker.invalid${path}`, { method });
+      const request = probeRequest(`https://worker.invalid${path}`, { method });
       const env = {
         ...WORKER_ENV,
         // Even a configured invite campaign cannot make the reserved route public.
@@ -229,7 +260,7 @@ for (const path of ["/metrics", "/metrics?token=synthetic", "/metrics/", "/metri
 
 test("non-probe route remains 404 without starting a container", async (t) => {
   const h = await harness(t);
-  const response = await h.bot.fetch(new Request("https://worker.invalid/debug"));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/debug"));
   assert.equal(response.status, 404);
   assert.equal(h.starts.length, 0);
 });
