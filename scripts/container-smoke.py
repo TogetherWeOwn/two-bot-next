@@ -1,11 +1,15 @@
 """Smoke-test a locally loaded runtime image, without Discord or a database."""
 
 import argparse
+import gzip
+import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
 import subprocess
+import tarfile
+import threading
 import time
 from urllib.parse import urlsplit
 import uuid
@@ -58,9 +62,66 @@ def http_response(url):
         connection.close()
 
 
+def saved_layer_bytes(stream, layer_ids, limit):
+    # Match archive contents to inspect's DiffIDs, not archive paths. Classic
+    # Docker saves layer.tar; containerd can save gzip blobs in an OCI layout.
+    # Count *all* layers (including overwritten files) plus tar padding. This
+    # is conservative versus the original uncompressed filesystem-byte gate.
+    require(layer_ids, "image must have rootfs layers")
+    sizes = {}
+    with tarfile.open(fileobj=stream, mode="r|*") as archive:
+        for member in archive:
+            if not member.isfile():
+                continue
+            with archive.extractfile(member) as payload:
+                compressed = payload.peek(2)[:2] == b"\x1f\x8b"
+                reader = gzip.GzipFile(fileobj=payload) if compressed else payload
+                try:
+                    digest = hashlib.sha256()
+                    size = 0
+                    while chunk := reader.read(256 * 1024):
+                        size += len(chunk)
+                        require(size <= limit, "image exceeds size budget")
+                        digest.update(chunk)
+                    layer_id = "sha256:" + digest.hexdigest()
+                    if layer_id in layer_ids:
+                        sizes[layer_id] = size
+                finally:
+                    if compressed:
+                        reader.close()
+    require(all(layer in sizes for layer in layer_ids),
+            "saved image is missing a verified rootfs layer")
+    return sum(sizes[layer] for layer in layer_ids)
+
+
+def image_layer_bytes(image, metadata, limit):
+    # inspect Size is storage-backend-dependent: containerd includes compressed
+    # content AND unpacked snapshots. Never substitute that disk-usage number
+    # for the calibrated uncompressed-layer budget, or use a merged export
+    # that hides bytes from overwritten layers. Stream save without scratch.
+    with subprocess.Popen(["docker", "image", "save", image], stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as process:
+        timer = threading.Timer(120, process.kill)
+        timer.start()
+        try:
+            size = saved_layer_bytes(process.stdout, metadata["RootFS"]["Layers"], limit)
+            # tarfile stops at the tar terminator; drain any trailing padding
+            # before waiting, so the producer cannot block on its stdout pipe.
+            while process.stdout.read(256 * 1024):
+                pass
+            require(process.wait(timeout=5) == 0, "docker image save failed or timed out")
+            return size
+        finally:
+            timer.cancel()
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
     metadata = json.loads(docker("image", "inspect", image).stdout)[0]
-    image_bytes = metadata["Size"]
+    report(f"Docker stored Size (backend-dependent, not the layer budget): {metadata['Size']} bytes")
+    image_bytes = image_layer_bytes(image, metadata, image_max_bytes)
     # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
     # orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex
@@ -73,7 +134,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     finally:
         docker("rm", "--force", measure, check=False)
     for label, size, limit in (
-        ("image (uncompressed Docker Size)", image_bytes, image_max_bytes),
+        ("image (verified uncompressed layer archives)", image_bytes, image_max_bytes),
         ("release binary", binary_bytes, binary_max_bytes),
     ):
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")
@@ -109,8 +170,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         code, body = http_response(url + "/readyz")
         require(code == 503, "/readyz must be 503 while the gateway is parked")
         require(isinstance(body, dict), "/readyz body must be a JSON object")
-        require(body.get("components") == [["process", "ready"], ["gateway", "down"]],
-                "/readyz body must report a ready process and parked gateway")
+        require(body.get("components") == [
+            ["process", "ready"], ["gateway", "down"], ["token_invalid", "ready"],
+        ], "/readyz body must report a ready process, parked gateway and valid token state")
         # The runtime always reports informational job status alongside
         # readiness; with no credentials all six jobs must be parked,
         # non-running and never started. Jobs never flip the 503 above.
@@ -180,7 +242,8 @@ def main():
     args = parser.parse_args()
     try:
         smoke(args.image, args.image_max_bytes, args.binary_max_bytes)
-    except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as error:
+    except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError,
+            tarfile.TarError, OSError, EOFError) as error:
         raise SystemExit(f"FAIL container smoke: {error}") from error
 
 

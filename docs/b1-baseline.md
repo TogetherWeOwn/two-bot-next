@@ -102,7 +102,24 @@ credentials. It also runs on `main` and workflow dispatch (including release
 check dispatches). The existing required `check` job is unchanged.
 
 `scripts/container-smoke.py` prints both sizes in bytes and MiB to the log and
-job summary and fails above these calibrated ceilings:
+job summary and fails above these calibrated ceilings. The image budget remains
+**112 MiB of uncompressed layers**, not Docker's backend-dependent disk usage.
+The original hosted measurement used the classic image store. The containerd
+store keeps compressed content **and** unpacked snapshots, and `inspect Size`
+includes both ([Docker storage documentation](https://docs.docker.com/engine/storage/containerd/);
+[Moby accounting implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_list.go)).
+It is logged for diagnosis, but is not comparable to the original ceiling.
+
+The gate now streams `docker image save`, hashes each raw/decompressed layer
+against `inspect RootFS.Layers`, and sums every verified uncompressed layer
+archive, including overwritten files and tar padding. This is conservative
+relative to the original filesystem-byte ceiling; it does **not** use a merged
+`docker export`, compressed transfer sizes, or subtract guessed overhead. Missing
+layers, corrupt/truncated gzip, save failure/timeout and budget violations fail
+closed. Classic layer tar files and containerd OCI gzip blobs share the same
+DiffID validation. No archive is extracted or retained in scratch. Both deliberate
+one-byte negative gates remain unchanged. The new image measurement must still
+pass in actual CI; offline fixtures are not a runtime-image measurement.
 
 | Artifact | Definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|

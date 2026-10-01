@@ -1,6 +1,8 @@
 """Offline fixtures for the container gate; no Docker or Cargo needed."""
 
 import contextlib
+import gzip
+import hashlib
 import importlib.util
 import io
 import json
@@ -8,6 +10,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -160,11 +163,121 @@ PARKED_JOB = {"parked": True, "running": False, "last_start": None,
 
 
 def parked_readyz_body():
-    return {"components": [["process", "ready"], ["gateway", "down"]],
+    return {"components": [["process", "ready"], ["gateway", "down"], ["token_invalid", "ready"]],
             "jobs": {name: dict(PARKED_JOB) for name in (
                 "counter", "rank", "scheduled_events", "presence_probe",
                 "community_scorecard", "inactivity",
             )}}
+
+
+def fixture_archive(entries):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, data in entries:
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def diff_id(data):
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+class ImageLayerTests(unittest.TestCase):
+    def setUp(self):
+        self.first = fixture_archive([("etc/example", b"old contents")])
+        self.second = fixture_archive([("etc/example", b"replacement contents")])
+        self.layers = [diff_id(self.first), diff_id(self.second)]
+        self.total = len(self.first) + len(self.second)
+
+    def measure(self, entries, layers=None, limit=smoke.IMAGE_MAX_BYTES):
+        return smoke.saved_layer_bytes(io.BytesIO(fixture_archive(entries)),
+                                       self.layers if layers is None else layers, limit)
+
+    def test_classic_save_counts_overwritten_layers_and_padding(self):
+        size = self.measure([("first/layer.tar", self.first), ("second/layer.tar", self.second),
+                             ("manifest.json", b"[]")])
+        self.assertEqual(size, self.total)
+        self.assertGreater(size, len(self.second))
+
+    def test_oci_gzip_blobs_use_uncompressed_bytes(self):
+        entries = [("blobs/sha256/one", gzip.compress(self.first)),
+                   ("blobs/sha256/two", gzip.compress(self.second))]
+        self.assertEqual(self.measure(entries), self.total)
+        self.assertGreater(self.total, sum(len(data) for _, data in entries))
+
+    def test_duplicate_archive_entries_do_not_double_count(self):
+        entries = [("layer.tar", self.first), ("copy/layer.tar", self.first)]
+        self.assertEqual(self.measure(entries, [self.layers[0]]), len(self.first))
+
+    def test_repeated_rootfs_layers_are_all_counted(self):
+        self.assertEqual(self.measure([("layer.tar", self.first)], [self.layers[0]] * 2),
+                         len(self.first) * 2)
+
+    def test_missing_or_changed_layer_fails_closed(self):
+        for data in (self.first, self.second + b"modified"):
+            with self.subTest(data=data[-8:]), self.assertRaisesRegex(RuntimeError, "missing a verified"):
+                self.measure([("layer.tar", data)])
+
+    def test_empty_rootfs_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "must have rootfs layers"):
+            self.measure([], [])
+
+    def test_large_raw_or_expanded_member_fails_before_hash_acceptance(self):
+        for data in (self.first, gzip.compress(self.first)):
+            with self.subTest(compressed=data[:2] == b"\x1f\x8b"), self.assertRaisesRegex(RuntimeError, "exceeds size budget"):
+                self.measure([("layer", data)], [self.layers[0]], len(self.first) - 1)
+
+    def test_gzip_crc_or_truncation_failure_is_not_a_size(self):
+        data = gzip.compress(self.first)
+        for broken in (data[:-5], data[:-8] + b"\x00" * 8):
+            with self.subTest(tail=broken[-8:]), self.assertRaises((EOFError, gzip.BadGzipFile)):
+                self.measure([("layer", broken)], [self.layers[0]])
+
+    def test_exact_uncompressed_limit_is_allowed(self):
+        self.assertEqual(self.measure([("layer", gzip.compress(self.first))],
+                                     [self.layers[0]], len(self.first)), len(self.first))
+
+    def test_save_counts_layers_not_backend_storage_and_drains_output(self):
+        process = unittest.mock.MagicMock()
+        process.__enter__.return_value = process
+        process.stdout = io.BytesIO(fixture_archive([("one", self.first), ("two", gzip.compress(self.second))]) + b"\x00" * 4096)
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        metadata = {"Size": 142257149, "RootFS": {"Layers": self.layers}}
+        with patch.object(smoke.subprocess, "Popen", return_value=process) as popen, \
+                patch.object(smoke.threading, "Timer") as timer:
+            self.assertEqual(smoke.image_layer_bytes("fixture", metadata, smoke.IMAGE_MAX_BYTES), self.total)
+        self.assertEqual(process.stdout.read(), b"")
+        process.kill.assert_not_called()
+        timer.assert_called_once_with(120, process.kill)
+        timer.return_value.start.assert_called_once()
+        timer.return_value.cancel.assert_called_once()
+        self.assertEqual(popen.call_args.args[0], ["docker", "image", "save", "fixture"])
+
+    def test_save_process_is_killed_on_invalid_archive(self):
+        process = unittest.mock.MagicMock()
+        process.__enter__.return_value = process
+        process.stdout = io.BytesIO(b"not an archive")
+        process.poll.return_value = None
+        with patch.object(smoke.subprocess, "Popen", return_value=process), \
+                patch.object(smoke.threading, "Timer") as timer:
+            with self.assertRaises(tarfile.ReadError):
+                smoke.image_layer_bytes("fixture", {"RootFS": {"Layers": self.layers}}, smoke.IMAGE_MAX_BYTES)
+        process.kill.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5)
+        timer.return_value.cancel.assert_called_once()
+
+    def test_save_failure_after_complete_archive_is_not_accepted(self):
+        process = unittest.mock.MagicMock()
+        process.__enter__.return_value = process
+        process.stdout = io.BytesIO(fixture_archive([("one", self.first), ("two", self.second)]))
+        process.wait.return_value = 1
+        with patch.object(smoke.subprocess, "Popen", return_value=process), \
+                patch.object(smoke.threading, "Timer"):
+            with self.assertRaisesRegex(RuntimeError, "save failed or timed out"):
+                smoke.image_layer_bytes("fixture", {"RootFS": {"Layers": self.layers}}, smoke.IMAGE_MAX_BYTES)
 
 
 class ContainerSmokeTests(unittest.TestCase):
@@ -184,6 +297,7 @@ class ContainerSmokeTests(unittest.TestCase):
             http_patcher = patch.object(
                 smoke, "http_response", side_effect=lambda url: self.http(url))
         with patch.object(smoke, "docker", self.fixture), \
+                patch.object(smoke, "image_layer_bytes", side_effect=lambda image, metadata, limit: metadata["Size"]), \
                 http_patcher, \
                 patch.object(smoke.time, "monotonic", side_effect=self.tick), \
                 patch.object(smoke.time, "sleep"), \
@@ -273,11 +387,15 @@ class ContainerSmokeTests(unittest.TestCase):
         # The pre-jobs contract is deliberately superseded: an informational
         # jobs map is now always serialized, so a bare components body no
         # longer satisfies the smoke gate.
-        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"]]}) if url.endswith("/readyz") else (200, {"status": "ok"})
+        body = parked_readyz_body()
+        del body["jobs"]
+        self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
         self.assert_rejected("all six jobs parked")
 
     def test_readyz_without_jobs_map_fails(self):
-        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"]], "jobs": {}}) if url.endswith("/readyz") else (200, {"status": "ok"})
+        body = parked_readyz_body()
+        body["jobs"] = {}
+        self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
         self.assert_rejected("all six jobs parked")
 
     def test_readyz_with_missing_job_fails(self):
@@ -314,7 +432,17 @@ class ContainerSmokeTests(unittest.TestCase):
         body = parked_readyz_body()
         body["components"] = [["process", "ready"], ["gateway", "ready"]]
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("ready process and parked gateway")
+        self.assert_rejected("ready process, parked gateway")
+
+    def test_readyz_missing_or_down_token_state_fails(self):
+        for token in (None, ["token_invalid", "down"]):
+            with self.subTest(token=token):
+                body = parked_readyz_body()
+                body["components"].pop()
+                if token is not None:
+                    body["components"].append(token)
+                self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+                self.assert_rejected("valid token state")
 
     def test_readyz_non_object_body_fails(self):
         self.http = lambda url: (503, []) if url.endswith("/readyz") else (200, {"status": "ok"})
