@@ -40,6 +40,15 @@ class ComparisonTests(unittest.TestCase):
                 actual["metrics"]["handler_latency_us"][key] *= 1.26
                 self.assertTrue(compare(self.baseline, actual))
 
+    def test_p99_breach_is_advisory_when_collected(self):
+        actual = copy.deepcopy(self.baseline)
+        actual["metrics"]["handler_latency_us"]["p99"] *= 3
+        advisories = []
+        self.assertEqual(compare(self.baseline, actual, advisories=advisories), [])
+        self.assertEqual(len(advisories), 1)
+        actual["metrics"]["handler_latency_us"]["p50"] *= 1.26
+        self.assertTrue(compare(self.baseline, actual, advisories=[]))
+
     def test_zero_query_baseline_is_strict(self):
         self.baseline["metrics"]["db_round_trips_per_event"] = 0
         self.actual["metrics"]["db_round_trips_per_event"] = 0.01

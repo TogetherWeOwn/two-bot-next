@@ -227,3 +227,9 @@ measurement definitions and non-required nightly integration.
 Driver: `/tmp/tog9694/soak.mjs` (kept on the run host, not committed — it
 points at an absolute checkout path). Scratch DB `tog9694_baseline` on
 agent-testdb left intact for B2 cross-checks.
+
+Gate policy (CTO decision, TOG-11786): the comparator fails on peak RSS,
+SQL exchanges per event and handler p50 (25% tolerance). Handler p99 is still
+measured and compared to the same limit, but a breach prints an `ADVISORY` line
+and does not fail the job. Raising the p99 limit needs at least five controlled
+repeats recorded in the baseline JSON plus independent QA acceptance.
