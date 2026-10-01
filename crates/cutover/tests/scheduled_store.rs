@@ -115,6 +115,108 @@ fn test_database_configuration_refuses_non_test_targets() {
 }
 
 #[tokio::test]
+async fn legacy_queue_upgrade_preserves_rows_and_decodes_store_shape() {
+    let Some(db) = setup().await else {
+        eprintln!("SKIP legacy_queue_upgrade_preserves_rows_and_decodes_store_shape: no test db");
+        return;
+    };
+    for has_claim_columns in [false, true] {
+        // Transactional schema isolation: never replace the shared test tables.
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::raw_sql(
+            "CREATE SCHEMA scheduled_legacy_upgrade;
+             SET LOCAL search_path = scheduled_legacy_upgrade, pg_catalog;",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!("fixtures/scheduled_messages_legacy.sql"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        if has_claim_columns {
+            sqlx::raw_sql(
+                "ALTER TABLE scheduled_messages ADD COLUMN claim_token TEXT, ADD COLUMN claimed_at TEXT;
+                 UPDATE scheduled_messages SET claim_token = 'claim-before-upgrade',
+                     claimed_at = '2026-01-01T00:00:00.000Z' WHERE id = 'legacy-hourly';",
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        let before: Vec<(String,)> = sqlx::query_as(
+            "SELECT (to_jsonb(s) - 'claim_token' - 'claimed_at' - 'occurrence_nonce')::TEXT
+             FROM scheduled_messages s ORDER BY id",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            sqlx::raw_sql(include_str!("../migrations/0140_scheduled_messages.sql"))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../migrations/0141_scheduled_messages_legacy_upgrade.sql"
+            ))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        let after: Vec<(String,)> = sqlx::query_as(
+            "SELECT (to_jsonb(s) - 'claim_token' - 'claimed_at' - 'occurrence_nonce')::TEXT
+             FROM scheduled_messages s ORDER BY id",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(before, after, "all legacy definition and run facts survive");
+        let rows: Vec<two_bot_core::ScheduledMessageRow> =
+            sqlx::query_as("SELECT * FROM scheduled_messages ORDER BY id")
+                .fetch_all(&mut *tx)
+                .await
+                .expect("legacy rows must decode into the sqlx store shape");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].interval_seconds, Some(3600));
+        assert_eq!(rows[1].interval_seconds, None);
+        assert!(rows.iter().all(|row| row.occurrence_nonce.is_none()));
+        assert_eq!(
+            rows[0].claim_token.as_deref(),
+            has_claim_columns.then_some("claim-before-upgrade")
+        );
+        assert_eq!(
+            rows[0].claimed_at.as_deref(),
+            has_claim_columns.then_some("2026-01-01T00:00:00.000Z")
+        );
+        for invalid in [
+            "interval_seconds = 59",
+            "interval_seconds = 31536001",
+            "body = ''",
+        ] {
+            sqlx::query("SAVEPOINT invalid_legacy_write")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let error = sqlx::query(&format!(
+                "UPDATE scheduled_messages SET {invalid} WHERE id = 'legacy-hourly'"
+            ))
+            .execute(&mut *tx)
+            .await
+            .expect_err("legacy CHECK constraints must remain enforced");
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some("23514")
+            );
+            sqlx::query("ROLLBACK TO SAVEPOINT invalid_legacy_write")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.rollback().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn put_get_list_round_trip_in_ticker_order() {
     let Some(db) = setup().await else {
         eprintln!("SKIP put_get_list_round_trip_in_ticker_order: no test db");

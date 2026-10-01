@@ -93,15 +93,15 @@ pub enum ScheduleError {
 }
 
 /// Validate a `/schedule` invocation (legacy `putScheduled` checks plus the
-/// handler's one-of rule). Body is counted in Unicode scalar values, matching
-/// the moderation-reason convention in this crate.
+/// handler's one-of rule). Count UTF-16 units and require sendable text after
+/// the shared outbound rendering, preserving the original body for storage.
 pub fn validate_schedule(input: &ScheduleInput<'_>) -> Result<ValidatedSchedule, ScheduleError> {
     let body = input.body;
-    if body.is_empty() {
-        return Err(ScheduleError::BodyEmpty);
-    }
-    if body.chars().count() > MAX_BODY_CHARS {
+    if crate::message_safety::text_len(body) > MAX_BODY_CHARS {
         return Err(ScheduleError::BodyTooLong);
+    }
+    if !crate::message_safety::has_message_text(&crate::message_safety::content(body)) {
+        return Err(ScheduleError::BodyEmpty);
     }
     if let Some(in_minutes) = input.in_minutes {
         if !(IN_MINUTES_MIN..=IN_MINUTES_MAX).contains(&in_minutes) {
@@ -502,6 +502,61 @@ mod tests {
             Err(ScheduleError::BodyTooLong)
         );
         assert!(validate_schedule(&input(&"x".repeat(2000), Some(1), None)).is_ok());
+    }
+
+    #[test]
+    fn body_bounds_count_utf16_units_without_truncating_stored_text() {
+        for body in [
+            "é".repeat(2000),
+            "😀".repeat(1000),
+            format!("{}😀", "x".repeat(1998)),
+        ] {
+            let validated = validate_schedule(&input(&body, Some(1), None)).expect("at limit");
+            assert_eq!(validated.body, body);
+            assert_eq!(
+                crate::message_safety::text_len(&validated.body),
+                MAX_BODY_CHARS
+            );
+            assert_eq!(crate::message_safety::content(&validated.body), body);
+        }
+        for body in ["😀".repeat(1001), format!("{}😀", "x".repeat(1999))] {
+            assert_eq!(
+                validate_schedule(&input(&body, Some(1), None)),
+                Err(ScheduleError::BodyTooLong)
+            );
+        }
+    }
+
+    #[test]
+    fn body_requires_effective_message_text_and_preserves_meaningful_joiners() {
+        for body in [
+            " ",
+            "\t\r\n",
+            "\u{a0}",
+            "\u{200b}",
+            "\u{200c}",
+            "\u{200d}",
+            "\u{feff}",
+            " \u{200b}\u{200c}\u{200d}\u{feff}\n",
+        ] {
+            assert_eq!(
+                validate_schedule(&input(body, Some(1), None)),
+                Err(ScheduleError::BodyEmpty),
+                "{body:?}"
+            );
+        }
+        for body in [
+            "  hello \n".to_owned(),
+            "👩\u{200d}💻".to_owned(),
+            format!("{}x", "\u{200b}".repeat(1999)),
+        ] {
+            assert_eq!(
+                validate_schedule(&input(&body, Some(1), None))
+                    .expect("sendable")
+                    .body,
+                body
+            );
+        }
     }
 
     #[test]

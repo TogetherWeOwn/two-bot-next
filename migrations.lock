@@ -25,6 +25,10 @@
       "sha256": "eda397a2c691b5001b9aee0bd46f407d7b83cabb47382259c810ad7fc1bbf164",
       "justification": "Add scheduled-message storage and shared automation audit table for TOG-10081; reserved migration block 0140-0149."
     },
+    "crates/cutover/migrations/0141_scheduled_messages_legacy_upgrade.sql": {
+      "sha256": "d4f98434aa21dca034e64f3e0a766539450deaeb9fc4aff2fc1f7c7f48a11d6e",
+      "justification": "Upgrade existing legacy scheduled queues to BIGINT and add claim/nonce columns for TOG-10081 without changing locked migration 0140 or row facts."
+    },
     "crates/cutover/migrations/0150_sticky_messages.sql": {
       "sha256": "17d867f772c9f37325c50be959d9f184958e1a632eb47a000ac9ec13b9c30f57",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
@@ -44,6 +48,10 @@
     "crates/cutover/migrations/0190_onboarding.sql": {
       "sha256": "dc3ead788a282166adf62fd5aa08366db5c4848f1fc633c420cc07a116e4ee9d",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0200_self_roles.sql": {
+      "sha256": "1e88d4300bea0c47c5ca37aaa1897314ecfa1677e43d7dcbbbfddf29344862df",
+      "justification": "Add reserved self-role audit and panel lease migration for TOG-10087; preserve legacy table and column names."
     },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
@@ -72,6 +80,10 @@
     "crates/cutover/migrations/0350_internal_actions.sql": {
       "sha256": "c291e8683b2afdeb23a985953a2afeba86519c06ec1deb8c6d2c5dd56d2f22bd",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0351_internal_action_roles.sql": {
+      "sha256": "889864e3d2768c5b95455b6b1e2071e20921cd65d5f8a017aad8668093b8f489",
+      "justification": "Pin the validated resolved role in internal-action intents and audits before REST for TOG-10861."
     },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",

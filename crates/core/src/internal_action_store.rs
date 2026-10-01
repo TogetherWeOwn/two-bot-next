@@ -88,6 +88,8 @@ pub struct AuditSubject {
     pub guild_id: Option<DiscordId>,
     pub actor_id: Option<DiscordId>,
     pub target_id: Option<DiscordId>,
+    /// Pin the allowlist-resolved role before REST; configuration may later change.
+    pub resolved_role_id: Option<DiscordId>,
 }
 
 /// A definitive failure, not a timeout with an unknown Discord outcome.
@@ -323,8 +325,8 @@ impl InternalActionStore {
         let mut tx = self.pool.begin().await?;
         let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO internal_idempotency \
-             (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id) \
-             VALUES ($1, $2, $3, $4, 'in_flight', $5, $6, $7) \
+             (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id, resolved_role_id) \
+             VALUES ($1, $2, $3, $4, 'in_flight', $5, $6, $7, $8) \
              ON CONFLICT (caller_hash, key_hash) DO NOTHING RETURNING intent_id",
         )
         .bind(&identity.caller_hash)
@@ -334,6 +336,7 @@ impl InternalActionStore {
         .bind(subject.guild_id.as_ref().map(DiscordId::as_str))
         .bind(subject.actor_id.as_ref().map(DiscordId::as_str))
         .bind(subject.target_id.as_ref().map(DiscordId::as_str))
+        .bind(subject.resolved_role_id.as_ref().map(DiscordId::as_str))
         .fetch_optional(&mut *tx)
         .await?;
         let result = if let Some(intent_id) = inserted {
@@ -491,9 +494,9 @@ impl InternalActionStore {
     ) -> Result<(), InternalStoreError> {
         sqlx::query(
             "INSERT INTO internal_action_log \
-             (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, \
+             (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
               response_code, http_status, evidence_code) \
-             SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, \
+             SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
                     response_code, http_status, $3 \
              FROM internal_idempotency WHERE intent_id = $1 \
              ON CONFLICT (intent_id, phase) DO NOTHING",
