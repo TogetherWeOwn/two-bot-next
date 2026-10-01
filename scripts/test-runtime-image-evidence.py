@@ -1,5 +1,6 @@
 """Offline contracts for bounded, non-deploying runtime image inspection."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -67,6 +68,74 @@ class EvidenceTests(unittest.TestCase):
         for label in ["affected_package_files", "package_dependencies"]:
             with self.subTest(probe=label):
                 self.assertIn("libpcre2-8-0", evidence.PROBES[label].split())
+
+    def test_mount_probe_records_package_source_and_resolved_payload_identity(self):
+        command = evidence.PROBES["mount_configuration"]
+        for field in ["${binary:Package}", "${Version}", "${Architecture}",
+                      "${source:Package}", "${source:Version}"]:
+            with self.subTest(field=field):
+                self.assertIn(field, command)
+        for path in ["/usr/bin/mount", "/usr/bin/umount", "/usr/bin/nsenter",
+                     "/usr/lib/x86_64-linux-gnu/libmount.so.1"]:
+            with self.subTest(path=path):
+                self.assertIn(path, command)
+        self.assertIn("readlink -e", command)
+        self.assertIn("sha256sum", command)
+
+    def test_payload_identity_shell_preserves_hashes_and_fails_on_missing_evidence(self):
+        scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
+        self.assertTrue(scratch, "Fake tools require run-owned scratch")
+        paths = ["/usr/bin/mount", "/usr/bin/umount", "/usr/bin/nsenter",
+                 "/usr/lib/x86_64-linux-gnu/libmount.so.1"]
+        failures = [(None, None), ("dpkg-query", None), ("sha256sum", None)]
+        failures += [("readlink", path) for path in paths]
+        for failed_tool, failed_path in failures:
+            with self.subTest(tool=failed_tool, path=failed_path), tempfile.TemporaryDirectory(dir=scratch) as temporary:
+                directory = Path(temporary)
+                payload = directory / "payload with spaces"
+                payload.write_bytes(b"offline payload fixture\n")
+                calls_path = directory / "calls.jsonl"
+                tool = (
+                    f"#!{sys.executable}\n"
+                    "import hashlib, json, sys\n"
+                    "from pathlib import Path\n"
+                    "name = Path(sys.argv[0]).name\n"
+                    f"with open({str(calls_path)!r}, 'a') as calls:\n"
+                    "    calls.write(json.dumps([name, *sys.argv[1:]]) + '\\n')\n"
+                    f"if name == {failed_tool!r} and ({failed_path!r} is None or sys.argv[-1] == {failed_path!r}):\n"
+                    "    print('fixture evidence unavailable', file=sys.stderr)\n"
+                    "    sys.exit(7)\n"
+                    "if name == 'dpkg-query':\n"
+                    "    print('bsdutils\\t1:2.38.1-5+deb12u3\\tamd64\\tutil-linux\\t2.38.1-5+deb12u3')\n"
+                    "elif name == 'readlink':\n"
+                    f"    assert sys.argv[1] == '-e' and sys.argv[2] in {paths!r}\n"
+                    f"    print({str(payload)!r})\n"
+                    "elif name == 'sha256sum':\n"
+                    f"    assert sys.argv[1:] == [{str(payload)!r}]\n"
+                    "    print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() + '  ' + sys.argv[1])\n"
+                )
+                for name in ["dpkg-query", "readlink", "sha256sum"]:
+                    executable = directory / name
+                    executable.write_text(tool)
+                    executable.chmod(0o700)
+                with patch.dict(os.environ, {"PATH": str(directory)}):
+                    result = subprocess.run(["/bin/sh", "-c", evidence.UTIL_LINUX_IDENTITY + "; printf 'later command\\n'"], capture_output=True, text=True)
+                calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+                self.assertEqual(calls[0][-8:], ["bsdutils", "libblkid1", "libmount1", "libsmartcols1",
+                                               "libuuid1", "mount", "util-linux", "util-linux-extra"])
+                if failed_tool:
+                    self.assertEqual(result.returncode, 7)
+                    self.assertIn("fixture evidence unavailable", result.stderr)
+                    self.assertNotIn("later command", result.stdout)
+                    self.assertEqual(calls[-1][0], failed_tool)
+                else:
+                    digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("bsdutils\t1:2.38.1-5+deb12u3\tamd64\tutil-linux\t2.38.1-5+deb12u3", result.stdout)
+                    for path in paths:
+                        self.assertIn(f"resolved\t{path}\t{payload}\n", result.stdout)
+                    self.assertEqual(result.stdout.count(digest + "  " + str(payload)), 4)
+                    self.assertEqual(len(calls), 9)
 
     def test_fixed_probe_commands_parse_without_executing(self):
         self.assertEqual(len(evidence.PROBES), 16)

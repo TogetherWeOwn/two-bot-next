@@ -71,6 +71,17 @@ all unresolved gates red; pursue supported Bookworm fixes or compatible removal
 of unnecessary packages before requesting a new disposition on the existing
 security-decision thread.
 
+The existing mount-configuration probe first records the eight util-linux binary
+packages' exact versions, architectures and source package/versions, then resolves
+and hashes `/usr/bin/mount`, `/usr/bin/umount`, `/usr/bin/nsenter` and the amd64
+`libmount.so.1` target. Path resolution, package-query or hashing failures remain
+nonzero observations; later help/configuration commands cannot hide them. This
+keeps the same 16-probe and timeout bounds. These are hashes observed inside the
+scanned image, not authenticated Debian package comparisons or automatic evidence
+of absent vulnerable code. Compare them with independently authenticated exact
+published payloads before relying on a source/build applicability decision. No
+ignore selector or vulnerability gate is changed by recording these hashes.
+
 ## Release and dry-run
 
 On release-please publication, `release.yml` resolves the explicit Git tag ref

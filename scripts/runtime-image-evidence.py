@@ -14,6 +14,14 @@ PACKAGES = (
     "util-linux-extra libacl1 libpcre2-8-0 libssl3 openssl"
 )
 BINARY = "/home/two-bot/two-bot"
+UTIL_LINUX_IDENTITY = (
+    "dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\t${source:Package}\t${source:Version}\n' "
+    "bsdutils libblkid1 libmount1 libsmartcols1 libuuid1 mount util-linux util-linux-extra || exit $?; "
+    "for path in /usr/bin/mount /usr/bin/umount /usr/bin/nsenter /usr/lib/x86_64-linux-gnu/libmount.so.1; do "
+    "resolved=$(readlink -e \"$path\") || exit $?; "
+    "printf 'resolved\\t%s\\t%s\\n' \"$path\" \"$resolved\"; "
+    "sha256sum \"$resolved\" || exit $?; done"
+)
 PROBES = {
     "installed_packages": "dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\t${Essential}\t${Status}\n'",
     "affected_package_files": "dpkg-query -L " + PACKAGES,
@@ -30,7 +38,7 @@ PROBES = {
     "openssl_build": "openssl version -a",
     "suid_sgid_files": "find / -xdev -type f -perm /6000 -printf '%m %u %g %p\\n'",
     "file_capabilities": "if command -v getcap > /dev/null 2>&1; then getcap -r /; else printf 'getcap unavailable; cannot establish capability absence\\n' >&2; exit 127; fi",
-    "mount_configuration": "for path in /etc/fstab /etc/mtab /etc/mount.conf; do printf '\\n%s\\n' \"$path\"; if [ -e \"$path\" ]; then ls -ld \"$path\"; cat \"$path\"; else printf 'absent\\n'; fi; done; mount --version; nsenter --version; nsenter --help",
+    "mount_configuration": UTIL_LINUX_IDENTITY + "; for path in /etc/fstab /etc/mtab /etc/mount.conf; do printf '\\n%s\\n' \"$path\"; if [ -e \"$path\" ]; then ls -ld \"$path\"; cat \"$path\"; else printf 'absent\\n'; fi; done; mount --version; nsenter --version; nsenter --help",
 }
 
 
