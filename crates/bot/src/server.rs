@@ -254,6 +254,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["components"],
+            serde_json::json!([
+                ["process", "ready"],
+                ["gateway", "down"],
+                ["database", "down"]
+            ])
+        );
     }
 
     #[test]

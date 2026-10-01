@@ -109,8 +109,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         code, body = http_response(url + "/readyz")
         require(code == 503, "/readyz must be 503 while the gateway is parked")
         require(isinstance(body, dict), "/readyz body must be a JSON object")
-        require(body.get("components") == [["process", "ready"], ["gateway", "down"]],
-                "/readyz body must report a ready process and parked gateway")
+        require(body.get("components") == [
+            ["process", "ready"], ["gateway", "down"], ["database", "down"],
+        ], "/readyz body must report a ready process and parked gateway with database down")
         # The runtime always reports informational job status alongside
         # readiness; with no credentials all six jobs must be parked,
         # non-running and never started. Jobs never flip the 503 above.
