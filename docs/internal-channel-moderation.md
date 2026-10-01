@@ -45,12 +45,18 @@ generation. Successful result/audit persistence, optional recovery deletion,
 and channel release happen in one transaction.
 
 Proven pre-mutation failures release the request/channel reservation atomically
-with a refused audit. Rejected first lockdown also removes only its newly created
-seed; rejected repeated lockdown keeps the original seed. Uncertain mutation
-results (timeouts, transport errors, rate limits, 5xx), cancellation, or failed
-post-mutation database settlement keep the channel/request fences. Later same-key
-and distinct-key requests are refused as in progress, rather than repeating a
-possibly accepted effect.
+with a refused audit. Channel/history GET failures (including timeouts and rate
+limits) and read-only recovery lookup errors abort before any Discord mutation;
+recovery-read errors preserve the original seed. Purge's history and deletion
+phases are separate so history failures are retryable, not uncertain deletions.
+Rejected first lockdown also removes only its newly created seed; rejected
+repeated lockdown keeps the original seed. Build-time validation and confirmed
+HTTP 400/401/403/404/405 rejections are safe; per-verb accepted statuses still
+complete normally. Uncertain mutation results (unexpected 2xx/3xx, HTTP 408 or
+other ambiguous statuses, timeouts, transport errors, rate limits, 5xx),
+cancellation, or failed post-mutation database settlement keep the channel/request
+fences. Later same-key and distinct-key requests are refused as in progress,
+rather than repeating a possibly accepted effect.
 
 There is deliberately **no expiry or automatic reconciliation**: a delayed unlock
 must never overwrite a newer lockdown. Recovery requires separately authorized
@@ -67,7 +73,7 @@ loopback only when `GITHUB_ACTIONS=true`.
 
 ```sh
 TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
-  cargo test -p two-bot-discord --features db --locked \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db \
   --test internal_channel_moderation -- --include-ignored
 ```
 
@@ -75,4 +81,7 @@ Coverage includes all four actions and replay, legacy actor attribution, signed
 Unicode reason bounds, permission/guild refusals, exact mask/absence restoration,
 both overlap directions across independent pools, uncertain/rejected writes,
 stale request/recovery generations, and atomic rollback after a terminal audit
-failure. CI runs the suite against its existing disposable service container.
+failure. Regressions cover ambiguous PUT/DELETE permission responses, fault-injected
+recovery reads with same-key retry, purge history 503/429/408/timeout recovery,
+and single/bulk-delete uncertainty without weakening same-key/distinct-key fences.
+CI runs the suite against its existing disposable service container.

@@ -330,6 +330,346 @@ async fn stale_channel_ticket_and_recovery_generation_cannot_finish_current_owne
     db.cleanup().await;
 }
 
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn ambiguous_permission_responses_retain_request_channel_and_recovery_fences() {
+    for (action, prior_allow) in [
+        ("moderation.lockdown", Some("3072")),
+        ("moderation.unlock", Some("3072")),
+        ("moderation.unlock", None),
+    ] {
+        for status in [202, 302, 408, 409, 425, 429, 503] {
+            let db = TestDb::new().await;
+            let original = if action == "moderation.unlock" {
+                Some(seed_lockdown(&db, prior_allow).await)
+            } else {
+                None
+            };
+            let mock = MockRest::start(
+                vec![
+                    channel(prior_allow, "8192"),
+                    ScriptedResponse::status(status),
+                ],
+                ScriptedResponse::status(500),
+            )
+            .await;
+            let exec = executor(db.pool.clone(), &mock);
+            let req = request(action, json!({}));
+            let failure = exec
+                .execute(
+                    &req,
+                    &actor(),
+                    "ambiguous-write",
+                    "ambiguous-write-key",
+                    TIME,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                failure.code,
+                if status == 429 {
+                    ErrorCode::RateLimited
+                } else {
+                    ErrorCode::DiscordUnavailable
+                },
+                "{action}: {status}"
+            );
+            let recovery = db.store().get_lockdown(CHANNEL).await.unwrap().unwrap();
+            if let Some(original) = original {
+                assert_eq!(recovery, original);
+            } else {
+                assert_eq!(recovery.prior_allow, "3072");
+                assert_eq!(recovery.prior_deny, "8192");
+            }
+            assert_eq!(
+                exec.execute(&req, &actor(), "same-key", "ambiguous-write-key", TIME)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InProgress
+            );
+            assert_eq!(
+                exec.execute(
+                    &request("moderation.lockdown", json!({})),
+                    &actor(),
+                    "distinct-key",
+                    "distinct-write-key",
+                    TIME,
+                )
+                .await
+                .unwrap_err()
+                .code,
+                ErrorCode::InProgress
+            );
+            let wire = mock.requests();
+            assert_eq!(wire.len(), 2);
+            assert_eq!(wire[0].method, "GET");
+            assert_eq!(
+                wire[1].method,
+                if action == "moderation.unlock" && prior_allow.is_none() {
+                    "DELETE"
+                } else {
+                    "PUT"
+                }
+            );
+            assert_reservations(&db, 1).await;
+            mock.shutdown().await;
+            db.cleanup().await;
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn recovery_read_failures_release_both_fences_and_preserve_original_seed() {
+    for (action, has_seed) in [
+        ("moderation.lockdown", false),
+        ("moderation.lockdown", true),
+        ("moderation.unlock", true),
+    ] {
+        let db = TestDb::new().await;
+        let original = if has_seed {
+            Some(seed_lockdown(&db, Some("3072")).await)
+        } else {
+            None
+        };
+        // Only this test's unique schema is altered. The lookup fails while
+        // claim/audit/abort remain writable; restoring the column ends the fault.
+        sqlx::query("ALTER TABLE moderation_lockdowns RENAME COLUMN prior_allow TO hidden_mask")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let mock = MockRest::start(
+            vec![
+                channel(Some("3072"), "8192"),
+                channel(Some("3072"), "8192"),
+                ScriptedResponse::status(204),
+                channel(Some("3072"), "8192"),
+                ScriptedResponse::json(200, json!({})),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let exec = executor(db.pool.clone(), &mock);
+        let req = request(action, json!({}));
+        assert_eq!(
+            exec.execute(&req, &actor(), "read-failure", "recovery-read-key", TIME)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+        assert_eq!(mock.requests().len(), 1);
+        assert_eq!(mock.requests()[0].method, "GET");
+        assert_reservations(&db, 0).await;
+        assert_audit(&db, action, "refused", "cleanup", None).await;
+        sqlx::query("ALTER TABLE moderation_lockdowns RENAME COLUMN hidden_mask TO prior_allow")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.store().get_lockdown(CHANNEL).await.unwrap(), original);
+        assert!(
+            !exec
+                .execute(&req, &actor(), "read-retry", "recovery-read-key", TIME)
+                .await
+                .unwrap()
+                .replayed
+        );
+        // The distinct key must acquire the channel too, not just replay a result.
+        exec.execute(
+            &request("moderation.slowmode", json!({"seconds":0})),
+            &actor(),
+            "after-read-retry",
+            "after-read-retry-key",
+            TIME,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock.requests().len(), 5);
+        mock.shutdown().await;
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn purge_history_failures_are_retryable_without_any_deletion() {
+    for (failure, code) in [
+        (ScriptedResponse::status(503), ErrorCode::DiscordUnavailable),
+        (ScriptedResponse::status(429), ErrorCode::RateLimited),
+        (ScriptedResponse::status(408), ErrorCode::DiscordUnavailable),
+        (
+            ScriptedResponse::json(200, json!([])).delayed(Duration::from_millis(
+                two_bot_discord::MODERATION_TIMEOUT_MS + 250,
+            )),
+            ErrorCode::UpstreamTimeout,
+        ),
+    ] {
+        let db = TestDb::new().await;
+        let mock = MockRest::start(
+            vec![
+                channel(None, "0"),
+                failure,
+                channel(None, "0"),
+                ScriptedResponse::json(
+                    200,
+                    json!([{"id":"555555555555555555"},{"id":"666666666666666666"}]),
+                ),
+                ScriptedResponse::status(204),
+                channel(None, "0"),
+                ScriptedResponse::json(200, json!({})),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let exec = executor(db.pool.clone(), &mock);
+        let req = request("moderation.purge", json!({"count":2}));
+        assert_eq!(
+            exec.execute(
+                &req,
+                &actor(),
+                "history-failure",
+                "history-failure-key",
+                TIME
+            )
+            .await
+            .unwrap_err()
+            .code,
+            code
+        );
+        assert_eq!(mock.requests().len(), 2);
+        assert!(mock.requests().iter().all(|r| r.method == "GET"));
+        assert_reservations(&db, 0).await;
+        assert_audit(&db, "moderation.purge", "refused", "cleanup", None).await;
+        let result = exec
+            .execute(&req, &actor(), "history-retry", "history-failure-key", TIME)
+            .await
+            .unwrap();
+        assert_eq!(result.affected, Some(2));
+        assert!(!result.replayed);
+        exec.execute(
+            &request("moderation.slowmode", json!({"seconds":0})),
+            &actor(),
+            "after-purge",
+            "after-purge-key",
+            TIME,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock.requests().len(), 7);
+        assert_eq!(mock.requests()[4].method, "POST");
+        mock.shutdown().await;
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced() {
+    for count in [1, 2] {
+        for status in [202, 302, 408, 429, 503] {
+            let db = TestDb::new().await;
+            let messages: Vec<Value> = ["555555555555555555", "666666666666666666"]
+                .iter()
+                .take(count)
+                .map(|id| json!({"id":id}))
+                .collect();
+            let mock = MockRest::start(
+                vec![
+                    channel(None, "0"),
+                    ScriptedResponse::json(200, json!(messages)),
+                    ScriptedResponse::status(status),
+                ],
+                ScriptedResponse::status(500),
+            )
+            .await;
+            let exec = executor(db.pool.clone(), &mock);
+            let req = request("moderation.purge", json!({"count":count}));
+            assert_eq!(
+                exec.execute(
+                    &req,
+                    &actor(),
+                    "deletion-failure",
+                    "deletion-failure-key",
+                    TIME
+                )
+                .await
+                .unwrap_err()
+                .code,
+                if status == 429 {
+                    ErrorCode::RateLimited
+                } else {
+                    ErrorCode::DiscordUnavailable
+                }
+            );
+            assert_eq!(
+                exec.execute(
+                    &req,
+                    &actor(),
+                    "deletion-retry",
+                    "deletion-failure-key",
+                    TIME
+                )
+                .await
+                .unwrap_err()
+                .code,
+                ErrorCode::InProgress
+            );
+            assert_eq!(
+                exec.execute(
+                    &request("moderation.slowmode", json!({"seconds":0})),
+                    &actor(),
+                    "unsafe-after-deletion",
+                    "unsafe-after-deletion-key",
+                    TIME,
+                )
+                .await
+                .unwrap_err()
+                .code,
+                ErrorCode::InProgress
+            );
+            assert_eq!(mock.requests().len(), 3);
+            assert_eq!(
+                mock.requests()[2].method,
+                if count == 1 { "DELETE" } else { "POST" }
+            );
+            assert_reservations(&db, 1).await;
+            mock.shutdown().await;
+            db.cleanup().await;
+        }
+    }
+}
+
+async fn seed_lockdown(db: &TestDb, prior_allow: Option<&str>) -> two_bot_core::LockdownRecord {
+    db.store()
+        .record_lockdown(
+            CHANNEL,
+            GUILD,
+            &two_bot_core::LockdownSeed {
+                prior_allow: prior_allow.unwrap_or("0").to_owned(),
+                prior_deny: "8192".to_owned(),
+                prior_exists: prior_allow.is_some(),
+            },
+            "cleanup",
+            TIME,
+        )
+        .await
+        .unwrap()
+}
+
+async fn assert_reservations(db: &TestDb, expected: i64) {
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let channels: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_channel_executions")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(claims, expected);
+    assert_eq!(channels, expected);
+}
+
 fn actor() -> ModerationActor {
     ModerationActor {
         user_id: ACTOR.to_owned(),

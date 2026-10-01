@@ -270,15 +270,26 @@ impl InternalChannelExecutor {
         let mut clear_on_success = None;
         let mut clear_on_rejection = None;
         let result = match request.action {
-            ModerationAction::Purge => self
-                .discord
-                .purge(
-                    &request.channel_id,
-                    request.count.expect("validated count") as u64,
-                    &reason,
-                )
-                .await
-                .map(|affected| ChannelOutcome::Purged { affected }),
+            ModerationAction::Purge => {
+                let ids = match self
+                    .discord
+                    .list_purge_messages(
+                        &request.channel_id,
+                        request.count.expect("validated count") as u64,
+                    )
+                    .await
+                {
+                    Ok(ids) => ids,
+                    Err(failure) => {
+                        self.abort(&ticket, &audit, None).await?;
+                        return Err(discord_error(failure));
+                    }
+                };
+                self.discord
+                    .purge_messages(&request.channel_id, &ids, &reason)
+                    .await
+                    .map(|affected| ChannelOutcome::Purged { affected })
+            }
             ModerationAction::Slowmode => self
                 .discord
                 .set_slowmode(
@@ -300,11 +311,15 @@ impl InternalChannelExecutor {
                         return Err(error(ErrorCode::Malformed, "invalid channel masks"));
                     }
                 };
-                let existing = self
-                    .store
-                    .get_lockdown(&request.channel_id)
-                    .await
-                    .map_err(database_error)?;
+                let existing = match self.store.get_lockdown(&request.channel_id).await {
+                    Ok(record) => record,
+                    Err(failure) => {
+                        // Recovery lookup is read-only: preserve any seed, but
+                        // atomically release both reservations before returning.
+                        self.abort(&ticket, &audit, None).await?;
+                        return Err(database_error(failure));
+                    }
+                };
                 if existing
                     .as_ref()
                     .is_some_and(|record| record.guild_id != self.config.guild_id)
@@ -341,11 +356,15 @@ impl InternalChannelExecutor {
                     .map(|()| ChannelOutcome::LockedDown)
             }
             ModerationAction::Unlock => {
-                let record = self
-                    .store
-                    .get_lockdown(&request.channel_id)
-                    .await
-                    .map_err(database_error)?;
+                let record = match self.store.get_lockdown(&request.channel_id).await {
+                    Ok(record) => record,
+                    Err(failure) => {
+                        // Recovery lookup is read-only: preserve any seed, but
+                        // atomically release both reservations before returning.
+                        self.abort(&ticket, &audit, None).await?;
+                        return Err(database_error(failure));
+                    }
+                };
                 let plan = match channel_moderation::plan_unlock(record.as_ref()) {
                     Ok(plan) => plan,
                     Err(_) => {
