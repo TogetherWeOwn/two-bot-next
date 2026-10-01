@@ -15,15 +15,19 @@ pub enum LiveCapability {
     Automations,
     Automod,
     Moderation,
+    /// Added with the tickets lifecycle slice; live denial is the default
+    /// until the cleared allowlist below is reviewed and widened.
+    Tickets,
 }
 
 impl LiveCapability {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::SelfRoles,
         Self::Announcements,
         Self::Automations,
         Self::Automod,
         Self::Moderation,
+        Self::Tickets,
     ];
 
     #[must_use]
@@ -34,6 +38,7 @@ impl LiveCapability {
             Self::Automations => "automations",
             Self::Automod => "automod",
             Self::Moderation => "moderation",
+            Self::Tickets => "tickets",
         }
     }
 }
@@ -152,5 +157,23 @@ mod tests {
     #[test]
     fn activation_shipped_clearance_is_self_roles_only() {
         assert_eq!(LIVE_CLEARED_CAPABILITIES, &[LiveCapability::SelfRoles]);
+    }
+
+    #[test]
+    fn live_pair_refuses_uncleared_tickets() {
+        // The tickets slice joined after the fence; live denial is the
+        // shipped default until the allowlist is deliberately widened.
+        assert_eq!(
+            assert_activation_permitted(Some(LIVE_GUILD), Some(LIVE_APP), LiveCapability::Tickets),
+            Err(ActivationRefusal::NotClearedForLive)
+        );
+        assert_eq!(
+            assert_activation_permitted(
+                Some(STAGING_GUILD),
+                Some(STAGING_APP),
+                LiveCapability::Tickets
+            ),
+            Ok(ActivationEnvironment::Staging)
+        );
     }
 }

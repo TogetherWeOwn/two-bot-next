@@ -112,6 +112,14 @@ fn intents_for_settings(
     } else {
         "0"
     };
+    // Refused tickets must not request a privileged intent the live app may
+    // not hold: a 4014 close would take every cleared capability down with
+    // it. The three ticket requirements stay independent of each other.
+    let ticket_vars = if activation.permitted(two_bot_core::activation::LiveCapability::Tickets) {
+        ticket_vars
+    } else {
+        ["", "", ""]
+    };
     gateway_intents(needs_message_content(automod, ticket_vars))
 }
 
@@ -187,9 +195,23 @@ pub async fn run_shard(
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store, runtime.as_ref()).await;
+    let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
+    let result = tokio::select! {
+        biased;
+        _ = async {
+            match shutdown {
+                Some(receiver) => crate::server::shutdown_requested(receiver).await,
+                None => std::future::pending().await,
+            }
+        } => Ok(()),
+        result = run_loop(&mut shard, &pipeline, &state, &store, runtime.as_ref()) => result,
+    };
     *state.write().await = GatewayState::Armed;
+    if let Some(tickets) = tickets {
+        tickets.shutdown().await;
+    }
     result
 }
 
@@ -398,7 +420,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn activation_intents_refuse_automod_but_preserve_independent_tickets() {
+    fn activation_intents_refuse_uncleared_automod_and_tickets() {
         const STAGING: u64 = 1545644954272137297;
         const LIVE: u64 = 326474832151838730;
         const STAGING_TOKEN: &str = "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature";
@@ -418,8 +440,10 @@ mod tests {
                     ["cat", "", "panel"],
                     ["cat", "staff", "panel"],
                 ] {
-                    let expected = (permitted && automod == "1")
-                        || tickets.iter().all(|value| !value.is_empty());
+                    // Either uncleared surface independently justifies the
+                    // privileged intent, but never on a refused identity.
+                    let expected =
+                        permitted && (automod == "1" || tickets.iter().all(|v| !v.is_empty()));
                     assert_eq!(
                         intents_for_settings(&activation, automod, tickets),
                         gateway_intents(expected)

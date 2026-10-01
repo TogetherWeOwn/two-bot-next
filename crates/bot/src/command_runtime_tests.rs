@@ -471,7 +471,7 @@ fn activation_runtime(guild: u64, token: &str, origin: String) -> Arc<CommandRun
         self_roles: true,
         ..gates(false, false)
     };
-    CommandRuntime::from_gates(pool, executor, requested, &activation)
+    CommandRuntime::from_gates(pool, executor, requested, None, &activation)
 }
 
 #[tokio::test]

@@ -4,6 +4,8 @@
 
 ### Added
 
+- Enforce the live-activation identity and capability fence at boot: derive the application id from the bot token (never config), permit every capability only for the staging guild/application pair, and restrict the live pair to the reviewed `LIVE_CLEARED_CAPABILITIES` allowlist (shipped: `self_roles` only). Refused capabilities validate no feature gates, register no commands, construct no runtime, request no privileged intents, and log one structured refusal line while the process stays up for cleared surfaces. The tickets runtime and its ticket-driven `MESSAGE_CONTENT` request land under the same default-deny rule.
+- Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

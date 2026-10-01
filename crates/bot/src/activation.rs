@@ -70,6 +70,7 @@ impl BootActivation {
         gates.announcements &= self.permitted(LiveCapability::Announcements);
         gates.moderation &= self.permitted(LiveCapability::Moderation);
         gates.self_roles &= self.permitted(LiveCapability::SelfRoles);
+        gates.tickets &= self.permitted(LiveCapability::Tickets);
         gates
     }
 }
