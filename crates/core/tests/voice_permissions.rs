@@ -361,7 +361,7 @@ proptest! {
             prop_assert!(seen.insert((o.id, o.kind)), "duplicate target {o:?}");
             prop_assert!(o.id != 0, "zero id in output");
             // (b) Deny wins over allow on every output target.
-            prop_assert_eq!(o.allow & o.deny, 0, "allow/deny overlap on {o:?}");
+            prop_assert_eq!(o.allow & o.deny, 0, "allow/deny overlap on {:?}", o);
             // (a) No granted bit the source did not allow, except the
             // documented grants on their own targets.
             let novel = o.allow & !source_allow_of(o.id, o.kind);
@@ -370,7 +370,8 @@ proptest! {
             prop_assert_eq!(
                 novel & !allowed_novel,
                 0,
-                "output grants a bit the source did not have on {o:?}"
+                "output grants a bit the source did not have on {:?}",
+                o
             );
         }
 
