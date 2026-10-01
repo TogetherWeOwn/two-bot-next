@@ -19,6 +19,7 @@ pub mod cli;
 pub mod db;
 pub mod dedupe;
 pub mod gateway_session;
+pub mod internal_settings;
 pub mod invite;
 pub mod legacy_copy;
 pub mod legacy_mapping;
@@ -30,6 +31,7 @@ pub mod message_scan;
 pub mod parse;
 pub mod raid_tools;
 pub mod rest;
+pub mod self_role_store;
 pub mod settings;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};

@@ -14,6 +14,7 @@ use two_bot_core::{
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
+    community_jobs,
     jobs::{self, ErrorClass, Job},
     server,
 };
@@ -54,16 +55,19 @@ fn cadence(kind: Kind) -> Duration {
     Duration::from_millis(millis)
 }
 
-struct Context {
-    url: String,
-    pool: OnceCell<PgPool>,
-    rest: ActionExecutor,
-    guild: String,
+/// Shared REST/DB context: website jobs also read `observation`; the community
+/// jobs in [`crate::community_jobs`] reuse the pool, executor and guild but
+/// hold their own lanes.
+pub(crate) struct Context {
+    pub(crate) url: String,
+    pub(crate) pool: OnceCell<PgPool>,
+    pub(crate) rest: ActionExecutor,
+    pub(crate) guild: String,
     observation: Mutex<()>,
 }
 
 impl Context {
-    async fn pool(&self) -> Result<&PgPool, ErrorClass> {
+    pub(crate) async fn pool(&self) -> Result<&PgPool, ErrorClass> {
         self.pool
             .get_or_try_init(|| async {
                 let db = two_bot_cutover::connect(
@@ -98,6 +102,7 @@ pub async fn serve(
     shutdown: watch::Sender<bool>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
+    let mut parked = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
         match ActionExecutor::with_proxy(token.to_owned(), std::env::var("DISCORD_API_BASE").ok()) {
             Ok(rest) => {
@@ -138,13 +143,27 @@ pub async fn serve(
                         }),
                     });
                 }
+                let registration = community_jobs::register(context);
+                registered.extend(registration.jobs);
+                parked = registration.parked;
             }
             Err(_) => tracing::warn!("website jobs parked: invalid REST configuration"),
         }
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let status = jobs::statuses(&NAMES, registered.is_empty());
+    let names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
+    // All six names park together when nothing registered; otherwise only the
+    // env-gated community names are parked and the rest report live status.
+    let status = jobs::statuses(&names, registered.is_empty());
+    {
+        let mut entries = status.write().await;
+        for name in parked {
+            if let Some(entry) = entries.get_mut(name) {
+                entry.parked = true;
+            }
+        }
+    }
     let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
     serve_jobs(registered, status, shutdown, http).await
 }
@@ -186,7 +205,7 @@ async fn drain_http(
     }
 }
 
-async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, ErrorClass> {
+pub(crate) async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, ErrorClass> {
     rest.get_json(path)
         .await
         .map_err(|_| ErrorClass::Rest)?
@@ -201,8 +220,44 @@ fn snowflake(value: &Value) -> Result<u64, ErrorClass> {
         .ok_or(ErrorClass::Rest)
 }
 
+fn roster_page(page: &Value, after: &mut u64) -> Result<Vec<RosterMember>, ErrorClass> {
+    let page = page.as_array().ok_or(ErrorClass::Rest)?;
+    if page.len() > 1000 {
+        return Err(ErrorClass::Rest);
+    }
+    let mut members = Vec::with_capacity(page.len());
+    for member in page {
+        let user = &member["user"];
+        let id = snowflake(&user["id"])?;
+        if id <= *after {
+            return Err(ErrorClass::Rest);
+        }
+        *after = id;
+        let is_bot = match user.get("bot") {
+            None => false,
+            Some(v) => v.as_bool().ok_or(ErrorClass::Rest)?,
+        };
+        let roles = member["roles"]
+            .as_array()
+            .ok_or(ErrorClass::Rest)?
+            .iter()
+            .map(|role| snowflake(role).map(|id| id.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        members.push(RosterMember {
+            user_id: id.to_string(),
+            is_bot,
+            roles,
+        });
+    }
+    Ok(members)
+}
+
 /// Discord's paginated roster is the denominator, never approximate counts.
-async fn roster(rest: &ActionExecutor, guild: &str) -> Result<Vec<RosterMember>, ErrorClass> {
+/// Website publication still requires the entire roster.
+pub(crate) async fn roster(
+    rest: &ActionExecutor,
+    guild: &str,
+) -> Result<Vec<RosterMember>, ErrorClass> {
     let mut after = 0;
     let mut members = Vec::new();
     loop {
@@ -211,37 +266,41 @@ async fn roster(rest: &ActionExecutor, guild: &str) -> Result<Vec<RosterMember>,
             &format!("/guilds/{guild}/members?limit=1000&after={after}"),
         )
         .await?;
-        let page = page.as_array().ok_or(ErrorClass::Rest)?;
-        if page.len() > 1000 {
-            return Err(ErrorClass::Rest);
-        }
-        for member in page {
-            let user = &member["user"];
-            let id = snowflake(&user["id"])?;
-            if id <= after {
-                return Err(ErrorClass::Rest);
-            }
-            after = id;
-            let is_bot = match user.get("bot") {
-                None => false,
-                Some(v) => v.as_bool().ok_or(ErrorClass::Rest)?,
-            };
-            let roles = member["roles"]
-                .as_array()
-                .ok_or(ErrorClass::Rest)?
-                .iter()
-                .map(|role| snowflake(role).map(|id| id.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
-            members.push(RosterMember {
-                user_id: id.to_string(),
-                is_bot,
-                roles,
-            });
-        }
-        if page.len() < 1000 {
+        let page = roster_page(&page, &mut after)?;
+        let complete = page.len() < 1000;
+        members.extend(page);
+        if complete {
             return Ok(members);
         }
     }
+}
+
+/// Legacy BOT_FLOOR_MAX_PAGES: ten full pages plus one termination probe.
+pub(crate) const BOT_FLOOR_MAX_PAGES: usize = 11;
+
+/// A daily floor scan is bounded independently of the website roster. A full
+/// final page cannot prove completion, so discard the partial count. Exactly
+/// 10,000 members completes via an empty eleventh page.
+pub(crate) async fn bot_floor_scan(
+    rest: &ActionExecutor,
+    guild: &str,
+) -> Result<two_bot_core::BotFloorScan, ErrorClass> {
+    let mut after = 0;
+    let mut bots = 0;
+    for _ in 0..BOT_FLOOR_MAX_PAGES {
+        // No hidden retries: the page ceiling also bounds wire requests.
+        let page = rest
+            .get_json_once(&format!("/guilds/{guild}/members?limit=1000&after={after}"))
+            .await
+            .map_err(|_| ErrorClass::Rest)?
+            .ok_or(ErrorClass::Rest)?;
+        let page = roster_page(&page, &mut after)?;
+        bots += page.iter().filter(|member| member.is_bot).count() as i64;
+        if page.len() < 1000 {
+            return Ok(two_bot_core::BotFloorScan::Complete(bots));
+        }
+    }
+    Ok(two_bot_core::BotFloorScan::Truncated)
 }
 
 fn raw_event(value: &Value) -> Result<RawScheduledEvent, ErrorClass> {

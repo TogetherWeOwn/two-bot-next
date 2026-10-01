@@ -140,7 +140,7 @@ struct Hello {
 /// Bound the entire SQL operation (pool acquire through COMMIT), not each query.
 /// Twilight only drives heartbeats while polled, so use at most a quarter of
 /// HELLO's interval and fail closed instead of waiting through missed heartbeats.
-/// Source: https://docs.rs/tokio/1/tokio/time/fn.timeout.html
+/// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
     deadline: std::time::Duration,
@@ -163,19 +163,20 @@ async fn checkpoint_io<T>(
 
 /// Drive raw packets so even dispatches not mapped by Twilight have a durable
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
-/// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
+/// fallback. Source: <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html>
 ///
-/// `sticky` is the S4 sticky runtime (TOG-10309): `dispatch` spawns detached
-/// work so this loop never awaits a REST call or store write — twilight only
-/// drives heartbeats while the shard is polled.
+/// `runtime` is the shared command runtime (TOG-11020; S4 sticky slice was
+/// TOG-10309): `dispatch` spawns detached work so this loop never awaits a
+/// REST call or store write — twilight only drives heartbeats while the
+/// shard is polled.
 pub async fn run_shard(
     mut shard: Shard,
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
-    sticky: Option<Arc<crate::sticky_runtime::StickyRuntime>>,
+    runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
 ) -> Result<(), sqlx::Error> {
-    let result = run_loop(&mut shard, &pipeline, &state, &store, sticky.as_ref()).await;
+    let result = run_loop(&mut shard, &pipeline, &state, &store, runtime.as_ref()).await;
     *state.write().await = GatewayState::Armed;
     result
 }
@@ -185,7 +186,7 @@ async fn run_loop(
     pipeline: &GatewayPipeline,
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
-    sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
+    runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
 ) -> Result<(), sqlx::Error> {
     let mut observer = crate::gateway_metrics::Observer::default();
     let mut deadline = CHECKPOINT_IO_MAX;
@@ -299,9 +300,9 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
-            // Detached dispatch only: awaiting sticky work inline would stall
+            // Detached dispatch only: awaiting command work inline would stall
             // heartbeat polling (see `run_shard` docs).
-            if let Some(runtime) = sticky {
+            if let Some(runtime) = runtime {
                 runtime.dispatch(&event);
             }
         }
@@ -407,7 +408,7 @@ mod tests {
 
     fn configured() -> Config {
         Config {
-            discord_token: Some("token".to_owned()),
+            discord_token: Some(two_bot_core::Secret::new("token".to_owned())),
             database_url: None,
             listen_addr: "0.0.0.0:8080".to_owned(),
             guild_id: None,

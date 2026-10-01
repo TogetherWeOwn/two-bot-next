@@ -2,11 +2,7 @@ use super::*;
 use serde_json::json;
 use two_bot_testsupport::TestDatabase;
 
-#[allow(dead_code)]
-#[path = "../../discord/tests/common/mod.rs"]
-mod common;
-
-use common::{MockRest, ScriptedResponse};
+use crate::discord_test_common::{MockRest, ScriptedResponse};
 
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
@@ -58,6 +54,60 @@ async fn roster_paginates_and_rejects_failed_or_repeated_pages() {
             roster(&executor(&mock), "2222").await.err(),
             Some(ErrorClass::Rest)
         );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn bot_floor_scan_caps_requests_and_never_returns_a_partial_count() {
+    use two_bot_core::BotFloorScan;
+
+    for total in [0_u64, 23, 999, 1000, 10_000, 10_999, 11_000, 11_001, 12_000] {
+        let mut responses = Vec::new();
+        for start in (0..=total).step_by(1000) {
+            let page: Vec<_> = (start + 1..=(start + 1000).min(total))
+                .map(|id| member(id, id % 10 == 0, &[]))
+                .collect();
+            responses.push(ScriptedResponse::json(200, json!(page)));
+        }
+        let mock = MockRest::start(responses, ScriptedResponse::status(500)).await;
+        let outcome = bot_floor_scan(&executor(&mock), "2222").await.unwrap();
+        let expected = if total >= 11_000 {
+            BotFloorScan::Truncated
+        } else {
+            BotFloorScan::Complete((total / 10) as i64)
+        };
+        assert_eq!(outcome, expected, "guild size {total}");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), ((total / 1000 + 1) as usize).min(11));
+        for (index, request) in requests.iter().enumerate() {
+            let (_, query) = request.path.split_once('?').unwrap();
+            let params: std::collections::HashMap<_, _> = query
+                .split('&')
+                .map(|pair| pair.split_once('=').unwrap())
+                .collect();
+            assert_eq!(params["limit"], "1000");
+            assert_eq!(params["after"], (index * 1000).to_string());
+        }
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn bot_floor_scan_errors_do_not_retry_or_report_a_count() {
+    for response in [
+        ScriptedResponse::status(403),
+        ScriptedResponse::status(429),
+        ScriptedResponse::status(500),
+        ScriptedResponse::json(200, json!({"not":"array"})),
+        ScriptedResponse::json(200, json!([member(2, false, &[]), member(2, true, &[])])),
+    ] {
+        let mock = MockRest::start(vec![response], ScriptedResponse::status(500)).await;
+        assert_eq!(
+            bot_floor_scan(&executor(&mock), "2222").await,
+            Err(ErrorClass::Rest)
+        );
+        assert_eq!(mock.requests().len(), 1, "wire request is not retried");
         mock.shutdown().await;
     }
 }

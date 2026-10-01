@@ -1,18 +1,28 @@
-//! Sticky runtime wiring (TOG-10309, S4 slice of TOG-9809).
+//! Shared command runtime (TOG-11020; grew out of the S4 sticky runtime,
+//! TOG-10309 — the slice of TOG-9809).
 //!
-//! Composes the three merged halves: the shared interaction router
-//! (TOG-10075) decides route/refusal for `/sticky` and `/sticky-remove`,
-//! the shared REST executor (TOG-10076) performs every Discord side effect,
-//! and the sticky domain + sqlx store (TOG-10082) owns validation, the
-//! debounce decision, and the atomic claim. This module builds no private
-//! dispatcher or HTTP client: gateway events arrive via [`Self::dispatch`]
-//! and are handled entirely through those interfaces.
+//! This module is the ONE bot composition/dispatch owner: the shared
+//! interaction router (TOG-10075) decides route/refusal for every slash
+//! command the runtime serves, the shared REST executor (TOG-10076) performs
+//! every Discord side effect, and each feature's domain + sqlx store owns
+//! its validation and mutation. No competing interaction listener, private
+//! dispatcher, or Discord client exists: gateway events arrive via
+//! [`CommandRuntime::dispatch`] and are handled entirely through those interfaces.
 //!
-//! Pinned legacy order (`sticky.rs` header): claim → post replacement →
-//! record → best-effort delete previous → audit. A failed post releases the
-//! claim and writes `post_failed`; `record` losing the claim means the just-
-//! posted message is an orphan and is deleted with no audit row; a hold
-//! (debounce or lost claim) writes nothing.
+//! Served slices:
+//! - sticky (`/sticky`, `/sticky-remove` + the accepted-message re-post hook;
+//!   legacy order pinned below: claim → post → record → delete previous →
+//!   audit, with `post_failed`/orphan cleanup on the failure edges).
+//! - feed relays (`/feed-add`, `/feed-remove`, `/feed-list`; TOG-10085 domain
+//!   and store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
+//!   completion. The generated relay/audit ids replace legacy `randomUUID()`.
+//!
+//! Registry publication runs here too: every `Event::Ready` publishes the
+//! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
+//! duplicate READY is a harmless repeat). A resumed process also synchronizes
+//! once: a persisted gateway session does not preserve this process's gates
+//! or command definitions. No custom-command store exists on `main` yet —
+//! `publish_set` gets an empty custom slice until that slice lands its own reader.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -28,6 +38,12 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
+    commands::PERM_MANAGE_GUILD,
+    feeds::{
+        feed_list_text, feed_removed_text, plan_command, FeedCommand, FeedCommandContext,
+        FeedCommandPlan, FeedError, FeedKind,
+    },
+    feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit},
     funnel::now_millis_for_test,
     sticky::{
         activity_eligible, decide_activity, normalize_debounce, sticky_removed_reply,
@@ -37,7 +53,9 @@ use two_bot_core::{
     FeatureGates, HandlerId, InteractionHandler, InteractionRouter, ModerationGates, RouterGates,
     SlashOutcome, SurfaceFlags,
 };
-use two_bot_discord::{response_for_slash, route_interaction, ActionExecutor, RoutedInteraction};
+use two_bot_discord::{
+    publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
+};
 
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
 /// free-text reason; kept short — `audit_reason` caps at 512 chars).
@@ -48,13 +66,17 @@ const ORPHAN_REASON: &str = "sticky re-post rolled back";
 const REMOVE_REASON: &str = "sticky-remove";
 /// Safe reply when the store fails — never leak sqlx internals to Discord.
 const STORE_FAILURE_REPLY: &str = "Sticky command failed; try again.";
+/// Same shape for the feed slice's store failures.
+const FEED_STORE_FAILURE_REPLY: &str = "Feed command failed; try again.";
 /// Reply when the interaction arrives without a channel (pathological —
 /// Discord always sends `channel_id` for guild slash commands).
 const NO_CHANNEL_REPLY: &str = "This command only works in a channel.";
+/// The merged registry includes builtins whose runtime slices have not landed.
+const UNAVAILABLE_REPLY: &str = "This command is not available in this build yet.";
 
 /// Router handler marker: this runtime is the `AutomationAdmin` executor for
 /// the sticky commands. Registration documents the ownership the router
-/// outcome names; execution happens in [`StickyRuntime::on_interaction`].
+/// outcome names; execution happens in [`CommandRuntime::on_interaction`].
 #[derive(Debug)]
 struct StickyHandler;
 
@@ -64,11 +86,21 @@ impl InteractionHandler for StickyHandler {
     }
 }
 
-/// The sticky slice's runtime: shared router + shared executor + the sqlx
-/// store, driven by gateway dispatches. Cheap to clone behind `Arc`; every
+/// Router handler marker for the feed-relay commands; one instance per id.
+#[derive(Debug)]
+struct FeedHandler(HandlerId);
+
+impl InteractionHandler for FeedHandler {
+    fn id(&self) -> HandlerId {
+        self.0
+    }
+}
+
+/// The shared command runtime: one router + one REST executor + the sqlx
+/// stores, driven by gateway dispatches. Cheap to clone behind `Arc`; every
 /// `dispatch` spawns detached work because twilight only drives heartbeats
 /// while the shard is polled.
-pub struct StickyRuntime {
+pub struct CommandRuntime {
     pool: Pool<Postgres>,
     executor: ActionExecutor,
     router: InteractionRouter,
@@ -77,12 +109,15 @@ pub struct StickyRuntime {
     /// `TWO_AUTOMATIONS=1`: fast-path gate for the message hook (the router
     /// still answers `/sticky*` refusals when it is off).
     automations: bool,
+    /// Serialize publication and remember a successful sync for this process.
+    /// Repeated RESUMED events need no work; READY still replaces the full set.
+    registry_synced: tokio::sync::Mutex<bool>,
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
     attempts: AtomicU64,
 }
 
-impl StickyRuntime {
+impl CommandRuntime {
     /// Build the runtime from process env gates + the optional
     /// `DISCORD_API_BASE` proxy override. Returns `None` — gateway still
     /// boots — when gate parsing or executor construction fails, so bad
@@ -92,14 +127,14 @@ impl StickyRuntime {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
             Err(err) => {
-                warn!(error = %err, "feature gates invalid; sticky runtime disabled");
+                warn!(error = %err, "feature gates invalid; command runtime disabled");
                 return None;
             }
         };
         let moderation = match ModerationGates::from_env() {
             Ok(moderation) => moderation,
             Err(err) => {
-                warn!(error = %err, "moderation gates invalid; sticky runtime disabled");
+                warn!(error = %err, "moderation gates invalid; command runtime disabled");
                 return None;
             }
         };
@@ -111,13 +146,20 @@ impl StickyRuntime {
         );
         let mut router = InteractionRouter::new(gates);
         router.register(Box::new(StickyHandler));
+        for id in [
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedList,
+        ] {
+            router.register(Box::new(FeedHandler(id)));
+        }
         let proxy = std::env::var("DISCORD_API_BASE")
             .ok()
             .filter(|value| !value.is_empty());
         let executor = match ActionExecutor::with_proxy(token.to_owned(), proxy) {
             Ok(executor) => executor,
             Err(err) => {
-                warn!(error = %err, "REST executor failed to build; sticky runtime disabled");
+                warn!(error = %err, "REST executor failed to build; command runtime disabled");
                 return None;
             }
         };
@@ -127,6 +169,7 @@ impl StickyRuntime {
             router,
             guild_id,
             automations: features.automations,
+            registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
         }))
     }
@@ -147,20 +190,24 @@ impl StickyRuntime {
             router,
             guild_id,
             automations,
+            registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
         })
     }
 
     /// Detached dispatch for one gateway event. Clones the payload and spawns
-    /// so the shard loop never awaits sticky work; the DB claim tolerates the
-    /// reorder/crash windows spawning opens.
+    /// so the shard loop never awaits runtime work; the DB claims tolerate
+    /// the reorder/crash windows spawning opens.
+    ///
+    /// READY replaces the full merged set; a first RESUMED also synchronizes
+    /// this process's definitions/gates, even without a preceding READY.
     pub fn dispatch(self: &Arc<Self>, event: &Event) {
         match event {
             Event::MessageCreate(message) => {
                 let runtime = Arc::clone(self);
                 let message = message.0.clone();
                 // Dropping the JoinHandle detaches the task — exactly what the
-                // shard loop needs (never await sticky work while polling).
+                // shard loop needs (never await runtime work while polling).
                 drop(tokio::spawn(async move {
                     runtime.on_message(&message).await;
                 }));
@@ -172,32 +219,90 @@ impl StickyRuntime {
                     runtime.on_interaction(&interaction).await;
                 }));
             }
+            Event::Ready(ready) => {
+                let runtime = Arc::clone(self);
+                let application_id = ready.application.id.get();
+                drop(tokio::spawn(async move {
+                    runtime.publish_registry(Some(application_id)).await;
+                }));
+            }
+            Event::Resumed => {
+                let runtime = Arc::clone(self);
+                drop(tokio::spawn(async move {
+                    runtime.publish_registry(None).await;
+                }));
+            }
             _ => {}
         }
     }
 
-    /// Route one interaction through the shared router: refusals get the
-    /// ephemeral legacy text, `Handled` sticky commands run their slice, and
-    /// everything else (including `command`/`command-remove`, owned by the
-    /// custom-commands slice) is ignored.
+    /// Publish the ONE complete merged registry (legacy `CommandRegistry::sync`
+    /// on `ready`). `publish_set` assembles every gated builtin plus DB custom
+    /// rows — none on `main` yet, so `&[]` — and `set_guild_commands` is a
+    /// full replace, making a duplicate READY idempotent rather than stale.
+    /// RESUMED supplies no application id: resolve it through the same executor
+    /// and synchronize once per process. Failed syncs remain eligible to retry
+    /// on a later gateway connection event, never a polling timer.
+    pub(crate) async fn publish_registry(&self, application_id: Option<u64>) {
+        let mut synced = self.registry_synced.lock().await;
+        if application_id.is_none() && *synced {
+            return;
+        }
+        let application_id = match application_id {
+            Some(id) => id,
+            None => match self.executor.current_application_id().await {
+                Ok(id) => id,
+                Err(err) => {
+                    warn!(error = %err, "application lookup failed; publish skipped");
+                    return;
+                }
+            },
+        };
+        let defs = match self.router.publish_set(&[]) {
+            Ok(defs) => defs,
+            Err(err) => {
+                warn!(error = %err, "command registry failed to assemble; publish skipped");
+                return;
+            }
+        };
+        let commands = publish_commands(&defs);
+        if let Err(err) = self
+            .executor
+            .publish_guild_commands(application_id, self.guild_id, &commands)
+            .await
+        {
+            warn!(error = %err, "command registry publish failed");
+        } else {
+            *synced = true;
+        }
+    }
+
+    /// Route all slash commands through the shared router. Refusals get the
+    /// existing ephemeral text; accepted builtins without a wired slice get
+    /// an unavailable reply. Only the five implemented names defer and run
+    /// their slice. Router Ignore (unknown names/guild fence) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
         let RoutedInteraction::Slash { name, outcome } =
             route_interaction(&self.router, interaction, None)
         else {
             return;
         };
-        if !matches!(name.as_str(), "sticky" | "sticky-remove") {
-            return;
-        }
         if let Some(response) = response_for_slash(&outcome) {
             self.answer(interaction, response).await;
             return;
         }
-        if outcome
-            != (SlashOutcome::Handled {
-                handler: HandlerId::AutomationAdmin,
-            })
-        {
+        let SlashOutcome::Handled { handler } = outcome else {
+            return;
+        };
+        let owner = match name.as_str() {
+            "sticky" | "sticky-remove" => Some(HandlerId::AutomationAdmin),
+            "feed-add" => Some(HandlerId::FeedAdd),
+            "feed-remove" => Some(HandlerId::FeedRemove),
+            "feed-list" => Some(HandlerId::FeedList),
+            _ => None,
+        };
+        if owner != Some(handler) {
+            self.answer(interaction, ephemeral(UNAVAILABLE_REPLY)).await;
             return;
         }
         // Acknowledge before any database wait or Discord cleanup. If the
@@ -217,12 +322,15 @@ impl StickyRuntime {
             )
             .await
         {
-            warn!(interaction_id = %interaction.id.get(), error = %err, "sticky defer failed");
+            warn!(interaction_id = %interaction.id.get(), command = %name, error = %err, "command defer failed");
             return;
         }
         match name.as_str() {
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
+            "feed-add" => self.feed_add(interaction).await,
+            "feed-remove" => self.feed_remove(interaction).await,
+            "feed-list" => self.feed_list(interaction).await,
             _ => {}
         }
     }
@@ -494,6 +602,153 @@ impl StickyRuntime {
         }
     }
 
+    /// `/feed-add`: decode options → plan → insert-only write → `feed.create`
+    /// audit → ephemeral confirmation. The relay id is generated here (legacy
+    /// `randomUUID()`); plan errors reply with the domain text and write
+    /// neither a row nor an audit (legacy parity). The relay binds to the
+    /// invoking channel.
+    async fn feed_add(&self, interaction: &Interaction) {
+        let Some(channel_id) = interaction_channel(interaction) else {
+            self.finish(interaction, NO_CHANNEL_REPLY).await;
+            return;
+        };
+        let inputs = self.feed_inputs(interaction);
+        let (kind, source) = feed_add_options(interaction);
+        let kind = match kind
+            .as_deref()
+            .map_or(Err(FeedError::InvalidKind), FeedKind::parse)
+        {
+            Ok(kind) => kind,
+            Err(err) => {
+                self.finish(interaction, err.to_string()).await;
+                return;
+            }
+        };
+        let context = inputs.context(&channel_id);
+        let command = FeedCommand::Add {
+            id: new_id(),
+            kind,
+            source: source.unwrap_or_default(),
+        };
+        match plan_command(&context, command) {
+            Ok(FeedCommandPlan::Add(relay)) => {
+                if let Err(err) = add_feed(&self.pool, &relay).await {
+                    warn!(error = %err, "feed insert failed");
+                    self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    return;
+                }
+                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str())
+                    .await;
+                self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
+                    .await;
+            }
+            // `FeedCommand::Add` can only plan to `Add`; the other arms are
+            // unreachable, not silently wrong.
+            Ok(plan) => {
+                warn!(?plan, "feed-add planned to a non-add variant");
+            }
+            Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
+    /// `/feed-remove`: decode `id` → plan → guild-scoped delete → `feed.remove`
+    /// audit (`removed`/`missing` outcome) → ephemeral confirmation.
+    async fn feed_remove(&self, interaction: &Interaction) {
+        // Remove does not bind to the invoking channel; `channel_id` is only
+        // context the planner ignores for this command.
+        let channel_id = interaction_channel(interaction).unwrap_or_default();
+        let inputs = self.feed_inputs(interaction);
+        let context = inputs.context(&channel_id);
+        let command = FeedCommand::Remove {
+            id: feed_remove_option(interaction).unwrap_or_default(),
+        };
+        match plan_command(&context, command) {
+            Ok(FeedCommandPlan::Remove { guild_id, id }) => {
+                match remove_feed(&self.pool, &guild_id, &id).await {
+                    Ok(removed) => {
+                        self.feed_audit(
+                            &inputs,
+                            "feed.remove",
+                            &id,
+                            if removed { "removed" } else { "missing" },
+                        )
+                        .await;
+                        self.finish(interaction, feed_removed_text(removed)).await;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "feed remove failed");
+                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    }
+                }
+            }
+            Ok(plan) => {
+                warn!(?plan, "feed-remove planned to a non-remove variant");
+            }
+            Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
+    /// `/feed-list`: plan → guild-scoped list → ephemeral text. Legacy
+    /// `listFeeds` lists every relay for the guild (not `enabled` only) and
+    /// writes no audit row.
+    async fn feed_list(&self, interaction: &Interaction) {
+        let channel_id = interaction_channel(interaction).unwrap_or_default();
+        let inputs = self.feed_inputs(interaction);
+        let context = inputs.context(&channel_id);
+        match plan_command(&context, FeedCommand::List) {
+            Ok(FeedCommandPlan::List { guild_id }) => {
+                match list_feeds(&self.pool, &guild_id, false).await {
+                    Ok(feeds) => self.finish(interaction, feed_list_text(&feeds)).await,
+                    Err(err) => {
+                        warn!(error = %err, "feed list failed");
+                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    }
+                }
+            }
+            Ok(plan) => {
+                warn!(?plan, "feed-list planned to a non-list variant");
+            }
+            Err(err) => self.finish(interaction, err.to_string()).await,
+        }
+    }
+
+    /// Owned pieces of the feed plan context for one interaction: the
+    /// router's `announcements` gate is the enable switch (the same value the
+    /// router refused on), the configured `GUILD_ID` is the fence, and the
+    /// invoker's member permission bits decide `can_manage_guild`.
+    fn feed_inputs(&self, interaction: &Interaction) -> FeedInputs {
+        FeedInputs {
+            enabled: self.router.gates().announcements,
+            configured_guild_id: self.guild_id.to_string(),
+            guild_id: interaction
+                .guild_id
+                .map(|id| id.get().to_string())
+                .unwrap_or_default(),
+            actor_id: actor_id(interaction),
+            can_manage_guild: can_manage_guild(interaction),
+            now_ms: now_millis_for_test(),
+        }
+    }
+
+    /// Append one `feed.*` audit row; an audit write failure is logged but
+    /// never fails the operation it records (same posture as [`Self::audit`]).
+    async fn feed_audit(&self, inputs: &FeedInputs, action: &str, target_key: &str, outcome: &str) {
+        let audit_id = new_id();
+        let row = FeedAudit {
+            id: &audit_id,
+            guild_id: &inputs.guild_id,
+            actor_id: Some(inputs.actor_id.as_str()).filter(|actor| !actor.is_empty()),
+            action,
+            target_key,
+            outcome,
+            reason: None,
+            now_ms: now_millis_for_test(),
+        };
+        if let Err(err) = write_audit(&self.pool, &row).await {
+            warn!(action, outcome, error = %err, "feed audit write failed");
+        }
+    }
+
     /// Answer an interaction through the shared executor. The token never
     /// appears in logs — only the interaction id and error.
     async fn answer(&self, interaction: &Interaction, response: InteractionResponse) {
@@ -581,17 +836,104 @@ fn interaction_channel(interaction: &Interaction) -> Option<String> {
         .or_else(|| interaction.channel_id.map(|id| id.get().to_string()))
 }
 
-/// The runtime's router for tests that bypass `from_env`'s env reads.
+/// Owned inputs for one feed command's plan context and audit rows. The
+/// borrowed [`FeedCommandContext`] cannot own its strings, so this holds them
+/// and lends them through [`FeedInputs::context`].
+struct FeedInputs {
+    enabled: bool,
+    configured_guild_id: String,
+    guild_id: String,
+    actor_id: String,
+    can_manage_guild: bool,
+    now_ms: i64,
+}
+
+impl FeedInputs {
+    fn context<'a>(&'a self, channel_id: &'a str) -> FeedCommandContext<'a> {
+        FeedCommandContext {
+            enabled: self.enabled,
+            configured_guild_id: &self.configured_guild_id,
+            guild_id: &self.guild_id,
+            channel_id,
+            actor_id: &self.actor_id,
+            can_manage_guild: self.can_manage_guild,
+            now_ms: self.now_ms,
+        }
+    }
+}
+
+/// Invoker's `member.permissions` bits → Manage Guild check (the same bits
+/// the router already adjudicated; the planner re-checks them).
+fn can_manage_guild(interaction: &Interaction) -> bool {
+    interaction
+        .member
+        .as_ref()
+        .and_then(|member| member.permissions)
+        .is_some_and(|permissions| permissions.bits() & PERM_MANAGE_GUILD == PERM_MANAGE_GUILD)
+}
+
+/// Relay and audit row ids: 16 CSPRNG bytes, hex-encoded to the 32-hex shape
+/// `internal_actions` already uses. `validate_id` accepts it (alphanumeric,
+/// ≤128) and it fills legacy `randomUUID()`'s role — opaque, unique.
+pub(crate) fn new_id() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
+
+/// `/feed-add`'s options: `kind` (choice string) + `source` (string). A
+/// missing `kind` replies `InvalidKind`; a missing `source` plans against an
+/// empty string, which the SSRF guard rejects.
+pub(crate) fn feed_add_options(interaction: &Interaction) -> (Option<String>, Option<String>) {
+    let mut kind = None;
+    let mut source = None;
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return (kind, source);
+    };
+    for option in &data.options {
+        match (option.name.as_str(), &option.value) {
+            ("kind", CommandOptionValue::String(value)) => kind = Some(value.clone()),
+            ("source", CommandOptionValue::String(value)) => source = Some(value.clone()),
+            _ => {}
+        }
+    }
+    (kind, source)
+}
+
+/// `/feed-remove`'s `id` option; `None` plans against an empty id, which
+/// `validate_id` rejects with `InvalidId`.
+pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
+    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(data)) =
+        &interaction.data
+    else {
+        return None;
+    };
+    data.options
+        .iter()
+        .find_map(|option| match (option.name.as_str(), &option.value) {
+            ("id", CommandOptionValue::String(value)) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+/// The runtime's router for tests that bypass `from_env`'s env reads:
+/// sticky + feed handler markers, matching `from_env`'s registrations.
 #[cfg(test)]
-pub(crate) fn router_with_sticky(gates: RouterGates) -> InteractionRouter {
+pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
     router.register(Box::new(StickyHandler));
+    for id in [
+        HandlerId::FeedAdd,
+        HandlerId::FeedRemove,
+        HandlerId::FeedList,
+    ] {
+        router.register(Box::new(FeedHandler(id)));
+    }
     router
 }
 
 /// Ephemeral channel-message reply (same shape the router's refusal builder
 /// produces).
-#[cfg(test)]
 pub(crate) fn ephemeral(text: impl Into<String>) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
