@@ -24,6 +24,8 @@
 
 ### Fixed
 
+- Grant the least-privilege runtime role scheduled-message CRUD and claim access, with web-reader denial coverage.
+- Isolate scheduled-store fixtures in per-test schema-only pools with awaited teardown on success or panic, so concurrent suites cannot replace each other's claims. Use literal legacy CHECK probes compatible with SQLx 0.9.
 - Upgrade legacy scheduled-message queues to BIGINT intervals and add missing claim/nonce columns without losing definitions or run facts (additive migration 0141).
 - Validate scheduled bodies in UTF-16 units and refuse whitespace/invisible-only effective messages before saving.
 - Scheduled claims lease one occurrence per call, preventing distinct messages from sharing a batch nonce while preserving the nonce across retries and restarts.
