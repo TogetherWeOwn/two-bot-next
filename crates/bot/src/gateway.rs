@@ -200,6 +200,7 @@ async fn run_loop(
     onboarding: Option<&Arc<crate::onboarding::OnboardingRuntime>>,
     sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
 ) -> Result<(), sqlx::Error> {
+    let mut observer = crate::gateway_metrics::Observer::default();
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
     info!(shard = ?ShardId::ONE, "gateway shard loop started");
@@ -289,6 +290,7 @@ async fn run_loop(
                 ))
             }
         };
+        observer.observe(&message, shard);
         let Message::Text(text) = message else {
             *state.write().await = GatewayState::Armed;
             // Twilight 0.17.1 retains its session on gateway-initiated closes.
@@ -366,6 +368,7 @@ async fn run_loop(
         {
             continue;
         }
+        let timer = crate::gateway_metrics::DispatchTimer::start();
         let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| {
             sqlx::Error::InvalidArgument(
                 "gateway dispatch parse failed; checkpoint unchanged".into(),
@@ -405,6 +408,7 @@ async fn run_loop(
             ),
         )
         .await?;
+        timer.committed();
         committed = Some(checkpoint);
         if let Some(id) = job_id {
             if let Some(job @ OnboardingJob::Interaction(_)) = onboarding_job {

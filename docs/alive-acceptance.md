@@ -14,7 +14,10 @@ and database both `agent_test`. Explicit Unix sockets (including SQLx's
 `?host=/path` override on an allowed TCP host) are rejected before connection.
 It never falls back to runtime `DATABASE_URL`.
 Each run creates its own schema; the child URL carries `options[search_path]`
-so even the binary's startup migrations stay isolated. Normal failure paths
+so the harness migration bootstrap and the child stay isolated. The gateway
+binary is DML-only and never migrates: the harness performs the operator's
+migration step before spawning the child, exactly like the documented
+production bootstrap. Normal failure paths
 kill/reap children and delete only that schema. CI explicitly runs this ignored
 test under `timeout 60s`; the lifecycle has its own 45-second deadline and
 five-second step deadlines. Assertion failures print captured stdout/stderr.

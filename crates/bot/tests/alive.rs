@@ -55,11 +55,20 @@ impl TestDb {
             .await
             .expect("isolated schema");
         // sqlx's to_url_lossy does NOT serialize options. Explicitly put the
-        // search_path in the URL so the separate binary migrates only our schema.
+        // search_path in the URL so the harness migration bootstrap and the
+        // child binary both stay inside our schema.
         let mut url = options.to_url_lossy();
         url.query_pairs_mut()
             .append_pair("options[search_path]", &schema);
         let child_url = url.to_string();
+        // The gateway binary is DML-only and never migrates: the harness
+        // performs the operator's migration step before spawning the child,
+        // exactly like the documented production bootstrap.
+        two_bot_cutover::connect(&child_url, 1, false)
+            .await
+            .expect("operator-equivalent migration bootstrap")
+            .close()
+            .await;
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .acquire_timeout(STEP)
@@ -387,7 +396,8 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         assert!(before.contains("\"gateway\",\"starting\""));
         discord.release.send(()).await.unwrap(); // Health precedes HELLO.
         let auth = discord.authentication().await;
-        // The binary itself has now finished migration and checkpoint loading.
+        // The DML-only binary has now finished checkpoint loading against the
+        // harness-migrated schema.
         assert_eq!(
             db.store()
                 .load()
