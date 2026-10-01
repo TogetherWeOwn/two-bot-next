@@ -516,13 +516,19 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
         if saw_end {
             return Err(refuse("dump contains data after its end marker"));
         }
+        if !obj.is_object() {
+            return Err(refuse(format!("dump line {line_no} is not an object")));
+        }
         let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("");
         match kind {
             "manifest" => {
                 if manifest.is_some() {
                     return Err(refuse("dump contains more than one manifest"));
                 }
-                let version = obj.get("version").and_then(Value::as_u64).unwrap_or(0);
+                let version = obj
+                    .get("version")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| refuse("manifest has an invalid version"))?;
                 if version != u64::from(DUMP_VERSION) {
                     return Err(refuse(format!(
                         "dump version {version}, this build reads {DUMP_VERSION}"
@@ -577,8 +583,14 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                 rows.push(data);
             }
             "end" => {
+                // as_u64 refuses nulls, strings, negatives and floating-point
+                // values. Missing metadata must not verify an empty archive.
+                // https://docs.rs/serde_json/1.0.151/serde_json/value/enum.Value.html#method.as_u64
+                declared_rows = obj
+                    .get("rows")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| refuse("dump end marker has an invalid row count"))?;
                 saw_end = true;
-                declared_rows = obj.get("rows").and_then(Value::as_u64).unwrap_or(0);
             }
             _ => {
                 return Err(refuse(format!(
@@ -644,6 +656,42 @@ fn inspect_with_limits(path: &Path, limits: InspectLimits) -> Result<DumpContent
 }
 
 fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
+    if obj.get("createdAt").and_then(Value::as_str).is_none() {
+        return Err(refuse("manifest has no createdAt timestamp"));
+    }
+    if obj
+        .get("eventsSequence")
+        .and_then(Value::as_i64)
+        .is_none_or(|mark| mark < 0)
+    {
+        return Err(refuse("manifest has an invalid eventsSequence"));
+    }
+    if !obj
+        .get("schemaMigrations")
+        .and_then(Value::as_array)
+        .is_some_and(|migrations| migrations.iter().all(Value::is_string))
+    {
+        return Err(refuse("manifest has an invalid schemaMigrations list"));
+    }
+    // Frozen v3 omits this additive metadata. When present, do not silently
+    // ignore malformed marks just because this reader restores only events.
+    if let Some(sequences) = obj.get("sequences") {
+        let sequences = sequences
+            .as_object()
+            .ok_or_else(|| refuse("manifest has invalid sequences"))?;
+        for (name, mark) in sequences {
+            if !is_dump_table(name) {
+                return Err(refuse(format!(
+                    "manifest sequence {name:?} is not a table this backup format owns"
+                )));
+            }
+            if mark.as_i64().is_none_or(|mark| mark < 0) {
+                return Err(refuse(format!(
+                    "manifest sequence {name} has an invalid high-water mark"
+                )));
+            }
+        }
+    }
     let tables = obj
         .get("tables")
         .and_then(Value::as_array)
@@ -782,6 +830,231 @@ mod tests {
         ]
     }
 
+    fn empty_dump() -> Vec<Value> {
+        vec![
+            manifest(complete_tables(&BTreeMap::new())),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]
+    }
+
+    #[test]
+    fn accepts_empty_archives_with_zero_sequence_and_empty_migrations() {
+        let mut objs = empty_dump();
+        objs[0]["eventsSequence"] = serde_json::json!(0);
+        objs[0]["schemaMigrations"] = serde_json::json!([]);
+        // Legacy v3 does not emit column_types or sequences.
+        for table in objs[0]["tables"].as_array_mut().unwrap() {
+            table.as_object_mut().unwrap().shift_remove("column_types");
+        }
+        let contents = inspect_bytes(&gzip_lines(&objs)).unwrap();
+        assert_eq!(contents.rows, 0);
+        assert!(contents.buffers.is_empty());
+        assert_eq!(contents.manifest.events_sequence, 0);
+        assert!(contents.manifest.schema_migrations.is_empty());
+        // Rust retains BIGINT marks exactly, without JavaScript's safe-integer
+        // limitation. Present additive metadata must still be well-formed.
+        objs[0]["eventsSequence"] = serde_json::json!(i64::MAX);
+        objs[0]["sequences"] = serde_json::json!({"events": i64::MAX});
+        assert_eq!(
+            inspect_bytes(&gzip_lines(&objs))
+                .unwrap()
+                .manifest
+                .events_sequence,
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn refuses_malformed_end_counts_even_in_empty_archives() {
+        let mut missing = empty_dump();
+        missing[1].as_object_mut().unwrap().shift_remove("rows");
+        let err = inspect_bytes(&gzip_lines(&missing)).unwrap_err();
+        assert!(err.to_string().contains("invalid row count"), "{err}");
+        for rows in [
+            Value::Null,
+            serde_json::json!("0"),
+            serde_json::json!(false),
+            serde_json::json!(-1),
+            serde_json::json!(0.0),
+            serde_json::json!(0.5),
+            serde_json::json!(1e20),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let mut objs = empty_dump();
+            objs[1]["rows"] = rows.clone();
+            let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid row count"),
+                "rows={rows}: {err}"
+            );
+        }
+        let mut mismatch = empty_dump();
+        mismatch[1]["rows"] = serde_json::json!(u64::MAX);
+        let err = inspect_bytes(&gzip_lines(&mismatch)).unwrap_err();
+        assert!(err.to_string().contains("file contains 0"), "{err}");
+    }
+
+    #[test]
+    fn refuses_non_object_records_and_malformed_kinds() {
+        for record in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!([{"kind":"end", "rows":0}]),
+            serde_json::json!(42),
+            serde_json::json!("end"),
+            serde_json::json!(true),
+        ] {
+            for index in [0, 1] {
+                let mut objs = empty_dump();
+                objs[index] = record.clone();
+                let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+                assert!(err.to_string().contains("not an object"), "{err}");
+            }
+        }
+        for record in [
+            serde_json::json!({"rows":0}),
+            serde_json::json!({"kind":null,"rows":0}),
+            serde_json::json!({"kind":[],"rows":0}),
+            serde_json::json!({"kind":"checkpoint","rows":0}),
+        ] {
+            let mut objs = empty_dump();
+            objs[1] = record;
+            let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+            assert!(err.to_string().contains("unknown kind"), "{err}");
+        }
+    }
+
+    #[test]
+    fn refuses_missing_or_mistyped_required_manifest_metadata() {
+        for field in [
+            "version",
+            "createdAt",
+            "eventsSequence",
+            "schemaMigrations",
+            "tables",
+        ] {
+            let mut objs = empty_dump();
+            objs[0].as_object_mut().unwrap().shift_remove(field);
+            assert!(
+                inspect_bytes(&gzip_lines(&objs)).is_err(),
+                "missing {field}"
+            );
+            for value in [Value::Null, serde_json::json!(true), serde_json::json!({})] {
+                let mut objs = empty_dump();
+                objs[0][field] = value.clone();
+                assert!(
+                    inspect_bytes(&gzip_lines(&objs)).is_err(),
+                    "{field}={value}"
+                );
+            }
+        }
+        for (field, values) in [
+            (
+                "version",
+                vec![
+                    serde_json::json!("3"),
+                    serde_json::json!(3.0),
+                    serde_json::json!(-1),
+                ],
+            ),
+            (
+                "createdAt",
+                vec![serde_json::json!(42), serde_json::json!([])],
+            ),
+            (
+                "eventsSequence",
+                vec![
+                    serde_json::json!("0"),
+                    serde_json::json!(-1),
+                    serde_json::json!(0.0),
+                    serde_json::json!(0.5),
+                    serde_json::json!(i64::MAX as u64 + 1),
+                ],
+            ),
+            (
+                "schemaMigrations",
+                vec![
+                    serde_json::json!("001"),
+                    serde_json::json!([null]),
+                    serde_json::json!(["001", 2]),
+                    serde_json::json!([[]]),
+                ],
+            ),
+        ] {
+            for value in values {
+                let mut objs = empty_dump();
+                objs[0][field] = value.clone();
+                let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+                assert!(err.to_string().contains(field), "{field}={value}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_malformed_present_sequence_metadata() {
+        for sequences in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("events"),
+            serde_json::json!(0),
+            serde_json::json!(true),
+            serde_json::json!({"website_users": 1}),
+            serde_json::json!({"events": null}),
+            serde_json::json!({"events": "0"}),
+            serde_json::json!({"events": -1}),
+            serde_json::json!({"events": 0.0}),
+            serde_json::json!({"events": 0.5}),
+            serde_json::json!({"events": i64::MAX as u64 + 1}),
+            serde_json::json!({"events": []}),
+            serde_json::json!({"events": {}}),
+        ] {
+            let mut objs = empty_dump();
+            objs[0]["sequences"] = sequences.clone();
+            let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+            assert!(err.to_string().contains("sequence"), "{sequences}: {err}");
+        }
+    }
+
+    #[test]
+    fn refuses_malformed_table_counts_and_typed_column_metadata() {
+        for count in [
+            Value::Null,
+            serde_json::json!("0"),
+            serde_json::json!(-1),
+            serde_json::json!(0.0),
+            serde_json::json!(1e20),
+            serde_json::json!([]),
+        ] {
+            let mut objs = empty_dump();
+            objs[0]["tables"][0]["count"] = count;
+            let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+            assert!(err.to_string().contains("invalid row count"), "{err}");
+        }
+        for field in ["name", "columns", "count"] {
+            let mut objs = empty_dump();
+            objs[0]["tables"][0]
+                .as_object_mut()
+                .unwrap()
+                .shift_remove(field);
+            assert!(
+                inspect_bytes(&gzip_lines(&objs)).is_err(),
+                "missing table {field}"
+            );
+        }
+        for types in [
+            Value::Null,
+            serde_json::json!("text"),
+            serde_json::json!([null]),
+            serde_json::json!([1]),
+        ] {
+            let mut objs = empty_dump();
+            objs[0]["tables"][0]["column_types"] = types;
+            let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+            assert!(err.to_string().contains("malformed"), "{err}");
+        }
+    }
+
     fn publication_dir(label: &str) -> std::path::PathBuf {
         let scratch = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
             .map(std::path::PathBuf::from)
@@ -906,6 +1179,31 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), saved);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         inspect(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn live_writer_refuses_malformed_empty_metadata_before_publication() {
+        let dir = publication_dir("empty-metadata");
+        let prior = dir.join("two-funnel-prior.ndjson.gz");
+        write_archive(&prior, &empty_dump(), INSPECT_LIMITS).unwrap();
+        let saved = std::fs::read(&prior).unwrap();
+        let next = dir.join("two-funnel-next.ndjson.gz");
+        for field in ["end", "manifest"] {
+            let mut invalid = empty_dump();
+            if field == "end" {
+                invalid[1].as_object_mut().unwrap().shift_remove("rows");
+            } else {
+                invalid[0]["eventsSequence"] = serde_json::json!(-1);
+            }
+            for path in [&prior, &next] {
+                write_archive(path, &invalid, INSPECT_LIMITS).unwrap_err();
+                assert!(!next.exists());
+                assert_eq!(std::fs::read(&prior).unwrap(), saved);
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+            }
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
