@@ -179,8 +179,13 @@ jobs:
       # only this slice's tests activate their test-container guard here.
       - name: channel moderation domain and store tests
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
+
+      - name: Internal channel moderation executor (mock REST and CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
 
       - name: Internal-member durable store regressions (CI service only)
         env:
