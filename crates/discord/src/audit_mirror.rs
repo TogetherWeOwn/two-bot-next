@@ -27,6 +27,16 @@ fn mirror_error(error: DiscordError) -> MirrorError {
     }
 }
 
+/// A local guard refusal is no channel permission or history evidence. Reads
+/// must defer/hold recovery, not quarantine the delivery as a permission loss.
+/// Posts retain the provably-unsent classification in `mirror_error`.
+fn mirror_read_error(error: DiscordError) -> MirrorError {
+    match error {
+        DiscordError::Guard(error) => MirrorError::Uncertain(error.to_string()),
+        error => mirror_error(error),
+    }
+}
+
 /// Unreadable evidence is not proof of a permission refusal or marker absence.
 fn unreadable(channel_id: &str, detail: &str) -> MirrorError {
     MirrorError::Uncertain(format!("unreadable channel {channel_id}: {detail}"))
@@ -68,7 +78,7 @@ impl AuditMirror for ActionExecutor {
         let doc = self
             .fetch_channel_document(channel_id)
             .await
-            .map_err(mirror_error)?;
+            .map_err(mirror_read_error)?;
         let guild_id = doc
             .get("guild_id")
             .and_then(|v| v.as_str())
@@ -139,7 +149,7 @@ impl AuditMirror for ActionExecutor {
         let rows = self
             .fetch_channel_messages(channel_id, before, limit)
             .await
-            .map_err(mirror_error)?;
+            .map_err(mirror_read_error)?;
         rows.iter()
             .map(|row| {
                 let parse = || {

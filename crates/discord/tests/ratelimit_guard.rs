@@ -85,6 +85,62 @@ async fn audit_guard_closure_during_authorization_refuses_without_waiting_or_dis
 }
 
 #[tokio::test]
+async fn audit_guard_refused_reads_hold_evidence_and_recover_after_cooldown() {
+    use two_bot_core::audit_mirror::{AuditMirror, MirrorError};
+
+    for restriction in ["breaker", "token", "global"] {
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::json(200, serde_json::json!({"guild_id": "2222"})),
+                ScriptedResponse::json(200, serde_json::json!([])),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let guard = Arc::new(
+            RateLimitGuard::new(GuardConfig {
+                invalid_request_threshold: 1,
+                window: Duration::from_millis(300),
+            })
+            .unwrap(),
+        );
+        let exec = executor(&mock, &guard);
+        match restriction {
+            "breaker" => guard.observe_status(403, true),
+            "token" => guard.observe_status(401, true),
+            "global" => guard.observe_global(Some(600.0)),
+            _ => unreachable!(),
+        }
+        let (document, history) = tokio::join!(
+            exec.channel_document("4444"),
+            exec.channel_history("4444", None, 100),
+        );
+        assert!(matches!(document, Err(MirrorError::Uncertain(_))));
+        assert!(matches!(history, Err(MirrorError::Uncertain(_))));
+        assert_eq!(exec.requests(), 0);
+        assert!(mock.requests().is_empty());
+        if restriction == "breaker" {
+            tokio::time::sleep(Duration::from_millis(320)).await;
+            assert_eq!(
+                exec.channel_document("4444").await.unwrap().guild_id,
+                "2222"
+            );
+            assert!(exec
+                .channel_history("4444", None, 100)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(mock.requests().len(), 2);
+            assert!(mock
+                .requests()
+                .iter()
+                .all(|request| request.method == "GET"));
+        }
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn interaction_webhook_401_counts_invalid_without_latching_the_bot_token() {
     let mock = MockRest::start(
         vec![ScriptedResponse::status(401)],
@@ -131,7 +187,15 @@ async fn internal_member_guard_refusals_preserve_the_pre_dispatch_boundary() {
         .await
         .expect("member admission retains its 1500ms total deadline")
         .unwrap_err();
-        assert_eq!(error.code, ErrorCode::DiscordRejected);
+        assert_eq!(
+            error.code,
+            if restriction == "token" {
+                ErrorCode::DiscordUnavailable
+            } else {
+                ErrorCode::RateLimited
+            }
+        );
+        assert!(error.code.retryable());
         assert_eq!(error.log_reason, "discord_guard_refused");
         assert_eq!(exec.requests(), 0);
         assert_eq!(mock.requests().len(), 0);

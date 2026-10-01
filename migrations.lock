@@ -77,6 +77,10 @@
       "sha256": "889864e3d2768c5b95455b6b1e2071e20921cd65d5f8a017aad8668093b8f489",
       "justification": "Pin the validated resolved role in internal-action intents and audits before REST for TOG-10861."
     },
+    "crates/cutover/migrations/0352_internal_action_not_sent.sql": {
+      "sha256": "eee55973b4e8cfd1bf5c0014d0ec80599f48c0954c373c86597d183af08acb16",
+      "justification": "Allow audited, owning-executor proof of no dispatch to retry a guarded member action under the original key for TOG-10857; unknown and stale intents remain fenced."
+    },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."

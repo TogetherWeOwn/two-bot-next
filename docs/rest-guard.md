@@ -77,7 +77,22 @@ bounded send. All admission waits precede authorization. If a global restriction
 arrives during authorization, the final no-wait check returns
 `GuardError::GlobalPaused` before dispatch; breaker/fatal closures likewise refuse
 locally. The audit adapter maps these guard refusals to provably-unsent `Rejected`,
-never the uncertain result used for post-dispatch timeouts.
+never the uncertain result used for post-dispatch timeouts. **Reads differ**:
+a local guard refusal of channel metadata/history is `MirrorError::Uncertain`,
+not channel permission evidence. The audit service defers preflight or holds
+reconciliation, preserving its boundary/cursor rather than permanently
+quarantining a valid delivery. Genuine Discord 403/404 reads still reject.
+
+Internal member actions retain typed admission refusals until their durable
+claim is disposed. Temporary refusal becomes retryable `rate_limited`/429;
+fatal bot-token refusal becomes `discord_unavailable`/502, not a permanent 422.
+Only the typed guard path consumes/releases a provably-unsent claim into the
+migration `0352` `not_sent` state. A fresh authenticated retry can claim the same
+key, exact payload and pinned subject after cooldown. Role actions perform only
+GETs before their sole final PUT, so refusal at any admission boundary proves
+that mutation was not dispatched. A dispatched 429, 5xx or timeout still retains
+the unknown fence and cannot automatically execute again. Fatal token recovery
+still requires the operator procedure below, never a guard reset.
 
 ## Fatal bot token and readiness
 
@@ -118,6 +133,11 @@ Local fixtures only:
 ```sh
 python3 scripts/cargo_cache.py run -- test -p two-bot-discord --lib \
   --test ratelimit_guard --test executor_acceptance --test executor_regressions
+# Authorized test-container DB only; the member suite is explicitly run in CI.
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db \
+  --test internal_action_store
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db \
+  --test internal_member_store -- --ignored
 python3 scripts/cargo_cache.py run -- test -p two-bot --test startup
 python3 scripts/cargo_cache.py run -- test -p two-bot server::tests
 ```
