@@ -229,7 +229,7 @@ mod tests {
             event(
                 "READY",
                 serde_json::json!({
-                    "v": 10, "user": {"id": id, "username": "mock", "discriminator": "0"},
+                    "v": 10, "user": {"id": id, "username": "mock", "discriminator": "0", "mfa_enabled": false},
                     "session_id": "mock", "resume_gateway_url": "ws://127.0.0.1:1", "guilds": [],
                     "application": {"id": "11", "flags": 0}
                 }),

@@ -5,6 +5,7 @@
 ### Added
 
 - Wire LFG commands and role selects through the shared interaction runtime and REST executor, with ephemeral replies, mention-free message refresh, serialized capacity/closure, nonce recovery, failed-post cleanup and shared announcement audit outcomes.
+- Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and
