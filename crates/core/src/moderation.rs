@@ -32,7 +32,10 @@ use std::collections::{HashMap, HashSet};
 
 use super::commands::{
     CommandDefinition, CommandOption, CommandOptionType, PERM_BAN_MEMBERS, PERM_KICK_MEMBERS,
-    PERM_MANAGE_CHANNELS, PERM_MANAGE_MESSAGES, PERM_MODERATE_MEMBERS,
+    PERM_MANAGE_CHANNELS, PERM_MANAGE_MESSAGES, PERM_MODERATE_MEMBERS, SCHEDULE_EVERY_MINUTES_MAX,
+    SCHEDULE_EVERY_MINUTES_MIN, SCHEDULE_IN_MINUTES_MAX, SCHEDULE_IN_MINUTES_MIN,
+    STICKY_DEBOUNCE_MAX_SECONDS, STICKY_DEBOUNCE_MIN_SECONDS, TEMPBAN_DURATION_MAX_SECONDS,
+    TEMPBAN_DURATION_MIN_SECONDS, TIMEOUT_DURATION_MAX_SECONDS, TIMEOUT_DURATION_MIN_SECONDS,
 };
 
 /// A moderation verb (parity §1 #3–#11, legacy `MODERATION_COMMANDS` order).
@@ -138,7 +141,7 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .required()
-                .min_value(60),
+                .min_value(TEMPBAN_DURATION_MIN_SECONDS),
                 CommandOption::reason(),
             ]),
         CommandDefinition::new("kick", "Kick a member")
@@ -154,7 +157,7 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .required()
-                .min_value(60),
+                .min_value(TIMEOUT_DURATION_MIN_SECONDS),
                 CommandOption::reason(),
             ]),
         CommandDefinition::new("warn", "Record a warning for a member")
@@ -362,6 +365,97 @@ pub fn require_moderation_reason(value: &str) -> Result<String, ReasonError> {
         return Err(ReasonError::TooLong);
     }
     Ok(reason.to_owned())
+}
+
+/// Cap refusal for bounded numeric inputs (parity §1 +
+/// `docs/property-tests.md`): tempban 60–365d, timeout 60–28d, schedule
+/// 1–525600 / 60–525600 minutes, sticky debounce 1–300 seconds. The builders
+/// above advertise minima (tempban/timeout expose no `max_value` per legacy
+/// parity); these validators enforce the runtime ceilings. Error text names
+/// the field and both bounds and never echoes the caller-supplied value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("\"{field}\" must be an integer between {min} and {max}")]
+pub struct ModerationCapError {
+    pub field: &'static str,
+    pub min: i64,
+    pub max: i64,
+}
+
+fn cap_between(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+    min: i64,
+    max: i64,
+) -> Result<i64, ModerationCapError> {
+    match value.and_then(serde_json::Value::as_i64) {
+        Some(n) if (min..=max).contains(&n) => Ok(n),
+        _ => Err(ModerationCapError { field, min, max }),
+    }
+}
+
+/// Validate `tempban` `duration_seconds` wire JSON: required integer
+/// 60–31,536,000 (365 days). Missing and non-integer inputs refuse.
+pub fn validate_tempban_duration(
+    value: Option<&serde_json::Value>,
+) -> Result<i64, ModerationCapError> {
+    cap_between(
+        value,
+        "duration_seconds",
+        TEMPBAN_DURATION_MIN_SECONDS,
+        TEMPBAN_DURATION_MAX_SECONDS,
+    )
+}
+
+/// Validate `timeout` `duration_seconds` wire JSON: required integer
+/// 60–2,419,200 (28 days, Discord's own ceiling). Missing and non-integer
+/// inputs refuse.
+pub fn validate_timeout_duration(
+    value: Option<&serde_json::Value>,
+) -> Result<i64, ModerationCapError> {
+    cap_between(
+        value,
+        "duration_seconds",
+        TIMEOUT_DURATION_MIN_SECONDS,
+        TIMEOUT_DURATION_MAX_SECONDS,
+    )
+}
+
+/// Validate `/schedule` `in-minutes` wire JSON: required integer 1–525,600.
+pub fn validate_schedule_in_minutes(
+    value: Option<&serde_json::Value>,
+) -> Result<i64, ModerationCapError> {
+    cap_between(
+        value,
+        "in-minutes",
+        SCHEDULE_IN_MINUTES_MIN,
+        SCHEDULE_IN_MINUTES_MAX,
+    )
+}
+
+/// Validate `/schedule` `every-minutes` wire JSON: required integer 60–525,600.
+pub fn validate_schedule_every_minutes(
+    value: Option<&serde_json::Value>,
+) -> Result<i64, ModerationCapError> {
+    cap_between(
+        value,
+        "every-minutes",
+        SCHEDULE_EVERY_MINUTES_MIN,
+        SCHEDULE_EVERY_MINUTES_MAX,
+    )
+}
+
+/// Validate `/sticky` `debounce` wire JSON: required integer 1–300 seconds.
+/// (`None` here refuses; the service-level omitted→default-5 rule lives in
+/// `sticky::normalize_debounce`.)
+pub fn validate_sticky_debounce(
+    value: Option<&serde_json::Value>,
+) -> Result<i64, ModerationCapError> {
+    cap_between(
+        value,
+        "debounce",
+        STICKY_DEBOUNCE_MIN_SECONDS,
+        STICKY_DEBOUNCE_MAX_SECONDS,
+    )
 }
 
 /// Moderation env gates (legacy `src/moderation/config.ts`).

@@ -74,17 +74,32 @@ export interface RedirectResult {
   click?: RedirectClick;
 }
 
-const SLUG = /^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$/;
-const INVITE_CODE = /^[A-Za-z0-9-]{1,64}$/;
+// Absolute end assertions: `$` alone also accepts a trailing line terminator.
+const SLUG = /^[a-z0-9][a-z0-9-]{0,38}[a-z0-9](?![\s\S])/;
+const INVITE_CODE = /^[A-Za-z0-9-]{1,64}(?![\s\S])/;
 /** Internal slugs that are never invite campaigns (matched post-canonicalization). */
-const RESERVED_METRICS_SLUG = "metrics";
+const RESERVED_SLUGS = ["metrics", "healthz"];
 
 export function isValidSlug(slug: string): boolean {
-  return SLUG.test(slug);
+  return SLUG.test(slug) && !RESERVED_SLUGS.includes(slug);
 }
 
 export function isValidInviteCode(code: string): boolean {
   return INVITE_CODE.test(code);
+}
+
+/** Empty/unset disables fallback. A configured code must be valid before serving. */
+export function isValidFallback(code: unknown): boolean {
+  return code == null || (typeof code === "string" && (code === "" || isValidInviteCode(code)));
+}
+
+/** Fixed vocabulary only: never log error messages, arbitrary names or stacks. */
+export function redirectErrorClass(err: unknown): string {
+  if (err instanceof TypeError) return "TypeError";
+  if (err instanceof RangeError) return "RangeError";
+  if (err instanceof SyntaxError) return "SyntaxError";
+  if (err instanceof Error) return "Error";
+  return "Unknown";
 }
 
 /** The URL a click is sent on to. Fixed host — never built from the path. */
@@ -168,28 +183,20 @@ const text = (status: number, body: string, extra?: Record<string, string>): Red
 });
 
 /**
- * Reserved internal paths that are never invite campaigns. Canonicalizes
- * exactly like the campaign lookup (strip slashes, percent-decode, lowercase)
- * so `/METRICS`, `/%6detrics`, `//metrics` and `/metrics/*` all match; a
- * campaign slug like `metricsfoo` does not. Undecodable input is not provably
- * reserved — callers still fail closed downstream (404 for GET/HEAD).
+ * Reserved internal paths that are never invite campaigns. Recognize only the
+ * first segment, stripping literal/encoded leading slashes and decoding once.
+ * A malformed suffix cannot unreserve a recognized `metrics`/`healthz` prefix;
+ * near-miss campaign slugs like `metricsfoo` still do not match.
  */
 export function isReservedInternal(path: string): boolean {
   const bare = path.split("?")[0] ?? "/";
-  let canonical: string;
+  const prefix = bare.replace(/^(?:\/|%2f)+/i, "").split(/\/|%2f/i, 1)[0] ?? "";
   try {
-    canonical = decodeURIComponent(
-      bare.replace(/^\/+/, "").replace(/\/+$/, ""),
-    ).toLowerCase();
+    return RESERVED_SLUGS.includes(decodeURIComponent(prefix).toLowerCase());
   } catch {
-    // Undecodable: not provably reserved; the caller fails closed downstream
-    // (404 for GET/HEAD, 405 for other methods).
+    // An undecodable prefix is not provably reserved; callers fail closed.
     return false;
   }
-  return (
-    canonical === RESERVED_METRICS_SLUG ||
-    canonical.startsWith(`${RESERVED_METRICS_SLUG}/`)
-  );
 }
 
 export async function handleRedirect(
@@ -198,26 +205,30 @@ export async function handleRedirect(
   callerKey: string,
   deps: RedirectDeps,
 ): Promise<RedirectResult> {
-  const error = deps.onError ?? (() => undefined);
-
   // Query strings are dropped, not parsed: they are the identifying data this
   // service promises not to collect.
   const bare = path.split("?")[0] ?? "/";
 
-  // Reserved internal slugs first, for every method (including POST, which
-  // otherwise reports 405): `/%6detrics`, `/METRICS`, `//metrics` and
-  // `/metrics/*` can never become a configured invite redirect. No DB touch,
-  // never a click.
-  if (isReservedInternal(path)) {
+  // Reserved paths reject every method before configuration, logging or lookup.
+  // Only the exact probe is exempt; aliases/subpaths never become campaigns.
+  if (bare !== "/healthz" && isReservedInternal(path)) {
     return text(404, "not found\n");
+  }
+
+  const error = deps.onError ?? (() => undefined);
+  if (!isValidFallback(deps.fallbackInviteCode)) {
+    error("invite_redirect_invalid_config", { errorClass: "invalid_fallback" });
+    return text(503, "redirect service misconfigured\n", { "retry-after": "30" });
+  }
+
+  if (bare === "/healthz") {
+    return method === "GET" || method === "HEAD"
+      ? text(200, "ok\n")
+      : text(405, "", { allow: "GET, HEAD" });
   }
 
   if (method !== "GET" && method !== "HEAD") {
     return text(405, "", { allow: "GET, HEAD" });
-  }
-
-  if (bare === "/healthz") {
-    return text(200, "ok\n");
   }
 
   if (bare === "/favicon.ico" || bare === "/robots.txt") {
@@ -247,13 +258,17 @@ export async function handleRedirect(
     return text(404, "not found\n");
   }
 
+  // Reject malformed input before lookup or logging: slugs are bounded labels,
+  // not arbitrary visitor-supplied paths that may contain identifying data.
+  if (!isValidSlug(slug)) return text(404, "not found\n");
+
   let campaign: Campaign | null;
   try {
     campaign = await deps.lookup(slug);
   } catch (err) {
     error("invite_redirect_lookup_failed", {
       slug,
-      err: String(err),
+      errorClass: redirectErrorClass(err),
     });
     if (deps.fallbackInviteCode && isValidInviteCode(deps.fallbackInviteCode)) {
       return redirect(inviteUrl(deps.fallbackInviteCode));
@@ -268,7 +283,7 @@ export async function handleRedirect(
   if (!isValidInviteCode(campaign.inviteCode)) {
     error("invite_redirect_bad_code", {
       slug,
-      code: campaign.inviteCode,
+      errorClass: "invalid_invite_code",
     });
     return text(500, "misconfigured campaign\n");
   }
