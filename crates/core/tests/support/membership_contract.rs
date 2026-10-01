@@ -442,34 +442,32 @@ pub fn concurrent<S: MembershipStore>(make: &impl Fn() -> S) {
     );
     s.record_observed(leave(RESUMED), Some("2026-09-30T01:00:00.000010Z"));
     let key = row(&s, EventType::MemberJoin).idempotency_key;
-    let (release, wait) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        let store = &s;
-        let old = scope.spawn(move || {
-            wait.recv().unwrap();
-            store.record_observed(join(FIRST, "unknown"), Some("2026-09-30T01:00:00.000001Z"))
-        });
-        let peers: Vec<_> = (2..=5)
-            .map(|n| {
-                let s = &s;
-                scope.spawn(move || {
-                    s.record_observed(
-                        join(FIRST, "unknown"),
-                        Some(&format!("2026-09-30T01:00:00.{n:06}Z")),
-                    )
-                })
-            })
-            .collect();
-        assert!(
-            !s.record_observed(join(FIRST, "unknown"), Some("2026-09-30T01:00:00.000050Z"))
-                .inserted
-        );
-        for peer in peers {
-            assert!(!peer.join().unwrap().inserted);
-        }
-        release.send(()).unwrap();
-        assert!(!old.join().unwrap().inserted);
-    });
+    let old = delayed_write(
+        || s.record_observed(join(FIRST, "unknown"), Some("2026-09-30T01:00:00.000001Z")),
+        || {
+            std::thread::scope(|scope| {
+                let peers: Vec<_> = (2..=5)
+                    .map(|n| {
+                        let s = &s;
+                        scope.spawn(move || {
+                            s.record_observed(
+                                join(FIRST, "unknown"),
+                                Some(&format!("2026-09-30T01:00:00.{n:06}Z")),
+                            )
+                        })
+                    })
+                    .collect();
+                assert!(
+                    !s.record_observed(join(FIRST, "unknown"), Some("2026-09-30T01:00:00.000050Z"))
+                        .inserted
+                );
+                for peer in peers {
+                    assert!(!peer.join().unwrap().inserted);
+                }
+            });
+        },
+    );
+    assert!(!old.inserted);
     expect(&s, Some(FIRST), Some("invite:original"), None, None);
     assert_eq!(row(&s, EventType::MemberJoin).idempotency_key, key);
     assert_eq!(
@@ -477,6 +475,44 @@ pub fn concurrent<S: MembershipStore>(make: &impl Fn() -> S) {
         "2026-09-30T01:00:00.000050Z"
     );
     assert_eq!(s.membership_rows(G, M).len(), 2);
+}
+
+fn delayed_write<R: Send>(write: impl FnOnce() -> R + Send, before_release: impl FnOnce()) -> R {
+    std::thread::scope(|scope| {
+        // Drop the sender inside the scope on unwind, before scope joins the
+        // delayed writer. Disconnect means skip the write, not wait forever.
+        let (release, wait) = std::sync::mpsc::channel();
+        let old = scope.spawn(move || wait.recv().ok().map(|()| write()));
+        before_release();
+        release.send(()).unwrap();
+        old.join().unwrap().expect("released delayed writer")
+    })
+}
+
+#[test]
+fn delayed_writer_unblocks_when_foreground_panics() {
+    let (done, wait) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let wrote = std::sync::atomic::AtomicBool::new(false);
+        let result = std::panic::catch_unwind(|| {
+            delayed_write(
+                || wrote.store(true, std::sync::atomic::Ordering::SeqCst),
+                || panic!("foreground"),
+            );
+        });
+        done.send((
+            result.is_err(),
+            wrote.load(std::sync::atomic::Ordering::SeqCst),
+        ))
+        .unwrap();
+    });
+    assert_eq!(
+        wait.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("foreground unwind must not deadlock scoped writer"),
+        (true, false),
+        "foreground panic propagates without executing the cancelled writer"
+    );
+    worker.join().unwrap();
 }
 
 pub fn dispatch_and_rest<S: MembershipStore>(make: &impl Fn() -> S) {

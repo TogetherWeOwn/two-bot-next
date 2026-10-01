@@ -69,6 +69,17 @@ pub fn normalize_timestamp(value: &str) -> Option<String> {
             _ => {}
         }
     }
+    // The parser truncates after nine fractional digits. Check the original
+    // fraction so submicrosecond evidence cannot disappear during parsing.
+    if input.as_bytes().get(19) == Some(&b'.')
+        && input.as_bytes()[20..]
+            .iter()
+            .take_while(|digit| digit.is_ascii_digit())
+            .skip(6)
+            .any(|digit| *digit != b'0')
+    {
+        return None;
+    }
     let utc = OffsetDateTime::parse(&input, &Rfc3339)
         .ok()?
         .checked_to_offset(UtcOffset::UTC)?;

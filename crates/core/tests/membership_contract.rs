@@ -126,6 +126,33 @@ fn timestamp_normalization_retains_microseconds_without_rounding() {
         Some("2026-08-01T00:00:00.001000Z".into())
     );
     assert!(normalize_timestamp("2026-02-30T00:00:00.000Z").is_none());
-    assert!(normalize_timestamp("2026-08-01T00:00:00.0000001Z").is_none());
+    for fraction in [
+        "0000001",
+        "00000101",
+        "000001001",
+        "0000010001",
+        "00000100001",
+        "000001000001",
+    ] {
+        for zone in ["Z", "+02:00", "-04"] {
+            assert!(
+                normalize_timestamp(&format!("2026-08-01T00:00:00.{fraction}{zone}")).is_none(),
+                "nonzero submicrosecond fraction {fraction} in {zone} must not be truncated"
+            );
+        }
+    }
+    for fraction in [
+        "000001",
+        "0000010",
+        "000001000",
+        "0000010000",
+        "000001000000",
+    ] {
+        assert_eq!(
+            normalize_timestamp(&format!("2026-08-01T00:00:00.{fraction}Z")),
+            Some("2026-08-01T00:00:00.000001Z".into()),
+            "trailing zeroes do not change the exact microsecond value"
+        );
+    }
     assert!(normalize_timestamp("2026-08-01T00:00:00+0é0").is_none());
 }

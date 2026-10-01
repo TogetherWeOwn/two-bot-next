@@ -52,15 +52,37 @@ async fn roster_evidence_precedes_delayed_headers_and_body() {
 // Source: two-bot@bffccf3 test/unit.membership-rest-observation.test.ts:31.
 #[tokio::test]
 async fn retried_roster_evidence_uses_successful_attempt_start() {
-    let mock = MockRest::start(
-        vec![
-            ScriptedResponse::status(503),
-            ScriptedResponse::json(200, serde_json::json!([{"user":{"id":"3333"}}])),
-        ],
-        ScriptedResponse::status(403),
-    )
-    .await;
-    let exec = ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin())).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut successful_headers_at = String::new();
+        let mut successful_body_at = String::new();
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with("GET /api/v10/guilds/2222/members?limit=1000 "));
+            if attempt == 0 {
+                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            successful_headers_at = two_bot_core::now_iso();
+            let body = r#"[{"user":{"id":"3333"}}]"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            successful_body_at = two_bot_core::now_iso();
+            stream.write_all(body.as_bytes()).await.unwrap();
+        }
+        (successful_headers_at, successful_body_at)
+    });
+    let exec = ActionExecutor::with_proxy("fixture-token".into(), Some(origin)).unwrap();
     let began = two_bot_core::now_iso();
     let (data, observed_at) = exec
         .get_json_observed("/guilds/2222/members?limit=1000")
@@ -72,9 +94,13 @@ async fn retried_roster_evidence_uses_successful_attempt_start() {
         ms(&observed_at) - ms(&began) >= 500,
         "failed attempt's timestamp must not survive retry"
     );
+    let (headers_at, body_at) = server.await.unwrap();
+    assert!(
+        ms(&observed_at) < ms(&headers_at),
+        "successful response headers must not replace request-start evidence"
+    );
+    assert!(ms(&headers_at) < ms(&body_at));
     assert_eq!(exec.requests(), 2);
-    assert_eq!(mock.requests().len(), 2);
-    mock.shutdown().await;
 }
 
 // Source: two-bot@bffccf3 test/unit.membership-rest-observation.test.ts:55.
