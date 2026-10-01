@@ -29,9 +29,77 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_last_success_timestamp_seconds{job}` | Completion time, zero means never run; currently `session_checkpoint` records successful durable gateway commits |
 
 `invite_snapshot` remains zero until a real scheduler calls `job_success` after
-completion. This card does not add jobs or wire otherwise-unconnected REST
-consumers into the bot. Executor calls automatically record metrics wherever the
+completion. Executor calls automatically record metrics wherever the
 executor is used. Other REST clients are not silently claimed as covered.
+
+## Scrape contract
+
+- Scrape path: `GET /metrics` on the existing `LISTEN_ADDR` listener
+  (default `0.0.0.0:8080`), served by the same router as `/health` and
+  `/readyz`. No dedicated port, auth, or query parameters.
+- Success status is `200` with the full exposition body, even with no
+  gateway and no database. There is no `503` or empty-body case.
+- Headers, byte-exact: `Content-Type: text/plain; version=0.0.4;
+  charset=utf-8` and `Cache-Control: no-store`.
+- Body: Prometheus text exposition 0.0.4. Every family is preceded by its
+  `# HELP` / `# TYPE` lines, one sample per line, body ends with a trailing
+  newline. All families render from process start at zero/`NaN`, before any
+  gateway event or job completion.
+
+## Label allowlists (stable)
+
+Renaming a metric, label, or allowlisted value breaks scrapers; new values
+are added to these compile-time lists in `crates/core/src/metrics.rs`, never
+as dynamic labels.
+
+- `two_bot_gateway_events_total{event}` — `event` is one of `READY`,
+  `RESUMED`, `GUILD_CREATE`, `GUILD_DELETE`, `GUILD_UPDATE`,
+  `GUILD_MEMBER_ADD`, `GUILD_MEMBER_REMOVE`, `GUILD_MEMBER_UPDATE`,
+  `MESSAGE_CREATE`, `MESSAGE_UPDATE`, `MESSAGE_DELETE`,
+  `VOICE_STATE_UPDATE`, `INVITE_CREATE`, `INVITE_DELETE`,
+  `INTERACTION_CREATE`, `HEARTBEAT_ACK`, `GATEWAY_CLOSE`, `other`.
+- `two_bot_rest_requests_total{route,result}` — `result` is one of `2xx`,
+  `3xx`, `4xx`, `429`, `5xx`, `transport`. `route` is one of the fixed
+  executor route templates (`GET /channels/:channel`,
+  `GET /channels/:channel/messages`, `GET /guilds/:guild`,
+  `GET /guilds/:guild/members`, `GET /guilds/:guild/scheduled-events`,
+  `DELETE /guilds/:guild/bans/:member`,
+  `DELETE /channels/:channel/permissions/:overwrite`,
+  `PUT /applications/:application/commands`,
+  `PUT /applications/:application/guilds/:guild/commands`,
+  `POST /interactions/:interaction/:token/callback`,
+  `POST /channels/:channel/messages`,
+  `DELETE /channels/:channel/messages/:message`,
+  `DELETE /guilds/:guild/members/:member`,
+  `PUT /guilds/:guild/bans/:member`,
+  `PATCH /guilds/:guild/members/:member`, `PATCH /channels/:channel`,
+  `PUT /channels/:channel/permissions/:overwrite`,
+  `POST /channels/:channel/messages/bulk-delete`,
+  `PUT /guilds/:guild/members/:member/roles/:role`,
+  `DELETE /guilds/:guild/members/:member/roles/:role`,
+  `POST /guilds/:guild/scheduled-events`,
+  `PATCH /guilds/:guild/scheduled-events/:event`,
+  `DELETE /guilds/:guild/scheduled-events/:event`, `other`).
+- `two_bot_job_last_success_timestamp_seconds{job}` — `job` is one of
+  `invite_snapshot`, `session_checkpoint`, `other`. `session_checkpoint`
+  records successful durable gateway commits; zero means never run.
+- `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
+  `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
+  `_sum` and `_count`.
+
+## Readiness breakdown (`/readyz`)
+
+- `GET /readyz` on the same listener: `200` when every listed component
+  reports `ready`, otherwise `503`. `starting` and `down` both count as not
+  ready.
+- The body is JSON, never a bare error string:
+  `{"components": [["process", "ready"], ["gateway", "down"]], "jobs": {...}}`.
+  Component statuses serialize lowercase (`ready`/`starting`/`down`), so a
+  degraded response names the failing component (e.g. `"gateway"` with
+  `"down"` while connecting/reconnecting reports `"starting"`).
+- The `jobs` map is informational supervisor status; it does not change the
+  readiness code. Supervisor outcomes and alert rules are separately owned
+  and not part of this contract.
 
 ## Cardinality and memory
 
