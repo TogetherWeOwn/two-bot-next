@@ -191,7 +191,10 @@ async fn profile_with_stored_zero_xp_keeps_numeric_rank_and_tie_order(
     }
     for (member, rank) in [(A, 2), (B, 3)] {
         let profile = store::profile(&pool, GUILD, member).await?;
-        assert_eq!((profile.xp, profile.level, profile.rank), (0, 0, Some(rank)));
+        assert_eq!(
+            (profile.xp, profile.level, profile.rank),
+            (0, 0, Some(rank))
+        );
         assert_eq!(profile.member_count, 3);
         assert!(rank_reply(&profile, "Zero XP")
             .content
