@@ -23,6 +23,11 @@ environment. Names only — values never go in cards, logs, or PRs:
   the staging bot token.
 - `GUILD_ID` — Worker secret (`wrangler secret put --env staging`),
   the TWO Staging guild (`1545644954272137297`).
+- `DATABASE_URL` — Worker secret (`wrangler secret put --env staging`),
+  the direct, unpooled URL for the bot's dedicated `two_bot` database and role
+  on the Neon **staging** branch (`br-summer-sunset`, project
+  `rough-dream-43123587`), separate from the web's `two` / `two_app`.
+  Required for gateway checkpoint persistence; never use a production URL.
 - `STAGING_WORKER_URL` — GitHub Actions **variable** (not a secret), the
   staging Worker URL, used by the `/readyz` gate. If it is missing the gate
   fails closed with instructions instead of deploying blind.

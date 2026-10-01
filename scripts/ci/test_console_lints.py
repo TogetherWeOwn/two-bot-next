@@ -6,6 +6,11 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CLI_MODULES = {
     "crates/bot/src/backup_cli.rs",
+    "crates/bot/src/database_roles_cli.rs",
+    "crates/bot/src/preflight.rs",
+    "crates/core/examples/metrics_rss.rs",
+    "crates/cutover/src/bin/legacy_copy.rs",
+    "crates/cutover/src/bin/legacy_verify.rs",
     "crates/cutover/src/bin/backfill.rs",
     "crates/cutover/src/bin/backfill_messages.rs",
     "crates/cutover/src/bin/capture.rs",
@@ -27,10 +32,17 @@ class ConsoleLintTests(unittest.TestCase):
                 package = tomllib.loads(path.read_text())
                 self.assertEqual(package["lints"], {"workspace": True})
 
+    def test_preflight_stdout_is_limited_to_report_and_help(self):
+        source = (ROOT / "crates/bot/src/preflight.rs").read_text()
+        self.assertNotIn("#![allow(clippy::print_stdout)]", source)
+        self.assertEqual(source.count("#[allow(clippy::print_stdout)]"), 2)
+        self.assertIn("#[allow(clippy::print_stdout)]\n    fn render(", source)
+        self.assertIn("#[allow(clippy::print_stdout)] // CLI help only; preserve exact output bytes.\nfn print_usage()", source)
+
     def test_stdout_suppressions_are_cli_only_and_dbg_is_not_suppressed(self):
         # Clippy provides the behavioral enforcement. This regression fixture
         # also prevents widening the narrowly documented CLI exceptions.
-        for path in (ROOT / "crates").glob("*/src/**/*.rs"):
+        for path in (ROOT / "crates").glob("*/**/*.rs"):
             with self.subTest(path=path):
                 source = path.read_text()
                 attributes = re.findall(r"#!?\[\s*(?:allow|expect)\s*\((.*?)\)\s*\]", source, re.DOTALL)

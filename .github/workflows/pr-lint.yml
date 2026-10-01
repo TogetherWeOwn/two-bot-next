@@ -42,7 +42,7 @@ jobs:
     permissions:
       contents: read # Resolve stored overflow notes through the Contents API.
       pull-requests: read # Fetch and validate the dispatched release PR metadata.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 5
     steps:
       - name: Resolve PR title/body

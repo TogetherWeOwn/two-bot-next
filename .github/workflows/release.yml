@@ -22,7 +22,7 @@ jobs:
       contents: write # Publish releases and reconcile the release/notes branches.
       pull-requests: write # Create and reconcile the release PR.
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 10
     outputs:
       pr_available: ${{ steps.select.outputs.pr_available }}
@@ -162,7 +162,7 @@ jobs:
       actions: write # Dispatch required checks for GITHUB_TOKEN-created release PRs.
     needs: release-please
     if: needs.release-please.outputs.pr_available == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 5
     steps:
       - env:

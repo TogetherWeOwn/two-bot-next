@@ -25,11 +25,31 @@ use two_bot_core::backup::{
     http, retention, s3,
 };
 
+pub fn print_server_usage() {
+    println!("{}", crate::preflight::USAGE);
+}
+
 fn env_var(name: &str) -> Option<String> {
     env::var(name)
         .ok()
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
+}
+
+/// Open a Postgres pool through the shared redacting parse path
+/// (`two_bot_core::database_url`): unsupported query keys are refused before
+/// the pinned driver's parser can WARN-log their values, the driver's passfile
+/// diagnostics stay suppressed for the synchronous parse, and every failure is
+/// a constant message that never echoes the URL. Same default pool options as
+/// `PgPool::connect`, so this only changes what failures can disclose.
+async fn open_pool(url: &str) -> Result<sqlx::PgPool, &'static str> {
+    two_bot_core::database_url::validate(url)?;
+    let options =
+        two_bot_core::database_url::connect_options(url).map_err(|_| "invalid database URL")?;
+    sqlx::postgres::PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .map_err(|_| "cannot connect; database details redacted")
 }
 
 /// Only an absent credential permits the deliberate environment fallback.
@@ -84,7 +104,13 @@ fn staging_token() -> Result<String, String> {
 
 /// Bump-friendly usage text. `--help` after any subcommand prints it.
 const USAGE: &str = "\
-two-bot backup & restore (TOG-9881)
+two-bot operator commands
+
+  two-bot db roles plan
+      Print the reviewed role SQL; never connects or applies it.
+
+  two-bot db roles verify
+      Read-only privilege drift inspection. Env: TWO_DATABASE_URL (required).
 
   two-bot backup
       Dump all bot-owned tables (v3 format) to TWO_BACKUP_DIR
@@ -141,6 +167,7 @@ pub async fn dispatch(args: &[String]) -> i32 {
         return 0;
     }
     match args[0].as_str() {
+        "db" => crate::database_roles_cli::dispatch(&args[1..]).await,
         "backup" => cmd_backup().await,
         "restore" => cmd_restore(&args[1..]).await,
         "backup-upload" => cmd_backup_upload(&args[1..]).await,
@@ -185,10 +212,12 @@ async fn cmd_backup() -> i32 {
     let stamp = guild_config::filename_stamp();
     let out = PathBuf::from(&dest).join(format!("two-funnel-{stamp}.ndjson.gz"));
 
-    let pool = match sqlx::PgPool::connect(&url).await {
+    // Every failure is a bounded constant from `open_pool`: the URL and its
+    // query secrets never reach logs or CLI output.
+    let pool = match open_pool(&url).await {
         Ok(pool) => pool,
-        Err(err) => {
-            eprintln!("backup: cannot connect: {err}");
+        Err(detail) => {
+            eprintln!("backup: {detail}");
             return 1;
         }
     };
@@ -385,10 +414,12 @@ async fn cmd_restore(args: &[String]) -> i32 {
         return cmd_restore_dry_run(&file, url.as_deref()).await;
     }
 
-    let pool = match sqlx::PgPool::connect(url.as_ref().expect("checked")).await {
+    // Every failure is a bounded constant from `open_pool`: the URL and its
+    // query secrets never reach logs or CLI output.
+    let pool = match open_pool(url.as_ref().expect("checked")).await {
         Ok(pool) => pool,
-        Err(err) => {
-            eprintln!("restore: cannot connect: {err}");
+        Err(detail) => {
+            eprintln!("restore: {detail}");
             return 1;
         }
     };
@@ -465,7 +496,9 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
     let mut before: std::collections::BTreeMap<String, String> = Default::default();
     if let Some(url) = url {
         println!("restore: checking configured target");
-        match sqlx::PgPool::connect(url).await {
+        // Every probe failure is a bounded constant from `open_pool`: the
+        // URL and its query secrets never reach logs or CLI output.
+        match open_pool(url).await {
             Ok(probe) => {
                 for name in dump_file::DUMP_TABLES {
                     let count: Result<(i64,), _> =
@@ -484,8 +517,8 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
                 }
                 probe.close().await;
             }
-            Err(err) => {
-                eprintln!("restore: cannot probe target ({err}); checking the file only.");
+            Err(_) => {
+                eprintln!("restore: cannot probe target; database details redacted; checking the file only.");
                 for name in dump_file::DUMP_TABLES {
                     before.insert((*name).to_owned(), "(not checked)".to_owned());
                 }
@@ -600,7 +633,14 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
     let timeout_ms: u64 = env_var("TWO_BACKUP_S3_TIMEOUT_MS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(300_000);
-    match http::put(&signed.url, signed.headers, body, timeout_ms.div_ceil(1000)).await {
+    match http::put(
+        signed.url.expose(),
+        signed.headers.expose().clone(),
+        body,
+        timeout_ms.div_ceil(1000),
+    )
+    .await
+    {
         Ok(res) => {
             if !(200..300).contains(&res.status.as_u16()) {
                 eprintln!(
@@ -611,12 +651,9 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
                 );
                 return 1;
             }
-            println!(
-                "backup-upload-s3: stored {}/{} etag={}",
-                target.bucket,
-                key,
-                res.header("etag").unwrap_or("(none)")
-            );
+            // Even successful response headers can echo signed credentials.
+            // The destination is ours; the remote ETag is not a safe log field.
+            println!("backup-upload-s3: stored {}/{}", target.bucket, key);
             0
         }
         Err(err) => {
@@ -1177,6 +1214,25 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("cannot read discord_staging_token"));
         assert!(err.contains("refusing environment fallback"));
+    }
+
+    #[tokio::test]
+    async fn open_pool_rejects_unknown_query_secrets_without_network_access() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!(
+            "postgres://fixture-user:fixture-password@127.0.0.1:{port}/db?api_key=fixture-restore-secret"
+        );
+        let error = super::open_pool(&url).await.unwrap_err();
+        assert_eq!(error, "unsupported database URL parameter");
+        assert!(!error.contains("fixture"));
+        // Validation precedes any socket: nothing may reach the listener,
+        // not even one connection attempt.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,8 +1,10 @@
 name: deploy-staging
 
-# Deploys the Worker + Container to the staging environment on every push to
-# main, then gates on /readyz: the container must report the gateway ready
-# against the staging guild. Prod deploys are manual (B4 owns the cutover).
+# AUTOMATED staging deployment and HTTP probes are suspended (TOG-10894).
+# The entire job is statically disabled for push and dispatch, before runner or
+# secret resolution. A skipped job is NOT deployment, readiness or E2E evidence.
+# Activation requires the actual protected-staging/secret-placement evidence,
+# separate approval and independent exact-head review (TOG-11271).
 on:
   push:
     branches: [main]
@@ -17,11 +19,12 @@ concurrency:
 jobs:
   deploy:
     name: wrangler deploy + readyz gate
-    # Deployment secrets and approvals remain scoped to staging.
+    if: ${{ false }} # zizmor: ignore[obfuscation] explicit unconditional suspension, tested offline
+    # Environment name alone does not prove protection or scoped secrets.
     environment: staging
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     defaults:
       run:

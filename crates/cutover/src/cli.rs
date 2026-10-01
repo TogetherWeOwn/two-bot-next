@@ -114,8 +114,8 @@ pub async fn open_db(_args: &Args, migrations_off: bool) -> CutoverDb {
         .unwrap_or(DB_POOL_MAX_DEFAULT);
     match crate::connect(&url, pool_max, migrations_off).await {
         Ok(db) => db,
-        Err(e) => {
-            eprintln!("cannot open database: {e}");
+        Err(_) => {
+            eprintln!("cannot open database; connection details redacted");
             std::process::exit(1);
         }
     }

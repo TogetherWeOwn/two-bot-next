@@ -13,12 +13,32 @@ an ephemeral Git credential helper for that one command, not a persisted token.
 Untrusted PR metadata remains in environment variables, never interpolated into
 shell source. The deploy job does not restore caches from PR checks.
 
-## Staging rollout prerequisite
+## Staging suspension and activation prerequisite
 
-The deployment job binds GitHub environment `staging`. **A YAML environment
+AUTOMATED staging deployment is suspended by the unconditional job-level
+`jobs.deploy.if: ${{ false }}` in `deploy-staging.yml`, for both push/main and
+workflow_dispatch. This blocks the whole runner/checkout/install/deploy/probe
+path; no input, variable, actor or secret can enable it. A skipped green job is
+**not** deployment, readiness, protected-environment or E2E success. Existing
+running staging resources are unchanged; no alternate manual route is authorized.
+
+CISO accepted this disabled CI-only scope in TOG-10958 and TOG-11179 plan revision
+2. The frozen 31-occurrence baseline and independent exact-head green-CI review
+and non-author squash-merge gates remain. Actual staging provisioning and later
+activation are separate on TOG-11271; this change does not satisfy that receipt.
+
+The offline workflow regression uses pinned PyYAML 6.0.3, rejects duplicate
+keys, inventories every workflow/job, requires all staging jobs to have the exact
+static-false guard, and rejects new jobs/workflows or known CI jobs repurposed as
+deploy/probe alternatives. Negative fixtures cover guard deletion/mutation,
+step-only guards, mutable activation flags and alternate deployment jobs. It
+also preserves private self-hosted routing, job-container service isolation,
+per-job grants and nonpersistent checkouts.
+
+The suspended job retains GitHub environment `staging`. **A YAML environment
 name alone does not create protection rules or scope repository-level secrets.**
-Before merging/deploying this workflow change, an authorized provisioning
-principal must verify and retain evidence for:
+Before separately approved activation, an authorized provisioning principal must
+verify and retain evidence for:
 
 - An existing protected `staging` environment with approved deployment approval
   and branch restrictions (only approved staging code, normally `main`).
@@ -42,8 +62,9 @@ python3 scripts/ci/verify-codeowners.py
 
 The snowflake gate scans `crates/*/src/**/*.rs` for decimal literals/strings with
 17–20 digits, including numeric separators and raw strings. Comments and exact
-`#[cfg(test)]` inline modules are excluded; integration-test fixtures under
-`crates/*/tests` are not production source. A production item after a test module
+`#[cfg(test)]` inline modules are excluded. External test modules must start with
+an explicit `#![cfg(test)]`; filenames alone do not exempt source. Integration-test
+fixtures under `crates/*/tests` are not production source. A production item after a test module
 is still scanned. This is a lexical guard, not a Rust constant-expression
 interpreter: computed, encoded, and non-decimal values still need code review.
 
@@ -67,9 +88,10 @@ separately verified runtime/config migration.
 
 ## Console macros and ownership
 
-All five Cargo packages inherit workspace Clippy `print_stdout = "deny"` and
-`dbg_macro = "deny"`. Only the seven cutover operator binary modules and the bot
-backup CLI locally allow stdout for their intentional human/JSON output. Debug
+All six Cargo packages inherit workspace Clippy `print_stdout = "deny"` and
+`dbg_macro = "deny"`. Only the nine cutover operator binary modules and the bot
+backup/database-role CLI modules, the preflight report/help functions, and the
+local metrics measurement example allow stdout for intentional human/JSON/SQL output. Debug
 macros remain denied even in CLI code. Runtime/library code uses tracing.
 Regression fixtures verify every package inherits the lint policy and the
 stdout exception paths remain CLI-only. CI Clippy provides compilation-based
@@ -89,6 +111,10 @@ no write grant. Transitive dependencies remain unlocked. A future fixture
 lockfile can remove this exception; it is not an exception for deployment
 package installation.
 
-A pedantic zizmor audit also reports two informational `superfluous-actions`
-advisories for the existing pinned Rust toolchain Actions. They are intentionally
-retained; all existing Action SHAs and pin comments are preserved.
+The static-false staging condition has a narrow `obfuscation` suppression:
+its explicit expression is the reviewed suspension invariant, not untrusted
+input or a mutable activation flag. The offline regression requires it exactly.
+
+Pedantic zizmor may report informational `superfluous-actions` advisories for
+existing pinned Rust toolchain Actions. They are intentionally retained; all
+existing Action SHAs and pin comments are preserved.

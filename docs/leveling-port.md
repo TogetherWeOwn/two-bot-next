@@ -74,19 +74,27 @@ The follow-up integration must:
 
 ## Verification
 
+Create one empty `two_bot_test_local` bootstrap database on the disposable
+service, owned by `agent_test` with its documented empty password and `CREATEDB`
+permission (see [CONTRIBUTING.md](../CONTRIBUTING.md#database-tests)). Then run:
+
 ```sh
+export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --features two-bot-core/db --locked -- -D warnings
 cargo test --workspace --features two-bot-core/db --locked
-cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
+cargo test -p two-bot-core --features db --locked --test leveling_store
 ```
 
-The last command connects only to `agent-testdb:5432`, user/database
-`agent_test`, empty password, and creates a random isolated schema. It never
-reads `DATABASE_URL` or inherited application credentials and never falls back
-on connection failure. CI runs the same tests against its credential-free
-Postgres service container using all three explicit CI flags. No tests contact
-Discord, staging databases or production databases.
+The last command executes all 13 leveling tests (none are ignored). The shared
+`two-bot-testsupport` fixture connects only to `agent-testdb:5432`, uses the
+passwordless `agent_test` principal, and creates a unique migrated database per
+test. The bootstrap is never migrated, reset or dropped. It never reads
+`DATABASE_URL` or inherited application credentials and never falls back on
+connection failure. CI aliases its disposable Postgres service as `agent-testdb`
+and supplies the shared bootstrap URL; no slice-specific CI opt-in is needed.
+Loopback URLs are refused even with CI flags set. No tests contact Discord,
+staging databases or production databases.
 
 The checked-in golden fixture executes the frozen legacy functions, covering
 104 level thresholds, 210 XP samples (threshold-minus-one and the storage

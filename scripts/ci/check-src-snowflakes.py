@@ -56,6 +56,10 @@ def tokens(source):
 
 def production_literals(source):
     items = list(tokens(source))
+    # An explicit inner cfg(test) makes this entire external module test-only.
+    # Never infer this from its filename or from a parent's module declaration.
+    if [t.group() for t in items[:8]] == ["#", "!", "[", "cfg", "(", "test", ")", "]"]:
+        return
     test_attribute = ["#", "[", "cfg", "(", "test", ")", "]"]
     i = 0
     while i < len(items):

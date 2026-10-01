@@ -64,6 +64,20 @@ let x = "#[cfg(test)] mod tests {";
 const ID: &str = "123456789012345678";
 '''), ["123456789012345678"])
 
+    def test_external_module_requires_explicit_inner_test_gate(self):
+        source = 'const ID: &str = "123456789012345678";'
+        self.assertEqual(self.values('#![cfg(test)]\n' + source), [])
+        self.assertEqual(self.values('#![cfg(feature = "test")]\n' + source), ["123456789012345678"])
+        self.assertEqual(self.values('const TEXT: &str = "#![cfg(test)]";\n' + source), ["123456789012345678"])
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as temp:
+            root = Path(temp)
+            path = root / "crates/core/src/tests.rs"
+            path.parent.mkdir(parents=True)
+            path.write_text(source)
+            self.assertEqual(len(snowflakes.check(root, [])), 1)
+            path.write_text('#![cfg(test)]\n' + source)
+            self.assertEqual(snowflakes.check(root, []), [])
+
     def test_allowance_is_path_line_value_and_occurrence_scoped(self):
         source = 'pub const LIVE_GUILD_ID: &str = "123456789012345678";'
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as temp:
