@@ -31,7 +31,7 @@ jobs:
   release-please:
     name: release-please
     if: github.ref == 'refs/heads/main' && inputs.dry_run != true && (inputs.release_tag == '' || github.event_name != 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 10
     outputs:
       pr_available: ${{ steps.select.outputs.pr_available }}
@@ -163,7 +163,7 @@ jobs:
     name: dispatch-checks
     needs: release-please
     if: needs.release-please.outputs.pr_available == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 5
     steps:
       - env:
