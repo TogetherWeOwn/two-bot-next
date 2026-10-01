@@ -1,0 +1,1 @@
+CREATE TABLE fixture_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
