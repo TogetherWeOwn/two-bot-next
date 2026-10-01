@@ -11,9 +11,8 @@
 //! `record_earliest`, forward-only `touch_activity`, and the members
 //! projection guards.
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
-use std::str::FromStr;
 
 /// Legacy pool default (`TWO_DB_POOL_MAX ?? 5`).
 pub const DB_POOL_MAX_DEFAULT: u32 = 5;
@@ -37,15 +36,19 @@ pub async fn connect(
                 .to_owned(),
         ));
     }
-    let mut options = PgConnectOptions::from_str(url)
-        .map_err(|e| sqlx::Error::InvalidArgument(format!("invalid database URL: {e}")))?;
+    two_bot_core::database_url::validate(url)
+        .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
+    // Passfile diagnostics stay suppressed during the synchronous parse, but a
+    // well-formed entry still supplies the password (see `database_url`).
+    let mut options = two_bot_core::database_url::connect_options(url)?;
     // Statement timeout rides the connection options (server-side setting
     // per connection), so no per-connection SET is needed.
     options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);
     let pool = PgPoolOptions::new()
         .max_connections(pool_max)
         .connect_with(options)
-        .await?;
+        .await
+        .map_err(|_| sqlx::Error::InvalidArgument("database connection failed".to_owned()))?;
     let db = CutoverDb { pool };
     if !skip_migrations {
         if let Err(e) = db.migrate().await {
@@ -73,7 +76,7 @@ impl CutoverDb {
         sqlx::migrate!("./migrations")
             .run(&self.pool)
             .await
-            .map_err(|e| sqlx::Error::InvalidArgument(format!("migration failed: {e}")))
+            .map_err(|_| sqlx::Error::InvalidArgument("database migration failed".to_owned()))
     }
 
     /// Close idle connections (drains the pool).
@@ -168,7 +171,7 @@ pub async fn record_event(
 /// Members projection guards (legacy `EventStore.project`): joins overwrite
 /// the arrival columns but clear `left_at`; milestone columns are
 /// earliest/first-wins; recency only ever moves forward.
-async fn project_event(
+pub(crate) async fn project_event(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     e: &FunnelWrite,
 ) -> Result<(), sqlx::Error> {
@@ -246,7 +249,7 @@ async fn project_event(
 }
 
 /// Recency never moves backwards (legacy `advance`).
-async fn advance_activity(
+pub(crate) async fn advance_activity(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     guild_id: &str,
     member_id: &str,
@@ -390,6 +393,12 @@ pub async fn role_rewards(
 /// Replace the full reward configuration atomically: last row per level wins
 /// in the input, then delete-all + insert in one transaction (legacy
 /// `replaceRoleRewards`).
+///
+/// Takes the same per-guild advisory lock as the runtime writer
+/// (`two-bot-core::leveling_store::replace_role_rewards`) with the same key:
+/// with an empty ladder two concurrent replacements otherwise both finish
+/// `DELETE` before either `INSERT`s and commit the union of two independent
+/// configurations (TOG-10359). Keep both key strings in sync.
 pub async fn replace_role_rewards(
     db: &CutoverDb,
     guild_id: &str,
@@ -412,6 +421,11 @@ pub async fn replace_role_rewards(
         normalized.insert(r.level, r.role_id.as_str());
     }
     let mut tx = db.pool.begin().await.map_err(ReplaceRewardsError::Db)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("{guild_id}:level_role_rewards"))
+        .execute(&mut *tx)
+        .await
+        .map_err(ReplaceRewardsError::Db)?;
     sqlx::query("DELETE FROM level_role_rewards WHERE guild_id = $1")
         .bind(guild_id)
         .execute(&mut *tx)

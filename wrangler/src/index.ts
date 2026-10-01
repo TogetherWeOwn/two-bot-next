@@ -24,6 +24,7 @@ import { Container } from "@cloudflare/containers";
 import {
   TokenBuckets,
   handleRedirect,
+  isReservedInternal,
   type Campaign,
   type RedirectClick,
 } from "./redirect.ts";
@@ -36,6 +37,10 @@ export interface Env {
   GUILD_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
+  /** Consecutive failed probes; default covers ~10 minutes of keepalive ticks. */
+  UNREADY_ALERT_FAILURES?: string;
+  /** Optional Worker secret; never forwarded to the container or logged. */
+  OPS_ALERT_WEBHOOK_URL?: string;
   /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -67,61 +72,85 @@ interface KeepalivePayload {
   startedAt: number;
 }
 
+interface ReadinessState {
+  failures: number;
+  firstFailureAt: number | null;
+  alerted: boolean;
+  lastProbeAt: number;
+  lastStatus: number | null;
+}
+
+type ReadinessEvent = "container_unready_alert" | "container_unready_recovery";
+
 const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
+const DEFAULT_UNREADY_SECONDS = 600;
+const READINESS_KEY = "two-bot:readiness";
+
+function containerPort(raw: string | undefined): number {
+  if (raw === undefined) return 8080;
+  const port = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("BOT_PORT must be an integer between 1 and 65535");
+  }
+  return port;
+}
 
 /** Readonly view of the secrets/vars the DO forwards into the container. */
-function containerEnvVars(env: Env): Record<string, string> {
+function containerEnvVars(env: Env, port: number): Record<string, string> {
   const vars: Record<string, string> = {};
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;
-  vars["LISTEN_ADDR"] = `0.0.0.0:${env.BOT_PORT ?? "8080"}`;
+  vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   return vars;
 }
 
 export class TwoBotContainer extends Container<Env> {
-  defaultPort = 8080;
+  override defaultPort = containerPort(this.env.BOT_PORT);
   // Belt and braces: the schedule() keepalive below is the primary guard;
   // a long sleepAfter means a missed tick or two never costs the session.
   sleepAfter = "30m";
   pingEndpoint = "health";
+  // SDK auto-start (containerFetch -> startAndWaitForPorts) bypasses start().
+  // Class defaults feed every startup path; explicit envVars replace them.
+  // https://developers.cloudflare.com/containers/examples/env-vars-and-secrets/
+  override envVars = containerEnvVars(this.env, this.defaultPort);
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {
-      this.armKeepalive();
+      await this.armKeepalive();
       return this.containerFetch(request);
     }
 
     return new Response("not found", { status: 404 });
   }
 
-  /**
-   * Start the container with secrets from the Worker env when it is not
-   * already running. containerFetch() auto-starts with class defaults, but
-   * secrets must be passed explicitly — this is the only place Worker
-   * secrets cross into the container, as env vars (never in image/layers).
-   */
-  override async start(...args: Parameters<Container<Env>["start"]>) {
-    const [startOptions, waitOptions] = args;
-    return super.start(
-      {
-        envVars: { ...containerEnvVars(this.env), ...startOptions?.envVars },
-        ...startOptions,
-      },
-      waitOptions,
-    );
-  }
+  private keepaliveArming: Promise<void> | undefined;
+  private keepaliveRunning = false;
 
-  /** Arm the self-perpetuating schedule() keepalive (idempotent). */
-  private armKeepalive(): void {
-    // schedule() rejects while an identical pending task exists — that just
-    // means the loop is already armed.
-    void this.schedule(this.keepaliveSeconds(), "keepalive", {
-      startedAt: Date.now(),
-    } satisfies KeepalivePayload).catch(() => undefined);
+  /** Arm one persistent chain, including after Container restart/DO eviction. */
+  private armKeepalive(): Promise<void> {
+    if (this.keepaliveRunning) return Promise.resolve();
+    if (this.keepaliveArming) return this.keepaliveArming;
+    // SDK 0.3.7 creates a new task ID on EVERY schedule() call. Coalesce local
+    // callers and check persisted schedules before inserting a new task.
+    // Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
+    this.keepaliveArming = (async () => {
+      if ((await this.listSchedules("keepalive")).length === 0) {
+        await this.schedule(this.keepaliveSeconds(), "keepalive", {
+          startedAt: Date.now(),
+        } satisfies KeepalivePayload);
+      }
+    })().catch(() => {
+      // Monitoring setup must not replace health/readiness responses or fail
+      // SDK startup via onStart. Later callers retry; never log error details.
+      // https://developers.cloudflare.com/containers/api/container-class/#onstart
+      console.warn(JSON.stringify({ event: "container_keepalive_arm_failed" }));
+    }).finally(() => { this.keepaliveArming = undefined; });
+    return this.keepaliveArming;
   }
 
   private keepaliveSeconds(): number {
@@ -135,24 +164,132 @@ export class TwoBotContainer extends Container<Env> {
    * idles out from under the gateway) and probes /readyz; then re-arms.
    * Invoked by name via schedule() — keep public.
    */
-  public async keepalive(payload: KeepalivePayload): Promise<void> {
-    this.renewActivityTimeout();
+  public async keepalive(payload: KeepalivePayload, schedule?: { taskId: string }): Promise<void> {
+    // SDK 0.3.7 passes undefined when an earlier callback deleted a row in
+    // its due-task snapshot. Such stale callbacks must not sample or re-arm.
+    if (!schedule || this.keepaliveRunning) return;
+    this.keepaliveRunning = true;
     try {
-      const res = await this.containerFetch("http://c/readyz", {
-        signal: AbortSignal.timeout(6000),
-      });
-      if (!res.ok) {
-        console.warn(`two-bot /readyz unhealthy: ${res.status}`);
+      await this.keepaliveArming;
+      // The SDK already looked up this due task by ID before invoking us.
+      // listSchedules() in 0.3.7 is unordered LIMIT 1: it can select a future
+      // legacy row, and a failed extra lookup loses this task when the SDK
+      // deletes it after the callback. Trust the live callback context instead.
+      // Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
+      this.renewActivityTimeout();
+      try {
+        let status: number | null = null;
+        try {
+          const res = await this.containerFetch("http://c/readyz", {
+            signal: AbortSignal.timeout(6000),
+          });
+          status = res.status;
+          if (!res.ok) {
+            console.warn(`two-bot /readyz unhealthy: ${status}`);
+          }
+          // /readyz is a small JSON response. Drain rather than cancel: SDK
+          // 0.3.7's proxy pipe has an unhandled rejection on cancellation.
+          await res.arrayBuffer();
+        } catch {
+          status = null;
+          console.warn("two-bot keepalive probe failed");
+        }
+        await this.recordReadiness(status);
+      } finally {
+        // Replace the executing row AND any legacy duplicate chains with one
+        // successor. onStart/inbound requests must not arm during this tick.
+        // https://developers.cloudflare.com/containers/api/container-class/#schedule
+        this.deleteSchedules("keepalive");
+        await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
       }
-    } catch (err) {
-      console.warn(`two-bot keepalive probe failed: ${String(err)}`);
+    } finally {
+      this.keepaliveRunning = false;
     }
-    await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
   }
 
-  override onStart(): void {
+  private unreadyAlertFailures(): number {
+    const raw = this.env.UNREADY_ALERT_FAILURES;
+    const count = Number(raw);
+    if (raw && /^\d+$/.test(raw) && Number.isSafeInteger(count) && count > 0) {
+      return count;
+    }
+    return Math.max(1, Math.ceil(DEFAULT_UNREADY_SECONDS / this.keepaliveSeconds()));
+  }
+
+  private async recordReadiness(status: number | null): Promise<void> {
+    const now = Date.now();
+    const ready = status !== null && status >= 200 && status < 300;
+    const threshold = this.unreadyAlertFailures();
+    // Container extends DurableObject; KV survives restarts and DO eviction.
+    // No network await between the read and write: DO storage input gates
+    // protect this transition from interleaving read/modify/write calls.
+    // https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#access-storage
+    const previous = await this.ctx.storage.get<ReadinessState>(READINESS_KEY);
+    const failures = ready ? 0 : (previous?.failures ?? 0) + 1;
+    let event: ReadinessEvent | undefined;
+    if (ready && previous?.alerted) {
+      event = "container_unready_recovery";
+    } else if (!ready && failures >= threshold && !previous?.alerted) {
+      event = "container_unready_alert";
+    }
+    const state: ReadinessState = {
+      failures,
+      firstFailureAt: ready ? null : previous?.firstFailureAt ?? now,
+      alerted: !ready && (previous?.alerted === true || event === "container_unready_alert"),
+      lastProbeAt: now,
+      lastStatus: status,
+    };
+    // Persist the transition BEFORE notifying: at most one attempt per event,
+    // even if the webhook times out after accepting it or an alarm is retried.
+    await this.ctx.storage.put(READINESS_KEY, state);
+    if (!event) return;
+
+    console.warn(JSON.stringify({
+      event,
+      service: "two-bot-next",
+      consecutive_failures: ready ? previous!.failures : failures,
+      threshold,
+      status,
+      first_failure_at: ready ? previous!.firstFailureAt : state.firstFailureAt,
+      observed_at: now,
+    }));
+    await this.postReadinessWebhook(event);
+  }
+
+  private async postReadinessWebhook(event: ReadinessEvent): Promise<void> {
+    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
+    if (!binding) return;
+    try {
+      const url = new URL(binding);
+      if (url.protocol !== "https:" || url.username || url.password) {
+        throw new Error("invalid webhook binding");
+      }
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(6000),
+        body: JSON.stringify({
+          content: event === "container_unready_alert"
+            ? "two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs."
+            : "two-bot-next: Container /readyz is ready again. The unready incident has recovered.",
+          // https://docs.discord.com/developers/resources/webhook#execute-webhook
+          allowed_mentions: { parse: [], replied_user: false },
+        }),
+      });
+      await response.body?.cancel();
+      if (!response.ok) {
+        console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: response.status }));
+      }
+    } catch {
+      // Fetch errors can contain the secret URL. Never log the error or body.
+      console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: null }));
+    }
+  }
+
+  override async onStart(): Promise<void> {
     console.log("two-bot container started");
-    this.armKeepalive();
+    await this.armKeepalive();
   }
 
   override onStop(): void {
@@ -176,6 +313,13 @@ export default {
     if (url.pathname === "/health" || url.pathname === "/readyz") {
       const container = env.TWO_BOT.getByName(SINGLETON_NAME);
       return container.fetch(request);
+    }
+
+    // Metrics are container-internal, never a public proxy or invite campaign.
+    // Canonicalized like the campaign lookup so /METRICS, /%6detrics,
+    // //metrics and /metrics/* cannot become a campaign redirect.
+    if (isReservedInternal(url.pathname)) {
+      return new Response("not found", { status: 404 });
     }
 
     // B3: everything else is a go.two.gg tracked link. Clicks record after

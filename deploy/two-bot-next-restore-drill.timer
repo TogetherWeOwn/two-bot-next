@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly two-bot-next restore drill
+
+[Timer]
+# The 1st of each month, well after the 04:17 nightly backup has finished.
+OnCalendar=*-*-01 05:30:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

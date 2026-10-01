@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "group": "fixture",
+      "source": "legacy_members",
+      "target": "next_members",
+      "keys": ["id"],
+      "conflict": ["member_id"],
+      "conflict_policy": "upsert",
+      "columns": [
+        {"source": "id", "target": "member_id", "pg_type": "bigint"},
+        {"source": "enabled", "target": "enabled", "pg_type": "boolean"},
+        {"source": "joined_at", "target": "joined_at", "pg_type": "timestamptz"},
+        {"source": "metadata", "target": "metadata", "pg_type": "jsonb"},
+        {"source": "display_name", "target": "display_name", "pg_type": "text"}
+      ]
+    }
+  ],
+  "pending_groups": []
+}
