@@ -583,6 +583,116 @@ describe("configuration and campaign ingress fail closed", () => {
   });
 });
 
+describe("idle buckets expire but throttles never reset", () => {
+  test("many one-time keys expire after the fully-refilled idle window", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 5, refillPerSecond: 1 },
+      () => now,
+    );
+    for (let i = 0; i < 200; i++) {
+      assert.ok(buckets.take(`synthetic-key-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 200);
+    // Below the 5-second full-refill window: nothing may expire yet.
+    now += 4_000;
+    assert.ok(buckets.take("synthetic-key-200").allowed);
+    assert.equal(buckets.size, 201);
+    // Past the window: four live takes reap 64+64+64+8 = 200 stale entries;
+    // only the five live keys (200–204) remain.
+    now += 2_000;
+    assert.ok(buckets.take("synthetic-key-201").allowed);
+    assert.ok(buckets.take("synthetic-key-202").allowed);
+    assert.ok(buckets.take("synthetic-key-203").allowed);
+    assert.ok(buckets.take("synthetic-key-204").allowed);
+    assert.equal(buckets.size, 5);
+  });
+
+  test("an exhausted key stays throttled until refill, never via eviction", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 2, refillPerSecond: 1 },
+      () => now,
+    );
+    assert.ok(buckets.take("hot").allowed);
+    assert.ok(buckets.take("hot").allowed);
+    assert.ok(!buckets.take("hot").allowed);
+    // New keys churn around it; the hot bucket must keep its debt.
+    for (let i = 0; i < 10; i++) {
+      assert.ok(buckets.take(`churn-${i}`).allowed);
+      assert.ok(!buckets.take("hot").allowed);
+    }
+    now += 1_100;
+    assert.ok(buckets.take("hot").allowed);
+    now += 1_100;
+    assert.ok(buckets.take("hot").allowed);
+  });
+
+  test("a sub-refill idle TTL is clamped to the full-refill window", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 4, refillPerSecond: 1 },
+      () => now,
+      { idleTtlMs: 500 },
+    );
+    assert.ok(buckets.take("drained").allowed);
+    for (let i = 0; i < 4; i++) buckets.take("drained");
+    assert.ok(!buckets.take("drained").allowed);
+    // 500ms would have expired the TTL; clamped to 4s, it must not.
+    now += 600;
+    assert.ok(!buckets.take("drained").allowed);
+    now += 3_500;
+    assert.ok(buckets.take("drained").allowed);
+  });
+
+  test("past the cardinality cap new keys shed load, tracked keys keep theirs", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 1, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 3 },
+    );
+    assert.ok(buckets.take("a").allowed);
+    assert.ok(buckets.take("b").allowed);
+    assert.ok(buckets.take("c").allowed);
+    assert.equal(buckets.size, 3);
+    const shed = buckets.take("overflow");
+    assert.ok(!shed.allowed);
+    assert.ok(shed.retryAfter >= 1);
+    assert.equal(buckets.size, 3);
+    // Tracked keys still spend and throttle exactly as before.
+    assert.ok(!buckets.take("a").allowed);
+    assert.ok(!buckets.take("b").allowed);
+    now += 1_100;
+    assert.ok(buckets.take("a").allowed);
+  });
+
+  test("sweep work per call is bounded regardless of map size", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 60, refillPerSecond: 1 },
+      () => now,
+      { idleTtlMs: 60_000, sweepBudget: 4 },
+    );
+    for (let i = 0; i < 100; i++) {
+      assert.ok(buckets.take(`idle-${i}`).allowed);
+    }
+    now += 61_000;
+    // One call reaps at most 4 of the 100 idle entries, then writes its own.
+    assert.ok(buckets.take("fresh").allowed);
+    assert.equal(buckets.size, 97);
+    // Repeat live calls a bounded number of times: each reaps at most 4
+    // stale entries (stale front stays front while idle), and every new key
+    // written 60s+ after the burst is itself live — so after 24 more writes
+    // all 100 stale entries are gone with the 25 live keys remaining.
+    for (let i = 0; i < 24; i++) {
+      now += 1_000;
+      assert.ok(buckets.take(`fresh-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 25);
+  });
+});
+
 describe("validators agree with the shapes we accept", () => {
   test("slugs and codes", () => {
     for (const good of ["reddit", "r-mmorpg", "twitch-panel-2", "ab"]) {
