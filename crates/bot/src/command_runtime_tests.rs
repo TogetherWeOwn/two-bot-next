@@ -400,7 +400,7 @@ fn runtime_without_db(
 
 /// READY payload: application 1111 owns the published guild registry.
 fn ready() -> Event {
-    Event::Ready(Box::new(Ready {
+    Event::Ready(Ready {
         application: PartialApplication {
             flags: ApplicationFlags::empty(),
             id: Id::new(1111),
@@ -430,7 +430,7 @@ fn ready() -> Event {
             verified: None,
         },
         version: 10,
-    }))
+    })
 }
 
 fn executor_at(origin: String) -> ActionExecutor {
