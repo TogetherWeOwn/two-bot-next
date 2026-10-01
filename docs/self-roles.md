@@ -199,6 +199,27 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   Recovery retains pending state, switches to rollback, and preserves unresolved
   evidence even when a read looks restored. Pending audits cannot settle or
   publish success. Generation transfer refuses old workers' flag/effect writes.
+- Migration `0205_self_role_exchange_receipts.sql` adds a distinct send identity
+  and redacted receipt capability per role/direction attempt, including repeated
+  attempts on the same role. Processing and terminal journal APIs commit the
+  ticket and unioned attempted/unresolved role evidence together, require
+  initialized intent and all supplied live fences after panel -> event waits,
+  and do not authorize a send without the executor's next ownership check.
+  A surviving original sender can persist a received final HTTP status or definite
+  no-send after generation transfer, but only to its own ticket. Exact replay is
+  idempotent; contradictory receipts are refused. That API cannot write audit
+  effects/outcome/claims or the panel target. A received 5xx is response provenance,
+  not a no-effect verdict; cancellation/timeouts leave the ticket pending.
+  Pending tickets also gate aggregate checkpoint clearing and both settlement/
+  terminal-completion paths. Legacy pending work is never assigned synthetic
+  provenance. Receipt completion alone does not clear aggregate uncertainty or
+  establish convergence: current-owner incorporation and runtime ticket wiring
+  remain follow-up work. Boot stays disabled. Isolated source fixtures cover
+  processing/terminal generation transfer, same-direction ticket separation,
+  no-send and 204/403/429/500 receipts, exact/contradictory replay, invalid status,
+  uninitialized/stale journaling, snapshot-free owner-state preservation and
+  pending settlement refusal. The explicit role matrix includes the new relation;
+  its source fixture exercises runtime CRUD and web-reader denial.
 - Added regressions exercise late in-flight 204 after a newer worker commits,
   repair to both selected and empty targets, unknown-target refusal, interrupted
   exchange recovery, settlement of success/compensation, event-expiry rollback

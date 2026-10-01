@@ -65,6 +65,10 @@
       "sha256": "914f655d23730d684156a70a5ff854748bfabc6cabc58a9640d62416692b1f3a",
       "justification": "Separate terminal superseded-audit evidence leases and completion receipts from processing admission for TOG-10292; preserve rejection, immutable intent, pending exchanges and legacy names."
     },
+    "crates/cutover/migrations/0205_self_role_exchange_receipts.sql": {
+      "sha256": "5e47a6680950a2bdf8d47dd181de786eb48cff22b53224121668984102ea731a",
+      "justification": "Persist immutable per-send response/no-send receipts across self-role generation transfer for TOG-10292 without granting former workers audit settlement or target authority; retain all legacy names and unknown evidence."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."

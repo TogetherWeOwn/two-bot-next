@@ -172,6 +172,34 @@ pub struct EventClaim {
     pub renew_after_ms: u64,
 }
 
+/// A single paced send's immutable identity. This capability can only record a
+/// definitive receipt for that send, even after ownership transfers. It cannot
+/// renew claims, overwrite aggregate effects, settle an audit or publish a target.
+#[derive(Debug, Clone)]
+pub struct ExchangeTicket {
+    exchange_id: String,
+    event_id: String,
+    origin_generation: i32,
+    receipt_token: Secret<String>,
+}
+
+/// Facts known by the sender, not inferred from a later snapshot or a timer.
+/// Received 5xx records response provenance, not proof of a rejected mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangeReceipt {
+    NoSend,
+    Response { status: u16 },
+}
+
+/// Each attempt gets a distinct ticket, including repeated same-role/direction
+/// sends. Role ID and direction cannot be changed by receipt completion.
+#[derive(Debug, Clone)]
+pub struct ExchangeIntent {
+    pub role_id: String,
+    pub adding: bool,
+    pub compensating: bool,
+}
+
 /// A fresh terminal-evidence fence, not a processing event or REST authority.
 /// Acquisition rotates the former worker's token/generation without resurrecting
 /// its rejected outcome. Unknown exchanges remain unknown across that transfer.
@@ -660,7 +688,9 @@ impl SelfRoleStore {
             return Ok(false);
         }
         let (pending, unresolved): (bool, bool) = sqlx::query_as(
-            "SELECT exchange_pending,(jsonb_array_length(unresolved_added_role_ids::jsonb)>0
+            "SELECT (exchange_pending OR EXISTS
+                 (SELECT 1 FROM self_role_exchanges WHERE event_id=$1 AND disposition='pending')),
+             (jsonb_array_length(unresolved_added_role_ids::jsonb)>0
              OR jsonb_array_length(unresolved_removed_role_ids::jsonb)>0)
              FROM self_role_audit WHERE event_id=$1",
         )
@@ -1201,6 +1231,119 @@ impl SelfRoleStore {
         self.checkpoint_execution(claim, effects, false).await
     }
 
+    /// Journal a distinct send and its attempted/unresolved role evidence in one
+    /// transaction. The clock is sampled after panel -> event lock waits. This is
+    /// not send authorization: the executor must fence again after the DB wait.
+    pub async fn journal_role_exchange(
+        &self,
+        claim: &EventClaim,
+        panel: Option<&PanelClaim>,
+        intent: &ExchangeIntent,
+    ) -> Result<Option<ExchangeTicket>, StoreError> {
+        validate_exchange_intent(intent)?;
+        let mut tx = self.pool.begin().await?;
+        if let Some(panel) = panel {
+            lock_panel(&mut tx, panel).await?;
+        }
+        lock_event(&mut tx, claim).await?;
+        check_exchange_scope(&mut tx, claim, panel, intent).await?;
+        let now = self.now(&mut tx).await?;
+        let (owned,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM self_role_audit WHERE event_id=$1
+             AND claim_token=$2 AND claim_generation=$3 AND outcome='processing'
+             AND intent_initialized AND processing_expires_at > $4)",
+        )
+        .bind(&claim.event_id)
+        .bind(claim.token.expose())
+        .bind(claim.generation)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !owned || !claim.intent_initialized {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        if let Some(panel) = panel {
+            let owned = if panel.maintenance {
+                owns_repair_panel(&mut tx, panel, now).await?
+            } else {
+                owns_live_panel(&mut tx, panel, now).await?
+            };
+            if !owned {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+        }
+        let ticket = insert_role_exchange(&mut tx, claim, intent).await?;
+        tx.commit().await?;
+        Ok(Some(ticket))
+    }
+
+    /// Terminal repair journals with both live fences. A rotated evidence owner
+    /// can create a new ticket but cannot complete a former worker's ticket.
+    pub async fn journal_terminal_role_exchange(
+        &self,
+        claim: &SupersededClaim,
+        panel: &PanelClaim,
+        intent: &ExchangeIntent,
+    ) -> Result<Option<ExchangeTicket>, StoreError> {
+        validate_exchange_intent(intent)?;
+        check_repair_scope(claim, panel)?;
+        if !intent.compensating {
+            return Err(StoreError::InvalidAudit);
+        }
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, panel).await?;
+        lock_event(&mut tx, &claim.event).await?;
+        check_exchange_scope(&mut tx, &claim.event, Some(panel), intent).await?;
+        let now = self.now(&mut tx).await?;
+        if !claim.intent_initialized()
+            || !owns_terminal(&mut tx, claim, now).await?
+            || !owns_repair_panel(&mut tx, panel, now).await?
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let ticket = insert_role_exchange(&mut tx, &claim.event, intent).await?;
+        tx.commit().await?;
+        Ok(Some(ticket))
+    }
+
+    /// Complete only this immutable exchange receipt. The original sender may
+    /// write after event/lane generation transfer because this statement cannot
+    /// touch either ownership relation, aggregate effects, outcome or target.
+    /// Exact replay is idempotent; contradictory receipts fail closed. Neither a
+    /// receipt nor its timestamp retires aggregate unknown work by itself.
+    pub async fn complete_role_exchange(
+        &self,
+        ticket: &ExchangeTicket,
+        receipt: ExchangeReceipt,
+    ) -> Result<bool, StoreError> {
+        let (disposition, status) = match receipt {
+            ExchangeReceipt::NoSend => ("no_send", None),
+            ExchangeReceipt::Response { status } if (200..=599).contains(&status) => (
+                "response",
+                Some(i16::try_from(status).expect("bounded HTTP status")),
+            ),
+            ExchangeReceipt::Response { .. } => return Err(StoreError::InvalidAudit),
+        };
+        Ok(sqlx::query(
+            "UPDATE self_role_exchanges SET disposition=$5,response_status=$6,
+             completed_at=COALESCE(completed_at,clock_timestamp())
+             WHERE exchange_id=$1 AND event_id=$2 AND origin_generation=$3 AND receipt_token=$4
+             AND (disposition='pending' OR (disposition=$5 AND response_status IS NOT DISTINCT FROM $6))",
+        )
+        .bind(&ticket.exchange_id)
+        .bind(&ticket.event_id)
+        .bind(ticket.origin_generation)
+        .bind(ticket.receipt_token.expose())
+        .bind(disposition)
+        .bind(status)
+        .execute(&self.pool)
+        .await?
+        .rows_affected() == 1)
+    }
+
     /// Atomically retain exchange evidence and the monotonic rollback decision.
     /// Like late effects this is token/generation fenced, not REST authorization.
     /// A false phase never clears a persisted rollback, including after recovery.
@@ -1236,7 +1379,8 @@ impl SelfRoleStore {
                  FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
              unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8,
              compensating=compensating OR $12,
-             exchange_pending=COALESCE($13,exchange_pending)
+             exchange_pending=COALESCE($13,exchange_pending) OR EXISTS
+                 (SELECT 1 FROM self_role_exchanges WHERE event_id=$9 AND disposition='pending')
              WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11 AND outcome='processing'
              AND (NOT $12 OR intent_initialized)",
         );
@@ -1348,6 +1492,117 @@ fn ids_json(ids: &Vec<String>) -> String {
     serde_json::to_string(ids).expect("role-id array serializes")
 }
 
+fn validate_exchange_intent(intent: &ExchangeIntent) -> Result<(), StoreError> {
+    if !intent.role_id.parse::<u64>().is_ok_and(|id| id > 0)
+        || !intent.role_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(StoreError::InvalidAudit);
+    }
+    Ok(())
+}
+
+async fn check_exchange_scope(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+    panel: Option<&PanelClaim>,
+    intent: &ExchangeIntent,
+) -> Result<(), StoreError> {
+    let scope: Option<(String, String, String)> =
+        sqlx::query_as("SELECT guild_id,member_id,panel_id FROM self_role_audit WHERE event_id=$1")
+            .bind(&claim.event_id)
+            .fetch_optional(conn)
+            .await?;
+    let Some((guild, member, panel_id)) = scope else {
+        return Err(StoreError::StaleClaim);
+    };
+    if intent.role_id == guild {
+        return Err(StoreError::InvalidAudit);
+    }
+    if panel.is_some_and(|panel| {
+        panel.key.guild_id != guild
+            || panel.key.member_id != member
+            || panel.key.panel_id != panel_id
+    }) {
+        return Err(StoreError::WrongPanel);
+    }
+    Ok(())
+}
+
+async fn owns_live_panel(
+    conn: &mut PgConnection,
+    claim: &PanelClaim,
+    now: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let (owned,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM self_role_panel_claims WHERE guild_id=$1
+         AND member_id=$2 AND panel_id=$3 AND claim_token=$4 AND claim_generation=$5
+         AND processing_expires_at > $6)",
+    )
+    .bind(&claim.key.guild_id)
+    .bind(&claim.key.member_id)
+    .bind(&claim.key.panel_id)
+    .bind(claim.token.expose())
+    .bind(claim.generation)
+    .bind(now)
+    .fetch_one(conn)
+    .await?;
+    Ok(owned)
+}
+
+// Caller holds the event lock (and a panel lock when required) and has checked
+// all applicable fences against one post-lock clock. No receipt is fabricated
+// for legacy aggregate uncertainty: pre-existing pending/effects stay intact.
+async fn insert_role_exchange(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+    intent: &ExchangeIntent,
+) -> Result<ExchangeTicket, StoreError> {
+    let (exchange_id, receipt_token): (String, String) = sqlx::query_as(
+        "INSERT INTO self_role_exchanges
+         (event_id,origin_generation,role_id,adding,compensating)
+         VALUES ($1,$2,$3,$4,$5) RETURNING exchange_id,receipt_token",
+    )
+    .bind(&claim.event_id)
+    .bind(claim.generation)
+    .bind(&intent.role_id)
+    .bind(intent.adding)
+    .bind(intent.compensating)
+    .fetch_one(&mut *conn)
+    .await?;
+    sqlx::query(
+        "UPDATE self_role_audit SET exchange_pending=TRUE,repair_complete=FALSE,
+         compensating=CASE WHEN outcome='processing' THEN compensating OR $4 ELSE compensating END,
+         attempted_added_role_ids=CASE WHEN $3 THEN
+             (SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+              FROM jsonb_array_elements_text(attempted_added_role_ids::jsonb || jsonb_build_array($2::text)))
+             ELSE attempted_added_role_ids END,
+         attempted_removed_role_ids=CASE WHEN NOT $3 THEN
+             (SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+              FROM jsonb_array_elements_text(attempted_removed_role_ids::jsonb || jsonb_build_array($2::text)))
+             ELSE attempted_removed_role_ids END,
+         unresolved_added_role_ids=CASE WHEN $3 THEN
+             (SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+              FROM jsonb_array_elements_text(unresolved_added_role_ids::jsonb || jsonb_build_array($2::text)))
+             ELSE unresolved_added_role_ids END,
+         unresolved_removed_role_ids=CASE WHEN NOT $3 THEN
+             (SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+              FROM jsonb_array_elements_text(unresolved_removed_role_ids::jsonb || jsonb_build_array($2::text)))
+             ELSE unresolved_removed_role_ids END WHERE event_id=$1",
+    )
+    .bind(&claim.event_id)
+    .bind(&intent.role_id)
+    .bind(intent.adding)
+    .bind(intent.compensating)
+    .execute(conn)
+    .await?;
+    Ok(ExchangeTicket {
+        exchange_id,
+        event_id: claim.event_id.clone(),
+        origin_generation: claim.generation,
+        receipt_token: Secret::new(receipt_token),
+    })
+}
+
 fn check_repair_scope(claim: &SupersededClaim, panel: &PanelClaim) -> Result<(), StoreError> {
     if claim.audit.guild_id != panel.key.guild_id
         || claim.audit.member_id != panel.key.member_id
@@ -1418,7 +1673,9 @@ async fn record_terminal_exchange(
          compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
              FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
          unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8,
-         exchange_pending=COALESCE($12,exchange_pending),repair_complete=FALSE
+         exchange_pending=COALESCE($12,exchange_pending) OR EXISTS
+             (SELECT 1 FROM self_role_exchanges WHERE event_id=$9 AND disposition='pending'),
+         repair_complete=FALSE
          WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11
          AND outcome='rejected' AND code='superseded_by_later_event'",
     );
@@ -1457,7 +1714,9 @@ async fn require_settleable_event(
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
     let pending: Option<(bool,)> = sqlx::query_as(
-        "SELECT exchange_pending FROM self_role_audit WHERE event_id=$1
+        "SELECT (exchange_pending OR EXISTS
+             (SELECT 1 FROM self_role_exchanges WHERE event_id=$1 AND disposition='pending'))
+         FROM self_role_audit WHERE event_id=$1
          AND claim_token=$2 AND claim_generation=$3 AND outcome='processing'
          AND intent_initialized AND processing_expires_at > $4",
     )
@@ -1520,7 +1779,8 @@ async fn finish_audit(
              FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $13::jsonb)),
          unresolved_added_role_ids=$14,unresolved_removed_role_ids=$15,processing_expires_at=NULL
          WHERE event_id=$16 AND claim_token=$17 AND claim_generation=$18 AND outcome='processing'
-         AND guild_id=$19 AND member_id=$20 AND panel_id=$21 AND source_id=$22",
+         AND guild_id=$19 AND member_id=$20 AND panel_id=$21 AND source_id=$22
+         AND NOT EXISTS (SELECT 1 FROM self_role_exchanges WHERE event_id=$16 AND disposition='pending')",
     )
     .bind(&row.option_key)
     .bind(&row.role_id)

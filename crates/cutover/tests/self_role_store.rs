@@ -13,8 +13,8 @@ use time::OffsetDateTime;
 use two_bot_core::self_roles::event_order_for_event_id;
 use two_bot_core::{PanelMode, RoleOperation, SettledOutcome};
 use two_bot_cutover::self_role_store::{
-    AuditEffects, EventClaim, PanelClaim, PanelClaimResult, PanelKey, SelfRoleAudit, SelfRoleStore,
-    StoreError,
+    AuditEffects, EventClaim, ExchangeIntent, ExchangeReceipt, PanelClaim, PanelClaimResult,
+    PanelKey, SelfRoleAudit, SelfRoleStore, StoreError,
 };
 
 const TEST_NOW_MS: i64 = 1_700_000_000_000;
@@ -104,6 +104,303 @@ async fn leases_recovery_ordering_and_atomic_settlement() -> TestResult {
         .await?;
     admin.close().await;
     result
+}
+
+async fn exchange_owner_state(pool: &PgPool, event: &str) -> TestResult<(String, Option<String>)> {
+    let (audit,): (String,) = sqlx::query_as(
+        "SELECT (to_jsonb(a)-'claim_token')::text FROM self_role_audit a WHERE event_id=$1",
+    )
+    .bind(event)
+    .fetch_one(pool)
+    .await?;
+    let panel: Option<(String,)> = sqlx::query_as(
+        "SELECT (to_jsonb(p)-'claim_token')::text FROM self_role_panel_claims p
+         JOIN self_role_audit a USING(guild_id,member_id,panel_id) WHERE a.event_id=$1",
+    )
+    .bind(event)
+    .fetch_optional(pool)
+    .await?;
+    Ok((audit, panel.map(|row| row.0)))
+}
+
+async fn exchange_receipts_survive_generation_transfer(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    let mut audit = row("exchange-processing", "exchange-processing");
+    audit.panel_id = audit.event_id.clone();
+    let original = store.claim_audit(&audit).await?.unwrap();
+    let key = panel_key(&audit);
+    let lane = acquired(
+        store
+            .claim_panel(&key, Some((&audit.event_id, "0001")))
+            .await?,
+    );
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: true,
+        compensating: false,
+    };
+    for role in ["", "0", "abc", "18446744073709551616"] {
+        assert!(matches!(
+            store
+                .journal_role_exchange(
+                    &original,
+                    Some(&lane),
+                    &ExchangeIntent {
+                        role_id: role.into(),
+                        ..intent.clone()
+                    }
+                )
+                .await,
+            Err(StoreError::InvalidAudit)
+        ));
+    }
+    // Even repeated same-role/direction work has distinct provenance.
+    let first = store
+        .journal_role_exchange(&original, Some(&lane), &intent)
+        .await?
+        .unwrap();
+    let second = store
+        .journal_role_exchange(&original, Some(&lane), &intent)
+        .await?
+        .unwrap();
+    let third = store
+        .journal_role_exchange(
+            &original,
+            Some(&lane),
+            &ExchangeIntent {
+                role_id: "102".into(),
+                adding: false,
+                compensating: true,
+            },
+        )
+        .await?
+        .unwrap();
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM self_role_exchanges WHERE event_id=$1")
+            .bind(&audit.event_id)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(count, 3);
+    assert!(
+        store
+            .complete_role_exchange(&first, ExchangeReceipt::NoSend)
+            .await?
+    );
+    assert!(
+        store
+            .complete_role_exchange(&first, ExchangeReceipt::NoSend)
+            .await?
+    );
+    assert!(
+        !store
+            .complete_role_exchange(&first, ExchangeReceipt::Response { status: 204 })
+            .await?
+    );
+    assert!(matches!(
+        store
+            .complete_role_exchange(&second, ExchangeReceipt::Response { status: 199 })
+            .await,
+        Err(StoreError::InvalidAudit)
+    ));
+
+    clock.fetch_add(301, Ordering::SeqCst);
+    let recovered = store.claim_audit(&audit).await?.unwrap();
+    assert_eq!(recovered.generation, original.generation + 1);
+    assert!(recovered.exchange_pending);
+    assert!(recovered.compensating);
+    assert!(store
+        .journal_role_exchange(&original, Some(&lane), &intent)
+        .await?
+        .is_none());
+    assert!(
+        !store
+            .checkpoint_exchange(&original, &AuditEffects::default(), false, Some(false))
+            .await?
+    );
+    let before = exchange_owner_state(pool, &audit.event_id).await?;
+    // A received 500 is durable response provenance, NOT a no-effect verdict.
+    assert!(
+        store
+            .complete_role_exchange(&second, ExchangeReceipt::Response { status: 500 })
+            .await?
+    );
+    assert!(
+        store
+            .complete_role_exchange(&second, ExchangeReceipt::Response { status: 500 })
+            .await?
+    );
+    assert!(
+        !store
+            .complete_role_exchange(&second, ExchangeReceipt::NoSend)
+            .await?
+    );
+    assert!(
+        !store
+            .complete_role_exchange(&second, ExchangeReceipt::Response { status: 204 })
+            .await?
+    );
+    assert_eq!(exchange_owner_state(pool, &audit.event_id).await?, before);
+    let (pending,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM self_role_exchanges WHERE event_id=$1 AND disposition='pending'",
+    )
+    .bind(&audit.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(pending, 1);
+    // An aggregate checkpoint cannot erase a different ticket's unknown send.
+    assert!(
+        store
+            .checkpoint_exchange(&recovered, &AuditEffects::default(), false, Some(false))
+            .await?
+    );
+    assert!(matches!(
+        store.finish_owned_audit(&audit, &recovered).await,
+        Err(StoreError::PendingExchange)
+    ));
+    assert!(matches!(
+        store.finish_audit(&audit, &recovered).await,
+        Err(StoreError::StaleClaim)
+    ));
+    assert!(
+        store
+            .complete_role_exchange(&third, ExchangeReceipt::NoSend)
+            .await?
+    );
+    let (pending,): (bool,) =
+        sqlx::query_as("SELECT exchange_pending FROM self_role_audit WHERE event_id=$1")
+            .bind(&audit.event_id)
+            .fetch_one(pool)
+            .await?;
+    assert!(pending); // Receipt alone never retires aggregate work.
+
+    let new_lane = acquired(
+        store
+            .claim_panel(&key, Some((&audit.event_id, "0001")))
+            .await?,
+    );
+    for status in [204, 403, 429, 500] {
+        let ticket = store
+            .journal_role_exchange(&recovered, Some(&new_lane), &intent)
+            .await?
+            .unwrap();
+        let before = exchange_owner_state(pool, &audit.event_id).await?;
+        assert!(
+            store
+                .complete_role_exchange(&ticket, ExchangeReceipt::Response { status })
+                .await?
+        );
+        assert_eq!(exchange_owner_state(pool, &audit.event_id).await?, before);
+    }
+    audit.event_id = "exchange-uninitialized".into();
+    audit.effects = AuditEffects::default();
+    audit.desired_role_ids.clear();
+    audit.pre_mutation_role_ids.clear();
+    let pending = store.claim_pending_audit(&audit).await?.unwrap();
+    assert!(store
+        .journal_role_exchange(&pending, None, &intent)
+        .await?
+        .is_none());
+    Ok(())
+}
+
+async fn terminal_exchange_receipts_survive_generation_transfer(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    let name = "exchange-terminal";
+    let (audit, _) = terminal_seed(&store, name, name, false).await?;
+    let hint = store
+        .superseded_audits("test-guild", name, "test-message", PanelMode::Button, 1)
+        .await?
+        .remove(0);
+    let former = store.claim_superseded_audit(&hint).await?.unwrap();
+    let key = panel_key(&audit);
+    let mut normal = acquired(
+        store
+            .claim_panel(&key, Some(("winner", "later-order")))
+            .await?,
+    );
+    assert!(
+        store
+            .set_panel_claim_option(&mut normal, Some("chess"))
+            .await?
+    );
+    let intent = ExchangeIntent {
+        role_id: "101".into(),
+        adding: false,
+        compensating: true,
+    };
+    assert!(matches!(
+        store
+            .journal_terminal_role_exchange(&former, &normal, &intent)
+            .await,
+        Err(StoreError::WrongPanel)
+    ));
+    assert!(store.release_panel_claim(&normal).await?);
+    let lane = acquired(store.claim_panel(&key, None).await?);
+    let ticket = store
+        .journal_terminal_role_exchange(&former, &lane, &intent)
+        .await?
+        .unwrap();
+    clock.fetch_add(301, Ordering::SeqCst);
+    let current = store.claim_superseded_audit(&hint).await?.unwrap();
+    let new_lane = acquired(store.claim_panel(&key, None).await?);
+    assert!(store
+        .journal_terminal_role_exchange(&former, &lane, &intent)
+        .await?
+        .is_none());
+    assert!(
+        !store
+            .record_superseded_repair(&former, &AuditEffects::default(), false)
+            .await?
+    );
+    let before = exchange_owner_state(pool, name).await?;
+    assert!(
+        store
+            .complete_role_exchange(&ticket, ExchangeReceipt::NoSend)
+            .await?
+    );
+    assert_eq!(exchange_owner_state(pool, name).await?, before);
+    assert!(matches!(
+        store.finish_superseded_repair(&current, &new_lane).await,
+        Err(StoreError::PendingExchange)
+    ));
+    let unknown = store
+        .journal_terminal_role_exchange(&current, &new_lane, &intent)
+        .await?
+        .unwrap();
+    assert!(
+        store
+            .record_superseded_repair(&current, &AuditEffects::default(), false)
+            .await?
+    );
+    let (disposition,): (String,) = sqlx::query_as(
+        "SELECT disposition FROM self_role_exchanges WHERE event_id=$1 AND disposition='pending'",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(disposition, "pending");
+    assert!(matches!(
+        store.finish_superseded_repair(&current, &new_lane).await,
+        Err(StoreError::PendingExchange)
+    ));
+    let before = exchange_owner_state(pool, name).await?;
+    assert!(
+        store
+            .complete_role_exchange(&unknown, ExchangeReceipt::Response { status: 204 })
+            .await?
+    );
+    assert_eq!(exchange_owner_state(pool, name).await?, before);
+    let tokens: Vec<String> =
+        sqlx::query_scalar("SELECT receipt_token FROM self_role_exchanges WHERE event_id=$1")
+            .bind(name)
+            .fetch_all(pool)
+            .await?;
+    assert!(tokens
+        .iter()
+        .all(|token| !format!("{unknown:?}").contains(token)));
+    Ok(())
 }
 
 async fn terminal_seed(
@@ -748,6 +1045,11 @@ async fn exercise(pool: &PgPool) -> TestResult {
         "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='self_role_audit'",
     ).fetch_one(pool).await?;
     assert_eq!(audit_columns, 32);
+    let exchange_migration = include_str!("../migrations/0205_self_role_exchange_receipts.sql");
+    sqlx::raw_sql(exchange_migration).execute(pool).await?;
+    sqlx::raw_sql(exchange_migration).execute(pool).await?;
+    exchange_receipts_survive_generation_transfer(pool).await?;
+    terminal_exchange_receipts_survive_generation_transfer(pool).await?;
     terminal_discovery_and_claim_race(pool).await?;
     terminal_repair_fences_and_completion(pool).await?;
     terminal_repair_lock_waits(pool).await?;

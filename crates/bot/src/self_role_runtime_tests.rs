@@ -249,6 +249,11 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0205_self_role_exchange_receipts.sql"
+    ))
+    .execute(pool)
+    .await?;
     processing_superseded_before_preparation(pool).await?;
     terminal_restart_repairs_committed_target(pool).await?;
     terminal_restart_refuses_unknown_or_uninitialized_target(pool).await?;
