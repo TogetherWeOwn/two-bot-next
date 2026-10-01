@@ -5,6 +5,12 @@ name: check
 
 on:
   pull_request:
+    # TOG-11810: docs-only PRs skip the heavy Rust matrix. Allowed because
+    # the rulesets only require the `gitleaks` + `pr-lint` contexts (kept as
+    # job names in supply-chain.yml); `check` is not a required check.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   push:
     branches: [main]
   # Dispatched by the release workflow (TOG-10035) on release-please branches:
@@ -16,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: check-${{ github.event.pull_request.number || github.sha }}
+  group: check-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -91,20 +97,16 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      # Restore on every run; save only on pushes to main (below). A PR-scoped
-      # cache is unreadable by other PRs, and uploading the ~4 GiB target dir
-      # from a busy self-hosted runner pushed PR jobs past their timeout.
+      # TOG-11810: incremental compile cache. The raw ~4 GiB target/ upload
+      # blew the 30-minute PR timeout (#147); rust-cache stores only the
+      # incremental artifacts so restore/save stay small. Restore on every
+      # run; save only on pushes to main (a PR-scoped entry is unreadable by
+      # other PRs, so a PR upload is pure waste).
       - name: Restore cargo cache
-        id: cargo-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Verify Docker dependency layer
         run: python3 scripts/test-docker-deps.py --cargo
@@ -207,16 +209,6 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
-
-      - name: Save cargo cache (main only)
-        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   self-role-store:
     name: self-role store leases
@@ -379,13 +371,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # TOG-11810: same incremental cache as the main check job (shared
+      # prefix-key), replacing the raw target/ upload on every PR run.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-tickets-cargo-${{ hashFiles('Cargo.lock') }}
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
       - name: Ticket shared router and mock Discord lifecycle acceptance
