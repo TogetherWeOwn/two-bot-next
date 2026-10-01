@@ -250,7 +250,7 @@ jobs:
 
   container:
     name: container smoke
-    runs-on: [self-hosted, two-selfhosted]
+    runs-on: [self-hosted, two-ephemeral]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -388,6 +388,9 @@ jobs:
           key: ${{ runner.os }}-tickets-cargo-${{ hashFiles('Cargo.lock') }}
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
+      - name: Ticket shared router and mock Discord lifecycle acceptance
+        run: >-
+          cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored
 
   worker:
     name: worker check
