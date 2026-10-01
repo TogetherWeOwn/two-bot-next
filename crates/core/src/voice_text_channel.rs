@@ -19,7 +19,7 @@ pub const MAX_TEXT_CHANNEL_NAME_CHARS: usize = 100;
 
 /// Per-creator text-channel settings. The runtime snapshots these at room
 /// creation: later changes only affect channels created afterwards.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextChannelSettings {
     /// Per-creator `/textchannels` toggle. Off by default; off yields no plan.
     pub enabled: bool,
@@ -29,16 +29,6 @@ pub struct TextChannelSettings {
     /// The one extra role allowed to view. `None` means occupants and admins
     /// only. `Some(guild_id)` is @everyone: the channel is visible to all.
     pub viewer_role_id: Option<Snowflake>,
-}
-
-impl Default for TextChannelSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            configured_name: None,
-            viewer_role_id: None,
-        }
-    }
 }
 
 /// Caller-supplied facts for one room. IDs are Discord snowflakes; a guild's
