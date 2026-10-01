@@ -7,6 +7,8 @@ license.workspace = true
 
 [features]
 db = ["two-bot-core/db"]
+# Explicit service-DB acceptance lane; no credentialed Discord traffic.
+db-tests = ["two-bot-core/db"]
 
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.
@@ -28,10 +30,6 @@ twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
-
-[features]
-# Explicit service-DB acceptance lane; no credentialed Discord traffic.
-db-tests = ["two-bot-core/db"]
 
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
