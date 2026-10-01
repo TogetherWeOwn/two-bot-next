@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -87,9 +88,52 @@ class SupplyChainTests(unittest.TestCase):
                     self.validate()
                 file.write_text(original)
 
-    def test_release_uses_published_tag_not_new_main(self):
-        self.assertEqual(selector.select_target("false", "v0.2.1", SHA), {"ref": "v0.2.1", "tag": "v0.2.1"})
-        self.assertEqual(selector.select_target("", "v0.2.1", SHA)["ref"], "v0.2.1")
+    def test_release_uses_published_tag_not_same_named_branch_or_new_main(self):
+        tag_sha, branch_sha = "c" * 40, "d" * 40
+        objects = {
+            "ref/tags/v0.2.1": {"object": {"type": "commit", "sha": tag_sha}},
+            "ref/heads/v0.2.1": {"object": {"type": "commit", "sha": branch_sha}},
+        }
+        with patch.object(selector, "github_object", side_effect=objects.__getitem__) as read:
+            self.assertEqual(selector.select_target("false", "v0.2.1", SHA), {"ref": tag_sha, "tag": "v0.2.1"})
+            self.assertEqual(selector.select_target("", "v0.2.1", SHA)["ref"], tag_sha)
+            self.assertEqual(read.call_args_list, [unittest.mock.call("ref/tags/v0.2.1")] * 2)
+
+    def test_annotated_tags_are_peeled_to_commit(self):
+        with patch.object(selector, "github_object", side_effect=[
+            {"object": {"type": "tag", "sha": "c" * 40}},
+            {"object": {"type": "commit", "sha": "d" * 40}},
+        ]) as read:
+            self.assertEqual(selector.resolve_tag("v0.2.1"), "d" * 40)
+            self.assertEqual(read.call_args.args, ("tags/" + "c" * 40,))
+
+    def test_tag_resolution_rejects_invalid_noncommit_and_unbounded_objects(self):
+        for obj in [{"type": "commit", "sha": "unknown"}, {"type": "tree", "sha": SHA}, {"type": "tag", "sha": SHA}]:
+            with self.subTest(obj=obj), patch.object(selector, "github_object", return_value={"object": obj}):
+                with self.assertRaises(ValueError):
+                    selector.resolve_tag("v0.2.1")
+
+    def test_tag_read_errors_are_not_retried_or_replaced(self):
+        with patch.object(selector, "github_object", side_effect=subprocess.CalledProcessError(1, "gh")) as read:
+            with self.assertRaises(subprocess.CalledProcessError):
+                selector.resolve_tag("v0.2.1")
+            self.assertEqual(read.call_count, 1)
+
+    def test_upload_rejects_source_mismatch_and_moved_tag(self):
+        with patch.object(selector, "resolve_tag", return_value=SHA):
+            selector.verify_source("v0.2.1", SHA, self.directory / "source-sha.txt")
+            with self.assertRaisesRegex(ValueError, "source"):
+                selector.verify_source("v0.2.1", "c" * 40, self.directory / "source-sha.txt")
+        with patch.object(selector, "resolve_tag", return_value="c" * 40):
+            with self.assertRaisesRegex(ValueError, "tag"):
+                selector.verify_source("v0.2.1", SHA, self.directory / "source-sha.txt")
+
+    def test_release_verifies_source_and_tag_commit_before_upload(self):
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        attach = release.split("  attach-sbom:", 1)[1]
+        self.assertIn("EXPECTED_SHA: ${{ needs.sbom-target.outputs.ref }}", attach)
+        verification = attach.index("python3 scripts/release-sbom-target.py --verify-source sbom/source-sha.txt")
+        self.assertLess(verification, attach.index('gh release upload "$RELEASE_TAG"'))
 
     def test_dry_run_cannot_publish_even_with_tag(self):
         self.assertEqual(selector.select_target("true", "v0.2.1", SHA), {"ref": SHA, "tag": ""})

@@ -201,6 +201,8 @@ jobs:
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           RELEASE_TAG: ${{ inputs.release_tag || needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: python3 scripts/release-sbom-target.py
 
   release-sbom:
@@ -220,6 +222,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: supply-chain
@@ -229,7 +234,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.sbom-target.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.sbom-target.outputs.ref }}
         run: |
           set -euo pipefail
           (cd sbom && sha256sum --check SHA256SUMS)
+          python3 scripts/release-sbom-target.py --verify-source sbom/source-sha.txt
           gh release upload "$RELEASE_TAG" sbom/*.cdx.json sbom/SHA256SUMS sbom/source-sha.txt sbom/image-id.txt --clobber
