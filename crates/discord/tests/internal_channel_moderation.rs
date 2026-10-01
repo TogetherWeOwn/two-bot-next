@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgPool, Row};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::time::Duration;
 use two_bot_core::channel_moderation_store::ChannelModerationStore;
 use two_bot_core::internal_actions::ErrorCode;
@@ -20,7 +21,15 @@ use two_bot_discord::internal_channel_moderation::{
 use two_bot_discord::ActionExecutor;
 
 const ACTOR: &str = "333333333333333333";
-const SECRET: &str = "fixture-moderation-key";
+// Signing and verification share an ephemeral key, never a stored credential.
+static SECRET: LazyLock<String> = LazyLock::new(|| {
+    let mut bytes = [0u8; 32];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut bytes)
+        .expect("OS randomness for the test audit key");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+});
 
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service container"]
@@ -387,9 +396,12 @@ fn verify_wire_reason(mock: &MockRest, action: &str, key: &str) -> String {
         .expect("wire mutation");
     let reason = decode_reason(write.header("x-audit-log-reason").unwrap());
     assert!(reason.encode_utf16().count() <= 512);
-    let marker =
-        two_bot_core::mac::parse_moderation_audit_reason(Some(SECRET), GUILD, Some(&reason))
-            .unwrap();
+    let marker = two_bot_core::mac::parse_moderation_audit_reason(
+        Some(SECRET.as_str()),
+        GUILD,
+        Some(&reason),
+    )
+    .unwrap();
     assert_eq!(marker.actor_id, ACTOR);
     assert_eq!(marker.action, action);
     assert_eq!(
@@ -737,9 +749,13 @@ async fn lockdown_and_unlock_restore_full_masks_and_replay_independently() {
     assert_eq!(restored["deny"], deny);
     let reason = decode_reason(wire[3].header("x-audit-log-reason").unwrap());
     assert_eq!(
-        two_bot_core::mac::parse_moderation_audit_reason(Some(SECRET), GUILD, Some(&reason))
-            .unwrap()
-            .action,
+        two_bot_core::mac::parse_moderation_audit_reason(
+            Some(SECRET.as_str()),
+            GUILD,
+            Some(&reason)
+        )
+        .unwrap()
+        .action,
         "moderation.unlock"
     );
     assert_audit(&db, "moderation.lockdown", "locked_down", "cleanup", None).await;
