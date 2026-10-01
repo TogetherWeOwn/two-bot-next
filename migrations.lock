@@ -108,6 +108,30 @@
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."
+    },
+    "crates/store/migrations/0400_initial.sql": {
+      "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
+      "justification": "Add unpublished S6 funnel foundation for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
+    },
+    "crates/store/migrations/0401_web_contract_tables.sql": {
+      "sha256": "b7f54d59e8f8e8ae9ebf3353ba2ff3d6f03877d2abb0ee40b7e2df2e4b73b270",
+      "justification": "Add unpublished S6 website contract tables for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
+    },
+    "crates/store/migrations/0402_counter_snapshots.sql": {
+      "sha256": "8c4470fec699bad73261be0d7c68dc2757933af9f401e6a4c559c1523c05b953",
+      "justification": "Add unpublished S6 invite and counter snapshots for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
+    },
+    "crates/store/migrations/0403_gate_cleared.sql": {
+      "sha256": "7f4a35024711e3e3738f0682054ae7388a721159079cf3483886256c9d035aa0",
+      "justification": "Add unpublished S6 gate-cleared projection for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
+    },
+    "crates/store/migrations/0404_members_third_message_at.sql": {
+      "sha256": "16d06d0ef49448618f0c272c94a3c69ee161a69b358683ed47f41fef79ead8b7",
+      "justification": "Add unpublished S6 third-message milestone for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
+    },
+    "crates/store/migrations/0405_timestamptz_and_boolean.sql": {
+      "sha256": "5c00a07ac5565bd668e5804aa9e681c5bc8ebe1728d6f700fa5b956a8b0bb987",
+      "justification": "Add unpublished S6 dependency-preserving normalization gate for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
     }
   }
 }

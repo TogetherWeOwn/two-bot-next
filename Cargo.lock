@@ -2288,6 +2288,7 @@ dependencies = [
  "two-bot-core",
  "two-bot-cutover",
  "two-bot-discord",
+ "two-bot-store",
  "two-bot-testsupport",
 ]
 
@@ -2388,6 +2389,21 @@ dependencies = [
  "sqlx",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "two-bot-store"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "twilight-model",
+ "two-bot-core",
+ "two-bot-discord",
 ]
 
 [[package]]
