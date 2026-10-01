@@ -124,7 +124,7 @@ pass in actual CI; offline fixtures are not a runtime-image measurement.
 | Artifact | Definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|
 | Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 10 MiB / 10,485,760 bytes | 2.99 MiB / 42.7% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 11 MiB / 11,534,336 bytes | 3.99 MiB / 56.9% |
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly

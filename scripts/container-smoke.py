@@ -16,8 +16,11 @@ import uuid
 
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
-BINARY_MAX_BYTES = 10 * MIB
+# Raised from 10 MiB: the durable store runtime plus the ticket runtime from main
+# measured 10.01 MiB under opt-level z/LTO/strip; image budget unchanged.
+BINARY_MAX_BYTES = 11 * MIB
 BINARY = "/home/two-bot/two-bot"
+CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 
 def require(condition, message):
@@ -157,6 +160,10 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         port = docker("port", name, "8080/tcp").stdout.strip()
         require(port.startswith("127.0.0.1:"), f"unexpected published port: {port}")
         url = "http://" + port
+        bundle = docker("exec", name, "cat", CA_BUNDLE).stdout
+        require("-----BEGIN CERTIFICATE-----" in bundle and
+                "-----END CERTIFICATE-----" in bundle,
+                "runtime CA bundle must contain PEM certificates")
         deadline = time.monotonic() + 30
         while True:
             code, body = http_response(url + "/health")
@@ -171,8 +178,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         require(code == 503, "/readyz must be 503 while the gateway is parked")
         require(isinstance(body, dict), "/readyz body must be a JSON object")
         require(body.get("components") == [
-            ["process", "ready"], ["gateway", "down"], ["token_invalid", "ready"],
-        ], "/readyz body must report a ready process, parked gateway and valid token state")
+            ["process", "ready"], ["gateway", "down"], ["database", "down"],
+            ["token_invalid", "ready"],
+        ], "/readyz body must report a ready process, parked gateway, database down and valid token state")
         # The runtime always reports informational job status alongside
         # readiness; with no credentials all six jobs must be parked,
         # non-running and never started. Jobs never flip the 503 above.

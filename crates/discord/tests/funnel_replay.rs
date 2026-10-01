@@ -655,6 +655,66 @@ fn pipeline_gate_clear_on_pending_flip() {
     );
 }
 
+#[test]
+fn pipeline_receipt_time_is_fallback_not_payload_override() {
+    let pipeline = MemPipeline::for_replay();
+    let observed_at = stamp("12:10:00");
+    pipeline.handle_at(&join_event(A, false, "12:00:00"), &observed_at);
+    pipeline.handle_at(&message_event(A, 1, "12:01:00"), &observed_at);
+    let mut unstamped = join_event(B, false, "12:00:00");
+    if let Event::MemberAdd(ref mut add) = unstamped {
+        add.member.joined_at = None;
+    }
+    pipeline.handle_at(&unstamped, &observed_at);
+    let rows = pipeline.handlers().store().rows();
+    for (kind, member_id, at) in [
+        (two_bot_core::EventType::MemberJoin, A, stamp("12:00:00")),
+        (two_bot_core::EventType::GateCleared, A, stamp("12:00:00")),
+        (two_bot_core::EventType::FirstMessage, A, stamp("12:01:00")),
+        (two_bot_core::EventType::MemberJoin, B, observed_at.clone()),
+        (two_bot_core::EventType::GateCleared, B, observed_at),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.event_type == kind && row.member_id == Some(member_id))
+            .unwrap();
+        assert_eq!(row.occurred_at, at);
+    }
+}
+
+#[test]
+fn pipeline_voice_move_and_server_leave_share_receipt_boundaries() {
+    let pipeline = MemPipeline::for_replay();
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_B)), &stamp("12:00:03"));
+    pipeline.handle_at(
+        &Event::MemberRemove(MemberRemove {
+            guild_id: Id::new(GUILD),
+            user: user(A, false),
+        }),
+        &stamp("12:00:05"),
+    );
+    let rows = pipeline.handlers().store().rows();
+    let ends: Vec<_> = rows
+        .iter()
+        .filter(|row| row.event_type == two_bot_core::EventType::VoiceSessionEnd)
+        .collect();
+    assert_eq!(ends.len(), 2);
+    assert_eq!(ends[0].occurred_at, stamp("12:00:03"));
+    assert_eq!(ends[0].metadata.as_ref().unwrap()["durationSeconds"], 3);
+    assert_eq!(ends[1].occurred_at, stamp("12:00:05"));
+    assert_eq!(ends[1].metadata.as_ref().unwrap()["durationSeconds"], 2);
+    assert!(rows.iter().any(|row| {
+        row.event_type == two_bot_core::EventType::VoiceSessionStart
+            && row.source == format!("channel:{CH_VOICE_B}")
+            && row.occurred_at == ends[0].occurred_at
+    }));
+    assert!(rows.iter().any(|row| {
+        row.event_type == two_bot_core::EventType::MemberLeave
+            && row.occurred_at == ends[1].occurred_at
+    }));
+}
+
 /// Messages: guild rows advance the ladder with the frame stamp; DMs drop.
 #[test]
 fn pipeline_messages_and_dm_drop() {

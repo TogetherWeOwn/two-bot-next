@@ -1,5 +1,5 @@
 //! Exercise the real entrypoint and TCP listener with synthetic configuration.
-//! Invalid gateway config must park the shard without moving the HTTP listener.
+//! Missing gateway prerequisites park; configured database failures exit safely.
 
 use std::{
     io::{Read, Write},
@@ -119,6 +119,41 @@ fn configured_gateway_initialization_failure_exits_nonzero() {
     }
 }
 
+#[test]
+fn configured_database_initialization_failure_exits_nonzero_without_logging_url() {
+    for url in [
+        "not-postgres://fixture-secret",
+        "postgresql://[fixture-secret",
+    ] {
+        let mut child = command("127.0.0.1:0")
+            .env("DISCORD_TOKEN", "INVALID")
+            .env("GUILD_ID", "123")
+            .env("DATABASE_URL", url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("configured DB failure parked instead of exiting");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(logs.contains("database initialization failed"));
+        assert!(!logs.contains("fixture-secret"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn non_unicode_gateway_override_exits_without_logging_its_value() {
@@ -211,6 +246,7 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
         serde_json::json!([
             ["process", "ready"],
             ["gateway", "down"],
+            ["database", "down"],
             ["token_invalid", "ready"]
         ])
     );
