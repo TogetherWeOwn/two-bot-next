@@ -129,7 +129,7 @@ pub async fn load_boot_session(
 pub const GATEWAY_POOL_MAX: u32 = 1;
 pub const FEATURE_POOL_MAX: u32 = two_bot_cutover::DB_POOL_MAX_DEFAULT - GATEWAY_POOL_MAX;
 // Admission is independent of the 32-row durable queue. Leave feature capacity
-// for settings and sticky work; do not claim more jobs while these workers run.
+// for settings and shared commands; do not claim more jobs while these workers run.
 const ONBOARDING_WORKER_LIMIT: usize = 2;
 
 const CHECKPOINT_IO_MAX: std::time::Duration = std::time::Duration::from_secs(5);
@@ -195,16 +195,17 @@ async fn checkpoint_io<T>(
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
 /// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
 ///
-/// `sticky` is the S4 sticky runtime (TOG-10309): `dispatch` spawns detached
-/// work so this loop never awaits a REST call or store write — twilight only
-/// drives heartbeats while the shard is polled.
+/// `runtime` is the shared command runtime (TOG-11020; S4 sticky slice was
+/// TOG-10309): `dispatch` spawns detached work. Independent ingress drives
+/// Twilight and initial onboarding ACKs while the ordered owner captures and
+/// commits dispatches; command REST work never blocks either owner.
 pub async fn run_shard(
     mut shard: Shard,
     pipeline: Arc<GatewayPipeline>,
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
     onboarding: Option<Arc<crate::onboarding::OnboardingRuntime>>,
-    sticky: Option<Arc<crate::sticky_runtime::StickyRuntime>>,
+    runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
 ) -> Result<(), sqlx::Error> {
     let (sender, mut packets) = tokio::sync::mpsc::channel(ingress::CAPACITY);
     let (saved, checkpoint) = tokio::sync::watch::channel(None);
@@ -226,7 +227,7 @@ pub async fn run_shard(
             &state,
             &store,
             onboarding.as_ref(),
-            sticky.as_ref(),
+            runtime.as_ref(),
             (&generation, saved),
         ),
     )
@@ -241,7 +242,7 @@ async fn run_loop(
     state: &RwLock<GatewayState>,
     store: &GatewaySessionStore,
     onboarding: Option<&Arc<crate::onboarding::OnboardingRuntime>>,
-    sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
+    runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
     progress: (
         &Arc<AtomicU64>,
         tokio::sync::watch::Sender<Option<GatewaySession>>,
@@ -262,8 +263,8 @@ async fn run_loop(
     }
     loop {
         if let Some(runtime) = onboarding {
-            // Poll Twilight between claims, rather than spend 32 consecutive
-            // SQL deadlines without driving the shard's heartbeat machinery.
+            // Claim only available worker slots and drain packets between
+            // claims; independent ingress continues polling Twilight.
             if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT {
                 if let Some(saved) =
                     checkpoint_io(state, generation, deadline, store.claim_onboarding_job()).await?
@@ -377,9 +378,9 @@ async fn run_loop(
             connected = matches!(*event, Event::Ready(_) | Event::Resumed);
             onboarding_job = onboarding.and_then(|runtime| runtime.capture(&event, pipeline));
             pipeline.handle(&event);
-            // Detached dispatch only: awaiting sticky work inline would stall
-            // heartbeat polling (see `run_shard` docs).
-            if let Some(runtime) = sticky {
+            // Detached dispatch only: command REST work must not stall the
+            // ordered pipeline/checkpoint owner.
+            if let Some(runtime) = runtime {
                 runtime.dispatch(&event);
             }
         }

@@ -634,6 +634,13 @@ async fn onboarding_runtime_roleless_session_reselection_stale_menu_and_goodbye_
         assert_eq!(body["allowed_mentions"]["parse"], json!([]));
         assert_eq!(body["allowed_mentions"]["users"], json!([]));
         assert_eq!(body["allowed_mentions"]["roles"], json!([]));
+        assert_eq!(body["allowed_mentions"]["replied_user"], false);
+        assert_eq!(
+            body["content"],
+            two_bot_core::message_safety::content(
+                &goodbye_text("@everyone <@44> <@&77>", Some(2),)
+            )
+        );
         assert!(body["content"].as_str().unwrap().contains("2 days"));
         assert!(
             !mock

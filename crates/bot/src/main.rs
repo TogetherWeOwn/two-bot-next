@@ -6,6 +6,9 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod backup_cli;
+mod command_runtime;
+#[cfg(test)]
+mod command_runtime_tests;
 mod community_jobs;
 mod database_roles_cli;
 mod gateway;
@@ -25,9 +28,6 @@ mod onboarding;
 mod onboarding_tests;
 mod preflight;
 mod server;
-mod sticky_runtime;
-#[cfg(test)]
-mod sticky_runtime_tests;
 mod website_jobs;
 
 use std::sync::Arc;
@@ -131,7 +131,7 @@ async fn main() {
                     let saved = gateway::load_boot_session(&store).await?;
                     let pipeline = Arc::new(build_pipeline(store.milestones().await?));
                     // Onboarding identity probe must honor the mock REST seam
-                    // (`DISCORD_API_BASE`), mirroring the sticky runtime: the
+                    // (`DISCORD_API_BASE`), mirroring the command runtime: the
                     // alive acceptance serves `/users/@me` on loopback.
                     let proxy = std::env::var("DISCORD_API_BASE")
                         .ok()
@@ -155,10 +155,11 @@ async fn main() {
                             sqlx::Error::InvalidArgument("onboarding initialization failed".into())
                         })?,
                     );
-                    // S4 sticky runtime (TOG-10309): shared router + REST
-                    // executor over the same pool. `None` on bad env gates —
-                    // the shard still boots without the sticky surface.
-                    let sticky = sticky_runtime::StickyRuntime::from_env(
+                    // Shared command runtime (TOG-11020; S4 sticky slice was
+                    // TOG-10309): ONE router + REST executor + sqlx stores
+                    // over the feature pool. `None` on bad env gates — the shard
+                    // still boots without the command surface.
+                    let runtime = command_runtime::CommandRuntime::from_env(
                         db.pool().clone(),
                         &token,
                         guild_id,
@@ -179,7 +180,7 @@ async fn main() {
                         Arc::clone(&state),
                         store,
                         Some(onboarding),
-                        sticky,
+                        runtime,
                     )
                     .await
                 }

@@ -96,7 +96,7 @@ async fn shared_executor_renders_each_mode_and_goodbye_without_extra_messages() 
                 &channel_id,
                 &content,
                 &components,
-                &allowed_mentions(MentionPolicy::Member(mention_user_id))
+                MentionPolicy::Member(mention_user_id)
             )
             .await
             .unwrap(),
@@ -117,7 +117,7 @@ async fn shared_executor_renders_each_mode_and_goodbye_without_extra_messages() 
     else {
         panic!("goodbye");
     };
-    exec.post_channel_message(&channel_id, &content, &[], &allowed_mentions(mentions))
+    exec.post_channel_message(&channel_id, &content, &[], mentions)
         .await
         .unwrap();
     let reqs = mock.requests();
@@ -127,10 +127,16 @@ async fn shared_executor_renders_each_mode_and_goodbye_without_extra_messages() 
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
         assert_eq!(body["allowed_mentions"]["roles"], serde_json::json!([]));
+        assert_eq!(body["allowed_mentions"]["replied_user"], false);
         if index < 3 {
             assert_eq!(body["allowed_mentions"]["users"], serde_json::json!(["44"]));
         } else {
             assert_eq!(body["allowed_mentions"]["users"], serde_json::json!([]));
+            assert_eq!(
+                body["content"],
+                two_bot_core::message_safety::content(&content)
+            );
+            assert!(!body["content"].as_str().unwrap().contains("@everyone"));
         }
         if index >= 2 {
             assert!(
@@ -193,13 +199,24 @@ async fn shared_executor_defer_role_delta_and_edit_are_not_broadcasts() {
     assert_eq!(body["allowed_mentions"]["users"], serde_json::json!([]));
     assert_eq!(body["allowed_mentions"]["roles"], serde_json::json!([]));
     assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
-    let before = exec.requests();
-    assert!(matches!(
-        exec.edit_interaction_response(11, "mock-callback", &"😀".repeat(1001))
-            .await,
-        Err(DiscordError::Rejected(_))
-    ));
-    assert_eq!(before, exec.requests(), "reject oversized edit before wire");
+    exec.edit_interaction_response(11, "mock-callback", &"😀".repeat(1001))
+        .await
+        .unwrap();
+    exec.edit_interaction_response(11, "mock-callback", "")
+        .await
+        .unwrap();
+    let edits = mock.requests();
+    assert_eq!(edits.len(), 6);
+    for (index, expected) in [(4, "😀".repeat(1000)), (5, String::new())] {
+        assert_eq!(edits[index].method, "PATCH");
+        assert!(edits[index].header("authorization").is_none());
+        let body: serde_json::Value = serde_json::from_slice(&edits[index].body).unwrap();
+        assert_eq!(body["content"], expected);
+        assert_eq!(
+            body["allowed_mentions"],
+            serde_json::json!({"parse":[], "roles":[], "users":[], "replied_user":false})
+        );
+    }
     assert!(
         reqs[2]
             .received_at
@@ -214,13 +231,8 @@ async fn shared_executor_failed_post_or_role_write_is_not_retried() {
     let mock = MockRest::start(vec![], ScriptedResponse::status(403)).await;
     let exec = executor(&mock);
     assert!(matches!(
-        exec.post_channel_message(
-            "12",
-            "welcome",
-            &[],
-            &allowed_mentions(MentionPolicy::Member(44))
-        )
-        .await,
+        exec.post_channel_message("12", "welcome", &[], MentionPolicy::Member(44))
+            .await,
         Err(DiscordError::Rejected(_))
     ));
     assert!(matches!(
@@ -231,13 +243,102 @@ async fn shared_executor_failed_post_or_role_write_is_not_retried() {
     assert_eq!(mock.requests().len(), 2);
     let before = exec.requests();
     assert!(exec
-        .post_channel_message(
-            "12",
-            &"😀".repeat(1001),
-            &[],
-            &allowed_mentions(MentionPolicy::None)
-        )
+        .post_channel_message("12", &"😀".repeat(1001), &[], MentionPolicy::None)
         .await
         .is_err());
     assert_eq!(before, exec.requests(), "reject before wire");
+}
+
+#[tokio::test]
+async fn shared_component_posts_bound_text_and_allow_only_the_welcome_recipient() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(201, serde_json::json!({"id":"99"})),
+    )
+    .await;
+    let exec = executor(&mock);
+    let components = picker_components(Some(PickerKind::Games), &[], &[]);
+    let injected = "@everyone @here @\u{200b}everyone <@44> <@55> <@&77>";
+    for policy in [MentionPolicy::None, MentionPolicy::Member(44)] {
+        exec.post_channel_message("12", injected, &components, policy)
+            .await
+            .unwrap();
+    }
+    let boundary = format!("{}@everyone!", "😀".repeat(995));
+    assert_eq!(boundary.encode_utf16().count(), 2000);
+    exec.post_channel_message("12", &boundary, &[], MentionPolicy::Member(44))
+        .await
+        .unwrap();
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 3);
+    for (index, req) in reqs.iter().enumerate() {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(
+            content,
+            two_bot_core::message_safety::content(if index < 2 { injected } else { &boundary })
+        );
+        assert!(!content.contains("@everyone"));
+        assert!(!content.contains("@here"));
+        assert!(content.encode_utf16().count() <= 2000);
+        assert_eq!(
+            body["allowed_mentions"],
+            serde_json::json!({
+                "parse":[], "roles":[], "replied_user":false,
+                "users": if index == 0 { vec![] } else { vec!["44"] },
+            })
+        );
+        if index < 2 {
+            assert_eq!(
+                body["components"],
+                serde_json::to_value(&components).unwrap()
+            );
+        } else {
+            assert_eq!(content.encode_utf16().count(), 2000);
+            assert!(content.ends_with("@\u{200b}everyone"));
+            assert!(body.get("components").is_none());
+        }
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_component_posts_reject_empty_payloads_but_keep_component_only_creates() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(201, serde_json::json!({"id":"99"})),
+    )
+    .await;
+    let exec = executor(&mock);
+    for content in ["", " \t\n", "\u{200b}"] {
+        assert!(matches!(
+            exec.post_channel_message("12", content, &[], MentionPolicy::None)
+                .await,
+            Err(DiscordError::Rejected(_))
+        ));
+    }
+    assert!(matches!(
+        exec.post_channel_message("12", "welcome", &[], MentionPolicy::Member(0))
+            .await,
+        Err(DiscordError::Rejected(_))
+    ));
+    assert_eq!(exec.requests(), 0, "invalid creates never reach the wire");
+    assert!(mock.requests().is_empty());
+    let components = picker_components(Some(PickerKind::Games), &[], &[]);
+    exec.post_channel_message("12", "", &components, MentionPolicy::None)
+        .await
+        .unwrap();
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(body.get("content").is_none());
+    assert_eq!(
+        body["components"],
+        serde_json::to_value(&components).unwrap()
+    );
+    assert_eq!(
+        body["allowed_mentions"],
+        serde_json::json!({"parse":[], "roles":[], "users":[], "replied_user":false})
+    );
+    mock.shutdown().await;
 }

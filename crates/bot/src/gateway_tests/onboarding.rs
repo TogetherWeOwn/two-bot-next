@@ -694,7 +694,10 @@ async fn onboarding_gateway_session_goodbye_restart_keeps_captured_joined_at() {
         let body: Value = serde_json::from_slice(&messages[0].body).unwrap();
         let days = days_in_guild(Some(joined_ms), Some(captured.3));
         assert_eq!(days, Some(2));
-        assert_eq!(body["content"], goodbye_text(username, days));
+        assert_eq!(
+            body["content"],
+            two_bot_core::message_safety::content(&goodbye_text(username, days))
+        );
         assert_eq!(
             body["allowed_mentions"],
             json!({"parse":[],"users":[],"roles":[],"replied_user":false})

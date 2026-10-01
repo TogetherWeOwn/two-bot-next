@@ -12,7 +12,7 @@ use two_bot_core::settings::SettingsCache;
 use two_bot_core::{ComponentHandler, ComponentOutcome, InteractionRouter, RouterGates};
 use two_bot_cutover::settings::SettingsStore;
 use two_bot_discord::onboarding_config::OnboardingConfig;
-use two_bot_discord::onboarding_messages::{allowed_mentions, defer_ephemeral, picker_components};
+use two_bot_discord::onboarding_messages::{defer_ephemeral, picker_components};
 use two_bot_discord::onboarding_permissions::MemberAccess;
 use two_bot_discord::{route_interaction, ActionExecutor, RoutedInteraction};
 
@@ -380,12 +380,7 @@ impl OnboardingRuntime {
                     config.gates.dry_run,
                 ) {
                     self.executor
-                        .post_channel_message(
-                            &channel_id,
-                            &content,
-                            &[],
-                            &allowed_mentions(mentions),
-                        )
+                        .post_channel_message(&channel_id, &content, &[], mentions)
                         .await
                         .map_err(|_| RuntimeError::Discord)?;
                 }
@@ -484,7 +479,7 @@ impl OnboardingRuntime {
                 &channel_id,
                 &content,
                 &components,
-                &allowed_mentions(MentionPolicy::Member(mention_user_id)),
+                MentionPolicy::Member(mention_user_id),
             )
             .await
             .map_err(|_| RuntimeError::Discord)?;

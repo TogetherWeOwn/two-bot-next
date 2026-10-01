@@ -1,9 +1,10 @@
 # S4 onboarding domain and store
 
-This is the domain/store slice of TOG-10086, not a deployed onboarding handler.
-The shared interaction router (TOG-10075) and REST executor (TOG-10076) must be
-merged before runtime integration. No private dispatcher, Discord HTTP client,
-production/staging database probe or live Discord action is included here.
+This records the domain/store slice of TOG-10086 and its runtime follow-up,
+TOG-10278, not a deployed onboarding handler. The shared interaction router
+(TOG-10075) and REST executor (TOG-10076) are merged prerequisites. No private
+dispatcher, Discord HTTP client, production/staging database probe or live
+Discord action is included here.
 
 ## Parity source and intentional differences
 
@@ -96,7 +97,13 @@ The shared `ActionExecutor` now supports component-bearing channel posts,
 single-role add/remove, and original deferred-response edits. These are bounded,
 single-attempt mutations, not a private client; empty components are omitted on
 posts so the anchor welcome attaches nothing. Role mutations use the shared
-110 ms pacing lane and preserve unrelated roles.
+110 ms pacing lane and preserve unrelated roles. Component posts use the shared
+mass-mention neutralization, scalar-safe text bounds and effective-create guard.
+They accept only the domain's typed `MentionPolicy`: no mentions by default, or
+exactly one welcome member, never arbitrary parse/role/multi-user/reply policies.
+Goodbye usernames remain captured verbatim for recovery, but outbound text is
+sanitized. Original-response edits retain the shared truncation/clearing contract
+and fully suppressed mentions; they never gain the welcome exception.
 
 The gateway now captures member state before S3 updates/removes it: ungated
 joins, cached pending true-to-false transitions, and session goodbye joined-at.
@@ -137,7 +144,8 @@ A single shard owner may have at most 32 unfinished durable rows, but admits at
 most two onboarding workers before claim/settings acquisition. Production opens
 **distinct** pools within the existing five-connection gateway subsystem budget:
 one gateway-only connection for checkpoints, funnel batches and queue operations,
-and four feature connections shared by onboarding and sticky work. Pool clones do
+and four feature connections shared by onboarding and the sticky/feed command
+runtime. Pool clones do
 not provide isolation. Feature transactions and member locks still span REST;
 they cannot consume the gateway reservation. The separately supervised HTTP/jobs
 pool retains its existing budget; this partition does not increase it.
@@ -187,10 +195,16 @@ interaction tickets are marked interrupted rather than applied. Settings/config
 failures and disabled-mode submissions after defer receive bounded honest edits,
 with no successful selection/routing rows or role writes.
 
-**Not review-ready:** the pool-repair head passed its required check, including the
-saturation/admission regressions. The subsequent ingress/ACK repair and new wire-clock,
-blocked-SQL, settings-timeout, overflow and unconfirmed-ACK regressions still require
-exact-head CI validation and independent review. Database isolation alone does not
+**Not review-ready:** ingress/ACK repair head `8ff9bf5` passed required check
+[36813095675](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36813095675).
+All four wire-clock/blocked-SQL, settings-timeout, overflow and unconfirmed-ACK
+ingress regressions passed, along with saturation/admission regressions, the
+25-test gateway suite, 11 sticky runtime acceptances and one real binary lifecycle
+acceptance. The optional JSON lifecycle assertion was skipped because the binary
+does not support `LOG_FORMAT=json`. This is evidence for that preceding head,
+not for the reconciliation with main `8af9b23` (shared command runtime and outbound
+message safety). The complete reconciled head still requires exact-head green CI
+and independent review on the same review card. Database isolation alone does not
 establish Discord's three-second ACK budget.
 Local Rust compilation has no certified bounded admission in this workspace; use the existing authorized CI
 service containers, never a speculative local build or target-directory bypass.
