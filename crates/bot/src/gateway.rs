@@ -238,6 +238,8 @@ pub async fn run_shard<I: InviteSource + 'static>(
 ) -> Result<(), sqlx::Error> {
     let generation = Arc::new(AtomicU64::new(0));
     let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;
+    // Tickets run beside reception and are cancelled/joined before return.
+    let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
     let receive_generation = Arc::clone(&generation);
     let receive_state = Arc::clone(&state);
     let events = futures_util::stream::unfold(
@@ -378,6 +380,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
     .await;
     // Reception does not restart in this runner. Keep Draining sticky through
     // both successful shutdown and fatal exit, including any remaining writer.
+    if let Some(tickets) = tickets {
+        tickets.shutdown().await;
+    }
     result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()))
 }
 

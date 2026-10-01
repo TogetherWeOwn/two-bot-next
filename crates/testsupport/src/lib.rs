@@ -87,7 +87,12 @@ fn guard_environment(mut is_set: impl FnMut(&str) -> bool) -> Result<()> {
     Ok(())
 }
 
-fn connect_options(raw: &str) -> Result<PgConnectOptions> {
+// Fixture pools keep a tight timeout; the admin connection only runs
+// CREATE/DROP DATABASE, which can legitimately exceed it on a loaded runner.
+const FIXTURE_STATEMENT_TIMEOUT: &str = "5000ms";
+const ADMIN_DDL_STATEMENT_TIMEOUT: &str = "120s";
+
+fn connect_options(raw: &str, statement_timeout: &str) -> Result<PgConnectOptions> {
     guard_database_url(raw)?;
     let url = Url::parse(raw).expect("guard already parsed URL");
     Ok(PgConnectOptions::new_without_pgpass()
@@ -97,7 +102,7 @@ fn connect_options(raw: &str) -> Result<PgConnectOptions> {
         .password("")
         .database(url.path().trim_start_matches('/'))
         .ssl_mode(PgSslMode::Disable)
-        .options([("statement_timeout", "5000ms")]))
+        .options([("statement_timeout", statement_timeout)]))
 }
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -120,38 +125,19 @@ struct Cleanup {
     name: String,
 }
 
-async fn cleanup_connection(admin: &PgPool) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
-    let mut connection = admin
-        .acquire()
-        .await
-        .context("acquire disposable database teardown connection")?;
-    // DROP DATABASE can wait for a forced checkpoint on a loaded CI service.
-    // Keep a finite DDL budget on this session only, not fixture queries.
-    sqlx::query("SET statement_timeout = '30s'")
-        .execute(&mut *connection)
-        .await
-        .context("set disposable database teardown timeout")?;
-    Ok(connection)
-}
-
 impl Cleanup {
     async fn close(self) -> Result<()> {
         self.pool.close().await;
-        let result = async {
-            let mut connection = cleanup_connection(&self.admin).await?;
-            // The name is generated internally, not supplied by a caller.
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP DATABASE \"{}\" WITH (FORCE)",
-                self.name
-            )))
-            .execute(&mut *connection)
-            .await
-            .context("drop disposable test database")?;
-            Ok(())
-        }
+        // The name is generated internally, not supplied by a caller.
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE \"{}\" WITH (FORCE)",
+            self.name
+        )))
+        .execute(&self.admin)
         .await;
         self.admin.close().await;
-        result
+        result.context("drop disposable test database")?;
+        Ok(())
     }
 }
 
@@ -166,11 +152,11 @@ pub struct TestDatabase {
 
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
-        let options = connect_options(raw)?;
+        let options = connect_options(raw, FIXTURE_STATEMENT_TIMEOUT)?;
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_with(options.clone())
+            .connect_with(connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?)
             .await
             .context("connect to test bootstrap database")?;
         let name = database_name();
@@ -353,43 +339,6 @@ mod tests {
             .to_string();
         assert!(!error.contains("private_password"));
         assert!(!error.contains("postgres://"));
-    }
-
-    #[tokio::test]
-    async fn teardown_session_has_a_separate_finite_statement_budget() {
-        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(url) => url,
-            Err(std::env::VarError::NotPresent) => return,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
-        };
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect_with(connect_options(&url).unwrap())
-            .await
-            .unwrap();
-        let ordinary_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
-            .fetch_one(&admin)
-            .await
-            .unwrap();
-        assert_eq!(ordinary_timeout, "5s");
-        let mut connection = cleanup_connection(&admin).await.unwrap();
-        let cleanup_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
-            .fetch_one(&mut *connection)
-            .await
-            .unwrap();
-        assert_eq!(cleanup_timeout, "30s");
-        // A slow server operation exceeds the ordinary five-second limit but
-        // fits the teardown budget. Use only the guarded disposable service.
-        tokio::time::timeout(
-            Duration::from_secs(35),
-            sqlx::query("SELECT pg_sleep(6)").execute(&mut *connection),
-        )
-        .await
-        .expect("teardown session remains bounded")
-        .expect("teardown permits an operation longer than five seconds");
-        drop(connection);
-        admin.close().await;
     }
 
     #[test]

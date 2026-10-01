@@ -26,6 +26,7 @@ mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
 mod server;
+mod ticket_runtime;
 mod website_jobs;
 
 use std::sync::Arc;

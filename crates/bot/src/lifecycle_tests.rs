@@ -335,6 +335,44 @@ async fn shutdown_retains_gateway_handle_through_gated_http_cleanup() {
 }
 
 #[tokio::test]
+async fn http_shutdown_signals_gateway_and_joins_graceful_cleanup() {
+    let (shutdown, receiver) = watch::channel(false);
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cleaned);
+    let task = tokio::spawn(async move {
+        server::shutdown_requested(receiver).await;
+        flag.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    supervise_gateway(
+        task,
+        async { Ok(()) },
+        Arc::new(RwLock::new(GatewayState::Armed)),
+        shutdown,
+    )
+    .await
+    .unwrap();
+    assert!(cleaned.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn requested_gateway_stop_is_not_reported_as_a_restart_failure() {
+    let (shutdown, _) = watch::channel(true);
+    let task = tokio::spawn(async { Ok(()) });
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    supervise_gateway(
+        task,
+        async { Ok(()) },
+        Arc::new(RwLock::new(GatewayState::Armed)),
+        shutdown,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn completed_gateway_requests_sticky_stop_before_first_http_poll() {
     let task = tokio::spawn(async { Ok(()) });
     while !task.is_finished() {
