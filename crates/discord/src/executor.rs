@@ -393,12 +393,14 @@ impl HyperTransport {
             Some(admission) => Some(admission.admit().await.map_err(|e| e.to_string())?),
             None => None, // Constructor restricts ungoverned transport to loopback fixtures.
         };
+        let mut attempt = crate::executor_metrics::Attempt::new(request);
         let response = self
             .inner
             .request(hyper_req)
             .await
             .map_err(|e| format!("transport: {e}"))?;
         let status = response.status().as_u16();
+        attempt.finish(Some(status));
         let retry_after_header = response
             .headers()
             .get("retry-after")

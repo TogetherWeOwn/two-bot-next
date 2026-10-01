@@ -379,6 +379,37 @@ impl RsvpAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn property_rsvp_parsers_match_exact_wire_contract(
+            text in proptest::collection::vec(any::<char>(), 0..128)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            let expected_id = (17..=20).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
+            prop_assert_eq!(validate_event_id(&text).is_ok(), expected_id);
+            if let Ok(id) = validate_event_id(&text) {
+                prop_assert_eq!(validate_event_id(&id), Ok(id));
+            }
+            let expected_status = ["going", "interested", "declined"].contains(&text.as_str());
+            prop_assert_eq!(RsvpStatus::parse(&text).is_ok(), expected_status);
+        }
+
+        #[test]
+        fn property_rsvp_values_round_trip(
+            digits in "[0-9]{0,23}",
+            status in prop::sample::select(RsvpStatus::ALL.to_vec()),
+        ) {
+            prop_assert_eq!(validate_event_id(&digits).is_ok(), (17..=20).contains(&digits.len()));
+            if (17..=20).contains(&digits.len()) {
+                prop_assert_eq!(validate_event_id(&digits), Ok(digits));
+            }
+            prop_assert_eq!(RsvpStatus::parse(&status.to_string()), Ok(status));
+        }
+    }
     use crate::commands::merge_commands;
     use crate::feature_commands::feature_commands;
     use crate::moderation::moderation_commands;
