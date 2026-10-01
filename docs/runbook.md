@@ -295,7 +295,9 @@ with `TWO_BACKUP_DIR`, retention and an approved upload wrapper already configur
 TWO_DATABASE_URL=postgres://agent_test@agent-testdb:5432/two_next_backup_test two-bot backup
 two-bot backup-upload "${BACKUP_FILE}"
 env -u TWO_RESTORE_URL two-bot restore "${BACKUP_FILE}" --dry-run
-TWO_RESTORE_URL=postgres://agent_test@agent-testdb:5432/two_next_restore_drill two-bot restore "${BACKUP_FILE}" --force
+TWO_RESTORE_DRILL_BOOTSTRAP_URL=postgres://agent_test:@agent-testdb:5432/postgres \
+TWO_RESTORE_DRILL_EVIDENCE_DIR="${PAPERCLIP_RUN_SCRATCH_DIR}/restore-drills" \
+two-bot restore-drill "${BACKUP_FILE}" --confirm-scratch
 ```
 
 `BACKUP_FILE` is the actual published `two-funnel-*.ndjson.gz`, not a partial
@@ -310,9 +312,13 @@ The `env -u` example makes dry-run a file-only check: an inherited
 `TWO_RESTORE_URL` would otherwise trigger a database probe. Require exit 0 plus
 `DRY RUN VERIFIED`, or for the destructive scratch restore `RESTORE VERIFIED`
 and matching per-table counts. `--force` only confirms intent; it is not
-authority to use a non-test target. The restore command **does not migrate**;
-the scratch target must already have the schema, despite the old dry-run
-output mentioning migration. Unknown restore options refuse (exit 2).
+authority to use a non-test target. Direct `restore` **does not migrate** and
+requires a fresh prepared target; moderation history refuses before truncation.
+The recurring `restore-drill` path instead allocates a distinct test-only database
+and applies the embedded migrations on each invocation. It preserves previous
+targets, quarantines imported expiries and retains private no-overwrite receipts
+and an archive copy. Failures retain their target/evidence too. Neither path
+starts a gateway or enables moderation. Unknown restore options refuse (exit 2).
 
 Guild-config capture/restore is different: it talks to Discord. Do not run it
 with live tokens or as a database test. Before either command, the authorized

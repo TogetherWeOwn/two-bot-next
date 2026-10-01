@@ -1835,6 +1835,145 @@ async fn postgres_staging_pool_timeout_is_mutation_free_in_both_paths() {
 
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_warning_acquisition_timeout_releases_only_new_key_and_retries() {
+    use std::sync::atomic::AtomicBool;
+    use two_bot_core::member_moderation::MemberError;
+
+    let (admin, pool, schema) = database().await;
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let injection = fail_once.clone();
+    let search_path = schema.clone();
+    let warning_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(250))
+        .after_connect(move |connection, _| {
+            let search_path = search_path.clone();
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('search_path', $1, false)")
+                    .bind(search_path)
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .before_acquire(move |connection, _| {
+            let injection = injection.clone();
+            Box::pin(async move {
+                if injection.load(Ordering::SeqCst) {
+                    let claimed: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM moderation_idempotency
+                         WHERE idempotency_key = 'warning-pool-loss' AND state = 'in_flight')",
+                    )
+                    .fetch_one(connection)
+                    .await?;
+                    if claimed && injection.swap(false, Ordering::SeqCst) {
+                        // The service's claim committed. Stall acquisition only:
+                        // the warning INSERT has not been sent on this connection.
+                        std::future::pending::<()>().await;
+                    }
+                }
+                Ok(true)
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .expect("isolated warning pool");
+    let store = PgMemberModerationStore::new(warning_pool.clone(), "100000000000000001");
+    let discord = MockMemberDiscord::new();
+    let svc = MemberModerationService::new(discord.clone(), store, policy(), || 1_700_000_000_000);
+    let request = execution(ModerationAction::Warn, "warning-pool-loss");
+    let error = svc
+        .execute(&request)
+        .await
+        .expect_err("pre-INSERT acquisition timeout");
+    assert!(
+        !fail_once.load(Ordering::SeqCst),
+        "failure followed a successful claim"
+    );
+    assert!(matches!(error, MemberError::Store(ref e)
+        if e.is_safe_pre_mutation() && e.message.contains("pool_timeout")));
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM moderation_warnings) +
+                (SELECT COUNT(*) FROM moderation_audit) +
+                (SELECT COUNT(*) FROM moderation_idempotency)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0, "no warning/audit; only the new claim was released");
+    assert!(
+        !svc.execute(&request)
+            .await
+            .expect("same-key retry")
+            .replayed
+    );
+    assert!(
+        svc.execute(&request)
+            .await
+            .expect("completed replay")
+            .replayed
+    );
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM moderation_warnings),
+                (SELECT COUNT(*) FROM moderation_audit WHERE outcome = 'warned'),
+                (SELECT COUNT(*) FROM moderation_idempotency WHERE state = 'done')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1, 1));
+    assert_eq!(discord.call_count("ban") + discord.call_count("kick"), 0);
+    warning_pool.close().await;
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_warning_execution_error_keeps_claim_fenced() {
+    use two_bot_core::member_moderation::MemberError;
+
+    let (admin, pool, schema) = database().await;
+    sqlx::raw_sql(
+        "CREATE FUNCTION lose_warning_connection() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM pg_terminate_backend(pg_backend_pid()); RETURN NEW; END $$;
+         CREATE TRIGGER lose_warning_connection AFTER INSERT ON moderation_warnings
+             FOR EACH ROW EXECUTE FUNCTION lose_warning_connection();",
+    )
+    .execute(&pool)
+    .await
+    .expect("disconnect after the warning statement starts");
+    let store = PgMemberModerationStore::new(pool.clone(), "100000000000000001");
+    let svc = MemberModerationService::new(MockMemberDiscord::new(), store, policy(), || {
+        1_700_000_000_000
+    });
+    let request = execution(ModerationAction::Warn, "warning-uncertain");
+    let error = svc
+        .execute(&request)
+        .await
+        .expect_err("lost INSERT outcome");
+    assert!(matches!(error, MemberError::Store(ref e) if !e.is_safe_pre_mutation()));
+    sqlx::query("DROP TRIGGER lose_warning_connection ON moderation_warnings")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        svc.execute(&request).await,
+        Err(MemberError::InFlight)
+    ));
+    let claims: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM moderation_idempotency WHERE state = 'in_flight'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        claims, 1,
+        "query/connection errors never get the acquisition exemption"
+    );
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
 async fn postgres_read_only_staging_timeout_releases_service_key_and_retries() {
     for action in [ModerationAction::Ban, ModerationAction::TempBan] {
         let (admin, pool, schema) = database().await;

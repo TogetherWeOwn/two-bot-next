@@ -29,7 +29,7 @@ const SCHEMA: &[(&str, &str)] = &[
     ("invite_snapshots", "guild_id TEXT NOT NULL, code TEXT NOT NULL, uses INTEGER NOT NULL DEFAULT 0, captured_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (guild_id, code)"),
     ("operational_audit_log", "entry_id TEXT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL, delivered BOOLEAN NOT NULL DEFAULT FALSE, detail JSONB"),
     ("moderation_warnings", "id BIGSERIAL PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, reason TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL"),
-    ("moderation_scheduled_unbans", "request_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, execute_at TIMESTAMPTZ NOT NULL, state TEXT NOT NULL DEFAULT 'pending', claim_token TEXT, claimed_at TIMESTAMPTZ, dispatch_uncertain BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("moderation_scheduled_unbans", "request_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, execute_at TIMESTAMPTZ NOT NULL, state TEXT NOT NULL DEFAULT 'pending', claim_token TEXT, claimed_at TIMESTAMPTZ, dispatch_uncertain BOOLEAN NOT NULL DEFAULT FALSE, retry_generation BIGINT CHECK (retry_generation > 0)"),
     ("moderation_member_bans", "request_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, user_id TEXT NOT NULL, generation BIGSERIAL NOT NULL UNIQUE, state TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ"),
     ("moderation_audit", "request_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, action TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL"),
     ("moderation_lockdowns", "guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, locked_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (guild_id, channel_id)"),
@@ -50,11 +50,16 @@ const SCHEMA: &[(&str, &str)] = &[
 ];
 
 async fn test_url() -> Option<String> {
-    let url = std::env::var("TWO_BOT_TEST_DATABASE_URL").ok()?;
-    let url = url.trim().to_owned();
-    if url.is_empty() {
-        return None;
+    let url = std::env::var("TWO_BOT_TEST_DATABASE_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty());
+    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        assert!(
+            url.is_some(),
+            "CI must execute the backup round trip, not skip it"
+        );
     }
+    let url = url?.trim().to_owned();
     let parsed = url::Url::parse(&url).expect("test database URL");
     assert_eq!(
         parsed.host_str(),

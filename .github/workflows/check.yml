@@ -34,6 +34,7 @@ jobs:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
+      PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-check-scratch
       TWO_LFG_TESTDB_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
     services:
@@ -123,7 +124,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Prepare isolated test databases
-        run: createdb -h agent-testdb -U agent_test two_bot_test_ci
+        run: |
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_ci
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
       # Migrated suites create/drop unique databases; this bootstrap is not reset.
@@ -132,9 +135,13 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
 
-      - name: cargo test (integration, including website acceptance)
+      # The standalone backup fixture has its own scratch-only URL guard.
+      # Supplying it here executes the round trip rather than its local skip.
+      - name: cargo test (integration, including website acceptance and backup round trip)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         run: cargo test --workspace --test '*' --features two-bot-core/db --locked
 
       # Reuse the exact feature/target graph above so this measures execution,
@@ -200,6 +207,9 @@ jobs:
 
       - name: Real binary lifecycle acceptance (CI service only, under 60 s)
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
+
+      - name: Consecutive retained restore drills (actual CLI, CI service only)
+        run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.

@@ -118,9 +118,17 @@ two-bot operator commands
       writes nothing (TWO_RESTORE_URL optional: with it you also get the
       target's current counts). Without --dry-run, --force is required and
       TWO_RESTORE_URL must name the target. The target variable is
-      deliberately NOT TWO_DATABASE_URL: restoring truncates the target,
-      so aiming it at production must be said twice, on purpose.
+      deliberately NOT TWO_DATABASE_URL: restoring replaces target data.
+      Requires a fresh migrated target without moderation history. --force
+      confirms intent, not authorization or a safety-guard bypass.
       `RESTORE VERIFIED` on the last line, and exit 0, is the only success.
+
+  two-bot restore-drill <backup.ndjson.gz> --confirm-scratch
+      Allocate a fresh agent-testdb scratch database, migrate and restore it.
+      Retain prior targets, archives and exclusive receipts; never reuse/drop.
+      Env: TWO_RESTORE_DRILL_BOOTSTRAP_URL (explicit empty-password test binding),
+           TWO_RESTORE_DRILL_EVIDENCE_DIR (absolute retained directory).
+      No TWO_RESTORE_URL/source credentials or live Discord are used.
 
   two-bot backup-upload <dump.ndjson.gz>
       PUT one dump to S3-compatible storage (SigV4, single-PUT).
@@ -163,6 +171,7 @@ pub async fn dispatch(args: &[String]) -> i32 {
         "db" => crate::database_roles_cli::dispatch(&args[1..]).await,
         "backup" => cmd_backup().await,
         "restore" => cmd_restore(&args[1..]).await,
+        "restore-drill" => crate::restore_drill::dispatch(&args[1..]).await,
         "backup-upload" => cmd_backup_upload(&args[1..]).await,
         "guild-config-snapshot" => cmd_guild_config_snapshot().await,
         "guild-config-restore" => cmd_guild_config_restore(&args[1..]).await,

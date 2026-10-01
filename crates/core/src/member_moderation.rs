@@ -3600,6 +3600,7 @@ mod tests {
         inner: MemMemberStore,
         fail_complete_once: Arc<std::sync::atomic::AtomicBool>,
         fail_stage_once: Arc<std::sync::atomic::AtomicBool>,
+        fail_warning_ack_once: Arc<std::sync::atomic::AtomicBool>,
         fail_audit_once: Arc<std::sync::atomic::AtomicBool>,
         fail_complete_unban_once: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -3611,6 +3612,7 @@ mod tests {
                 inner,
                 fail_complete_once: Arc::new(AtomicBool::new(false)),
                 fail_stage_once: Arc::new(AtomicBool::new(false)),
+                fail_warning_ack_once: Arc::new(AtomicBool::new(false)),
                 fail_audit_once: Arc::new(AtomicBool::new(false)),
                 fail_complete_unban_once: Arc::new(AtomicBool::new(false)),
             }
@@ -3710,7 +3712,11 @@ mod tests {
                 .add_warning(
                     warning_id, guild_id, user_id, actor_id, reason, request_id, created_at,
                 )
-                .await
+                .await?;
+            if Self::fail_once(&self.fail_warning_ack_once) {
+                return Err(StoreError::new("injected lost warning acknowledgment"));
+            }
+            Ok(())
         }
 
         async fn stage_ban(
@@ -3857,6 +3863,27 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.inner.requeue_unban(request_id, claim_token).await
         }
+    }
+
+    #[tokio::test]
+    async fn lost_warning_acknowledgment_keeps_the_written_warning_fenced() {
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        store
+            .fail_warning_ack_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let svc =
+            MemberModerationService::new(MockMemberDiscord::new(), store.clone(), policy(), || {
+                1_700_000_000_000
+            });
+        let request = execution(ModerationAction::Warn);
+        let error = svc
+            .execute(&request)
+            .await
+            .expect_err("write acknowledgment lost");
+        assert!(matches!(error, MemberError::Store(ref e) if !e.is_safe_pre_mutation()));
+        assert_eq!(store.inner.warnings().len(), 1);
+        assert_eq!(svc.execute(&request).await, Err(MemberError::InFlight));
+        assert_eq!(store.inner.warnings().len(), 1, "no ambiguous write retry");
     }
 
     // F3: a completion failure after Discord acceptance must still leave the

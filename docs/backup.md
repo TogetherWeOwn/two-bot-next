@@ -152,21 +152,47 @@ mismatch → exit 1 with the residual operations listed.
 
 ## Monthly restore drill — 1st, 05:30
 
-`deploy/two-bot-next-restore-drill.{service,timer}` restores the newest
-backup into the **scratch** database and requires `RESTORE VERIFIED`.
-A red drill means the backups are not real — better on the 1st than during
-an outage.
+`deploy/two-bot-next-restore-drill.{service,timer}` invokes `restore-drill`
+for the newest published backup and requires `RESTORE VERIFIED`. **Every run
+allocates a distinct fresh scratch database**, applies the same embedded S6
+migrations, then performs the normal guarded restore. It never reuses or drops
+previous targets. A destination with moderation history still refuses direct
+restore, even with `--force`; do not erase history to pass that guard.
 
-Manual drill (what the timer does, step by step):
+The currently authorized provisioning path is only the disposable
+`agent-testdb:5432` service, explicitly empty-password `agent_test` and bootstrap
+`postgres`. Production/staging, arbitrary hosts, runtime credentials, URL query
+options and inherited libpq `PG*` settings refuse before allocation. No login,
+role, runtime grant or Discord consumer is created. Extending this binding to
+another environment requires separate authorization and review, not a URL edit.
+
+Operator installation must provide protected `/etc/two-bot-next/restore-drill.env`
+with `TWO_RESTORE_DRILL_BOOTSTRAP_URL=postgres://agent_test:@agent-testdb:5432/postgres`.
+The unit does not read shared `backup.env`, source or upload credentials. Its
+`StateDirectory` supplies `/var/lib/two-bot-next-restore-drills`, writable under
+the unit sandbox. No service installation/execution is authorized by this PR.
+
+Each run retains a private archive copy and exclusive `planned`, `allocated`,
+`migrated` and `verified` JSON receipts as those stages complete. A provisioning,
+migration or restore failure records a `failed` classification without raw SQL
+errors or credentials; any partially allocated target and completed evidence
+remain. Archive-validation failures allocate no database and preserve the private
+copy for diagnosis. No prior target, archive or receipt is overwritten or pruned.
+Capacity/retention decisions require a separate authorized evidence-preservation
+policy; do not clear drill history to free a build cache or make the next run pass.
+
+Manual drill (with that explicit scratch authority, no production restore):
 
 ```bash
 # 1. Is last night's file any good? (writes nothing; TWO_RESTORE_URL optional)
 two-bot restore /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --dry-run
 # → DRY RUN VERIFIED
 
-# 2. Rehearse into scratch. Never restore straight to prod.
-TWO_RESTORE_URL=postgres://.../two_scratch two-bot restore /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --force
-# → RESTORE VERIFIED (every table count matches the manifest)
+# 2. Allocate a NEW migrated scratch target; retain earlier drill evidence.
+TWO_RESTORE_DRILL_BOOTSTRAP_URL=postgres://agent_test:@agent-testdb:5432/postgres \
+TWO_RESTORE_DRILL_EVIDENCE_DIR=/var/lib/two-bot-next-restore-drills \
+two-bot restore-drill /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --confirm-scratch
+# → retained evidence <unique directory>, then RESTORE VERIFIED
 ```
 
 Production restore is **not authorized by this slice**. S6 must establish its

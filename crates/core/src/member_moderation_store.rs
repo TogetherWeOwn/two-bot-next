@@ -333,12 +333,16 @@ impl MemberModerationStore for PgMemberModerationStore {
         now: &str,
     ) -> Result<(), StoreError> {
         self.ensure_guild(guild)?;
+        // Acquisition failed before the INSERT could be sent: release only
+        // this new command's claim. Once acquired, every execution error is
+        // conservatively uncertain, including a lost write acknowledgment.
+        let mut connection = self.pool.acquire().await.map_err(rolled_back_error)?;
         sqlx::query(
             "INSERT INTO moderation_warnings (id, guild_id, user_id, actor_id, reason, request_id, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7::text::timestamptz)
              ON CONFLICT (request_id) DO NOTHING"
         ).bind(id).bind(&self.guild_id).bind(user).bind(actor).bind(reason).bind(request).bind(now)
-            .execute(&self.pool).await.map_err(db_error)?;
+            .execute(&mut *connection).await.map_err(db_error)?;
         Ok(())
     }
 

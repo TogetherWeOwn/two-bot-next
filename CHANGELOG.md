@@ -23,6 +23,13 @@
 
 ### Fixed
 
+- Execute the standalone backup round trip in CI with the current retry-ticket
+  schema while preserving frozen legacy-v3 input coverage. Release only a newly
+  claimed warning key when connection acquisition fails before INSERT; uncertain
+  execution and lost acknowledgments remain fenced. Recurring scratch restore
+  drills allocate fresh migrated test-only targets and retain prior databases,
+  private archive copies and stage receipts instead of overwriting moderation
+  history. The direct-restore safety guard and moderation default-off are unchanged.
 - Resolve historical member-ban acceptance only with exact-attempt acceptance
   and ordering evidence, atomically audited without taking newer ownership or
   clearing dispatched DELETE uncertainty. Moderation activation remains deferred.
