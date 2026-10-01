@@ -27,7 +27,7 @@ pub struct SettingsStore<'a> {
 }
 
 impl<'a> SettingsStore<'a> {
-    /// Borrow the pool; migrations (including `0330`–`0333`) are applied by
+    /// Borrow the pool; migrations (including `0330`–`0334`) are applied by
     /// [`crate::CutoverDb::migrate`], not here.
     #[must_use]
     pub fn new(pool: &'a Pool<Postgres>) -> Self {
@@ -87,7 +87,7 @@ impl<'a> SettingsStore<'a> {
     ) -> Result<Option<(serde_json::Value, i64)>, SettingsWriteError> {
         validate_write(guild_id, key, None, "settings-reader")?;
         Ok(sqlx::query_as(
-            "SELECT value, version FROM guild_settings WHERE guild_id = $1 AND key = $2",
+            "SELECT value, cas_version FROM guild_settings WHERE guild_id = $1 AND key = $2",
         )
         .bind(guild_id)
         .bind(key)
@@ -122,7 +122,9 @@ impl<'a> SettingsStore<'a> {
 
     /// Compare under the same revision-row lock used by every settings writer.
     /// Zero expects an absent override. None retains legacy unconditional saves.
-    /// Returns the committed row version (zero after delete), without a value.
+    /// Negative CAS tokens are separate from copyable legacy row versions; old
+    /// nonnegative tokens never match an existing override after migration 0334.
+    /// Returns the committed CAS token (zero after delete), without a value.
     pub async fn set_if_version(
         &self,
         guild_id: &str,
@@ -140,7 +142,7 @@ impl<'a> SettingsStore<'a> {
         .await?;
 
         let previous: Option<(serde_json::Value, i64)> = sqlx::query_as(
-            "SELECT value, version FROM guild_settings WHERE guild_id = $1 AND key = $2",
+            "SELECT value, cas_version FROM guild_settings WHERE guild_id = $1 AND key = $2",
         )
         .bind(guild_id)
         .bind(key)
@@ -172,9 +174,10 @@ impl<'a> SettingsStore<'a> {
                      VALUES ($1, $2, $3, now(), $4)
                      ON CONFLICT (guild_id, key) DO UPDATE
                        SET value = EXCLUDED.value,
+                           version = EXCLUDED.version,
                            updated_at = EXCLUDED.updated_at,
                            updated_by = EXCLUDED.updated_by
-                     RETURNING version",
+                     RETURNING cas_version",
                 )
                 .bind(guild_id)
                 .bind(key)

@@ -62,10 +62,10 @@ impl SettingsCommand {
             let expected_version = body
                 .get("expected_version")
                 .map(|v| {
-                    v.as_i64().filter(|v| *v >= 0).ok_or_else(|| {
+                    v.as_i64().ok_or_else(|| {
                         ActionError::new(
                             ErrorCode::Malformed,
-                            "\"expected_version\" must be a non-negative integer",
+                            "\"expected_version\" must be a signed integer token",
                             "bad_expected_version",
                         )
                     })
@@ -249,6 +249,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(command.write(), Some((None, ADMIN, Some(0))));
+        for token in [-1, -9007199254740991] {
+            let command = parse(
+                "settings.set",
+                json!({"key": KEY, "value": 8, "updated_by": ADMIN, "expected_version": token}),
+            )
+            .unwrap();
+            assert_eq!(command.write().unwrap().2, Some(token));
+        }
         for body in [
             json!({"key": KEY, "updated_by": ADMIN}),
             json!({"key": KEY, "value": 8, "updated_by": "name"}),
@@ -259,13 +267,7 @@ mod tests {
                 ErrorCode::Malformed
             );
         }
-        for version in [
-            json!(-1),
-            json!(1.5),
-            json!("1"),
-            Value::Null,
-            json!(u64::MAX),
-        ] {
+        for version in [json!(1.5), json!("1"), Value::Null, json!(u64::MAX)] {
             let error = parse(
                 "settings.set",
                 json!({

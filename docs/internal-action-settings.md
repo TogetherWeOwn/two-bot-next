@@ -44,17 +44,19 @@ against `SettingsStore` using the configured guild ID, not a body-supplied guild
 The receiver must still enforce action enablement, signing and replay protection;
 a validated command is not an authorization grant.
 
-`settings.set` accepts an optional `expected_version` non-negative integer.
-It is the observed **row version**, not the global poll revision. Zero expects
-an absent override, never a stored token of zero. A legacy version-zero row
-still returns `source: "store"`; expected-zero saves/deletes refuse it. An
-explicit legacy unconditional save assigns it a new positive token, after which
-version-checked writes work normally. A supplied stale version returns
-non-retryable HTTP 409 `version_conflict`; refresh before deliberately submitting
-a new save. Omitting it retains the legacy unconditional-save behavior. The
-comparison occurs under the existing revision-row lock, before the value, audit
-or poll revision changes, so simultaneous saves against one version cannot both
-succeed.
+`settings.set` accepts an optional `expected_version` signed integer token.
+It is the observed **CAS token**, not the copyable legacy `version` column or
+poll revision. Tokens are opaque: compare for equality, never magnitude. Zero
+expects an absent override, never an existing row. Migration `0334` assigns a
+fresh negative token to every existing row, including legacy version-zero rows;
+all previously accepted nonnegative tokens become stale. Clients must reread
+metadata after upgrade. Negative tokens stay within JavaScript's exact integer
+range; the noncycling sequence refuses writes on exhaustion rather than reuse.
+A supplied stale token returns non-retryable HTTP 409 `version_conflict`; refresh
+before deliberately submitting a new save. Omitting it retains the legacy
+unconditional-save behavior. Comparison occurs under the existing revision-row
+lock, before value, audit or poll revision changes, so simultaneous saves
+against one token cannot both succeed.
 
 `SettingsOutcome.observed_version` exposes the observed/committed version to a
 future HTTP adapter as metadata, not an extra field in the legacy `result`.
@@ -63,20 +65,25 @@ cycle that returns the key to absence. Clients needing that stronger guarantee
 need a separate revision contract; this slice does not redefine legacy results.
 
 The value write/delete, audit transition and poll-revision advance commit in
-one settings transaction. Audit failure rolls back all three. Row versions
-advance on every insert/update, including supported direct SQL writers, via
-migration `0331`'s database-owned row trigger. Caller-supplied versions are
-ignored; the upgrade seeds the allocator above existing row tokens without
-changing migration `0330`. Additive migration `0332` binds allocation to the
-trigger's target table schema, independent of the caller's sequence search path.
-Additive migration `0333` locks settings DML and reseeds that canonical allocator
-above existing tokens (including intervening shadow-issued `0331` tokens) and
-unused allocations without rewinding it. It also binds the statement trigger's
-revision table to the target schema: qualified direct writers lock/advance the
-same revision used by store CAS and polling, not a caller's shadow table. A
-missing target revision row still refuses the statement. Applied `0330`–`0332`
-checksums and existing row tokens remain unchanged. Deletion advances the
-transactional poll revision. No runtime hot-reload consumer is changed here.
+one settings transaction. Audit failure rolls back all three. Additive `0334`
+separates destination-owned `cas_version` from copyable legacy `version`. Its
+new descending allocator is never reseeded: standalone `nextval` only creates
+gaps, not reuse. Every insert/update, including direct SQL/upserts, replaces
+caller-supplied CAS tokens via a target-schema-bound row trigger. The volatile
+column default backfills existing rows under a DDL lock without settings DML,
+value/audit/poll changes or acquiring the revision lock (avoiding an upgrade
+cycle with waiting store writers). Preserved legacy versions do not participate
+in CAS or poll safety. Copy replay can therefore preserve all legacy columns,
+issue no DML, and leave CAS metadata unchanged; a genuine copied change gets a
+fresh token even if its source version is unchanged.
+
+Applied `0330`–`0333` checksums stay unchanged. The earlier allocator repair
+cannot reconstruct vanished shadow tokens or serialize read/setval with every
+standalone allocation; it is retired from CAS, not treated as a safe high-water
+mark. `0333`'s schema-bound revision trigger remains: qualified writers lock and
+advance the same revision used by store CAS and polling, never a shadow table.
+A missing target revision row still refuses writes. Deletes advance the poll
+revision. No runtime hot-reload consumer is changed here.
 
 The outer durable store and this transaction are separate. A receiver must not
 re-execute an ambiguous write after losing a terminal-response commit. Its
@@ -86,9 +93,9 @@ HTTP/durable-result integration belongs to the receiver slice.
 ## Verification
 
 ```sh
-cargo test -p two-bot-core --locked internal_settings --lib
-cargo test -p two-bot-cutover --locked internal_settings --lib
-cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
+python3 scripts/cargo_cache.py run -- test -p two-bot-core internal_settings --lib
+python3 scripts/cargo_cache.py run -- test -p two-bot-cutover internal_settings --lib
+python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test settings_db -- --ignored
 ```
 
 The existing `settings_db` harness pins `agent-testdb:5432` locally, or CI's
