@@ -85,6 +85,11 @@ jobs:
       - name: Verify Docker dependency layer
         run: python3 scripts/test-docker-deps.py --cargo
 
+      - name: Prevent raw secrets under derived Debug
+        run: |
+          python3 scripts/check-secret-debug.py --test
+          python3 scripts/check-secret-debug.py
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
