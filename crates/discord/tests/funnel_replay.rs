@@ -820,5 +820,71 @@ fn pipeline_failed_invite_read_still_records() {
     assert_eq!(join.source, "unknown");
 }
 
+/// Vanity-guild joins with no invite growth attribute `vanity` (legacy catch
+/// path): a clean read showing no movement, and a failed read alike. The
+/// join still records — attribution never blocks it.
+#[test]
+fn pipeline_vanity_guild_join_attributes_vanity() {
+    let pipeline = MemPipeline::for_replay();
+    pipeline.set_guild_vanity(GUILD, true);
+    // Successful empty read: nothing grew → vanity.
+    pipeline.invite_source().push(GUILD, vec![]);
+    pipeline.handle_at(&join_event(A, false, "12:00:00"), &stamp("12:00:00"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(A))
+        .expect("member_join");
+    assert_eq!(join.source, "vanity");
+    // Failed read on a vanity guild: still vanity, row still written.
+    pipeline.handle_at(&join_event(B, false, "12:30:00"), &stamp("12:30:00"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(B))
+        .expect("member_join");
+    assert_eq!(join.source, "vanity");
+}
+
+/// A baseline older than the staleness bound is re-seeded, not diffed: the
+/// stale window files `unknown` and the next join measures against the fresh
+/// baseline (TOG-11716).
+#[test]
+fn pipeline_stale_baseline_reseeds_instead_of_crediting_drift() {
+    const D: u64 = 900_000_000_000_004_444;
+    let pipeline = MemPipeline::for_replay();
+    // Baseline at 12:00 (first read: stored, nothing to credit).
+    pipeline.invite_source().push(GUILD, invite_snapshot(5));
+    pipeline.handle_at(&join_event(A, false, "12:00:00"), &stamp("12:00:00"));
+    // Fresh growth at 12:30 credits normally.
+    pipeline.invite_source().push(GUILD, invite_snapshot(6));
+    pipeline.handle_at(&join_event(B, false, "12:30:00"), &stamp("12:30:00"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(B))
+        .expect("member_join");
+    assert_eq!(join.source, "invite:twodev01");
+    // Stale read at 13:30:01 (>1h after the 12:30 baseline): re-seed, no
+    // credit — this window files `unknown`, never drift.
+    pipeline.invite_source().push(GUILD, invite_snapshot(9));
+    pipeline.handle_at(&join_event(C, false, "13:30:01"), &stamp("13:30:01"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(C))
+        .expect("member_join");
+    assert_eq!(join.source, "unknown");
+    // Next join measures against the re-seeded baseline (9 → 10).
+    pipeline.invite_source().push(GUILD, invite_snapshot(10));
+    pipeline.handle_at(&join_event(D, false, "13:31:00"), &stamp("13:31:00"));
+    let rows = pipeline.handlers().store().rows();
+    let join = rows
+        .iter()
+        .find(|r| r.event_type == two_bot_core::EventType::MemberJoin && r.member_id == Some(D))
+        .expect("member_join");
+    assert_eq!(join.source, "invite:twodev01");
+}
+
 #[allow(dead_code)]
 fn _classifier_check(_: &NoClassification) {}
