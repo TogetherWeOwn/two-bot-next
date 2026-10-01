@@ -8,12 +8,13 @@ It is not a full-bot or real-guild soak, and cannot authorize a production resiz
 ## Reproduce
 
 The non-required **pipeline benchmark** workflow runs on changes to its driver,
-comparator or baseline, and supports `workflow_dispatch` once merged. No nightly
-workflow currently exists; do not add this budget comparison to required `check`.
-It uses an ephemeral hosted Postgres service, never staging/production.
+comparator or baseline, supports `workflow_dispatch` once merged, and is called
+by the existing **nightly** workflow. It is not part of required `check`.
+It uses `[self-hosted, two-selfhosted]` with an ephemeral Rust job container and
+job-private Postgres service DNS, without publishing host ports; never staging/production.
 The workflow uploads the JSON report and tested head SHA, including on failure.
 
-Build on hosted CI first (compilation time is separate from replay time):
+Build in the CI job container first (compilation time is separate from replay time):
 
 ```sh
 cargo build -p two-bot-discord --example pipeline_bench --locked
@@ -21,8 +22,8 @@ cargo build -p two-bot-discord --example pipeline_bench --locked
 
 On the persistent controller, compiling commands must instead use the approved
 `scripts/cargo_cache.py` wrapper from an isolated workspace. A missing/refused
-pool is not permission for direct Cargo or an alternate cache. Hosted CI is the
-measurement execution path while the controller pool rollout is deferred.
+pool is not permission for direct Cargo or an alternate cache. Ephemeral CI job
+containers are the measurement path while the controller pool rollout is deferred.
 
 With an authorized disposable `agent-testdb` container, pre-create an empty
 `two_bot_test_pipeline_bench` bootstrap DB owned by passwordless `agent_test`.

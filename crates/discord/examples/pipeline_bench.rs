@@ -141,9 +141,14 @@ fn user(id: u64) -> Value {
     json!({"id":id.to_string(),"username":"bench-member","discriminator":"0","bot":false})
 }
 
+fn gateway_timestamp(at_ms: i64) -> String {
+    // Twilight requires Discord's explicit UTC offset, not the core's Z suffix.
+    two_bot_core::format_iso_millis(at_ms).replace('Z', "+00:00")
+}
+
 fn member(id: u64) -> Value {
     json!({"guild_id":GUILD.to_string(),"user":user(id),"roles":[],
-        "joined_at":two_bot_core::format_iso_millis(EPOCH_MS),
+        "joined_at":gateway_timestamp(EPOCH_MS),
         "pending":false,"deaf":false,"mute":false,"flags":0})
 }
 
@@ -266,7 +271,7 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
             tokio::time::sleep_until((replay_started + deadline).into()).await;
             sequence += 1;
             let at_ms = EPOCH_MS + 1_000 + deadline.as_millis() as i64;
-            let stamp = two_bot_core::format_iso_millis(at_ms);
+            let stamp = gateway_timestamp(at_ms);
             let (kind, data) = if slot < config.messages_per_sec {
                 let id = 100 + messages % config.members;
                 let channel = 10_000 + 2 * (messages % config.channels.div_ceil(2));
@@ -287,7 +292,7 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
             let started = Instant::now();
             commit(&pipeline, &store, event, sequence, at_ms).await?;
             latency.push(started.elapsed().as_secs_f64() * 1_000_000.0);
-            if (index + 1) % config.rest_every == 0 {
+            if (index + 1).is_multiple_of(config.rest_every) {
                 let started = Instant::now();
                 executor
                     .post_message("10000", "synthetic benchmark reply", Some(sequence))
@@ -425,7 +430,7 @@ mod tests {
             &dispatch(
                 2,
                 "MESSAGE_CREATE",
-                message(100, 10000, 2, &two_bot_core::format_iso_millis(EPOCH_MS)),
+                message(100, 10000, 2, &gateway_timestamp(EPOCH_MS)),
             )
             .unwrap(),
             &two_bot_core::format_iso_millis(EPOCH_MS),
