@@ -285,6 +285,54 @@ async fn rejected_guild_write_does_not_echo_authorization_or_remote_json() {
     assert!(!shown.contains("fixture-remote-json-secret"));
 }
 
+#[tokio::test]
+async fn emoji_non_image_content_type_never_echoes_remote_header() {
+    use axum::{http::StatusCode, response::Response, routing::get, Router};
+    let sentinel = "fixture-emoji-content-type-secret";
+    let app = Router::new().route(
+        "/emojis/e1.png",
+        get(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/x-fixture-emoji-content-type-secret")
+                .body(axum::body::Body::from("ok"))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cdn_base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let api = GuildConfigDiscordApi::new(
+        None,
+        Some(&cdn_base),
+        "fixture-bot-token".to_owned(),
+        "1".to_owned(),
+        "2".to_owned(),
+    )
+    .unwrap();
+    let emoji = serde_json::json!({
+        "id": "e1",
+        "name": "wave",
+        "managed": false,
+        "animated": false,
+    });
+    let emoji = emoji.as_object().unwrap();
+    let error = api.capture_emoji_image(emoji).await.unwrap_err();
+    server.abort();
+    assert_redacted(&error, &[sentinel]);
+    let shown = error.to_string();
+    assert!(
+        shown.contains("non-image"),
+        "classification retained: {shown}"
+    );
+    assert!(!shown.contains(sentinel));
+    assert!(!format!("{error:?}").contains(sentinel));
+    // CLI diagnostics render the same error string (`eprintln!(... {err})`),
+    // so the backup CLI cannot disclose the echoed header either.
+    let cli = format!("guild-config-snapshot: capture failed: {error}");
+    assert!(!cli.contains(sentinel));
+}
+
 #[test]
 fn http_rejects_userinfo_before_hyper_can_log_it() {
     let capture = tracing_capture::Capture::default();

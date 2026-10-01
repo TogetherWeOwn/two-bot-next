@@ -566,8 +566,10 @@ impl GuildConfigDiscordApi {
             .unwrap_or(if animated { "image/gif" } else { "image/png" })
             .to_owned();
         if !content_type.starts_with("image/") {
+            // The header value is remote-controlled (a URL echo can carry a
+            // credential), so the error keeps only the constant classification.
             return Err(GuildConfigApiError::Discord(format!(
-                "Emoji {} returned non-image content type {content_type}.",
+                "Emoji {} returned a non-image response.",
                 name.unwrap_or("?")
             )));
         }

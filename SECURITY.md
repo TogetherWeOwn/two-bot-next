@@ -33,9 +33,18 @@ Do not print raw sqlx connection errors, parser errors, task panics, or remote
 HTTP bodies. They can echo credentials. Database connection failures expose
 bounded constant messages. Unsupported database URL query keys are rejected
 before the pinned SQLx parser can WARN-log their values; re-audit the allowlist
-in `database_url.rs` on SQLx upgrades. HTTP errors protect URLs/reasons/details,
-response Debug shows only status/lengths, and rejected Discord writes expose
-only status/context, not remote JSON. Successful S3 uploads never log remote
+in `database_url.rs` on SQLx upgrades. Database URLs are parsed through
+`database_url::connect_options`, which also suppresses the driver's passfile
+target for the synchronous parse: a malformed pgpass line can carry a
+credential, while a well-formed entry still supplies the password exactly as
+`FromStr` would. Re-audit the suppressed target (`sqlx_postgres::options::pgpass`
+on pinned sqlx-postgres 0.9) on SQLx upgrades. The backup/restore CLI opens
+pools only through its `open_pool` wrapper over the same path, so every CLI
+failure is a bounded constant too. HTTP errors protect URLs/reasons/details,
+response Debug shows only status/lengths, rejected Discord writes expose
+only status/context, not remote JSON, and non-image emoji captures keep only
+the constant classification, never the remote-controlled Content-Type value.
+Successful S3 uploads never log remote
 ETags. Transport URLs and Discord proxy overrides reject userinfo before Hyper
 can DEBUG-log an authority/pool key; proxy overrides accept origins only, not
 paths or queries. Truncation alone is not redaction. Do not enable
@@ -44,7 +53,9 @@ dependency TRACE logging of request payloads or format wire bodies/headers,
 
 Run `python3 scripts/check-secret-debug.py` (and `--test` for its tripwire tests).
 The required `check` CI job runs this grep-style guard over all Rust crate source
-files, refusing derived Debug with raw string/byte credential fields. Exact
+files, refusing derived Debug with raw string/byte credential fields. Debug in
+any of several `#[derive]` attributes on one type counts, in either order and
+with other attributes between them. Exact
 `file/type/field` exceptions cover only public correlation/idempotency tokens.
 The guard is deliberately not a Rust parser or data-flow analysis: unusual type
 aliases, tuple structs, generic maps and custom formatters still require review.

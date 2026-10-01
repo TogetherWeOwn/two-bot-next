@@ -10,11 +10,15 @@ import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+# The attribute run may hold several derive attributes (in either order, with
+# other attributes between them); Debug in ANY of them counts. Doc comments
+# are already blanked to whitespace before matching, so plain `\s*` covers
+# the gaps between the bracketed attributes.
 DERIVE = re.compile(
-    r"#\[derive\((?P<traits>[^)]*)\)\]"
-    r"(?:\s|#\[[^\]]*\])*"
+    r"(?P<attrs>(?:#\[[^\]]*\]\s*)+)"
     r"(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum)\s+(?P<name>\w+)[^{;]*\{"
 )
+DERIVE_ONE = re.compile(r"#\[derive\((?P<traits>[^)]*)\)\]")
 FIELD = re.compile(r"\b(\w+)\s*:\s*([^,\n}]+)")
 SENSITIVE = re.compile(
     r"(?:^|_)(?:token|secret|password|credential|credentials)(?:_|$)"
@@ -42,7 +46,10 @@ def violations(source, path="fixture.rs"):
     clean = blank_literals(source)
     results = []
     for match in DERIVE.finditer(clean):
-        if "Debug" not in match["traits"].split(",") and not re.search(r"\bDebug\b", match["traits"]):
+        traits = ",".join(
+            derive["traits"] for derive in DERIVE_ONE.finditer(match["attrs"])
+        )
+        if "Debug" not in traits.split(",") and not re.search(r"\bDebug\b", traits):
             continue
         start = match.end()
         end, depth = start, 1
@@ -77,6 +84,19 @@ class GuardTests(unittest.TestCase):
 
     def test_multiline_derive_and_extra_attributes_fail(self):
         self.assertTrue(violations('#[derive(\n Debug,\n Clone\n)]\n#[serde(default)]\npub(crate) struct Fixture { pub discord_token: String, }'))
+
+    def test_split_derive_attributes_fail_in_either_order(self):
+        for attrs in [
+            '#[derive(Clone)]\n#[derive(Debug)]',
+            '#[derive(Debug)]\n#[derive(Clone)]',
+            '#[derive(Clone)]\n#[serde(default)]\n#[derive(Debug)]',
+            '/// doc comment\n#[derive(Clone)]\n// line comment\n#[derive(Debug)]',
+        ]:
+            code = f'{attrs}\nstruct Credentials {{ token: String, }}'
+            self.assertEqual(len(violations(code)), 1, code)
+
+    def test_split_derive_without_debug_passes(self):
+        self.assertFalse(violations('#[derive(Clone)]\n#[derive(Default)]\nstruct Safe { token: String, }'))
 
     def test_wrappers_and_custom_debug_pass(self):
         self.assertFalse(violations('#[derive(Debug)] struct Safe { token: Option<Secret<String>>, secret: crate::Secret<Vec<u8>>, }'))

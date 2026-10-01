@@ -29,6 +29,22 @@ fn env_var(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Open a Postgres pool through the shared redacting parse path
+/// (`two_bot_core::database_url`): unsupported query keys are refused before
+/// the pinned driver's parser can WARN-log their values, the driver's passfile
+/// diagnostics stay suppressed for the synchronous parse, and every failure is
+/// a constant message that never echoes the URL. Same default pool options as
+/// `PgPool::connect`, so this only changes what failures can disclose.
+async fn open_pool(url: &str) -> Result<sqlx::PgPool, &'static str> {
+    two_bot_core::database_url::validate(url)?;
+    let options =
+        two_bot_core::database_url::connect_options(url).map_err(|_| "invalid database URL")?;
+    sqlx::postgres::PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .map_err(|_| "cannot connect; database details redacted")
+}
+
 /// Only an absent credential permits the deliberate environment fallback.
 /// Inject the directory and lazy fallback so tests never mutate process env.
 fn load_staging_token(
@@ -182,10 +198,12 @@ async fn cmd_backup() -> i32 {
     let stamp = guild_config::filename_stamp();
     let out = PathBuf::from(&dest).join(format!("two-funnel-{stamp}.ndjson.gz"));
 
-    let pool = match sqlx::PgPool::connect(&url).await {
+    // Every failure is a bounded constant from `open_pool`: the URL and its
+    // query secrets never reach logs or CLI output.
+    let pool = match open_pool(&url).await {
         Ok(pool) => pool,
-        Err(_) => {
-            eprintln!("backup: cannot connect; database details redacted");
+        Err(detail) => {
+            eprintln!("backup: {detail}");
             return 1;
         }
     };
@@ -382,10 +400,12 @@ async fn cmd_restore(args: &[String]) -> i32 {
         return cmd_restore_dry_run(&file, url.as_deref()).await;
     }
 
-    let pool = match sqlx::PgPool::connect(url.as_ref().expect("checked")).await {
+    // Every failure is a bounded constant from `open_pool`: the URL and its
+    // query secrets never reach logs or CLI output.
+    let pool = match open_pool(url.as_ref().expect("checked")).await {
         Ok(pool) => pool,
-        Err(_) => {
-            eprintln!("restore: cannot connect; database details redacted");
+        Err(detail) => {
+            eprintln!("restore: {detail}");
             return 1;
         }
     };
@@ -462,7 +482,9 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
     let mut before: std::collections::BTreeMap<String, String> = Default::default();
     if let Some(url) = url {
         println!("restore: checking configured target");
-        match sqlx::PgPool::connect(url).await {
+        // Every probe failure is a bounded constant from `open_pool`: the
+        // URL and its query secrets never reach logs or CLI output.
+        match open_pool(url).await {
             Ok(probe) => {
                 for name in dump_file::DUMP_TABLES {
                     let count: Result<(i64,), _> =
@@ -1178,6 +1200,25 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("cannot read discord_staging_token"));
         assert!(err.contains("refusing environment fallback"));
+    }
+
+    #[tokio::test]
+    async fn open_pool_rejects_unknown_query_secrets_without_network_access() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!(
+            "postgres://fixture-user:fixture-password@127.0.0.1:{port}/db?api_key=fixture-restore-secret"
+        );
+        let error = super::open_pool(&url).await.unwrap_err();
+        assert_eq!(error, "unsupported database URL parameter");
+        assert!(!error.contains("fixture"));
+        // Validation precedes any socket: nothing may reach the listener,
+        // not even one connection attempt.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[test]

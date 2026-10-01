@@ -11,9 +11,8 @@
 //! `record_earliest`, forward-only `touch_activity`, and the members
 //! projection guards.
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
-use std::str::FromStr;
 
 /// Legacy pool default (`TWO_DB_POOL_MAX ?? 5`).
 pub const DB_POOL_MAX_DEFAULT: u32 = 5;
@@ -39,8 +38,9 @@ pub async fn connect(
     }
     two_bot_core::database_url::validate(url)
         .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
-    let mut options = PgConnectOptions::from_str(url)
-        .map_err(|_| sqlx::Error::InvalidArgument("invalid database URL".to_owned()))?;
+    // Passfile diagnostics stay suppressed during the synchronous parse, but a
+    // well-formed entry still supplies the password (see `database_url`).
+    let mut options = two_bot_core::database_url::connect_options(url)?;
     // Statement timeout rides the connection options (server-side setting
     // per connection), so no per-connection SET is needed.
     options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);
