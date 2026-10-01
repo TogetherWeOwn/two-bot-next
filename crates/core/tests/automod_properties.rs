@@ -76,7 +76,7 @@ proptest! {
     ) {
         let once = normalize_content(&s);
         // NFKC + lowercase + whitespace collapse is a fixed point.
-        prop_assert_eq!(normalize_content(&once), once);
+        prop_assert_eq!(normalize_content(&once), once.clone());
         // Normalized output is trimmed and single-spaced.
         prop_assert!(once == once.trim());
         prop_assert!(!once.contains("  "));
@@ -87,7 +87,7 @@ proptest! {
         word in proptest::collection::vec(proptest::char::range('a', 'z'), 1..12)
             .prop_map(|chars| chars.into_iter().collect::<String>()),
     ) {
-        prop_assert_eq!(normalize_content(&fullwidth(&word)), word);
+        prop_assert_eq!(normalize_content(&fullwidth(&word)), word.clone());
         prop_assert_eq!(normalize_content(&fullwidth(&word.to_uppercase())), word);
     }
 
