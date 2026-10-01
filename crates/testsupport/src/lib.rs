@@ -120,19 +120,38 @@ struct Cleanup {
     name: String,
 }
 
+async fn cleanup_connection(admin: &PgPool) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    let mut connection = admin
+        .acquire()
+        .await
+        .context("acquire disposable database teardown connection")?;
+    // DROP DATABASE can wait for a forced checkpoint on a loaded CI service.
+    // Keep a finite DDL budget on this session only, not fixture queries.
+    sqlx::query("SET statement_timeout = '30s'")
+        .execute(&mut *connection)
+        .await
+        .context("set disposable database teardown timeout")?;
+    Ok(connection)
+}
+
 impl Cleanup {
     async fn close(self) -> Result<()> {
         self.pool.close().await;
-        // The name is generated internally, not supplied by a caller.
-        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE \"{}\" WITH (FORCE)",
-            self.name
-        )))
-        .execute(&self.admin)
+        let result = async {
+            let mut connection = cleanup_connection(&self.admin).await?;
+            // The name is generated internally, not supplied by a caller.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE \"{}\" WITH (FORCE)",
+                self.name
+            )))
+            .execute(&mut *connection)
+            .await
+            .context("drop disposable test database")?;
+            Ok(())
+        }
         .await;
         self.admin.close().await;
-        result.context("drop disposable test database")?;
-        Ok(())
+        result
     }
 }
 
@@ -334,6 +353,43 @@ mod tests {
             .to_string();
         assert!(!error.contains("private_password"));
         assert!(!error.contains("postgres://"));
+    }
+
+    #[tokio::test]
+    async fn teardown_session_has_a_separate_finite_statement_budget() {
+        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(std::env::VarError::NotPresent) => return,
+            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_with(connect_options(&url).unwrap())
+            .await
+            .unwrap();
+        let ordinary_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        assert_eq!(ordinary_timeout, "5s");
+        let mut connection = cleanup_connection(&admin).await.unwrap();
+        let cleanup_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(cleanup_timeout, "30s");
+        // A slow server operation exceeds the ordinary five-second limit but
+        // fits the teardown budget. Use only the guarded disposable service.
+        tokio::time::timeout(
+            Duration::from_secs(35),
+            sqlx::query("SELECT pg_sleep(6)").execute(&mut *connection),
+        )
+        .await
+        .expect("teardown session remains bounded")
+        .expect("teardown permits an operation longer than five seconds");
+        drop(connection);
+        admin.close().await;
     }
 
     #[test]
