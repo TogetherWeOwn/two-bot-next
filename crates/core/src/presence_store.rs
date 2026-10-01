@@ -34,22 +34,25 @@ pub async fn record_reading(
     decision: ProbeDecision,
     observed_at: &str,
 ) -> Result<bool, PresenceStoreError> {
-    let (presence, bot_floor) = match decision {
+    let (presence, bot_floor, truncated) = match decision {
         ProbeDecision::Skip => return Ok(false),
         ProbeDecision::Record {
             presence,
             bot_floor,
-        } => (presence, bot_floor),
+            bot_floor_scan_truncated,
+        } => (presence, bot_floor, bot_floor_scan_truncated),
     };
     let inserted = sqlx::query(
-        "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count, bot_floor)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO presence_probe
+             (guild_id, observed_at, approximate_presence_count, bot_floor, bot_floor_scan_truncated)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (guild_id, observed_at) DO NOTHING",
     )
     .bind(guild_id)
     .bind(observed_at)
     .bind(presence)
-    .bind(bot_floor)
+    .bind(if truncated { None } else { bot_floor })
+    .bind(truncated)
     .execute(pool)
     .await?
     .rows_affected();
@@ -84,15 +87,16 @@ pub async fn read_series(
     Ok(out)
 }
 
-/// When the newest actually-observed bot floor was taken, or `None` if never
-/// (legacy `lastBotFloorAt`).
+/// When the newest complete or truncated bot-floor scan was recorded, or
+/// `None` if never (legacy `lastBotFloorAt`). Failed/unattempted scans do not
+/// consume the cadence; truncated scans do, without manufacturing a floor.
 pub async fn last_bot_floor_at(
     pool: &Pool<Postgres>,
     guild_id: &str,
 ) -> Result<Option<String>, PresenceStoreError> {
     let at: Option<String> = sqlx::query_scalar(
         "SELECT MAX(observed_at) FROM presence_probe
-          WHERE guild_id = $1 AND bot_floor IS NOT NULL",
+          WHERE guild_id = $1 AND (bot_floor IS NOT NULL OR bot_floor_scan_truncated)",
     )
     .bind(guild_id)
     .fetch_one(pool)
@@ -105,7 +109,8 @@ mod tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
     use super::super::presence::{
-        decide_probe_cycle, evaluate_trigger, TriggerOptions, REOPEN_PEAK_THRESHOLD,
+        bot_floor_due, decide_probe_cycle, evaluate_trigger, BotFloorScan, TriggerOptions,
+        BOT_FLOOR_MAX_AGE_MS, REOPEN_PEAK_THRESHOLD,
     };
     use super::*;
 
@@ -171,6 +176,11 @@ mod tests {
         ))
         .execute(&pool)
         .await?;
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0390_legacy_copy_presence.sql"
+        ))
+        .execute(&pool)
+        .await?;
         Ok((pool, schema))
     }
 
@@ -220,7 +230,7 @@ mod tests {
             None
         );
         // First cycle: no floor observed yet, so the rescan lands on the row.
-        let first = decide_probe_cycle(Some(42), None, Some(23), 1_000);
+        let first = decide_probe_cycle(Some(42), None, Some(BotFloorScan::Complete(23)), 1_000);
         assert!(
             record_reading(&pool, "guild-a", first, "2026-09-07T06:15:00.000Z")
                 .await
@@ -233,7 +243,12 @@ mod tests {
                 .expect("retry dedupes")
         );
         // Hourly tick without a rescan: floor stays NULL, not zero.
-        let second = decide_probe_cycle(Some(30), Some(1_000), Some(99), 2_000);
+        let second = decide_probe_cycle(
+            Some(30),
+            Some(1_000),
+            Some(BotFloorScan::Complete(99)),
+            2_000,
+        );
         assert!(
             record_reading(&pool, "guild-a", second, "2026-09-07T07:15:00.000Z")
                 .await
@@ -254,6 +269,63 @@ mod tests {
             .await
             .expect("isolated")
             .is_empty());
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn truncated_scan_round_trips_and_delays_the_next_attempt() {
+        let Some((pool, schema)) = test_pool("tog_11146_presence")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping presence_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let at = "2026-10-01T00:00:00.000Z";
+        let now = super::super::funnel::parse_iso_millis(at).unwrap();
+        let decision = decide_probe_cycle(Some(42), None, Some(BotFloorScan::Truncated), now);
+        assert!(record_reading(&pool, "guild-a", decision, at)
+            .await
+            .unwrap());
+        assert!(!record_reading(&pool, "guild-a", decision, at)
+            .await
+            .unwrap());
+        let row: (Option<i32>, bool) = sqlx::query_as(
+            "SELECT bot_floor, bot_floor_scan_truncated FROM presence_probe WHERE guild_id=$1",
+        )
+        .bind("guild-a")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (None, true));
+        let last = last_bot_floor_at(&pool, "guild-a").await.unwrap();
+        assert_eq!(last.as_deref(), Some(at));
+        let last_ms = last.and_then(|at| super::super::funnel::parse_iso_millis(&at));
+        let age = BOT_FLOOR_MAX_AGE_MS as i64;
+        assert!(!bot_floor_due(last_ms, now + age - 1, BOT_FLOOR_MAX_AGE_MS));
+        assert!(bot_floor_due(last_ms, now + age, BOT_FLOOR_MAX_AGE_MS));
+        assert_eq!(last_bot_floor_at(&pool, "guild-b").await.unwrap(), None);
+
+        // Later hourly readings/failures must not reset the scan timestamp.
+        record_reading(
+            &pool,
+            "guild-a",
+            decide_probe_cycle(Some(43), last_ms, None, now + 3_600_000),
+            "2026-10-01T01:00:00.000Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            last_bot_floor_at(&pool, "guild-a")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(at)
+        );
+        assert_eq!(
+            read_series(&pool, "guild-a").await.unwrap()[0].bot_floor,
+            None
+        );
         drop_schema(&pool, &schema).await;
     }
 
