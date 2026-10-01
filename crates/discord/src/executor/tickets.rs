@@ -5,7 +5,12 @@
 
 use super::*;
 use serde_json::{json, Value};
-use twilight_model::{channel::ChannelType, guild::Permissions};
+use twilight_model::{
+    channel::{
+        permission_overwrite::PermissionOverwrite as ChannelPermissionOverwrite, ChannelType,
+    },
+    guild::Permissions,
+};
 use two_bot_core::tickets::{
     ticket_channel_name, PANEL_TEXT, TICKET_CLAIM_ID, TICKET_CLOSE_ID, TICKET_OPEN_ID,
 };
@@ -54,11 +59,11 @@ impl ActionExecutor {
         let common = Permissions::VIEW_CHANNEL
             | Permissions::SEND_MESSAGES
             | Permissions::READ_MESSAGE_HISTORY;
-        let overwrite = |id, kind, allow, deny| PermissionOverwrite {
+        let overwrite = |id, kind, allow, deny| ChannelPermissionOverwrite {
             id,
             kind,
-            allow: Some(allow),
-            deny: Some(deny),
+            allow,
+            deny,
         };
         let overwrites = [
             overwrite(
