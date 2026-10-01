@@ -6,6 +6,7 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod backup_cli;
+mod community_jobs;
 mod database_roles_cli;
 mod gateway;
 mod gateway_metrics;
