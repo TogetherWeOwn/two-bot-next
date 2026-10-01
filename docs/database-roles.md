@@ -58,7 +58,7 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 41 ordinary bot tables plus the restricted admission lane,
+current migrations' 43 ordinary bot tables plus the restricted admission lane,
 SQLx ledger, eight named SERIAL sequences and
 `guild_settings_version_seq`, nine web views and five functions. A detached SERIAL
 sequence remains required even after `OWNED BY NONE`. New relations/sequences need

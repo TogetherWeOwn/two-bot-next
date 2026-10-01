@@ -73,6 +73,7 @@ pub mod rsvp_store;
 pub mod scheduled_events;
 pub mod secret;
 pub use secret::Secret;
+pub mod self_roles;
 pub mod send_admission;
 pub mod settings;
 pub mod sticky;
@@ -252,6 +253,17 @@ pub use rsvp_store::{
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
     ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+};
+pub use self_roles::{
+    emoji_identity, event_order_for_event_id, event_order_from_snowflake,
+    find_disallowed_permission, find_unsafe_channel_grant, parse_self_role_custom_id,
+    parse_self_role_panels, plan_select_delta, plan_self_role_change, reaction_endpoint_emoji,
+    reaction_option_key, self_role_claim_owned, self_role_custom_id, self_role_renew_after_ms,
+    self_role_reply, validate_panel_roles, validate_self_role_dispatch, ChannelOverwrite,
+    ChannelSnapshot, DispatchCheck, DispatchFailure, DispatchRole, PanelMode, ParsedCustomId,
+    PlanRejection, ResolvedRole, RoleOperation, SelfRoleConfigError, SelfRoleGates, SelfRoleOption,
+    SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
+    SELF_ROLE_ALLOWED_MASK, SELF_ROLE_ALLOWED_PERMISSIONS, SELF_ROLE_CLAIM_LEASE_MS,
 };
 pub use settings::{
     assert_storable_key, classify_key, is_declared_env_only, is_env_only_key, is_storable_key,
