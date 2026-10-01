@@ -69,6 +69,10 @@
       "sha256": "c291e8683b2afdeb23a985953a2afeba86519c06ec1deb8c6d2c5dd56d2f22bd",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0351_internal_action_roles.sql": {
+      "sha256": "889864e3d2768c5b95455b6b1e2071e20921cd65d5f8a017aad8668093b8f489",
+      "justification": "Pin the validated resolved role in internal-action intents and audits before REST for TOG-10861."
+    },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."
