@@ -45,14 +45,19 @@ async fn scorecard_database_failure_then_restart_success_publishes_once() {
     let monday = at("2026-09-28T06:15:00.000Z");
     // Missing relations simulate transient coverage and scoring failures in
     // this unique disposable database only; no production/staging store.
-    for (guild, table) in [
-        ("coverage", "community_stream_heartbeats"),
-        ("scoring", "community_facts"),
+    for (guild, hide_table, restore_table) in [
+        (
+            "coverage",
+            "ALTER TABLE community_stream_heartbeats RENAME TO retry_hidden",
+            "ALTER TABLE retry_hidden RENAME TO community_stream_heartbeats",
+        ),
+        (
+            "scoring",
+            "ALTER TABLE community_facts RENAME TO retry_hidden",
+            "ALTER TABLE retry_hidden RENAME TO community_facts",
+        ),
     ] {
-        sqlx::query(&format!("ALTER TABLE {table} RENAME TO retry_hidden"))
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(hide_table).execute(pool).await.unwrap();
         let state = fresh_state(enabled_gates(), 14);
         assert_eq!(
             scorecard_once(pool, guild, &state, monday).await,
@@ -62,10 +67,7 @@ async fn scorecard_database_failure_then_restart_success_publishes_once() {
             saved(pool, guild, "2026-09-28").await,
             (1, monday + RETRY_DELAY_MS, false)
         );
-        sqlx::query(&format!("ALTER TABLE retry_hidden RENAME TO {table}"))
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(restore_table).execute(pool).await.unwrap();
         let restarted = fresh_state(enabled_gates(), 14);
         scorecard_once(pool, guild, &restarted, monday + RETRY_DELAY_MS - 1)
             .await
