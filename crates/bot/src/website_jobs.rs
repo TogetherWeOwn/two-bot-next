@@ -14,6 +14,7 @@ use two_bot_core::{
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
+    community_jobs,
     jobs::{self, ErrorClass, Job},
     server,
 };
@@ -54,16 +55,19 @@ fn cadence(kind: Kind) -> Duration {
     Duration::from_millis(millis)
 }
 
-struct Context {
-    url: String,
-    pool: OnceCell<PgPool>,
-    rest: ActionExecutor,
-    guild: String,
+/// Shared REST/DB context: website jobs also read `observation`; the community
+/// jobs in [`crate::community_jobs`] reuse the pool, executor and guild but
+/// hold their own lanes.
+pub(crate) struct Context {
+    pub(crate) url: String,
+    pub(crate) pool: OnceCell<PgPool>,
+    pub(crate) rest: ActionExecutor,
+    pub(crate) guild: String,
     observation: Mutex<()>,
 }
 
 impl Context {
-    async fn pool(&self) -> Result<&PgPool, ErrorClass> {
+    pub(crate) async fn pool(&self) -> Result<&PgPool, ErrorClass> {
         self.pool
             .get_or_try_init(|| async {
                 let db = two_bot_cutover::connect(
@@ -104,6 +108,7 @@ pub async fn serve(
     shutdown: watch::Sender<bool>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
+    let mut parked = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
         // Lazy connection preserves parked/startup behavior; every wire attempt
         // still fails closed on this same runtime database authority.
@@ -153,13 +158,27 @@ pub async fn serve(
                         }),
                     });
                 }
+                let registration = community_jobs::register(context);
+                registered.extend(registration.jobs);
+                parked = registration.parked;
             }
             Err(_) => tracing::warn!("website jobs parked: invalid REST configuration"),
         }
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let status = jobs::statuses(&NAMES, registered.is_empty());
+    let names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
+    // All six names park together when nothing registered; otherwise only the
+    // env-gated community names are parked and the rest report live status.
+    let status = jobs::statuses(&names, registered.is_empty());
+    {
+        let mut entries = status.write().await;
+        for name in parked {
+            if let Some(entry) = entries.get_mut(name) {
+                entry.parked = true;
+            }
+        }
+    }
     let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
     serve_jobs(registered, status, shutdown, http).await
 }
@@ -201,7 +220,7 @@ async fn drain_http(
     }
 }
 
-async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, ErrorClass> {
+pub(crate) async fn get(rest: &ActionExecutor, path: &str) -> Result<Value, ErrorClass> {
     rest.get_json(path)
         .await
         .map_err(|_| ErrorClass::Rest)?
@@ -217,7 +236,11 @@ fn snowflake(value: &Value) -> Result<u64, ErrorClass> {
 }
 
 /// Discord's paginated roster is the denominator, never approximate counts.
-async fn roster(rest: &ActionExecutor, guild: &str) -> Result<Vec<RosterMember>, ErrorClass> {
+/// The presence probe reuses it for the daily bot-floor re-list.
+pub(crate) async fn roster(
+    rest: &ActionExecutor,
+    guild: &str,
+) -> Result<Vec<RosterMember>, ErrorClass> {
     let mut after = 0;
     let mut members = Vec::new();
     loop {

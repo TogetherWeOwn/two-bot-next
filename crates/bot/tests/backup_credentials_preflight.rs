@@ -364,7 +364,9 @@ async fn administrator_added_live_passes_preflight_despite_stale_snapshot() {
     let (out, text) = output(restore_command(&scratch, &fake, &source)).await;
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(
-        text.contains("apply failed") && text.contains(WRITE_SENTINEL),
+        text.contains("apply failed")
+            && text.contains("HTTP 403")
+            && !text.contains(WRITE_SENTINEL),
         "{text}"
     );
     assert!(!text.contains("preflight failed"), "{text}");
@@ -389,7 +391,9 @@ async fn hierarchy_case(source_position: i64, live_position: i64, allowed: bool)
     fake.assert_member_preflight();
     if allowed {
         assert!(
-            text.contains("apply failed") && text.contains(WRITE_SENTINEL),
+            text.contains("apply failed")
+                && text.contains("HTTP 403")
+                && !text.contains(WRITE_SENTINEL),
             "{text}"
         );
         assert!(!text.contains("preflight failed"), "{text}");

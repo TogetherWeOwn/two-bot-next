@@ -6,7 +6,15 @@
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
 mod backup_cli;
+mod command_runtime;
+#[cfg(test)]
+mod command_runtime_tests;
+mod community_jobs;
 mod database_roles_cli;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../discord/tests/common/mod.rs"]
+mod discord_test_common;
 mod gateway;
 mod gateway_metrics;
 #[cfg(test)]
@@ -17,9 +25,6 @@ mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
 mod server;
-mod sticky_runtime;
-#[cfg(test)]
-mod sticky_runtime_tests;
 mod website_jobs;
 
 use std::sync::Arc;
@@ -121,10 +126,11 @@ async fn main() {
                     );
                     let saved = gateway::load_boot_session(&store).await?;
                     let pipeline = Arc::new(build_pipeline(store.milestones().await?));
-                    // S4 sticky runtime (TOG-10309): shared router + REST
-                    // executor over the same pool. `None` on bad env gates —
-                    // the shard still boots without the sticky surface.
-                    let sticky = sticky_runtime::StickyRuntime::from_env(
+                    // Shared command runtime (TOG-11020; S4 sticky slice was
+                    // TOG-10309): ONE router + REST executor + sqlx stores
+                    // over the same pool. `None` on bad env gates — the shard
+                    // still boots without the command surface.
+                    let runtime = command_runtime::CommandRuntime::from_env(
                         db.pool().clone(),
                         &token,
                         guild_id,
@@ -139,7 +145,7 @@ async fn main() {
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
-                    run_shard(shard, pipeline, Arc::clone(&state), store, sticky).await
+                    run_shard(shard, pipeline, Arc::clone(&state), store, runtime).await
                 }
                 .await;
                 if result.is_err() {
@@ -187,12 +193,14 @@ async fn print_backup_help_and_exit() -> ! {
 fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static str> {
     let token = config
         .discord_token
-        .as_deref()
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
         .filter(|token| !token.is_empty())
         .ok_or("DISCORD_TOKEN")?;
     let url = config
         .database_url
-        .as_deref()
+        .as_ref()
+        .map(|secret| secret.expose().as_str())
         .filter(|url| !url.is_empty())
         .ok_or("DATABASE_URL")?;
     let guild_id = config.guild_id.filter(|id| *id != 0).ok_or("GUILD_ID")?;

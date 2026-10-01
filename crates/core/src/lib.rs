@@ -28,6 +28,7 @@ pub mod config;
 pub mod containment;
 #[cfg(feature = "db")]
 pub mod database_roles;
+pub mod database_url;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
@@ -55,6 +56,7 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod message_safety;
 pub mod metrics;
 pub mod moderation;
 pub mod onboarding;
@@ -69,6 +71,8 @@ pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
 pub mod scheduled_events;
+pub mod secret;
+pub use secret::Secret;
 pub mod send_admission;
 pub mod settings;
 pub mod sticky;

@@ -59,19 +59,20 @@ until the durable hold allows it.
   `Unknown` retains both the receiver's effect claim and the gate's occupancy.
   The transport still has one attempt, no redirects/status/connection retries,
   one ten-second deadline, and a 64-KiB response cap.
-- **ActionExecutor/sticky:** use
+- **ActionExecutor/command runtime:** use
   `ActionExecutor::with_admission(token, optional_proxy, admission)`.
-  `StickyRuntime::from_env` constructs this gate using its existing runtime
-  pool. Every actual request, including callbacks, command publication,
-  sticky posts/deletes and every retry, uses the raw governed transport. Its
+  `CommandRuntime::from_env` constructs this gate using its existing runtime
+  pool. Every actual request, including callbacks, sticky/feed command
+  publication, sticky posts/deletes and every retry, uses the raw governed transport. Its
   bounded response cap is 8 MiB for list/history responses. Local legacy pacing
   is additional, never the authority. Ungoverned constructor paths accept only
   explicit loopback HTTP fixtures; real Discord is refused.
 - **Website-contract jobs (added to main during this change):** the supervised
   counter/rank/events adapters construct a governed ActionExecutor from the same
-  gateway `DATABASE_URL`. Their lazy admission pool preserves startup/parking
-  behavior; every authenticated roster/role/event read fails closed before wire
-  I/O when the shared lane is held or unavailable.
+  gateway `DATABASE_URL`. Community presence probes reuse that same executor for
+  guild/member reads. Their lazy admission pool preserves startup/parking
+  behavior; every authenticated roster/role/event/presence read fails closed before
+  wire I/O when the shared lane is held or unavailable.
 - **Cutover:** the three Discord-reading CLI bootstraps call
   `RestClient::from_env`. It requires the runtime `TWO_DATABASE_URL` authority
   even if a data import target is different. Twilight builds requests/models
