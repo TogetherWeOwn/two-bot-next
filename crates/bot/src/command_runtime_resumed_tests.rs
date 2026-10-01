@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    discord_test_common::{MockRest, ScriptedResponse},
+    mock_rest::{MockRest, ScriptedResponse},
     ticket_runtime::{TicketConfig, TicketRuntime},
 };
 use serde_json::json;
