@@ -121,11 +121,27 @@ export function clickIdempotencyKey(click: RedirectClick): string {
 /**
  * Minimal per-key token buckets (port of two-bot `TokenBuckets.take`).
  * One isolate = one map; acceptable for a 60-burst crawler cap at this scale.
+ *
+ * Memory is bounded without ever resetting an active throttle:
+ * - Idle expiry: a bucket untouched for `idleTtlMs` is dropped and restarts
+ *   full. The TTL is clamped to at least the full-refill window
+ *   (`capacity / refillPerSecond`), so eviction can only discard buckets that
+ *   refill would already have restored to full — a key that still owes tokens
+ *   is never idle-expired, and expiry never grants tokens refill would not.
+ * - Cardinality cap: at most `maxBuckets` entries. A new key past the cap is
+ *   denied (fail closed) — overflow sheds load, it never disables throttling.
+ *   Buckets already tracked are unaffected by the cap.
+ * - Bounded cleanup: every `take` touches its key (LRU order, most-recent at
+ *   the back) then reaps at most `sweepBudget` idle-expired entries from the
+ *   front. Per-call work is O(sweepBudget), independent of map size.
  */
 export class TokenBuckets {
   private buckets = new Map<string, { tokens: number; updatedAt: number }>();
   private spec: { capacity: number; refillPerSecond: number };
   private clock: () => number;
+  private idleTtlMs: number;
+  private maxBuckets: number;
+  private sweepBudget: number;
 
   constructor(
     spec: { capacity: number; refillPerSecond: number } = {
@@ -133,33 +149,95 @@ export class TokenBuckets {
       refillPerSecond: 1,
     },
     now: () => number = Date.now,
+    limits: {
+      idleTtlMs?: number;
+      maxBuckets?: number;
+      sweepBudget?: number;
+    } = {},
   ) {
     this.spec = spec;
     this.clock = now;
+    const fullRefillMs = Math.ceil(
+      (spec.capacity / spec.refillPerSecond) * 1000,
+    );
+    const requestedTtl = limits.idleTtlMs;
+    this.idleTtlMs = Math.max(
+      Number.isFinite(requestedTtl) ? (requestedTtl as number) : fullRefillMs,
+      fullRefillMs,
+    );
+    this.maxBuckets = Math.max(
+      1,
+      Number.isFinite(limits.maxBuckets)
+        ? Math.floor(limits.maxBuckets as number)
+        : 10_000,
+    );
+    this.sweepBudget = Math.max(
+      1,
+      Number.isFinite(limits.sweepBudget)
+        ? Math.floor(limits.sweepBudget as number)
+        : 64,
+    );
+  }
+
+  /** Tracked buckets. For tests/observability; keys are never logged. */
+  get size(): number {
+    return this.buckets.size;
   }
 
   take(key: string): { allowed: boolean; retryAfter: number } {
     const t = this.clock();
-    const b = this.buckets.get(key) ?? {
-      tokens: this.spec.capacity,
-      updatedAt: t,
-    };
+    let b = this.buckets.get(key);
+    if (b && Math.max(0, t - b.updatedAt) >= this.idleTtlMs) {
+      // Untouched for a full refill window: dropping restarts it full, exactly
+      // as capped refill would. Cannot apply to a key that still owes tokens
+      // (the TTL floor guarantees that), so expiry never resets a throttle.
+      this.buckets.delete(key);
+      b = undefined;
+    }
+    if (!b) {
+      if (this.buckets.size >= this.maxBuckets) {
+        // Fail closed: shed the unknown caller, keep every tracked throttle.
+        return {
+          allowed: false,
+          retryAfter: Math.max(1, Math.ceil(this.idleTtlMs / 1000)),
+        };
+      }
+      b = { tokens: this.spec.capacity, updatedAt: t };
+    }
     const elapsed = Math.max(0, (t - b.updatedAt) / 1000);
     b.tokens = Math.min(
       this.spec.capacity,
       b.tokens + elapsed * this.spec.refillPerSecond,
     );
     b.updatedAt = t;
+    // Move to the back: map order is recency order, so the sweep below always
+    // reaps the least-recently-touched entries first.
+    this.buckets.delete(key);
+    let verdict: { allowed: boolean; retryAfter: number };
     if (b.tokens >= 1) {
       b.tokens -= 1;
-      this.buckets.set(key, b);
-      return { allowed: true, retryAfter: 0 };
+      verdict = { allowed: true, retryAfter: 0 };
+    } else {
+      const wait = Math.ceil(
+        (1 - b.tokens) / this.spec.refillPerSecond,
+      );
+      verdict = { allowed: false, retryAfter: Math.max(1, wait) };
     }
     this.buckets.set(key, b);
-    const wait = Math.ceil(
-      (1 - b.tokens) / this.spec.refillPerSecond,
-    );
-    return { allowed: false, retryAfter: Math.max(1, wait) };
+    this.sweep(t);
+    return verdict;
+  }
+
+  /** Reap up to `sweepBudget` idle-expired entries from the least-recent end. */
+  private sweep(t: number): void {
+    let budget = this.sweepBudget;
+    for (const [key, b] of this.buckets) {
+      if (budget <= 0) return;
+      // Front is live: recency order means everything behind it is newer.
+      if (Math.max(0, t - b.updatedAt) < this.idleTtlMs) return;
+      this.buckets.delete(key);
+      budget -= 1;
+    }
   }
 }
 
