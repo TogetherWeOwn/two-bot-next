@@ -213,7 +213,7 @@ fn source_manifest(migrator: &Migrator) -> Value {
             .filter(|m| !m.migration_type.is_down_migration())
             .map(|m| {
                 // Recompute from SQL so the manifest never trusts the stored value.
-                let computed = hex::encode(Sha384::digest(m.sql.as_bytes()));
+                let computed = hex::encode(Sha384::digest(m.sql.as_str().as_bytes()));
                 json!({"version": m.version, "description": m.description,
                        "sha384": hex::encode(&m.checksum), "sha384_recomputed": computed})
             })
