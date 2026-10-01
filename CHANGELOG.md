@@ -25,6 +25,7 @@
 - Grant the least-privilege runtime role CRUD on the self-role audit and panel-claim relations (migration 0200), cover 0200 in the role-matrix tests, and prove runtime claim access with continued web-reader denial.
 - Record late result/compensation evidence for superseded self-role events under their still-current token/generation without reopening settlement or panel publication, with regression coverage.
 - Reject the guild @everyone role as a self-role mutation target during catalogue validation and unconditionally at dispatch.
+- Hold self-role claim fencing tokens in `Secret` so derived `Debug` redacts them; the raw value is exposed only at the SQL fencing comparisons.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 

@@ -480,7 +480,7 @@ async fn exercise_superseded_evidence(pool: &PgPool) -> TestResult {
     ).fetch_one(pool).await?;
     assert_eq!(outcome, "rejected");
     assert_eq!(code.as_deref(), Some("superseded_by_later_event"));
-    assert_eq!(token.as_deref(), Some(current.token.as_str()));
+    assert_eq!(token.as_deref(), Some(current.token.expose().as_str()));
     assert_eq!(generation, current.generation);
     // Late result/compensation evidence records under the still-current
     // token/generation; the rejection stays terminal and authorizes neither

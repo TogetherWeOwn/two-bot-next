@@ -72,7 +72,9 @@ result/compensation evidence under its still-current token/generation via
 and this authorizes no further REST work or panel-target publication. This is
 not permission for another Discord mutation.
 Unlike legacy's optional settlement claim, Rust requires an explicit claim;
-it never looks up and borrows a different worker's token. Malformed recovered
+it never looks up and borrows a different worker's token. The claim fencing
+token is held in `Secret`, so derived `Debug` redacts it; the raw value is
+exposed only at the SQL fencing comparisons. Malformed recovered
 intent fails closed rather than silently becoming an empty selection.
 
 ## Verification

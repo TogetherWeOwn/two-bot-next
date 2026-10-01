@@ -26,6 +26,7 @@ use two_bot_core::self_roles::{
     event_order_from_snowflake, self_role_renew_after_ms, PanelMode, RoleOperation, SettledOutcome,
     SELF_ROLE_CLAIM_LEASE_MS,
 };
+use two_bot_core::Secret;
 
 /// Observed (added/removed) and unresolved fields describe the latest snapshot.
 /// Attempted/compensated fields are cumulative historical evidence: checkpoint
@@ -95,10 +96,13 @@ pub struct SelfRoleAudit {
 }
 
 /// Opaque fencing identity plus original intent returned by recovery.
+///
+/// The fencing token authorizes SQL fencing comparisons but must never reach
+/// diagnostics; as a [`Secret`] it redacts under derived `Debug`.
 #[derive(Debug, Clone)]
 pub struct EventClaim {
     pub event_id: String,
-    pub token: String,
+    pub token: Secret<String>,
     pub generation: i32,
     pub recovered: bool,
     /// Persisted effect snapshot at acquisition; attempts/compensations remain
@@ -126,10 +130,12 @@ pub struct PanelTarget {
     pub committed: bool,
 }
 
+/// The fencing token is a [`Secret`]: redacted under derived `Debug`, and
+/// exposed only at the SQL fencing comparisons that need the raw value.
 #[derive(Debug, Clone)]
 pub struct PanelClaim {
     pub key: PanelKey,
-    pub token: String,
+    pub token: Secret<String>,
     pub generation: i32,
     pub target: PanelTarget,
     pub renew_after_ms: u64,
@@ -264,7 +270,7 @@ impl SelfRoleStore {
         let claim = if let Some((token,)) = inserted {
             Some(EventClaim {
                 event_id: row.event_id.clone(),
-                token,
+                token: Secret::new(token),
                 generation: 1,
                 recovered: false,
                 effects: row.effects.clone(),
@@ -306,7 +312,7 @@ impl SelfRoleStore {
                 .await?;
                 Some(EventClaim {
                     event_id: row.event_id.clone(),
-                    token,
+                    token: Secret::new(token),
                     generation: next,
                     recovered: true,
                     effects,
@@ -342,7 +348,7 @@ impl SelfRoleStore {
              AND processing_expires_at > $4)",
         )
         .bind(&claim.event_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(now)
         .fetch_one(&mut *tx)
@@ -361,7 +367,7 @@ impl SelfRoleStore {
              AND processing_expires_at > $4",
         )
         .bind(&claim.event_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(now)
         .bind(self.expiry(now)?)
@@ -476,7 +482,7 @@ impl SelfRoleStore {
         tx.commit().await?;
         Ok(PanelClaimResult::Acquired(PanelClaim {
             key: key.clone(),
-            token,
+            token: Secret::new(token),
             generation,
             target,
             renew_after_ms: self_role_renew_after_ms(self.lease_ms),
@@ -495,7 +501,7 @@ impl SelfRoleStore {
         .bind(&claim.key.guild_id)
         .bind(&claim.key.member_id)
         .bind(&claim.key.panel_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(now)
         .fetch_one(&mut *tx)
@@ -516,7 +522,7 @@ impl SelfRoleStore {
         .bind(&claim.key.guild_id)
         .bind(&claim.key.member_id)
         .bind(&claim.key.panel_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(now)
         .bind(self.expiry(now)?)
@@ -540,7 +546,7 @@ impl SelfRoleStore {
         .bind(&claim.key.guild_id)
         .bind(&claim.key.member_id)
         .bind(&claim.key.panel_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(now)
         .execute(&mut *tx)
@@ -594,7 +600,7 @@ impl SelfRoleStore {
         }
         Ok(query
             .bind(&claim.event_id)
-            .bind(&claim.token)
+            .bind(claim.token.expose())
             .bind(claim.generation)
             .execute(&self.pool)
             .await?
@@ -633,7 +639,7 @@ impl SelfRoleStore {
         }
         Ok(query
             .bind(&claim.event_id)
-            .bind(&claim.token)
+            .bind(claim.token.expose())
             .bind(claim.generation)
             .execute(&self.pool)
             .await?
@@ -720,7 +726,7 @@ async fn set_panel_option(
     .bind(&claim.key.guild_id)
     .bind(&claim.key.member_id)
     .bind(&claim.key.panel_id)
-    .bind(&claim.token)
+    .bind(claim.token.expose())
     .bind(claim.generation)
     .bind(now)
     .bind(option)
@@ -765,7 +771,7 @@ async fn finish_audit(
     }
     let changed = query
         .bind(&row.event_id)
-        .bind(&claim.token)
+        .bind(claim.token.expose())
         .bind(claim.generation)
         .bind(&row.guild_id)
         .bind(&row.member_id)
