@@ -25,7 +25,11 @@ reader before the first publish sees the empty revision-0 cache and falls
 through to the environment either way. Applied swaps log `settings_applied
 {version, keys}` (key names only), `setting_changed` per hot key,
 `settings_restart_required` per stored-but-cold key, and
-`setting_ignored_not_applied` per env-only/unknown row.
+`setting_ignored_not_applied` per env-only/unknown row. The published cache
+contains only `HOT_WIRED` keys: cold and hot-but-unwired keys remain in the
+writer's stored-state cache for diff/logging, never in `get()`, `snapshot()` or
+`env_snapshot()` exposed to live consumers. `settings_applied.keys` lists only
+hot-applied keys; restart-required keys have their own log event.
 
 Each job gets one random startup offset in `[0, min(cadence, 5 seconds)]`.
 The first attempt runs at that offset and subsequent deadlines keep the same

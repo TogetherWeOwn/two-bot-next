@@ -3,7 +3,8 @@
 //! [`POLL_SECONDS`] and swaps `liveCfg` when it moves; here the swap target is
 //! a `watch`-published `Arc<SettingsCache>` behind [`live`], so feature
 //! runtimes (automod lists, raid thresholds, channel IDs) read the latest
-//! snapshot without lock contention and never see a half-rebuilt cache.
+//! snapshot without waiting for database work or cache construction and never
+//! see a half-rebuilt cache.
 //!
 //! Each tick is the cheap marks query first; only a moved revision or row
 //! count pays for the consistent snapshot load. A malformed snapshot (empty
@@ -48,6 +49,7 @@ static LIVE: OnceLock<LiveSettings> = OnceLock::new();
 /// `Some` reader before the first successful poll sees the empty revision-0
 /// cache, so lookups fall through to the environment either way.
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))] // Feature consumers are wired in follow-up slices.
 pub fn live() -> Option<LiveSettings> {
     LIVE.get().cloned()
 }
@@ -186,7 +188,6 @@ fn log_applied(report: &RefreshReport) {
     let mut keys: Vec<&str> = report
         .hot
         .iter()
-        .chain(report.cold.iter())
         .map(|change| change.key.as_str())
         .collect();
     keys.sort_unstable();

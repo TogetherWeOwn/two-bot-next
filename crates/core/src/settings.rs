@@ -579,9 +579,9 @@ impl RefreshReport {
 
 /// The read side of the shared hot-settings handle (TOG-10898). One
 /// `tokio::sync::watch` channel carries an immutable `Arc<SettingsCache>`;
-/// readers borrow the current snapshot without lock contention on the writer
-/// and never observe a half-rebuilt cache — the swap is a single atomic
-/// store (arc-swap semantics without a new dependency).
+/// readers clone the current snapshot under watch's short read lock and never
+/// observe a half-rebuilt cache. Rebuilding happens outside that lock, so reads
+/// do not wait for database work or cache construction.
 ///
 /// Before the first publish, readers see the empty revision-0 cache: every
 /// lookup falls through to the environment exactly as if the table were
@@ -622,14 +622,19 @@ impl LiveSettingsWriter {
         self.cache.needs_refresh(revision, rows)
     }
 
-    /// Rebuild the working cache from one consistent snapshot and publish the
-    /// new `Arc` to every reader when anything moved. Returns the partitioned
-    /// report for logging. The caller must refuse malformed snapshots before
-    /// this runs: publish is all-or-nothing.
+    /// Rebuild the working cache from one consistent snapshot and publish only
+    /// hot-wired entries when the marks moved. Keep the full working cache for
+    /// change detection and restart-required logs; cold, env-only and unwired
+    /// entries never reach live readers. The caller must refuse malformed
+    /// snapshots before this runs: publish is all-or-nothing.
     pub fn publish(&mut self, snapshot: &SettingsSnapshot) -> RefreshReport {
         let report = self.cache.refresh(snapshot);
         if report.changed {
-            self.tx.send_replace(Arc::new(self.cache.clone()));
+            let mut live = self.cache.clone();
+            live.entries.retain(|(_, key), _| {
+                classify_key(key) == Some(SettingClass::Hot) && HOT_WIRED.contains(&key.as_str())
+            });
+            self.tx.send_replace(Arc::new(live));
         }
         report
     }
@@ -656,9 +661,9 @@ impl LiveSettings {
         self.rx.borrow().revision()
     }
 
-    /// One stored value for a guild, or `None` to fall through to the
-    /// environment. Hot and cold classes are both visible; env-only and
-    /// unknown keys are refused by [`SettingsCache::get`] itself.
+    /// One hot-wired value for a guild, or `None` to fall through to the
+    /// environment. Cold, env-only, unknown and hot-but-unwired keys are absent
+    /// from the published snapshot.
     #[must_use]
     pub fn get(&self, guild_id: &str, key: &str) -> Option<Value> {
         self.rx.borrow().get(guild_id, key).cloned()
@@ -1219,9 +1224,7 @@ mod tests {
         assert_eq!(live.get("g1", "TWO_RAID_JOIN_THRESHOLD"), Some(json!(3)));
         assert_eq!(writer.revision(), 1);
 
-        // Republishing identical marks is a no-op for the cache; even an
-        // identical-content publish under a moved revision keeps readers on
-        // the same Arc unless the diff found a real change.
+        // Republishing identical marks is a no-op: readers keep the same Arc.
         let published = live.snapshot();
         assert!(!writer.needs_refresh(1, 1));
         let report = writer.publish(&snapshot(
@@ -1230,6 +1233,55 @@ mod tests {
         ));
         assert!(!report.changed);
         assert!(Arc::ptr_eq(&published, &live.snapshot()));
+    }
+
+    #[test]
+    fn live_channel_never_publishes_restart_required_or_ignored_keys() {
+        let (mut writer, live) = live_channel();
+        let blocked = [
+            "TWO_FEED_POLL_SECONDS",
+            "TWO_AUTOMOD_BAD_WORDS", // Hot, but not yet in HOT_WIRED.
+            "DISCORD_TOKEN",
+            "TWO_MADE_UP_KEY",
+        ];
+        for revision in 1..=2 {
+            let mut rows = vec![row(
+                "g1",
+                "TWO_RAID_JOIN_THRESHOLD",
+                json!(revision),
+                revision,
+            )];
+            rows.extend(
+                blocked
+                    .iter()
+                    .map(|key| row("g1", key, json!(revision), revision)),
+            );
+            let report = writer.publish(&snapshot(revision, rows));
+            assert!(report.changed);
+            assert_eq!(report.cold.len(), 2);
+            assert_eq!(report.ignored.len(), 2);
+            assert_eq!(
+                live.get("g1", "TWO_RAID_JOIN_THRESHOLD"),
+                Some(json!(revision))
+            );
+            for key in blocked {
+                assert_eq!(live.get("g1", key), None, "{key}");
+                assert_eq!(live.snapshot().get("g1", key), None, "{key}");
+                assert!(!live.env_snapshot(Some("g1")).contains_key(key), "{key}");
+            }
+            // Poll marks still cover all stored rows, not just live entries.
+            assert!(!writer.needs_refresh(revision, 5));
+        }
+        let report = writer.publish(&snapshot(
+            3,
+            vec![row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(2), 2)],
+        ));
+        assert_eq!(report.cold.len(), 2); // Deletion also requires restart.
+        assert_eq!(live.snapshot().size(), 1);
+        assert!(live
+            .env_snapshot(Some("g1"))
+            .keys()
+            .all(|key| key == "TWO_RAID_JOIN_THRESHOLD"));
     }
 
     #[test]
