@@ -404,6 +404,9 @@ impl HyperTransport {
     }
 }
 
+#[path = "internal_exec/member.rs"]
+pub mod member;
+
 /// The S4 REST executor: paced lane + moderation lane over one transport.
 #[derive(Debug, Clone)]
 pub struct ActionExecutor {

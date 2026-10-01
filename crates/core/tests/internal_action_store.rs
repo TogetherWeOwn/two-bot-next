@@ -156,6 +156,7 @@ fn subject() -> AuditSubject {
         guild_id: Some(DiscordId::new("123456789012345678").unwrap()),
         actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
         target_id: None,
+        resolved_role_id: None,
     }
 }
 

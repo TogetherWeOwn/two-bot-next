@@ -42,6 +42,8 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'internal_idempotency', 'table'),
     ('public', 'internal_action_log', 'table'),
     ('public', 'internal_discord_events', 'table'),
+    ('public', 'self_role_audit', 'table'),
+    ('public', 'self_role_panel_claims', 'table'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),
     ('public', 'gateway_onboarding_jobs_id_seq', 'sequence'),
