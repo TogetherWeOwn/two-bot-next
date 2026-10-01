@@ -21,10 +21,31 @@ class NightlyRoutingTests(unittest.TestCase):
     def test_dedicated_channel_suite_runs_all_fixtures_with_unchanged_guard(self):
         workflow = WORKFLOW.read_text()
         dedicated = workflow.split("- name: Channel moderation ignored tests with their guarded URL", 1)[1]
-        dedicated = dedicated.split("- name: Feed store ignored tests with their guarded URL", 1)[0]
+        dedicated = dedicated.split("- name: Discord channel-moderation executor ignored tests", 1)[0]
         self.assertIn("steps.databases.outcome == 'success'", dedicated)
         self.assertIn("TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test", dedicated)
         self.assertIn("cargo test -p two-bot-core --all-features --lib --locked channel_moderation_store::", dedicated)
+        self.assertIn("-- --include-ignored --test-threads=1", dedicated)
+        self.assertNotIn("--skip", dedicated, "routing is not permanent exclusion")
+
+    def test_every_ignored_discord_executor_fixture_is_routed_out_of_broad_bootstrap(self):
+        source = (ROOT / "crates/discord/tests/internal_channel_moderation.rs").read_text()
+        names = set(re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', source))
+        self.assertTrue(names, "guarded ignored fixtures must be discovered")
+        workflow = WORKFLOW.read_text()
+        broad = workflow.split("- name: Full workspace sweep including ignored tests", 1)[1]
+        broad = broad.split("- name: Channel moderation ignored tests with their guarded URL", 1)[0]
+        routed = set(re.findall(r"--skip (\w+)", broad))
+        for name in names:
+            self.assertIn(name, routed, f"{name} must skip the incompatible bootstrap")
+
+    def test_dedicated_discord_executor_suite_runs_all_fixtures_with_unchanged_guard(self):
+        workflow = WORKFLOW.read_text()
+        dedicated = workflow.split("- name: Discord channel-moderation executor ignored tests", 1)[1]
+        dedicated = dedicated.split("- name: Feed store ignored tests with their guarded URL", 1)[0]
+        self.assertIn("steps.databases.outcome == 'success'", dedicated)
+        self.assertIn("TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test", dedicated)
+        self.assertIn("cargo test -p two-bot-discord --all-features --test internal_channel_moderation --locked", dedicated)
         self.assertIn("-- --include-ignored --test-threads=1", dedicated)
         self.assertNotIn("--skip", dedicated, "routing is not permanent exclusion")
 
