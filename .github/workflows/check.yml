@@ -50,8 +50,14 @@ jobs:
           # Ephemeral CI service only; tests explicitly use an empty password.
           # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
+        # PG18 places data and WAL below this volume. Isolate disposable fixture
+        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
+        # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
         options: >-
-          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --tmpfs /var/lib/postgresql:rw,size=1073741824
+          --memory 2147483648
+          --memory-swap 2147483648
+          --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
@@ -86,6 +92,7 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_single_core.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_postgres_storage.py' -v
 
       - name: parity soak checklist coverage (offline)
         run: |
@@ -155,6 +162,35 @@ jobs:
 
       - name: Prepare isolated test databases
         run: createdb -h agent-testdb -U agent_test two_bot_test_ci
+
+      - name: Verify disposable Postgres defaults
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          if any(name.startswith('PG') for name in os.environ):
+              raise SystemExit('unset ambient libpq PG* configuration before probing the test service')
+          expected = {
+              'data_directory': '/var/lib/postgresql/18/docker',
+              'fsync': 'on',
+              'full_page_writes': 'on',
+              'synchronous_commit': 'on',
+          }
+          fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
+          settings = json.loads(subprocess.check_output([
+              'psql', 'postgres://agent_test:@agent-testdb:5432/two_bot_test_ci',
+              '-X', '-w', '-At', '-v', 'ON_ERROR_STOP=1',
+              '-c', f'SELECT json_build_object({fields})',
+          ], text=True, env=os.environ | {
+              'PGPASSFILE': '/dev/null', 'PGSSLMODE': 'disable',
+              'PGOPTIONS': '-c statement_timeout=5000',
+          }))
+          if settings != expected:
+              raise SystemExit('disposable Postgres data path or durability defaults changed')
+          print('Disposable Postgres defaults:', json.dumps(settings, sort_keys=True))
+          PY
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
       # Migrated suites create/drop unique databases; this bootstrap is not reset.
