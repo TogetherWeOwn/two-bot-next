@@ -8,7 +8,7 @@ fn backup_connection_failure_does_not_echo_database_url() {
         .unwrap_or_else(std::env::temp_dir);
     let dir = base.join(format!("redaction-backup-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let url = "postgres://fixture-user:fixture-db-password@agent-testdb:fixture-invalid-port/db";
+    let url = "postgres://fixture-user:fixture-db-password@agent-testdb:59998/db";
     let output = Command::new(env!("CARGO_BIN_EXE_two-bot"))
         .arg("backup")
         .env_clear()
@@ -24,12 +24,7 @@ fn backup_connection_failure_does_not_echo_database_url() {
         stderr.contains("cannot connect"),
         "unexpected diagnostic: {stderr}"
     );
-    for secret in [
-        url,
-        "fixture-user",
-        "fixture-db-password",
-        "fixture-invalid-port",
-    ] {
+    for secret in [url, "fixture-user", "fixture-db-password", "59998"] {
         assert!(!stdout.contains(secret));
         assert!(!stderr.contains(secret));
     }
