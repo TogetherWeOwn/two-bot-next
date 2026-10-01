@@ -747,11 +747,13 @@ fn conditional_branch_sources(inner: &str) -> Vec<&str> {
 }
 
 fn conditional_separator(input: &str, separator: &str) -> Option<usize> {
-    // One non-backtracking parser pass records balanced spans, including valid
-    // children of malformed parents. Reusing construct parsing keeps literal
-    // closers inside other constructs opaque (e.g. `>>` inside styled text).
+    // Pair styles from the right before the non-backtracking parser pass. An
+    // unclosed style in one branch must not steal the next branch's opener as
+    // its closer. Failed styles consume only their opener in this scan, so
+    // balanced children still hide their own separators. Other constructs use
+    // the parser's boundaries (e.g. `>>` inside styled text stays opaque).
     let mut cursor = Cursor::new(input);
-    cursor.balanced_ends = Some(vec![None; input.len()]);
+    cursor.balanced_ends = Some(separator_style_ends(input));
     parse_segments(&mut cursor, Stops::NONE, 0);
     let ends = cursor.balanced_ends.expect("separator scan records spans");
     let mut pos = 0;
@@ -768,10 +770,40 @@ fn conditional_separator(input: &str, separator: &str) -> Option<usize> {
     None
 }
 
+// Each quote pair is visited once; mode headers are disjoint. This is linear
+// in source length, and never reparses a failed styling suffix. Only a colon
+// before a quote or newline forms a header, matching parse_styled's grammar.
+fn separator_style_ends(input: &str) -> Vec<Option<usize>> {
+    let mut ends = vec![None; input.len()];
+    let quotes: Vec<_> = input.match_indices("\"\"").map(|(pos, _)| pos).collect();
+    for pair in quotes.windows(2).rev() {
+        let (start, close) = (pair[0], pair[1]);
+        if ends[close].is_some() {
+            continue; // This quote already opens a complete later style.
+        }
+        let modes = &input[start + 2..close];
+        if matches!(
+            modes.chars().find(|c| matches!(c, ':' | '"' | '\n')),
+            Some(':')
+        ) {
+            ends[start] = Some(close + 2);
+        }
+    }
+    ends
+}
+
 /// Parse styling without rewinding; its body inherits the nesting budget.
 fn parse_styled(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
     let start = cursor.pos;
     cursor.pos += 2;
+    if let Some(ends) = &cursor.balanced_ends {
+        cursor.pos = ends[start]?;
+        return Some(Segment::Extension(Extension::Styled {
+            source: cursor.src[start..cursor.pos].to_string(),
+            modes: String::new(),
+            body: Template(Vec::new()),
+        }));
+    }
     let modes_start = cursor.pos;
     while let Some(c) = cursor.peek_char() {
         if c == ':' || c == '"' || c == '\n' {
@@ -792,14 +824,9 @@ fn parse_styled(cursor: &mut Cursor, depth: usize) -> Option<Segment> {
     if !cursor.eat("\"\"") {
         return None;
     }
-    let body = if cursor.balanced_ends.is_some() {
-        Template(Vec::new())
-    } else {
-        let mut body_cursor = Cursor::new(&cursor.src[body_start..end]);
-        let body = Template(parse_segments(&mut body_cursor, Stops::NONE, depth + 1));
-        cursor.depth_exceeded |= body_cursor.depth_exceeded;
-        body
-    };
+    let mut body_cursor = Cursor::new(&cursor.src[body_start..end]);
+    let body = Template(parse_segments(&mut body_cursor, Stops::NONE, depth + 1));
+    cursor.depth_exceeded |= body_cursor.depth_exceeded;
     Some(Segment::Extension(Extension::Styled {
         source: cursor.src[start..cursor.pos].to_string(),
         modes,
@@ -1743,6 +1770,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn malformed_styling_preserves_independent_conditional_reservations() {
+        for (yes, no) in [
+            ("\"\"identity:[[a//b]] <<broken", "[[c/d]]"),
+            ("\"\"ident\"ity:[[a//b]]\"\"", "[[c/d]]"),
+            ("\"\"ident\nity:[[a//b]]\"\"", "[[c/d]]"),
+            ("\"\"identity:broken", "\"\"identity:[[a/b]]\"\" [[c/d]]"),
+            (
+                "\"\"identity:broken",
+                "\"\"upper:[[a/b]]\"\" \"\"lower:[[c/d]]\"\"",
+            ),
+            ("\"\"identity:[[a/b]]\"\"", "\"\"identity:broken"),
+            ("\"\"identity:[[a/b]]//text\"\"", "\"\"identity:broken"),
+            ("\"\"identity:[[a/b]]\"\" \"\"upper:[[c/d]]\"\"", "[[e/f]]"),
+            (
+                "\"\"identity:[[a/b]]\"\" text:literal",
+                "\"\"lower:[[c/d]]\"\"",
+            ),
+        ] {
+            let inner = format!("LIVE ?? {yes} // {no}");
+            assert_eq!(
+                conditional_branch_sources(&inner),
+                vec![format!(" {yes} "), format!(" {no}")]
+            );
+            let branches = [parse(yes), parse(no)];
+            let conditional = parse(&format!("{{{{{inner}}}}}"));
+            assert_eq!(
+                random_choice_count(&conditional),
+                branches.iter().map(random_choice_count).sum::<u64>()
+            );
+            let template = parse(&format!("<<{{{{{inner}}}}}/many>> · [[x/y]]"));
+            for seed in 0..100 {
+                let mut c = RoomContext { seed, ..ctx() };
+                let mut expected = Evaluation::new(&c, &PassthroughExtensions);
+                expected.evaluate_selected_branch(&branches, 0);
+                let trailing = expected.evaluate(&parse("[[x/y]]"));
+                for members in [0, 1, 2] {
+                    for live in [0, 1] {
+                        c.member_count = members;
+                        c.live_count = live;
+                        let name = render(&template, &c, &BranchExtensions);
+                        assert_eq!(
+                            name.rsplit(" · ").next(),
+                            Some(trailing.as_str()),
+                            "seed {seed}, members {members}, live {live}, {inner}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn separator_style_scans_cover_quote_runs_and_source_limit() {
+        for count in [1, 2, 10, 63, 128, 255] {
+            let yes = format!("{}[[a//b]]", "\"\"identity:".repeat(count));
+            let no = "[[c/d]]";
+            let inner = format!("LIVE ??{yes}//{no}");
+            assert_eq!(conditional_branch_sources(&inner), vec![yes.as_str(), no]);
+            let template = parse(&format!("{{{{{inner}}}}}"));
+            assert_eq!(
+                random_choice_count(&template),
+                random_choice_count(&parse(&yes)) + random_choice_count(&parse(no))
+            );
+            assert_eq!(parse(&template.to_string()), template);
+        }
+        let prefix = "{{LIVE ?? \"\"identity:[[a//b]] ";
+        let suffix = " // [[c/d]]}}";
+        let input = format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(MAX_TEMPLATE_BYTES - prefix.len() - suffix.len())
+        );
+        let template = parse(&input);
+        assert_eq!(random_choice_count(&template), 1);
+        assert_eq!(parse(&template.to_string()), template);
     }
 
     #[test]
