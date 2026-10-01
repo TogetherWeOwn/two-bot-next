@@ -10,6 +10,7 @@ pub mod audit_mirror;
 pub mod channel_access;
 pub mod command_registry;
 pub mod executor;
+mod executor_metrics;
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;

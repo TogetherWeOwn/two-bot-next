@@ -16,7 +16,10 @@
  * - HEAD redirects but is never counted (link previewers, incl. Discord's).
  * - Query strings are dropped, never parsed or recorded.
  * - `/healthz` → 200 `ok`; `/favicon.ico` + `/robots.txt` → 404, no DB touch.
- * - Non-GET/HEAD → 405 with `Allow: GET, HEAD`.
+ * - Reserved internal slugs (`metrics`, plus `metrics/*` subpaths) → 404 for
+ *   every method, before lookup — canonical case/encoding/slash aliases
+ *   included, never a redirect, never a click.
+ * - Non-GET/HEAD on non-reserved paths → 405 with `Allow: GET, HEAD`.
  * - Per-caller 60-burst / 1-per-sec token bucket runs BEFORE the DB lookup;
  *   denied → 429 + `retry-after: 1`, nothing recorded.
  * - Bare `/` → fallback code redirect (uncounted), else 404.
@@ -73,6 +76,8 @@ export interface RedirectResult {
 
 const SLUG = /^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$/;
 const INVITE_CODE = /^[A-Za-z0-9-]{1,64}$/;
+/** Internal slugs that are never invite campaigns (matched post-canonicalization). */
+const RESERVED_METRICS_SLUG = "metrics";
 
 export function isValidSlug(slug: string): boolean {
   return SLUG.test(slug);
@@ -162,6 +167,31 @@ const text = (status: number, body: string, extra?: Record<string, string>): Red
   body,
 });
 
+/**
+ * Reserved internal paths that are never invite campaigns. Canonicalizes
+ * exactly like the campaign lookup (strip slashes, percent-decode, lowercase)
+ * so `/METRICS`, `/%6detrics`, `//metrics` and `/metrics/*` all match; a
+ * campaign slug like `metricsfoo` does not. Undecodable input is not provably
+ * reserved — callers still fail closed downstream (404 for GET/HEAD).
+ */
+export function isReservedInternal(path: string): boolean {
+  const bare = path.split("?")[0] ?? "/";
+  let canonical: string;
+  try {
+    canonical = decodeURIComponent(
+      bare.replace(/^\/+/, "").replace(/\/+$/, ""),
+    ).toLowerCase();
+  } catch {
+    // Undecodable: not provably reserved; the caller fails closed downstream
+    // (404 for GET/HEAD, 405 for other methods).
+    return false;
+  }
+  return (
+    canonical === RESERVED_METRICS_SLUG ||
+    canonical.startsWith(`${RESERVED_METRICS_SLUG}/`)
+  );
+}
+
 export async function handleRedirect(
   method: string,
   path: string,
@@ -170,13 +200,21 @@ export async function handleRedirect(
 ): Promise<RedirectResult> {
   const error = deps.onError ?? (() => undefined);
 
-  if (method !== "GET" && method !== "HEAD") {
-    return text(405, "", { allow: "GET, HEAD" });
-  }
-
   // Query strings are dropped, not parsed: they are the identifying data this
   // service promises not to collect.
   const bare = path.split("?")[0] ?? "/";
+
+  // Reserved internal slugs first, for every method (including POST, which
+  // otherwise reports 405): `/%6detrics`, `/METRICS`, `//metrics` and
+  // `/metrics/*` can never become a configured invite redirect. No DB touch,
+  // never a click.
+  if (isReservedInternal(path)) {
+    return text(404, "not found\n");
+  }
+
+  if (method !== "GET" && method !== "HEAD") {
+    return text(405, "", { allow: "GET, HEAD" });
+  }
 
   if (bare === "/healthz") {
     return text(200, "ok\n");

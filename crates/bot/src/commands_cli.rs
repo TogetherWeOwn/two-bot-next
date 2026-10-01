@@ -14,7 +14,7 @@ pub const USAGE: &str = "\
       Fetch and compare the guild command list against the compiled, feature-gated
       builtins. Both commands are read-only unless publish receives --apply.
       Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot.
-      No database is opened. See docs/commands.md before applying a cutover.
+      No database is opened. See docs/command-publish.md before applying a cutover.
 ";
 
 #[derive(Debug, PartialEq, Eq)]
