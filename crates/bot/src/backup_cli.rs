@@ -665,8 +665,10 @@ async fn governed_guild_config_api(
     if env::var_os("TWO_DATABASE_URL").is_none()
         && env_var("TWO_GUILD_CONFIG_OFFLINE_TEST").as_deref() == Some("1")
     {
-        let api_base = env_var("GUILD_CONFIG_API_BASE").ok_or("offline fixture API base required")?;
-        let cdn_base = env_var("GUILD_CONFIG_CDN_BASE").ok_or("offline fixture CDN base required")?;
+        let api_base =
+            env_var("GUILD_CONFIG_API_BASE").ok_or("offline fixture API base required")?;
+        let cdn_base =
+            env_var("GUILD_CONFIG_CDN_BASE").ok_or("offline fixture CDN base required")?;
         return GuildConfigDiscordApi::new(
             Some(&api_base),
             Some(&cdn_base),

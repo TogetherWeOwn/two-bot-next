@@ -45,8 +45,7 @@ pub fn checked_base(
         return Ok(production.to_owned());
     };
     let raw = raw.trim_end_matches('/');
-    let parsed = url::Url::parse(raw)
-        .map_err(|_| GuildConfigApiError::BadBase(name.to_owned()))?;
+    let parsed = url::Url::parse(raw).map_err(|_| GuildConfigApiError::BadBase(name.to_owned()))?;
     if !matches!(parsed.scheme(), "http" | "https")
         || !parsed.username().is_empty()
         || parsed.password().is_some()
