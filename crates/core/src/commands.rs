@@ -51,6 +51,12 @@ pub const SCHEDULE_EVERY_MINUTES_MAX: i64 = 525_600;
 pub const STICKY_DEBOUNCE_MIN_SECONDS: i64 = 1;
 pub const STICKY_DEBOUNCE_MAX_SECONDS: i64 = 300;
 pub const STICKY_DEBOUNCE_DEFAULT_SECONDS: i64 = 5;
+/// `/attendance` `event-occurrence` bound (UTF-16 units, legacy JS `length`
+/// semantics — astral counts 2). Worst-case duplicate reply is 64 framing +
+/// 20 snowflake member + 128 = 212 units, ~10x under Discord's 2000 content
+/// limit. Builders advertise it via `max_length`; `crate::rsvp` refuses
+/// longer IDs before any record operation.
+pub const OCCURRENCE_ID_MAX_CHARS: usize = 128;
 
 /// Discord application-command option types (API integers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
