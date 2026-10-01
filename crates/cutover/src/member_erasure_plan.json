@@ -127,7 +127,7 @@
     },
     {
       "table": "ticket_transcripts",
-      "columns": ["opener_id", "claimed_by", "ticket_id"],
+      "columns": ["opener_id", "claimed_by"],
       "predicate": "guild_id = $1 AND (opener_id = $2 OR claimed_by = $2)"
     },
     {
