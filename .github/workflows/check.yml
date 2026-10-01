@@ -20,24 +20,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  parity-docs:
-    name: parity docs
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Offline parity guard regressions
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_parity_baseline.py' -v
-      - name: Fetch public legacy history (no credentials)
-        run: |
-          git -c credential.helper= clone --bare https://github.com/TogetherWeOwn/two-bot.git "$RUNNER_TEMP/legacy.git"
-          start=$(python3 -c 'import json; print(json.load(open("docs/parity-baseline.json"))["historyStart"])')
-          git -C "$RUNNER_TEMP/legacy.git" -c credential.helper= fetch origin "$start"
-      - name: Check baseline ancestry, complete ledger and permalink targets
-        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_parity_baseline.py --legacy-repo "$RUNNER_TEMP/legacy.git"
-
   check:
     name: check
     needs: [self-role-store, parity-docs]
@@ -213,6 +195,24 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+
+  parity-docs:
+    name: parity docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Offline parity guard regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_parity_baseline.py' -v
+      - name: Fetch public legacy history (no credentials)
+        run: |
+          git -c credential.helper= clone --bare https://github.com/TogetherWeOwn/two-bot.git "$RUNNER_TEMP/legacy.git"
+          start=$(python3 -c 'import json; print(json.load(open("docs/parity-baseline.json"))["historyStart"])')
+          git -C "$RUNNER_TEMP/legacy.git" -c credential.helper= fetch origin "$start"
+      - name: Check baseline ancestry, complete ledger and permalink targets
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_parity_baseline.py --legacy-repo "$RUNNER_TEMP/legacy.git"
 
   self-role-store:
     name: self-role store leases
