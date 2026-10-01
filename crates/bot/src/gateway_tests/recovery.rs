@@ -20,7 +20,7 @@ async fn rejected_close(code: u16) {
     assert_eq!(saved.session_id, "fresh-session");
     assert_eq!(saved.resume_url, mock.url);
     assert_eq!(db.count().await, 1);
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     assert!(!runner.is_finished());
     runner.abort();
     let _ = runner.await;
@@ -62,7 +62,7 @@ async fn failed_saved_endpoint_resumes_and_commits_with_saved_ready_url() {
     let saved = db.store.load().await.unwrap().unwrap();
     assert_eq!(saved.resume_url, saved_url);
     assert_eq!(db.count().await, 0, "replayed leave must be skipped");
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     assert!(!runner.is_finished());
     runner.abort();
     let _ = runner.await;
@@ -143,7 +143,7 @@ async fn persistence_failure_stops_service_and_restart_recovers_committed_sequen
         1,
         "missed dispatch persisted exactly once"
     );
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     assert!(!runner.is_finished());
     runner.abort();
     let _ = runner.await;

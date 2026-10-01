@@ -48,7 +48,7 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     let mut lock = db.pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("gateway:{GUILD}:0"))
@@ -105,7 +105,7 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
     assert_eq!(auth["d"]["seq"], 1);
     wait_sequence(&db.store, 3).await;
     assert_eq!(db.count().await, 1, "missed dispatch replayed once");
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     runner.abort();
     let _ = runner.await;
     second.task.abort();
