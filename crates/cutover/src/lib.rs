@@ -33,6 +33,7 @@ pub mod raid_tools;
 pub mod rest;
 pub mod self_role_store;
 pub mod settings;
+pub mod tickets;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
 pub use db::{

@@ -78,6 +78,7 @@ pub use secret::Secret;
 pub mod self_roles;
 pub mod settings;
 pub mod sticky;
+pub mod tickets;
 pub mod voice;
 pub mod voice_config;
 pub mod voice_ownership;
@@ -171,9 +172,9 @@ pub use internal_actions::{
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
-    summarize_attribution_split, AttributionCategory, AttributionSplit, DowntimeWindow,
-    DowntimeWindowCount, InviteSnapshotStore, InviteState, InviteTracker, JoinAttribution,
-    MemSnapshots,
+    is_snapshot_stale, summarize_attribution_split, AttributionCategory, AttributionSplit,
+    DowntimeWindow, DowntimeWindowCount, InviteSnapshotStore, InviteState, InviteTracker,
+    JoinAttribution, MemSnapshots, INVITE_SNAPSHOT_STALENESS_BOUND_MS,
 };
 #[cfg(feature = "db")]
 pub use leveling_store::{
