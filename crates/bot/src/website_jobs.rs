@@ -232,8 +232,40 @@ fn snowflake(value: &Value) -> Result<u64, ErrorClass> {
         .ok_or(ErrorClass::Rest)
 }
 
+fn roster_page(page: &Value, after: &mut u64) -> Result<Vec<RosterMember>, ErrorClass> {
+    let page = page.as_array().ok_or(ErrorClass::Rest)?;
+    if page.len() > 1000 {
+        return Err(ErrorClass::Rest);
+    }
+    let mut members = Vec::with_capacity(page.len());
+    for member in page {
+        let user = &member["user"];
+        let id = snowflake(&user["id"])?;
+        if id <= *after {
+            return Err(ErrorClass::Rest);
+        }
+        *after = id;
+        let is_bot = match user.get("bot") {
+            None => false,
+            Some(v) => v.as_bool().ok_or(ErrorClass::Rest)?,
+        };
+        let roles = member["roles"]
+            .as_array()
+            .ok_or(ErrorClass::Rest)?
+            .iter()
+            .map(|role| snowflake(role).map(|id| id.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        members.push(RosterMember {
+            user_id: id.to_string(),
+            is_bot,
+            roles,
+        });
+    }
+    Ok(members)
+}
+
 /// Discord's paginated roster is the denominator, never approximate counts.
-/// The presence probe reuses it for the daily bot-floor re-list.
+/// Website publication still requires the entire roster.
 pub(crate) async fn roster(
     rest: &ActionExecutor,
     guild: &str,
@@ -246,37 +278,41 @@ pub(crate) async fn roster(
             &format!("/guilds/{guild}/members?limit=1000&after={after}"),
         )
         .await?;
-        let page = page.as_array().ok_or(ErrorClass::Rest)?;
-        if page.len() > 1000 {
-            return Err(ErrorClass::Rest);
-        }
-        for member in page {
-            let user = &member["user"];
-            let id = snowflake(&user["id"])?;
-            if id <= after {
-                return Err(ErrorClass::Rest);
-            }
-            after = id;
-            let is_bot = match user.get("bot") {
-                None => false,
-                Some(v) => v.as_bool().ok_or(ErrorClass::Rest)?,
-            };
-            let roles = member["roles"]
-                .as_array()
-                .ok_or(ErrorClass::Rest)?
-                .iter()
-                .map(|role| snowflake(role).map(|id| id.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
-            members.push(RosterMember {
-                user_id: id.to_string(),
-                is_bot,
-                roles,
-            });
-        }
-        if page.len() < 1000 {
+        let page = roster_page(&page, &mut after)?;
+        let complete = page.len() < 1000;
+        members.extend(page);
+        if complete {
             return Ok(members);
         }
     }
+}
+
+/// Legacy BOT_FLOOR_MAX_PAGES: ten full pages plus one termination probe.
+pub(crate) const BOT_FLOOR_MAX_PAGES: usize = 11;
+
+/// A daily floor scan is bounded independently of the website roster. A full
+/// final page cannot prove completion, so discard the partial count. Exactly
+/// 10,000 members completes via an empty eleventh page.
+pub(crate) async fn bot_floor_scan(
+    rest: &ActionExecutor,
+    guild: &str,
+) -> Result<two_bot_core::BotFloorScan, ErrorClass> {
+    let mut after = 0;
+    let mut bots = 0;
+    for _ in 0..BOT_FLOOR_MAX_PAGES {
+        // No hidden retries: the page ceiling also bounds wire requests.
+        let page = rest
+            .get_json_once(&format!("/guilds/{guild}/members?limit=1000&after={after}"))
+            .await
+            .map_err(|_| ErrorClass::Rest)?
+            .ok_or(ErrorClass::Rest)?;
+        let page = roster_page(&page, &mut after)?;
+        bots += page.iter().filter(|member| member.is_bot).count() as i64;
+        if page.len() < 1000 {
+            return Ok(two_bot_core::BotFloorScan::Complete(bots));
+        }
+    }
+    Ok(two_bot_core::BotFloorScan::Truncated)
 }
 
 fn raw_event(value: &Value) -> Result<RawScheduledEvent, ErrorClass> {
