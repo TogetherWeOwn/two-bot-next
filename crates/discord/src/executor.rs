@@ -678,7 +678,8 @@ impl ActionExecutor {
         request: Request,
         accepted: &[u16],
     ) -> Result<RawResponse, DiscordError> {
-        self.call_once_raw_lane(request, accepted, Some(false)).await
+        self.call_once_raw_lane(request, accepted, Some(false))
+            .await
     }
 
     async fn call_once_raw_lane(
