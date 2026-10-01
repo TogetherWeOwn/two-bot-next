@@ -23,6 +23,7 @@
 import { Container } from "@cloudflare/containers";
 import {
   TokenBuckets,
+  RedirectMissCache,
   handleRedirect,
   isReservedInternal,
   type Campaign,
@@ -48,6 +49,8 @@ export interface Env {
 // Per-isolate crawler cap (60 burst, 1/sec refill — matches legacy
 // CLICK_BUCKET). Module-level so one isolate shares the budget.
 const clickBuckets = new TokenBuckets();
+// Store instances are request-scoped; misses must survive across requests.
+const redirectMisses = new RedirectMissCache();
 
 function redirectStore(env: Env): RedirectStore {
   let snapshot: Campaign[] = [];
@@ -190,6 +193,8 @@ export default {
     const result = await handleRedirect(
       request.method,
       url.pathname,
+      // Cloudflare supplies this at ingress. Never trust X-Forwarded-For;
+      // when no edge IP exists, callers share the conservative unknown bucket.
       request.headers.get("cf-connecting-ip") ?? "unknown",
       {
         guildId: env.GUILD_ID ?? "",
@@ -199,6 +204,7 @@ export default {
         onError: (msg, detail) =>
           console.error(`${msg} ${JSON.stringify(detail)}`),
         isThrottled: (key) => !clickBuckets.take(key).allowed,
+        missCache: redirectMisses,
       },
     );
     if (result.click) {
