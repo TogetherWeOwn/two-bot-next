@@ -5,15 +5,16 @@ use std::fmt;
 use serde_json::{Map, Value};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{
-    filter::LevelFilter,
+    filter::{FilterExt, LevelFilter},
     fmt::{
         format::{JsonFields, Writer},
         time::{FormatTime, SystemTime},
         FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter,
     },
+    layer::{Context, Filter, SubscriberExt},
     registry::LookupSpan,
     util::SubscriberInitExt,
-    EnvFilter,
+    EnvFilter, Layer,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +55,22 @@ pub fn http_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Sp
     // DefaultMakeSpan records the URI, including credential-bearing queries.
     // https://docs.rs/tower-http/0.7.0/tower_http/trace/index.html
     tracing::debug_span!("http_request", method = %request.method())
+}
+
+pub fn with_http_context(router: axum::Router) -> axum::Router {
+    use axum::{extract::Request, middleware::Next};
+    use tracing::{instrument::WithSubscriber, Instrument};
+
+    // Axum spawns connection tasks without the serving future's context. Capture
+    // it at construction and restore it around the entire TraceLayer invocation.
+    // https://docs.rs/axum/0.8.9/axum/middleware/fn.from_fn.html
+    let span = tracing::Span::current();
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    router.layer(axum::middleware::from_fn(move |request: Request, next: Next| {
+        next.run(request)
+            .instrument(span.clone())
+            .with_subscriber(dispatch.clone())
+    }))
 }
 
 pub fn run_span() -> tracing::Span {
@@ -98,14 +115,40 @@ fn subscriber<W>(
 where
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    // Correlation spans remain available even with WARN/ERROR/OFF directives;
+    // only events obey verbosity. Never enable an event through this predicate.
+    // https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/filter/trait.FilterExt.html#method.or
+    let filter = filter.or(CorrelationSpans);
+    let layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .log_internal_errors(false)
         .with_writer(writer);
     match format {
-        LogFormat::Json => Box::new(builder.json().event_format(JsonEvent).finish()),
-        LogFormat::Pretty => Box::new(builder.pretty().finish()),
+        LogFormat::Json => Box::new(tracing_subscriber::registry().with(
+            layer.json().event_format(JsonEvent).with_filter(filter),
+        )),
+        LogFormat::Pretty => Box::new(
+            tracing_subscriber::registry().with(layer.pretty().with_filter(filter)),
+        ),
+    }
+}
+
+struct CorrelationSpans;
+
+impl<S: Subscriber> Filter<S> for CorrelationSpans {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _: &Context<'_, S>) -> bool {
+        metadata.is_span()
+            && (metadata.fields().field("run_id").is_some()
+                || metadata.fields().field("guild_id").is_some()
+                || metadata.fields().field("interaction_id").is_some()
+                || (metadata.target() == module_path!() && metadata.name() == "http_request"))
+    }
+
+    // FilterFn's default event_enabled is true. Under OR that would bypass
+    // EnvFilter's dynamic field/span directives; this branch never enables events.
+    // https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/layer/trait.Filter.html#method.event_enabled
+    fn event_enabled(&self, _: &Event<'_>, _: &Context<'_, S>) -> bool {
+        false
     }
 }
 
@@ -345,6 +388,135 @@ mod tests {
                 expected,
                 "RUST_LOG={rust_log:?} LOG_LEVEL={log_level:?}"
             );
+        }
+    }
+
+    #[test]
+    fn restrictive_filters_keep_correlation_without_enabling_quiet_events() {
+        for (rust_log, level, expected) in [
+            (None, "warn", 2),
+            (None, "error", 1),
+            (None, "off", 0),
+            (Some("off,[gateway]=error"), "debug", 1),
+        ] {
+            let capture = Capture::default();
+            tracing::subscriber::with_default(
+                subscriber(LogFormat::Json, filter(rust_log, Some(level)), capture.clone()),
+                || {
+                    let run = run_span().entered();
+                    assert!(run.id().is_some());
+                    let gateway = gateway_span(456).entered();
+                    let interaction = tracing::info_span!(
+                        "interaction", interaction_id = "123", guild_id = "456"
+                    ).entered();
+                    tracing::info!(msg = "ready");
+                    tracing::warn!(msg = "shard_closed");
+                    tracing::error!(msg = "gateway_failed");
+                    drop(interaction);
+                    drop(gateway);
+                    drop(run);
+                },
+            );
+            let lines = capture.lines();
+            assert_eq!(lines.len(), expected, "RUST_LOG={rust_log:?} LOG_LEVEL={level}");
+            for line in lines {
+                assert!(line["run_id"].as_str().is_some_and(|id| !id.is_empty()));
+                assert_eq!(line["guild_id"], "456");
+                assert_eq!(line["interaction_id"], "123");
+                assert_ne!(line["msg"], "ready");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_dsn_parameters_cannot_reach_json_logs() {
+        use tracing::instrument::WithSubscriber;
+
+        let capture = Capture::default();
+        // Rejected before parsing/connecting: only synthetic data, no DB access.
+        for key in ["sslpassword", "api%5Fkey"] {
+            let result = two_bot_cutover::connect(
+                &format!("postgres://agent_test@agent-testdb/db?{key}=synthetic-log-secret"),
+                1,
+                true,
+            )
+            .with_subscriber(subscriber(LogFormat::Json, filter(None, None), capture.clone()))
+            .await;
+            match result.unwrap_err() {
+                sqlx::Error::InvalidArgument(message) => {
+                    assert_eq!(message, "unsupported database URL parameter");
+                }
+                _ => panic!("DSN was not rejected before connection"),
+            }
+        }
+        assert!(capture.text().is_empty(), "parser must not log rejected DSNs");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_request_logs_preserve_run_at_debug_warn_and_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tracing::{instrument::WithSubscriber, Instrument};
+
+        for level in ["debug", "warn", "error"] {
+            let capture = Capture::default();
+            let dispatch = tracing::Dispatch::new(subscriber(
+                LogFormat::Json, filter(None, Some(level)), capture.clone(),
+            ));
+            let run = tracing::dispatcher::with_default(&dispatch, run_span);
+            let run_id = tracing::dispatcher::with_default(&dispatch, || {
+                let _guard = run.enter();
+                tracing::error!(msg = "test_run_marker");
+                capture.lines()[0]["run_id"].as_str().unwrap().to_owned()
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let state = Arc::new(tokio::sync::RwLock::new(
+                crate::gateway::GatewayState::Unconfigured,
+            ));
+            let (shutdown, _) = tokio::sync::watch::channel(false);
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(
+                crate::server::serve_with_shutdown(
+                    listener, state, crate::jobs::statuses(&[], true), shutdown,
+                    async { let _ = stopped.await; },
+                )
+                .instrument(run)
+                .with_subscriber(dispatch),
+            );
+            let requests = async {
+                for (path, status) in [("/health", "200"), ("/readyz", "503")] {
+                    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    stream.write_all(format!(
+                        "GET {path}?access_token=synthetic-http-secret HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                    ).as_bytes()).await.unwrap();
+                    let mut response = Vec::new();
+                    stream.read_to_end(&mut response).await.unwrap();
+                    assert!(String::from_utf8(response).unwrap().starts_with(
+                        &format!("HTTP/1.1 {status}")
+                    ));
+                }
+            };
+            let requests_result = tokio::time::timeout(std::time::Duration::from_secs(3), requests).await;
+            stop.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), server)
+                .await.unwrap().unwrap().unwrap();
+            requests_result.unwrap();
+            let lines = capture.lines();
+            let http: Vec<_> = lines.iter().filter(|line| {
+                line["target"].as_str().is_some_and(|target| target.starts_with("tower_http::trace"))
+            }).collect();
+            assert!(!http.is_empty(), "no request/failure logs at {level}");
+            assert!(http.iter().any(|line| line["level"] == "error"));
+            if level == "debug" {
+                assert!(http.iter().any(|line| line["message"] == "started processing request"));
+                assert!(http.iter().any(|line| line["status"] == 200));
+            }
+            for line in http {
+                assert_eq!(line["run_id"], run_id, "{level}: {line}");
+                assert_eq!(line["spans"][0]["name"], "run");
+            }
+            assert!(!capture.text().contains("synthetic-http-secret"));
+            assert!(!capture.text().contains("access_token"));
         }
     }
 

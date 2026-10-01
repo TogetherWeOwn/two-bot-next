@@ -99,7 +99,8 @@ pub(super) async fn serve_with_shutdown(
 ) -> std::io::Result<()> {
     // Axum spawns the signal future: preserve both the run span and dispatcher.
     // https://docs.rs/axum/0.8.9/src/axum/serve/mod.rs.html
-    axum::serve(listener, router_with_jobs(state, jobs).into_make_service())
+    let router = crate::logging::with_http_context(router_with_jobs(state, jobs));
+    axum::serve(listener, router.into_make_service())
         .with_graceful_shutdown(
             async move {
                 tokio::select! {

@@ -44,6 +44,11 @@ New tasks must propagate context explicitly; synchronous span context is not
 implicitly inherited by `tokio::spawn`. Axum spawns the graceful-shutdown signal
 future internally, so that future explicitly carries the run span and subscriber
 as well; `shutdown_started` keeps the same `run_id` as boot and drain completion.
+Run/guild/interaction correlation spans remain enabled independently of event
+verbosity, including `WARN`, `ERROR`, and `OFF`; `OFF` still emits no events.
+HTTP request execution restores the serving future's run span and subscriber
+around the trace layer, including Axum's separately spawned connection tasks.
+HTTP request spans omit URI/query/headers and remain available for failure logs.
 
 Existing snake_case message-only events retain their name as `msg`. Events with
 neither a valid string `msg` nor a snake_case `message` use `msg=tracing_event`,
@@ -92,13 +97,14 @@ not merely receipt of a Discord packet. A token-free boot parks the gateway;
 | `shutdown_failed` | Service/supervisor failed; process exits nonzero |
 | `tracing_event` | Uncataloged/free-form tracing diagnostic; inspect `target`/`message` |
 
-### Reserved job names (not emitted by a scheduler yet)
+### Reserved job names
 
-The current entrypoint does not run feature job schedulers or settings polling,
-nor dispatch live interactions through the route adapter. This change supplies
-formatting and hooks; it does **not** wire those subsystems or claim all ~208
-legacy feature messages are ported. `settings_*` emit when the existing refresh
-report hook is invoked. Job slices must use these names when they wire execution:
+These names are reserved, not a claim that all ~208 legacy feature messages are
+ported. The entrypoint now runs the website-job supervisor; its existing
+free-form diagnostics use `tracing_event`. This logging slice does not rename
+those diagnostics or wire additional schedulers/settings polling. `settings_*`
+emit when the existing refresh-report hook is invoked. Future job call sites
+should use these names when adding explicit lifecycle instrumentation:
 
 | Reserved `msg` | Required conventions |
 | --- | --- |
@@ -117,7 +123,10 @@ binding names, allowlisted identifiers, counts, status codes, and bounded reason
 Do not add `%error`/`?error` for SQL/HTTP/provider failures: their display/debug
 chains can contain URLs. HTTP tracing omits URI/query/headers. Existing settings
 reports log only catalog-approved hot-key values; never add env-only/secret values
-to those reports.
+to those reports. Database URL query keys are validated before SQLx parses them:
+unsupported keys (including `sslpassword`) are rejected without logging keys or
+values. Parse-scoped passfile diagnostics are suppressed by the existing core
+`database_url` helper; do not bypass that helper with direct SQLx URL parsing.
 
 The JSON formatter is an encoder, **not a general secret scrubber**. Call sites
 must select safe fields before emission. Global third-party debug/trace can expose
@@ -130,6 +139,9 @@ from becoming multiple log lines, but does not redact it.
 - `cargo test -p two-bot --bin two-bot logging:: --locked`: captures every line,
   checks string envelope/flat typed fields, escaping, spans/record updates,
   filter precedence, reserved key safety, pretty opt-in, and URI omission.
+  Regressions cover WARN/ERROR/OFF correlation, synthetic rejected-DSN diagnostics
+  (no database connection), graceful shutdown, and actual TCP `/health` +
+  `/readyz` request/failure correlation under DEBUG/WARN/ERROR.
   On the controller, use the bounded wrapper in [build-cache.md](build-cache.md).
 - Hosted `logging container smoke`: builds the repository Dockerfile with locked
   dependencies, runs the actual image without token/database/guild bindings,
