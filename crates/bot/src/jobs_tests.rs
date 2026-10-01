@@ -233,6 +233,86 @@ async fn shutdown_drops_inflight_future_and_starts_no_more_work() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn shutdown_preserves_completed_success_error_timeout_and_panics() {
+    for close_channel in [false, true] {
+        for case in 0..5 {
+            let starts = Arc::new(AtomicUsize::new(0));
+            let count = starts.clone();
+            let action: JobAction = Arc::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                if case == 4 {
+                    panic!("completed factory panic");
+                }
+                Box::pin(async move {
+                    match case {
+                        0 => Ok(()),
+                        1 => Err(ErrorClass::Database),
+                        2 => std::future::pending().await,
+                        _ => panic!("completed future panic"),
+                    }
+                })
+            });
+            let status = statuses(&["presence_probe"], false);
+            let metrics = Metrics::default();
+            let before = metrics.render(None);
+            let (stop, rx) = watch::channel(false);
+            let mut fixture = job("presence_probe", action);
+            fixture.startup_jitter = Duration::ZERO;
+            fixture.timeout = Duration::from_secs(3);
+            let mut supervisor = std::pin::pin!(run_job(fixture, status.clone(), rx, &metrics));
+            // Poll only to start the attempt, then leave the supervisor unpolled
+            // until both its join and shutdown branches are ready.
+            assert!(futures_util::poll!(supervisor.as_mut()).is_pending());
+            settle().await;
+            if case == 2 {
+                tokio::time::advance(Duration::from_secs(3)).await;
+                settle().await;
+            }
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            assert!(status.read().await["presence_probe"].running);
+            assert_eq!(metrics.render(None), before);
+            if !close_channel {
+                stop.send(true).unwrap();
+            }
+            drop(stop);
+            supervisor.await;
+
+            let expected_error = match case {
+                0 => None,
+                1 => Some(ErrorClass::Database),
+                2 => Some(ErrorClass::Timeout),
+                _ => Some(ErrorClass::Panic),
+            };
+            let current = &status.read().await["presence_probe"];
+            let failures = u64::from(expected_error.is_some());
+            let successes = 1 - failures;
+            assert!(!current.running);
+            assert_eq!(current.last_error_class, expected_error);
+            assert_eq!(current.consecutive_failures, failures);
+            assert_eq!(current.last_success.is_some(), expected_error.is_none());
+            let seconds = current.last_success.unwrap_or_default() / 1_000;
+            if expected_error.is_none() {
+                assert!(seconds > 0);
+            }
+            let text = metrics.render(None);
+            assert!(text.contains(&format!(
+                "two_bot_job_runs_total{{job=\"presence_probe\",outcome=\"success\"}} {successes}\n"
+            )));
+            assert!(text.contains(&format!(
+                "two_bot_job_runs_total{{job=\"presence_probe\",outcome=\"failure\"}} {failures}\n"
+            )));
+            assert!(text.contains(&format!(
+                "two_bot_job_consecutive_failures{{job=\"presence_probe\"}} {failures}\n"
+            )));
+            assert!(text.contains(&format!(
+                "two_bot_job_last_success_timestamp_seconds{{job=\"presence_probe\"}} {seconds}\n"
+            )));
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn shutdown_while_waiting_for_status_lock_never_starts_an_attempt() {
     for close_channel in [false, true] {
         let count = Arc::new(AtomicUsize::new(0));

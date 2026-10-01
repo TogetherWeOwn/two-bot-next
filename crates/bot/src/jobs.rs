@@ -101,6 +101,32 @@ fn timestamp() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+async fn record_completion(
+    name: &str,
+    status: &SharedStatus,
+    metrics: &Metrics,
+    result: Result<(), ErrorClass>,
+) {
+    let mut statuses = status.write().await;
+    let current = statuses.get_mut(name).expect("registered job");
+    current.running = false;
+    match result {
+        Ok(()) => {
+            let completed = timestamp();
+            current.last_success = Some(completed);
+            current.last_error_class = None;
+            current.consecutive_failures = 0;
+            metrics.job_success(name, completed / 1_000);
+        }
+        Err(class) => {
+            current.last_error_class = Some(class);
+            current.consecutive_failures = current.consecutive_failures.saturating_add(1);
+            metrics.job_failure(name);
+            tracing::warn!(job = name, error_class = ?class, "periodic job failed");
+        }
+    }
+}
+
 async fn run_job(
     job: Job,
     status: SharedStatus,
@@ -118,25 +144,7 @@ async fn run_job(
             result = async { active.as_mut().expect("guarded active task").await }, if active.is_some() => {
                 active = None;
                 completed_at = Some(Instant::now());
-                let result = result.unwrap_or(Err(ErrorClass::Panic));
-                let mut statuses = status.write().await;
-                let current = statuses.get_mut(job.name).expect("registered job");
-                current.running = false;
-                match result {
-                    Ok(()) => {
-                        let completed = timestamp();
-                        current.last_success = Some(completed);
-                        current.last_error_class = None;
-                        current.consecutive_failures = 0;
-                        metrics.job_success(job.name, completed / 1_000);
-                    }
-                    Err(class) => {
-                        current.last_error_class = Some(class);
-                        current.consecutive_failures = current.consecutive_failures.saturating_add(1);
-                        metrics.job_failure(job.name);
-                        tracing::warn!(job = job.name, error_class = ?class, "periodic job failed");
-                    }
-                }
+                record_completion(job.name, &status, metrics, result.unwrap_or(Err(ErrorClass::Panic))).await;
             }
             deadline = interval.tick() => {
                 if active.is_some() || completed_at.is_some_and(|end| deadline < end) { continue; }
@@ -162,7 +170,20 @@ async fn run_job(
     }
     if let Some(task) = active {
         task.abort();
-        let _ = task.await;
+        // Abort does not cancel an already-completed attempt. Preserve its
+        // outcome when the biased shutdown branch wins over a ready join.
+        match task.await {
+            Err(error) if error.is_cancelled() => {}
+            result => {
+                record_completion(
+                    job.name,
+                    &status,
+                    metrics,
+                    result.unwrap_or(Err(ErrorClass::Panic)),
+                )
+                .await;
+            }
+        }
     }
     if let Some(current) = status.write().await.get_mut(job.name) {
         current.running = false;

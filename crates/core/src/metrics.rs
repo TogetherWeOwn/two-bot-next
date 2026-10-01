@@ -1,5 +1,5 @@
 //! Fixed-cardinality, process-local metrics; no background task or retained payloads.
-//! Text format: https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details
+//! Text format: <https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details>
 
 use std::{
     fmt::Write,
