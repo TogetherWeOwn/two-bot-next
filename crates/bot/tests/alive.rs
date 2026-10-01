@@ -89,13 +89,20 @@ impl TestDb {
 
     async fn close(self) {
         self.pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
-        )))
-        .execute(&self.admin)
-        .await
-        .expect("drop only our generated schema");
+        // Website jobs apply the companion contract schema (`<schema>_web_v1`)
+        // on first tick; drop both generated schemas so no companion schema
+        // or helper functions leak. Companion may not exist if jobs never fired.
+        for schema in [&self.schema, &format!("{}_web_v1", self.schema)] {
+            assert!(schema
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE"
+            )))
+            .execute(&self.admin)
+            .await
+            .expect("drop only our generated schemas");
+        }
         self.admin.close().await;
     }
 }
@@ -188,8 +195,9 @@ struct MockDiscord {
     api: String,
     auth: mpsc::Receiver<Value>,
     release: mpsc::Sender<()>,
+    rest_requests: Arc<Mutex<Vec<String>>>,
     task: JoinHandle<()>,
-    rest: JoinHandle<()>,
+    rest_task: JoinHandle<()>,
 }
 
 impl MockDiscord {
@@ -197,58 +205,14 @@ impl MockDiscord {
         let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = ws_listener.local_addr().unwrap();
         let url = format!("ws://{ws_addr}");
-        // REST origin without the `/api/v10` suffix: `HyperTransport::url()`
-        // appends `/api/v10/{path}` itself, so passing the suffixed form
-        // would double-prefix to `/api/v10/api/v10/...`.
+        // Dedicated REST socket: onboarding identity and website jobs share
+        // DISCORD_API_BASE, never the gateway's two boot accept slots. No
+        // `/api/v10` suffix — the executor appends the version to this origin.
         let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let rest_addr = rest_listener.local_addr().unwrap();
-        let api = format!("http://{rest_addr}");
+        let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
         let (release, mut gates) = mpsc::channel(4);
         let resume_url = url.clone();
-        // Boot-time onboarding identity probe (`GET /api/v10/users/@me`)
-        // must stay on loopback: serve the bot identity on the same REST
-        // origin the child receives via `DISCORD_API_BASE`.
-        let rest = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = rest_listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let mut reader = BufReader::new(stream);
-                    let mut request_line = String::new();
-                    if reader.read_line(&mut request_line).await.is_err() {
-                        return;
-                    }
-                    loop {
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).await.is_err() {
-                            return;
-                        }
-                        if line.trim().is_empty() {
-                            break;
-                        }
-                    }
-                    let path = request_line
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("/")
-                        .to_owned();
-                    let (status, body) =
-                        if request_line.starts_with("GET") && path == "/api/v10/users/@me" {
-                            ("200 OK", r#"{"id":"999","bot":true}"#.to_owned())
-                        } else {
-                            ("404 Not Found", r#"{"message":"not found"}"#.to_owned())
-                        };
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let mut stream = reader.into_inner();
-                    let _ = stream.write_all(response.as_bytes()).await;
-                });
-            }
-        });
         let task = tokio::spawn(async move {
             for boot in 0..2 {
                 let (stream, _) = ws_listener.accept().await.unwrap();
@@ -304,13 +268,19 @@ impl MockDiscord {
                 }
             }
         });
+        // Dedicated REST double: answers the website jobs' paced reads with
+        // valid payloads and records arrivals so the test can prove a job
+        // tick happened during the first boot before restart/resume.
+        let rest_requests: Arc<Mutex<Vec<String>>> = Arc::default();
+        let rest_task = tokio::spawn(serve_rest(rest_listener, rest_requests.clone()));
         Self {
             url,
             api,
             auth,
             release,
+            rest_requests,
             task,
-            rest,
+            rest_task,
         }
     }
 
@@ -319,6 +289,69 @@ impl MockDiscord {
             .await
             .expect("authentication deadline")
             .expect("authentication packet")
+    }
+}
+
+/// Dedicated REST double on its own socket: answers the binary's paced
+/// website-job reads and records every arrival. The gateway listener must
+/// never see a plain-HTTP connection — one queued job tick consumed its
+/// second accept slot and broke resume (exact-head CI: `Upgrade(
+/// MissingHeader("Upgrade"))` at accept, then `authentication packet`).
+async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
+        let recorded = recorded.clone();
+        tokio::spawn(async move {
+            let mut chunk = [0u8; 4096];
+            let mut head = Vec::new();
+            loop {
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&chunk[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if head.len() > 64 * 1024 {
+                    return;
+                }
+            }
+            let request_line = String::from_utf8_lossy(&head)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_owned();
+            recorded.lock().await.push(path.clone());
+            // Serve onboarding's boot identity probe and website event reads
+            // on one REST socket; unknown routes still fail closed.
+            let (status, body): (&str, &[u8]) =
+                if request_line.starts_with("GET ") && path == "/api/v10/users/@me" {
+                    ("200 OK", br#"{"id":"999","bot":true}"#)
+                } else if path.contains("scheduled-events") {
+                    ("200 OK", b"[]")
+                } else {
+                    (
+                        "404 Not Found",
+                        b"{\"message\":\"alive mock: unknown route\"}",
+                    )
+                };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        });
     }
 }
 
@@ -425,6 +458,30 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         checkpoint(db, if boot == 0 { 2 } else { 3 }).await;
         let ready = wait_http(bot, addr, "/readyz", 200).await;
         assert!(ready.contains("\"gateway\",\"ready\""));
+        if boot == 0 {
+            // Deterministic website-job coverage: the events mirror must tick
+            // on its own REST socket during the first boot, never the gateway
+            // listener. Jitter is bounded by min(cadence, 5s); STEP covers it.
+            let ticked = timeout(STEP, async {
+                loop {
+                    if discord
+                        .rest_requests
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|path| path.contains("scheduled-events"))
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                ticked.is_ok(),
+                "events job never hit REST during first boot"
+            );
+        }
         sleep(Duration::from_millis(100)).await;
         bot.assert_alive();
         bot.terminate().await;
@@ -481,9 +538,9 @@ async fn real_binary_is_alive_and_resumes_after_sigterm() {
         bot.cleanup().await;
     }
     discord.task.abort();
+    discord.rest_task.abort();
     let _ = discord.task.await;
-    discord.rest.abort();
-    let _ = discord.rest.await;
+    let _ = discord.rest_task.await;
     db.close().await;
     match result {
         Ok(Ok(())) => eprintln!("real-binary lifecycle PASS in {:?}", started.elapsed()),
