@@ -64,10 +64,41 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(report["probes"]["perl_archive_tar"]["returncode"], 2)
             self.assertEqual(report["probes"]["perl_archive_tar"]["stderr"], "module missing")
 
-    def test_reported_pcre2_package_has_file_and_dependency_probes(self):
-        for label in ["affected_package_files", "package_dependencies"]:
-            with self.subTest(probe=label):
-                self.assertIn("libpcre2-8-0", evidence.PROBES[label].split())
+    def test_reported_pcre2_package_has_files_and_unfiltered_dependencies(self):
+        self.assertIn("libpcre2-8-0", evidence.PROBES["affected_package_files"].split())
+        command = evidence.PROBES["package_dependencies"]
+        for field in ["${binary:Package}", "${Version}", "${Architecture}",
+                      "${Essential}", "${Status}", "${Depends}", "${Pre-Depends}"]:
+            with self.subTest(field=field):
+                self.assertIn(field, command)
+
+    def test_dependency_query_covers_reverse_consumers_without_absent_package_operands(self):
+        scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
+        self.assertTrue(scratch, "Fake tools require run-owned scratch")
+        rows = (
+            "libpcre2-8-0:amd64\t10.42-1\tamd64\tno\tinstall ok installed\tlibc6\t\n"
+            "grep\t3.8-5\tamd64\tyes\tinstall ok installed\t\tlibc6, libpcre2-8-0\n"
+        )
+        for failed in (False, True):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory(dir=scratch) as temporary:
+                directory = Path(temporary)
+                executable = directory / "dpkg-query"
+                executable.write_text(
+                    f"#!{sys.executable}\n"
+                    "import sys\n"
+                    "assert sys.argv[1] == '-W' and sys.argv[2].startswith('-f=')\n"
+                    "if len(sys.argv) != 3:\n"
+                    "    print('fixture: explicitly requested openssl is not installed', file=sys.stderr)\n"
+                    "    sys.exit(1)\n"
+                    f"print({rows!r}, end='')\n"
+                    f"sys.exit({7 if failed else 0})\n"
+                )
+                executable.chmod(0o700)
+                result = subprocess.run(["/bin/sh", "-c", evidence.PROBES["package_dependencies"]],
+                                        env={"PATH": str(directory)}, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 7 if failed else 0, result.stderr)
+                self.assertEqual(result.stdout, rows)
+                self.assertEqual(result.stderr, "")
 
     def test_mount_probe_records_package_source_and_resolved_payload_identity(self):
         command = evidence.PROBES["mount_configuration"]

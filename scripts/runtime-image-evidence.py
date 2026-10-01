@@ -25,7 +25,7 @@ UTIL_LINUX_IDENTITY = (
 PROBES = {
     "installed_packages": "dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\t${Essential}\t${Status}\n'",
     "affected_package_files": "dpkg-query -L " + PACKAGES,
-    "package_dependencies": "dpkg-query -W -f='${binary:Package}\t${Depends}\t${Pre-Depends}\n' " + PACKAGES,
+    "package_dependencies": "dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\t${Essential}\t${Status}\t${Depends}\t${Pre-Depends}\n'",
     "affected_utility_paths": "for utility in infocmp gzip perl openssl mount umount nsenter systemd-homed; do printf '%s: ' \"$utility\"; command -v \"$utility\" || true; done",
     "affected_files": "find / -xdev -type f \\( -iname '*minizip*' -o -name 'homed*' -o -name 'systemd-homed*' -o -path '*/Archive/Tar*' -o -path '*/IO/Compress*' -o -path '*/File/GlobMapper*' -o -name 'Storable*' \\) -print",
     "perl_build_width": "perl -V:version -V:archname -V:ptrsize -V:ivsize -V:longsize",

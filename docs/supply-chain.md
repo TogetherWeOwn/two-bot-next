@@ -126,6 +126,16 @@ Each probe has a 20-second client timeout, CPU/memory/PID limits and removal of
 only its own container even on timeout. The enclosing job retains its 40-minute
 bound. Docker inspection does not record image environment values.
 
+The dependency probe queries the full dpkg inventory, not a selected list that
+fails when an optional package (such as `openssl`) is absent. Its seven tab-separated
+fields are binary package, full version, architecture, Essential flag, dpkg status,
+Depends and Pre-Depends. This preserves reverse consumers outside the affected
+package list and distinguishes installed packages from residual configuration
+records. Interpret dependency alternatives/version constraints with Debian package
+semantics; this is not an apt removal simulation, linkage closure or permission
+to remove Essential packages. A successful query alone does not clear a CVE.
+The existing 16-probe count, isolation and timeout bounds are unchanged.
+
 Nonzero exits, unavailable tools and timeouts are retained explicitly; they are
 not absence proof. For example, missing `getcap` leaves capabilities unresolved.
 Completed and timed-out output is decoded as UTF-8; invalid bytes are replaced and
