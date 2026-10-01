@@ -3241,14 +3241,11 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
         .await?;
         assert_eq!(serde_json::from_str::<Vec<String>>(&desired)?, [OLD_ROLE]);
         assert!(serde_json::from_str::<Vec<String>>(&before)?.is_empty());
-        assert_eq!(
-            serde_json::from_str::<Vec<String>>(&observed)?,
-            if empty {
-                vec![]
-            } else {
-                vec![NEW_ROLE.to_owned()]
-            }
-        );
+        // The superseded event attempted only OLD_ROLE, which the repair removed:
+        // its truthful net observed effect is empty in both cases. NEW_ROLE was
+        // added by the winner's event, never by this one; crediting it here
+        // would fabricate success of the old input.
+        assert!(serde_json::from_str::<Vec<String>>(&observed)?.is_empty());
         assert!(serde_json::from_str::<Vec<String>>(&unresolved_added)?.is_empty());
         assert!(serde_json::from_str::<Vec<String>>(&unresolved_removed)?.is_empty());
         let receipts = role_receipts(pool, &old_request.event_id).await?;
