@@ -28,6 +28,8 @@
 
 ### Fixed
 
+- Keep parallel settings DB fixture schemas distinct when wall-clock readings
+  repeat, without sharing schemas or serializing the CAS regressions. (TOG-10089)
 - Grant runtime-only CRUD on the automod relations and cover migrations 0220–0223
   in least-privilege role tests. Keep edit retry identity stable across member
   role changes, and inspect updates without replacing or evicting CREATE repeat
