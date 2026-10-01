@@ -72,16 +72,20 @@ until the durable hold allows it.
   first identity/preflight request, including dry runs. Every authenticated
   request and retry participates. Capture's four bot-token reads are sequential
   so they do not compete with each other. CDN emoji reads and S3 requests do not
-  use a bot credential and are not put in this lane.
+  use a bot credential and are not put in this lane. Offline CLI tests may set
+  `TWO_GUILD_CONFIG_OFFLINE_TEST=1` only with both explicit validated loopback
+  API/CDN endpoints and an absent `TWO_DATABASE_URL`. A supplied authority,
+  including an empty/invalid value, is never bypassed by this fixture mode.
 
 - **Preflight (added to main during this change):** live checks require the same
   `TWO_DATABASE_URL`, construct the shared gate and use the raw transport without
   Twilight retries. The explicit validated loopback-only fixture can run without
   a database; if an authority is supplied but unavailable, it is never bypassed.
 
-Loopback fixture constructors are not an operational bypass: sticky, cutover and
-backup bootstraps inject admission even when given a loopback proxy, and preflight
-without authority can reach only its explicitly validated loopback fixture. Do not
+Loopback fixture constructors are not an operational bypass: sticky and cutover
+bootstraps inject admission even when given a loopback proxy. Backup and preflight
+without authority can reach only their explicitly validated loopback fixtures;
+backup additionally requires its offline opt-in. Do not
 activate an old ungoverned binary, legacy bot, or external same-token client
 alongside this runtime. Cutover to these guarded versions retains the existing
 owner-approved activation/deployment boundary; this code cannot police arbitrary

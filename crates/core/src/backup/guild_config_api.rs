@@ -45,28 +45,24 @@ pub fn checked_base(
         return Ok(production.to_owned());
     };
     let raw = raw.trim_end_matches('/');
-    let host = raw
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-        // Strip brackets for IPv6 display.
-        let shown = host.trim_start_matches('[').trim_end_matches(']');
-        let _ = shown;
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| GuildConfigApiError::BadBase(name.to_owned()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(GuildConfigApiError::BadBase(name.to_owned()));
+    }
+    let host = parsed.host_str().unwrap_or("");
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
         return Err(GuildConfigApiError::NonLoopbackBase(
             name.to_owned(),
             host.to_owned(),
         ));
     }
-    if !raw.starts_with("https://") && !raw.starts_with("http://") {
-        return Err(GuildConfigApiError::BadBase(raw.to_owned()));
-    }
-    Ok(raw.to_owned())
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 /// Discord REST/CDN client for one guild. Counts writes for restore evidence.
@@ -815,6 +811,18 @@ mod tests {
         assert!(
             matches!(err, GuildConfigApiError::NonLoopbackBase(_, _)),
             "{err}"
+        );
+        for raw in [
+            "http://127.0.0.1:9@evil.example.com",
+            "https://localhost:9@evil.example.com",
+            "http://127.0.0.1:9?redirect=elsewhere",
+            "http://127.0.0.1:9#fragment",
+        ] {
+            assert!(checked_base(Some(raw), "test", "").is_err(), "{raw}");
+        }
+        assert_eq!(
+            checked_base(Some("http://[::1]:9"), "test", "").unwrap(),
+            "http://[::1]:9"
         );
     }
 }

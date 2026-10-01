@@ -660,6 +660,22 @@ async fn governed_guild_config_api(
     token: String,
     guild_id: String,
 ) -> Result<GuildConfigDiscordApi, String> {
+    // Offline CLI fixtures must explicitly opt in and supply both loopback
+    // endpoints. A supplied authority (even empty/invalid) is never bypassed.
+    if env::var_os("TWO_DATABASE_URL").is_none()
+        && env_var("TWO_GUILD_CONFIG_OFFLINE_TEST").as_deref() == Some("1")
+    {
+        let api_base = env_var("GUILD_CONFIG_API_BASE").ok_or("offline fixture API base required")?;
+        let cdn_base = env_var("GUILD_CONFIG_CDN_BASE").ok_or("offline fixture CDN base required")?;
+        return GuildConfigDiscordApi::new(
+            Some(&api_base),
+            Some(&cdn_base),
+            token,
+            guild_config::STAGING_BOT_APPLICATION_ID.to_owned(),
+            guild_id,
+        )
+        .map_err(|error| error.to_string());
+    }
     let url = env_var("TWO_DATABASE_URL").ok_or("TWO_DATABASE_URL admission authority required")?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
