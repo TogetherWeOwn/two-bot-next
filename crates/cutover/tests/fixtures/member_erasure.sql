@@ -73,6 +73,15 @@ BEGIN
       INSERT INTO internal_action_log
         (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, response_code, http_status)
         VALUES (intent, 'terminal', repeat(md5(k), 2), 'role.assign', g, u, u, 'success', 200);
+      INSERT INTO self_role_audit
+        (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome,
+         added_role_ids, removed_role_ids, created_at)
+        VALUES (k, g, 'fixture-panel', u, 'fixture-source', 'button', 'assign', 'assigned',
+          '[]', '[]', '2026-10-01T00:00:00Z');
+      INSERT INTO self_role_panel_claims
+        (guild_id, member_id, panel_id, claim_token, claim_generation, processing_expires_at,
+         latest_event_id, target_committed)
+        VALUES (g, u, 'fixture-panel', 'fixture-claim', 1, '2000-01-01T00:00:00Z', k, TRUE);
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);

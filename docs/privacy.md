@@ -19,6 +19,9 @@ are outside this implementation's scope.
 - Moderation, announcements, automation and operational audit rows, actor/target
   IDs, reasons and metadata. Some legacy-compatible payload columns are arbitrary
   TEXT, not database-validated JSON.
+- Self-role audit and panel claims store member IDs, role effects, lease/recovery
+  state and outcomes. Settled member records are covered; unresolved role effects
+  or active leases refuse erasure rather than discard reconciliation evidence.
 - Internal action/replay ledgers store actor/target/resource IDs and outcomes,
   with hashed keys/nonces/event identities. Settings and immutable settings audit
   store operator attribution and JSON policy configuration.

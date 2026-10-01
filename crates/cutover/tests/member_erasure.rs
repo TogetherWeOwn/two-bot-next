@@ -222,6 +222,64 @@ async fn unresolved_side_effect_guards_refuse_without_deleting_any_rows() {
 }
 
 #[tokio::test]
+async fn unresolved_self_role_effects_and_active_claims_refuse_erasure() {
+    let Some(db) = database().await else { return };
+    seed(db.pool()).await;
+    let before = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    for assignment in [
+        "outcome = 'processing'",
+        "unresolved_added_role_ids = '[\"999999999999999999\"]'",
+        "unresolved_removed_role_ids = '[\"999999999999999999\"]'",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE self_role_audit SET {assignment} WHERE guild_id = $1 AND member_id = $2"
+        )))
+        .bind(GUILD)
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR }
+        )
+        .await
+        .is_err());
+        assert_eq!(audit_count(db.pool()).await, 0);
+        assert_eq!(
+            before,
+            erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE self_role_audit SET outcome = 'assigned', unresolved_added_role_ids = '[]', unresolved_removed_role_ids = '[]' WHERE guild_id = $1 AND member_id = $2")
+            .bind(GUILD).bind(USER).execute(db.pool()).await.unwrap();
+    }
+    sqlx::query("UPDATE self_role_panel_claims SET processing_expires_at = now() + interval '1 hour' WHERE guild_id = $1 AND member_id = $2")
+        .bind(GUILD).bind(USER).execute(db.pool()).await.unwrap();
+    assert!(erase_member(
+        db.pool(),
+        GUILD,
+        USER,
+        ErasureMode::Execute { actor: ACTOR }
+    )
+    .await
+    .is_err());
+    assert_eq!(audit_count(db.pool()).await, 0);
+    assert_eq!(
+        before,
+        erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+            .await
+            .unwrap()
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn audit_failure_rolls_back_the_entire_erasure() {
     let Some(db) = database().await else { return };
     seed(db.pool()).await;

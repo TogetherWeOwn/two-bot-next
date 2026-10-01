@@ -196,9 +196,17 @@ pub async fn erase_member(
     if let ErasureMode::Execute { actor } = mode {
         // An unresolved intent is a replay/side-effect safety guard, not stale
         // member data. Preserve it and fail the whole operation until resolved.
-        for (table, terminal_state) in [
-            ("internal_idempotency", "completed"),
-            ("moderation_idempotency", "done"),
+        for (table, unresolved_predicate) in [
+            ("internal_idempotency", "state <> 'completed'"),
+            ("moderation_idempotency", "state <> 'done'"),
+            (
+                "self_role_audit",
+                "outcome NOT IN ('assigned', 'removed', 'switched', 'already_held', 'already_absent', 'rejected') OR unresolved_added_role_ids::jsonb <> '[]'::jsonb OR unresolved_removed_role_ids::jsonb <> '[]'::jsonb",
+            ),
+            (
+                "self_role_panel_claims",
+                "processing_expires_at > clock_timestamp()",
+            ),
         ] {
             let entry = plan
                 .tables
@@ -206,13 +214,12 @@ pub async fn erase_member(
                 .find(|entry| entry.table == table)
                 .expect("replay guards must be in the erasure plan");
             let sql = format!(
-                "SELECT EXISTS (SELECT 1 FROM {table} WHERE ({}) AND state <> $3)",
+                "SELECT EXISTS (SELECT 1 FROM {table} WHERE ({}) AND ({unresolved_predicate}))",
                 entry.predicate
             );
             let unresolved = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql))
                 .bind(guild)
                 .bind(member)
-                .bind(terminal_state)
                 .fetch_one(&mut *tx)
                 .await?;
             if unresolved {
