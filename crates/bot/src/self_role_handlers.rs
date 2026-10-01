@@ -249,24 +249,57 @@ impl SelfRoleService {
         }
     }
 
-    /// One bounded processing-audit sweep. Terminal stale repair remains a boot
-    /// blocker. Renewed expiry supplies durable backoff across process restarts.
+    /// At most eight panels, sixteen discovery queries, sixty-four hints and
+    /// thirty-two considered audits. Each panel interleaves up to four owners;
+    /// queue priority and panel start rotate before any await so cancellation
+    /// cannot permanently favor processing over terminal repair. Dry-run never
+    /// claims terminal work. Renewed expiry supplies durable restart backoff.
     pub async fn recover_once(&self) -> Result<usize, RuntimeError> {
         let mut considered = 0;
-        let start = self.recovery_cursor.fetch_add(1, Ordering::Relaxed) % self.panels.len();
-        // Bound discovery I/O even when configured sources have no work. Rotate
-        // before awaiting so cancellation cannot starve later panels.
+        let sweep = self.recovery_cursor.fetch_add(1, Ordering::Relaxed);
+        let start = sweep % self.panels.len();
         for offset in 0..self.panels.len().min(8) {
             let panel = &self.panels[(start + offset) % self.panels.len()];
-            let candidates = self
+            let budget = (32 - considered).min(4);
+            let mut processing = self
                 .runtime
-                .recovery_candidates(panel, (32 - considered).min(4))
-                .await?;
-            for candidate in candidates {
+                .recovery_candidates(panel, budget)
+                .await?
+                .into_iter();
+            let mut terminal = if self.dry_run {
+                vec![]
+            } else {
+                self.runtime.terminal_candidates(panel, budget).await?
+            }
+            .into_iter();
+            for slot in 0..budget {
+                // Alternate each complete start-panel rotation, not sweep
+                // parity (which would pin a panel's priority for even counts).
+                let terminal_first = (sweep / self.panels.len() + slot) % 2 == 1;
+                let next = if terminal_first {
+                    terminal
+                        .next()
+                        .map(|c| (c, true))
+                        .or_else(|| processing.next().map(|c| (c, false)))
+                } else {
+                    processing
+                        .next()
+                        .map(|c| (c, false))
+                        .or_else(|| terminal.next().map(|c| (c, true)))
+                };
+                let Some((candidate, is_terminal)) = next else {
+                    break;
+                };
                 considered += 1;
-                let admission = self.runtime.recover(&candidate, panel).await;
-                self.handle_admission(admission, panel, &candidate.event_id)
-                    .await;
+                if is_terminal {
+                    if let Err(error) = self.runtime.recover_terminal(&candidate, panel).await {
+                        warn!(?error, event_id = %candidate.event_id, "self-role terminal repair unresolved");
+                    }
+                } else {
+                    let admission = self.runtime.recover(&candidate, panel).await;
+                    self.handle_admission(admission, panel, &candidate.event_id)
+                        .await;
+                }
             }
             if considered == 32 {
                 break;

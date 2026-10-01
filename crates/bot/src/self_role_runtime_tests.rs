@@ -209,6 +209,11 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    terminal_restart_repairs_committed_target(pool).await?;
+    terminal_restart_refuses_unknown_or_uninitialized_target(pool).await?;
+    terminal_restart_preserves_inherited_pending(pool).await?;
+    terminal_restart_cancellation_preserves_journal(pool).await?;
+    mixed_terminal_processing_sweep_and_dry_run(pool).await?;
     supervised_processing_recovery(pool).await?;
     bounded_processing_sweep(pool).await?;
     durable_processing_recovery_without_redelivery(pool).await?;
@@ -252,6 +257,529 @@ fn effect_snapshots_do_not_invent_unattempted_changes_or_erase_history() {
     // Differences on other roles do not become this event's observed effects.
     observe_effects(&mut effects, &[OTHER.into()], &held);
     assert!(!effects.added_role_ids.contains(&OLD_ROLE.into()));
+}
+
+// Restart fixtures retain the rejected event's real panel/member/source ids and
+// initialized immutable intent. Only a new maintenance claim may repair it.
+async fn terminal_seed(
+    store: &SelfRoleStore,
+    panel: &SelfRolePanel,
+    id: &str,
+    pending: bool,
+) -> TestResult<SelfRoleAudit> {
+    let mut audit = SelfRoleAudit {
+        event_id: id.into(),
+        event_order: Some("0001".into()),
+        guild_id: GUILD.into(),
+        panel_id: panel.id.clone(),
+        member_id: USER.into(),
+        source_id: MESSAGE.into(),
+        option_key: Some("old".into()),
+        role_id: Some(OLD_ROLE.into()),
+        source: panel.mode,
+        operation: RoleOperation::Replace,
+        outcome: SettledOutcome::Switched,
+        code: None,
+        reason: None,
+        effects: AuditEffects {
+            attempted_added_role_ids: vec![OLD_ROLE.into()],
+            unresolved_added_role_ids: if pending {
+                vec![OLD_ROLE.into()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        },
+        desired_role_ids: vec![OLD_ROLE.into()],
+        pre_mutation_role_ids: vec![],
+    };
+    let event = store.claim_audit(&audit).await?.unwrap();
+    assert!(event.intent_initialized);
+    assert!(
+        store
+            .checkpoint_exchange(&event, &audit.effects, false, Some(pending))
+            .await?
+    );
+    audit.outcome = SettledOutcome::Rejected;
+    audit.code = Some("superseded_by_later_event".into());
+    audit.reason = Some("a later exclusive-panel event was accepted".into());
+    store.finish_audit(&audit, &event).await?;
+    Ok(audit)
+}
+
+async fn terminal_winner(
+    store: &SelfRoleStore,
+    panel: &SelfRolePanel,
+    option: Option<&str>,
+) -> TestResult<String> {
+    let winner = format!("{}-winner", panel.id);
+    let key = PanelKey {
+        guild_id: GUILD.into(),
+        member_id: USER.into(),
+        panel_id: panel.id.clone(),
+    };
+    let mut claim = match store.claim_panel(&key, Some((&winner, "0002"))).await? {
+        PanelClaimResult::Acquired(claim) => claim,
+        other => panic!("expected winner lane, got {other:?}"),
+    };
+    assert!(store.set_panel_claim_option(&mut claim, option).await?);
+    assert!(store.release_panel_claim(&claim).await?);
+    Ok(winner)
+}
+
+async fn assert_terminal_winner(
+    pool: &PgPool,
+    panel: &SelfRolePanel,
+    winner: &str,
+    option: Option<&str>,
+) -> TestResult {
+    let (event, order, selected, committed): (String, String, Option<String>, bool) =
+        sqlx::query_as(
+            "SELECT latest_event_id,latest_event_order,latest_option_key,target_committed
+         FROM self_role_panel_claims WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3",
+        )
+        .bind(GUILD)
+        .bind(USER)
+        .bind(&panel.id)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(event, winner);
+    assert_eq!(order, "0002");
+    assert_eq!(selected.as_deref(), option);
+    assert!(committed);
+    Ok(())
+}
+
+async fn terminal_evidence(
+    pool: &PgPool,
+    audit: &SelfRoleAudit,
+    pending: bool,
+    complete: bool,
+) -> TestResult<AuditEffects> {
+    let (outcome, code, reason, order, desired, before, exchange, receipt, effects): (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        bool,
+        bool,
+        Vec<String>,
+    ) = sqlx::query_as(
+        "SELECT outcome,code,reason,event_order,desired_role_ids,pre_mutation_role_ids,
+         exchange_pending,repair_complete,ARRAY[added_role_ids,removed_role_ids,
+         attempted_added_role_ids,attempted_removed_role_ids,compensated_added_role_ids,
+         compensated_removed_role_ids,unresolved_added_role_ids,unresolved_removed_role_ids]
+         FROM self_role_audit WHERE event_id=$1",
+    )
+    .bind(&audit.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(outcome, "rejected");
+    assert_eq!(Some(code.as_str()), audit.code.as_deref());
+    assert_eq!(Some(reason.as_str()), audit.reason.as_deref());
+    assert_eq!(order, audit.event_order);
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&desired)?,
+        audit.desired_role_ids
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&before)?,
+        audit.pre_mutation_role_ids
+    );
+    assert_eq!(exchange, pending);
+    assert_eq!(receipt, complete);
+    Ok(AuditEffects {
+        added_role_ids: serde_json::from_str(&effects[0])?,
+        removed_role_ids: serde_json::from_str(&effects[1])?,
+        attempted_added_role_ids: serde_json::from_str(&effects[2])?,
+        attempted_removed_role_ids: serde_json::from_str(&effects[3])?,
+        compensated_added_role_ids: serde_json::from_str(&effects[4])?,
+        compensated_removed_role_ids: serde_json::from_str(&effects[5])?,
+        unresolved_added_role_ids: serde_json::from_str(&effects[6])?,
+        unresolved_removed_role_ids: serde_json::from_str(&effects[7])?,
+    })
+}
+
+async fn terminal_restart_repairs_committed_target(pool: &PgPool) -> TestResult {
+    for case in ["selected", "selected-missing", "empty"] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("terminal-restart-{case}");
+        let option = if case == "empty" { None } else { Some("new") };
+        let held = if case == "selected-missing" {
+            vec![OLD_ROLE, OTHER]
+        } else {
+            vec![OLD_ROLE, NEW_ROLE, OTHER]
+        };
+        let mut script = snapshot(&held);
+        script.push(ScriptedResponse::status(204)); // DELETE obsolete old first
+        if case == "selected-missing" {
+            script.extend(snapshot(&[OTHER]));
+            script.push(ScriptedResponse::status(204)); // PUT missing committed new
+        } else if case == "empty" {
+            script.extend(snapshot(&[NEW_ROLE, OTHER]));
+            script.push(ScriptedResponse::status(204)); // DELETE remaining panel role
+        }
+        script.extend(snapshot(if case == "empty" {
+            &[OTHER]
+        } else {
+            &[NEW_ROLE, OTHER]
+        }));
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
+        let winner = terminal_winner(&feature.store, &panel, option).await?;
+        let hints = feature.terminal_candidates(&panel, 1).await.unwrap();
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].event_id, audit.event_id);
+        assert!(feature.recover_terminal(&hints[0], &panel).await.unwrap());
+        assert!(!feature.recover_terminal(&hints[0], &panel).await.unwrap());
+        assert!(feature
+            .terminal_candidates(&panel, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let effects = terminal_evidence(pool, &audit, false, true).await?;
+        assert!(effects.attempted_added_role_ids.contains(&OLD_ROLE.into()));
+        assert!(effects
+            .compensated_removed_role_ids
+            .contains(&OLD_ROLE.into()));
+        if case == "selected-missing" {
+            assert!(effects.attempted_added_role_ids.contains(&NEW_ROLE.into()));
+            assert_eq!(effects.compensated_added_role_ids, [NEW_ROLE]);
+        } else if case == "empty" {
+            assert!(effects
+                .compensated_removed_role_ids
+                .contains(&NEW_ROLE.into()));
+        }
+        assert!(effects.unresolved_added_role_ids.is_empty());
+        assert!(effects.unresolved_removed_role_ids.is_empty());
+        assert_terminal_winner(pool, &panel, &winner, option).await?;
+        let calls = mock.requests();
+        let mutations: Vec<_> = calls.iter().filter(|r| r.method != "GET").collect();
+        let actual: Vec<_> = mutations
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect();
+        let old_path = format!("/api/v10/guilds/{GUILD}/members/{USER}/roles/{OLD_ROLE}");
+        let new_path = format!("/api/v10/guilds/{GUILD}/members/{USER}/roles/{NEW_ROLE}");
+        let mut expected = vec![("DELETE", old_path.as_str())];
+        if case == "selected-missing" {
+            expected.push(("PUT", new_path.as_str()));
+        } else if case == "empty" {
+            expected.push(("DELETE", new_path.as_str()));
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(calls.len(), if case == "selected" { 9 } else { 14 });
+        assert!(mutations
+            .iter()
+            .all(|r| r.body.is_empty() && !r.path.ends_with(OTHER)));
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn terminal_restart_refuses_unknown_or_uninitialized_target(pool: &PgPool) -> TestResult {
+    for case in ["unknown", "uninitialized", "removed-option"] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("terminal-refuse-{case}");
+        let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
+        let winner = if case == "unknown" {
+            None // a maintenance lane without a committed target is not empty
+        } else {
+            Some(
+                terminal_winner(
+                    &feature.store,
+                    &panel,
+                    Some(if case == "removed-option" {
+                        "no-longer-offered"
+                    } else {
+                        "new"
+                    }),
+                )
+                .await?,
+            )
+        };
+        if case == "uninitialized" {
+            sqlx::query("UPDATE self_role_audit SET intent_initialized=FALSE WHERE event_id=$1")
+                .bind(&audit.event_id)
+                .execute(pool)
+                .await?;
+        }
+        let hints = feature.terminal_candidates(&panel, 1).await.unwrap();
+        assert_eq!(hints.len(), 1);
+        assert!(matches!(
+            feature.recover_terminal(&hints[0], &panel).await,
+            Err(RuntimeError::InvalidSnapshot)
+        ));
+        assert!(mock.requests().is_empty()); // no reads or mutation before refusal
+        terminal_evidence(pool, &audit, false, false).await?;
+        if let Some(winner) = winner {
+            assert_terminal_winner(
+                pool,
+                &panel,
+                &winner,
+                Some(if case == "removed-option" {
+                    "no-longer-offered"
+                } else {
+                    "new"
+                }),
+            )
+            .await?;
+        } else {
+            let (committed, option): (bool, Option<String>) = sqlx::query_as(
+                "SELECT target_committed,latest_option_key FROM self_role_panel_claims
+                 WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3",
+            )
+            .bind(GUILD)
+            .bind(USER)
+            .bind(&panel.id)
+            .fetch_one(pool)
+            .await?;
+            assert!(!committed);
+            assert!(option.is_none());
+        }
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn terminal_restart_preserves_inherited_pending(pool: &PgPool) -> TestResult {
+    for converged in [true, false] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("terminal-pending-{converged}");
+        let mut script = if converged {
+            snapshot(&[NEW_ROLE, OTHER])
+        } else {
+            snapshot(&[OLD_ROLE, OTHER])
+        };
+        if !converged {
+            script.push(ScriptedResponse::status(204)); // fresh DELETE response
+            script.extend(snapshot(&[OTHER]));
+            script.push(ScriptedResponse::status(204)); // fresh PUT response
+            script.extend(snapshot(&[NEW_ROLE, OTHER]));
+        }
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let audit = terminal_seed(&feature.store, &panel, &panel.id, true).await?;
+        let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
+        let hint = feature
+            .terminal_candidates(&panel, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(matches!(
+            feature.recover_terminal(&hint, &panel).await,
+            Err(RuntimeError::PendingExchange)
+        ));
+        let effects = terminal_evidence(pool, &audit, true, false).await?;
+        assert!(effects.unresolved_added_role_ids.contains(&OLD_ROLE.into()));
+        if converged {
+            assert_eq!(effects.unresolved_added_role_ids, [OLD_ROLE]);
+        }
+        assert!(effects.attempted_added_role_ids.contains(&OLD_ROLE.into()));
+        if !converged {
+            assert_eq!(effects.compensated_removed_role_ids, [OLD_ROLE]);
+            assert_eq!(effects.compensated_added_role_ids, [NEW_ROLE]);
+        }
+        assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
+        let calls = mock.requests();
+        let methods: Vec<_> = calls
+            .iter()
+            .filter(|r| r.method != "GET")
+            .map(|r| r.method.as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            if converged {
+                vec![]
+            } else {
+                vec!["DELETE", "PUT"]
+            }
+        );
+        assert_eq!(calls.len(), if converged { 4 } else { 14 });
+        // A response to this repair (or a converged member) never resolves the
+        // prior process's unknown exchange. It remains due after lease expiry.
+        clock.store(NOW + 500, Ordering::SeqCst);
+        let retry = feature.terminal_candidates(&panel, 1).await.unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].event_id, audit.event_id);
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mut panel = panel(PanelMode::Select);
+    panel.id = "terminal-cancel-delayed-repair".into();
+    let mut script = snapshot(&[OLD_ROLE, OTHER]);
+    script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(5)));
+    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let feature = Arc::new(runtime(pool, &clock, &mock));
+    let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
+    let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
+    let hint = feature
+        .terminal_candidates(&panel, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let owner = {
+        let feature = feature.clone();
+        let panel = panel.clone();
+        tokio::spawn(async move { feature.recover_terminal(&hint, &panel).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !mock.requests().iter().any(|r| r.method == "DELETE") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    clock.store(NOW + 100, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let renewed: (i64, i64) = sqlx::query_as(
+        "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
+         (extract(epoch FROM p.processing_expires_at)*1000)::bigint
+         FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
+         WHERE a.event_id=$1",
+    )
+    .bind(&audit.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert!(renewed.0 > NOW + 300 && renewed.1 > NOW + 300);
+    assert!(!owner.is_finished());
+    owner.abort();
+    assert!(owner.await.unwrap_err().is_cancelled());
+    let effects = terminal_evidence(pool, &audit, true, false).await?;
+    assert_eq!(effects.attempted_added_role_ids, [OLD_ROLE]);
+    assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]);
+    assert_eq!(effects.unresolved_removed_role_ids, [OLD_ROLE]);
+    assert!(effects.compensated_removed_role_ids.is_empty());
+    assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
+    let expiry: (i64, i64) = sqlx::query_as(
+        "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
+         (extract(epoch FROM p.processing_expires_at)*1000)::bigint
+         FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
+         WHERE a.event_id=$1",
+    )
+    .bind(&audit.event_id)
+    .fetch_one(pool)
+    .await?;
+    let calls = mock.requests();
+    clock.store(NOW + 200, Ordering::SeqCst); // both old leases are still live
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let after: (i64, i64) = sqlx::query_as(
+        "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
+         (extract(epoch FROM p.processing_expires_at)*1000)::bigint
+         FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
+         WHERE a.event_id=$1",
+    )
+    .bind(&audit.event_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(expiry, after); // neither renewal keeper escaped its cancelled owner
+    assert_eq!(calls.len(), 5);
+    assert_eq!(calls.len(), mock.requests().len());
+    assert_eq!(calls[4].method, "DELETE");
+    assert!(calls[4].path.ends_with(OLD_ROLE));
+    let after_effects = terminal_evidence(pool, &audit, true, false).await?;
+    assert_eq!(
+        effects.attempted_removed_role_ids,
+        after_effects.attempted_removed_role_ids
+    );
+    assert_eq!(
+        effects.unresolved_removed_role_ids,
+        after_effects.unresolved_removed_role_ids
+    );
+    clock.store(NOW + 1_000, Ordering::SeqCst);
+    assert_eq!(
+        feature.terminal_candidates(&panel, 1).await.unwrap().len(),
+        1
+    );
+    mock.shutdown().await;
+    Ok(())
+}
+
+async fn mixed_terminal_processing_sweep_and_dry_run(pool: &PgPool) -> TestResult {
+    use crate::self_role_handlers::SelfRoleService;
+    use two_bot_core::self_roles::SelfRoleGates;
+
+    for dry_run in [false, true] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let mut panel = panel(PanelMode::Select);
+        panel.id = format!("mixed-terminal-sweep-{dry_run}");
+        for n in 0..3 {
+            let audit = terminal_seed(
+                &feature.store,
+                &panel,
+                &format!("{}-terminal-{n}", panel.id),
+                false,
+            )
+            .await?;
+            sqlx::query("UPDATE self_role_audit SET intent_initialized=FALSE WHERE event_id=$1")
+                .bind(&audit.event_id)
+                .execute(pool)
+                .await?;
+            let mut processing = audit;
+            processing.event_id = format!("{}-processing-{n}", panel.id);
+            processing.effects = AuditEffects::default();
+            processing.desired_role_ids.clear();
+            assert!(feature
+                .store
+                .claim_pending_audit(&processing)
+                .await?
+                .is_some());
+        }
+        clock.store(NOW + 500, Ordering::SeqCst);
+        let service = SelfRoleService::new(
+            feature,
+            SelfRoleGates {
+                panels: vec![panel.clone()],
+                dry_run,
+            },
+            &[GUILD.to_owned()].into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            service.recover_once().await.unwrap(),
+            if dry_run { 3 } else { 4 }
+        );
+        let (processing, repairs): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE outcome='processing'),
+             count(*) FILTER (WHERE repair_expires_at IS NOT NULL)
+             FROM self_role_audit WHERE panel_id=$1",
+        )
+        .bind(&panel.id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(processing, if dry_run { 0 } else { 1 });
+        assert_eq!(repairs, if dry_run { 0 } else { 2 }); // two slots per queue, not four each
+        assert_eq!(
+            service.recover_once().await.unwrap(),
+            if dry_run { 0 } else { 2 }
+        );
+        assert_eq!(service.recover_once().await.unwrap(), 0);
+        let (generation, receipts): (i32, i64) = sqlx::query_as(
+            "SELECT min(claim_generation),count(*) FILTER (WHERE repair_complete)
+             FROM self_role_audit WHERE panel_id=$1 AND code='superseded_by_later_event'",
+        )
+        .bind(&panel.id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(generation, if dry_run { 1 } else { 2 });
+        assert_eq!(receipts, 0);
+        assert!(mock.requests().is_empty()); // invalid intent/dry-run never enter REST
+        mock.shutdown().await;
+    }
+    Ok(())
 }
 
 async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {

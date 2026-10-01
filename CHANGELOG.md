@@ -31,10 +31,14 @@
   status, and cancellation/evidence-preservation fixtures. Add separate terminal
   supersession discovery, fresh typed evidence leases, dual-fenced repair
   journaling/completion receipts and inherited-unknown preservation (migration
-  0204), with isolated source regressions. Terminal runtime repair is not yet wired.
-  Production boot remains disabled until terminal stale repair, approved shared
-  boot configuration, unresolved-work continuation and compiled acceptance are
-  complete.
+  0204), with isolated source regressions. Add cancellation-owned terminal restart
+  repair through the shared journaled executor to a freshly leased committed
+  selected/empty target, atomic paired ownership checks and bounded fair mixed
+  discovery. Preserve inherited uncertainty and terminal rejection; dry-run skips
+  terminal claims. Add source fixtures for restart convergence, missing/unknown
+  targets, pending evidence, cancelled renewals and mixed sweeps. Production boot
+  remains disabled until approved shared boot configuration, unresolved-work
+  continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

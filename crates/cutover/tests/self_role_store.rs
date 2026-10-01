@@ -128,7 +128,7 @@ async fn terminal_seed(
     let event = store.claim_audit(&audit).await?.unwrap();
     assert!(
         store
-            .checkpoint_exchange(&event, &audit.effects, false, pending)
+            .checkpoint_exchange(&event, &audit.effects, false, Some(pending))
             .await?
     );
     audit.outcome = SettledOutcome::Rejected;
@@ -274,6 +274,7 @@ async fn terminal_repair_fences_and_completion(pool: &PgPool) -> TestResult {
                 .journal_superseded_repair(&claim, &unknown, &audit.effects)
                 .await?
         );
+        assert!(!store.owns_superseded_repair(&claim, &unknown).await?);
         assert!(!store.finish_superseded_repair(&claim, &unknown).await?);
         assert!(store.release_panel_claim(&unknown).await?);
         let mut normal = acquired(
@@ -288,8 +289,13 @@ async fn terminal_repair_fences_and_completion(pool: &PgPool) -> TestResult {
                 .await,
             Err(StoreError::WrongPanel)
         ));
+        assert!(matches!(
+            store.owns_superseded_repair(&claim, &normal).await,
+            Err(StoreError::WrongPanel)
+        ));
         assert!(store.release_panel_claim(&normal).await?);
         let mut maintenance = acquired(store.claim_panel(&key, None).await?);
+        assert!(store.owns_superseded_repair(&claim, &maintenance).await?);
         assert_eq!(
             maintenance.target.latest_event_id.as_deref(),
             Some("winner")
@@ -368,6 +374,7 @@ async fn terminal_repair_fences_and_completion(pool: &PgPool) -> TestResult {
             assert!(store.renew_superseded_claim(&claim).await?);
             clock.store(TEST_NOW_MS + 300, Ordering::SeqCst);
             assert!(store.owns_superseded_claim(&claim).await?);
+            assert!(!store.owns_superseded_repair(&claim, &maintenance).await?);
             assert!(
                 !store
                     .journal_superseded_repair(&claim, &maintenance, &journal)
@@ -430,7 +437,15 @@ async fn terminal_repair_fences_and_completion(pool: &PgPool) -> TestResult {
 }
 
 async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
-    for operation in ["owns", "renew", "journal", "finish", "acquire"] {
+    for operation in [
+        "owns",
+        "paired",
+        "paired-panel",
+        "renew",
+        "journal",
+        "finish",
+        "acquire",
+    ] {
         let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
         let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
         let id = format!("terminal-wait-{operation}");
@@ -443,13 +458,20 @@ async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
         let mut panel = acquired(store.claim_panel(&panel_key(&audit), None).await?);
         assert!(store.set_panel_claim_option(&mut panel, None).await?);
         let mut lock = pool.begin().await?;
-        sqlx::query("SELECT event_id FROM self_role_audit WHERE event_id=$1 FOR UPDATE")
-            .bind(&id)
-            .execute(&mut *lock)
-            .await?;
+        if operation == "paired-panel" {
+            sqlx::query("SELECT panel_id FROM self_role_panel_claims WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3 FOR UPDATE")
+                .bind(&panel.key.guild_id).bind(&panel.key.member_id).bind(&panel.key.panel_id)
+                .execute(&mut *lock).await?;
+        } else {
+            sqlx::query("SELECT event_id FROM self_role_audit WHERE event_id=$1 FOR UPDATE")
+                .bind(&id)
+                .execute(&mut *lock)
+                .await?;
+        }
         let mut pending = Box::pin(async {
             match operation {
                 "owns" => store.owns_superseded_claim(&claim).await,
+                "paired" | "paired-panel" => store.owns_superseded_repair(&claim, &panel).await,
                 "renew" => store.renew_superseded_claim(&claim).await,
                 "journal" => {
                     store
@@ -506,6 +528,7 @@ async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
             .journal_superseded_repair(&claim, &panel, &AuditEffects::default())
             .await?
     );
+    assert!(!store.owns_superseded_repair(&claim, &panel).await?);
     assert!(!store.finish_superseded_repair(&claim, &panel).await?);
     Ok(())
 }

@@ -20,7 +20,7 @@ use two_bot_core::self_roles::{
 };
 use two_bot_cutover::self_role_store::{
     AuditEffects, EventClaim, PanelClaim, PanelClaimResult, PanelKey, RecoverableAudit,
-    SelfRoleAudit, SelfRoleStore, StoreError,
+    SelfRoleAudit, SelfRoleStore, StoreError, SupersededClaim,
 };
 use two_bot_discord::{
     executor::self_roles::{SelfRoleRestError, SelfRoleSnapshot},
@@ -144,6 +144,21 @@ async fn store_io<T>(
 struct LeaseKeeper(tokio::task::JoinHandle<()>);
 
 impl LeaseKeeper {
+    fn terminal(store: SelfRoleStore, claim: SupersededClaim, lost: Arc<AtomicBool>) -> Self {
+        Self(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(claim.renew_after_ms())).await;
+                if !matches!(
+                    store_io(store.renew_superseded_claim(&claim)).await,
+                    Ok(true)
+                ) {
+                    lost.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }))
+    }
+
     fn start(
         store: SelfRoleStore,
         event: Option<EventClaim>,
@@ -241,6 +256,40 @@ impl RepairLease {
         }
         let owned = store_io(store.owns_panel_claim(&self.claim)).await?;
         Ok(owned && !self.lost.load(Ordering::SeqCst))
+    }
+}
+
+/// Restarted terminal repair is not a fabricated successful-change plan. The
+/// rejected audit only supplies evidence; the fresh lane supplies its target.
+struct TerminalRepair {
+    claim: SupersededClaim,
+    effects: AuditEffects,
+    pending: bool,
+    lost: Arc<AtomicBool>,
+    _keeper: LeaseKeeper,
+}
+
+impl TerminalRepair {
+    async fn owns(&self, store: &SelfRoleStore, lane: &RepairLease) -> Result<bool, RuntimeError> {
+        if self.lost.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let owned = store_io(store.owns_superseded_repair(&self.claim, &lane.claim)).await?;
+        Ok(owned && !self.lost.load(Ordering::SeqCst))
+    }
+
+    fn observe(&mut self, held: &HashSet<String>) {
+        let added = self.effects.unresolved_added_role_ids.clone();
+        let removed = self.effects.unresolved_removed_role_ids.clone();
+        observe_effects(
+            &mut self.effects,
+            &self.claim.audit().pre_mutation_role_ids,
+            held,
+        );
+        if self.pending {
+            self.effects.unresolved_added_role_ids = added;
+            self.effects.unresolved_removed_role_ids = removed;
+        }
     }
 }
 
@@ -722,19 +771,7 @@ impl SelfRoleRuntime {
         panel: &SelfRolePanel,
         repair: &RepairLease,
     ) -> Result<(), RuntimeError> {
-        if !repair.claim.target.committed {
-            return Err(RuntimeError::InvalidSnapshot);
-        }
-        let target = match repair.claim.target.option_key.as_deref() {
-            None => vec![],
-            Some(key) => vec![panel
-                .options
-                .iter()
-                .find(|o| o.key == key)
-                .ok_or(RuntimeError::InvalidSnapshot)?
-                .role_id
-                .clone()],
-        };
+        let target = committed_target(panel, &repair.claim)?;
         let offered: Vec<_> = panel.options.iter().map(|o| o.role_id.clone()).collect();
         for _ in 0..(panel.options.len() * 2 + 1) {
             if !repair.owns(&self.store).await? {
@@ -791,6 +828,280 @@ impl SelfRoleRuntime {
                 .await?;
         }
         Err(RuntimeError::Rest(SelfRoleRestError::Ambiguous))
+    }
+
+    pub async fn terminal_candidates(
+        &self,
+        panel: &SelfRolePanel,
+        limit: usize,
+    ) -> Result<Vec<RecoverableAudit>, RuntimeError> {
+        if !panel.exclusive {
+            return Ok(vec![]);
+        }
+        store_io(self.store.superseded_audits(
+            &self.guild_id,
+            &panel.id,
+            &panel.message_id,
+            panel.mode,
+            limit,
+        ))
+        .await
+    }
+
+    /// Terminal repair never executes the superseded input, replies success, or
+    /// publishes a target. Dry-run callers must not enter this mutation path.
+    /// Both renewal tasks are retained by this awaited owner; cancellation leaves
+    /// journaled uncertainty intact and falls back to lease expiry.
+    pub async fn recover_terminal(
+        &self,
+        candidate: &RecoverableAudit,
+        panel: &SelfRolePanel,
+    ) -> Result<bool, RuntimeError> {
+        if !panel.exclusive
+            || candidate.guild_id != self.guild_id
+            || candidate.panel_id != panel.id
+            || candidate.source_id != panel.message_id
+            || candidate.source != panel.mode
+        {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        let Some(claim) = store_io(self.store.claim_superseded_audit(candidate)).await? else {
+            return Ok(false);
+        };
+        let offered: Vec<_> = panel.options.iter().map(|o| o.role_id.clone()).collect();
+        let audit = claim.audit();
+        if !claim.intent_initialized()
+            || [
+                &audit.desired_role_ids,
+                &audit.pre_mutation_role_ids,
+                &audit.effects.added_role_ids,
+                &audit.effects.removed_role_ids,
+                &audit.effects.attempted_added_role_ids,
+                &audit.effects.attempted_removed_role_ids,
+                &audit.effects.compensated_added_role_ids,
+                &audit.effects.compensated_removed_role_ids,
+                &audit.effects.unresolved_added_role_ids,
+                &audit.effects.unresolved_removed_role_ids,
+            ]
+            .iter()
+            .any(|ids| ids.iter().any(|id| !offered.contains(id)))
+        {
+            return Err(RuntimeError::InvalidSnapshot);
+        }
+        let lost = Arc::new(AtomicBool::new(false));
+        let keeper = LeaseKeeper::terminal(self.store.clone(), claim.clone(), lost.clone());
+        let mut owner = TerminalRepair {
+            effects: claim.audit().effects.clone(),
+            pending: claim.exchange_pending(),
+            claim,
+            lost: lost.clone(),
+            _keeper: keeper,
+        };
+        let key = PanelKey {
+            guild_id: candidate.guild_id.clone(),
+            member_id: candidate.member_id.clone(),
+            panel_id: panel.id.clone(),
+        };
+        let deadline = tokio::time::Instant::now() + LANE_WAIT;
+        let lane = loop {
+            if owner.lost.load(Ordering::SeqCst)
+                || !store_io(self.store.owns_superseded_claim(&owner.claim)).await?
+            {
+                return Err(RuntimeError::Stale);
+            }
+            match store_io(self.store.claim_panel(&key, None)).await? {
+                PanelClaimResult::Acquired(claim) => break claim,
+                PanelClaimResult::Busy if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(LANE_BACKOFF).await;
+                }
+                _ => return Err(RuntimeError::Stale),
+            }
+        };
+        let keeper = LeaseKeeper::start(self.store.clone(), None, Some(lane.clone()), lost.clone());
+        let lane = RepairLease {
+            claim: lane,
+            lost,
+            _keeper: keeper,
+        };
+        let result = self.repair_terminal_owned(&mut owner, panel, &lane).await;
+        let _ = store_io(self.store.release_panel_claim(&lane.claim)).await;
+        result
+    }
+
+    async fn repair_terminal_owned(
+        &self,
+        owner: &mut TerminalRepair,
+        panel: &SelfRolePanel,
+        lane: &RepairLease,
+    ) -> Result<bool, RuntimeError> {
+        let target = committed_target(panel, &lane.claim)?;
+        let offered: Vec<_> = panel.options.iter().map(|o| o.role_id.clone()).collect();
+        for _ in 0..(panel.options.len() * 2 + 1) {
+            if !owner.owns(&self.store, lane).await? {
+                return Err(RuntimeError::Stale);
+            }
+            let mut snapshot = self
+                .executor
+                .fetch_self_role_snapshot(
+                    &self.guild_id,
+                    &owner.claim.audit().member_id,
+                    &self.bot_id,
+                )
+                .await
+                .map_err(RuntimeError::Rest)?;
+            if !owner.owns(&self.store, lane).await? {
+                return Err(RuntimeError::Stale);
+            }
+            owner.observe(&snapshot.member_role_ids);
+            if !store_io(self.store.record_superseded_repair(
+                &owner.claim,
+                &owner.effects,
+                owner.pending,
+            ))
+            .await?
+            {
+                return Err(RuntimeError::Stale);
+            }
+            if snapshot.member_is_bot
+                || snapshot.validate(&self.guild_id, panel, &offered).is_some()
+            {
+                return Err(RuntimeError::Rest(SelfRoleRestError::Snapshot));
+            }
+            let plan = plan_select_delta(panel, &snapshot.member_role_ids, &target)
+                .map_err(|_| RuntimeError::InvalidSnapshot)?;
+            let next = plan
+                .remove_role_ids
+                .first()
+                .map(|id| (id.clone(), false))
+                .or_else(|| plan.add_role_ids.first().map(|id| (id.clone(), true)));
+            let Some((role, add)) = next else {
+                if owner.pending {
+                    return Err(RuntimeError::PendingExchange);
+                }
+                // This receipt is not settlement of the superseded event. The
+                // store rechecks both leases/target after panel -> audit waits.
+                return if store_io(
+                    self.store
+                        .finish_superseded_repair(&owner.claim, &lane.claim),
+                )
+                .await?
+                {
+                    Ok(true)
+                } else {
+                    Err(RuntimeError::Stale)
+                };
+            };
+            self.terminal_step(owner, lane, &mut snapshot, &role, add)
+                .await?;
+        }
+        Err(RuntimeError::Rest(SelfRoleRestError::Ambiguous))
+    }
+
+    async fn terminal_step(
+        &self,
+        owner: &mut TerminalRepair,
+        lane: &RepairLease,
+        snapshot: &mut SelfRoleSnapshot,
+        role: &str,
+        add: bool,
+    ) -> Result<(), RuntimeError> {
+        let prior_pending = owner.pending;
+        let mut attempted = owner.effects.clone();
+        mark_attempt(&mut attempted, role, add);
+        let journaled = AtomicBool::new(false);
+        let exchange = self
+            .executor
+            .self_role_step_journaled(
+                &self.guild_id,
+                &owner.claim.audit().member_id,
+                role,
+                add,
+                || async {
+                    owner
+                        .owns(&self.store, lane)
+                        .await
+                        .map_err(|_| SelfRoleRestError::StaleClaim)
+                },
+                || async {
+                    if !store_io(self.store.journal_superseded_repair(
+                        &owner.claim,
+                        &lane.claim,
+                        &attempted,
+                    ))
+                    .await
+                    .map_err(|_| SelfRoleRestError::StaleClaim)?
+                    {
+                        return Err(SelfRoleRestError::StaleClaim);
+                    }
+                    journaled.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+        let exchange = match exchange {
+            Ok(exchange) => exchange,
+            Err(error) => {
+                if journaled.load(Ordering::SeqCst) {
+                    // Shared Err means definite no-send. It resolves only this
+                    // repair attempt, never inherited/earlier unknown work.
+                    clear_unresolved(&mut attempted, role, add);
+                    if prior_pending {
+                        attempted.unresolved_added_role_ids =
+                            owner.effects.unresolved_added_role_ids.clone();
+                        attempted.unresolved_removed_role_ids =
+                            owner.effects.unresolved_removed_role_ids.clone();
+                    }
+                    owner.effects = attempted;
+                    store_io(self.store.record_superseded_repair(
+                        &owner.claim,
+                        &owner.effects,
+                        prior_pending,
+                    ))
+                    .await?;
+                }
+                return Err(if error == SelfRoleRestError::StaleClaim {
+                    RuntimeError::Stale
+                } else {
+                    RuntimeError::Rest(error)
+                });
+            }
+        };
+        owner.effects = attempted;
+        owner.pending = prior_pending || !exchange.response_received;
+        match exchange.result {
+            Ok(()) => {
+                if add {
+                    snapshot.member_role_ids.insert(role.into());
+                } else {
+                    snapshot.member_role_ids.remove(role);
+                }
+                owner.observe(&snapshot.member_role_ids);
+                push_role(
+                    if add {
+                        &mut owner.effects.compensated_added_role_ids
+                    } else {
+                        &mut owner.effects.compensated_removed_role_ids
+                    },
+                    role,
+                );
+            }
+            Err(SelfRoleRestError::Ambiguous) => {}
+            Err(_) if !prior_pending => clear_unresolved(&mut owner.effects, role, add),
+            Err(_) => {}
+        }
+        if !store_io(self.store.record_superseded_repair(
+            &owner.claim,
+            &owner.effects,
+            owner.pending,
+        ))
+        .await?
+        {
+            return Err(RuntimeError::Stale);
+        }
+        if !exchange.owned_after || !owner.owns(&self.store, lane).await? {
+            return Err(RuntimeError::Stale);
+        }
+        exchange.result.map_err(RuntimeError::Rest)
     }
 
     /// Claim first, exclusive lane second, authoritative policy/member last.
@@ -1260,6 +1571,25 @@ fn observe_prepared(prepared: &mut PreparedSelfRole, held: &HashSet<String>) {
     if prepared.event.exchange_pending {
         prepared.audit.effects.unresolved_added_role_ids = added;
         prepared.audit.effects.unresolved_removed_role_ids = removed;
+    }
+}
+
+fn committed_target(
+    panel: &SelfRolePanel,
+    claim: &PanelClaim,
+) -> Result<Vec<String>, RuntimeError> {
+    if !claim.target.committed {
+        return Err(RuntimeError::InvalidSnapshot);
+    }
+    match claim.target.option_key.as_deref() {
+        None => Ok(vec![]),
+        Some(key) => Ok(vec![panel
+            .options
+            .iter()
+            .find(|o| o.key == key)
+            .ok_or(RuntimeError::InvalidSnapshot)?
+            .role_id
+            .clone()]),
     }
 }
 

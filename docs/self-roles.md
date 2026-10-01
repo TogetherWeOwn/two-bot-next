@@ -250,9 +250,9 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   stopped renewals, plus bounded panel/row passes and status parking. These Rust
   fixtures remain uncompiled. Production `serve` still passes no self-role
   service, and `CommandRuntime::from_env` still creates none; approved boot
-  composition must share one Arc across both paths. Terminal superseded audits
-  and their committed-target repair are not covered by processing discovery;
-  those and the unknown-work lifecycle remain activation blockers.
+  composition must share one Arc across both paths. Processing discovery still
+  refuses terminal rows; the separate terminal consumer below repairs only to
+  committed targets. The unknown-work lifecycle remains an activation blocker.
 
 ### Terminal repair storage checkpoint (not runtime activation)
 
@@ -296,10 +296,50 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   **uncompiled** while the mandated Cargo pool is unavailable. SQL-only smoke
   evidence does not substitute for Rust acceptance.
 
-The terminal **runtime** consumer, fair processing/terminal sweep composition,
-shared-executor repair orchestration and cancellation-owned renewal are not yet
-wired. Production dispatch/boot remains disabled. Repair must use the latest
-committed panel target, never the superseded audit's before/desired snapshots.
+### Terminal repair runtime checkpoint (not boot activation)
+
+- `recover_terminal` consumes a freshly claimed terminal hint without fabricating
+  a normal `PreparedSelfRole` or reopening processing admission. It refuses
+  nonexclusive/wrong-scope input, uninitialized intent and catalogue drift in
+  snapshots or any effect array before REST. The dedicated terminal evidence
+  owner renews while bounded-waiting for a new maintenance lane; both renewal
+  tasks belong to the awaited repair and abort when it is dropped.
+- The only repair target is the maintenance lane's **committed** option or
+  committed null/empty selection. Unknown targets and removed options fail
+  before REST; no target is seeded from the old before/desired intent. Original
+  before supplies only the net-evidence baseline. Authoritative shared REST
+  snapshots revalidate bot/hierarchy/permissions each step; unrelated roles are
+  preserved and singular removals precede additions.
+- `owns_superseded_repair` checks both live fences and the unchanged committed
+  maintenance target using one clock sampled after panel-to-audit lock waits.
+  The shared journaled executor owns pacing and checks the pair after pacing,
+  after journaling and after the exchange. Runtime checks bracket snapshot reads
+  and follow response-evidence waits. The store's completion receipt repeats
+  both fences after its own waits, following fresh convergence verification.
+- Send intent is durable before REST. Attempt/compensation history is cumulative;
+  received/no-send/unknown outcomes retain truthful evidence. A new unknown send
+  is monotonic for this owner, and inherited unknown sends and unresolved IDs
+  survive later repair responses and observations. Pending work cannot complete
+  a repair receipt. No terminal repair sends a successful old-event reply, changes
+  the rejection/immutable snapshots or publishes a target.
+- The existing supervised pass now interleaves processing and terminal queues:
+  at most **eight panels, sixteen discovery queries, sixty-four fetched hints,
+  four considered audits per panel and thirty-two considered audits** per tick.
+  Unused slots can serve either queue. Panel start advances before awaiting;
+  queue priority flips each full start-panel rotation, avoiding parity pinning
+  with even panel counts and cancellation before the second slot. Claimed expiry
+  yields unresolved terminal attempts to other work. Dry-run skips terminal
+  discovery/acquisition entirely and does not retire pending work as simulation.
+- Added isolated source fixtures cover restarted selected/missing/empty target
+  repair, remove-before-add/unrelated-role preservation, unknown/uninitialized
+  refusal, inherited pending, cancellation-owned renewals and mixed/dry-run
+  sweeps. Paired store fixtures cover normal/unknown lane refusal and expiry
+  after both panel and audit lock waits. These are **uncompiled source coverage**,
+  not passed Rust acceptance or independent review.
+
+Production dispatch/boot remains disabled. The conservative unknown-work
+lifecycle, approved shared boot composition and compiled exact-head acceptance
+still gate activation, review and merge.
 
 Interrupted remote work stays explicitly unresolved; its durable continuation/
 reconciliation lifecycle must be wired before activation, not silently cleared

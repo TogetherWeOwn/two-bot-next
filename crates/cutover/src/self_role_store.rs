@@ -575,6 +575,25 @@ impl SelfRoleStore {
         Ok(changed)
     }
 
+    /// Evaluate both repair fences against one post-lock clock. Separate checks
+    /// could accept a terminal owner that expired while waiting for the lane.
+    pub async fn owns_superseded_repair(
+        &self,
+        claim: &SupersededClaim,
+        panel: &PanelClaim,
+    ) -> Result<bool, StoreError> {
+        check_repair_scope(claim, panel)?;
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, panel).await?;
+        lock_event(&mut tx, &claim.event).await?;
+        let now = self.now(&mut tx).await?;
+        let owned = claim.intent_initialized()
+            && owns_terminal(&mut tx, claim, now).await?
+            && owns_repair_panel(&mut tx, panel, now).await?;
+        tx.commit().await?;
+        Ok(owned)
+    }
+
     /// Journal only with BOTH live fences after panel -> audit lock waits.
     /// The caller must check both again after journaling/pacing and after REST.
     pub async fn journal_superseded_repair(
