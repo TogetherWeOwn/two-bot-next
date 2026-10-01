@@ -25,6 +25,10 @@ pub const NAMES: [&str; 3] = ["counter", "rank", "scheduled_events"];
 #[path = "website_jobs_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "website_snapshot_tests.rs"]
+mod snapshot_tests;
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,
@@ -118,6 +122,7 @@ pub async fn serve(
                     .zip([Kind::Counter, Kind::Rank, Kind::Events])
                 {
                     let context = context.clone();
+                    let shutdown = shutdown.subscribe();
                     let cadence = cadence(kind);
                     registered.push(Job {
                         name,
@@ -130,15 +135,22 @@ pub async fn serve(
                         }),
                         action: Arc::new(move || {
                             let context = context.clone();
+                            let shutdown = shutdown.clone();
                             Box::pin(async move {
-                                run_once(
-                                    kind,
-                                    context.pool().await?,
-                                    &context.rest,
-                                    &context.guild,
-                                    &context.observation,
-                                )
-                                .await
+                                tokio::select! {
+                                    biased;
+                                    _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
+                                    result = async {
+                                        run_once(
+                                            kind,
+                                            context.pool().await?,
+                                            &context.rest,
+                                            &context.guild,
+                                            &context.observation,
+                                            &shutdown,
+                                        ).await
+                                    } => result,
+                                }
                             })
                         }),
                     });
@@ -287,12 +299,36 @@ fn raw_event(value: &Value) -> Result<RawScheduledEvent, ErrorClass> {
     })
 }
 
+/// Cancel queued/in-flight observations directly, without waiting for the job
+/// supervisor to abort us. Biased selection discards a simultaneously-ready REST
+/// result; publication fences also cover shutdown arriving during that poll.
+/// This cannot undo a database commit already submitted before shutdown.
 pub async fn run_once(
     kind: Kind,
     pool: &PgPool,
     rest: &ActionExecutor,
     guild: &str,
     observation: &Mutex<()>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<(), ErrorClass> {
+    tokio::select! {
+        biased;
+        _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
+        result = snapshot_once(kind, pool, rest, guild, observation, shutdown) => result,
+    }
+}
+
+fn publication_stopped(shutdown: &watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+async fn snapshot_once(
+    kind: Kind,
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    observation: &Mutex<()>,
+    shutdown: &watch::Receiver<bool>,
 ) -> Result<(), ErrorClass> {
     if matches!(kind, Kind::Events) {
         let response = get(
@@ -307,6 +343,9 @@ pub async fn run_once(
             .map(raw_event)
             .collect::<Result<Vec<_>, _>>()?;
         let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
+        if publication_stopped(shutdown) {
+            return Ok(());
+        }
         return replace_events(pool, guild, &now_iso(), &events)
             .await
             .map_err(|_| ErrorClass::Database);
@@ -315,6 +354,9 @@ pub async fn run_once(
     // observation through commit so a slow rank tick cannot overwrite a newer
     // counter roster. Events use independent tables and do not take this lock.
     let _observation = observation.lock().await;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     let Some(windows) = read_raid_windows(pool, guild)
         .await
         .map_err(|_| ErrorClass::Database)?
@@ -329,11 +371,20 @@ pub async fn run_once(
         );
         return Ok(());
     };
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     let members = roster(rest, guild).await?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     if matches!(kind, Kind::Counter) {
         let reading = build_counter_reading(&members, &windows).ok_or(ErrorClass::Rest)?;
         let count =
             i32::try_from(reading.human_member_count).map_err(|_| ErrorClass::Configuration)?;
+        if publication_stopped(shutdown) {
+            return Ok(());
+        }
         return write_counter(pool, guild, &now_iso(), count)
             .await
             .map_err(|_| ErrorClass::Database);
@@ -351,6 +402,9 @@ pub async fn run_once(
         .collect::<Result<Vec<_>, ErrorClass>>()?;
     let ladder = match_rank_roles(&roles).ok_or(ErrorClass::Configuration)?;
     let snapshot = build_community_snapshot(&members, &ladder, &windows).ok_or(ErrorClass::Rest)?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     write_rank_snapshot(pool, guild, &now_iso(), &snapshot)
         .await
         .map_err(|error| match error {
