@@ -43,6 +43,24 @@ impl TestDb {
         sqlx::query(database_sql("CREATE DATABASE", &name))
             .execute(&admin)
             .await?;
+        // Anything failing after CREATE DATABASE must not leak the database.
+        match Self::provision(&admin, options, &name, url).await {
+            Ok(db) => Ok(db),
+            Err(error) => {
+                let _ = sqlx::query(database_sql("DROP DATABASE", &name))
+                    .execute(&admin)
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn provision(
+        admin: &PgPool,
+        options: sqlx::postgres::PgConnectOptions,
+        name: &str,
+        url: String,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -54,9 +72,9 @@ impl TestDb {
         let manifest = scratch.join(format!("{name}_manifest.json"));
         std::fs::write(&file, EXPORT)?;
         Ok(Self {
-            admin,
+            admin: admin.clone(),
             pool,
-            name,
+            name: name.to_string(),
             url,
             file,
             manifest,
@@ -81,17 +99,33 @@ impl TestDb {
         command.output().unwrap()
     }
 
-    async fn cleanup(self) -> TestResult {
+    /// Best-effort teardown: every step runs, the first failure is reported.
+    async fn cleanup(&self) -> TestResult {
         self.pool.close().await;
-        sqlx::query(database_sql("DROP DATABASE", &self.name))
+        let dropped = sqlx::query(database_sql("DROP DATABASE", &self.name))
             .execute(&self.admin)
-            .await?;
+            .await
+            .map(|_| ());
         self.admin.close().await;
-        std::fs::remove_file(self.file)?;
-        if self.manifest.exists() {
-            std::fs::remove_file(self.manifest)?;
-        }
-        Ok(())
+        let _ = std::fs::remove_file(&self.file);
+        let _ = std::fs::remove_file(&self.manifest);
+        Ok(dropped?)
+    }
+}
+
+/// Runs a scenario on a spawned task so a panicking assertion still reaches
+/// teardown, then reports the scenario failure ahead of any cleanup failure.
+async fn with_db<F, Fut>(scenario: F) -> TestResult
+where
+    F: FnOnce(std::sync::Arc<TestDb>) -> Fut,
+    Fut: std::future::Future<Output = TestResult> + Send + 'static,
+{
+    let db = std::sync::Arc::new(TestDb::new().await?);
+    let joined = tokio::spawn(scenario(db.clone())).await;
+    let cleaned = db.cleanup().await;
+    match joined {
+        Ok(result) => result.and(cleaned),
+        Err(panic) => Err(format!("scenario panicked: {panic}").into()),
     }
 }
 
@@ -152,7 +186,7 @@ fn successful_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-async fn read_only_scenarios(db: &TestDb) -> TestResult {
+async fn read_only_scenarios(db: std::sync::Arc<TestDb>) -> TestResult {
     let empty = snapshot(&db.pool).await?;
     assert_eq!(empty["data"], json!({}));
     for (args, import) in [
@@ -212,16 +246,31 @@ async fn read_only_scenarios(db: &TestDb) -> TestResult {
         assert_eq!(manifest["accounting"]["duplicateRows"], 1);
         assert_eq!(manifest["accounting"]["uniqueMembersIn"], 4);
         assert_eq!(manifest["accounting"]["inserted"], 1);
-        assert_eq!(manifest["accounting"]["updated"], if allow_lower { 2 } else { 1 });
+        assert_eq!(
+            manifest["accounting"]["updated"],
+            if allow_lower { 2 } else { 1 }
+        );
         assert_eq!(manifest["accounting"]["unchanged"], 1);
-        assert_eq!(manifest["accounting"]["skippedMembers"], if allow_lower { 0 } else { 1 });
+        assert_eq!(
+            manifest["accounting"]["skippedMembers"],
+            if allow_lower { 0 } else { 1 }
+        );
         assert_eq!(manifest["rowsWritten"], if allow_lower { 3 } else { 2 });
-        assert_eq!(manifest["importedXpWritten"], if allow_lower { 800 } else { 550 });
-        assert_eq!(manifest["totalXpAfterProjected"], if allow_lower { 1060 } else { 1110 });
+        assert_eq!(
+            manifest["importedXpWritten"],
+            if allow_lower { 800 } else { 550 }
+        );
+        assert_eq!(
+            manifest["totalXpAfterProjected"],
+            if allow_lower { 1060 } else { 1110 }
+        );
         assert_eq!(manifest["reconciled"], true);
         assert_eq!(manifest["reconciliationErrors"], json!([]));
         assert_eq!(manifest["file"]["bytes"], EXPORT.len());
-        assert_eq!(manifest["file"]["sha256"], two_bot_cutover::mee6_xp::sha256_hex(EXPORT.as_bytes()));
+        assert_eq!(
+            manifest["file"]["sha256"],
+            two_bot_cutover::mee6_xp::sha256_hex(EXPORT.as_bytes())
+        );
         let saved: Value = serde_json::from_slice(&std::fs::read(&db.manifest)?)?;
         assert_eq!(saved, manifest);
         assert_eq!(snapshot(&db.pool).await?, before);
@@ -235,10 +284,7 @@ async fn inventory_and_dry_run_never_migrate_or_write() -> TestResult {
         eprintln!("skipped: TWO_TEST_DATABASE_URL opt-in required for agent-testdb");
         return Ok(());
     }
-    let db = TestDb::new().await?;
-    let result = read_only_scenarios(&db).await;
-    db.cleanup().await?;
-    result
+    with_db(read_only_scenarios).await
 }
 
 #[tokio::test]
@@ -247,7 +293,10 @@ async fn explicit_apply_still_bootstraps_and_imports() -> TestResult {
         eprintln!("skipped: TWO_TEST_DATABASE_URL opt-in required for agent-testdb");
         return Ok(());
     }
-    let db = TestDb::new().await?;
+    with_db(apply_scenario).await
+}
+
+async fn apply_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     let manifest = successful_json(&db.run(&["import", "--apply"], true));
     assert_eq!(manifest["mode"], "apply");
     assert_eq!(manifest["reconciled"], true);
@@ -265,5 +314,5 @@ async fn explicit_apply_still_bootstraps_and_imports() -> TestResult {
         .fetch_one(&db.pool)
         .await?;
     assert_eq!(runs, 1);
-    db.cleanup().await
+    Ok(())
 }
