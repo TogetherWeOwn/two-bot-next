@@ -35,6 +35,9 @@
 //!   ping `@everyone`), via client-level
 //!   `default_allowed_mentions(AllowedMentions { parse: vec![], .. })`.
 
+mod tickets;
+pub use tickets::{ChannelPresence, TicketChannelRequest, TicketMessage};
+
 use std::sync::Arc;
 use std::time::Duration;
 

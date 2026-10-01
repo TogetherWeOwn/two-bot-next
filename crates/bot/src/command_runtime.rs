@@ -50,8 +50,9 @@ use two_bot_core::{
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
-    FeatureGates, HandlerId, InteractionHandler, InteractionRouter, ModerationGates, RouterGates,
-    SlashOutcome, SurfaceFlags,
+    tickets::TicketAction,
+    ComponentHandler, ComponentOutcome, FeatureGates, HandlerId, InteractionHandler, InteractionRouter,
+    ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
     publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
@@ -106,6 +107,7 @@ pub struct CommandRuntime {
     router: InteractionRouter,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
+    tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
     /// `TWO_AUTOMATIONS=1`: fast-path gate for the message hook (the router
     /// still answers `/sticky*` refusals when it is off).
     automations: bool,
@@ -138,11 +140,12 @@ impl CommandRuntime {
                 return None;
             }
         };
+        let ticket_config = crate::ticket_runtime::TicketConfig::from_env(guild_id);
         let gates = RouterGates::from_slices(
             Some(guild_id),
             &features,
             &moderation,
-            SurfaceFlags::default(),
+            SurfaceFlags { tickets: ticket_config.is_some(), ..SurfaceFlags::default() },
         );
         let mut router = InteractionRouter::new(gates);
         router.register(Box::new(StickyHandler));
@@ -163,11 +166,19 @@ impl CommandRuntime {
                 return None;
             }
         };
+        let tickets = match ticket_config {
+            Some(config) => match crate::ticket_runtime::TicketRuntime::new(pool.clone(), executor.clone(), config) {
+                Ok(runtime) => Some(Arc::new(runtime)),
+                Err(_) => return None,
+            },
+            None => None,
+        };
         Some(Arc::new(Self {
             pool,
             executor,
             router,
             guild_id,
+            tickets,
             automations: features.automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
@@ -189,6 +200,7 @@ impl CommandRuntime {
             executor,
             router,
             guild_id,
+            tickets: None,
             automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
@@ -220,6 +232,17 @@ impl CommandRuntime {
                 }));
             }
             Event::Ready(ready) => {
+                if let Some(tickets) = &self.tickets {
+                    tickets.set_bot_id(ready.user.id.get());
+                    let tickets = Arc::clone(tickets);
+                    drop(tokio::spawn(async move {
+                        // Privacy work does not wait for a Discord recovery scan.
+                        let (purge, recovery) = tokio::join!(tickets.purge(), tickets.recover());
+                        if purge.is_err() || recovery.is_err() {
+                            warn!("ticket Ready work incomplete; durable state retained");
+                        }
+                    }));
+                }
                 let runtime = Arc::clone(self);
                 let application_id = ready.application.id.get();
                 drop(tokio::spawn(async move {
@@ -282,11 +305,18 @@ impl CommandRuntime {
     /// an unavailable reply. Only the five implemented names defer and run
     /// their slice. Router Ignore (unknown names/guild fence) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
-        let RoutedInteraction::Slash { name, outcome } =
-            route_interaction(&self.router, interaction, None)
-        else {
+        let routed = route_interaction(&self.router, interaction, None);
+        if let RoutedInteraction::Component {
+            custom_id,
+            outcome: ComponentOutcome::Handled { handler: ComponentHandler::Tickets },
+            ..
+        } = &routed {
+            if let (Some(tickets), Some(action)) = (&self.tickets, TicketAction::from_custom_id(custom_id)) {
+                self.on_ticket_interaction(tickets, interaction, action).await;
+            }
             return;
-        };
+        }
+        let RoutedInteraction::Slash { name, outcome } = routed else { return; };
         if let Some(response) = response_for_slash(&outcome) {
             self.answer(interaction, response).await;
             return;
@@ -332,6 +362,36 @@ impl CommandRuntime {
             "feed-remove" => self.feed_remove(interaction).await,
             "feed-list" => self.feed_list(interaction).await,
             _ => {}
+        }
+    }
+
+    async fn on_ticket_interaction(
+        &self,
+        tickets: &crate::ticket_runtime::TicketRuntime,
+        interaction: &Interaction,
+        action: TicketAction,
+    ) {
+        if let Err(error) = tickets.authorize(interaction, action) {
+            self.answer(interaction, ephemeral(error.to_string())).await;
+            return;
+        }
+        if self.executor.answer_interaction(interaction.id.get(), &interaction.token,
+            &InteractionResponse {
+                kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                data: Some(InteractionResponseData { flags: Some(MessageFlags::EPHEMERAL), ..Default::default() }),
+            }).await.is_err() {
+            warn!("ticket defer failed; no state mutated");
+            return;
+        }
+        let reply = match tickets.execute(interaction, action).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                warn!(error_class = ?error.class(), "ticket action incomplete");
+                error.reply()
+            }
+        };
+        if self.executor.edit_interaction_response(interaction.application_id.get(), &interaction.token, &reply).await.is_err() {
+            warn!("ticket response edit failed; durable state retained");
         }
     }
 
