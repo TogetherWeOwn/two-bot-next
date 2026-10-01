@@ -124,7 +124,7 @@ async fn cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dum
         "actual-cli-dump-publication-{}",
         std::process::id()
     ));
-    std::fs::create_dir(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
     let backups = dir.join("backups");
     std::fs::create_dir(&backups).unwrap();
     let marker = dir.join("upload-invoked");
