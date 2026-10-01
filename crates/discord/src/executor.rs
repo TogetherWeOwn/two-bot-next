@@ -36,6 +36,9 @@
 //!   ping `@everyone`), via client-level
 //!   `default_allowed_mentions(AllowedMentions { parse: vec![], .. })`.
 
+mod tickets;
+pub use tickets::{ChannelPresence, TicketChannelRequest, TicketMessage};
+
 use crate::ratelimit_guard::{process_guard, GuardError, RateLimitGuard};
 use std::sync::Arc;
 use std::time::Duration;
@@ -665,7 +668,26 @@ impl ActionExecutor {
         request: Request,
         accepted: &[u16],
     ) -> Result<RawResponse, DiscordError> {
-        let (res, _) = self.send_with_timeout(&request, None).await?;
+        self.call_once_raw_lane(request, accepted, None).await
+    }
+
+    /// [`Self::call_once_raw`] through the paced non-kick lane: admission,
+    /// pacing and the guard run inside the one bounded attempt.
+    pub(crate) async fn call_once_raw_paced(
+        &self,
+        request: Request,
+        accepted: &[u16],
+    ) -> Result<RawResponse, DiscordError> {
+        self.call_once_raw_lane(request, accepted, Some(false)).await
+    }
+
+    async fn call_once_raw_lane(
+        &self,
+        request: Request,
+        accepted: &[u16],
+        lane: Option<bool>,
+    ) -> Result<RawResponse, DiscordError> {
+        let (res, _) = self.send_with_timeout(&request, lane).await?;
         if accepted.contains(&res.status) {
             return Ok(res);
         }
@@ -1540,6 +1562,25 @@ impl ActionExecutor {
                 Ok(ChannelCallOutcome::MessageDeleted)
             }
         }
+    }
+
+    /// Resolve the authenticated bot USER, not its application, after RESUMED.
+    /// One bounded, paced read; malformed/non-bot evidence never initializes
+    /// author checks or permission targets with a guessed identity.
+    pub async fn current_bot_user_id(&self) -> Result<u64, DiscordError> {
+        let req = Self::request_of(self.inner.factory.current_user())?;
+        self.pace(false).await;
+        let res = self.call_once_raw(req, &[200]).await?;
+        let body: serde_json::Value = serde_json::from_slice(&res.body)
+            .map_err(|_| DiscordError::Unavailable("invalid bot user response".into()))?;
+        let id = body["id"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok().map(|id| (value, id)))
+            .filter(|(value, id)| *id != 0 && id.to_string() == *value)
+            .map(|(_, id)| id)
+            .filter(|_| body["bot"].as_bool() == Some(true))
+            .ok_or_else(|| DiscordError::Unavailable("invalid bot user identity".into()))?;
+        Ok(id)
     }
 
     /// Resolve the authenticated bot's application for a resumed startup

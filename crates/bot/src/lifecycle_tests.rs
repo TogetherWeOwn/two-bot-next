@@ -136,7 +136,7 @@ impl Drop for Dropped {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn http_shutdown_aborts_and_joins_gateway_before_returning() {
     let dropped = Arc::new(AtomicBool::new(false));
     let guard = Dropped(dropped.clone());
@@ -154,6 +154,34 @@ async fn http_shutdown_aborts_and_joins_gateway_before_returning() {
         .unwrap();
     assert!(abort.is_finished(), "gateway abort must be joined");
     assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn http_shutdown_signals_gateway_and_joins_graceful_cleanup() {
+    let (shutdown, receiver) = watch::channel(false);
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cleaned);
+    let task = tokio::spawn(async move {
+        server::shutdown_requested(receiver).await;
+        flag.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    supervise_gateway(task, async { Ok(()) }, shutdown)
+        .await
+        .unwrap();
+    assert!(cleaned.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn requested_gateway_stop_is_not_reported_as_a_restart_failure() {
+    let (shutdown, _) = watch::channel(true);
+    let task = tokio::spawn(async { Ok(()) });
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    supervise_gateway(task, async { Ok(()) }, shutdown)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
