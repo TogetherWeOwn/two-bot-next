@@ -54,8 +54,13 @@
   or target authority. Pending tickets gate settlement and cannot be erased by
   aggregate checkpoint clearing. Read ticket evidence only after audit lock waits
   and preserve unresolved role/direction IDs from pending tickets. Add processing/
-  terminal provenance, lock-wait and role-matrix source fixtures; runtime ticket
-  wiring/current-owner incorporation are deferred.
+  terminal provenance, lock-wait and role-matrix source fixtures. Wire tickets
+  into normal processing and typed terminal paced runtime steps, persisting raw
+  response/no-send receipts before stale aggregate writes; retain timeout and
+  cancellation uncertainty without retry. Extend runtime/executor source fixtures
+  for status provenance, generation transfer, post-journal no-send and pending
+  tickets. Fenced current-owner incorporation and migration of the legacy lane-only
+  stale-maintenance journal remain deferred.
   Production boot remains disabled until approved shared boot configuration,
   unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,

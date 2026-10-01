@@ -139,6 +139,40 @@ fn surface_plans_preserve_option_explicit_remove_and_unrelated_roles() {
 }
 
 #[test]
+fn step_receipts_use_sender_facts_not_result_or_ownership() {
+    for error in [SelfRoleRestError::InvalidId, SelfRoleRestError::StaleClaim] {
+        assert_eq!(step_receipt(&Err(error)), Some(ExchangeReceipt::NoSend));
+    }
+    for owned_after in [false, true] {
+        for (status, result) in [
+            (204, Ok(())),
+            (403, Err(SelfRoleRestError::Rejected(403))),
+            (429, Err(SelfRoleRestError::RateLimited)),
+            (500, Err(SelfRoleRestError::Ambiguous)),
+        ] {
+            assert_eq!(
+                step_receipt(&Ok(RoleExchange {
+                    result,
+                    owned_after,
+                    response_received: true,
+                    response_status: Some(status),
+                })),
+                Some(ExchangeReceipt::Response { status })
+            );
+        }
+        assert_eq!(
+            step_receipt(&Ok(RoleExchange {
+                result: Err(SelfRoleRestError::Ambiguous),
+                owned_after,
+                response_received: false,
+                response_status: None,
+            })),
+            None
+        );
+    }
+}
+
+#[test]
 fn definite_attempt_evidence_preserves_only_prior_same_direction_uncertainty() {
     for add in [false, true] {
         for pending in [false, true] {
@@ -260,6 +294,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     terminal_restart_preserves_inherited_pending(pool).await?;
     terminal_restart_cancellation_preserves_journal(pool).await?;
     terminal_partial_repair_exchange_outcomes(pool).await?;
+    processing_receipts_survive_generation_transfer(pool).await?;
     terminal_late_response_after_independent_transfer(pool).await?;
     terminal_pacing_loss_is_definite_no_send(pool).await?;
     terminal_post_journal_wait_is_definite_no_send(pool).await?;
@@ -891,6 +926,12 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
     assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]);
     assert_eq!(effects.unresolved_removed_role_ids, [OLD_ROLE]);
     assert!(effects.compensated_removed_role_ids.is_empty());
+    let receipts = role_receipts(pool, &audit.event_id).await?;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].1, OLD_ROLE);
+    assert!(!receipts[0].2 && receipts[0].3);
+    assert_eq!(receipts[0].4, "pending");
+    assert_eq!(receipts[0].5, None);
     assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
     let expiry: (i64, i64) = sqlx::query_as(
         "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
@@ -932,6 +973,7 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
         feature.terminal_candidates(&panel, 1).await.unwrap().len(),
         1
     );
+    assert_eq!(role_receipts(pool, &audit.event_id).await?, receipts);
     mock.shutdown().await;
     Ok(())
 }
@@ -1002,6 +1044,30 @@ async fn terminal_partial_repair_exchange_outcomes(pool: &PgPool) -> TestResult 
             matches!(outcome, "server-error" | "timeout")
         );
         assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
+        let receipts = role_receipts(pool, &audit.event_id).await?;
+        let status = match outcome {
+            "forbidden" => Some(403),
+            "rate-limited" => Some(429),
+            "server-error" => Some(500),
+            "timeout" => None,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|r| (r.1.as_str(), r.2, r.3, r.4.as_str(), r.5))
+                .collect::<Vec<_>>(),
+            [
+                (OLD_ROLE, false, true, "response", Some(204)),
+                (
+                    NEW_ROLE,
+                    true,
+                    true,
+                    if pending { "pending" } else { "response" },
+                    status
+                ),
+            ]
+        );
         let calls = mock.requests();
         let mutations: Vec<_> = calls.iter().filter(|r| r.method != "GET").collect();
         assert_eq!(calls.len(), 10);
@@ -1027,6 +1093,7 @@ async fn terminal_partial_repair_exchange_outcomes(pool: &PgPool) -> TestResult 
             assert!(repaired.unwrap());
         }
         let after = terminal_evidence(pool, &audit, pending, !pending).await?;
+        assert_eq!(role_receipts(pool, &audit.event_id).await?, receipts);
         assert_eq!(after.compensated_removed_role_ids, [OLD_ROLE]);
         // A snapshot observes the attempted addition; it does not fabricate an
         // acknowledged compensation response to the prior failed/unknown PUT.
@@ -1097,13 +1164,137 @@ async fn terminal_fixture_owners(
     Ok((owner, lane))
 }
 
+async fn exchange_owner_state(pool: &PgPool, event: &str) -> TestResult<(String, Option<String>)> {
+    Ok(sqlx::query_as(
+        "SELECT (to_jsonb(a)-'claim_token')::text,(to_jsonb(p)-'claim_token')::text
+         FROM self_role_audit a LEFT JOIN self_role_panel_claims p
+         USING(guild_id,member_id,panel_id) WHERE a.event_id=$1",
+    )
+    .bind(event)
+    .fetch_one(pool)
+    .await?)
+}
+
+type RoleReceipt = (i32, String, bool, bool, String, Option<i16>);
+
+async fn role_receipts(pool: &PgPool, event: &str) -> TestResult<Vec<RoleReceipt>> {
+    Ok(sqlx::query_as(
+        "SELECT origin_generation,role_id,adding,compensating,disposition,response_status
+         FROM self_role_exchanges WHERE event_id=$1 ORDER BY created_at,exchange_id",
+    )
+    .bind(event)
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestResult {
+    for exclusive in [false, true] {
+        for status in [204, 403, 429, 500] {
+            let clock = Arc::new(AtomicI64::new(NOW));
+            let mut panel = panel(PanelMode::Select);
+            panel.id = format!("processing-receipt-{exclusive}-{status}");
+            panel.exclusive = exclusive;
+            let mut script = snapshot(&[OLD_ROLE, OTHER]);
+            script.push(ScriptedResponse::status(status).delayed(Duration::from_secs(3)));
+            let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+            let feature = runtime(pool, &clock, &mock);
+            let request = request(
+                &panel.id,
+                Selection::Select {
+                    option_keys: vec!["new".into()],
+                },
+            );
+            let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+            prepared._event_keeper.0.abort();
+            prepared._panel_keeper.take();
+            let original = prepared.event.clone();
+            let audit = prepared.audit.clone();
+            let panel_claim = prepared.panel.clone();
+            let mut step = Box::pin(feature.execute_step(&mut prepared, OLD_ROLE, false, None));
+            tokio::select! {
+                result = step.as_mut() => panic!("step completed before transfer: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(2), async {
+                    while !mock.requests().iter().any(|r| r.method == "DELETE") {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }) => result?,
+            }
+            clock.store(NOW + 100, Ordering::SeqCst);
+            if let Some(panel) = &panel_claim {
+                assert!(feature.store.renew_panel_claim(panel).await?);
+            }
+            clock.store(NOW + 300, Ordering::SeqCst);
+            let replacement = feature.store.claim_audit(&audit).await?.unwrap();
+            assert_eq!(replacement.generation, original.generation + 1);
+            assert!(replacement.exchange_pending);
+            let owner_state = exchange_owner_state(pool, &request.event_id).await?;
+            assert!(matches!(step.await, Err(RuntimeError::Stale)));
+            // The late response updates ONLY its receipt, not the replacement's
+            // immutable intent, effect checkpoint, phase, claims or target.
+            assert_eq!(
+                exchange_owner_state(pool, &request.event_id).await?,
+                owner_state
+            );
+            assert_eq!(
+                role_receipts(pool, &request.event_id).await?,
+                [(
+                    original.generation,
+                    OLD_ROLE.into(),
+                    false,
+                    false,
+                    "response".into(),
+                    Some(status as i16)
+                )]
+            );
+            assert!(
+                !feature
+                    .store
+                    .checkpoint_exchange(&original, &prepared.audit.effects, false, Some(false),)
+                    .await?
+            );
+            assert!(
+                feature
+                    .store
+                    .checkpoint_exchange(
+                        &replacement,
+                        &replacement.effects,
+                        replacement.compensating,
+                        Some(replacement.exchange_pending),
+                    )
+                    .await?
+            );
+            let pending: bool = sqlx::query_scalar(
+                "SELECT exchange_pending FROM self_role_audit WHERE event_id=$1",
+            )
+            .bind(&request.event_id)
+            .fetch_one(pool)
+            .await?;
+            assert!(pending); // a completed receipt does not incorporate itself
+            assert_eq!(
+                mock.requests().iter().filter(|r| r.method != "GET").count(),
+                1
+            );
+            feature.park(&mut prepared).await;
+            drop(prepared);
+            mock.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
 async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> TestResult {
-    for evidence_transfer in [true, false] {
+    for (status, evidence_transfer) in [
+        (204, true),
+        (204, false),
+        (403, true),
+        (429, true),
+        (500, true),
+    ] {
         let clock = Arc::new(AtomicI64::new(NOW));
         let mut panel = panel(PanelMode::Select);
-        panel.id = format!("terminal-late-transfer-{evidence_transfer}");
+        panel.id = format!("terminal-late-transfer-{status}-{evidence_transfer}");
         let mut script = snapshot(&[OLD_ROLE, OTHER]);
-        script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(3)));
+        script.push(ScriptedResponse::status(status).delayed(Duration::from_secs(3)));
         let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
         let feature = runtime(pool, &clock, &mock);
         let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
@@ -1159,8 +1350,33 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
             );
             assert!(feature.store.owns_superseded_claim(&evidence_claim).await?);
         }
+        let owner_state = exchange_owner_state(pool, &audit.event_id).await?;
         assert!(matches!(step.await, Err(RuntimeError::Stale)));
-        assert_eq!(owner.effects.compensated_removed_role_ids, [OLD_ROLE]);
+        if evidence_transfer {
+            assert_eq!(
+                exchange_owner_state(pool, &audit.event_id).await?,
+                owner_state
+            );
+        }
+        assert_eq!(
+            owner.effects.compensated_removed_role_ids,
+            if status == 204 {
+                vec![OLD_ROLE.to_owned()]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(
+            role_receipts(pool, &audit.event_id).await?,
+            [(
+                evidence_claim.generation(),
+                OLD_ROLE.into(),
+                false,
+                true,
+                "response".into(),
+                Some(status as i16)
+            )]
+        );
         let effects = terminal_evidence(pool, &audit, evidence_transfer, false).await?;
         assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]);
         if let Some(replacement) = replacement_evidence {
@@ -1168,8 +1384,9 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
             assert!(replacement.exchange_pending());
             assert!(effects.compensated_removed_role_ids.is_empty());
             assert_eq!(effects.unresolved_removed_role_ids, [OLD_ROLE]);
-            // The former response is not authority after token transfer. Even a
-            // fresh owner's evidence-only write cannot erase inherited unknown work.
+            // The former response is receipt-only after transfer. The new owner
+            // retains its saved aggregate pending/evidence until fenced receipt
+            // incorporation, not an optimistic snapshot or timer.
             assert!(
                 !feature
                     .store
@@ -1179,7 +1396,11 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
             assert!(
                 feature
                     .store
-                    .record_superseded_repair(&replacement, &AuditEffects::default(), false)
+                    .record_superseded_repair(
+                        &replacement,
+                        &replacement.audit().effects,
+                        replacement.exchange_pending(),
+                    )
                     .await?
             );
             let effects = terminal_evidence(pool, &audit, true, false).await?;
@@ -1260,6 +1481,7 @@ async fn terminal_pacing_loss_is_definite_no_send(pool: &PgPool) -> TestResult {
         let effects = terminal_evidence(pool, &audit, inherited_pending, false).await?;
         assert_eq!(effects.attempted_added_role_ids, [OLD_ROLE]);
         assert!(effects.attempted_removed_role_ids.is_empty()); // no journal, no send intent
+        assert!(role_receipts(pool, &audit.event_id).await?.is_empty());
         assert!(effects.compensated_removed_role_ids.is_empty());
         assert!(effects.unresolved_removed_role_ids.is_empty());
         assert_eq!(
@@ -1343,6 +1565,17 @@ async fn terminal_post_journal_wait_is_definite_no_send(pool: &PgPool) -> TestRe
         assert!(matches!(result, Err(RuntimeError::Stale)));
         let effects = terminal_evidence(pool, &audit, inherited_pending, false).await?;
         assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]); // journal committed, send refused
+        assert_eq!(
+            role_receipts(pool, &audit.event_id).await?,
+            [(
+                owner.claim.generation(),
+                OLD_ROLE.into(),
+                false,
+                true,
+                "no_send".into(),
+                None
+            )]
+        );
         assert_eq!(effects.attempted_added_role_ids, [OLD_ROLE]);
         assert!(effects.compensated_removed_role_ids.is_empty());
         assert!(effects.unresolved_removed_role_ids.is_empty()); // only the definite no-send is resolved

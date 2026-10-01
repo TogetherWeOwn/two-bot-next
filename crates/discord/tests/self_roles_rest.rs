@@ -236,6 +236,7 @@ async fn singular_add_and_remove_never_replace_unrelated_member_roles() {
             .unwrap();
         assert_eq!(exchange.result, Ok(()));
         assert!(exchange.owned_after);
+        assert_eq!(exchange.response_status, Some(204));
     }
     let calls = mock.requests();
     assert_eq!(calls.len(), 2);
@@ -271,6 +272,7 @@ async fn rejected_rate_limited_and_uncertain_exchanges_do_not_retry_or_leak_bodi
         assert_eq!(exchange.result, Err(error));
         assert!(exchange.owned_after);
         assert!(exchange.response_received);
+        assert_eq!(exchange.response_status, Some(status));
         assert!(!format!("{exchange:?}").contains("provider-secret"));
         assert_eq!(mock.requests().len(), 1);
         mock.shutdown().await;
@@ -310,6 +312,7 @@ async fn received_status_survives_truncated_or_stalled_body_and_lost_ownership()
                     assert_eq!(exchange.result, Err(error));
                     assert_eq!(exchange.owned_after, owned_after);
                     assert!(exchange.response_received);
+                    assert_eq!(exchange.response_status, Some(code));
                     assert_eq!(checks.load(Ordering::SeqCst), 3);
                     assert!(!format!("{exchange:?}").contains("provider-secret"));
                     let calls = mock.requests();
@@ -356,6 +359,7 @@ async fn lost_post_call_ownership_retains_accepted_effect() {
     assert_eq!(exchange.result, Ok(()));
     assert!(!exchange.owned_after);
     assert!(exchange.response_received);
+    assert_eq!(exchange.response_status, Some(204));
     assert_eq!(checks.load(Ordering::SeqCst), 3);
     assert_eq!(mock.requests().len(), 1);
     mock.shutdown().await;
@@ -375,6 +379,7 @@ async fn timeout_cannot_claim_remote_completion_or_retry() {
     assert_eq!(exchange.result, Err(SelfRoleRestError::Ambiguous));
     assert!(exchange.owned_after);
     assert!(!exchange.response_received);
+    assert_eq!(exchange.response_status, None);
     assert_eq!(mock.requests().len(), 1);
     mock.shutdown().await;
 }

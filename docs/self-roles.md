@@ -217,14 +217,28 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   pending tickets rather than trusting a replacement effect snapshot. Lock-wait
   source fixtures cover processing/terminal checkpoints and post-wait journal
   expiry. Legacy pending work is never assigned synthetic
-  provenance. Receipt completion alone does not clear aggregate uncertainty or
-  establish convergence: current-owner incorporation and runtime ticket wiring
+  provenance. Normal processing and typed terminal runtime steps now create
+  tickets in the shared paced journal callback and persist definitive receipts
+  before any aggregate write can fail after generation transfer. The shared
+  executor carries raw final status independently of result mapping/ownership;
+  outer pre-send errors become no-send receipts only when a ticket was committed.
+  Inner timeout/transport ambiguity leaves the ticket pending. Receipt-write
+  failure stops the step without a retry or invented completion. The legacy
+  lane-only stale-maintenance path still uses aggregate journaling: migrating it
+  requires a fresh typed evidence owner, not a fabricated live event fence.
+  Receipt completion alone does not clear aggregate uncertainty or establish
+  convergence: fenced current-owner incorporation and that stale-path migration
   remain follow-up work. Boot stays disabled. Isolated source fixtures cover
   processing/terminal generation transfer, same-direction ticket separation,
   no-send and 204/403/429/500 receipts, exact/contradictory replay, invalid status,
   uninitialized/stale journaling, snapshot-free owner-state preservation and
   pending settlement refusal. The explicit role matrix includes the new relation;
-  its source fixture exercises runtime CRUD and web-reader denial.
+  its source fixture exercises runtime CRUD and web-reader denial. Runtime source
+  regressions assert late 204/403/429/500 receipt persistence after processing or
+  terminal generation transfer without replacement audit/target writes, raw status
+  retention despite truncated/stalled bodies, definitive post-journal no-send,
+  no ticket before journaling, and pending receipts across timeout/cancellation.
+  These Rust fixtures remain uncompiled while the required bounded pool is absent.
 - Added regressions exercise late in-flight 204 after a newer worker commits,
   repair to both selected and empty targets, unknown-target refusal, interrupted
   exchange recovery, settlement of success/compensation, event-expiry rollback

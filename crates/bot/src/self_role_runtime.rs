@@ -19,11 +19,12 @@ use two_bot_core::self_roles::{
     RoleOperation, SelfRolePanel, SelfRolePlan, SettledOutcome,
 };
 use two_bot_cutover::self_role_store::{
-    AuditEffects, EventClaim, PanelClaim, PanelClaimResult, PanelKey, RecoverableAudit,
-    SelfRoleAudit, SelfRoleStore, StoreError, SupersededClaim,
+    AuditEffects, EventClaim, ExchangeIntent, ExchangeReceipt, ExchangeTicket, PanelClaim,
+    PanelClaimResult, PanelKey, RecoverableAudit, SelfRoleAudit, SelfRoleStore, StoreError,
+    SupersededClaim,
 };
 use two_bot_discord::{
-    executor::self_roles::{SelfRoleRestError, SelfRoleSnapshot},
+    executor::self_roles::{RoleExchange, SelfRoleRestError, SelfRoleSnapshot},
     ActionExecutor,
 };
 
@@ -445,6 +446,22 @@ impl SelfRoleRuntime {
         .await
     }
 
+    /// A receipt is a sender fact, not current ownership. Persist it before any
+    /// aggregate checkpoint can fail after generation transfer. Cancellation or
+    /// receipt-write failure leaves the durable ticket unresolved, never no-send.
+    async fn complete_step_receipt(
+        &self,
+        ticket: &ExchangeTicket,
+        exchange: &Result<RoleExchange, SelfRoleRestError>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(receipt) = step_receipt(exchange) {
+            if !store_io(self.store.complete_role_exchange(ticket, receipt)).await? {
+                return Err(RuntimeError::Store);
+            }
+        }
+        Ok(())
+    }
+
     async fn execute_step(
         &self,
         prepared: &mut PreparedSelfRole,
@@ -458,6 +475,7 @@ impl SelfRoleRuntime {
         let mut attempted = prior_effects.clone();
         mark_attempt(&mut attempted, role, add);
         let journaled = AtomicBool::new(false);
+        let ticket = tokio::sync::OnceCell::new();
         // Journal AFTER pacing; fence again after the database wait. A crash
         // after journal cannot be distinguished from an unknown in-flight send.
         let exchange = self
@@ -473,18 +491,43 @@ impl SelfRoleRuntime {
                         .map_err(|_| SelfRoleRestError::StaleClaim)
                 },
                 || async {
-                    if !self
-                        .record_evidence(&prepared.event, &attempted, compensating, true)
+                    if repair.is_some() {
+                        // Legacy stale maintenance keeps its separate lane-only
+                        // authority until it migrates to a fresh typed evidence
+                        // owner. Never fabricate a live event for that path.
+                        if !self
+                            .record_evidence(&prepared.event, &attempted, compensating, true)
+                            .await
+                            .map_err(|_| SelfRoleRestError::StaleClaim)?
+                        {
+                            return Err(SelfRoleRestError::StaleClaim);
+                        }
+                    } else {
+                        let intent = ExchangeIntent {
+                            role_id: role.into(),
+                            adding: add,
+                            compensating,
+                        };
+                        let receipt = store_io(self.store.journal_role_exchange(
+                            &prepared.event,
+                            prepared.panel.as_ref(),
+                            &intent,
+                        ))
                         .await
                         .map_err(|_| SelfRoleRestError::StaleClaim)?
-                    {
-                        return Err(SelfRoleRestError::StaleClaim);
+                        .ok_or(SelfRoleRestError::StaleClaim)?;
+                        ticket
+                            .set(receipt)
+                            .map_err(|_| SelfRoleRestError::StaleClaim)?;
                     }
                     journaled.store(true, Ordering::SeqCst);
                     Ok(())
                 },
             )
             .await;
+        if let Some(ticket) = ticket.get() {
+            self.complete_step_receipt(ticket, &exchange).await?;
+        }
         let exchange = match exchange {
             Ok(exchange) => exchange,
             Err(error) => {
@@ -1022,7 +1065,7 @@ impl SelfRoleRuntime {
         let prior_effects = owner.effects.clone();
         let mut attempted = prior_effects.clone();
         mark_attempt(&mut attempted, role, add);
-        let journaled = AtomicBool::new(false);
+        let ticket = tokio::sync::OnceCell::new();
         let exchange = self
             .executor
             .self_role_step_journaled(
@@ -1037,25 +1080,33 @@ impl SelfRoleRuntime {
                         .map_err(|_| SelfRoleRestError::StaleClaim)
                 },
                 || async {
-                    if !store_io(self.store.journal_superseded_repair(
+                    let intent = ExchangeIntent {
+                        role_id: role.into(),
+                        adding: add,
+                        compensating: true,
+                    };
+                    let receipt = store_io(self.store.journal_terminal_role_exchange(
                         &owner.claim,
                         &lane.claim,
-                        &attempted,
+                        &intent,
                     ))
                     .await
                     .map_err(|_| SelfRoleRestError::StaleClaim)?
-                    {
-                        return Err(SelfRoleRestError::StaleClaim);
-                    }
-                    journaled.store(true, Ordering::SeqCst);
+                    .ok_or(SelfRoleRestError::StaleClaim)?;
+                    ticket
+                        .set(receipt)
+                        .map_err(|_| SelfRoleRestError::StaleClaim)?;
                     Ok(())
                 },
             )
             .await;
+        if let Some(ticket) = ticket.get() {
+            self.complete_step_receipt(ticket, &exchange).await?;
+        }
         let exchange = match exchange {
             Ok(exchange) => exchange,
             Err(error) => {
-                if journaled.load(Ordering::SeqCst) {
+                if ticket.initialized() {
                     // Shared Err means definite no-send. It resolves only this
                     // repair attempt, never inherited/earlier unknown work.
                     resolve_attempt(&mut attempted, &prior_effects, prior_pending, role, add);
@@ -1526,6 +1577,18 @@ fn recovery_selection(
         },
         PanelMode::Select => unreachable!(),
     })
+}
+
+/// The outer shared-executor error is definite pre-send; an inner ambiguous
+/// result may still carry received headers. Never infer completion from result,
+/// elapsed time, a snapshot or a missing post-call ownership fence.
+fn step_receipt(exchange: &Result<RoleExchange, SelfRoleRestError>) -> Option<ExchangeReceipt> {
+    match exchange {
+        Err(_) => Some(ExchangeReceipt::NoSend),
+        Ok(exchange) => exchange
+            .response_status
+            .map(|status| ExchangeReceipt::Response { status }),
+    }
 }
 
 fn push_role(ids: &mut Vec<String>, role: &str) {

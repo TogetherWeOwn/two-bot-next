@@ -41,6 +41,9 @@ pub struct RoleExchange {
     /// False on timeout/transport loss: remote work may still finish later.
     /// A subsequent member snapshot cannot establish exchange completion.
     pub response_received: bool,
+    /// Final received status, independent of result mapping or post-call ownership.
+    /// None means transport/timeout uncertainty, never definite no-send.
+    pub response_status: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -353,24 +356,25 @@ impl ActionExecutor {
             return Err(SelfRoleRestError::StaleClaim);
         }
         *lane = std::time::Instant::now();
-        let (result, response_received) = match tokio::time::timeout(
+        let (result, response_status) = match tokio::time::timeout(
             Duration::from_millis(MODERATION_TIMEOUT_MS),
             self.send_status(&request),
         )
         .await
         {
-            Ok(Ok(204)) => (Ok(()), true),
+            Ok(Ok(204)) => (Ok(()), Some(204)),
             Ok(Ok(code)) => (
                 status_code(code).and(Err(SelfRoleRestError::Ambiguous)),
-                true,
+                Some(code),
             ),
-            _ => (Err(SelfRoleRestError::Ambiguous), false),
+            _ => (Err(SelfRoleRestError::Ambiguous), None),
         };
         let owned_after = owns().await.unwrap_or(false);
         Ok(RoleExchange {
             result,
             owned_after,
-            response_received,
+            response_received: response_status.is_some(),
+            response_status,
         })
     }
 }
