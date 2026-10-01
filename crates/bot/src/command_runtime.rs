@@ -238,6 +238,12 @@ impl CommandRuntime {
         runtime
     }
 
+    /// Isolate ticket gateway acceptance from unrelated command publication.
+    #[cfg(test)]
+    pub(crate) async fn suppress_registry_for_test(&self) {
+        *self.registry_synced.lock().await = true;
+    }
+
     pub(crate) fn start_tickets(&self) -> Option<crate::ticket_runtime::TicketSupervisor> {
         self.tickets.as_ref().and_then(|tickets| tickets.start())
     }
@@ -288,12 +294,35 @@ impl CommandRuntime {
                 }));
             }
             Event::Resumed => {
+                if let Some(tickets) = &self.tickets {
+                    let runtime = Arc::clone(self);
+                    // Saved sessions emit RESUMED without READY. Resolve the
+                    // authenticated USER through the shared executor before
+                    // waking maintenance; application ids are not author ids.
+                    // Keep the lookup in the ticket shutdown scope, independent
+                    // of registry publication and its success/dedup gate.
+                    tickets.spawn(async move {
+                        runtime.ready_tickets_after_resume().await;
+                    });
+                }
                 let runtime = Arc::clone(self);
                 drop(tokio::spawn(async move {
                     runtime.publish_registry(None).await;
                 }));
             }
             _ => {}
+        }
+    }
+
+    async fn ready_tickets_after_resume(&self) {
+        let Some(tickets) = &self.tickets else {
+            return;
+        };
+        match self.executor.current_bot_user_id().await {
+            Ok(bot_id) => tickets.on_ready(bot_id),
+            Err(_) => {
+                warn!("bot user lookup failed; ticket readiness skipped");
+            }
         }
     }
 
@@ -1102,3 +1131,7 @@ pub(crate) fn sticky_options(interaction: &Interaction) -> (Option<String>, Opti
     }
     (body, debounce)
 }
+
+#[cfg(test)]
+#[path = "command_runtime_resumed_tests.rs"]
+mod resumed_tests;

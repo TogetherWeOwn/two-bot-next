@@ -581,7 +581,8 @@ fn own_panel() -> Value {
 #[ignore = "requires agent-testdb or CI service container"]
 async fn ready_recovers_controls_and_panel_without_duplicates_and_purges_expired_bodies() {
     let db = TestDb::new().await;
-    let panel_channel = json!({"id":"700","guild_id":"100","type":0});
+    let mut panel_channel = channel();
+    panel_channel["id"] = json!("700");
     let mock = MockRest::start(
         vec![
             ScriptedResponse::json(200, channel()),
@@ -733,6 +734,270 @@ async fn saved_close_access_failure_stays_durable_after_inclusive_purge_and_neve
         TicketStatus::Closed
     );
     assert!(mock.requests().iter().all(|r| r.method != "PUT"));
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn missing_open_channel_requires_typed_absence_and_releases_the_reservation() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(403, json!({"code":50013})),
+            ScriptedResponse::status(500),
+            ScriptedResponse::json(404, json!({"message":"Unknown Channel 10003"})),
+            ScriptedResponse::json(404, json!({"code":"10003"})),
+            ScriptedResponse::json(404, json!({"code":10003})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(db.pool.clone(), &mock);
+    let ticket = active(&runtime, "missing").await;
+    for _ in 0..4 {
+        assert!(runtime.recover_ticket(&ticket).await.is_err());
+        assert_eq!(
+            runtime.store.get("missing").await.unwrap().unwrap().status,
+            TicketStatus::Open
+        );
+        assert!(matches!(
+            runtime.store.reserve("blocked", "500", 1, 0).await.unwrap(),
+            OpenResult::Existing(_)
+        ));
+        assert!(!runtime.store.transcript_exists("missing").await.unwrap());
+    }
+    assert!(runtime.recover_ticket(&ticket).await.is_ok());
+    assert_eq!(
+        runtime.store.get("missing").await.unwrap().unwrap().status,
+        TicketStatus::Closed
+    );
+    assert!(!runtime.store.transcript_exists("missing").await.unwrap());
+    assert!(matches!(
+        runtime
+            .store
+            .reserve("replacement", "500", 2, 0)
+            .await
+            .unwrap(),
+        OpenResult::Created(_)
+    ));
+    assert_eq!(mock.requests().len(), 5);
+    assert!(mock.requests().iter().all(|r| r.method == "GET"));
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn missing_open_retirement_rechecks_guild_channel_state_and_saved_capture() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = runtime(db.pool.clone(), &mock);
+    active(&runtime, "fenced").await;
+    assert!(runtime
+        .store
+        .retire_missing_open("fenced", "601", 2)
+        .await
+        .is_err());
+    let foreign = TicketStore::new(db.pool.clone(), "999".into()).unwrap();
+    assert!(foreign
+        .retire_missing_open("fenced", "600", 2)
+        .await
+        .is_err());
+    assert_eq!(
+        runtime.store.get("fenced").await.unwrap().unwrap().status,
+        TicketStatus::Open
+    );
+    runtime.store.begin_close("fenced", 3).await.unwrap();
+    assert!(runtime
+        .store
+        .retire_missing_open("fenced", "600", 4)
+        .await
+        .is_err());
+    runtime
+        .store
+        .save_transcript("fenced", 3, 4, format_transcript(vec![]))
+        .await
+        .unwrap();
+    assert!(runtime
+        .store
+        .retire_missing_open("fenced", "600", 5)
+        .await
+        .is_err());
+    // A legacy inconsistent open row must not erase or reinterpret saved evidence.
+    sqlx::query("UPDATE tickets SET status='open', closing_started_at=NULL, closed_at=NULL WHERE id='fenced'")
+        .execute(&db.pool).await.unwrap();
+    assert!(runtime
+        .store
+        .retire_missing_open("fenced", "600", 5)
+        .await
+        .is_err());
+    assert!(runtime.store.transcript_exists("fenced").await.unwrap());
+    assert_eq!(
+        runtime.store.get("fenced").await.unwrap().unwrap().status,
+        TicketStatus::Open
+    );
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn cold_resumed_dispatch_recovers_controls_panel_and_purges_without_ready() {
+    let db = TestDb::new().await;
+    let mut panel = channel();
+    panel["id"] = json!("700");
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id":"400","bot":true})),
+            ScriptedResponse::json(200, channel()),
+            ScriptedResponse::json(200, json!([])),
+            ScriptedResponse::json(200, json!({"id":"800"})),
+            ScriptedResponse::json(200, panel),
+            ScriptedResponse::json(200, json!([])),
+            ScriptedResponse::json(200, json!({"id":"801"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let executor =
+        ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
+    let tickets =
+        Arc::new(TicketRuntime::new(db.pool.clone(), executor.clone(), config()).unwrap());
+    active(&tickets, "expired-resume").await;
+    tickets
+        .store
+        .begin_close("expired-resume", 1)
+        .await
+        .unwrap();
+    tickets
+        .store
+        .save_transcript("expired-resume", 1, 2, format_transcript(vec![]))
+        .await
+        .unwrap();
+    tickets
+        .store
+        .finish_cleanup("expired-resume", 3)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tickets SET channel_id='601' WHERE id='expired-resume'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    active(&tickets, "open-resume").await;
+    let commands = CommandRuntime::with_tickets(db.pool.clone(), executor, Arc::clone(&tickets));
+    commands.suppress_registry_for_test().await;
+    let supervisor = commands.start_tickets().unwrap();
+    assert_eq!(tickets.readiness_for_test(), (0, 0));
+    commands.dispatch(&twilight_model::gateway::event::Event::Resumed);
+    wait_for_request(&mock, "POST", "/channels/700/messages").await;
+    let recovery_guard = tickets.lane.lock().await;
+    let purge_guard = tickets.purge_lane.lock().await;
+    assert_eq!(tickets.readiness_for_test(), (400, 1));
+    assert!(!tickets
+        .store
+        .transcript_exists("expired-resume")
+        .await
+        .unwrap());
+    assert_eq!(
+        tickets
+            .store
+            .get("open-resume")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TicketStatus::Open
+    );
+    assert_eq!(mock.requests().len(), 7);
+    assert_eq!(mock.requests()[0].path, "/api/v10/users/@me");
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .count(),
+        2
+    );
+    drop(recovery_guard);
+    drop(purge_guard);
+    supervisor.shutdown().await;
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn cancelled_close_drops_partial_capture_and_recovery_restores_unsaved_ticket() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, channel()),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!([history(1)])).delayed(Duration::from_secs(1)),
+            ScriptedResponse::json(200, channel()),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(db.pool.clone(), &mock);
+    active(&runtime, "cancelled").await;
+    let work_runtime = Arc::clone(&runtime);
+    let task = tokio::spawn(async move {
+        work_runtime
+            .execute(
+                &button(TicketAction::Close, "100", "501", vec!["300"], 0),
+                TicketAction::Close,
+            )
+            .await
+    });
+    wait_for_request(&mock, "GET", "/channels/600/messages?limit=100").await;
+    task.abort();
+    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+    assert!(runtime.lane.try_lock().is_ok());
+    assert_eq!(
+        runtime
+            .store
+            .get("cancelled")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TicketStatus::Closing
+    );
+    assert!(!runtime.store.transcript_exists("cancelled").await.unwrap());
+    assert!(mock.requests().iter().all(|r| r.method != "DELETE"));
+    sqlx::query("UPDATE tickets SET closing_started_at=$1 WHERE id='cancelled'")
+        .bind(two_bot_core::funnel::format_iso_millis(
+            now_millis_for_test() - INTERRUPTED_AFTER_MS - 1,
+        ))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let stale = runtime.store.get("cancelled").await.unwrap().unwrap();
+    assert!(runtime.recover_ticket(&stale).await.is_ok());
+    assert_eq!(
+        runtime
+            .store
+            .get("cancelled")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TicketStatus::Open
+    );
+    assert!(runtime
+        .store
+        .save_transcript(
+            "cancelled",
+            stale.closing_started_at.unwrap(),
+            now_millis_for_test(),
+            format_transcript(vec![])
+        )
+        .await
+        .is_err());
+    assert!(mock.requests().iter().all(|r| r.method != "DELETE"));
     mock.shutdown().await;
     db.close().await;
 }

@@ -196,3 +196,290 @@ async fn fixed_panel_and_controls_enforce_styles_and_controlled_mentions() {
     assert!(controls["content"].as_str().unwrap().contains("90 days"));
     mock.shutdown().await;
 }
+
+#[tokio::test]
+async fn resumed_identity_is_authenticated_bot_user_not_application() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!({"id":"400","bot":true}))],
+        ScriptedResponse::json(200, json!({"id":"900"})),
+    )
+    .await;
+    let rest = executor(&mock);
+    assert_eq!(rest.current_bot_user_id().await.unwrap(), 400);
+    assert_eq!(rest.current_application_id().await.unwrap(), 900);
+    assert_eq!(mock.requests()[0].path, "/api/v10/users/@me");
+    assert_eq!(mock.requests()[1].path, "/api/v10/applications/@me");
+    assert_eq!(
+        mock.requests()[0].header("authorization"),
+        Some("Bot ticket-test-token")
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn resumed_identity_refuses_invalid_evidence_without_retry_or_mutation() {
+    let mut responses = vec![
+        ScriptedResponse::status(403),
+        ScriptedResponse::status(429),
+        ScriptedResponse::status(500),
+        ScriptedResponse::status(200),
+        ScriptedResponse::json(200, json!({"id":"900"})),
+        ScriptedResponse::json(200, json!({"id":"400","bot":false})),
+        ScriptedResponse::json(200, json!({"id":"400","bot":"true"})),
+    ];
+    for id in [
+        json!("0"),
+        json!("0400"),
+        json!("+400"),
+        json!(400),
+        json!("18446744073709551616"),
+    ] {
+        responses.push(ScriptedResponse::json(200, json!({"id":id,"bot":true})));
+    }
+    for response in responses {
+        let mock = MockRest::start(vec![], response).await;
+        assert!(executor(&mock).current_bot_user_id().await.is_err());
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/v10/users/@me");
+        mock.shutdown().await;
+    }
+}
+
+fn permission_channel(overwrites: Vec<Value>) -> Value {
+    json!({"id":"700","guild_id":"100","type":0,"permission_overwrites":overwrites})
+}
+
+fn overwrite(id: &str, kind: u8, allow: u64, deny: u64) -> Value {
+    json!({"id":id,"type":kind,"allow":allow.to_string(),"deny":deny.to_string()})
+}
+
+fn member_roles_response() -> ScriptedResponse {
+    ScriptedResponse::json(200, json!({"user":{"id":"400"},"roles":["300","301"]}))
+}
+
+fn guild_roles_response(everyone: u64, bot_role: u64) -> ScriptedResponse {
+    ScriptedResponse::json(
+        200,
+        json!([
+            {"id":"100","permissions":everyone.to_string()},
+            {"id":"300","permissions":bot_role.to_string()},
+            {"id":"301","permissions":"0"},
+            {"id":"302","permissions":"0"},
+        ]),
+    )
+}
+
+#[tokio::test]
+async fn history_permission_member_grants_need_no_role_fetch_but_validate_entire_channel() {
+    let required = (Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY).bits();
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let rest = executor(&mock);
+    let channel = permission_channel(vec![
+        overwrite("100", 0, 0, required),
+        overwrite("400", 1, required, 0),
+    ]);
+    assert!(rest
+        .ticket_history_readable("100", "400", &channel)
+        .await
+        .unwrap());
+    assert!(mock.requests().is_empty());
+    for malformed in [
+        json!({"id":"300","type":0,"allow":"bad","deny":"0"}),
+        json!({"id":"300","type":2,"allow":"0","deny":"0"}),
+        json!({"id":"0","type":0,"allow":"0","deny":"0"}),
+        json!({"id":"400","type":1,"allow":"0","deny":"0"}),
+    ] {
+        let mut channel = channel.clone();
+        channel["permission_overwrites"]
+            .as_array_mut()
+            .unwrap()
+            .push(malformed);
+        assert!(rest
+            .ticket_history_readable("100", "400", &channel)
+            .await
+            .is_err());
+    }
+    let mut wrong_guild = channel.clone();
+    wrong_guild["guild_id"] = json!("101");
+    assert!(rest
+        .ticket_history_readable("100", "400", &wrong_guild)
+        .await
+        .is_err());
+    let mut missing = channel;
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("permission_overwrites");
+    assert!(rest
+        .ticket_history_readable("100", "400", &missing)
+        .await
+        .is_err());
+    assert!(
+        mock.requests().is_empty(),
+        "malformed evidence fails before REST"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn history_permission_resolves_ordinary_panel_roles_and_discord_overwrite_precedence() {
+    let view = Permissions::VIEW_CHANNEL.bits();
+    let history = Permissions::READ_MESSAGE_HISTORY.bits();
+    let required = view | history;
+    for (name, everyone, bot_role, rows, readable) in [
+        ("guild everyone grants", required, 0, vec![], true),
+        ("held guild role grants", 0, required, vec![], true),
+        (
+            "everyone overwrite grants",
+            0,
+            0,
+            vec![overwrite("100", 0, required, 0)],
+            true,
+        ),
+        (
+            "held role rescues everyone deny",
+            required,
+            0,
+            vec![
+                overwrite("100", 0, 0, required),
+                overwrite("300", 0, required, 0),
+            ],
+            true,
+        ),
+        (
+            "role union allow beats role deny",
+            required,
+            0,
+            vec![
+                overwrite("300", 0, 0, history),
+                overwrite("301", 0, history, 0),
+            ],
+            true,
+        ),
+        (
+            "unheld role cannot grant",
+            view,
+            0,
+            vec![overwrite("302", 0, history, 0)],
+            false,
+        ),
+        (
+            "member deny overrides roles",
+            required,
+            0,
+            vec![overwrite("400", 1, 0, history)],
+            false,
+        ),
+        (
+            "member partial allow rescues role deny",
+            required,
+            0,
+            vec![
+                overwrite("300", 0, 0, history),
+                overwrite("400", 1, history, 0),
+            ],
+            true,
+        ),
+        (
+            "view without history is insufficient",
+            view,
+            0,
+            vec![],
+            false,
+        ),
+        (
+            "history without view is insufficient",
+            history,
+            0,
+            vec![],
+            false,
+        ),
+        (
+            "admin bypasses overwrites",
+            0,
+            Permissions::ADMINISTRATOR.bits(),
+            vec![
+                overwrite("100", 0, 0, required),
+                overwrite("400", 1, 0, required),
+            ],
+            true,
+        ),
+    ] {
+        let mock = MockRest::start(
+            vec![
+                member_roles_response(),
+                guild_roles_response(everyone, bot_role),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        assert_eq!(
+            executor(&mock)
+                .ticket_history_readable("100", "400", &permission_channel(rows))
+                .await
+                .unwrap(),
+            readable,
+            "{name}"
+        );
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2, "{name}");
+        assert_eq!(requests[0].path, "/api/v10/guilds/100/members/400");
+        assert_eq!(requests[1].path, "/api/v10/guilds/100/roles");
+        assert!(requests.iter().all(|r| r.method == "GET"));
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn history_permission_rejects_missing_or_unreadable_role_evidence() {
+    for (member, roles, requests) in [
+        (ScriptedResponse::status(403), guild_roles_response(0, 0), 1),
+        (
+            ScriptedResponse::json(200, json!({"user":{"id":"401"},"roles":[]})),
+            guild_roles_response(0, 0),
+            1,
+        ),
+        (
+            ScriptedResponse::json(200, json!({"user":{"id":"400"}})),
+            guild_roles_response(0, 0),
+            1,
+        ),
+        (member_roles_response(), ScriptedResponse::status(500), 2),
+        (
+            member_roles_response(),
+            ScriptedResponse::json(200, json!([])),
+            2,
+        ),
+        (
+            member_roles_response(),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id":"100","permissions":"0"}, {"id":"300","permissions":"0"}
+                ]),
+            ),
+            2,
+        ),
+        (
+            member_roles_response(),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id":"100","permissions":"0"}, {"id":"300","permissions":8}, {"id":"301","permissions":"0"}
+                ]),
+            ),
+            2,
+        ),
+    ] {
+        let mock = MockRest::start(vec![member, roles], ScriptedResponse::status(500)).await;
+        assert!(executor(&mock)
+            .ticket_history_readable("100", "400", &permission_channel(vec![]))
+            .await
+            .is_err());
+        assert_eq!(mock.requests().len(), requests, "bounded single attempts");
+        assert!(mock.requests().iter().all(|r| r.method == "GET"));
+        mock.shutdown().await;
+    }
+}

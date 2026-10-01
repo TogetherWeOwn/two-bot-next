@@ -2,7 +2,6 @@
 //! No transcript body is logged, audited, or returned in an interaction reply.
 
 use std::{
-    collections::HashSet,
     future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -19,10 +18,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 use twilight_model::{application::interaction::Interaction, guild::Permissions};
-use two_bot_core::{
-    funnel::{now_millis_for_test, parse_iso_millis},
-    tickets::*,
-};
+use two_bot_core::{funnel::now_millis_for_test, tickets::*};
 use two_bot_cutover::tickets::{OpenResult, StoreError, TicketStore};
 use two_bot_discord::{
     executor::{ChannelPresence, TicketChannelRequest, TicketMessage},
@@ -35,6 +31,19 @@ const RECOVERY_CADENCE: Duration = Duration::from_secs(RECOVERY_INTERVAL_SECONDS
 const PURGE_CADENCE: Duration = Duration::from_secs(PURGE_INTERVAL_SECONDS);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(240);
 const PURGE_TIMEOUT: Duration = Duration::from_secs(60);
+const BUTTON_TIMEOUT: Duration = Duration::from_secs(120);
+const LANE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const RECOVERY_ITEM_TIMEOUT: Duration = Duration::from_secs(20);
+const RECOVERY_ROWS_BUDGET: Duration = Duration::from_secs(180);
+
+#[path = "ticket_history.rs"]
+mod history;
+
+async fn bounded<T>(duration: Duration, work: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(duration, work)
+        .await
+        .unwrap_or(Err(Failure::Timeout))
+}
 
 /// The gateway owns this scope. Dropping a cancelled shard also cancels all
 /// ticket work; normal shutdown additionally joins it before returning.
@@ -65,6 +74,45 @@ impl Drop for TicketSupervisor {
         self.shutdown.send_replace(true);
         self.task.abort();
     }
+}
+
+async fn recovery_batch<F, Fut>(
+    cursor: &TaskMutex<Option<(i64, String)>>,
+    mut tickets: Vec<Ticket>,
+    action: F,
+) -> Option<ErrorClass>
+where
+    F: Fn(Ticket) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    if tickets.is_empty() {
+        return None;
+    }
+    let after = cursor.lock().expect("ticket recovery cursor").clone();
+    if let Some((created_at, id)) = after {
+        let start = tickets
+            .iter()
+            .position(|ticket| (ticket.created_at, ticket.id.as_str()) > (created_at, id.as_str()))
+            .unwrap_or(0);
+        tickets.rotate_left(start);
+    }
+    let deadline = Instant::now() + RECOVERY_ROWS_BUDGET;
+    let mut failed = None;
+    for ticket in tickets {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // Advance before await: even whole-scope cancellation rotates past
+        // this row next time. The durable row, not this cursor, remains truth.
+        *cursor.lock().expect("ticket recovery cursor") =
+            Some((ticket.created_at, ticket.id.clone()));
+        if let Err(error) = bounded(remaining.min(RECOVERY_ITEM_TIMEOUT), action(ticket)).await {
+            failed = Some(error.class());
+            tracing::warn!(error_class = ?error.class(), "ticket recovery deferred");
+        }
+    }
+    failed
 }
 
 async fn maintenance_loop(
@@ -161,6 +209,7 @@ pub(crate) struct TicketRuntime {
     // slow Discord I/O cannot postpone the privacy ceiling.
     lane: Mutex<()>,
     purge_lane: Mutex<()>,
+    recovery_cursor: TaskMutex<Option<(i64, String)>>,
     ready: watch::Sender<u64>,
     started: AtomicBool,
     stopping: AtomicBool,
@@ -171,6 +220,7 @@ pub(crate) enum Failure {
     Store(StoreError),
     Rest(DiscordError),
     InvalidEvidence,
+    Timeout,
 }
 
 impl From<StoreError> for Failure {
@@ -195,7 +245,7 @@ impl Failure {
     pub fn class(&self) -> ErrorClass {
         match self {
             Self::Store(_) => ErrorClass::Database,
-            Self::Rest(DiscordError::Timeout) => ErrorClass::Timeout,
+            Self::Timeout | Self::Rest(DiscordError::Timeout) => ErrorClass::Timeout,
             Self::Rest(_) | Self::InvalidEvidence => ErrorClass::Rest,
         }
     }
@@ -216,6 +266,7 @@ impl TicketRuntime {
             bot_id: AtomicU64::new(0),
             lane: Mutex::new(()),
             purge_lane: Mutex::new(()),
+            recovery_cursor: TaskMutex::new(None),
             ready: watch::channel(0).0,
             started: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -294,6 +345,11 @@ impl TicketRuntime {
         self.bot_id.store(id, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn readiness_for_test(&self) -> (u64, u64) {
+        (self.bot_id.load(Ordering::Acquire), *self.ready.borrow())
+    }
+
     fn bot_id(&self) -> Result<String> {
         let id = self.bot_id.load(Ordering::Acquire);
         if id == 0 {
@@ -338,7 +394,19 @@ impl TicketRuntime {
     pub async fn execute(&self, interaction: &Interaction, action: TicketAction) -> Result<String> {
         self.authorize(interaction, action)
             .map_err(StoreError::Domain)?;
-        let _guard = self.lane.lock().await;
+        // Includes admission: an already-deferred interaction must not spend
+        // its token lifetime queued behind somebody else's history capture.
+        bounded(BUTTON_TIMEOUT, self.execute_in_lane(interaction, action)).await
+    }
+
+    async fn execute_in_lane(
+        &self,
+        interaction: &Interaction,
+        action: TicketAction,
+    ) -> Result<String> {
+        let _guard = tokio::time::timeout(LANE_WAIT_TIMEOUT, self.lane.lock())
+            .await
+            .map_err(|_| Failure::Timeout)?;
         let user = interaction
             .member
             .as_ref()
@@ -516,8 +584,7 @@ impl TicketRuntime {
 
     pub(crate) async fn capture_history(&self, channel: &str) -> Result<TranscriptSnapshot> {
         let mut before: Option<String> = None;
-        let mut seen = HashSet::new();
-        let mut messages = Vec::new();
+        let mut capture = history::HistoryCapture::default();
         loop {
             let page = self
                 .executor
@@ -527,59 +594,32 @@ impl TicketRuntime {
                 return Err(Failure::InvalidEvidence);
             }
             let count = page.len();
+            // Retain at most one page of IDs. Strictly decreasing cursors and
+            // IDs prove global uniqueness without a history-sized seen set.
+            let mut page = page
+                .into_iter()
+                .map(|message| {
+                    let id = valid_id(message["id"].as_str().ok_or(Failure::InvalidEvidence)?)?;
+                    Ok((id, message))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            page.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             let mut floor = before.as_deref().map(valid_id).transpose()?;
-            for message in page {
-                let id = valid_id(message["id"].as_str().ok_or(Failure::InvalidEvidence)?)?;
-                if !seen.insert(id)
-                    || before
-                        .as_deref()
-                        .map(valid_id)
-                        .transpose()?
-                        .is_some_and(|cursor| id >= cursor)
-                {
+            for (id, message) in page {
+                if floor.is_some_and(|cursor| id >= cursor) {
                     return Err(Failure::InvalidEvidence);
                 }
-                floor = Some(floor.map_or(id, |cursor| cursor.min(id)));
-                let author = message["author"]["username"]
-                    .as_str()
-                    .ok_or(Failure::InvalidEvidence)?;
-                let discriminator = message["author"]
-                    .get("discriminator")
-                    .and_then(Value::as_str);
-                let author_tag = match discriminator {
-                    Some(value) if value != "0" => format!("{author}#{value}"),
-                    _ => author.to_owned(),
-                };
-                let attachment_urls = message["attachments"]
-                    .as_array()
-                    .ok_or(Failure::InvalidEvidence)?
-                    .iter()
-                    .map(|attachment| {
-                        attachment["url"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .ok_or(Failure::InvalidEvidence)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                messages.push(TranscriptMessage {
-                    created_at: message["timestamp"]
-                        .as_str()
-                        .and_then(parse_iso_millis)
-                        .ok_or(Failure::InvalidEvidence)?,
-                    author_tag,
-                    content: message["content"]
-                        .as_str()
-                        .ok_or(Failure::InvalidEvidence)?
-                        .to_owned(),
-                    attachment_urls,
-                });
+                floor = Some(id);
+                capture
+                    .push(id, &message)
+                    .map_err(|_| Failure::InvalidEvidence)?;
             }
             if count < 100 {
                 break;
             }
             before = Some(floor.ok_or(Failure::InvalidEvidence)?.to_string());
         }
-        Ok(format_transcript(messages))
+        Ok(capture.finish())
     }
 
     async fn cleanup(&self, id: &str, channel: &str) -> Result<()> {
@@ -602,20 +642,22 @@ impl TicketRuntime {
         if self.bot_id.load(Ordering::Acquire) == 0 {
             return Ok(());
         }
-        let tickets = self
-            .store
-            .recoverable()
-            .await
-            .map_err(|_| ErrorClass::Database)?;
-        let mut failed = None;
-        for ticket in tickets {
-            if let Err(error) = self.recover_ticket(&ticket).await {
-                failed = Some(error.class());
-                tracing::warn!(error_class = ?error.class(), "ticket recovery deferred");
+        let tickets = bounded(RECOVERY_ITEM_TIMEOUT, async {
+            self.store.recoverable().await.map_err(Failure::from)
+        })
+        .await;
+        let mut failed = match tickets {
+            Ok(tickets) => {
+                recovery_batch(&self.recovery_cursor, tickets, |ticket| async move {
+                    self.recover_ticket(&ticket).await
+                })
+                .await
             }
-        }
-        // Panel ensure still runs when one ticket is inaccessible.
-        if let Err(error) = self.ensure_panel().await {
+            Err(error) => Some(error.class()),
+        };
+        // Rows consume at most 180s, leaving a separate bounded panel slot
+        // inside the 240s supervisor budget, even with a permanent slow prefix.
+        if let Err(error) = bounded(RECOVERY_ITEM_TIMEOUT, self.ensure_panel()).await {
             failed = Some(error.class());
         }
         failed.map_or(Ok(()), Err)
@@ -714,7 +756,25 @@ impl TicketRuntime {
     }
 
     async fn ensure_controls(&self, ticket: &Ticket, channel: &str) -> Result<()> {
-        self.channel_document(channel).await?;
+        let doc = match self.executor.fetch_ticket_channel(channel).await? {
+            ChannelPresence::Present(doc) => {
+                self.validate_channel(&doc, channel, 0)?;
+                doc
+            }
+            ChannelPresence::Absent => {
+                self.store
+                    .retire_missing_open(&ticket.id, channel, now_millis_for_test())
+                    .await?;
+                return Ok(());
+            }
+        };
+        if !self
+            .executor
+            .ticket_history_readable(&self.config.guild_id, &self.bot_id()?, &doc)
+            .await?
+        {
+            return Err(Failure::InvalidEvidence);
+        }
         let messages = self
             .executor
             .fetch_channel_messages(channel, None, 50)
@@ -739,7 +799,14 @@ impl TicketRuntime {
     }
 
     async fn ensure_panel(&self) -> Result<()> {
-        self.channel_document(&self.config.panel_channel_id).await?;
+        let doc = self.channel_document(&self.config.panel_channel_id).await?;
+        if !self
+            .executor
+            .ticket_history_readable(&self.config.guild_id, &self.bot_id()?, &doc)
+            .await?
+        {
+            return Err(Failure::InvalidEvidence);
+        }
         let messages = self
             .executor
             .fetch_channel_messages(&self.config.panel_channel_id, None, 50)
@@ -831,3 +898,7 @@ mod timer_tests;
 #[cfg(test)]
 #[path = "ticket_acceptance_tests.rs"]
 mod acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_revision_tests.rs"]
+mod revision_tests;

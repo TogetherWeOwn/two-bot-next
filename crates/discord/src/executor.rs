@@ -1390,6 +1390,25 @@ impl ActionExecutor {
         }
     }
 
+    /// Resolve the authenticated bot USER, not its application, after RESUMED.
+    /// One bounded, paced read; malformed/non-bot evidence never initializes
+    /// author checks or permission targets with a guessed identity.
+    pub async fn current_bot_user_id(&self) -> Result<u64, DiscordError> {
+        let req = Self::request_of(self.inner.factory.current_user())?;
+        self.pace(false).await;
+        let res = self.call_once_raw(req, &[200]).await?;
+        let body: serde_json::Value = serde_json::from_slice(&res.body)
+            .map_err(|_| DiscordError::Unavailable("invalid bot user response".into()))?;
+        let id = body["id"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok().map(|id| (value, id)))
+            .filter(|(value, id)| *id != 0 && id.to_string() == *value)
+            .map(|(_, id)| id)
+            .filter(|_| body["bot"].as_bool() == Some(true))
+            .ok_or_else(|| DiscordError::Unavailable("invalid bot user identity".into()))?;
+        Ok(id)
+    }
+
     /// Resolve the authenticated bot's application for a resumed startup
     /// without READY. One bounded, paced read; no alternate client or guessed id.
     pub async fn current_application_id(&self) -> Result<u64, DiscordError> {

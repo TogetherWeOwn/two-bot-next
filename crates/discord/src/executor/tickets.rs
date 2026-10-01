@@ -146,6 +146,115 @@ impl ActionExecutor {
         Ok(ChannelPresence::Present(doc))
     }
 
+    /// Prove effective ViewChannel + ReadMessageHistory before interpreting an
+    /// empty history as absence. Public panels may grant access through roles,
+    /// not a bot-member overwrite. Missing/malformed evidence fails closed.
+    pub async fn ticket_history_readable(
+        &self,
+        guild_id: &str,
+        bot_id: &str,
+        channel_doc: &Value,
+    ) -> Result<bool, DiscordError> {
+        let guild: Id<GuildMarker> = snowflake(guild_id)?;
+        let bot: Id<UserMarker> = snowflake(bot_id)?;
+        ticket_evidence_id(&channel_doc["id"])?;
+        if ticket_evidence_id(&channel_doc["guild_id"])? != guild.get()
+            || !matches!(channel_doc["type"].as_u64(), Some(0 | 5))
+        {
+            return Err(invalid_ticket_permissions());
+        }
+        let rows = channel_doc["permission_overwrites"]
+            .as_array()
+            .ok_or_else(invalid_ticket_permissions)?;
+        let mut overwrites = Vec::with_capacity(rows.len());
+        let mut targets = std::collections::HashSet::new();
+        for row in rows {
+            let id = ticket_evidence_id(&row["id"])?;
+            let kind = row["type"]
+                .as_u64()
+                .filter(|kind| *kind <= 1)
+                .ok_or_else(invalid_ticket_permissions)?;
+            if !targets.insert((kind, id)) {
+                return Err(invalid_ticket_permissions());
+            }
+            overwrites.push(TicketOverwrite {
+                id,
+                kind,
+                allow: ticket_permission_bits(&row["allow"])?,
+                deny: ticket_permission_bits(&row["deny"])?,
+            });
+        }
+        let required = (Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY).bits();
+        let member = overwrites
+            .iter()
+            .find(|row| row.kind == 1 && row.id == bot.get());
+        // Member allows override every role deny. Our generated private ticket
+        // has these explicit grants; no guild role fetch is needed to prove them.
+        if member.is_some_and(|row| row.allow & required == required && row.deny == 0) {
+            return Ok(true);
+        }
+
+        let req = Self::request_of(self.inner.factory.guild_member(guild, bot))?;
+        self.pace(false).await;
+        let res = self.call_once_raw(req, &[200]).await?;
+        let member_doc = ticket_json(&res)?;
+        if ticket_evidence_id(&member_doc["user"]["id"])? != bot.get() {
+            return Err(invalid_ticket_permissions());
+        }
+        let held = member_doc["roles"]
+            .as_array()
+            .ok_or_else(invalid_ticket_permissions)?
+            .iter()
+            .map(ticket_evidence_id)
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        let req = Self::request_of(self.inner.factory.roles(guild))?;
+        self.pace(false).await;
+        let res = self.call_once_raw(req, &[200]).await?;
+        let roles_doc = ticket_json(&res)?;
+        let roles = roles_doc
+            .as_array()
+            .ok_or_else(invalid_ticket_permissions)?;
+        let mut known = std::collections::HashSet::new();
+        let mut permissions = 0;
+        for role in roles {
+            let id = ticket_evidence_id(&role["id"])?;
+            let bits = ticket_permission_bits(&role["permissions"])?;
+            if !known.insert(id) {
+                return Err(invalid_ticket_permissions());
+            }
+            if id == guild.get() || held.contains(&id) {
+                permissions |= bits;
+            }
+        }
+        // An incomplete list could hide an administrator or a role grant.
+        if !known.contains(&guild.get()) || !held.is_subset(&known) {
+            return Err(invalid_ticket_permissions());
+        }
+        if permissions & Permissions::ADMINISTRATOR.bits() != 0 {
+            return Ok(true);
+        }
+        if let Some(everyone) = overwrites
+            .iter()
+            .find(|row| row.kind == 0 && row.id == guild.get())
+        {
+            permissions = (permissions & !everyone.deny) | everyone.allow;
+        }
+        let mut allow = 0;
+        let mut deny = 0;
+        for row in overwrites
+            .iter()
+            .filter(|row| row.kind == 0 && row.id != guild.get() && held.contains(&row.id))
+        {
+            allow |= row.allow;
+            deny |= row.deny;
+        }
+        permissions = (permissions & !deny) | allow;
+        if let Some(member) = member {
+            permissions = (permissions & !member.deny) | member.allow;
+        }
+        Ok(permissions & required == required)
+    }
+
     pub async fn delete_ticket_channel(&self, channel_id: &str) -> Result<(), DiscordError> {
         let req = Self::request_of(self.inner.factory.delete_channel(snowflake(channel_id)?))?;
         self.pace(false).await;
@@ -241,6 +350,33 @@ impl ActionExecutor {
             .map_err(|_| DiscordError::Unavailable("invalid ticket message id".into()))?;
         Ok(id.to_owned())
     }
+}
+
+struct TicketOverwrite {
+    id: u64,
+    kind: u64,
+    allow: u64,
+    deny: u64,
+}
+
+fn invalid_ticket_permissions() -> DiscordError {
+    DiscordError::Unavailable("invalid ticket permission evidence".into())
+}
+
+fn ticket_permission_bits(value: &Value) -> Result<u64, DiscordError> {
+    value
+        .as_str()
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(invalid_ticket_permissions)
+}
+
+fn ticket_evidence_id(value: &Value) -> Result<u64, DiscordError> {
+    let id = ticket_permission_bits(value)?;
+    if id == 0 || value.as_str() != Some(id.to_string().as_str()) {
+        return Err(invalid_ticket_permissions());
+    }
+    Ok(id)
 }
 
 fn ticket_json(res: &RawResponse) -> Result<Value, DiscordError> {

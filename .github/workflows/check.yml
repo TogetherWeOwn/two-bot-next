@@ -389,7 +389,8 @@ jobs:
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
       - name: Ticket shared router and mock Discord lifecycle acceptance
-        run: cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored
+        run: >-
+          cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored
 
   worker:
     name: worker check

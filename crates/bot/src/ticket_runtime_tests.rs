@@ -153,7 +153,10 @@ async fn exact_full_page_requires_a_final_empty_page() {
 }
 
 fn panel_channel() -> Value {
-    json!({"id":"700","guild_id":"100","type":0})
+    let allow = (Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY).bits();
+    json!({"id":"700","guild_id":"100","type":0,"permission_overwrites":[
+        {"id":"400","type":1,"allow":allow.to_string(),"deny":"0"}
+    ]})
 }
 fn panel(author: &str) -> Value {
     json!({"author":{"id":author},"components":[{"type":1,"components":[{"type":2,"custom_id":TICKET_OPEN_ID}]}]})
