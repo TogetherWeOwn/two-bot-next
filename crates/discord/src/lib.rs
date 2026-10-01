@@ -14,6 +14,8 @@ pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
 #[cfg(feature = "db")]
+pub mod internal_channel_moderation;
+#[cfg(feature = "db")]
 pub mod leveling_runtime;
 mod message_safety;
 pub mod pipeline;

@@ -5,6 +5,7 @@
 ### Added
 
 - Wire leveling through the shared command runtime, interaction router and REST executor with ordered, awaited gateway awards. Preserve message eligibility, measured voice duration, session/dry-run reward suppression, ephemeral rank and mention-suppressed public top 10. Ordinary level-ups only grant roles; explicit revokes require a pinned staging fence and whole-set permission/hierarchy preflight. Mock REST and migrated disposable database proofs run in CI, including a shared-runtime single-callback regression.
+- Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and
