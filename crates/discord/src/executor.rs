@@ -1282,10 +1282,8 @@ impl ActionExecutor {
                 let body: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
                     DiscordError::Unavailable("invalid application response".to_owned())
                 })?;
-                let id: Id<ApplicationMarker> =
-                    serde_json::from_value(body["id"].clone()).map_err(|_| {
-                        DiscordError::Unavailable("invalid application id".to_owned())
-                    })?;
+                let id: Id<ApplicationMarker> = serde_json::from_value(body["id"].clone())
+                    .map_err(|_| DiscordError::Unavailable("invalid application id".to_owned()))?;
                 Ok(id.get())
             }
             _ => Err(throw_for_status(&res)),

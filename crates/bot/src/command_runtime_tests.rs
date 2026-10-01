@@ -552,11 +552,7 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
         },
     ] {
         let (mock, origin) = MockRest::start(Vec::new()).await;
-        let runtime = runtime_without_db(
-            router_gates,
-            router_gates.automations,
-            origin,
-        );
+        let runtime = runtime_without_db(router_gates, router_gates.automations, origin);
         runtime.publish_registry(Some(1111)).await;
         let requests = mock.requests();
         assert_eq!(requests.len(), 1, "one full registry publication");
@@ -627,18 +623,9 @@ async fn unwired_commands_preserve_disabled_and_permission_refusals() {
             true,
             ANNOUNCEMENTS_DISABLED_REPLY,
         ),
-        (
-            gates(true, true),
-            "command",
-            false,
-            MANAGE_SERVER_REQUIRED,
-        ),
+        (gates(true, true), "command", false, MANAGE_SERVER_REQUIRED),
     ] {
-        let runtime = runtime_without_db(
-            router_gates,
-            router_gates.automations,
-            origin.clone(),
-        );
+        let runtime = runtime_without_db(router_gates, router_gates.automations, origin.clone());
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         if !permitted {
             interaction.member.as_mut().unwrap().permissions = Some(Permissions::empty());
@@ -685,7 +672,10 @@ async fn foreign_moderation_preserves_the_router_guild_refusal() {
     let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
     assert_eq!(reply["type"], 4);
     assert_eq!(reply["data"]["flags"], 64);
-    assert_eq!(reply["data"]["content"], RouterRefusal::GuildRestricted.message());
+    assert_eq!(
+        reply["data"]["content"],
+        RouterRefusal::GuildRestricted.message()
+    );
     assert_eq!(mock.requests().len(), 1, "no foreign-guild effects");
     mock.shutdown().await;
 }
@@ -1137,11 +1127,7 @@ async fn resumed_lookup_failure_or_invalid_id_never_guesses_a_publish_target() {
         assert_eq!(requests[0].method, "GET");
         runtime.publish_registry(Some(1111)).await;
         runtime.publish_registry(None).await;
-        assert_eq!(
-            mock.requests().len(),
-            2,
-            "later READY can synchronize"
-        );
+        assert_eq!(mock.requests().len(), 2, "later READY can synchronize");
         mock.shutdown().await;
     }
 }
@@ -1165,11 +1151,7 @@ async fn failed_resumed_publication_can_retry_on_a_later_connection() {
     runtime.publish_registry(None).await;
     runtime.publish_registry(None).await;
     let requests = mock.requests();
-    assert_eq!(
-        requests.len(),
-        4,
-        "retry only until one successful sync"
-    );
+    assert_eq!(requests.len(), 4, "retry only until one successful sync");
     assert_eq!(requests[0].method, "GET");
     assert_eq!(requests[1].method, "PUT");
     assert_eq!(requests[2].method, "GET");
