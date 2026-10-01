@@ -518,13 +518,38 @@ pub struct GamePickerOutcome {
     /// Record `channel_routed` after success only with visible destinations;
     /// clearing roles or saving roles with no route records nothing routed.
     pub record_routed: bool,
-    /// The re-resolved plan to record when `record_routed` is set. Re-resolve
-    /// post-grant in the caller — a just-added role can itself reveal the
-    /// channel to link, so the "before" answer would be wrong.
+    /// Provisional until [`Self::finalize_after_grant`] re-resolves visibility
+    /// after successful role writes, updating the plan, reply and routed flag
+    /// together. A just-added role can itself reveal the channel to link.
     ///
     /// If the executor's role writes fail it replies
     /// [`PICKER_ROLE_FAILURE_REPLY`] and records nothing (legacy catch path).
     pub routed: GameSelection,
+}
+
+impl GamePickerOutcome {
+    /// Finalize a successful role selection using refreshed member visibility.
+    /// The executor must call this after role writes and before replying or
+    /// recording funnel events. Dry runs and clears retain their special reply
+    /// and record no events. Role deltas and unknown-key diagnostics survive.
+    #[must_use]
+    pub fn finalize_after_grant(mut self, visible: &dyn Fn(&str) -> bool, guild_id: u64) -> Self {
+        if !self.record_selected {
+            return self;
+        }
+        let keys: Vec<&str> = self
+            .routed
+            .destinations
+            .iter()
+            .map(|destination| destination.key.as_str())
+            .chain(self.routed.unknown_keys.iter().map(String::as_str))
+            .collect();
+        let plan = plan_game_selection(&keys, visible);
+        self.reply = game_picker_reply(&plan, guild_id);
+        self.record_routed = !plan.channel_ids.is_empty();
+        self.routed = plan;
+        self
+    }
 }
 
 /// Build the successful ephemeral reply from a post-grant visibility plan.
@@ -605,8 +630,8 @@ pub fn adjudicate_game_select(
         .filter(|r| !selected.contains(r) && member_role_ids.contains(r))
         .map(str::to_owned)
         .collect();
-    // Provisional reply: rebuild with game_picker_reply after role writes and
-    // post-grant visibility resolution, not with stale pre-grant permissions.
+    // Provisional: finalize_after_grant refreshes the reply, plan and recording
+    // flag together after successful role writes, using current permissions.
     Some(GamePickerOutcome {
         add_role_ids: plan.role_ids.clone(),
         remove_role_ids,

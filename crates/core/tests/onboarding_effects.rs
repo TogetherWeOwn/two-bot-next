@@ -38,15 +38,91 @@ fn game_role_effects_preserve_unrelated_roles_and_resolve_after_grant() {
                 .map(str::to_owned)
                 .collect()
         );
-        let final_plan =
-            plan_game_selection(&["horror"], &|_| mock_roles.contains(new_game.role_id));
-        let reply = game_picker_reply(&final_plan, 1);
-        assert!(reply.contains(new_game.primary_channel_id.unwrap()));
+        let outcome = outcome.finalize_after_grant(&|_| mock_roles.contains(new_game.role_id), 1);
+        assert!(outcome.reply.contains(new_game.primary_channel_id.unwrap()));
         assert!(
-            !reply.contains(GAME_HUB_CHANNEL_ID),
+            !outcome.reply.contains(GAME_HUB_CHANNEL_ID),
             "role unlocked the room"
         );
-        assert_eq!(final_plan.degraded_count, 0);
+        assert!(outcome.record_selected && outcome.record_routed);
+        assert_eq!(outcome.routed.degraded_count, 0);
+    }
+}
+
+#[test]
+fn game_finalization_keeps_reply_plan_and_recording_in_sync_when_visibility_changes() {
+    let pick = pick_by_key("horror").unwrap();
+    let primary = pick.primary_channel_id.unwrap();
+    for mode in [OnboardingMode::Legacy, OnboardingMode::Anchor] {
+        for initially_visible in [false, true] {
+            let outcome = adjudicate_game_select(
+                mode,
+                &["horror", "horror", "gone", "gone"],
+                &[],
+                &|id| initially_visible && id == primary,
+                1,
+                false,
+            )
+            .unwrap();
+            assert_eq!(outcome.record_routed, initially_visible);
+            let role_effects = (
+                outcome.add_role_ids.clone(),
+                outcome.remove_role_ids.clone(),
+            );
+            let final_visible = !initially_visible;
+            let outcome = outcome.finalize_after_grant(&|id| final_visible && id == primary, 1);
+            assert!(outcome.ephemeral && outcome.record_selected);
+            assert_eq!(outcome.record_routed, final_visible);
+            assert_eq!(
+                (outcome.add_role_ids, outcome.remove_role_ids),
+                role_effects
+            );
+            assert_eq!(outcome.routed.role_ids, vec![pick.role_id]);
+            assert_eq!(outcome.routed.unknown_keys, vec!["gone"]);
+            assert_eq!(outcome.routed.destinations.len(), 1);
+            assert_eq!(outcome.routed.degraded_count, 0);
+            assert!(!outcome.reply.contains(GAME_HUB_CHANNEL_ID));
+            if final_visible {
+                assert_eq!(outcome.routed.channel_ids, vec![primary]);
+                assert_eq!(
+                    outcome.routed.destinations[0].channel_id.as_deref(),
+                    Some(primary)
+                );
+                assert!(outcome.reply.starts_with("Done. Here is where to go:"));
+                assert!(outcome.reply.contains(&channel_link(1, primary)));
+            } else {
+                assert!(outcome.routed.channel_ids.is_empty());
+                assert_eq!(outcome.routed.destinations[0].channel_id, None);
+                assert!(outcome.reply.starts_with("Game roles saved."));
+                assert!(outcome
+                    .reply
+                    .contains("No channel is available to you right now."));
+                assert!(!outcome.reply.contains("discord.com/channels"));
+            }
+        }
+    }
+}
+
+#[test]
+fn game_finalization_preserves_dry_run_and_clear_outcomes() {
+    for mode in [OnboardingMode::Legacy, OnboardingMode::Anchor] {
+        for (keys, dry_run) in [(vec!["horror"], true), (vec![], false)] {
+            let outcome = adjudicate_game_select(
+                mode,
+                &keys,
+                &[pick_by_key("shooters").unwrap().role_id],
+                &|_| false,
+                1,
+                dry_run,
+            )
+            .unwrap();
+            let finalized = outcome.clone().finalize_after_grant(
+                &|_| panic!("dry runs and clears must not resolve routes"),
+                1,
+            );
+            assert_eq!(finalized, outcome);
+            assert!(!finalized.record_selected && !finalized.record_routed);
+        }
     }
 }
 
