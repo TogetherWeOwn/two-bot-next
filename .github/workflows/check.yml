@@ -29,8 +29,8 @@ jobs:
 
   check:
     name: check
-    needs: self-role-store
-    # A skipped dependency must not make the required check appear green.
+    needs: [self-role-store, supply-chain]
+    # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
@@ -73,8 +73,8 @@ jobs:
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
 
-      - name: require self-role store tests to pass
-        if: needs.self-role-store.result != 'success'
+      - name: require self-role store and supply-chain gates to pass
+        if: needs.self-role-store.result != 'success' || needs.supply-chain.result != 'success'
         run: exit 1
 
       - name: Check migration numbering and immutability
