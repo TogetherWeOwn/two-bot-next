@@ -168,15 +168,30 @@ async fn admission_read_only_complete_5xx_does_not_hold_mutation_lane() {
     let gate = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
     let action =
         ActionExecutor::with_admission(token(), Some(mock.origin.clone()), gate.clone()).unwrap();
+    let path = format!("/channels/{CHANNEL}");
     for _ in 0..2 {
-        assert_eq!(action.get_json_once("/users/@me").await.unwrap(), None);
+        assert_eq!(action.get_json_once(&path).await.unwrap(), None);
     }
-    let permit = gate
+    let second = db.independent_pool().await.unwrap();
+    let restarted = PgSendAdmission::new(second.clone(), &token()).unwrap();
+    let permit = restarted
         .admit()
         .await
         .expect("read-only status has no uncertain mutation");
     permit.complete(None).await.unwrap();
-    assert_eq!(mock.count(), 2);
+    assert_eq!(
+        mock.count(),
+        2,
+        "one wire attempt per read, without retries"
+    );
+    {
+        let requests = mock.requests.lock().unwrap();
+        for request in requests.iter() {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, format!("/api/v10/channels/{CHANNEL}"));
+        }
+    }
+    second.close().await;
     db.close().await.unwrap();
 }
 
