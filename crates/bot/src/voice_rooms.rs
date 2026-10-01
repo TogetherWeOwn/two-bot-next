@@ -1074,29 +1074,34 @@ fn elapsed_ms(now_ms: u64, started: Instant) -> u64 {
 
 /// Gateway-loop sink for voice events. The shard runner calls [`VoiceEventSink::handle`]
 /// after the pipeline's cache update, so every snapshot the runtime builds is
-/// complete. Handling never blocks: events become actor commands on unbounded
-/// channels, and each guild actor drains its worker on its own timer.
+/// complete. Live evidence is published synchronously before actor commands;
+/// network/database writes remain serialized on each guild actor's timer.
 pub trait VoiceEventSink: Send + Sync {
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache);
+    /// Invalidate occupancy immediately on connection loss, including while an
+    /// actor is awaiting SQL, HTTP or token-global rate-limit backoff.
+    fn disconnect(&self);
+    /// A cold RESUME has replayed durably but cannot populate a fresh cache.
+    /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
+    fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
 }
 
-/// Commands for one guild actor. The actor owns its [`GuildRoomWorker`]
-/// mutably; the gateway loop never touches the worker directly.
+/// The gateway shares only live evidence; the actor owns the mutable queue.
+#[derive(Clone)]
+struct GuildActor {
+    live: LiveGuild,
+    tx: mpsc::UnboundedSender<ActorCommand>,
+}
+
 enum ActorCommand {
-    /// Complete snapshot (GuildCreate, reconnect refresh): publish + reconcile.
-    Publish(GuildSnapshot),
-    /// One voice transition: update live state, maybe accept the join, reconcile.
-    VoiceFrame {
-        member: Snowflake,
-        channel: Option<Snowflake>,
-        bot: Option<bool>,
+    Reconcile,
+    Join {
+        ticket: JoinTicket,
         name: String,
         seed: u64,
         created_at: String,
     },
-    ChannelUpsert(Box<Channel>),
-    ChannelRemove(Snowflake),
-    RefreshBot(BotAccess),
+    CreatorAdded(CreatorChannel),
     /// One-shot worker snapshot for `/setup` (room count, failures, halt).
     Status(oneshot::Sender<WorkerStatus>),
 }
@@ -1109,7 +1114,7 @@ pub struct VoiceRuntime<S, H> {
     tick: Duration,
     enabled: bool,
     seeds: AtomicU64,
-    actors: Mutex<HashMap<Snowflake, mpsc::UnboundedSender<ActorCommand>>>,
+    actors: Mutex<HashMap<Snowflake, GuildActor>>,
 }
 
 impl<S, H> VoiceRuntime<S, H>
@@ -1134,38 +1139,44 @@ where
         }
     }
 
-    fn live_actor(&self, guild: Snowflake) -> Option<mpsc::UnboundedSender<ActorCommand>> {
+    fn live_actor(&self, guild: Snowflake) -> Option<GuildActor> {
         self.actors
             .lock()
             .expect("voice runtime lock")
             .get(&guild)
+            .filter(|actor| !actor.tx.is_closed())
             .cloned()
     }
 
-    fn ensure_actor(&self, guild: Snowflake) -> Option<mpsc::UnboundedSender<ActorCommand>> {
+    fn ensure_actor(&self, guild: Snowflake) -> Option<GuildActor> {
         if !self.enabled {
             return None;
         }
         let mut actors = self.actors.lock().expect("voice runtime lock");
-        if let Some(tx) = actors.get(&guild) {
-            if !tx.is_closed() {
-                return Some(tx.clone());
+        if let Some(actor) = actors.get(&guild) {
+            if !actor.tx.is_closed() {
+                return Some(actor.clone());
             }
+            actor.live.disconnect();
             actors.remove(&guild);
         }
         let (tx, rx) = mpsc::unbounded_channel();
+        let actor = GuildActor {
+            live: LiveGuild::new(guild),
+            tx,
+        };
+        let live = actor.live.clone();
         let make = Arc::clone(&self.make);
         let tick = self.tick;
         tokio::spawn(async move {
-            let live = LiveGuild::new(guild);
             let (store, http) = make();
             let Ok(mut worker) = GuildRoomWorker::load(live, store, http).await else {
                 return;
             };
             run_actor(&mut worker, rx, tick).await;
         });
-        actors.insert(guild, tx.clone());
-        Some(tx)
+        actors.insert(guild, actor.clone());
+        Some(actor)
     }
 
     /// Guilds with a live actor (reconnect refresh iterates these).
@@ -1180,9 +1191,10 @@ where
 
     /// Publish a complete snapshot, spawning the guild actor on first use.
     pub fn publish_snapshot(&self, guild: Snowflake, snapshot: GuildSnapshot) -> bool {
-        self.ensure_actor(guild)
-            .and_then(|tx| tx.send(ActorCommand::Publish(snapshot)).ok())
-            .is_some()
+        let Some(actor) = self.ensure_actor(guild) else {
+            return false;
+        };
+        actor.live.publish(snapshot) && actor.tx.send(ActorCommand::Reconcile).is_ok()
     }
 
     /// Feed one voice transition to an existing actor. Returns false when the
@@ -1196,21 +1208,19 @@ where
         bot: Option<bool>,
         name: String,
     ) -> bool {
-        let seed = self.seeds.fetch_add(1, Ordering::Relaxed);
-        let created_at = now_iso();
-        self.live_actor(guild)
-            .and_then(|tx| {
-                tx.send(ActorCommand::VoiceFrame {
-                    member,
-                    channel,
-                    bot,
-                    name,
-                    seed,
-                    created_at,
-                })
-                .ok()
-            })
-            .is_some()
+        let Some(actor) = self.live_actor(guild) else {
+            return false;
+        };
+        let command = match actor.live.voice_update(member, channel, bot) {
+            Some(ticket) => ActorCommand::Join {
+                ticket,
+                name,
+                seed: self.seeds.fetch_add(1, Ordering::Relaxed),
+                created_at: now_iso(),
+            },
+            None => ActorCommand::Reconcile,
+        };
+        actor.tx.send(command).is_ok()
     }
 
     /// Fresh store/http pair from the actor factory (used by the S4 command
@@ -1222,23 +1232,41 @@ where
     /// Snapshot the live worker for `/setup`. `None` when the guild has no
     /// actor yet (before the first GuildCreate) or its inbox already drained.
     pub async fn worker_status(&self, guild: Snowflake) -> Option<WorkerStatus> {
-        let tx = self.live_actor(guild)?;
+        let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
-        tx.send(ActorCommand::Status(reply)).ok()?;
+        actor.tx.send(ActorCommand::Status(reply)).ok()?;
         inbox.await.ok()
     }
 
-    /// Drop the guild actor (GuildDelete). The task exits once its inbox drains.
+    /// Invalidate first: even an in-flight task cannot write after GuildDelete.
     pub fn remove_guild(&self, guild: Snowflake) {
-        self.actors
+        if let Some(actor) = self
+            .actors
             .lock()
             .expect("voice runtime lock")
-            .remove(&guild);
+            .remove(&guild)
+        {
+            actor.live.disconnect();
+        }
     }
 
-    fn send_to_live(&self, guild: Snowflake, command: ActorCommand) {
-        if let Some(tx) = self.live_actor(guild) {
-            let _ = tx.send(command);
+    fn update_live(&self, guild: Snowflake, update: impl FnOnce(&LiveGuild)) {
+        if let Some(actor) = self.live_actor(guild) {
+            update(&actor.live);
+            let _ = actor.tx.send(ActorCommand::Reconcile);
+        }
+    }
+
+    fn creator_added(&self, creator: &CreatorChannel, channel: Channel) {
+        if let Some(actor) = self.live_actor(creator.guild_id) {
+            actor.live.upsert_channel(channel);
+            let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
+        }
+    }
+
+    pub fn disconnect(&self) {
+        for actor in self.actors.lock().expect("voice runtime lock").values() {
+            actor.live.disconnect();
         }
     }
 }
@@ -1280,48 +1308,51 @@ where
             }
             Event::ChannelCreate(created) => {
                 if let Some(guild_id) = created.guild_id.map(|id| id.get()) {
-                    self.send_to_live(
-                        guild_id,
-                        ActorCommand::ChannelUpsert(Box::new(created.0.clone())),
-                    );
+                    self.update_live(guild_id, |live| live.upsert_channel(created.0.clone()));
                 }
             }
             Event::ChannelUpdate(updated) => {
                 if let Some(guild_id) = updated.guild_id.map(|id| id.get()) {
-                    self.send_to_live(
-                        guild_id,
-                        ActorCommand::ChannelUpsert(Box::new(updated.0.clone())),
-                    );
+                    self.update_live(guild_id, |live| live.upsert_channel(updated.0.clone()));
                 }
             }
             Event::ChannelDelete(deleted) => {
                 if let Some(guild_id) = deleted.guild_id.map(|id| id.get()) {
-                    self.send_to_live(guild_id, ActorCommand::ChannelRemove(deleted.id.get()));
+                    self.update_live(guild_id, |live| live.remove_channel(deleted.id.get()));
                 }
             }
             Event::RoleCreate(created) => {
                 let guild_id = created.guild_id.get();
                 if let Some(access) = bot_access_from_cache(cache, guild_id) {
-                    self.send_to_live(guild_id, ActorCommand::RefreshBot(access));
+                    self.update_live(guild_id, |live| live.refresh_bot(access));
                 }
             }
             Event::RoleUpdate(updated) => {
                 let guild_id = updated.guild_id.get();
                 if let Some(access) = bot_access_from_cache(cache, guild_id) {
-                    self.send_to_live(guild_id, ActorCommand::RefreshBot(access));
+                    self.update_live(guild_id, |live| live.refresh_bot(access));
                 }
             }
             Event::RoleDelete(deleted) => {
                 let guild_id = deleted.guild_id.get();
                 if let Some(access) = bot_access_from_cache(cache, guild_id) {
-                    self.send_to_live(guild_id, ActorCommand::RefreshBot(access));
+                    self.update_live(guild_id, |live| live.refresh_bot(access));
                 }
             }
-            // RESUMED keeps the cache but proves nothing about the outage
-            // window: re-publish every known guild from the cache so tracked
-            // rooms reconcile against actual channels (spec "Discord API notes").
-            // READY alone is not sufficient (GuildCreate follows with state).
-            // MemberUpdate carries no voice data; voice frames feed bot flags.
+            Event::MemberUpdate(updated) => {
+                if cache
+                    .current_user()
+                    .is_some_and(|bot| bot.id == updated.user.id)
+                {
+                    let guild_id = updated.guild_id.get();
+                    if let Some(access) = bot_access_from_cache(cache, guild_id) {
+                        self.update_live(guild_id, |live| live.refresh_bot(access));
+                    }
+                }
+            }
+            // A warm RESUME replays missed dispatches before RESUMED; only then
+            // may cached occupancy become authoritative again. READY alone is
+            // not sufficient (GuildCreate follows with state).
             Event::Resumed => {
                 for guild_id in self.known_guilds() {
                     if let Some(snapshot) = snapshot_from_cache(cache, guild_id) {
@@ -1334,6 +1365,14 @@ where
             }
             _ => {}
         }
+    }
+
+    fn disconnect(&self) {
+        VoiceRuntime::disconnect(self);
+    }
+
+    fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
+        self.enabled && cache.current_user().is_none()
     }
 }
 
@@ -1358,11 +1397,10 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                     .elapsed()
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64;
-                for _ in 0..64 {
-                    if !worker.dispatch_one(now_ms).await {
-                        break;
-                    }
-                }
+                // Return to the inbox after each await. Evidence is already
+                // live, but creator configuration/status commands must not sit
+                // behind a 64-write burst either.
+                worker.dispatch_one(now_ms).await;
             }
         }
     }
@@ -1373,34 +1411,18 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
     command: ActorCommand,
 ) {
     match command {
-        ActorCommand::Publish(snapshot) => {
-            if worker.live.publish(snapshot) {
-                worker.reconcile();
-            }
-        }
-        ActorCommand::VoiceFrame {
-            member,
-            channel,
-            bot,
+        ActorCommand::Reconcile => worker.reconcile(),
+        ActorCommand::Join {
+            ticket,
             name,
             seed,
             created_at,
         } => {
-            if let Some(ticket) = worker.live.voice_update(member, channel, bot) {
-                worker.accept_join(ticket, name, seed, created_at);
-            }
+            worker.accept_join(ticket, name, seed, created_at);
             worker.reconcile();
         }
-        ActorCommand::ChannelUpsert(channel) => {
-            worker.live.upsert_channel(*channel);
-            worker.reconcile();
-        }
-        ActorCommand::ChannelRemove(channel) => {
-            worker.live.remove_channel(channel);
-            worker.reconcile();
-        }
-        ActorCommand::RefreshBot(access) => {
-            worker.live.refresh_bot(access);
+        ActorCommand::CreatorAdded(creator) => {
+            worker.creators.insert(creator.channel_id, creator);
             worker.reconcile();
         }
         ActorCommand::Status(reply) => {
@@ -1747,6 +1769,7 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
     http: &H,
     guild_id: Snowflake,
     name: &str,
+    on_created: impl FnOnce(&CreatorChannel, Channel),
 ) -> String {
     let attributes = RoomChannelAttributes {
         parent_id: None,
@@ -1766,11 +1789,12 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
         Err(error) => return create_error_text(error),
     };
     let channel_id = channel.id.get();
-    match store
-        .add_creator(&CreatorChannel::new(guild_id, channel_id))
-        .await
-    {
-        Ok(()) => format!("Created <#{channel_id}>: join it to spin up temporary voice rooms."),
+    let creator = CreatorChannel::new(guild_id, channel_id);
+    match store.add_creator(&creator).await {
+        Ok(()) => {
+            on_created(&creator, channel);
+            format!("Created <#{channel_id}>: join it to spin up temporary voice rooms.")
+        }
         Err(error) => {
             let compensation = http.delete(channel_id, always).await;
             let removed = compensation.is_ok();
@@ -1857,7 +1881,10 @@ where
                 CreateChannelPlan::Refuse { message } => message,
                 CreateChannelPlan::Create { guild_id, name } => {
                     let (store, http) = runtime.make_pair();
-                    execute_create(&store, &http, guild_id, &name).await
+                    execute_create(&store, &http, guild_id, &name, |creator, channel| {
+                        runtime.creator_added(creator, channel);
+                    })
+                    .await
                 }
             };
             reply(ephemeral_response(&text)).await;
@@ -1971,6 +1998,14 @@ where
                 Self::respond(&runtime, &replies, &interaction).await;
             });
         }
+    }
+
+    fn disconnect(&self) {
+        self.runtime.disconnect();
+    }
+
+    fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
+        self.runtime.needs_bootstrap(cache)
     }
 }
 

@@ -1232,7 +1232,7 @@ async fn execute_create_rest_failure_never_touches_store() {
         .lock()
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
-    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    let text = execute_create(&store, &http, GUILD, "lobby", |_, _| {}).await;
     assert!(text.contains("Manage Channels"));
     assert!(!trace
         .lock()
@@ -1253,7 +1253,7 @@ async fn execute_create_rate_limit_reports_retry_seconds() {
             retry_after_ms: 1500,
             global: false,
         });
-    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    let text = execute_create(&store, &http, GUILD, "lobby", |_, _| {}).await;
     assert!(text.contains("2s"));
 }
 
@@ -1263,7 +1263,7 @@ async fn execute_create_store_failure_deletes_channel_as_compensation() {
     let store = Store::new(trace.clone());
     *store.add_creator_error.lock().unwrap() = Some(StoreError::Unavailable);
     let http = Http::new(trace.clone());
-    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    let text = execute_create(&store, &http, GUILD, "lobby", |_, _| {}).await;
     assert!(text.contains("removed"));
     assert_eq!(*trace.lock().unwrap(), ["create", "delete:500"]);
 }
@@ -1274,7 +1274,7 @@ async fn execute_create_store_credential_pause() {
     let store = Store::new(trace.clone());
     *store.add_creator_error.lock().unwrap() = Some(StoreError::CredentialRefused);
     let http = Http::new(trace.clone());
-    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    let text = execute_create(&store, &http, GUILD, "lobby", |_, _| {}).await;
     assert!(text.contains("paused"));
     assert!(text.contains("removed"));
     assert_eq!(*trace.lock().unwrap(), ["create", "delete:500"]);
@@ -1290,7 +1290,7 @@ async fn execute_create_failed_compensation_names_orphan_channel() {
         .lock()
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
-    let text = execute_create(&store, &http, GUILD, "lobby").await;
+    let text = execute_create(&store, &http, GUILD, "lobby", |_, _| {}).await;
     assert!(!text.contains("was removed"));
     assert!(text.contains("manually"));
     assert!(text.contains("<#500>"));

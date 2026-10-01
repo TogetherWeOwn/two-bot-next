@@ -194,6 +194,18 @@ pub async fn run_shard(
     result
 }
 
+/// Covers stream termination, parse/checkpoint failures and task cancellation,
+/// not just close frames observed by the packet loop.
+struct VoiceConnectionGuard<'a>(Option<&'a Arc<dyn VoiceEventSink>>);
+
+impl Drop for VoiceConnectionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(voice) = self.0 {
+            voice.disconnect();
+        }
+    }
+}
+
 async fn run_loop(
     shard: &mut Shard,
     pipeline: &GatewayPipeline,
@@ -202,6 +214,7 @@ async fn run_loop(
     sticky: Option<&Arc<crate::sticky_runtime::StickyRuntime>>,
     voice: Option<&Arc<dyn VoiceEventSink>>,
 ) -> Result<(), sqlx::Error> {
+    let _voice_connection = VoiceConnectionGuard(voice);
     let mut observer = crate::gateway_metrics::Observer::default();
     let mut deadline = CHECKPOINT_IO_MAX;
     let mut committed = checkpoint_io(state, deadline, store.load()).await?;
@@ -215,6 +228,9 @@ async fn run_loop(
                     twilight_gateway::error::ReceiveMessageErrorType::Reconnect
                 ) =>
             {
+                if let Some(voice) = voice {
+                    voice.disconnect();
+                }
                 *state.write().await = GatewayState::Armed;
                 warn!("gateway reconnect failed; Twilight will retry");
                 continue;
@@ -227,6 +243,9 @@ async fn run_loop(
         };
         observer.observe(&message, shard);
         let Message::Text(text) = message else {
+            if let Some(voice) = voice {
+                voice.disconnect();
+            }
             *state.write().await = GatewayState::Armed;
             // Twilight 0.17.1 retains its session on gateway-initiated closes.
             // Discord requires a new session for these two reconnectable codes.
@@ -258,6 +277,12 @@ async fn run_loop(
             }
             deadline = CHECKPOINT_IO_MAX
                 .min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
+        }
+        if matches!(header.op, 7 | 9) {
+            if let Some(voice) = voice {
+                voice.disconnect();
+            }
+            *state.write().await = GatewayState::Armed;
         }
         if header.op == 9 {
             let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
@@ -310,6 +335,7 @@ async fn run_loop(
             )
         })?;
         let mut connected = false;
+        let mut voice_bootstrap = false;
         if let Some(parsed) = parsed {
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
@@ -323,6 +349,8 @@ async fn run_loop(
             // handling never blocks (actor inbox), failures stay in the
             // worker — never here.
             if let Some(sink) = voice {
+                voice_bootstrap =
+                    matches!(event, Event::Resumed) && sink.needs_bootstrap(pipeline.cache());
                 sink.handle(&event, pipeline.cache());
             }
         }
@@ -334,6 +362,21 @@ async fn run_loop(
         .await?;
         timer.committed();
         committed = Some(checkpoint);
+        if voice_bootstrap {
+            // Recover missed dispatches via the saved RESUME first. Only after
+            // RESUMED commits do we IDENTIFY to receive authoritative READY +
+            // GuildCreate state. Keep the durable checkpoint until the new
+            // session commits; duplicate delivery remains fenced as before.
+            if let Some(voice) = voice {
+                voice.disconnect();
+            }
+            *state.write().await = GatewayState::Armed;
+            // Twilight consumes the boot session from config on construction;
+            // the live shard's config clone therefore starts a fresh IDENTIFY.
+            *shard = Shard::with_config(shard.id(), shard.config().clone());
+            info!("cold resume committed; requesting voice snapshot via identify");
+            continue;
+        }
         if connected {
             *state.write().await = GatewayState::Connected;
             info!(sequence, "gateway ready; checkpoint committed");
@@ -429,7 +472,9 @@ pub async fn build_voice_runtime(
             return None;
         }
     };
-    let db = match connect(&database_url, DB_POOL_MAX_DEFAULT, false).await {
+    // Migrations belong to the operator's migrator role, never the DML-only
+    // runtime credential. Voice consumes the already-migrated schema.
+    let db = match connect(&database_url, DB_POOL_MAX_DEFAULT, true).await {
         Ok(db) => db,
         Err(err) => {
             warn!(error = %err, "voice database unavailable; voice rooms disabled");

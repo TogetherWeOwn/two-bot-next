@@ -87,6 +87,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0160_rsvp.sql"),
         include_str!("../../cutover/migrations/0170_lfg.sql"),
         include_str!("../../cutover/migrations/0190_onboarding.sql"),
+        include_str!("../../cutover/migrations/0200_voice_rooms.sql"),
+        include_str!("../../cutover/migrations/0201_voice_inherit_limit.sql"),
         include_str!("../../cutover/migrations/0300_website_contract.sql"),
         include_str!("../../cutover/migrations/0310_presence_probe.sql"),
         include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
