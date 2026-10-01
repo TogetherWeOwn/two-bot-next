@@ -199,10 +199,9 @@ fn malformed_policy_headers_fail_closed_through_the_production_gate() {
 
 /// The absolute deadline governs the synchronous decode path, not just
 /// pending DNS/body awaits. With an already-expired budget, decode must
-/// return `Deadline` — never a success past the budget. Deterministic: on
-/// the timeout's first poll the spawned decode cannot have completed (the
-/// polling thread never yields mid-poll), while the elapsed sleep is ready
-/// immediately, so the delay arm always wins.
+/// return `Deadline` — never a success past the budget. The explicit deadline
+/// checks must enforce this regardless of whether the blocking task or the
+/// timeout timer is ready first.
 #[tokio::test]
 async fn expired_deadline_refuses_decode_instead_of_succeeding() {
     use flate2::write::GzEncoder;

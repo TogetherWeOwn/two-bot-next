@@ -444,15 +444,19 @@ async fn decode_later(
     wire: Vec<u8>,
     deadline: &FetchDeadline,
 ) -> Result<Vec<u8>, FeedConnectError> {
+    deadline.check()?;
     let at = deadline.at;
     let budget_ms = deadline.budget_ms;
-    tokio::time::timeout_at(
+    let decoded = tokio::time::timeout_at(
         at.into(),
         tokio::task::spawn_blocking(move || decode_wire(&wire, coding)),
     )
     .await
     .map_err(|_| FeedConnectError::Deadline(budget_ms))?
-    .map_err(|err| FeedConnectError::Transport(format!("feed body decode failed: {err}")))?
+    .map_err(|err| FeedConnectError::Transport(format!("feed body decode failed: {err}")))??;
+    // A ready task can win the timeout poll even after the timer expires.
+    deadline.check()?;
+    Ok(decoded)
 }
 
 /// Decode `Content-Encoding` bodies; decompressed output is capped at
