@@ -186,7 +186,7 @@ jobs:
   sbom-target:
     needs: release-please
     if: ${{ !cancelled() && (inputs.dry_run == true || inputs.release_tag != '' || needs.release-please.outputs.release_created == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     permissions:
       contents: read
     outputs:
@@ -215,7 +215,7 @@ jobs:
   attach-sbom:
     needs: [sbom-target, release-sbom]
     if: ${{ !cancelled() && needs.release-sbom.result == 'success' && needs.sbom-target.outputs.tag != '' }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 5
     permissions:
       contents: write

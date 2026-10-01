@@ -1,7 +1,7 @@
 # Container scan and release SBOMs
 
 `check.yml` calls the same read-only `supply-chain.yml` used by releases. It
-builds the Dockerfile on a hosted runner, without registry push or deployment,
+builds the Dockerfile on `[self-hosted, two-selfhosted]`, without registry push or deployment,
 then inventories the exact image and all packages in the workspace Cargo.lock
 (including workspace, optional and development dependencies). The Rust BOM is
 not a claim that every locked package is linked into the runtime executable.
@@ -38,18 +38,23 @@ and use the explicit repair input below. Publication isn't atomic with
 release-please; require the assets before treating the release as fully delivered.
 
 ```sh
-# Safe branch dry-run: skips release-please, PR reconciliation/dispatch and uploads.
-# Use the existing GitHub broker; do not export a personal GH_TOKEN.
-gh workflow run release.yml --ref <branch> -f dry_run=true
-# Inspect the resulting run's supply-chain artifact: two nonempty CycloneDX BOMs,
+# Opening/updating a PR automatically runs check.yml's PR SBOM dry-run.
+# The 40-minute job has contents: read, no deploy secrets and no publishing path.
+# No release workflow dispatch or pull_request_target is required.
+# Inspect the PR run's supply-chain artifact: two nonempty CycloneDX BOMs,
 # SHA256SUMS, source SHA/image ID, and both vulnerability reports.
 gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 # Repair assets on an existing stable release; rebuilds its tag, not current main.
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
-The dry-run always inventories its workflow source SHA and has no publication
-tag, even if a release tag input is also supplied. The repair path skips
+The PR dry-run inventories the exact PR head SHA, validates lockfile coverage
+and Debian image components, and records checksums/provenance before scanning.
+Image tags include the Actions run ID and attempt; Trivy's cache is run-local.
+Cleanup removes only that run's image tag, never shared Docker caches.
+The optional release-workflow dry-run input also has no publication tag, even
+if a release tag input is supplied; PR verification does not use that dispatch.
+The repair path skips
 release-please and replaces assets only after the full scan passes. Release
 upload uses the short-lived Actions GITHUB_TOKEN with only `contents: write`;
 all builder/scanner jobs have only `contents: read` and no repository credential

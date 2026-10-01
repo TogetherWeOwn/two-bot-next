@@ -123,6 +123,25 @@ class SupplyChainTests(unittest.TestCase):
         self.assertTrue(images[1].startswith("debian:bookworm-slim@"))
         self.assertIn("package-ecosystem: docker", (ROOT / ".github/dependabot.yml").read_text())
 
+    def test_pr_dry_run_is_read_only_bounded_and_isolated(self):
+        check = (ROOT / ".github/workflows/check.yml").read_text()
+        supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        self.assertIn("pull_request:", check)
+        self.assertIn("name: PR SBOM dry-run", check)
+        self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", check)
+        self.assertNotIn("pull_request_target", check + supply)
+        self.assertIn("timeout-minutes: 40", supply)
+        self.assertIn("contents: read", supply)
+        self.assertNotIn("secrets:", supply)
+        self.assertIn("push: false", supply)
+        self.assertIn("two-bot-next:scan-${{ github.run_id }}-${{ github.run_attempt }}", supply)
+        self.assertEqual(supply.count("image-ref: ${{ env.IMAGE }}"), 2)
+        self.assertIn('docker image rm "$IMAGE"', supply)
+        self.assertIn("TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache", supply)
+        for name in ["check", "release", "supply-chain"]:
+            path = ROOT / ".github/workflows" / f"{name}.yml"
+            self.assertNotIn("ubuntu-latest", path.read_text(), str(path))
+
     def test_shared_gate_and_dry_run_publication_guards(self):
         supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
         release = (ROOT / ".github/workflows/release.yml").read_text()
