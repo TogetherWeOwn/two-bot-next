@@ -165,7 +165,7 @@ per-connection `after_connect`, verifying `current_user` on every connection.
 Invocation (secret-free; the URL comes only from the existing
 `TWO_BOT_STAGING_MIGRATOR_DATABASE_URL` binding):
 
-```bash
+```text
 staging-migrate --plan --source-sha <40hex> --staging-host <host> \
   --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
 ```
