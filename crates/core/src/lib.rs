@@ -125,9 +125,11 @@ pub use community_snapshots::{
 pub use config::Config;
 pub use containment::{
     plan_quarantine, quarantine_outcome, role_removal_status, ClaimedContainmentEvent,
-    ContainmentDisposition, ContainmentEventState, ContainmentIncident, ContainmentIncidentState,
-    ContainmentPolicy, ContainmentPolicyError, ContainmentReason, ContainmentRole,
-    DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan, QuarantineRefusal,
+    ContainmentAlert, ContainmentDisposition, ContainmentEventState, ContainmentIncident,
+    ContainmentIncidentState, ContainmentPolicy, ContainmentPolicyError, ContainmentReason,
+    ContainmentRole, ContainmentSignal, DestructiveAction, DestructiveAuditEvent,
+    QuarantineFailure, QuarantinePlan, QuarantineRefusal, CONTAINMENT_ALERT_EVENT,
+    CONTAINMENT_ALERT_MAX_IDS, CONTAINMENT_SUPPRESSED_EVENT,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
