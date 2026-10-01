@@ -64,8 +64,12 @@ impl FixtureHttp {
 }
 
 impl FeedResolver for FixtureHttp {
-    async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, std::io::Error> {
-        Ok(vec!["93.184.216.34".parse().unwrap()])
+    fn resolve(
+        &self,
+        _host: &str,
+        _port: u16,
+    ) -> impl std::future::Future<Output = Result<Vec<IpAddr>, std::io::Error>> + Send + '_ {
+        std::future::ready(Ok(vec!["93.184.216.34".parse().unwrap()]))
     }
 }
 
