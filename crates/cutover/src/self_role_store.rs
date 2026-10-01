@@ -192,8 +192,8 @@ pub enum ExchangeReceipt {
 }
 
 /// Current-owner aggregate evidence, not authorization to retry or settle.
-/// Incorporation never clears inherited pending/unresolved evidence: the legacy
-/// aggregate schema cannot attribute overlapping uncertainty to a single ticket.
+/// Conservative incorporation never clears uncertainty. Explicit retirement can
+/// clear completed ticket contributions but never legacy or other pending work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptEvidence {
     pub effects: AuditEffects,
@@ -653,6 +653,9 @@ impl SelfRoleStore {
         }
         let effects = claim.preserve_unknown(effects);
         let changed = record_terminal_exchange(&mut tx, &claim.event, &effects, Some(true)).await?;
+        if changed {
+            pin_legacy_exchange(&mut tx, &claim.event, &effects).await?;
+        }
         tx.commit().await?;
         Ok(changed)
     }
@@ -701,7 +704,8 @@ impl SelfRoleStore {
         }
         let (pending, unresolved): (bool, bool) = sqlx::query_as(
             "SELECT (exchange_pending OR EXISTS
-                 (SELECT 1 FROM self_role_exchanges WHERE event_id=$1 AND disposition='pending')),
+                 (SELECT 1 FROM self_role_exchanges WHERE event_id=$1 AND retired_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM self_role_exchange_baselines WHERE event_id=$1 AND legacy_pending)),
              (jsonb_array_length(unresolved_added_role_ids::jsonb)>0
              OR jsonb_array_length(unresolved_removed_role_ids::jsonb)>0)
              FROM self_role_audit WHERE event_id=$1",
@@ -1426,6 +1430,81 @@ impl SelfRoleStore {
         Ok(Some(evidence))
     }
 
+    /// Retire completed ticket uncertainty only under the current live fences.
+    /// Receipt rows are locked before sampling time; pending tickets and explicit
+    /// legacy uncertainty are never retired. A received ambiguous response keeps
+    /// effect uncertainty even though its send provenance is no longer unknown.
+    pub async fn retire_role_receipts(
+        &self,
+        claim: &EventClaim,
+        panel: Option<&PanelClaim>,
+    ) -> Result<Option<ReceiptEvidence>, StoreError> {
+        if panel.is_some_and(|panel| panel.maintenance) {
+            return Err(StoreError::WrongPanel);
+        }
+        let mut tx = self.pool.begin().await?;
+        if let Some(panel) = panel {
+            lock_panel(&mut tx, panel).await?;
+        }
+        lock_event(&mut tx, claim).await?;
+        check_panel_scope(&mut tx, claim, panel).await?;
+        lock_exchange_receipts(&mut tx, claim).await?;
+        let now = self.now(&mut tx).await?;
+        let (owned,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM self_role_audit WHERE event_id=$1
+             AND claim_token=$2 AND claim_generation=$3 AND outcome='processing'
+             AND intent_initialized AND processing_expires_at > $4)",
+        )
+        .bind(&claim.event_id)
+        .bind(claim.token.expose())
+        .bind(claim.generation)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !owned || !claim.intent_initialized {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        if let Some(panel) = panel {
+            if !owns_live_panel(&mut tx, panel, now).await? {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+        }
+        let evidence = retire_exchange_evidence(&mut tx, claim, now).await?;
+        tx.commit().await?;
+        Ok(Some(evidence))
+    }
+
+    /// Terminal retirement requires both current repair fences. Refresh the typed
+    /// acquisition snapshot only after commit so later preservation cannot revive
+    /// this owner's already-retired ticket uncertainty. Outcome/intent stay fixed.
+    pub async fn retire_terminal_receipts(
+        &self,
+        claim: &mut SupersededClaim,
+        panel: &PanelClaim,
+    ) -> Result<Option<ReceiptEvidence>, StoreError> {
+        check_repair_scope(claim, panel)?;
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, panel).await?;
+        lock_event(&mut tx, &claim.event).await?;
+        lock_exchange_receipts(&mut tx, &claim.event).await?;
+        let now = self.now(&mut tx).await?;
+        if !claim.intent_initialized()
+            || !owns_terminal(&mut tx, claim, now).await?
+            || !owns_repair_panel(&mut tx, panel, now).await?
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let evidence = retire_exchange_evidence(&mut tx, &claim.event, now).await?;
+        tx.commit().await?;
+        claim.event.effects = evidence.effects.clone();
+        claim.event.exchange_pending = evidence.exchange_pending;
+        claim.audit.effects = evidence.effects.clone();
+        Ok(Some(evidence))
+    }
+
     /// Atomically retain exchange evidence and the monotonic rollback decision.
     /// Like late effects this is token/generation fenced, not REST authorization.
     /// A false phase never clears a persisted rollback, including after recovery.
@@ -1449,6 +1528,31 @@ impl SelfRoleStore {
         compensating: bool,
         exchange_pending: Option<bool>,
     ) -> Result<bool, StoreError> {
+        self.checkpoint_exchange_inner(claim, effects, compensating, exchange_pending, false)
+            .await
+    }
+
+    /// Compatibility journal for lane-only stale maintenance, not send authority.
+    /// If tickets already exist, pin this untracked attempt in the legacy floor
+    /// atomically with its aggregate journal. Never manufacture a live event.
+    pub async fn journal_legacy_exchange(
+        &self,
+        claim: &EventClaim,
+        effects: &AuditEffects,
+        compensating: bool,
+    ) -> Result<bool, StoreError> {
+        self.checkpoint_exchange_inner(claim, effects, compensating, Some(true), true)
+            .await
+    }
+
+    async fn checkpoint_exchange_inner(
+        &self,
+        claim: &EventClaim,
+        effects: &AuditEffects,
+        compensating: bool,
+        exchange_pending: Option<bool>,
+        legacy_journal: bool,
+    ) -> Result<bool, StoreError> {
         // Read pending tickets only after the audit lock wait. A statement begun
         // before a journal commits must not clear it using a pre-wait snapshot.
         let mut tx = self.pool.begin().await?;
@@ -1466,21 +1570,28 @@ impl SelfRoleStore {
              unresolved_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
                  FROM (SELECT value FROM jsonb_array_elements_text($7::jsonb)
                        UNION SELECT role_id FROM self_role_exchanges
-                       WHERE event_id=$9 AND disposition='pending' AND adding) pending),
+                       WHERE event_id=$9 AND retired_at IS NULL AND adding
+                       UNION SELECT value FROM self_role_exchange_baselines,
+                           LATERAL jsonb_array_elements_text(unresolved_added_role_ids::jsonb)
+                       WHERE event_id=$9) pending),
              unresolved_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
                  FROM (SELECT value FROM jsonb_array_elements_text($8::jsonb)
                        UNION SELECT role_id FROM self_role_exchanges
-                       WHERE event_id=$9 AND disposition='pending' AND NOT adding) pending),
+                       WHERE event_id=$9 AND retired_at IS NULL AND NOT adding
+                       UNION SELECT value FROM self_role_exchange_baselines,
+                           LATERAL jsonb_array_elements_text(unresolved_removed_role_ids::jsonb)
+                       WHERE event_id=$9) pending),
              compensating=compensating OR $12,
              exchange_pending=COALESCE($13,exchange_pending) OR EXISTS
-                 (SELECT 1 FROM self_role_exchanges WHERE event_id=$9 AND disposition='pending')
+                 (SELECT 1 FROM self_role_exchanges WHERE event_id=$9 AND retired_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM self_role_exchange_baselines WHERE event_id=$9 AND legacy_pending)
              WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11 AND outcome='processing'
              AND (NOT $12 OR intent_initialized)",
         );
         for effect in effects.encoded() {
             query = query.bind(effect);
         }
-        let changed = query
+        let mut changed = query
             .bind(&claim.event_id)
             .bind(claim.token.expose())
             .bind(claim.generation)
@@ -1490,6 +1601,14 @@ impl SelfRoleStore {
             .await?
             .rows_affected()
             == 1;
+        if legacy_journal {
+            if !changed {
+                changed = record_terminal_exchange(&mut tx, claim, effects, Some(true)).await?;
+            }
+            if changed {
+                pin_legacy_exchange(&mut tx, claim, effects).await?;
+            }
+        }
         tx.commit().await?;
         Ok(changed)
     }
@@ -1638,6 +1757,195 @@ async fn check_panel_scope(
     Ok(guild)
 }
 
+// Audit locking serializes baseline capture with tracked and legacy journals.
+// Only the pre-ticket aggregate is captured; repeated calls never absorb ticket
+// uncertainty into the legacy floor. Missing upgrade attribution fails closed.
+async fn ensure_exchange_baseline(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO self_role_exchange_baselines
+         (event_id,legacy_pending,unresolved_added_role_ids,unresolved_removed_role_ids)
+         SELECT event_id,exchange_pending OR unresolved_added_role_ids <> '[]'
+             OR unresolved_removed_role_ids <> '[]',unresolved_added_role_ids,unresolved_removed_role_ids
+         FROM self_role_audit WHERE event_id=$1 ON CONFLICT (event_id) DO NOTHING",
+    )
+    .bind(&claim.event_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+// A baseline exists only after upgrade/capture. Before that, the aggregate itself
+// remains the legacy provenance and will be captured before any tracked ticket.
+async fn pin_legacy_exchange(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+    effects: &AuditEffects,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE self_role_exchange_baselines SET legacy_pending=TRUE,
+         unresolved_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(unresolved_added_role_ids::jsonb || $2::jsonb)),
+         unresolved_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(unresolved_removed_role_ids::jsonb || $3::jsonb))
+         WHERE event_id=$1",
+    )
+    .bind(&claim.event_id)
+    .bind(ids_json(&effects.unresolved_added_role_ids))
+    .bind(ids_json(&effects.unresolved_removed_role_ids))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+async fn lock_exchange_receipts(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "SELECT exchange_id FROM self_role_exchanges WHERE event_id=$1
+         ORDER BY exchange_id FOR UPDATE",
+    )
+    .bind(&claim.event_id)
+    .fetch_all(conn)
+    .await?;
+    Ok(())
+}
+
+// Caller owns panel -> audit -> receipt locks and checked the post-wait clock.
+async fn retire_exchange_evidence(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+    now: OffsetDateTime,
+) -> Result<ReceiptEvidence, StoreError> {
+    ensure_exchange_baseline(conn, claim).await?;
+    let (legacy_pending, added, removed): (bool, String, String) = sqlx::query_as(
+        "SELECT legacy_pending,unresolved_added_role_ids,unresolved_removed_role_ids
+         FROM self_role_exchange_baselines WHERE event_id=$1",
+    )
+    .bind(&claim.event_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let legacy_added: Vec<String> = serde_json::from_str(&added)?;
+    let legacy_removed: Vec<String> = serde_json::from_str(&removed)?;
+    let (fields,): (Vec<String>,) = sqlx::query_as(
+        "SELECT ARRAY[added_role_ids,removed_role_ids,attempted_added_role_ids,
+         attempted_removed_role_ids,compensated_added_role_ids,compensated_removed_role_ids,
+         unresolved_added_role_ids,unresolved_removed_role_ids]
+         FROM self_role_audit WHERE event_id=$1",
+    )
+    .bind(&claim.event_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let receipts: Vec<RetirementRow> = sqlx::query_as(
+        "SELECT role_id,adding,compensating,disposition,response_status,retired_at IS NOT NULL
+         FROM self_role_exchanges WHERE event_id=$1",
+    )
+    .bind(&claim.event_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let evidence = retired_receipt_evidence(
+        AuditEffects::decoded(&fields)?,
+        legacy_pending,
+        &legacy_added,
+        &legacy_removed,
+        &receipts,
+    );
+    sqlx::query(
+        "UPDATE self_role_exchanges SET retired_at=$2,retired_generation=$3
+         WHERE event_id=$1 AND retired_at IS NULL AND disposition <> 'pending'",
+    )
+    .bind(&claim.event_id)
+    .bind(now)
+    .bind(claim.generation)
+    .execute(&mut *conn)
+    .await?;
+    let mut query = sqlx::query(
+        "UPDATE self_role_audit SET attempted_added_role_ids=$1,attempted_removed_role_ids=$2,
+         compensated_added_role_ids=$3,compensated_removed_role_ids=$4,
+         unresolved_added_role_ids=$5,unresolved_removed_role_ids=$6,
+         exchange_pending=$7 WHERE event_id=$8",
+    );
+    for field in evidence.effects.encoded().into_iter().skip(2) {
+        query = query.bind(field);
+    }
+    query
+        .bind(evidence.exchange_pending)
+        .bind(&claim.event_id)
+        .execute(conn)
+        .await?;
+    Ok(evidence)
+}
+
+type RetirementRow = (String, bool, bool, String, Option<i16>, bool);
+
+fn retired_receipt_evidence(
+    mut effects: AuditEffects,
+    legacy_pending: bool,
+    legacy_added: &[String],
+    legacy_removed: &[String],
+    receipts: &[RetirementRow],
+) -> ReceiptEvidence {
+    let unattributed = effects.unresolved_added_role_ids.iter().any(|role| {
+        !receipts
+            .iter()
+            .any(|receipt| receipt.0 == *role && receipt.1)
+    }) || effects.unresolved_removed_role_ids.iter().any(|role| {
+        !receipts
+            .iter()
+            .any(|receipt| receipt.0 == *role && !receipt.1)
+    });
+    // Clear only newly completed ticket contributions, then union every pending
+    // ticket and the immutable legacy floor. Already-retired ambiguity remains
+    // snapshot evidence: do not clear it here or resurrect it after observation.
+    for (ids, adding) in [
+        (&mut effects.unresolved_added_role_ids, true),
+        (&mut effects.unresolved_removed_role_ids, false),
+    ] {
+        ids.retain(|role| {
+            let completed = receipts.iter().any(|receipt| {
+                receipt.0 == *role && receipt.1 == adding && !receipt.5 && receipt.3 != "pending"
+            });
+            let prior_ambiguous = receipts.iter().any(|receipt| {
+                receipt.0 == *role
+                    && receipt.1 == adding
+                    && receipt.5
+                    && receipt.3 == "response"
+                    && !receipt
+                        .4
+                        .is_some_and(|status| status == 204 || (400..=499).contains(&status))
+            });
+            !completed || prior_ambiguous
+        });
+    }
+    for role in legacy_added {
+        retain_role(&mut effects.unresolved_added_role_ids, role);
+    }
+    for role in legacy_removed {
+        retain_role(&mut effects.unresolved_removed_role_ids, role);
+    }
+    let mut evidence = ReceiptEvidence {
+        effects,
+        exchange_pending: legacy_pending || unattributed,
+    };
+    for (role, adding, compensating, disposition, status, retired) in receipts {
+        // Retirement preserves historical attempts/204 compensation but only a
+        // newly incorporated response contributes new effect uncertainty.
+        merge_receipt_evidence(
+            &mut evidence,
+            role,
+            *adding,
+            *compensating,
+            disposition,
+            *status,
+            !*retired,
+        );
+    }
+    evidence
+}
+
 // Caller holds the audit lock and has checked every applicable live fence.
 // Receipt reads use a new post-lock snapshot. Completion takes no audit lock,
 // so a receipt arriving after this read is picked up by a later incorporation;
@@ -1674,6 +1982,7 @@ async fn incorporate_exchange_evidence(
             compensating,
             &disposition,
             status,
+            true,
         );
     }
     let mut query = sqlx::query(
@@ -1701,6 +2010,7 @@ fn merge_receipt_evidence(
     compensating: bool,
     disposition: &str,
     status: Option<i16>,
+    include_uncertainty: bool,
 ) {
     let effects = &mut evidence.effects;
     let attempted = if adding {
@@ -1720,7 +2030,7 @@ fn merge_receipt_evidence(
     let definite = disposition == "no_send"
         || (disposition == "response"
             && status.is_some_and(|status| status == 204 || (400..=499).contains(&status)));
-    if !definite {
+    if !definite && include_uncertainty {
         // A received ambiguous status is not an unknown in-flight send. Retain
         // effect uncertainty without reopening a sender-resolved pending flag.
         if disposition != "response" {
@@ -1772,6 +2082,7 @@ async fn insert_role_exchange(
     claim: &EventClaim,
     intent: &ExchangeIntent,
 ) -> Result<ExchangeTicket, StoreError> {
+    ensure_exchange_baseline(&mut *conn, claim).await?;
     let (exchange_id, receipt_token): (String, String) = sqlx::query_as(
         "INSERT INTO self_role_exchanges
          (event_id,origin_generation,role_id,adding,compensating)
@@ -1890,13 +2201,20 @@ async fn record_terminal_exchange(
          unresolved_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
              FROM (SELECT value FROM jsonb_array_elements_text($7::jsonb)
                    UNION SELECT role_id FROM self_role_exchanges
-                   WHERE event_id=$9 AND disposition='pending' AND adding) pending),
+                   WHERE event_id=$9 AND retired_at IS NULL AND adding
+                       UNION SELECT value FROM self_role_exchange_baselines,
+                           LATERAL jsonb_array_elements_text(unresolved_added_role_ids::jsonb)
+                       WHERE event_id=$9) pending),
          unresolved_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
              FROM (SELECT value FROM jsonb_array_elements_text($8::jsonb)
                    UNION SELECT role_id FROM self_role_exchanges
-                   WHERE event_id=$9 AND disposition='pending' AND NOT adding) pending),
+                   WHERE event_id=$9 AND retired_at IS NULL AND NOT adding
+                       UNION SELECT value FROM self_role_exchange_baselines,
+                           LATERAL jsonb_array_elements_text(unresolved_removed_role_ids::jsonb)
+                       WHERE event_id=$9) pending),
          exchange_pending=COALESCE($12,exchange_pending) OR EXISTS
-             (SELECT 1 FROM self_role_exchanges WHERE event_id=$9 AND disposition='pending'),
+             (SELECT 1 FROM self_role_exchanges WHERE event_id=$9 AND retired_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM self_role_exchange_baselines WHERE event_id=$9 AND legacy_pending),
          repair_complete=FALSE
          WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11
          AND outcome='rejected' AND code='superseded_by_later_event'",
@@ -1937,7 +2255,8 @@ async fn require_settleable_event(
 ) -> Result<(), StoreError> {
     let pending: Option<(bool,)> = sqlx::query_as(
         "SELECT (exchange_pending OR EXISTS
-             (SELECT 1 FROM self_role_exchanges WHERE event_id=$1 AND disposition='pending'))
+             (SELECT 1 FROM self_role_exchanges WHERE event_id=$1 AND retired_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM self_role_exchange_baselines WHERE event_id=$1 AND legacy_pending))
          FROM self_role_audit WHERE event_id=$1
          AND claim_token=$2 AND claim_generation=$3 AND outcome='processing'
          AND intent_initialized AND processing_expires_at > $4",
@@ -2002,7 +2321,8 @@ async fn finish_audit(
          unresolved_added_role_ids=$14,unresolved_removed_role_ids=$15,processing_expires_at=NULL
          WHERE event_id=$16 AND claim_token=$17 AND claim_generation=$18 AND outcome='processing'
          AND guild_id=$19 AND member_id=$20 AND panel_id=$21 AND source_id=$22
-         AND NOT EXISTS (SELECT 1 FROM self_role_exchanges WHERE event_id=$16 AND disposition='pending')",
+         AND NOT EXISTS (SELECT 1 FROM self_role_exchanges WHERE event_id=$16 AND retired_at IS NULL)
+         AND NOT EXISTS (SELECT 1 FROM self_role_exchange_baselines WHERE event_id=$16 AND legacy_pending)",
     )
     .bind(&row.option_key)
     .bind(&row.role_id)
@@ -2036,6 +2356,132 @@ mod receipt_tests {
     use super::*;
 
     #[test]
+    fn retirement_preserves_legacy_overlap_and_ambiguous_effects() {
+        for adding in [false, true] {
+            for compensating in [false, true] {
+                for (disposition, status, ambiguous) in [
+                    ("no_send", None, false),
+                    ("response", Some(204), false),
+                    ("response", Some(403), false),
+                    ("response", Some(429), false),
+                    ("response", Some(500), true),
+                    ("response", Some(302), true),
+                    ("response", Some(200), true),
+                ] {
+                    let mut effects = AuditEffects::default();
+                    let unresolved = if adding {
+                        &mut effects.unresolved_added_role_ids
+                    } else {
+                        &mut effects.unresolved_removed_role_ids
+                    };
+                    unresolved.push("101".into());
+                    let completed = (
+                        "101".into(),
+                        adding,
+                        compensating,
+                        disposition.into(),
+                        status,
+                        false,
+                    );
+                    let pending = ("101".into(), adding, false, "pending".into(), None, false);
+                    let evidence = retired_receipt_evidence(
+                        effects.clone(),
+                        false,
+                        &[],
+                        &[],
+                        &[completed.clone()],
+                    );
+                    assert!(!evidence.exchange_pending);
+                    let unresolved = if adding {
+                        &evidence.effects.unresolved_added_role_ids
+                    } else {
+                        &evidence.effects.unresolved_removed_role_ids
+                    };
+                    assert_eq!(unresolved.contains(&"101".into()), ambiguous);
+                    let compensated = if adding {
+                        &evidence.effects.compensated_added_role_ids
+                    } else {
+                        &evidence.effects.compensated_removed_role_ids
+                    };
+                    assert_eq!(
+                        compensated.contains(&"101".into()),
+                        compensating && status == Some(204)
+                    );
+                    let overlap = retired_receipt_evidence(
+                        effects.clone(),
+                        false,
+                        &[],
+                        &[],
+                        &[completed.clone(), pending],
+                    );
+                    assert!(overlap.exchange_pending);
+                    assert!(if adding {
+                        &overlap.effects.unresolved_added_role_ids
+                    } else {
+                        &overlap.effects.unresolved_removed_role_ids
+                    }
+                    .contains(&"101".into()));
+                    let legacy = ["101".into()];
+                    let inherited = retired_receipt_evidence(
+                        effects,
+                        true,
+                        if adding { &legacy } else { &[] },
+                        if adding { &[] } else { &legacy },
+                        &[completed.clone()],
+                    );
+                    assert!(inherited.exchange_pending);
+                    assert!(if adding {
+                        &inherited.effects.unresolved_added_role_ids
+                    } else {
+                        &inherited.effects.unresolved_removed_role_ids
+                    }
+                    .contains(&"101".into()));
+                    let mut retired = completed;
+                    retired.5 = true;
+                    assert_eq!(
+                        retired_receipt_evidence(
+                            evidence.effects.clone(),
+                            false,
+                            &[],
+                            &[],
+                            &[retired.clone()]
+                        ),
+                        evidence,
+                    );
+                    // Observation can resolve effect ambiguity only after sender
+                    // completion. Replaying retirement must not reopen it.
+                    let observed = retired_receipt_evidence(
+                        AuditEffects::default(),
+                        false,
+                        &[],
+                        &[],
+                        &[retired],
+                    );
+                    assert!(!observed.exchange_pending);
+                    assert!(observed.effects.unresolved_added_role_ids.is_empty());
+                    assert!(observed.effects.unresolved_removed_role_ids.is_empty());
+                }
+            }
+        }
+        let ambiguous = (
+            "101".into(),
+            true,
+            false,
+            "response".into(),
+            Some(500),
+            true,
+        );
+        let no_send = ("101".into(), true, false, "no_send".into(), None, false);
+        let effects = AuditEffects {
+            unresolved_added_role_ids: vec!["101".into(), "999".into()],
+            ..AuditEffects::default()
+        };
+        let evidence = retired_receipt_evidence(effects, false, &[], &[], &[ambiguous, no_send]);
+        assert!(evidence.exchange_pending); // unrelated unattributed work
+        assert_eq!(evidence.effects.unresolved_added_role_ids, ["101", "999"]);
+    }
+
+    #[test]
     fn receipts_retain_unknown_and_only_acknowledge_204_compensation() {
         for adding in [false, true] {
             for compensating in [false, true] {
@@ -2066,6 +2512,7 @@ mod receipt_tests {
                         compensating,
                         disposition,
                         status,
+                        true,
                     );
                     assert!(evidence.exchange_pending);
                     assert_eq!(
@@ -2097,6 +2544,7 @@ mod receipt_tests {
                         compensating,
                         disposition,
                         status,
+                        true,
                     );
                     assert_eq!(evidence, once);
                     let mut empty = ReceiptEvidence {
@@ -2110,6 +2558,7 @@ mod receipt_tests {
                         compensating,
                         disposition,
                         status,
+                        true,
                     );
                     assert_eq!(empty.exchange_pending, disposition == "pending");
                     let unresolved = if adding {

@@ -64,8 +64,16 @@
   204 compensation while preserving pending/legacy uncertainty, snapshot effects,
   terminal outcome and committed target. Distinguish received ambiguous effects
   from unknown in-flight sends. Add replay, stale-fence, lock-wait and recovery
-  source coverage. Receipt-specific uncertainty attribution/retirement and migration
-  of the legacy lane-only stale-maintenance journal remain deferred.
+  source coverage. Add explicit legacy uncertainty baselines and current-owner
+  receipt-specific retirement (migration 0206), preserving overlapping pending
+  tickets and legacy work. Require live fences after receipt lock waits; received
+  ambiguous effects are not no-effect verdicts or unknown sends. Protect unretired
+  completed tickets and legacy floors from aggregate clearing/settlement. Wire
+  processing/typed terminal retirement and post-commit claim refresh; atomically
+  pin untracked stale-path journals instead of borrowing a ticket's provenance.
+  Add classifier, overlap/replay, stale-fence, lock-wait and recovery source
+  fixtures plus baseline role-matrix coverage. Migration of the legacy lane-only
+  stale-maintenance journal to a fresh typed evidence owner remains deferred.
   Production boot remains disabled until approved shared boot configuration,
   unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,

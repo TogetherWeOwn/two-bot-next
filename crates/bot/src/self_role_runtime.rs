@@ -420,7 +420,15 @@ impl SelfRoleRuntime {
             .await?;
             return Err(RuntimeError::Stale);
         }
+        let evidence = store_io(
+            self.store
+                .retire_role_receipts(&prepared.event, prepared.panel.as_ref()),
+        )
+        .await?
+        .ok_or(RuntimeError::Stale)?;
+        prepared.audit.effects = evidence.effects;
         prepared.event.effects = prepared.audit.effects.clone();
+        prepared.event.exchange_pending = evidence.exchange_pending;
         Ok(())
     }
 
@@ -495,10 +503,13 @@ impl SelfRoleRuntime {
                         // Legacy stale maintenance keeps its separate lane-only
                         // authority until it migrates to a fresh typed evidence
                         // owner. Never fabricate a live event for that path.
-                        if !self
-                            .record_evidence(&prepared.event, &attempted, compensating, true)
-                            .await
-                            .map_err(|_| SelfRoleRestError::StaleClaim)?
+                        if !store_io(self.store.journal_legacy_exchange(
+                            &prepared.event,
+                            &attempted,
+                            compensating,
+                        ))
+                        .await
+                        .map_err(|_| SelfRoleRestError::StaleClaim)?
                         {
                             return Err(SelfRoleRestError::StaleClaim);
                         }
@@ -998,7 +1009,7 @@ impl SelfRoleRuntime {
             }
             let evidence = store_io(
                 self.store
-                    .incorporate_terminal_receipts(&owner.claim, &lane.claim),
+                    .retire_terminal_receipts(&mut owner.claim, &lane.claim),
             )
             .await?
             .ok_or(RuntimeError::Stale)?;
@@ -1171,6 +1182,14 @@ impl SelfRoleRuntime {
         if !exchange.owned_after || !owner.owns(&self.store, lane).await? {
             return Err(RuntimeError::Stale);
         }
+        let evidence = store_io(
+            self.store
+                .retire_terminal_receipts(&mut owner.claim, &lane.claim),
+        )
+        .await?
+        .ok_or(RuntimeError::Stale)?;
+        owner.effects = evidence.effects;
+        owner.pending = evidence.exchange_pending;
         exchange.result.map_err(RuntimeError::Rest)
     }
 
@@ -1399,7 +1418,7 @@ impl SelfRoleRuntime {
         lane: &mut Option<PanelClaim>,
     ) -> Result<Result<PreparedPlans, &'static str>, RuntimeError> {
         if event.recovered && event.intent_initialized {
-            let evidence = store_io(self.store.incorporate_role_receipts(event, lane.as_ref()))
+            let evidence = store_io(self.store.retire_role_receipts(event, lane.as_ref()))
                 .await?
                 .ok_or(RuntimeError::Stale)?;
             event.effects = evidence.effects;

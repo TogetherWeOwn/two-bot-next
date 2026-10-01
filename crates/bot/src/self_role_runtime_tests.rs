@@ -288,6 +288,11 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0206_self_role_exchange_baselines.sql"
+    ))
+    .execute(pool)
+    .await?;
     processing_superseded_before_preparation(pool).await?;
     terminal_restart_repairs_committed_target(pool).await?;
     terminal_restart_refuses_unknown_or_uninitialized_target(pool).await?;
@@ -295,6 +300,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     terminal_restart_cancellation_preserves_journal(pool).await?;
     terminal_partial_repair_exchange_outcomes(pool).await?;
     processing_receipts_survive_generation_transfer(pool).await?;
+    repeated_processing_tickets_preserve_pending(pool).await?;
     terminal_late_response_after_independent_transfer(pool).await?;
     terminal_pacing_loss_is_definite_no_send(pool).await?;
     terminal_post_journal_wait_is_definite_no_send(pool).await?;
@@ -1270,18 +1276,27 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             .bind(&request.event_id)
             .fetch_one(pool)
             .await?;
-            assert!(pending); // a completed receipt does not incorporate itself
+            assert!(pending); // A store-only checkpoint does not retire receipts.
             feature.park(&mut prepared).await;
             drop(prepared);
             clock.store(NOW + 601, Ordering::SeqCst);
             let receipts = role_receipts(pool, &request.event_id).await?;
             let mut current = ready(feature.prepare(&request, &panel).await.unwrap());
             assert!(current.event.recovered);
-            assert!(current.event.exchange_pending);
+            assert!(!current.event.exchange_pending);
+            assert_eq!(current.event.desired_role_ids, [NEW_ROLE]);
+            assert_eq!(current.event.pre_mutation_role_ids, [OLD_ROLE]);
             assert_eq!(current.audit.effects.attempted_removed_role_ids, [OLD_ROLE]);
+            // Recovered prepare retires completed send provenance under its new
+            // live fences. A received 5xx still has effect uncertainty until a
+            // subsequent observation, but is not an unknown in-flight exchange.
             assert_eq!(
                 current.audit.effects.unresolved_removed_role_ids,
-                [OLD_ROLE]
+                if status == 500 {
+                    vec![OLD_ROLE.to_owned()]
+                } else {
+                    vec![]
+                }
             );
             assert!(current
                 .audit
@@ -1289,10 +1304,198 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
                 .compensated_removed_role_ids
                 .is_empty());
             assert_eq!(role_receipts(pool, &request.event_id).await?, receipts);
+            let held = current.snapshot.member_role_ids.clone();
+            observe_prepared(&mut current, &held);
+            feature.checkpoint(&mut current).await.unwrap();
+            feature.checkpoint(&mut current).await.unwrap();
+            assert!(!current.event.exchange_pending);
+            assert!(current.audit.effects.unresolved_removed_role_ids.is_empty());
+            assert_eq!(current.audit.effects.attempted_removed_role_ids, [OLD_ROLE]);
+            assert_eq!(role_receipts(pool, &request.event_id).await?, receipts);
+            assert_eq!(mock.requests().len(), 9);
             assert_eq!(
                 mock.requests().iter().filter(|r| r.method != "GET").count(),
                 1
             );
+            feature.park(&mut current).await;
+            drop(current);
+            mock.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
+async fn repeated_processing_tickets_preserve_pending(pool: &PgPool) -> TestResult {
+    for exclusive in [false, true] {
+        for status in [204, 403, 429, 500] {
+            let clock = Arc::new(AtomicI64::new(NOW));
+            let mut panel = panel(PanelMode::Select);
+            panel.id = format!("processing-repeated-ticket-{exclusive}-{status}");
+            panel.exclusive = exclusive;
+            let mut script = snapshot(&[OLD_ROLE, OTHER]);
+            script.push(ScriptedResponse::status(status));
+            script.extend(snapshot(&[OLD_ROLE, OTHER])); // recovered prepare
+            script.extend(snapshot(&[OLD_ROLE, OTHER])); // observation after retirement
+            let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+            let feature = runtime(pool, &clock, &mock);
+            let request = request(
+                &panel.id,
+                Selection::Select {
+                    option_keys: vec!["new".into()],
+                },
+            );
+            let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+            let original = prepared.event.clone();
+            let original_lane = prepared.panel.clone();
+            // Hold one sender-owned ticket at the shared journal seam without
+            // dispatching it. The runtime's next same-role/direction send gets
+            // its own ticket and a real response from the existing REST double.
+            let pending_ticket = feature
+                .store
+                .journal_role_exchange(
+                    &prepared.event,
+                    prepared.panel.as_ref(),
+                    &ExchangeIntent {
+                        role_id: NEW_ROLE.into(),
+                        adding: true,
+                        compensating: false,
+                    },
+                )
+                .await?
+                .unwrap();
+            feature.checkpoint(&mut prepared).await.unwrap();
+            assert!(prepared.event.exchange_pending);
+            feature
+                .execute_step(&mut prepared, NEW_ROLE, true, None)
+                .await
+                .unwrap();
+            assert!(prepared.event.exchange_pending);
+            assert_eq!(prepared.audit.effects.attempted_added_role_ids, [NEW_ROLE]);
+            assert_eq!(prepared.audit.effects.unresolved_added_role_ids, [NEW_ROLE]);
+            let receipts = role_receipts(pool, &request.event_id).await?;
+            assert_eq!(
+                receipts,
+                [
+                    (
+                        original.generation,
+                        NEW_ROLE.into(),
+                        true,
+                        false,
+                        "pending".into(),
+                        None,
+                    ),
+                    (
+                        original.generation,
+                        NEW_ROLE.into(),
+                        true,
+                        false,
+                        "response".into(),
+                        Some(status as i16),
+                    ),
+                ]
+            );
+            let retired: (i64, i64) = sqlx::query_as(
+                "SELECT count(*) FILTER (WHERE retired_at IS NOT NULL),
+                 count(*) FILTER (WHERE disposition='pending' AND retired_at IS NULL)
+                 FROM self_role_exchanges WHERE event_id=$1",
+            )
+            .bind(&request.event_id)
+            .fetch_one(pool)
+            .await?;
+            assert_eq!(retired, (1, 1));
+            feature.park(&mut prepared).await;
+            drop(prepared);
+            clock.store(NOW + 301, Ordering::SeqCst);
+            let mut current = ready(feature.prepare(&request, &panel).await.unwrap());
+            assert!(current.event.recovered);
+            assert_eq!(current.event.generation, original.generation + 1);
+            assert_eq!(current.event.desired_role_ids, [NEW_ROLE]);
+            assert_eq!(current.event.pre_mutation_role_ids, [OLD_ROLE]);
+            assert_eq!(current.event.compensating, status != 204);
+            assert!(current.event.exchange_pending);
+            assert_eq!(current.audit.effects.unresolved_added_role_ids, [NEW_ROLE]);
+            let held = current.snapshot.member_role_ids.clone();
+            observe_prepared(&mut current, &held);
+            feature.checkpoint(&mut current).await.unwrap();
+            assert!(current.event.exchange_pending);
+            assert_eq!(current.audit.effects.unresolved_added_role_ids, [NEW_ROLE]);
+            assert_eq!(role_receipts(pool, &request.event_id).await?, receipts);
+            let owner_state = exchange_owner_state(pool, &request.event_id).await?;
+            assert!(feature
+                .store
+                .retire_role_receipts(&original, original_lane.as_ref())
+                .await?
+                .is_none());
+            assert_eq!(
+                exchange_owner_state(pool, &request.event_id).await?,
+                owner_state
+            );
+            // Only the fixture's undispatched ticket has definite no-send
+            // provenance. Completing it cannot checkpoint the replacement owner.
+            assert!(
+                feature
+                    .store
+                    .complete_role_exchange(&pending_ticket, ExchangeReceipt::NoSend)
+                    .await?
+            );
+            assert!(
+                !feature
+                    .store
+                    .complete_role_exchange(
+                        &pending_ticket,
+                        ExchangeReceipt::Response { status: 204 }
+                    )
+                    .await?
+            );
+            assert_eq!(
+                exchange_owner_state(pool, &request.event_id).await?,
+                owner_state
+            );
+            let completed = role_receipts(pool, &request.event_id).await?;
+            assert_eq!(completed[0].4, "no_send");
+            assert_eq!(completed[0].5, None);
+            assert_eq!(completed[1], receipts[1]);
+            feature.checkpoint(&mut current).await.unwrap();
+            assert!(!current.event.exchange_pending);
+            assert_eq!(
+                current.audit.effects.unresolved_added_role_ids,
+                if status == 500 {
+                    vec![NEW_ROLE.to_owned()]
+                } else {
+                    vec![]
+                }
+            );
+            // A subsequent fresh snapshot may resolve already-retired 5xx
+            // ambiguity. Repeated checkpoints must not resurrect that evidence.
+            let observed = feature
+                .executor
+                .fetch_self_role_snapshot(GUILD, USER, BOT)
+                .await
+                .unwrap();
+            observe_prepared(&mut current, &observed.member_role_ids);
+            feature.checkpoint(&mut current).await.unwrap();
+            feature.checkpoint(&mut current).await.unwrap();
+            assert!(!current.event.exchange_pending);
+            assert!(current.audit.effects.unresolved_added_role_ids.is_empty());
+            assert_eq!(current.audit.effects.attempted_added_role_ids, [NEW_ROLE]);
+            assert!(current.audit.effects.compensated_added_role_ids.is_empty());
+            assert_eq!(role_receipts(pool, &request.event_id).await?, completed);
+            assert!(feature.store.owns_claim(&current.event).await?);
+            if let Some(lane) = &current.panel {
+                assert!(feature.store.owns_panel_claim(lane).await?);
+                assert_eq!(lane.target.option_key.as_deref(), Some("old"));
+                assert!(lane.target.committed);
+            }
+            assert_eq!(mock.requests().len(), 13);
+            let mutations: Vec<_> = mock
+                .requests()
+                .into_iter()
+                .filter(|r| r.method != "GET")
+                .collect();
+            assert_eq!(mutations.len(), 1);
+            assert_eq!(mutations[0].method, "PUT");
+            assert!(mutations[0].path.ends_with(NEW_ROLE));
+            assert!(mutations[0].body.is_empty());
             feature.park(&mut current).await;
             drop(current);
             mock.shutdown().await;
@@ -1396,9 +1599,21 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
                 Some(status as i16)
             )]
         );
-        let effects = terminal_evidence(pool, &audit, evidence_transfer, false).await?;
+        let receipts = role_receipts(pool, &audit.event_id).await?;
+        // Losing either fence prevents this sender from retiring its completed
+        // ticket. Late compensation facts do not clear durable send provenance.
+        let effects = terminal_evidence(pool, &audit, true, false).await?;
         assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]);
-        if let Some(replacement) = replacement_evidence {
+        assert_eq!(effects.unresolved_removed_role_ids, [OLD_ROLE]);
+        let retained = exchange_owner_state(pool, &audit.event_id).await?;
+        assert!(feature
+            .store
+            .retire_terminal_receipts(&mut owner.claim, &lane.claim)
+            .await?
+            .is_none());
+        assert_eq!(exchange_owner_state(pool, &audit.event_id).await?, retained);
+        assert_eq!(role_receipts(pool, &audit.event_id).await?, receipts);
+        if let Some(mut replacement) = replacement_evidence {
             assert_eq!(replacement.generation(), owner.claim.generation() + 1);
             assert!(replacement.exchange_pending());
             assert!(effects.compensated_removed_role_ids.is_empty());
@@ -1453,11 +1668,41 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
                     .finish_superseded_repair(&owner.claim, &lane.claim)
                     .await?
             );
+            let retired = feature
+                .store
+                .retire_terminal_receipts(&mut replacement, &lane.claim)
+                .await?
+                .unwrap();
+            assert!(!retired.exchange_pending);
+            assert_eq!(
+                retired.effects.unresolved_removed_role_ids,
+                if status == 500 {
+                    vec![OLD_ROLE.to_owned()]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(
+                retired.effects.compensated_removed_role_ids,
+                incorporated.effects.compensated_removed_role_ids
+            );
+            assert_eq!(
+                feature
+                    .store
+                    .retire_terminal_receipts(&mut replacement, &lane.claim)
+                    .await?
+                    .unwrap(),
+                retired
+            );
+            assert_eq!(
+                terminal_evidence(pool, &audit, false, false).await?,
+                retired.effects
+            );
         }
         if let Some(replacement) = replacement_lane {
             assert_eq!(replacement.generation, lane.claim.generation + 1);
             assert_eq!(effects.compensated_removed_role_ids, [OLD_ROLE]);
-            assert!(effects.unresolved_removed_role_ids.is_empty());
+            assert_eq!(effects.unresolved_removed_role_ids, [OLD_ROLE]);
             assert!(!feature.store.release_panel_claim(&lane.claim).await?);
             assert!(feature.store.owns_panel_claim(&replacement).await?);
             assert!(
@@ -1466,8 +1711,34 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
                     .finish_superseded_repair(&owner.claim, &lane.claim)
                     .await?
             );
+            // The surviving evidence fence expires at +400; the replacement
+            // lane remains live until +600. A newly acquired evidence owner can
+            // now retire the response under both current fences, without a send.
+            clock.store(NOW + 400, Ordering::SeqCst);
+            let hint = feature
+                .terminal_candidates(&panel, 1)
+                .await
+                .unwrap()
+                .remove(0);
+            let mut replacement_owner = feature.store.claim_superseded_audit(&hint).await?.unwrap();
+            assert_eq!(replacement_owner.generation(), owner.claim.generation() + 1);
+            assert!(replacement_owner.exchange_pending());
+            assert!(feature.store.owns_panel_claim(&replacement).await?);
+            let retired = feature
+                .store
+                .retire_terminal_receipts(&mut replacement_owner, &replacement)
+                .await?
+                .unwrap();
+            assert!(!retired.exchange_pending);
+            assert!(retired.effects.unresolved_removed_role_ids.is_empty());
+            assert_eq!(retired.effects.compensated_removed_role_ids, [OLD_ROLE]);
+            assert_eq!(
+                terminal_evidence(pool, &audit, false, false).await?,
+                retired.effects
+            );
             assert!(feature.store.release_panel_claim(&replacement).await?);
         }
+        assert_eq!(role_receipts(pool, &audit.event_id).await?, receipts);
         assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
         assert_eq!(mock.requests().len(), 5);
         assert_eq!(
@@ -1605,10 +1876,13 @@ async fn terminal_post_journal_wait_is_definite_no_send(pool: &PgPool) -> TestRe
         .execute(pool)
         .await?;
         assert!(matches!(result, Err(RuntimeError::Stale)));
-        let effects = terminal_evidence(pool, &audit, inherited_pending, false).await?;
+        // The no-send fact is immutable, but both leases expired while the
+        // journal waited. This former owner cannot retire its ticket afterward.
+        let effects = terminal_evidence(pool, &audit, true, false).await?;
         assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]); // journal committed, send refused
+        let receipts = role_receipts(pool, &audit.event_id).await?;
         assert_eq!(
-            role_receipts(pool, &audit.event_id).await?,
+            receipts,
             [(
                 owner.claim.generation(),
                 OLD_ROLE.into(),
@@ -1620,7 +1894,7 @@ async fn terminal_post_journal_wait_is_definite_no_send(pool: &PgPool) -> TestRe
         );
         assert_eq!(effects.attempted_added_role_ids, [OLD_ROLE]);
         assert!(effects.compensated_removed_role_ids.is_empty());
-        assert!(effects.unresolved_removed_role_ids.is_empty()); // only the definite no-send is resolved
+        assert_eq!(effects.unresolved_removed_role_ids, [OLD_ROLE]);
         assert_eq!(
             effects.unresolved_added_role_ids.contains(&OLD_ROLE.into()),
             inherited_pending
@@ -1629,6 +1903,59 @@ async fn terminal_post_journal_wait_is_definite_no_send(pool: &PgPool) -> TestRe
             !feature
                 .store
                 .finish_superseded_repair(&owner.claim, &lane.claim)
+                .await?
+        );
+        let retained = exchange_owner_state(pool, &audit.event_id).await?;
+        assert!(feature
+            .store
+            .retire_terminal_receipts(&mut owner.claim, &lane.claim)
+            .await?
+            .is_none());
+        assert_eq!(exchange_owner_state(pool, &audit.event_id).await?, retained);
+        assert_eq!(role_receipts(pool, &audit.event_id).await?, receipts);
+        let (mut replacement, replacement_lane) = terminal_fixture_owners(&feature, &panel).await?;
+        assert_eq!(replacement.claim.generation(), owner.claim.generation() + 1);
+        assert_eq!(replacement_lane.claim.generation, lane.claim.generation + 1);
+        assert!(replacement.claim.exchange_pending());
+        assert!(!feature.store.release_panel_claim(&lane.claim).await?);
+        let retired = feature
+            .store
+            .retire_terminal_receipts(&mut replacement.claim, &replacement_lane.claim)
+            .await?
+            .unwrap();
+        assert_eq!(retired.exchange_pending, inherited_pending);
+        assert!(retired.effects.unresolved_removed_role_ids.is_empty());
+        assert_eq!(
+            retired
+                .effects
+                .unresolved_added_role_ids
+                .contains(&OLD_ROLE.into()),
+            inherited_pending
+        );
+        assert_eq!(retired.effects.attempted_removed_role_ids, [OLD_ROLE]);
+        assert_eq!(retired.effects.attempted_added_role_ids, [OLD_ROLE]);
+        assert!(retired.effects.compensated_removed_role_ids.is_empty());
+        assert_eq!(
+            terminal_evidence(pool, &audit, inherited_pending, false).await?,
+            retired.effects
+        );
+        assert_eq!(role_receipts(pool, &audit.event_id).await?, receipts);
+        assert!(
+            feature
+                .store
+                .owns_superseded_claim(&replacement.claim)
+                .await?
+        );
+        assert!(
+            feature
+                .store
+                .owns_panel_claim(&replacement_lane.claim)
+                .await?
+        );
+        assert!(
+            feature
+                .store
+                .release_panel_claim(&replacement_lane.claim)
                 .await?
         );
         assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
@@ -2880,7 +3207,10 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
             (outcome.as_str(), code.as_str()),
             ("rejected", "superseded_by_later_event")
         );
-        assert!(!pending);
+        // Lane-only compatibility repair has no typed ticket migration. Once
+        // tracked attribution exists, its journal pins unknown legacy provenance;
+        // observed committed-target compensation cannot retire that durable floor.
+        assert!(pending);
         assert_eq!(
             serde_json::from_str::<Vec<String>>(&compensated)?,
             [OLD_ROLE]

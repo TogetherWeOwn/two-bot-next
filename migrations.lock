@@ -69,6 +69,10 @@
       "sha256": "5e47a6680950a2bdf8d47dd181de786eb48cff22b53224121668984102ea731a",
       "justification": "Persist immutable per-send response/no-send receipts across self-role generation transfer for TOG-10292 without granting former workers audit settlement or target authority; retain all legacy names and unknown evidence."
     },
+    "crates/cutover/migrations/0206_self_role_exchange_baselines.sql": {
+      "sha256": "29ed5b2382733c025ce94137d448e3e140c58562a431fe8218919873c56040ad",
+      "justification": "Preserve legacy self-role uncertainty separately from tracked exchange receipts and add exchange retirement metadata for TOG-10292; retain unknown evidence and all legacy names."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."

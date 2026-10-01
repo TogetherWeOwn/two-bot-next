@@ -239,10 +239,10 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   Neither path changes outcome, immutable intent, ownership, expiry or target.
   Recovery synchronizes effects/pending before planning or observation and rejects
   catalogue drift in incorporated evidence. Replays retain cumulative facts.
-  This is conservative evidence incorporation, not receipt-specific uncertainty
-  retirement: aggregate IDs cannot distinguish overlapping ticket and legacy
-  uncertainty. Safe attribution/retirement and the stale-path migration remain
-  follow-up work; no timer or optimistic snapshot substitutes for that provenance.
+  The incorporation APIs remain conservative; they do not retire uncertainty.
+  Migration 0206 below supplies separate attribution and retirement. The legacy
+  stale-path migration still requires a fresh typed owner; no timer or optimistic
+  snapshot substitutes for sender provenance.
   Boot stays disabled. Isolated source fixtures cover
   processing/terminal generation transfer, same-direction ticket separation,
   no-send and 204/403/429/500 receipts, exact/contradictory replay, invalid status,
@@ -258,6 +258,46 @@ The settlement/repair checkpoint adds these runtime seams, still without handler
   expiry, unchanged authority metadata and retained pending settlement gates.
   Processing runtime recovery synchronizes the late evidence without new sends.
   These Rust fixtures remain uncompiled while the required bounded pool is absent.
+- Migration `0206_self_role_exchange_baselines.sql` separates legacy uncertainty
+  from ticket contributions, preserving the existing JSON-array-as-TEXT format.
+  Upgrade backfills **all** pre-existing pending/unresolved work conservatively;
+  matching role IDs in 0205 tickets do not prove exclusive attribution. New
+  journals capture the pre-ticket aggregate under the audit lock exactly once.
+  Replay does not absorb subsequent ticket uncertainty into that legacy floor.
+  The floor cannot be retired by a ticket receipt, time, or a member snapshot.
+- `retire_role_receipts` and `retire_terminal_receipts` require the current live
+  processing/normal-lane or typed-terminal/committed-maintenance fences. They lock
+  panel -> audit -> receipt rows and sample time after those waits, including a
+  wait on sender completion. Only completed response/no-send rows receive an
+  immutable retirement time/generation; pending, cancelled and transport-lost
+  tickets remain unretired. Receipt completion alone cannot retire anything.
+  Current-owner retirement preserves observed effects, intent, outcome, leases,
+  chronology and target. Historical attempts and only 204 compensation remain
+  cumulative. A same-role pending ticket and legacy floor survive another
+  completed ticket; unrelated unattributed directions fail closed.
+- Received 5xx/other ambiguous responses retire unknown-send provenance, **not**
+  effect uncertainty or evidence of success. Their unresolved effects remain
+  until subsequent authoritative observation with no unknown send pending.
+  Replaying retirement neither clears already-retired ambiguous effects nor
+  reopens them after observation. A later same-role no-send receipt cannot
+  erase earlier ambiguous effects. Aggregate checkpoints union legacy and
+  unretired-ticket directions; settlement/completion refuse unretired completed
+  tickets too, preventing an aggregate writer from bypassing the live retire fence.
+- Processing recovery and normal checkpoints synchronize retired evidence into
+  runtime state. Typed terminal recovery/steps also refresh the opaque claim's
+  acquisition snapshot after commit, preventing stale preservation from reviving
+  its retired uncertainty. The legacy lane-only path remains aggregate-journaled;
+  its compatibility journal atomically pins untracked work when a baseline exists.
+  That conservative floor may remain permanently uncertain. Migrating this path
+  to a fresh typed evidence owner remains required before activation.
+- Added uncompiled Rust classifier/store/runtime fixtures cover completed versus
+  same-role pending tickets, legacy overlap, no-send/204/403/429/500/2xx/3xx facts,
+  replay/contradiction, former-owner/lane refusal, post-receipt-lock expiry,
+  unchanged authority and typed claim refresh. The explicit role inventory and
+  runtime CRUD/web-reader-denial source fixtures include the baseline relation.
+  Extracted SQL-only fixtures exercise the migration and persisted unions in an
+  owned `agent-testdb` schema, with expected classifier arrays supplied explicitly;
+  they do not execute the Rust classifier, API transactions, runtime or grants.
 - Added regressions exercise late in-flight 204 after a newer worker commits,
   repair to both selected and empty targets, unknown-target refusal, interrupted
   exchange recovery, settlement of success/compensation, event-expiry rollback
@@ -352,10 +392,12 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   it requires both live fences, initialized intent, and no pending/unresolved
   work. It never makes the superseded event successful or publishes a panel
   target. Completion removes the row from discovery until new accepted evidence.
-- Rotation refuses the former worker's later response writes. Consequently an
-  inherited unknown send can remain permanently uncertain in this conservative
-  seam; there is no implemented automatic retirement of such work. This is an
-  explicit activation blocker, not a justification to clear the flag.
+- Rotation refuses the former worker's later aggregate response writes. Sender
+  ticket completion remains separate: 0206 current-owner retirement can resolve
+  completed ticket provenance without restoring former-worker authority. Legacy
+  or genuinely pending sends can still remain permanently uncertain; there is no
+  automatic timer/snapshot retirement. Their continuation and the legacy-path
+  migration remain activation blockers, not reasons to clear the flag.
 - Added isolated store source fixtures cover scope/due/limit/race discovery,
   fresh secret generation and former-worker refusal, initialized empty targets,
   malformed intent, terminal renewal/expiry, panel-to-audit lock waits, selected/

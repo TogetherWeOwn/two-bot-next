@@ -58,6 +58,7 @@ mod tests {
             include_str!("../../cutover/migrations/0170_lfg.sql"),
             include_str!("../../cutover/migrations/0200_self_roles.sql"),
             include_str!("../../cutover/migrations/0205_self_role_exchange_receipts.sql"),
+            include_str!("../../cutover/migrations/0206_self_role_exchange_baselines.sql"),
             include_str!("../../cutover/migrations/0300_website_contract.sql"),
             include_str!("../../cutover/migrations/0310_presence_probe.sql"),
             include_str!("../../cutover/migrations/0311_community_scorecard.sql"),

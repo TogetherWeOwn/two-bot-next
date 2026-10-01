@@ -140,6 +140,260 @@ async fn incorporation_authority_state(
     Ok((audit, panel))
 }
 
+async fn receipt_retirement_preserves_provenance(pool: &PgPool) -> TestResult {
+    for adding in [false, true] {
+        for legacy in [false, true] {
+            for receipt in [
+                ExchangeReceipt::NoSend,
+                ExchangeReceipt::Response { status: 204 },
+                ExchangeReceipt::Response { status: 403 },
+                ExchangeReceipt::Response { status: 429 },
+                ExchangeReceipt::Response { status: 500 },
+                ExchangeReceipt::Response { status: 302 },
+                ExchangeReceipt::Response { status: 200 },
+            ] {
+                let id = format!("retirement-{adding}-{legacy}-{receipt:?}");
+                let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+                let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+                let mut audit = row(&id, &id);
+                audit.panel_id = id.clone();
+                if legacy {
+                    if adding {
+                        audit.effects.unresolved_added_role_ids = vec!["101".into(), "999".into()];
+                    } else {
+                        audit.effects.unresolved_removed_role_ids =
+                            vec!["101".into(), "999".into()];
+                    }
+                }
+                let original = store.claim_audit(&audit).await?.unwrap();
+                let key = panel_key(&audit);
+                let lane = acquired(store.claim_panel(&key, Some((&id, "0001"))).await?);
+                let intent = ExchangeIntent {
+                    role_id: "101".into(),
+                    adding,
+                    compensating: true,
+                };
+                let completed = store
+                    .journal_role_exchange(&original, Some(&lane), &intent)
+                    .await?
+                    .unwrap();
+                let pending = store
+                    .journal_role_exchange(&original, Some(&lane), &intent)
+                    .await?
+                    .unwrap();
+                assert!(store.complete_role_exchange(&completed, receipt).await?);
+                // Even a completed receipt cannot be erased by aggregate callers.
+                assert!(
+                    store
+                        .checkpoint_exchange(&original, &AuditEffects::default(), true, Some(false))
+                        .await?
+                );
+                assert!(matches!(
+                    store.finish_owned_audit(&audit, &original).await,
+                    Err(StoreError::PendingExchange)
+                ));
+                let authority = incorporation_authority_state(pool, &id).await?;
+                let evidence = store
+                    .retire_role_receipts(&original, Some(&lane))
+                    .await?
+                    .unwrap();
+                assert!(evidence.exchange_pending); // same-role pending ticket survives
+                assert_eq!(incorporation_authority_state(pool, &id).await?, authority);
+                let unresolved = if adding {
+                    &evidence.effects.unresolved_added_role_ids
+                } else {
+                    &evidence.effects.unresolved_removed_role_ids
+                };
+                assert!(unresolved.contains(&"101".into()));
+                assert_eq!(unresolved.contains(&"999".into()), legacy);
+                let (retired,): (i64,) = sqlx::query_as(
+                    "SELECT count(*) FROM self_role_exchanges WHERE event_id=$1 AND retired_at IS NOT NULL",
+                ).bind(&id).fetch_one(pool).await?;
+                assert_eq!(retired, 1);
+                clock.store(TEST_NOW_MS + 300, Ordering::SeqCst);
+                assert!(store
+                    .retire_role_receipts(&original, Some(&lane))
+                    .await?
+                    .is_none());
+                clock.store(TEST_NOW_MS + 301, Ordering::SeqCst);
+                let current = store.claim_audit(&audit).await?.unwrap();
+                let new_lane = acquired(store.claim_panel(&key, Some((&id, "0001"))).await?);
+                assert!(store
+                    .retire_role_receipts(&original, Some(&new_lane))
+                    .await?
+                    .is_none());
+                assert!(store
+                    .retire_role_receipts(&current, Some(&lane))
+                    .await?
+                    .is_none());
+                assert!(
+                    store
+                        .complete_role_exchange(&pending, ExchangeReceipt::NoSend)
+                        .await?
+                );
+                let authority = incorporation_authority_state(pool, &id).await?;
+                let evidence = store
+                    .retire_role_receipts(&current, Some(&new_lane))
+                    .await?
+                    .unwrap();
+                assert_eq!(evidence.exchange_pending, legacy);
+                let ambiguous = matches!(
+                    receipt,
+                    ExchangeReceipt::Response {
+                        status: 200 | 302 | 500
+                    }
+                );
+                let unresolved = if adding {
+                    &evidence.effects.unresolved_added_role_ids
+                } else {
+                    &evidence.effects.unresolved_removed_role_ids
+                };
+                assert_eq!(unresolved.contains(&"101".into()), legacy || ambiguous);
+                assert_eq!(unresolved.contains(&"999".into()), legacy);
+                let compensated = if adding {
+                    &evidence.effects.compensated_added_role_ids
+                } else {
+                    &evidence.effects.compensated_removed_role_ids
+                };
+                assert_eq!(
+                    compensated.contains(&"101".into()),
+                    receipt == ExchangeReceipt::Response { status: 204 }
+                );
+                assert_eq!(incorporation_authority_state(pool, &id).await?, authority);
+                assert_eq!(
+                    store
+                        .retire_role_receipts(&current, Some(&new_lane))
+                        .await?
+                        .unwrap(),
+                    evidence
+                );
+                assert!(store.complete_role_exchange(&completed, receipt).await?);
+                assert!(
+                    !store
+                        .complete_role_exchange(
+                            &completed,
+                            if receipt == ExchangeReceipt::NoSend {
+                                ExchangeReceipt::Response { status: 204 }
+                            } else {
+                                ExchangeReceipt::NoSend
+                            }
+                        )
+                        .await?
+                );
+                if legacy {
+                    assert!(
+                        store
+                            .checkpoint_exchange(
+                                &current,
+                                &AuditEffects::default(),
+                                true,
+                                Some(false)
+                            )
+                            .await?
+                    );
+                    assert!(matches!(
+                        store.finish_owned_audit(&audit, &current).await,
+                        Err(StoreError::PendingExchange)
+                    ));
+                } else {
+                    // A later legacy journal must not borrow an already-retired
+                    // same-role ticket's identity, even when the IDs overlap.
+                    let mut legacy_effects = evidence.effects.clone();
+                    if adding {
+                        legacy_effects.unresolved_added_role_ids.push("101".into());
+                    } else {
+                        legacy_effects
+                            .unresolved_removed_role_ids
+                            .push("101".into());
+                    }
+                    assert!(
+                        store
+                            .journal_legacy_exchange(&current, &legacy_effects, true)
+                            .await?
+                    );
+                    assert!(
+                        store
+                            .checkpoint_exchange(
+                                &current,
+                                &AuditEffects::default(),
+                                true,
+                                Some(false)
+                            )
+                            .await?
+                    );
+                    assert!(
+                        store
+                            .retire_role_receipts(&current, Some(&new_lane))
+                            .await?
+                            .unwrap()
+                            .exchange_pending
+                    );
+                }
+            }
+        }
+    }
+    // A typed terminal owner refreshes its inherited snapshot after retirement,
+    // without resurrecting the old event or publishing a different target.
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    let id = "retirement-terminal";
+    let (audit, _) = terminal_seed(&store, id, id, false).await?;
+    let hint = store
+        .superseded_audits("test-guild", id, "test-message", PanelMode::Button, 1)
+        .await?
+        .remove(0);
+    let mut current = store.claim_superseded_audit(&hint).await?.unwrap();
+    let mut lane = acquired(store.claim_panel(&panel_key(&audit), None).await?);
+    assert!(store.set_panel_claim_option(&mut lane, None).await?);
+    let ticket = store
+        .journal_terminal_role_exchange(
+            &current,
+            &lane,
+            &ExchangeIntent {
+                role_id: "101".into(),
+                adding: false,
+                compensating: true,
+            },
+        )
+        .await?
+        .unwrap();
+    clock.store(TEST_NOW_MS + 301, Ordering::SeqCst);
+    let mut former = current;
+    current = store.claim_superseded_audit(&hint).await?.unwrap();
+    assert!(current.exchange_pending());
+    let old_lane = lane;
+    lane = acquired(store.claim_panel(&panel_key(&audit), None).await?);
+    assert!(
+        store
+            .complete_role_exchange(&ticket, ExchangeReceipt::Response { status: 204 })
+            .await?
+    );
+    assert!(store
+        .retire_terminal_receipts(&mut former, &lane)
+        .await?
+        .is_none());
+    assert!(store
+        .retire_terminal_receipts(&mut current, &old_lane)
+        .await?
+        .is_none());
+    let authority = incorporation_authority_state(pool, id).await?;
+    let evidence = store
+        .retire_terminal_receipts(&mut current, &lane)
+        .await?
+        .unwrap();
+    assert!(!evidence.exchange_pending && !current.exchange_pending());
+    assert_eq!(current.audit().effects, evidence.effects);
+    assert_eq!(evidence.effects.compensated_removed_role_ids, ["101"]);
+    assert_eq!(incorporation_authority_state(pool, id).await?, authority);
+    assert!(
+        store
+            .record_superseded_repair(&current, &evidence.effects, false)
+            .await?
+    );
+    assert!(store.finish_superseded_repair(&current, &lane).await?);
+    Ok(())
+}
+
 async fn exchange_receipts_survive_generation_transfer(pool: &PgPool) -> TestResult {
     let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
     let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
@@ -954,6 +1208,9 @@ async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
         "journal",
         "incorporate",
         "incorporate-panel",
+        "retire",
+        "retire-panel",
+        "retire-receipt",
         "finish",
         "acquire",
     ] {
@@ -965,11 +1222,38 @@ async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
             .superseded_audits("test-guild", &id, "test-message", PanelMode::Button, 1)
             .await?
             .remove(0);
-        let claim = store.claim_superseded_audit(&hint).await?.unwrap();
+        let mut claim = store.claim_superseded_audit(&hint).await?.unwrap();
         let mut panel = acquired(store.claim_panel(&panel_key(&audit), None).await?);
         assert!(store.set_panel_claim_option(&mut panel, None).await?);
+        if operation == "retire-receipt" {
+            let ticket = store
+                .journal_terminal_role_exchange(
+                    &claim,
+                    &panel,
+                    &ExchangeIntent {
+                        role_id: "101".into(),
+                        adding: false,
+                        compensating: true,
+                    },
+                )
+                .await?
+                .unwrap();
+            assert!(
+                store
+                    .complete_role_exchange(&ticket, ExchangeReceipt::NoSend)
+                    .await?
+            );
+        }
         let mut lock = pool.begin().await?;
-        if matches!(operation, "paired-panel" | "incorporate-panel") {
+        if operation == "retire-receipt" {
+            sqlx::query("SELECT exchange_id FROM self_role_exchanges WHERE event_id=$1 FOR UPDATE")
+                .bind(&id)
+                .execute(&mut *lock)
+                .await?;
+        } else if matches!(
+            operation,
+            "paired-panel" | "incorporate-panel" | "retire-panel"
+        ) {
             sqlx::query("SELECT panel_id FROM self_role_panel_claims WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3 FOR UPDATE")
                 .bind(&panel.key.guild_id).bind(&panel.key.member_id).bind(&panel.key.panel_id)
                 .execute(&mut *lock).await?;
@@ -991,6 +1275,10 @@ async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
                 }
                 "incorporate" | "incorporate-panel" => store
                     .incorporate_terminal_receipts(&claim, &panel)
+                    .await
+                    .map(|evidence| evidence.is_some()),
+                "retire" | "retire-panel" | "retire-receipt" => store
+                    .retire_terminal_receipts(&mut claim, &panel)
                     .await
                     .map(|evidence| evidence.is_some()),
                 "finish" => store.finish_superseded_repair(&claim, &panel).await,
@@ -1020,7 +1308,15 @@ async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
         .bind(&id)
         .fetch_one(pool)
         .await?;
-        assert!(!complete && !pending_exchange);
+        assert!(!complete);
+        assert_eq!(pending_exchange, operation == "retire-receipt");
+        let retired: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM self_role_exchanges WHERE event_id=$1 AND retired_at IS NOT NULL",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(retired, 0);
     }
     let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
     let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock)?;
@@ -1266,6 +1562,12 @@ async fn exercise(pool: &PgPool) -> TestResult {
     let exchange_migration = include_str!("../migrations/0205_self_role_exchange_receipts.sql");
     sqlx::raw_sql(exchange_migration).execute(pool).await?;
     sqlx::raw_sql(exchange_migration).execute(pool).await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0206_self_role_exchange_baselines.sql"
+    ))
+    .execute(pool)
+    .await?;
+    receipt_retirement_preserves_provenance(pool).await?;
     exchange_receipts_survive_generation_transfer(pool).await?;
     terminal_exchange_receipts_survive_generation_transfer(pool).await?;
     exchange_journal_and_checkpoint_lock_waits(pool).await?;
