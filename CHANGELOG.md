@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Self-role domain and storage:** framework-free button/select/reaction plans,
+  configuration and live-role safety validation, hierarchy refusals, and
+  legacy-compatible audit/panel tables (migration 0200). Shared event and
+  exclusive-panel leases support renewal, expiry recovery, immutable mutation
+  intent, fencing, and atomic audit/target settlement. Lease checks use database
+  wall time after lock waits; recovery preserves cumulative attempted/compensated
+  evidence. Generated events have cross-worker tie-breakers, and controls enforce
+  UTF-16 and Discord size limits. The isolated Postgres lease regression test
+  runs in CI and gates the required `check` job.
+  Runtime router/REST wiring remains deferred; this does not enable Discord
+  role mutations.
 - Wire `/feed-add`, `/feed-remove` and `/feed-list` through the same command runtime, router and REST executor as sticky commands. Defer ephemerally before guild-scoped CRUD and audit writes, preserve the invoking channel, and publish the complete gated command registry on Ready. Isolated Postgres and mock REST acceptance cover feed commands and sticky coexistence; announcements remain off by default, with no fetching, polling or relay posts.
 - Wire `/sticky` and `/sticky-remove` through the shared interaction router and drive accepted-message re-posts through the shared REST executor. The runtime claims one re-post window atomically per burst, validates and records the replacement id before retiring the previous sticky (best-effort), releases the claim and audits `post_failed` on REST failure, and deletes an orphaned replacement when the claim moved on. Commands defer ephemerally before I/O and edit the original reply; refusals are limited to owned sticky commands. `TWO_AUTOMATIONS` gates both surfaces; ManageGuild is required, and `/sticky` validates a 1–2000 UTF-16 body with a 1–300 s debounce (default 5 s). Covered by isolated Postgres and mock REST acceptance tests.
 - Wire RSVP, namespaced RSVP totals and ManageEvents-gated host attendance through the shared interaction router, sqlx stores and REST executor, with ephemeral deferred replies and test-container/mock-Discord acceptance. Publish the full shared command registry before gateway startup, including persisted-session RESUMED boots. Defer queued commands at receipt, keep effects/checkpoints in dispatch order, and drain accepted work rather than cancel it at the feature deadline or backlog limit.
@@ -20,6 +31,10 @@
 - Answer published but unwired commands ephemerally instead of timing out, preserving the existing router refusals and complete registry. Synchronize the registry on resumed process startup as well as Ready, without blocking gateway polling.
 - Preserve one RSVP acknowledgement owner when composing the ordered RSVP path with the shared sticky/feed command runtime; the latter must not send fallback replies for RSVP or redundantly publish a registry already synchronized at boot.
 - Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
+- Grant the least-privilege runtime role CRUD on the self-role audit and panel-claim relations (migration 0200), cover 0200 in the role-matrix tests, and prove runtime claim access with continued web-reader denial.
+- Record late result/compensation evidence for superseded self-role events under their still-current token/generation without reopening settlement or panel publication, with regression coverage.
+- Reject the guild @everyone role as a self-role mutation target during catalogue validation and unconditionally at dispatch.
+- Hold self-role claim fencing tokens in `Secret` so derived `Debug` redacts them; the raw value is exposed only at the SQL fencing comparisons.
 
 ## [0.2.0](https://github.com/TogetherWeOwn/two-bot-next/releases/tag/v0.2.0) (2026-09-30)
 
