@@ -22,6 +22,9 @@
 
 ### Fixed
 
+- Resolve historical member-ban acceptance only with exact-attempt acceptance
+  and ordering evidence, atomically audited without taking newer ownership or
+  clearing dispatched DELETE uncertainty. Moderation activation remains deferred.
 - Fence member-ban PUT confirmation and rejection to the attempt generation
   returned by staging, including safely rejected request-ID retries. Legacy
   identity-only reconciliation fails closed; accepted-PUT audits retain the

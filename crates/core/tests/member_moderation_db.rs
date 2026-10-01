@@ -174,6 +174,186 @@ async fn put_snapshot(pool: &PgPool, request: &str) -> String {
 
 #[tokio::test]
 #[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_historical_acceptance_requires_exact_ordering_and_atomic_audit() {
+    use two_bot_core::member_moderation::{BanAttempt, HistoricalBanAcceptance};
+    let (admin, pool, schema) = database().await;
+    let guild = "100000000000000001";
+    let store = PgMemberModerationStore::new(pool.clone(), guild);
+    for (temporary, user) in [(false, "333333333333333333"), (true, "444444444444444444")] {
+        let older_id = format!("historical-older-{user}");
+        let later_id = format!("historical-later-{user}");
+        let discord = MockMemberDiscord::new();
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_003_600_000
+        });
+        let mut exec = execution(ModerationAction::TempBan, &older_id);
+        exec.target.as_mut().unwrap().user_id = user.into();
+        discord.fail_with("ban", DiscordError::Timeout);
+        assert!(svc.execute(&exec).await.is_err());
+        let older = fixture_attempt(&pool, &older_id).await;
+        // Explicit import of a later accepted remote PUT, not normal staging
+        // through a prepared fence; ordering proof comes separately below.
+        let later = BanAttempt { generation: sqlx::query_scalar(
+            "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at, completed_at)
+             VALUES ($1, $2, $3, 'accepted', $4::text::timestamptz, $4::text::timestamptz) RETURNING generation",
+        ).bind(&later_id).bind(guild).bind(user).bind(DUE).fetch_one(&pool).await.unwrap() };
+        if temporary {
+            sqlx::query(
+                "INSERT INTO moderation_scheduled_unbans (request_id, guild_id, user_id, execute_at, reason, state, created_at)
+                 VALUES ($1, $2, $3, $4::text::timestamptz, 'later expiry', 'staged', $4::text::timestamptz)",
+            ).bind(&later_id).bind(guild).bind(user).bind(DUE).execute(&pool).await.unwrap();
+        }
+        let proof = HistoricalBanAcceptance {
+            later_request_id: later_id.clone(),
+            later_attempt: later,
+            acceptance_evidence_id: "fixture:older-put-accepted".into(),
+            ordering_evidence_id: "fixture:older-completed-before-later".into(),
+            actor_id: "111111111111111111".into(),
+        };
+        let before = put_snapshot(&pool, &older_id).await;
+        let later_before = put_snapshot(&pool, &later_id).await;
+        assert!(store
+            .confirm_ban_attempt(guild, user, &older_id, older, DUE)
+            .await
+            .is_err());
+        assert_eq!(svc.run_due_unbans(guild).await.unwrap(), 0);
+        for bad in 0..7 {
+            let mut evidence = proof.clone();
+            let mut attempt = older;
+            let mut proof_guild = guild;
+            let mut proof_user = user;
+            match bad {
+                0 => evidence.ordering_evidence_id.clear(),
+                1 => evidence.acceptance_evidence_id.clear(),
+                2 => evidence.later_attempt.generation += 1,
+                3 => attempt.generation += 1,
+                4 => evidence.later_request_id = "absent".into(),
+                5 => proof_guild = "200000000000000002",
+                _ => proof_user = "999999999999999999",
+            }
+            assert!(store
+                .resolve_historical_ban_acceptance(
+                    proof_guild,
+                    proof_user,
+                    &older_id,
+                    attempt,
+                    &evidence,
+                    DUE
+                )
+                .await
+                .is_err());
+            assert_eq!(put_snapshot(&pool, &older_id).await, before);
+            assert_eq!(put_snapshot(&pool, &later_id).await, later_before);
+        }
+        // Real database failure after the conditional acceptance update must
+        // roll it back, together with all schedule changes.
+        sqlx::raw_sql(
+            "CREATE FUNCTION refuse_historical_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN IF NEW.outcome = 'accepted_historical' THEN RAISE EXCEPTION 'fixture audit failure'; END IF;
+             RETURN NEW; END $$;
+             CREATE TRIGGER refuse_historical_audit BEFORE INSERT ON moderation_audit
+             FOR EACH ROW EXECUTE FUNCTION refuse_historical_audit();",
+        ).execute(&pool).await.unwrap();
+        assert!(store
+            .resolve_historical_ban_acceptance(guild, user, &older_id, older, &proof, DUE)
+            .await
+            .is_err());
+        assert_eq!(put_snapshot(&pool, &older_id).await, before);
+        assert_eq!(put_snapshot(&pool, &later_id).await, later_before);
+        sqlx::raw_sql("DROP TRIGGER refuse_historical_audit ON moderation_audit; DROP FUNCTION refuse_historical_audit();")
+            .execute(&pool).await.unwrap();
+        store
+            .serialize_member(guild, user, || {
+                store.resolve_historical_ban_acceptance(guild, user, &older_id, older, &proof, DUE)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ban_state(&pool, &older_id).await, "accepted");
+        assert_eq!(unban_state(&pool, &older_id).await, "superseded");
+        assert_eq!(put_snapshot(&pool, &later_id).await, later_before);
+        let audit_id = format!("historical-ban:{}:{older_id}", older.generation);
+        let (outcome, metadata): (String, String) = sqlx::query_as(
+            "SELECT outcome, metadata_json FROM moderation_audit WHERE request_id = $1",
+        )
+        .bind(&audit_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outcome, "accepted_historical");
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["ban_attempt_generation"], older.generation);
+        assert_eq!(metadata["later_ban_attempt_generation"], later.generation);
+        assert_eq!(metadata["ordering_evidence_id"], proof.ordering_evidence_id);
+        assert_eq!(
+            svc.run_due_unbans(guild).await.unwrap(),
+            usize::from(temporary)
+        );
+        assert_eq!(discord.call_count("unban"), usize::from(temporary));
+        let fresh_id = format!("historical-fresh-{user}");
+        let mut fresh = execution(ModerationAction::Ban, &fresh_id);
+        fresh.target.as_mut().unwrap().user_id = user.into();
+        svc.execute(&fresh)
+            .await
+            .expect("only older uncertainty was resolved");
+    }
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
+async fn postgres_historical_acceptance_preserves_dispatched_delete_evidence() {
+    use two_bot_core::member_moderation::{BanAttempt, HistoricalBanAcceptance};
+    let (admin, pool, schema) = database().await;
+    let guild = "100000000000000001";
+    let user = "333333333333333333";
+    let store = PgMemberModerationStore::new(pool.clone(), guild);
+    let older = store
+        .stage_unban(guild, user, DUE, "expiry", "older", NOW)
+        .await
+        .unwrap();
+    let later = BanAttempt {
+        generation: sqlx::query_scalar(
+            "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at)
+         VALUES ('later', $1, $2, 'accepted', $3::text::timestamptz) RETURNING generation",
+        )
+        .bind(guild)
+        .bind(user)
+        .bind(DUE)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+    };
+    sqlx::query(
+        "UPDATE moderation_scheduled_unbans SET state = 'running', dispatch_uncertain = TRUE,
+         claimed_at = $1::text::timestamptz, claim_token = 'fixture-delete-claim' WHERE request_id = 'older'",
+    ).bind(DUE).execute(&pool).await.unwrap();
+    let before: String = sqlx::query_scalar("SELECT row_to_json(job)::text FROM moderation_scheduled_unbans AS job WHERE request_id = 'older'")
+        .fetch_one(&pool).await.unwrap();
+    let proof = HistoricalBanAcceptance {
+        later_request_id: "later".into(),
+        later_attempt: later,
+        acceptance_evidence_id: "fixture:older-put-accepted".into(),
+        ordering_evidence_id: "fixture:older-completed-before-later".into(),
+        actor_id: "111111111111111111".into(),
+    };
+    store
+        .resolve_historical_ban_acceptance(guild, user, "older", older, &proof, DUE)
+        .await
+        .unwrap();
+    let after: String = sqlx::query_scalar("SELECT row_to_json(job)::text FROM moderation_scheduled_unbans AS job WHERE request_id = 'older'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(before, after);
+    assert!(store.stage_ban(guild, user, "fresh", DUE).await.is_err());
+    assert!(store
+        .claim_due_unbans(guild, DUE, 25)
+        .await
+        .unwrap()
+        .is_empty());
+    cleanup(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or CI Postgres service"]
 async fn postgres_stale_put_outcomes_cannot_resolve_a_retried_generation() {
     let (admin, pool, schema) = database().await;
     let guild = "100000000000000001";

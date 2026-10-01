@@ -288,8 +288,8 @@ pub enum ClaimState {
 }
 
 /// One row for the `moderation_audit` ledger (legacy `ModerationAuditRow`).
-/// `channel_id` is always `None` on the member slice; metadata carries only
-/// bounded numbers (legacy never stores request bodies).
+/// `channel_id` is always `None` on the member slice; metadata carries numbers
+/// and reconciliation identities/evidence references, never raw response bodies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditRow {
     pub request_id: String,
@@ -355,6 +355,73 @@ impl UnbanResolution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BanAttempt {
     pub generation: i64,
+}
+
+/// Authoritative evidence that the exact older PUT succeeded and finished
+/// BEFORE this exact later accepted PUT. Only the trusted reconciliation
+/// workflow may construct this assertion after examining durable evidence.
+/// This crate checks identity and records the assertion, not external evidence
+/// authenticity. Age, generations, and a current banned snapshot are NOT proof.
+/// Evidence IDs are bounded, non-secret references, never raw responses/tokens.
+#[derive(Debug, Clone)]
+pub struct HistoricalBanAcceptance {
+    pub later_request_id: String,
+    pub later_attempt: BanAttempt,
+    pub acceptance_evidence_id: String,
+    pub ordering_evidence_id: String,
+    pub actor_id: String,
+}
+
+impl HistoricalBanAcceptance {
+    pub(crate) fn audit_row(
+        &self,
+        guild: &str,
+        user: &str,
+        request: &str,
+        attempt: BanAttempt,
+    ) -> Result<AuditRow, StoreError> {
+        let evidence_id = |id: &str| {
+            !id.is_empty()
+                && id.len() <= 160
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_:/.".contains(&c))
+        };
+        if !evidence_id(&self.acceptance_evidence_id)
+            || !evidence_id(&self.ordering_evidence_id)
+            || self.actor_id.is_empty()
+            || self.actor_id.len() > 20
+            || !self.actor_id.bytes().all(|c| c.is_ascii_digit())
+            || request.is_empty()
+            || request == self.later_request_id
+            || attempt.generation <= 0
+            || self.later_attempt.generation <= attempt.generation
+        {
+            return Err(StoreError::new(
+                "exact historical acceptance and ordering evidence required",
+            ));
+        }
+        let request_id = format!("historical-ban:{}:{request}", attempt.generation);
+        Ok(AuditRow {
+            idempotency_key: request_id.clone(),
+            request_id,
+            guild_id: guild.to_owned(),
+            actor_id: self.actor_id.clone(),
+            action: "ban_reconcile",
+            target_id: Some(user.to_owned()),
+            reason: "Authoritative acceptance before a later accepted PUT".into(),
+            outcome: "accepted_historical",
+            metadata_json: serde_json::json!({
+                "request_id": request,
+                "ban_attempt_generation": attempt.generation,
+                "later_request_id": self.later_request_id,
+                "later_ban_attempt_generation": self.later_attempt.generation,
+                "acceptance_evidence_id": self.acceptance_evidence_id,
+                "ordering_evidence_id": self.ordering_evidence_id,
+            })
+            .to_string(),
+        })
+    }
 }
 
 /// Persistence seam for the member slice (legacy `ModerationStore`,
@@ -443,6 +510,23 @@ pub trait MemberModerationStore: Send + Sync {
         user_id: &str,
         request_id: &str,
         attempt: BanAttempt,
+        completed_at: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Resolve an older prepared PUT truthfully without claiming current
+    /// ownership. Requires authoritative acceptance AND remote ordering proof
+    /// bound to both attempts; unknown ordering must stay fenced. Atomically
+    /// append a separate reconciliation audit, accept only this older intent,
+    /// and supersede only its never-dispatched expiry. Newer rows and any
+    /// dispatched DELETE evidence are untouched. Caller holds the member queue.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_historical_ban_acceptance(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        request_id: &str,
+        attempt: BanAttempt,
+        evidence: &HistoricalBanAcceptance,
         completed_at: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
@@ -1590,6 +1674,62 @@ impl MemberModerationStore for MemMemberStore {
         Ok(())
     }
 
+    async fn resolve_historical_ban_acceptance(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        request_id: &str,
+        attempt: BanAttempt,
+        evidence: &HistoricalBanAcceptance,
+        completed_at: &str,
+    ) -> Result<(), StoreError> {
+        let audit = evidence.audit_row(guild_id, user_id, request_id, attempt)?;
+        let mut inner = self.lock();
+        let matches = |id: &str, expected: BanAttempt, state: BanState| {
+            inner.bans.get(id).is_some_and(|row| {
+                row.guild_id == guild_id
+                    && row.user_id == user_id
+                    && row.generation == expected.generation
+                    && row.state == state
+            })
+        };
+        if !matches(request_id, attempt, BanState::Prepared)
+            || !matches(
+                &evidence.later_request_id,
+                evidence.later_attempt,
+                BanState::Accepted,
+            )
+        {
+            return Err(StoreError::new(
+                "lost historical ban attempt or accepted successor",
+            ));
+        }
+        // Unlike record_audit's replay behavior, conflicting reconciliation
+        // evidence must fail before any ledger change.
+        if inner
+            .audits
+            .iter()
+            .any(|row| row.request_id == audit.request_id)
+        {
+            return Err(StoreError::new(
+                "historical reconciliation audit already exists",
+            ));
+        }
+        inner.audits.push(audit);
+        inner.bans.get_mut(request_id).expect("checked ban").state = BanState::Accepted;
+        if let Some(job) = inner.unbans.get_mut(request_id) {
+            if job.guild_id == guild_id
+                && job.user_id == user_id
+                && matches!(job.state, UnbanState::Staged | UnbanState::Pending)
+            {
+                job.state = UnbanState::Superseded;
+                job.completed_at = Some(completed_at.to_owned());
+                job.claim_token = None;
+            }
+        }
+        Ok(())
+    }
+
     async fn stage_unban(
         &self,
         guild_id: &str,
@@ -2089,6 +2229,168 @@ mod tests {
     }
 
     const NOW: &str = "2023-11-14T22:13:20.000Z";
+
+    // Imported ownership may contain an older uncertain PUT plus a later
+    // accepted one, a state ordinary staging deliberately cannot create.
+    async fn historical_fixture(
+        temporary: bool,
+    ) -> (MemMemberStore, BanAttempt, HistoricalBanAcceptance) {
+        let store = MemMemberStore::new();
+        let older = store
+            .stage_unban(GUILD, TARGET_ID, NOW, "old expiry", "older", NOW)
+            .await
+            .unwrap();
+        let later = BanAttempt {
+            generation: older.generation + 1,
+        };
+        {
+            let mut inner = store.lock();
+            inner.ban_sequence = later.generation;
+            inner.bans.insert(
+                "later".into(),
+                BanRow {
+                    guild_id: GUILD.into(),
+                    user_id: TARGET_ID.into(),
+                    generation: later.generation,
+                    state: BanState::Accepted,
+                },
+            );
+            if temporary {
+                let mut expiry = inner.unbans["older"].clone();
+                expiry.reason = "later expiry".into();
+                inner.unbans.insert("later".into(), expiry);
+            }
+        }
+        let evidence = HistoricalBanAcceptance {
+            later_request_id: "later".into(),
+            later_attempt: later,
+            acceptance_evidence_id: "fixture:older-put-accepted".into(),
+            ordering_evidence_id: "fixture:older-completed-before-later".into(),
+            actor_id: ACTOR_ID.into(),
+        };
+        (store, older, evidence)
+    }
+
+    #[tokio::test]
+    async fn historical_acceptance_clears_only_exact_older_uncertainty() {
+        for temporary in [false, true] {
+            let (store, older, evidence) = historical_fixture(temporary).await;
+            let later_expiry = store.lock().unbans.get("later").cloned();
+            assert!(store
+                .confirm_ban_attempt(GUILD, TARGET_ID, "older", older, NOW)
+                .await
+                .is_err());
+            assert!(store
+                .claim_due_unbans(GUILD, NOW, 25)
+                .await
+                .unwrap()
+                .is_empty());
+            for bad in 0..5 {
+                let mut proof = evidence.clone();
+                let mut attempt = older;
+                match bad {
+                    0 => proof.ordering_evidence_id.clear(),
+                    1 => proof.acceptance_evidence_id.clear(),
+                    2 => proof.later_attempt.generation += 1,
+                    3 => attempt.generation += 1,
+                    _ => proof.later_request_id = "absent".into(),
+                }
+                assert!(store
+                    .resolve_historical_ban_acceptance(
+                        GUILD, TARGET_ID, "older", attempt, &proof, NOW
+                    )
+                    .await
+                    .is_err());
+                assert_eq!(store.lock().bans["older"].state, BanState::Prepared);
+                assert_eq!(store.unban_state("older").as_deref(), Some("staged"));
+                assert_eq!(store.lock().unbans.get("later").cloned(), later_expiry);
+                assert!(store.audits().is_empty());
+            }
+            store
+                .serialize_member(GUILD, TARGET_ID, || {
+                    store.resolve_historical_ban_acceptance(
+                        GUILD, TARGET_ID, "older", older, &evidence, NOW,
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(store.lock().bans["older"].state, BanState::Accepted);
+            assert!(!store.lock().accepted_current_ban("older"));
+            assert!(store.lock().accepted_current_ban("later"));
+            assert_eq!(store.unban_state("older").as_deref(), Some("superseded"));
+            assert_eq!(store.lock().unbans.get("later").cloned(), later_expiry);
+            let audits = store.audits();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0].outcome, "accepted_historical");
+            let metadata: serde_json::Value =
+                serde_json::from_str(&audits[0].metadata_json).unwrap();
+            assert_eq!(metadata["ban_attempt_generation"], older.generation);
+            assert_eq!(
+                metadata["ordering_evidence_id"],
+                evidence.ordering_evidence_id
+            );
+            let jobs = store.claim_due_unbans(GUILD, NOW, 25).await.unwrap();
+            assert_eq!(jobs.len(), usize::from(temporary));
+            if temporary {
+                assert_eq!(jobs[0].request_id, "later");
+                store
+                    .complete_unban("later", &jobs[0].claim_token)
+                    .await
+                    .unwrap();
+            }
+            assert!(store
+                .stage_ban(GUILD, TARGET_ID, "fresh", NOW)
+                .await
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_acceptance_audit_failure_and_running_delete_stay_fenced() {
+        let (store, older, evidence) = historical_fixture(true).await;
+        let faulty = FaultyStore::wrap(store.clone());
+        faulty
+            .fail_audit_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(faulty
+            .resolve_historical_ban_acceptance(GUILD, TARGET_ID, "older", older, &evidence, NOW)
+            .await
+            .is_err());
+        assert_eq!(store.lock().bans["older"].state, BanState::Prepared);
+        assert!(store.audits().is_empty());
+        // A collision is not successful evidence recording, either.
+        let collision = evidence
+            .audit_row(GUILD, TARGET_ID, "older", older)
+            .unwrap();
+        store.record_audit(&collision).await.unwrap();
+        assert!(store
+            .resolve_historical_ban_acceptance(GUILD, TARGET_ID, "older", older, &evidence, NOW)
+            .await
+            .is_err());
+        assert_eq!(store.lock().bans["older"].state, BanState::Prepared);
+        store.lock().audits.clear();
+        let before = {
+            let mut inner = store.lock();
+            let job = inner.unbans.get_mut("older").unwrap();
+            job.state = UnbanState::Running;
+            job.claim_token = Some("fixture-delete-claim".into());
+            job.clone()
+        };
+        store
+            .resolve_historical_ban_acceptance(GUILD, TARGET_ID, "older", older, &evidence, NOW)
+            .await
+            .unwrap();
+        assert_eq!(store.lock().unbans["older"], before);
+        assert!(store
+            .stage_ban(GUILD, TARGET_ID, "fresh", NOW)
+            .await
+            .is_err());
+        assert!(store
+            .claim_due_unbans(GUILD, NOW, 25)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     fn service(
         discord: MockMemberDiscord,
@@ -3374,6 +3676,30 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.inner
                 .confirm_ban_attempt(guild_id, user_id, request_id, attempt, completed_at)
+                .await
+        }
+
+        async fn resolve_historical_ban_acceptance(
+            &self,
+            guild_id: &str,
+            user_id: &str,
+            request_id: &str,
+            attempt: BanAttempt,
+            evidence: &HistoricalBanAcceptance,
+            completed_at: &str,
+        ) -> Result<(), StoreError> {
+            if Self::fail_once(&self.fail_audit_once) {
+                return Err(StoreError::new("injected reconciliation audit failure"));
+            }
+            self.inner
+                .resolve_historical_ban_acceptance(
+                    guild_id,
+                    user_id,
+                    request_id,
+                    attempt,
+                    evidence,
+                    completed_at,
+                )
                 .await
         }
 

@@ -10,8 +10,8 @@ use std::future::Future;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::member_moderation::{
-    AuditRow, BanAttempt, ClaimState, MemberModerationStore, MemberQueues, StoreError, UnbanJob,
-    UnbanResolution,
+    AuditRow, BanAttempt, ClaimState, HistoricalBanAcceptance, MemberModerationStore, MemberQueues,
+    StoreError, UnbanJob, UnbanResolution,
 };
 
 #[derive(Clone)]
@@ -421,6 +421,87 @@ impl MemberModerationStore for PgMemberModerationStore {
         .bind(&self.guild_id)
         .bind(user)
         .bind(generation)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)
+    }
+
+    async fn resolve_historical_ban_acceptance(
+        &self,
+        guild: &str,
+        user: &str,
+        request: &str,
+        attempt: BanAttempt,
+        evidence: &HistoricalBanAcceptance,
+        now: &str,
+    ) -> Result<(), StoreError> {
+        self.ensure_guild(guild)?;
+        let audit = evidence.audit_row(guild, user, request, attempt)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        // The generation comparison selects a durable successor, NOT remote
+        // ordering proof. The trusted workflow supplies that separately.
+        let changed = sqlx::query(
+            "UPDATE moderation_member_bans AS older SET state = 'accepted',
+               completed_at = $4::text::timestamptz
+             WHERE older.request_id = $1 AND older.guild_id = $2 AND older.user_id = $3
+               AND older.state = 'prepared' AND older.generation = $5
+               AND EXISTS (
+                 SELECT 1 FROM moderation_member_bans AS later
+                 WHERE later.request_id = $6 AND later.guild_id = older.guild_id
+                   AND later.user_id = older.user_id AND later.generation = $7
+                   AND later.state = 'accepted' AND later.generation > older.generation
+               )",
+        )
+        .bind(request)
+        .bind(&self.guild_id)
+        .bind(user)
+        .bind(now)
+        .bind(attempt.generation)
+        .bind(&evidence.later_request_id)
+        .bind(evidence.later_attempt.generation)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StoreError::new(
+                "lost historical ban attempt or accepted successor",
+            ));
+        }
+        // Do not silently ignore conflicting audit evidence. Any audit failure
+        // rolls acceptance and expiry changes back, keeping uncertainty fenced.
+        sqlx::query(
+            "INSERT INTO moderation_audit
+             (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
+              outcome, idempotency_key, metadata_json, created_at)
+             VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10::text::timestamptz)",
+        )
+        .bind(&audit.request_id)
+        .bind(&self.guild_id)
+        .bind(&audit.actor_id)
+        .bind(audit.action)
+        .bind(&audit.target_id)
+        .bind(&audit.reason)
+        .bind(audit.outcome)
+        .bind(&audit.idempotency_key)
+        .bind(&audit.metadata_json)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        // Only this historical PUT's never-dispatched schedule is superseded.
+        // Running/imported-uncertain DELETE evidence requires its own resolution.
+        sqlx::query(
+            "UPDATE moderation_scheduled_unbans SET state = 'superseded',
+               completed_at = $4::text::timestamptz, claim_token = NULL
+             WHERE request_id = $1 AND guild_id = $2 AND user_id = $3
+               AND state IN ('staged', 'pending') AND NOT dispatch_uncertain",
+        )
+        .bind(request)
+        .bind(&self.guild_id)
+        .bind(user)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;

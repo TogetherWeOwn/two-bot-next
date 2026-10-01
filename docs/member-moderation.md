@@ -91,6 +91,24 @@ closed**; migrate callers to the attempt-fenced methods. Never attach old eviden
 to a generation fetched from the current row. A member queue alone does not
 identify which retry an outcome describes.
 
+An older prepared PUT with authoritative evidence of success **before** a later
+accepted PUT has a separate terminal path: `resolve_historical_ban_acceptance`.
+The trusted operator workflow must authenticate acceptance and remote completion
+ordering for both exact attempts before constructing `HistoricalBanAcceptance`.
+It supplies the later request/generation, actor, and bounded non-secret durable
+acceptance/ordering evidence IDs; the store validates identities, not external
+proof authenticity. Local generations only prevent ownership takeover; they do
+not prove remote order. Missing/unknown ordering stays fenced and requires a
+recorded security disposition, never a false rejection of an accepted effect.
+
+Under the same member queue, historical resolution atomically records a separate
+`accepted_historical` audit and marks only the exact older intent accepted.
+The later accepted intent remains the owner; its schedule is untouched. Only the
+older PUT's never-dispatched expiry is superseded. Running or imported-uncertain
+DELETE evidence is preserved and still fences mutations. Audit failure or
+collision rolls back the entire resolution. This API neither completes the
+original idempotency key nor enables a runtime/operator command.
+
 Observed Discord acceptance is explicitly recorded with `confirm_ban_attempt` before
 expiry activation. Confirmation atomically supersedes strictly older staged or
 pending schedules, never dispatched `running` rows or authoritative terminal
