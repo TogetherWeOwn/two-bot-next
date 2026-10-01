@@ -73,6 +73,22 @@
       "sha256": "9addc4962a1a69062bb8886e7c6f33596c0a1cc7583a965c360376819b546ed0",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0331_guild_settings_versions.sql": {
+      "sha256": "316d249d0919aabf651910547a21894f6500dc63fa34443a96ae3decbe7b73c4",
+      "justification": "Add database-owned settings tokens for TOG-10863; unchanged historical migration, superseded for CAS by 0334."
+    },
+    "crates/cutover/migrations/0332_guild_settings_allocator.sql": {
+      "sha256": "4ed890d1779cdf93e2697b66598e433e63302852a1d889032168f2b4de602a4a",
+      "justification": "Bind historical settings allocation to the target schema for TOG-10863; unchanged SQL."
+    },
+    "crates/cutover/migrations/0333_guild_settings_revision.sql": {
+      "sha256": "96389fed46faf05e9aad246c9625b866078c2c0921eef2ed375a8b1236a72eb4",
+      "justification": "Bind revision locks to target schema for TOG-10863; unchanged historical allocator repair, retired from CAS by 0334."
+    },
+    "crates/cutover/migrations/0334_guild_settings_cas.sql": {
+      "sha256": "99df054037d2e8df35b414867f4573629093aa86236c51bf19ab0151bec7b9ae",
+      "justification": "Separate negative destination CAS tokens from copyable legacy versions for TOG-10863; invalidate historical tokens without a racy reseed."
+    },
     "crates/cutover/migrations/0340_operational_audit.sql": {
       "sha256": "045f005f212d9e38bc51c2c5b49ff541fff887251949a4dbbf34d4ceb574cac8",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."

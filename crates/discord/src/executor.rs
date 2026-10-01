@@ -855,6 +855,19 @@ impl ActionExecutor {
         }
     }
 
+    /// One paced GET without retries. Bounded roster scans use this so the
+    /// page budget is also a wire-request budget, including 429/5xx responses.
+    pub async fn get_json_once(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
+        let route = raw_get_route(path)?;
+        self.pace(false).await;
+        let res = self.send(&Request::from_route(&route)).await?;
+        Ok(if (200..=299).contains(&res.status) {
+            serde_json::from_slice(&res.body).ok()
+        } else {
+            None
+        })
+    }
+
     /// Channel GET with the paced lane (legacy `getEveryoneOverwrite` reads
     /// `permission_overwrites` off the channel).
     pub async fn get_everyone_overwrite(
