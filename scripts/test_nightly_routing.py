@@ -45,6 +45,21 @@ class NightlyRoutingTests(unittest.TestCase):
             self.assertIn("UnknownReason::Timeout", body)
             self.assertIn("assert_eq!(mock.count(), 1)", body)
 
+    def test_broad_sweep_binds_member_testdb_for_member_ledger_fixtures(self):
+        workflow = WORKFLOW.read_text()
+        broad = workflow.split("- name: Full workspace sweep including ignored tests", 1)[1]
+        broad = broad.split("- name: Channel moderation ignored tests with their guarded URL", 1)[0]
+        self.assertIn("MEMBER_TESTDB: agent-testdb", broad)
+
+    def test_discord_reference_urls_are_hyperlinks_without_suppressing_doc_lint(self):
+        for name in ["executor/tickets.rs", "internal_exec/member.rs"]:
+            source = (ROOT / "crates/discord/src" / name).read_text()
+            bare = [
+                line for line in source.splitlines()
+                if re.search(r"^\s*//[/!] ", line) and re.search(r"(?<!<)https?://", line)
+            ]
+            self.assertEqual(bare, [], f"{name} must wrap doc URLs in <angle brackets>")
+
     def test_cutover_reference_urls_are_hyperlinks_without_suppressing_doc_lint(self):
         for name in ["self_role_store.rs", "tickets.rs"]:
             source = (ROOT / "crates/cutover/src" / name).read_text()

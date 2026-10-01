@@ -102,6 +102,7 @@ jobs:
       - name: Full workspace sweep including ignored tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
+          MEMBER_TESTDB: agent-testdb
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
         run: >-
           cargo test --workspace --all-features --locked -- --include-ignored --test-threads=1

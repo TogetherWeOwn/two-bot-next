@@ -1,7 +1,7 @@
 //! Ticket verbs on the shared executor, never a separate HTTP client.
 //! All mutations are single-attempt: an uncertain create is recovered by topic.
-//! Protocol: https://docs.discord.com/developers/resources/channel
-//! History: https://docs.discord.com/developers/resources/message#get-channel-messages
+//! Protocol: <https://docs.discord.com/developers/resources/channel>
+//! History: <https://docs.discord.com/developers/resources/message#get-channel-messages>
 
 use super::*;
 use serde_json::{json, Value};
