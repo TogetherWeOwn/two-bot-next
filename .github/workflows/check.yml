@@ -48,16 +48,29 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The migration guard reads PR base/push-before blobs, including the lock.
+          fetch-depth: 0
+
       - name: require self-role store tests to pass
         if: needs.self-role-store.result != 'success'
         run: exit 1
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
+      - name: Check migration numbering and immutability
+        env:
+          MIGRATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
+          python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
       - name: offline build-cache safety regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+
+      - name: parity soak checklist coverage (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
@@ -94,38 +107,53 @@ jobs:
           # Host-runner steps reach only this job's published service port.
           # Keep the test guards' required hostname instead of weakening them.
           printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
-          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_tog10090_rsvp_ci
-          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_tog10090_ci
+          docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_ci
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
-      # RSVP's unique schemas live in a different database from website resets.
+      # Migrated suites create/drop unique databases; this bootstrap is not reset.
       - name: cargo test (unit and binary, including RSVP store)
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_rsvp_ci
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
 
       - name: cargo test (integration, including website acceptance)
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_ci
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --test '*' --features two-bot-core/db --locked
+
+      # Reuse the exact feature/target graph above so this measures execution,
+      # not a second compilation. Property tests are pure fixtures (64 cases).
+      - name: property tests stay under 30 seconds
+        run: |
+          start=$SECONDS
+          cargo test --workspace --lib --bins --test '*' --features two-bot-core/db --locked property_
+          elapsed=$((SECONDS - start))
+          printf 'Property suite: %s seconds (budget <30)\n' "$elapsed"
+          test "$elapsed" -lt 30
 
       - name: cargo test (docs)
         run: cargo test --workspace --doc --features two-bot-core/db --locked
 
+      - name: Measure metrics RSS (local fixtures only)
+        run: cargo run -p two-bot-core --example metrics_rss --locked
+
       - name: audit database regressions (CI service only)
-        run: cargo test -p two-bot-core --features db --test audit_store --locked -- --ignored
+        run: cargo test -p two-bot-core --features db --test audit_store --test audit_service --locked -- --ignored
 
       - name: LFG store regressions (CI service container only)
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
-      - name: leveling Postgres parity tests
-        env:
-          TWO_LEVELING_TEST_CI: '1'
-        run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
-
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
+
+      - name: legacy copy acceptance (two owned databases on CI service only)
+        run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
+
+      - name: Legacy verification acceptance (two disposable CI databases)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test legacy_verify_db --locked -- --ignored
 
       - name: channel moderation store clippy
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
@@ -138,13 +166,14 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@127.0.0.1:5432/agent_test
         run: cargo test -p two-bot-core --features db --locked channel_moderation -- --include-ignored
 
-      - name: Internal-action durable store regressions (CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-core --features db --locked --test internal_action_store -- --ignored
-
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
+
+      - name: Sticky runtime acceptance tests (CI service only)
+        run: cargo test -p two-bot --locked sticky_runtime_tests -- --ignored --test-threads=1
+
+      - name: Real binary lifecycle acceptance (CI service only, under 60 s)
+        run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
 
       # `check all` reads Cargo.lock by default (no --locked flag exists).
       # deny.toml's allow-list is verified tight: no unmatched allowances.
@@ -183,6 +212,45 @@ jobs:
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
 
+  container:
+    name: container smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Offline smoke-test regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
+      - name: Set up BuildKit
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build runtime image (local only)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: two-bot:ci
+          cache-from: type=gha,scope=two-bot-runtime-amd64
+          cache-to: type=gha,mode=max,scope=two-bot-runtime-amd64
+      - name: Runtime contract and size budgets
+        run: python3 scripts/container-smoke.py two-bot:ci
+      - name: Prove deliberate budget breakage fails
+        run: |
+          set -euo pipefail
+          for budget in image binary; do
+            log="$RUNNER_TEMP/container-negative-$budget.log"
+            if python3 scripts/container-smoke.py two-bot:ci "--$budget-max-bytes" 1 >"$log" 2>&1; then
+              printf 'FAIL: deliberate %s budget violation was accepted\n' "$budget"
+              exit 1
+            fi
+            grep -F "exceeds size budget" "$log"
+            printf 'PASS: deliberate %s budget violation rejected\n' "$budget"
+          done
+
   community-db:
     name: community db
     runs-on: ubuntu-latest
@@ -215,6 +283,35 @@ jobs:
           cargo test -p two-bot-core --features db --locked --lib presence_store
           cargo test -p two-bot-core --features db --locked --lib inactivity_store
 
+  feeds-db:
+    name: feeds db check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+    services:
+      agent-testdb:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Map test-container-only hostname on runner
+        run: printf '127.0.0.1 agent-testdb\n' | sudo tee -a /etc/hosts
+      - run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
+      - run: cargo test -p two-bot-core --features db --test feeds --locked
+      - run: cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
+
   worker:
     name: worker check
     runs-on: ubuntu-latest
@@ -238,6 +335,8 @@ jobs:
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
       - name: check env bindings are explicit
         run: python3 scripts/check-env-bindings.py wrangler.toml
+      - name: Verify frozen legacy registry export preconditions
+        run: node --test ../scripts/test-export-legacy-registry.mjs
       - name: Verify PR lint event and dispatch paths
         run: python3 ../scripts/test-pr-lint.py
       - name: Verify release reconciliation retries

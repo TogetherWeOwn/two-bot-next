@@ -7,6 +7,9 @@
 
 pub mod action_outcomes;
 pub mod audit;
+pub mod audit_mirror;
+#[cfg(feature = "db")]
+pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
 pub mod automod;
@@ -15,6 +18,7 @@ pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;
+pub mod command_permissions;
 pub mod commands;
 pub mod community;
 pub mod community_snapshots;
@@ -22,9 +26,15 @@ pub mod community_snapshots;
 pub mod community_store;
 pub mod config;
 pub mod containment;
+#[cfg(feature = "db")]
+pub mod database_roles;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
+pub mod feeds;
+pub mod feeds_http;
+#[cfg(feature = "db")]
+pub mod feeds_store;
 pub mod funnel;
 pub mod gateway_funnel;
 pub mod gateway_session;
@@ -44,6 +54,7 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod metrics;
 pub mod moderation;
 pub mod onboarding;
 #[cfg(feature = "db")]

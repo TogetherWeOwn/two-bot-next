@@ -165,6 +165,13 @@ pub enum ChannelCall {
         content: String,
         nonce: Option<String>,
     },
+    /// `DELETE /channels/{c}/messages/{m}` (legacy automation cleanup —
+    /// sticky retirement removes the previous re-post).
+    DeleteMessage {
+        channel_id: String,
+        message_id: String,
+        reason: String,
+    },
 }
 
 /// One observed HTTP exchange: status plus parsed bodies the retry policy
@@ -344,12 +351,14 @@ impl HyperTransport {
         let hyper_req = builder
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
+        let mut attempt = crate::executor_metrics::Attempt::new(request);
         let response = self
             .inner
             .request(hyper_req)
             .await
             .map_err(|e| format!("transport: {e}"))?;
         let status = response.status().as_u16();
+        attempt.finish(Some(status));
         let retry_after_header = response
             .headers()
             .get("retry-after")
@@ -447,18 +456,28 @@ impl ActionExecutor {
     }
 
     async fn pace(&self, kick_lane: bool) {
+        let mut last = self.paced_lane(kick_lane).await;
+        *last = std::time::Instant::now();
+    }
+
+    /// Keep the reservation through late authorization and the bounded send
+    /// so another caller cannot overtake a sender waiting on its DB fence.
+    pub(crate) async fn paced_lane(
+        &self,
+        kick_lane: bool,
+    ) -> tokio::sync::MutexGuard<'_, std::time::Instant> {
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
         } else {
             (&self.inner.pace_last_at, self.inner.pace_interval)
         };
-        let mut last = lock.lock().await;
+        let last = lock.lock().await;
         let earliest = *last + interval;
         let now = std::time::Instant::now();
         if earliest > now {
             tokio::time::sleep(earliest - now).await;
         }
-        *last = std::time::Instant::now();
+        last
     }
 
     fn count(&self) {
@@ -891,6 +910,65 @@ impl ActionExecutor {
         Ok(None)
     }
 
+    /// Raw channel document for the audit-mirror preflight
+    /// (`GET /channels/{c}`, single paced read). Unlike
+    /// [`Self::get_everyone_overwrite`] this keeps the whole document: the
+    /// `AuditMirror` adapter owns guild/privacy field policy, so a body that
+    /// is not a JSON object is unavailable evidence, not permission loss.
+    pub async fn fetch_channel_document(
+        &self,
+        channel_id: &str,
+    ) -> Result<serde_json::Value, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let req = Self::request_of(self.inner.factory.channel(channel))?;
+        self.pace(false).await;
+        let res = self.call_once_raw(req, &[200]).await?;
+        let doc: serde_json::Value = serde_json::from_slice(&res.body).map_err(|_| {
+            DiscordError::Unavailable(format!("unreadable channel {channel_id}: body is not JSON"))
+        })?;
+        if !doc.is_object() {
+            return Err(DiscordError::Unavailable(format!(
+                "unreadable channel {channel_id}: body is not a JSON object"
+            )));
+        }
+        Ok(doc)
+    }
+
+    /// One newest-first history page for the audit-mirror dedup/reconcile
+    /// scan (`GET /channels/{c}/messages`, legacy `findMirror` reads).
+    /// `before` is the previous page's floor id; `limit` clamps into
+    /// Discord's 1..=100 range. The body must be a JSON array; per-element
+    /// field policy belongs to the `AuditMirror` adapter; malformed evidence
+    /// is uncertain rather than proof of marker absence.
+    pub async fn fetch_channel_messages(
+        &self,
+        channel_id: &str,
+        before: Option<&str>,
+        limit: u8,
+    ) -> Result<Vec<serde_json::Value>, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let before: Option<Id<MessageMarker>> =
+            before.map(snowflake::<MessageMarker>).transpose()?;
+        let limit = u16::from(limit.clamp(1, 100));
+        let req = match before {
+            Some(cursor) => Self::request_of(
+                self.inner
+                    .factory
+                    .channel_messages(channel)
+                    .before(cursor)
+                    .limit(limit),
+            )?,
+            None => Self::request_of(self.inner.factory.channel_messages(channel).limit(limit))?,
+        };
+        self.pace(false).await;
+        let res = self.call_once_raw(req, &[200]).await?;
+        serde_json::from_slice(&res.body).map_err(|_| {
+            DiscordError::Unavailable(format!(
+                "unreadable channel {channel_id} history: body is not a JSON array"
+            ))
+        })
+    }
+
     /// `PUT /channels/{c}/permissions/{g}` with decimal-string masks
     /// (legacy `putEveryoneOverwrite`, 200/204).
     pub async fn put_everyone_overwrite(
@@ -1028,6 +1106,29 @@ impl ActionExecutor {
         Ok(ids.len() as u64)
     }
 
+    /// Delete one message (legacy `ModerationDiscord` single delete — the
+    /// same request purge's one-id arm makes). Best-effort cleanup callers
+    /// (sticky retirement) treat `Rejected`/`Http` as a miss, not a crash.
+    pub async fn delete_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<(), DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let message: Id<MessageMarker> = snowflake(message_id)?;
+        let reason = audit_reason(reason)?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .delete_message(channel, message)
+                .reason(&reason),
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
+        self.call_once(req, &[200, 204]).await?;
+        Ok(())
+    }
+
     /// Post a message with mention suppression (legacy
     /// `allowed_mentions: { parse: [] }`). Asserts the legacy 2000 UTF-16-unit
     /// ceiling before sending; returns the message id (`""` when Discord
@@ -1156,6 +1257,14 @@ impl ActionExecutor {
                     message_id: self.send_message(channel_id, content, value).await?,
                 })
             }
+            ChannelCall::DeleteMessage {
+                channel_id,
+                message_id,
+                reason,
+            } => {
+                self.delete_message(channel_id, message_id, reason).await?;
+                Ok(ChannelCallOutcome::MessageDeleted)
+            }
         }
     }
 
@@ -1236,6 +1345,30 @@ impl ActionExecutor {
             200..=299 => Ok(()),
             _ => Err(throw_for_status(&res)),
         }
+    }
+
+    /// Complete an acknowledged interaction by editing its original response.
+    /// Like the initial callback, this bypasses the paced moderation lane.
+    pub async fn edit_interaction_response(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        let application =
+            Id::<ApplicationMarker>::new_checked(application_id).ok_or_else(|| {
+                DiscordError::Rejected(format!("bad application id: {application_id}"))
+            })?;
+        let mentions = AllowedMentions::default();
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .interaction(application)
+                .update_response(interaction_token)
+                .content(Some(content))
+                .allowed_mentions(Some(&mentions)),
+        )?;
+        self.call_once_raw(req, &[200]).await.map(|_| ())
     }
 
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
@@ -1332,6 +1465,7 @@ pub enum ChannelCallOutcome {
     OverwriteWritten,
     OverwriteDeleted,
     Posted { message_id: String },
+    MessageDeleted,
 }
 
 /// @everyone overwrite masks (decimal strings, legacy schema).

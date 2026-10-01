@@ -75,22 +75,29 @@ async fn kick_terminal_paths_hit_expected_route_with_audit_reason() {
 #[tokio::test]
 async fn kick_paces_removals_at_350ms_floor() {
     let mock = MockRest::start(
-        vec![ScriptedResponse::status(204), ScriptedResponse::status(204)],
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+        ],
         ScriptedResponse::status(500),
     )
     .await;
     let exec = executor_for(&mock);
-    let first = exec.kick_paced(GUILD, USER, REASON).await;
-    let second = exec.kick_paced(GUILD, USER, REASON).await;
-    assert_eq!(first.outcome, KickOutcome::Kicked);
-    assert_eq!(second.outcome, KickOutcome::Kicked);
+    for _ in 0..3 {
+        let result = exec.kick_paced(GUILD, USER, REASON).await;
+        assert_eq!(result.outcome, KickOutcome::Kicked);
+    }
     let reqs = mock.requests();
-    assert_eq!(reqs.len(), 2);
-    let gap = gap_ms(&reqs);
-    assert!(
-        (300..=3000).contains(&gap),
-        "kick lane holds the legacy 350 ms floor, got {gap} ms"
-    );
+    assert_eq!(reqs.len(), 3);
+    // The third call catches timestamps captured before the second call's wait.
+    for pair in reqs.windows(2) {
+        let gap = gap_ms(pair);
+        assert!(
+            (300..=3000).contains(&gap),
+            "kick lane holds the legacy 350 ms floor, got {gap} ms"
+        );
+    }
     mock.shutdown().await;
 }
 
@@ -265,29 +272,31 @@ async fn paced_gets_hold_110ms_floor() {
     let mock = MockRest::start(
         vec![
             ScriptedResponse::json(200, channel_body.clone()),
+            ScriptedResponse::json(200, channel_body.clone()),
             ScriptedResponse::json(200, channel_body),
         ],
         ScriptedResponse::status(500),
     )
     .await;
     let exec = executor_for(&mock);
-    let first = exec
-        .get_json(&format!("/channels/{CHANNEL}"))
-        .await
-        .expect("first read succeeds");
-    let second = exec
-        .get_json(&format!("/channels/{CHANNEL}"))
-        .await
-        .expect("second read succeeds");
-    assert!(first.is_some() && second.is_some());
+    for _ in 0..3 {
+        let result = exec
+            .get_json(&format!("/channels/{CHANNEL}"))
+            .await
+            .expect("read succeeds");
+        assert!(result.is_some());
+    }
     let reqs = mock.requests();
-    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs.len(), 3);
     assert!(reqs.iter().all(|r| r.method == "GET"));
-    let gap = gap_ms(&reqs);
-    assert!(
-        (80..=2000).contains(&gap),
-        "paced lane holds the legacy 110 ms floor, got {gap} ms"
-    );
+    // Check both gaps: two calls alone miss a stale post-wait timestamp.
+    for pair in reqs.windows(2) {
+        let gap = gap_ms(pair);
+        assert!(
+            (80..=2000).contains(&gap),
+            "paced lane holds the legacy 110 ms floor, got {gap} ms"
+        );
+    }
     mock.shutdown().await;
 }
 
