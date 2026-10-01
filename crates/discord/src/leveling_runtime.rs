@@ -21,12 +21,13 @@ use two_bot_core::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
-    FunnelHandlers, FunnelStore, HandlerId, LevelOutcome, LevelingHook, NoopFacts, Snowflake,
+    FunnelHandlers, FunnelStore, HandlerId, InviteSnapshotStore, LevelOutcome, LevelingHook,
+    NoopFacts, Snowflake,
 };
 
 use crate::{
-    pipeline::MessageEligibility, ActionExecutor, DiscordError, NoClassification, NoInvites,
-    Pipeline,
+    pipeline::MessageEligibility, ActionExecutor, ChannelClassifier, DiscordError, InviteSource,
+    NoClassification, NoInvites, Pipeline, PipelineSnapshots,
 };
 
 /// Failures propagate to the gateway supervisor; Display never includes SQL
@@ -42,7 +43,7 @@ pub enum LevelingRuntimeError {
 }
 
 #[derive(Debug)]
-struct AwardRequest {
+pub struct AwardRequest {
     guild_id: Snowflake,
     member_id: Snowflake,
     channel_id: Snowflake,
@@ -251,8 +252,12 @@ impl LevelingRuntime {
 /// Serial dispatches include member-removal/session-reset barriers as well as
 /// messages and voice transitions. This deliberately matches the one-shard
 /// checkpoint runner; unrelated shards should own separate pipelines.
-pub struct OrderedLevelingPipeline<S> {
-    pipeline: Pipeline<S, DeferredLeveling>,
+///
+/// `I` serves invite counters and `P` persists invite snapshots; the
+/// persistent gateway runner seeds both from the store, while unit and
+/// database tests keep the in-memory defaults.
+pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
+    pipeline: Pipeline<S, DeferredLeveling, NoopFacts, I, NoClassification, P>,
     pending: DeferredLeveling,
     dispatch: tokio::sync::Mutex<()>,
     runtime: Option<LevelingRuntime>,
@@ -274,9 +279,51 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
             runtime,
         }
     }
+}
+
+impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPipeline<S, I, P> {
+    pub fn with_snapshots(
+        store: S,
+        runtime: Option<LevelingRuntime>,
+        invite_source: I,
+        snapshots: P,
+    ) -> Self {
+        let pending = DeferredLeveling::default();
+        Self {
+            pipeline: Pipeline::with_snapshots(
+                store,
+                Some(pending.clone()),
+                None,
+                invite_source,
+                NoClassification,
+                snapshots,
+            ),
+            pending,
+            dispatch: tokio::sync::Mutex::new(()),
+            runtime,
+        }
+    }
 
     pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, NoopFacts> {
         self.pipeline.handlers()
+    }
+
+    /// Drain deferred XP awards without holding the async dispatch lock.
+    /// The caller owns ordering (the serial checkpoint writer); this only
+    /// preserves the funnel-before-award sequence per dispatch.
+    pub async fn drain(
+        &self,
+        requests: Vec<AwardRequest>,
+    ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
+        let mut results = Vec::with_capacity(requests.len());
+        if let Some(runtime) = &self.runtime {
+            for request in requests {
+                if let Some(award) = runtime.award(request).await? {
+                    results.push(award);
+                }
+            }
+        }
+        Ok(results)
     }
 
     pub async fn handle(&self, event: &Event) -> Result<Vec<XpAward>, LevelingRuntimeError> {
@@ -295,17 +342,21 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
         eligibility: MessageEligibility,
     ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
         let _dispatch = self.dispatch.lock().await;
+        let requests = self.collect_at(event, at, eligibility);
+        self.drain(requests).await
+    }
+
+    /// Drive one event through the funnel and return its deferred award
+    /// requests for the caller to drain. Separated so the blocking
+    /// checkpoint writer can funnel synchronously, then await awards.
+    pub fn collect_at(
+        &self,
+        event: &Event,
+        at: &str,
+        eligibility: MessageEligibility,
+    ) -> Vec<AwardRequest> {
         self.pipeline
             .handle_at_with_eligibility(event, at, eligibility);
-        let requests = self.pending.take();
-        let mut results = Vec::with_capacity(requests.len());
-        if let Some(runtime) = &self.runtime {
-            for request in requests {
-                if let Some(award) = runtime.award(request).await? {
-                    results.push(award);
-                }
-            }
-        }
-        Ok(results)
+        self.pending.take()
     }
 }

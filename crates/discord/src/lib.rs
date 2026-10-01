@@ -36,6 +36,6 @@ pub use interactions::{
     RoutedInteraction,
 };
 pub use pipeline::{
-    build_cache, ChannelClassifier, InviteSource, MemPipeline, NoClassification, NoInvites,
-    Pipeline, PipelineSnapshots, ScriptedInvites,
+    build_cache, ChannelClassifier, InviteSource, MemPipeline, MessageEligibility,
+    NoClassification, NoInvites, Pipeline, PipelineSnapshots, ScriptedInvites,
 };
