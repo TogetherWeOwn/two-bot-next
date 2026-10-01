@@ -59,15 +59,11 @@ impl TestDb {
     }
 
     async fn new_legacy() -> Result<Self, Box<dyn std::error::Error>> {
-        // The endpoint is chosen here, never from DATABASE_URL or any app
-        // config. CI uses only its disposable trust-authenticated service.
-        let host = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
-            "127.0.0.1"
-        } else {
-            "agent-testdb"
-        };
+        // Never use DATABASE_URL or app config. Both local tests and the CI
+        // job container reach the disposable service directly by this name,
+        // avoiding the loopback TCP proxy in the concurrent snapshot regression.
         let options = PgConnectOptions::new()
-            .host(host)
+            .host("agent-testdb")
             .port(5432)
             .username("agent_test")
             .password("")
