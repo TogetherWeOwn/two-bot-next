@@ -165,10 +165,9 @@ async fn checkpoint_io<T>(
 /// sequence. Twilight itself still owns transport, heartbeat and opcode-9
 /// fallback. Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html
 ///
-/// `runtime` is the shared command runtime (TOG-11020; S4 sticky slice was
-/// TOG-10309): `dispatch` spawns detached work so this loop never awaits a
-/// REST call or store write — twilight only drives heartbeats while the
-/// shard is polled.
+/// `runtime` is the shared command runtime: `dispatch` admits bounded work so
+/// this loop never awaits command REST/SQL — twilight only drives heartbeats
+/// while the shard is polled. The scope guard cancels admitted work on exit.
 pub async fn run_shard(
     mut shard: Shard,
     pipeline: Arc<GatewayPipeline>,
@@ -176,6 +175,7 @@ pub async fn run_shard(
     store: GatewaySessionStore,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
 ) -> Result<(), sqlx::Error> {
+    let _dispatch_guard = runtime.as_ref().map(|runtime| runtime.dispatch_guard());
     let result = run_loop(&mut shard, &pipeline, &state, &store, runtime.as_ref()).await;
     *state.write().await = GatewayState::Armed;
     result
@@ -300,7 +300,7 @@ async fn run_loop(
             let event = Event::from(parsed);
             connected = matches!(event, Event::Ready(_) | Event::Resumed);
             pipeline.handle(&event);
-            // Detached dispatch only: awaiting command work inline would stall
+            // Bounded dispatch only: awaiting command work inline would stall
             // heartbeat polling (see `run_shard` docs).
             if let Some(runtime) = runtime {
                 runtime.dispatch(&event);

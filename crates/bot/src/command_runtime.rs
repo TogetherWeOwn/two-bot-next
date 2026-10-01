@@ -16,6 +16,9 @@
 //! - feed relays (`/feed-add`, `/feed-remove`, `/feed-list`; TOG-10085 domain
 //!   and store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
 //!   completion. The generated relay/audit ids replace legacy `randomUUID()`.
+//! - channel moderation (`/purge`, `/slowmode`, `/lockdown`, `/unlock`): shared
+//!   router authorization → ephemeral defer → durable claim/lane → REST effect →
+//!   atomic result/audit → original-response edit. Ambiguity retains the lane.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
@@ -26,7 +29,7 @@
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use sqlx::{Pool, Postgres};
@@ -50,11 +53,12 @@ use two_bot_core::{
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
-    FeatureGates, HandlerId, InteractionHandler, InteractionRouter, ModerationGates, RouterGates,
-    SlashOutcome, SurfaceFlags,
+    ChannelModerationStore, FeatureGates, HandlerId, InteractionHandler, InteractionRouter,
+    ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
-    publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
+    publish_commands, register_channel_handlers, response_for_slash, route_interaction,
+    ActionExecutor, ChannelModerationRuntime, RoutedInteraction,
 };
 
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
@@ -96,14 +100,41 @@ impl InteractionHandler for FeedHandler {
     }
 }
 
+/// Separate admission budgets prevent message bursts or registry pacing from
+/// consuming interaction acknowledgement capacity. No queued/spawned waiters.
+const DISPATCH_LIMITS: [usize; 3] = [16, 16, 1];
+
+#[derive(Default)]
+struct DispatchTasks {
+    stopped: bool,
+    lanes: [Vec<tokio::task::AbortHandle>; 3],
+}
+
+/// Cancels admitted work on gateway exit, including supervisor cancellation.
+/// Interrupted channel effects retain their durable claims for reconciliation.
+pub(crate) struct CommandDispatchGuard(Arc<CommandRuntime>);
+
+impl Drop for CommandDispatchGuard {
+    fn drop(&mut self) {
+        let mut tasks = self.0.tasks.lock().expect("command task scope");
+        tasks.stopped = true;
+        for lane in &mut tasks.lanes {
+            for handle in lane.drain(..) {
+                handle.abort();
+            }
+        }
+    }
+}
+
 /// The shared command runtime: one router + one REST executor + the sqlx
-/// stores, driven by gateway dispatches. Cheap to clone behind `Arc`; every
-/// `dispatch` spawns detached work because twilight only drives heartbeats
-/// while the shard is polled.
+/// stores, driven by gateway dispatches. Bounded asynchronous work leaves
+/// twilight free to poll heartbeats, and is cancelled when its shard exits.
 pub struct CommandRuntime {
     pool: Pool<Postgres>,
     executor: ActionExecutor,
     router: InteractionRouter,
+    channel: ChannelModerationRuntime,
+    tasks: Mutex<DispatchTasks>,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
     /// `TWO_AUTOMATIONS=1`: fast-path gate for the message hook (the router
@@ -145,6 +176,7 @@ impl CommandRuntime {
             SurfaceFlags::default(),
         );
         let mut router = InteractionRouter::new(gates);
+        register_channel_handlers(&mut router);
         router.register(Box::new(StickyHandler));
         for id in [
             HandlerId::FeedAdd,
@@ -164,6 +196,11 @@ impl CommandRuntime {
             }
         };
         Some(Arc::new(Self {
+            channel: ChannelModerationRuntime::new(
+                ChannelModerationStore::from_pool(pool.clone()),
+                executor.clone(),
+            ),
+            tasks: Mutex::new(DispatchTasks::default()),
             pool,
             executor,
             router,
@@ -185,6 +222,11 @@ impl CommandRuntime {
         automations: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
+            channel: ChannelModerationRuntime::new(
+                ChannelModerationStore::from_pool(pool.clone()),
+                executor.clone(),
+            ),
+            tasks: Mutex::new(DispatchTasks::default()),
             pool,
             executor,
             router,
@@ -195,44 +237,67 @@ impl CommandRuntime {
         })
     }
 
-    /// Detached dispatch for one gateway event. Clones the payload and spawns
-    /// so the shard loop never awaits runtime work; the DB claims tolerate
-    /// the reorder/crash windows spawning opens.
-    ///
-    /// READY replaces the full merged set; a first RESUMED also synchronizes
-    /// this process's definitions/gates, even without a preceding READY.
-    pub fn dispatch(self: &Arc<Self>, event: &Event) {
+    pub(crate) fn dispatch_guard(self: &Arc<Self>) -> CommandDispatchGuard {
+        CommandDispatchGuard(Arc::clone(self))
+    }
+
+    fn spawn(
+        &self,
+        lane: usize,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let mut tasks = self.tasks.lock().expect("command task scope");
+        if tasks.stopped {
+            return false;
+        }
+        let handles = &mut tasks.lanes[lane];
+        handles.retain(|handle| !handle.is_finished());
+        if handles.len() >= DISPATCH_LIMITS[lane] {
+            warn!(lane, "command dispatch saturated; event not admitted");
+            return false;
+        }
+        let task = tokio::spawn(work);
+        handles.push(task.abort_handle());
+        true
+    }
+
+    /// Admit before spawning, without waiting on SQL/REST in the shard loop.
+    /// Saturated lanes drop events without effects, queued waiters or tokens in
+    /// logs. READY/RESUMED publication has independent capacity; overlapping
+    /// connection events coalesce while the full registry is being synchronized.
+    pub fn dispatch(self: &Arc<Self>, event: &Event) -> bool {
         match event {
             Event::MessageCreate(message) => {
+                if !self.automations {
+                    return false;
+                }
                 let runtime = Arc::clone(self);
                 let message = message.0.clone();
-                // Dropping the JoinHandle detaches the task — exactly what the
-                // shard loop needs (never await runtime work while polling).
-                drop(tokio::spawn(async move {
+                self.spawn(0, async move {
                     runtime.on_message(&message).await;
-                }));
+                })
             }
             Event::InteractionCreate(interaction) => {
                 let runtime = Arc::clone(self);
                 let interaction = interaction.0.clone();
-                drop(tokio::spawn(async move {
+                self.spawn(1, async move {
                     runtime.on_interaction(&interaction).await;
-                }));
+                })
             }
             Event::Ready(ready) => {
                 let runtime = Arc::clone(self);
                 let application_id = ready.application.id.get();
-                drop(tokio::spawn(async move {
+                self.spawn(2, async move {
                     runtime.publish_registry(Some(application_id)).await;
-                }));
+                })
             }
             Event::Resumed => {
                 let runtime = Arc::clone(self);
-                drop(tokio::spawn(async move {
+                self.spawn(2, async move {
                     runtime.publish_registry(None).await;
-                }));
+                })
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -279,9 +344,16 @@ impl CommandRuntime {
 
     /// Route all slash commands through the shared router. Refusals get the
     /// existing ephemeral text; accepted builtins without a wired slice get
-    /// an unavailable reply. Only the five implemented names defer and run
-    /// their slice. Router Ignore (unknown names/guild fence) stays silent.
+    /// an unavailable reply. Channel commands own their defer/audit lifecycle;
+    /// other implemented names use the existing lifecycle below. Router Ignore
+    /// (unknown names/guild fence) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
+        if ChannelModerationRuntime::accepts(interaction) {
+            if let Err(error) = self.channel.respond(&self.router, interaction).await {
+                warn!(interaction_id = %interaction.id.get(), error = %error, "channel response failed; no effect retry");
+            }
+            return;
+        }
         let RoutedInteraction::Slash { name, outcome } =
             route_interaction(&self.router, interaction, None)
         else {
@@ -917,10 +989,11 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
 }
 
 /// The runtime's router for tests that bypass `from_env`'s env reads:
-/// sticky + feed handler markers, matching `from_env`'s registrations.
+/// sticky + feed + channel handler markers, matching `from_env`'s registrations.
 #[cfg(test)]
 pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
+    register_channel_handlers(&mut router);
     router.register(Box::new(StickyHandler));
     for id in [
         HandlerId::FeedAdd,

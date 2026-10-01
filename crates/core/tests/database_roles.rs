@@ -83,6 +83,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
         include_str!("../../cutover/migrations/0121_channel_claim_generation.sql"),
         include_str!("../../cutover/migrations/0122_channel_lockdown_generation.sql"),
+        include_str!("../../cutover/migrations/0123_channel_execution.sql"),
+        include_str!("../../cutover/migrations/0124_channel_shared_timestamps.sql"),
         include_str!("../../cutover/migrations/0150_sticky_messages.sql"),
         include_str!("../../cutover/migrations/0160_rsvp.sql"),
         include_str!("../../cutover/migrations/0170_lfg.sql"),
@@ -127,6 +129,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     )
     .await?;
     as_role(pool, &roles[1], "SELECT * FROM public.members; INSERT INTO public.guild_settings (guild_id, key, value, version, updated_by) VALUES ('test', 'test', '1', nextval('public.guild_settings_version_seq'), 'test'); UPDATE public.guild_settings SET value = '2' WHERE guild_id = 'test'; DELETE FROM public.guild_settings WHERE guild_id = 'test'").await?;
+    // Channel runtime exclusion is DML-only and stays private to the bot.
+    as_role(pool, &roles[1], "INSERT INTO public.moderation_idempotency (guild_id, idempotency_key, action, request_hash, state, claimed_at) VALUES ('channel-role-probe', 'key', 'slowmode', 'hash', 'in_flight', now()); INSERT INTO public.moderation_channel_execution (guild_id, channel_id, idempotency_key, claim_token) SELECT guild_id, 'channel', idempotency_key, claim_token FROM public.moderation_idempotency WHERE guild_id = 'channel-role-probe'; SELECT * FROM public.moderation_channel_execution; UPDATE public.moderation_channel_execution SET channel_id = 'other' WHERE guild_id = 'channel-role-probe'; DELETE FROM public.moderation_channel_execution WHERE guild_id = 'channel-role-probe'").await?;
     // Migration 0200 relations are runtime-operated: event claims and panel
     // lane leases must work under the least-privilege login.
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_audit; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); UPDATE public.self_role_audit SET reason = 'probe' WHERE event_id = 'roles-probe'; DELETE FROM public.self_role_audit WHERE event_id = 'roles-probe'").await?;
@@ -159,6 +163,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "INSERT INTO public.members (member_id) VALUES ('test')",
         "SELECT * FROM public.self_role_audit",
         "SELECT * FROM public.self_role_panel_claims",
+        "SELECT * FROM public.moderation_channel_execution",
         "CREATE TABLE web_v1.reader_probe (id int)",
         "SELECT nextval('public.guild_settings_version_seq')",
     ] {

@@ -38,9 +38,9 @@ fn context(action: ModerationAction, count: Option<u64>) -> ModerationExecution 
 }
 
 #[tokio::test]
-async fn original_response_edit_suppresses_mentions_and_validates_before_send() {
+async fn original_response_edit_suppresses_mentions_bounds_content_and_validates_ids() {
     let mock = MockRest::start(
-        vec![ScriptedResponse::status(200)],
+        vec![ScriptedResponse::status(200), ScriptedResponse::status(200)],
         ScriptedResponse::status(500),
     )
     .await;
@@ -67,13 +67,22 @@ async fn original_response_edit_suppresses_mentions_and_validates_before_send() 
             .await,
         Err(DiscordError::Rejected(_))
     ));
-    assert!(matches!(
-        executor
-            .edit_interaction_response(1234, "synthetic-webhook-token", &"x".repeat(2001))
-            .await,
-        Err(DiscordError::Rejected(_))
-    ));
-    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "invalid id never reaches the wire"
+    );
+    executor
+        .edit_interaction_response(1234, "synthetic-webhook-token", &"x".repeat(2001))
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let bounded: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        bounded["content"].as_str().unwrap().encode_utf16().count(),
+        2000
+    );
     mock.shutdown().await;
 }
 

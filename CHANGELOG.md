@@ -28,7 +28,10 @@
   Verify gates, exact overwrite recovery, durable retry exclusion and finalization-only
   retries with mock REST and isolated PostgreSQL tests. Defer ephemerally before SQL/REST
   work, then edit the original response without mentions or effect retries.
-  Startup activation remains pending.
+  Compose these handlers alongside sticky and feed commands at startup and publish
+  the complete gated set on READY/RESUMED. Bound asynchronous work in separate message,
+  interaction and registry lanes; cancel it on shard exit without releasing uncertain
+  effects. Moderation remains default-off; no live guild activation is included.
 
 ### Fixed
 

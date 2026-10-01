@@ -11,6 +11,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'moderation_lockdowns', 'table'),
     ('public', 'moderation_audit', 'table'),
     ('public', 'moderation_idempotency', 'table'),
+    ('public', 'moderation_channel_execution', 'table'),
     ('public', 'sticky_messages', 'table'),
     ('public', 'automation_audit_log', 'table'),
     ('public', 'event_rsvps', 'table'),
