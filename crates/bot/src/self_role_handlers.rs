@@ -3,7 +3,11 @@
 
 use std::{
     collections::HashSet,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use tracing::warn;
@@ -19,8 +23,11 @@ use two_bot_core::self_roles::{
 
 use crate::{
     command_runtime::new_id,
+    jobs::{self, ErrorClass, Job},
     self_role_runtime::{Admission, RuntimeError, Selection, SelfRoleRequest, SelfRoleRuntime},
 };
+
+pub(crate) const RECOVERY_JOB_NAME: &str = "self_role_recovery";
 
 pub(crate) struct SelfRoleInput {
     pub panel: SelfRolePanel,
@@ -213,13 +220,43 @@ impl SelfRoleService {
         .await
     }
 
-    /// One bounded processing-audit sweep; scheduling/terminal stale repair must
-    /// be attached to the shared shutdown supervisor before boot activation.
-    /// Renewed expiry supplies durable backoff even if this process restarts.
+    /// Await the sweep inside the existing supervisor's attempt, not a detached
+    /// recovery task. Timeout/shutdown drops its owners and their lease keepers;
+    /// durable evidence and pending remote exchanges remain for future recovery.
+    /// A successful tick means the sweep completed, not that every audit settled.
+    pub fn recovery_job(self: &Arc<Self>) -> Job {
+        let service = Arc::clone(self);
+        let cadence = Duration::from_secs(30);
+        Job {
+            name: RECOVERY_JOB_NAME,
+            cadence,
+            startup_jitter: jobs::startup_jitter(cadence, rand::random()),
+            timeout: Duration::from_secs(25),
+            action: Arc::new(move || {
+                let service = Arc::clone(&service);
+                Box::pin(async move {
+                    service
+                        .recover_once()
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| match error {
+                            RuntimeError::Store => ErrorClass::Database,
+                            RuntimeError::Rest(_) => ErrorClass::Rest,
+                            _ => ErrorClass::Configuration,
+                        })
+                })
+            }),
+        }
+    }
+
+    /// One bounded processing-audit sweep. Terminal stale repair remains a boot
+    /// blocker. Renewed expiry supplies durable backoff across process restarts.
     pub async fn recover_once(&self) -> Result<usize, RuntimeError> {
         let mut considered = 0;
         let start = self.recovery_cursor.fetch_add(1, Ordering::Relaxed) % self.panels.len();
-        for offset in 0..self.panels.len() {
+        // Bound discovery I/O even when configured sources have no work. Rotate
+        // before awaiting so cancellation cannot starve later panels.
+        for offset in 0..self.panels.len().min(8) {
             let panel = &self.panels[(start + offset) % self.panels.len()];
             let candidates = self
                 .runtime

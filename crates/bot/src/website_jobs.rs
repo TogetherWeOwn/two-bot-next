@@ -16,6 +16,7 @@ use two_bot_discord::executor::ActionExecutor;
 use crate::{
     community_jobs,
     jobs::{self, ErrorClass, Job},
+    self_role_handlers::{SelfRoleService, RECOVERY_JOB_NAME},
     server,
 };
 
@@ -101,6 +102,18 @@ pub async fn serve(
     gateway: server::SharedState,
     shutdown: watch::Sender<bool>,
 ) -> std::io::Result<()> {
+    // No production self-role boot construction until terminal recovery and
+    // compiled acceptance are complete. Do not create another feature service.
+    serve_with_self_roles(config, listener, gateway, shutdown, None).await
+}
+
+pub(crate) async fn serve_with_self_roles(
+    config: &Config,
+    listener: tokio::net::TcpListener,
+    gateway: server::SharedState,
+    shutdown: watch::Sender<bool>,
+    self_roles: Option<Arc<SelfRoleService>>,
+) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
@@ -152,20 +165,38 @@ pub async fn serve(
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
-    // All six names park together when nothing registered; otherwise only the
-    // env-gated community names are parked and the rest report live status.
-    let status = jobs::statuses(&names, registered.is_empty());
+    if let Some(service) = self_roles {
+        registered.push(service.recovery_job());
+    }
+    let status = registered_statuses(&registered, &parked).await;
+    let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
+    serve_jobs(registered, status, shutdown, http).await
+}
+
+async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::SharedStatus {
+    let names: Vec<&'static str> = NAMES
+        .into_iter()
+        .chain(community_jobs::NAMES)
+        .chain([RECOVERY_JOB_NAME])
+        .collect();
+    // Mark only actual registrations live: injecting recovery alone must not
+    // make unavailable website/community jobs look active.
+    let status = jobs::statuses(&names, true);
     {
         let mut entries = status.write().await;
+        for job in registered {
+            entries
+                .get_mut(job.name)
+                .expect("known registered job")
+                .parked = false;
+        }
         for name in parked {
-            if let Some(entry) = entries.get_mut(name) {
+            if let Some(entry) = entries.get_mut(*name) {
                 entry.parked = true;
             }
         }
     }
-    let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
-    serve_jobs(registered, status, shutdown, http).await
+    status
 }
 
 pub(crate) const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);

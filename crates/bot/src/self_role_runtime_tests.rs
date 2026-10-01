@@ -204,6 +204,8 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    supervised_processing_recovery(pool).await?;
+    bounded_processing_sweep(pool).await?;
     durable_processing_recovery_without_redelivery(pool).await?;
     shared_reaction_dispatch_and_disabled_gate(pool).await?;
     shared_component_orchestration(pool).await?;
@@ -245,6 +247,252 @@ fn effect_snapshots_do_not_invent_unattempted_changes_or_erase_history() {
     // Differences on other roles do not become this event's observed effects.
     observe_effects(&mut effects, &[OTHER.into()], &held);
     assert!(!effects.added_role_ids.contains(&OLD_ROLE.into()));
+}
+
+async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
+    use crate::{
+        jobs::{self, ErrorClass},
+        self_role_handlers::{SelfRoleService, RECOVERY_JOB_NAME},
+        website_jobs,
+    };
+    use two_bot_core::self_roles::SelfRoleGates;
+
+    for case in ["success", "pending", "shutdown", "timeout", "stopped"] {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let held = if case == "success" || case == "pending" {
+            vec![OLD_ROLE, OTHER]
+        } else {
+            vec![OTHER]
+        };
+        let pending = matches!(case, "pending" | "timeout" | "stopped");
+        let mut script = snapshot(&held);
+        if case == "timeout" {
+            script.push(
+                ScriptedResponse::json(200, json!({"user":{"id":USER},"roles":held}))
+                    .delayed(Duration::from_secs(5)),
+            );
+        } else if case != "stopped" {
+            script.extend(snapshot(&held)); // recovered admission
+            script.extend(snapshot(&held)); // execution
+            if case == "shutdown" {
+                script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(5)));
+            } else if case == "success" {
+                script.push(ScriptedResponse::status(204)); // DELETE old
+                script.extend(snapshot(&[OTHER]));
+                script.push(ScriptedResponse::status(204)); // PUT new
+                script.extend(snapshot(&[NEW_ROLE, OTHER]));
+                script.extend(snapshot(&[NEW_ROLE, OTHER])); // settlement
+            }
+        }
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let mut panel = panel(PanelMode::Button);
+        panel.id = format!("supervised-recovery-{case}");
+        let request = request(
+            &panel.id,
+            Selection::Button {
+                option_key: "new".into(),
+            },
+        );
+        let prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+        if pending {
+            let mut effects = AuditEffects::default();
+            mark_attempt(&mut effects, NEW_ROLE, true);
+            assert!(
+                feature
+                    .store
+                    .checkpoint_exchange(&prepared.event, &effects, false, Some(true))
+                    .await?
+            );
+        }
+        drop(prepared);
+        clock.store(NOW + 500, Ordering::SeqCst);
+        let service = Arc::new(
+            SelfRoleService::new(
+                feature,
+                SelfRoleGates {
+                    panels: vec![panel.clone()],
+                    dry_run: false,
+                },
+                &[GUILD.to_owned()].into_iter().collect(),
+            )
+            .unwrap(),
+        );
+        let mut job = service.recovery_job();
+        job.startup_jitter = Duration::ZERO;
+        job.cadence = Duration::from_secs(600); // one attempt, no retries in fixture
+        if case == "timeout" {
+            job.timeout = Duration::from_secs(2);
+        }
+        let status = jobs::statuses(&[RECOVERY_JOB_NAME], false);
+        let (stop, _) = tokio::sync::watch::channel(case == "stopped");
+        let http_shutdown = stop.subscribe();
+        let owner = tokio::spawn(website_jobs::serve_jobs(
+            vec![job],
+            status.clone(),
+            stop.clone(),
+            async move {
+                crate::server::shutdown_requested(http_shutdown).await;
+                Ok(())
+            },
+        ));
+        if case == "shutdown" {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !mock.requests().iter().any(|r| r.method == "PUT") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+        } else if case != "stopped" {
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let current = status.read().await[RECOVERY_JOB_NAME].clone();
+                    if case == "timeout" {
+                        if current.last_error_class == Some(ErrorClass::Timeout) {
+                            break;
+                        }
+                    } else {
+                        assert_eq!(current.last_error_class, None);
+                        if current.last_success.is_some() {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+        }
+        stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), owner).await???;
+        let current = status.read().await[RECOVERY_JOB_NAME].clone();
+        assert!(!current.running);
+        if case == "stopped" {
+            assert!(current.last_start.is_none());
+        }
+        if case == "timeout" {
+            assert_eq!(current.last_error_class, Some(ErrorClass::Timeout));
+            assert_eq!(current.consecutive_failures, 1);
+        }
+        let row: (String, bool, i32, String, String, String) = sqlx::query_as(
+            "SELECT outcome,exchange_pending,claim_generation,desired_role_ids,attempted_added_role_ids,unresolved_added_role_ids FROM self_role_audit WHERE event_id=$1",
+        ).bind(&request.event_id).fetch_one(pool).await?;
+        assert_eq!(
+            row.0,
+            if case == "success" {
+                "switched"
+            } else {
+                "processing"
+            }
+        );
+        assert_eq!(row.1, case != "success");
+        assert_eq!(row.2, if case == "stopped" { 1 } else { 2 });
+        assert_eq!(serde_json::from_str::<Vec<String>>(&row.3)?, [NEW_ROLE]);
+        assert_eq!(serde_json::from_str::<Vec<String>>(&row.4)?, [NEW_ROLE]);
+        if case != "success" {
+            assert_eq!(serde_json::from_str::<Vec<String>>(&row.5)?, [NEW_ROLE]);
+        }
+        let (target, committed): (Option<String>, bool) = sqlx::query_as(
+            "SELECT latest_option_key,target_committed FROM self_role_panel_claims WHERE guild_id=$1 AND member_id=$2 AND panel_id=$3",
+        ).bind(GUILD).bind(USER).bind(&panel.id).fetch_one(pool).await?;
+        assert!(committed);
+        assert_eq!(
+            target.as_deref(),
+            if case == "success" {
+                Some("new")
+            } else if case == "pending" {
+                Some("old")
+            } else {
+                None
+            }
+        );
+        let calls = mock.requests();
+        let methods: Vec<_> = calls
+            .iter()
+            .filter(|r| r.method != "GET")
+            .map(|r| r.method.as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            if case == "success" {
+                vec!["DELETE", "PUT"]
+            } else if case == "shutdown" {
+                vec!["PUT"]
+            } else {
+                vec![]
+            }
+        );
+        // Changing the DB clock while the old lease is still live would expose
+        // any renewal keeper that escaped cancellation/join of its job owner.
+        let expiry: (Option<i64>, i64) = sqlx::query_as(
+            "SELECT (extract(epoch FROM a.processing_expires_at)*1000)::bigint,(extract(epoch FROM p.processing_expires_at)*1000)::bigint FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id) WHERE a.event_id=$1",
+        ).bind(&request.event_id).fetch_one(pool).await?;
+        clock.store(NOW + 600, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let after: (Option<i64>, i64) = sqlx::query_as(
+            "SELECT (extract(epoch FROM a.processing_expires_at)*1000)::bigint,(extract(epoch FROM p.processing_expires_at)*1000)::bigint FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id) WHERE a.event_id=$1",
+        ).bind(&request.event_id).fetch_one(pool).await?;
+        assert_eq!(expiry, after);
+        assert_eq!(calls.len(), mock.requests().len());
+        mock.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn bounded_processing_sweep(pool: &PgPool) -> TestResult {
+    use crate::self_role_handlers::SelfRoleService;
+    use two_bot_core::self_roles::SelfRoleGates;
+
+    for (case, panel_count, rows_per_panel, expected) in
+        [("panels", 10, 1, vec![8, 1, 1]), ("rows", 1, 5, vec![4, 1])]
+    {
+        let clock = Arc::new(AtomicI64::new(NOW));
+        let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+        let feature = runtime(pool, &clock, &mock);
+        let mut panels = vec![];
+        for i in 0..panel_count {
+            let mut panel = panel(PanelMode::Button);
+            panel.id = format!("bounded-sweep-{case}-{i}");
+            for n in 0..rows_per_panel {
+                let audit = SelfRoleAudit {
+                    event_id: format!("{}-{n}", panel.id),
+                    event_order: Some(format!("{n:04}")),
+                    guild_id: GUILD.into(),
+                    panel_id: panel.id.clone(),
+                    member_id: USER.into(),
+                    source_id: MESSAGE.into(),
+                    option_key: Some("new".into()),
+                    role_id: Some(NEW_ROLE.into()),
+                    source: PanelMode::Button,
+                    operation: RoleOperation::Add,
+                    outcome: SettledOutcome::Rejected,
+                    code: None,
+                    reason: None,
+                    effects: AuditEffects::default(),
+                    desired_role_ids: vec![],
+                    pre_mutation_role_ids: vec![],
+                };
+                assert!(feature.store.claim_pending_audit(&audit).await?.is_some());
+            }
+            panels.push(panel);
+        }
+        clock.store(NOW + 500, Ordering::SeqCst);
+        let service = SelfRoleService::new(
+            feature,
+            SelfRoleGates {
+                panels,
+                dry_run: false,
+            },
+            &[GUILD.to_owned()].into_iter().collect(),
+        )
+        .unwrap();
+        for count in expected {
+            assert_eq!(service.recover_once().await.unwrap(), count);
+        }
+        assert_eq!(service.recover_once().await.unwrap(), 0);
+        assert!(mock.requests().is_empty()); // uninitialized rows refuse before REST
+        mock.shutdown().await;
+    }
+    Ok(())
 }
 
 async fn durable_processing_recovery_without_redelivery(pool: &PgPool) -> TestResult {

@@ -229,16 +229,30 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   ordered by expiry then a stable event-ID tie-breaker, and capped at 32 rows.
   It grants no authority or snapshot: the existing claim lock reloads immutable
   intent/effects and rotates the generation. A service pass considers at most
-  32 rows, four per panel, rotating its starting panel; renewed expiry supplies
-  durable backoff. Initialized empty select targets remain meaningful, while
-  interrupted uninitialized intent rejects without REST. Inconsistent pending or
+  32 rows across at most eight panels, four per panel, rotating its starting panel
+  before awaiting work; renewed expiry supplies durable backoff. Initialized empty
+  select targets remain meaningful, while interrupted uninitialized intent rejects
+  without REST. Inconsistent pending or
   effect evidence stays processing even when initialization is absent.
 - Added isolated discovery/race/limit and recovery-without-redelivery fixtures
   cover selected/empty targets, compensation, dry-run/pending refusal and
-  uninitialized evidence preservation. The sweep is not yet registered with the
-  shared shutdown supervisor. Terminal superseded audits and their committed-
-  target repair are not covered by processing discovery; these remain activation
-  blockers.
+  uninitialized evidence preservation.
+- `recovery_job` awaits a pass inside the existing fixed-phase supervisor, with
+  a 30-second cadence, bounded startup jitter and 25-second attempt timeout.
+  `serve_with_self_roles` accepts the same injected service Arc used for dispatch;
+  no new scheduler, detached recovery task or HTTP client is created. Per-name
+  status parking keeps unavailable website/community jobs parked even when only
+  recovery is injected. A successful tick means the sweep completed, not that
+  every pending exchange settled. Shutdown/timeout drops owners and their renewal
+  keepers without clearing pending work or publishing a new target.
+- Added shared owner/supervisor fixtures cover recovery without redelivery,
+  still-pending sweeps, timeout, in-flight-send shutdown, stopped startup and
+  stopped renewals, plus bounded panel/row passes and status parking. These Rust
+  fixtures remain uncompiled. Production `serve` still passes no self-role
+  service, and `CommandRuntime::from_env` still creates none; approved boot
+  composition must share one Arc across both paths. Terminal superseded audits
+  and their committed-target repair are not covered by processing discovery;
+  those and the unknown-work lifecycle remain activation blockers.
 
 Interrupted remote work stays explicitly unresolved; its durable continuation/
 reconciliation lifecycle must be wired before activation, not silently cleared

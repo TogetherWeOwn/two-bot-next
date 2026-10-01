@@ -114,6 +114,19 @@ fn service(mode: PanelMode) -> SelfRoleService {
 }
 
 #[tokio::test]
+async fn recovery_job_has_bounded_cadence_jitter_and_owned_service() {
+    let service = Arc::new(service(PanelMode::Button));
+    let job = service.recovery_job();
+    assert_eq!(job.name, RECOVERY_JOB_NAME);
+    assert_eq!(job.cadence, Duration::from_secs(30));
+    assert_eq!(job.timeout, Duration::from_secs(25));
+    assert!(job.startup_jitter <= Duration::from_secs(5));
+    assert_eq!(Arc::strong_count(&service), 2);
+    drop(job);
+    assert_eq!(Arc::strong_count(&service), 1);
+}
+
+#[tokio::test]
 async fn empty_or_denied_catalogue_never_registers_a_surface() {
     let allowlist = [GUILD.to_string()].into_iter().collect();
     assert!(SelfRoleService::new(

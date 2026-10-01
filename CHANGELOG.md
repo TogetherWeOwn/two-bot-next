@@ -26,8 +26,10 @@
   source discovery and generation-fenced recovery of expired processing audits
   without gateway redelivery, preserving initialized empty targets and unresolved
   evidence. Gate reaction dispatch through the shared router and add actual
-  partial/duplicate add/remove fixtures. Production boot remains disabled until
-  shared recovery supervision, terminal stale repair, approved staging configuration,
+  partial/duplicate add/remove fixtures. Add optional shared-supervisor recovery
+  registration with bounded cadence/timeout and discovery I/O, per-name parked
+  status, and cancellation/evidence-preservation fixtures. Production boot remains
+  disabled until terminal stale repair, approved shared boot configuration,
   unresolved-work continuation and compiled acceptance are complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
