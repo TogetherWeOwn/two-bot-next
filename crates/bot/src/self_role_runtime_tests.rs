@@ -204,6 +204,11 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0204_self_role_terminal_repair.sql"
+    ))
+    .execute(pool)
+    .await?;
     supervised_processing_recovery(pool).await?;
     bounded_processing_sweep(pool).await?;
     durable_processing_recovery_without_redelivery(pool).await?;

@@ -13,7 +13,8 @@ use time::OffsetDateTime;
 use two_bot_core::self_roles::event_order_for_event_id;
 use two_bot_core::{PanelMode, RoleOperation, SettledOutcome};
 use two_bot_cutover::self_role_store::{
-    AuditEffects, PanelClaim, PanelClaimResult, PanelKey, SelfRoleAudit, SelfRoleStore, StoreError,
+    AuditEffects, EventClaim, PanelClaim, PanelClaimResult, PanelKey, SelfRoleAudit, SelfRoleStore,
+    StoreError,
 };
 
 const TEST_NOW_MS: i64 = 1_700_000_000_000;
@@ -103,6 +104,410 @@ async fn leases_recovery_ordering_and_atomic_settlement() -> TestResult {
         .await?;
     admin.close().await;
     result
+}
+
+async fn terminal_seed(
+    store: &SelfRoleStore,
+    id: &str,
+    panel: &str,
+    pending: bool,
+) -> TestResult<(SelfRoleAudit, EventClaim)> {
+    let mut audit = row(id, id);
+    audit.panel_id = panel.into();
+    audit.desired_role_ids.clear();
+    audit.pre_mutation_role_ids.clear();
+    audit.effects = AuditEffects {
+        attempted_added_role_ids: vec!["role-a".into()],
+        unresolved_added_role_ids: if pending {
+            vec!["role-a".into()]
+        } else {
+            vec![]
+        },
+        ..Default::default()
+    };
+    let event = store.claim_audit(&audit).await?.unwrap();
+    assert!(
+        store
+            .checkpoint_exchange(&event, &audit.effects, false, pending)
+            .await?
+    );
+    audit.outcome = SettledOutcome::Rejected;
+    audit.code = Some("superseded_by_later_event".into());
+    audit.reason = Some("a later exclusive-panel event was accepted".into());
+    store.finish_audit(&audit, &event).await?;
+    Ok((audit, event))
+}
+
+async fn terminal_discovery_and_claim_race(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+    for i in 0..46 {
+        terminal_seed(
+            &store,
+            &format!("terminal-discovery-{i:02}"),
+            "terminal-discovery",
+            false,
+        )
+        .await?;
+    }
+    // Scope, terminal outcome/code, dirty evidence, completion and due eligibility
+    // are separate predicates. A discovery hint carries none of their authority.
+    for (id, change) in [
+        (0, "outcome='processing'"),
+        (1, "outcome='switched'"),
+        (2, "code='dry_run'"),
+        (3, "attempted_added_role_ids='[]'"),
+        (4, "guild_id='other-guild'"),
+        (5, "panel_id='other-panel'"),
+        (6, "source_id='other-message'"),
+        (7, "source='reaction'"),
+        (8, "repair_complete=TRUE"),
+    ] {
+        // Audited: fixed fixture fragments, no external identifiers or SQL.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "UPDATE self_role_audit SET {change} WHERE event_id='terminal-discovery-{id:02}'"
+        )))
+        .execute(pool)
+        .await?;
+    }
+    sqlx::query("UPDATE self_role_audit SET repair_expires_at=to_timestamp($1::double precision/1000) WHERE event_id='terminal-discovery-09'")
+        .bind(TEST_NOW_MS + 300).execute(pool).await?;
+    sqlx::query("UPDATE self_role_audit SET repair_expires_at=to_timestamp($1::double precision/1000) WHERE event_id='terminal-discovery-10'")
+        .bind(TEST_NOW_MS).execute(pool).await?;
+    let discover = |limit| {
+        store.superseded_audits(
+            "test-guild",
+            "terminal-discovery",
+            "test-message",
+            PanelMode::Button,
+            limit,
+        )
+    };
+    assert!(discover(0).await?.is_empty());
+    let candidates = discover(100).await?;
+    assert_eq!(candidates.len(), 32);
+    assert_eq!(candidates[0].event_id, "terminal-discovery-11");
+    assert_eq!(candidates[31].event_id, "terminal-discovery-42");
+    assert_eq!(discover(1).await?.len(), 1);
+    let hint = &candidates[0];
+    let mut mismatch = hint.clone();
+    mismatch.member_id = "different-member".into();
+    assert!(store.claim_superseded_audit(&mismatch).await?.is_none());
+    let (a, b) = tokio::join!(
+        store.claim_superseded_audit(hint),
+        store.claim_superseded_audit(hint)
+    );
+    let (a, b) = (a?, b?);
+    assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
+    let winner = a.or(b).unwrap();
+    assert_eq!(winner.generation(), 2);
+    assert!(winner.intent_initialized());
+    assert!(winner.audit().desired_role_ids.is_empty());
+    assert!(winner.audit().pre_mutation_role_ids.is_empty());
+    assert_eq!(winner.audit().effects.attempted_added_role_ids, ["role-a"]);
+    assert_eq!(discover(1).await?[0].event_id, "terminal-discovery-12");
+    assert!(store.owns_superseded_claim(&winner).await?);
+    clock.store(TEST_NOW_MS + 100, Ordering::SeqCst);
+    assert!(store.renew_superseded_claim(&winner).await?);
+    clock.store(TEST_NOW_MS + 400, Ordering::SeqCst);
+    assert!(!store.owns_superseded_claim(&winner).await?);
+    assert!(!store.renew_superseded_claim(&winner).await?);
+    let replacement = store.claim_superseded_audit(hint).await?.unwrap();
+    assert_eq!(replacement.generation(), 3);
+    assert!(
+        !store
+            .record_superseded_repair(&winner, &AuditEffects::default(), false)
+            .await?
+    );
+    assert!(store.owns_superseded_claim(&replacement).await?);
+    // Malformed persisted arrays refuse acquisition without rotating ownership.
+    let malformed = &candidates[1];
+    sqlx::query("UPDATE self_role_audit SET desired_role_ids='{}' WHERE event_id=$1")
+        .bind(&malformed.event_id)
+        .execute(pool)
+        .await?;
+    assert!(matches!(
+        store.claim_superseded_audit(malformed).await,
+        Err(StoreError::Intent(_))
+    ));
+    let (generation,): (i32,) =
+        sqlx::query_as("SELECT claim_generation FROM self_role_audit WHERE event_id=$1")
+            .bind(&malformed.event_id)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(generation, 1);
+    Ok(())
+}
+
+async fn terminal_repair_fences_and_completion(pool: &PgPool) -> TestResult {
+    for (suffix, target, inherited_pending) in [
+        ("selected", Some("chess"), false),
+        ("empty", None, false),
+        ("pending", Some("chess"), true),
+    ] {
+        let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+        let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+        let name = format!("terminal-repair-{suffix}");
+        let (audit, former) = terminal_seed(&store, &name, &name, inherited_pending).await?;
+        let hint = store
+            .superseded_audits("test-guild", &name, "test-message", PanelMode::Button, 1)
+            .await?
+            .remove(0);
+        let claim = store.claim_superseded_audit(&hint).await?.unwrap();
+        let (token,): (String,) =
+            sqlx::query_as("SELECT claim_token FROM self_role_audit WHERE event_id=$1")
+                .bind(&name)
+                .fetch_one(pool)
+                .await?;
+        assert_ne!(&token, former.token.expose());
+        assert!(!format!("{claim:?}").contains(&token));
+        assert!(
+            !store
+                .record_superseded_exchange(&former, &audit.effects, Some(false))
+                .await?
+        );
+        assert!(store.claim_audit(&audit).await?.is_none());
+        let key = panel_key(&audit);
+        let unknown = acquired(store.claim_panel(&key, None).await?);
+        assert!(
+            !store
+                .journal_superseded_repair(&claim, &unknown, &audit.effects)
+                .await?
+        );
+        assert!(!store.finish_superseded_repair(&claim, &unknown).await?);
+        assert!(store.release_panel_claim(&unknown).await?);
+        let mut normal = acquired(
+            store
+                .claim_panel(&key, Some(("winner", "later-order")))
+                .await?,
+        );
+        assert!(store.set_panel_claim_option(&mut normal, target).await?);
+        assert!(matches!(
+            store
+                .journal_superseded_repair(&claim, &normal, &audit.effects)
+                .await,
+            Err(StoreError::WrongPanel)
+        ));
+        assert!(store.release_panel_claim(&normal).await?);
+        let mut maintenance = acquired(store.claim_panel(&key, None).await?);
+        assert_eq!(
+            maintenance.target.latest_event_id.as_deref(),
+            Some("winner")
+        );
+        assert_eq!(maintenance.target.option_key.as_deref(), target);
+        let journal = AuditEffects {
+            attempted_removed_role_ids: vec!["role-b".into()],
+            unresolved_removed_role_ids: vec!["role-b".into()],
+            ..Default::default()
+        };
+        assert!(
+            store
+                .journal_superseded_repair(&claim, &maintenance, &journal)
+                .await?
+        );
+        assert!(matches!(
+            store.finish_superseded_repair(&claim, &maintenance).await,
+            Err(StoreError::PendingExchange)
+        ));
+        assert!(
+            store
+                .record_superseded_repair(&claim, &journal, false)
+                .await?
+        );
+        assert!(matches!(
+            store.finish_superseded_repair(&claim, &maintenance).await,
+            Err(StoreError::PendingExchange)
+        ));
+        let observed = AuditEffects {
+            compensated_removed_role_ids: vec!["role-b".into()],
+            ..Default::default()
+        };
+        assert!(
+            store
+                .record_superseded_repair(&claim, &observed, false)
+                .await?
+        );
+        let effects = stored_effects(pool, &name).await?;
+        assert_eq!(effects.attempted_added_role_ids, ["role-a"]);
+        assert_eq!(effects.attempted_removed_role_ids, ["role-b"]);
+        assert_eq!(effects.compensated_removed_role_ids, ["role-b"]);
+        if inherited_pending {
+            assert_eq!(effects.unresolved_added_role_ids, ["role-a"]);
+            assert!(matches!(
+                store.finish_superseded_repair(&claim, &maintenance).await,
+                Err(StoreError::PendingExchange)
+            ));
+            // Even journaling a new repair cannot discard the inherited unknown.
+            assert!(
+                store
+                    .journal_superseded_repair(&claim, &maintenance, &AuditEffects::default())
+                    .await?
+            );
+            assert_eq!(
+                stored_effects(pool, &name).await?.unresolved_added_role_ids,
+                ["role-a"]
+            );
+            clock.store(TEST_NOW_MS + 300, Ordering::SeqCst);
+            assert!(
+                !store
+                    .journal_superseded_repair(&claim, &maintenance, &journal)
+                    .await?
+            );
+            assert!(!store.finish_superseded_repair(&claim, &maintenance).await?);
+            let retry = store.claim_superseded_audit(&hint).await?.unwrap();
+            assert!(retry.exchange_pending());
+            assert_eq!(retry.audit().effects.unresolved_added_role_ids, ["role-a"]);
+        } else {
+            let mut wrong = maintenance.clone();
+            wrong.key.member_id = "other-member".into();
+            assert!(matches!(
+                store.finish_superseded_repair(&claim, &wrong).await,
+                Err(StoreError::WrongPanel)
+            ));
+            clock.store(TEST_NOW_MS + 100, Ordering::SeqCst);
+            assert!(store.renew_superseded_claim(&claim).await?);
+            clock.store(TEST_NOW_MS + 300, Ordering::SeqCst);
+            assert!(store.owns_superseded_claim(&claim).await?);
+            assert!(
+                !store
+                    .journal_superseded_repair(&claim, &maintenance, &journal)
+                    .await?
+            );
+            assert!(!store.finish_superseded_repair(&claim, &maintenance).await?);
+            maintenance = acquired(store.claim_panel(&key, None).await?);
+            assert!(store.finish_superseded_repair(&claim, &maintenance).await?);
+            assert!(!store.owns_superseded_claim(&claim).await?);
+            assert!(!store.renew_superseded_claim(&claim).await?);
+            assert!(store
+                .superseded_audits("test-guild", &name, "test-message", PanelMode::Button, 32)
+                .await?
+                .is_empty());
+            // Accepted late evidence invalidates a prior completion receipt, but
+            // only a fresh acquisition can authorize any additional repair.
+            assert!(
+                store
+                    .record_superseded_repair(&claim, &journal, true)
+                    .await?
+            );
+            let retry = store.claim_superseded_audit(&hint).await?.unwrap();
+            assert!(retry.exchange_pending());
+            assert_eq!(retry.generation(), 3);
+            assert!(
+                !store
+                    .record_superseded_repair(&claim, &observed, false)
+                    .await?
+            );
+        }
+        let (outcome, code, desired, before, event, order, option, committed): (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT a.outcome,a.code,a.desired_role_ids,a.pre_mutation_role_ids,
+             p.latest_event_id,p.latest_event_order,p.latest_option_key,p.target_committed
+             FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
+             WHERE a.event_id=$1",
+        )
+        .bind(&name)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(
+            (outcome.as_str(), code.as_str()),
+            ("rejected", "superseded_by_later_event")
+        );
+        assert_eq!((desired.as_str(), before.as_str()), ("[]", "[]"));
+        assert_eq!(event.as_deref(), Some("winner"));
+        assert_eq!(order.as_deref(), Some("later-order"));
+        assert_eq!(option.as_deref(), target);
+        assert!(committed);
+    }
+    Ok(())
+}
+
+async fn terminal_repair_lock_waits(pool: &PgPool) -> TestResult {
+    for operation in ["owns", "renew", "journal", "finish", "acquire"] {
+        let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+        let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone())?;
+        let id = format!("terminal-wait-{operation}");
+        let (audit, _) = terminal_seed(&store, &id, &id, false).await?;
+        let hint = store
+            .superseded_audits("test-guild", &id, "test-message", PanelMode::Button, 1)
+            .await?
+            .remove(0);
+        let claim = store.claim_superseded_audit(&hint).await?.unwrap();
+        let mut panel = acquired(store.claim_panel(&panel_key(&audit), None).await?);
+        assert!(store.set_panel_claim_option(&mut panel, None).await?);
+        let mut lock = pool.begin().await?;
+        sqlx::query("SELECT event_id FROM self_role_audit WHERE event_id=$1 FOR UPDATE")
+            .bind(&id)
+            .execute(&mut *lock)
+            .await?;
+        let mut pending = Box::pin(async {
+            match operation {
+                "owns" => store.owns_superseded_claim(&claim).await,
+                "renew" => store.renew_superseded_claim(&claim).await,
+                "journal" => {
+                    store
+                        .journal_superseded_repair(&claim, &panel, &AuditEffects::default())
+                        .await
+                }
+                "finish" => store.finish_superseded_repair(&claim, &panel).await,
+                "acquire" => store
+                    .claim_superseded_audit(&hint)
+                    .await
+                    .map(|claim| claim.is_some()),
+                _ => unreachable!(),
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pending.as_mut())
+                .await
+                .is_err()
+        );
+        clock.store(TEST_NOW_MS + 300, Ordering::SeqCst);
+        lock.rollback().await?;
+        let changed = tokio::time::timeout(Duration::from_secs(3), pending.as_mut()).await??;
+        assert_eq!(
+            changed,
+            operation == "acquire",
+            "post-lock clock: {operation}"
+        );
+        let (complete, pending_exchange): (bool, bool) = sqlx::query_as(
+            "SELECT repair_complete,exchange_pending FROM self_role_audit WHERE event_id=$1",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await?;
+        assert!(!complete && !pending_exchange);
+    }
+    let clock = Arc::new(AtomicI64::new(TEST_NOW_MS));
+    let store = SelfRoleStore::with_test_clock(pool.clone(), 300, clock)?;
+    let id = "terminal-uninitialized";
+    let (audit, _) = terminal_seed(&store, id, id, false).await?;
+    sqlx::query("UPDATE self_role_audit SET intent_initialized=FALSE WHERE event_id=$1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    let hint = store
+        .superseded_audits("test-guild", id, "test-message", PanelMode::Button, 1)
+        .await?
+        .remove(0);
+    let claim = store.claim_superseded_audit(&hint).await?.unwrap();
+    assert!(!claim.intent_initialized());
+    let mut panel = acquired(store.claim_panel(&panel_key(&audit), None).await?);
+    assert!(store.set_panel_claim_option(&mut panel, None).await?);
+    assert!(
+        !store
+            .journal_superseded_repair(&claim, &panel, &AuditEffects::default())
+            .await?
+    );
+    assert!(!store.finish_superseded_repair(&claim, &panel).await?);
+    Ok(())
 }
 
 async fn pending_intent_initialization(pool: &PgPool) -> TestResult {
@@ -313,6 +718,16 @@ async fn exercise(pool: &PgPool) -> TestResult {
     ))
     .execute(pool)
     .await?;
+    let terminal_migration = include_str!("../migrations/0204_self_role_terminal_repair.sql");
+    sqlx::raw_sql(terminal_migration).execute(pool).await?;
+    sqlx::raw_sql(terminal_migration).execute(pool).await?;
+    let (audit_columns,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='self_role_audit'",
+    ).fetch_one(pool).await?;
+    assert_eq!(audit_columns, 32);
+    terminal_discovery_and_claim_race(pool).await?;
+    terminal_repair_fences_and_completion(pool).await?;
+    terminal_repair_lock_waits(pool).await?;
     recovery_discovery_scope_limits_and_claim_race(pool).await?;
     pending_intent_initialization(pool).await?;
     compensation_phase_recovery(pool).await?;

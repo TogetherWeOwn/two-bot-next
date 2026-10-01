@@ -96,8 +96,8 @@ pub struct SelfRoleAudit {
 }
 
 /// Discovery metadata only: this carries no lease or mutation authority.
-/// Reacquisition must recheck processing state/expiry and load the immutable
-/// intent/effects under the audit lock, not use a discovery-time snapshot.
+/// Processing recovery or terminal evidence acquisition must recheck state/expiry
+/// and load immutable intent/effects under the lock, never from this hint.
 #[derive(Debug, Clone)]
 pub struct RecoverableAudit {
     pub event_id: String,
@@ -110,6 +110,40 @@ pub struct RecoverableAudit {
     pub role_id: Option<String>,
     pub source: PanelMode,
     pub operation: RoleOperation,
+}
+
+type DiscoveryRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+impl RecoverableAudit {
+    fn decoded(row: DiscoveryRow, source: PanelMode) -> Result<Self, StoreError> {
+        Ok(Self {
+            event_id: row.0,
+            event_order: row.1,
+            guild_id: row.2,
+            panel_id: row.3,
+            member_id: row.4,
+            source_id: row.5,
+            option_key: row.6,
+            role_id: row.7,
+            source,
+            operation: match row.8.as_str() {
+                "add" => RoleOperation::Add,
+                "remove" => RoleOperation::Remove,
+                "replace" => RoleOperation::Replace,
+                _ => return Err(StoreError::InvalidAudit),
+            },
+        })
+    }
 }
 
 /// Opaque fencing identity plus original intent returned by recovery.
@@ -138,6 +172,63 @@ pub struct EventClaim {
     pub renew_after_ms: u64,
 }
 
+/// A fresh terminal-evidence fence, not a processing event or REST authority.
+/// Acquisition rotates the former worker's token/generation without resurrecting
+/// its rejected outcome. Unknown exchanges remain unknown across that transfer.
+#[derive(Debug, Clone)]
+pub struct SupersededClaim {
+    event: EventClaim,
+    audit: SelfRoleAudit,
+}
+
+impl SupersededClaim {
+    #[must_use]
+    pub fn audit(&self) -> &SelfRoleAudit {
+        &self.audit
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> i32 {
+        self.event.generation
+    }
+
+    #[must_use]
+    pub fn renew_after_ms(&self) -> u64 {
+        self.event.renew_after_ms
+    }
+
+    #[must_use]
+    pub fn intent_initialized(&self) -> bool {
+        self.event.intent_initialized
+    }
+
+    #[must_use]
+    pub fn exchange_pending(&self) -> bool {
+        self.event.exchange_pending
+    }
+
+    fn preserve_unknown(&self, effects: &AuditEffects) -> AuditEffects {
+        let mut effects = effects.clone();
+        if self.exchange_pending() {
+            for (current, inherited) in [
+                (
+                    &mut effects.unresolved_added_role_ids,
+                    &self.event.effects.unresolved_added_role_ids,
+                ),
+                (
+                    &mut effects.unresolved_removed_role_ids,
+                    &self.event.effects.unresolved_removed_role_ids,
+                ),
+            ] {
+                current.extend(inherited.iter().cloned());
+                current.sort();
+                current.dedup();
+            }
+        }
+        effects
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelKey {
     pub guild_id: String,
@@ -164,6 +255,7 @@ pub struct PanelClaim {
     pub generation: i32,
     pub target: PanelTarget,
     pub renew_after_ms: u64,
+    maintenance: bool,
 }
 
 /// A superseded event has no ownership; do not confuse it with a claim.
@@ -270,17 +362,6 @@ impl SelfRoleStore {
         }
         let mut conn = self.pool.acquire().await?;
         let now = self.now(&mut conn).await?;
-        type DiscoveryRow = (
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-        );
         let rows: Vec<DiscoveryRow> = sqlx::query_as(
             "SELECT event_id,event_order,guild_id,panel_id,member_id,source_id,
              option_key,role_id,operation FROM self_role_audit
@@ -297,26 +378,283 @@ impl SelfRoleStore {
         .fetch_all(&mut *conn)
         .await?;
         rows.into_iter()
-            .map(|row| {
-                Ok(RecoverableAudit {
-                    event_id: row.0,
-                    event_order: row.1,
-                    guild_id: row.2,
-                    panel_id: row.3,
-                    member_id: row.4,
-                    source_id: row.5,
-                    option_key: row.6,
-                    role_id: row.7,
-                    source,
-                    operation: match row.8.as_str() {
-                        "add" => RoleOperation::Add,
-                        "remove" => RoleOperation::Remove,
-                        "replace" => RoleOperation::Replace,
-                        _ => return Err(StoreError::InvalidAudit),
-                    },
-                })
-            })
+            .map(|row| RecoverableAudit::decoded(row, source))
             .collect()
+    }
+
+    /// Configured-source terminal discovery, separate from processing admission.
+    /// Historical attempts remain eligible until a fenced repair receipt; unknown
+    /// sends stay eligible even if an authoritative snapshot appears restored.
+    pub async fn superseded_audits(
+        &self,
+        guild_id: &str,
+        panel_id: &str,
+        source_id: &str,
+        source: PanelMode,
+        limit: usize,
+    ) -> Result<Vec<RecoverableAudit>, StoreError> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let mut conn = self.pool.acquire().await?;
+        let now = self.now(&mut conn).await?;
+        let rows: Vec<DiscoveryRow> = sqlx::query_as(
+            "SELECT event_id,event_order,guild_id,panel_id,member_id,source_id,
+             option_key,role_id,operation FROM self_role_audit
+             WHERE outcome='rejected' AND code='superseded_by_later_event'
+             AND NOT repair_complete AND guild_id=$1 AND panel_id=$2
+             AND source_id=$3 AND source=$4
+             AND (repair_expires_at IS NULL OR repair_expires_at <= $5)
+             AND (exchange_pending OR added_role_ids <> '[]' OR removed_role_ids <> '[]'
+                  OR attempted_added_role_ids <> '[]' OR attempted_removed_role_ids <> '[]'
+                  OR compensated_added_role_ids <> '[]' OR compensated_removed_role_ids <> '[]'
+                  OR unresolved_added_role_ids <> '[]' OR unresolved_removed_role_ids <> '[]')
+             ORDER BY repair_expires_at NULLS FIRST,event_id COLLATE \"C\" LIMIT $6",
+        )
+        .bind(guild_id)
+        .bind(panel_id)
+        .bind(source_id)
+        .bind(source.as_str())
+        .bind(now)
+        .bind(limit.min(32) as i64)
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.into_iter()
+            .map(|row| RecoverableAudit::decoded(row, source))
+            .collect()
+    }
+
+    /// Acquire terminal EVIDENCE ownership under the audit lock, never a borrowed
+    /// old token. Recheck metadata/due state and reload intent/effects. Rotating
+    /// the generation refuses the former worker's late writes; its unknown send
+    /// cannot then be cleared by the new worker's observations or compensation.
+    /// REST work still requires a separate fresh committed maintenance lane.
+    pub async fn claim_superseded_audit(
+        &self,
+        hint: &RecoverableAudit,
+    ) -> Result<Option<SupersededClaim>, StoreError> {
+        type TerminalRow = (
+            i32,
+            Option<OffsetDateTime>,
+            String,
+            String,
+            Vec<String>,
+            bool,
+            bool,
+            bool,
+            Option<String>,
+        );
+        let mut tx = self.pool.begin().await?;
+        let prior: Option<TerminalRow> = sqlx::query_as(
+            "SELECT claim_generation,repair_expires_at,desired_role_ids,pre_mutation_role_ids,
+             ARRAY[added_role_ids,removed_role_ids,attempted_added_role_ids,attempted_removed_role_ids,
+             compensated_added_role_ids,compensated_removed_role_ids,unresolved_added_role_ids,
+             unresolved_removed_role_ids],intent_initialized,compensating,exchange_pending,reason
+             FROM self_role_audit WHERE event_id=$1 AND outcome='rejected'
+             AND code='superseded_by_later_event' AND NOT repair_complete
+             AND guild_id=$2 AND member_id=$3 AND panel_id=$4 AND source_id=$5
+             AND source=$6 AND event_order IS NOT DISTINCT FROM $7
+             AND option_key IS NOT DISTINCT FROM $8 AND role_id IS NOT DISTINCT FROM $9
+             AND operation=$10 FOR UPDATE",
+        )
+        .bind(&hint.event_id)
+        .bind(&hint.guild_id)
+        .bind(&hint.member_id)
+        .bind(&hint.panel_id)
+        .bind(&hint.source_id)
+        .bind(hint.source.as_str())
+        .bind(&hint.event_order)
+        .bind(&hint.option_key)
+        .bind(&hint.role_id)
+        .bind(hint.operation.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let now = self.now(&mut tx).await?;
+        let Some((
+            generation,
+            _,
+            desired,
+            before,
+            effects,
+            initialized,
+            compensating,
+            pending,
+            reason,
+        )) = prior.filter(|p| p.1.is_none_or(|expiry| expiry <= now))
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let effects = AuditEffects::decoded(&effects)?;
+        if !pending && effects == AuditEffects::default() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let generation = generation
+            .checked_add(1)
+            .ok_or(StoreError::GenerationExhausted)?;
+        let desired_role_ids = serde_json::from_str(&desired)?;
+        let pre_mutation_role_ids = serde_json::from_str(&before)?;
+        let (token,): (String,) = sqlx::query_as(
+            "UPDATE self_role_audit SET claim_token=gen_random_uuid()::text,
+             claim_generation=$2,repair_expires_at=$3 WHERE event_id=$1 RETURNING claim_token",
+        )
+        .bind(&hint.event_id)
+        .bind(generation)
+        .bind(self.expiry(now)?)
+        .fetch_one(&mut *tx)
+        .await?;
+        let audit = SelfRoleAudit {
+            event_id: hint.event_id.clone(),
+            event_order: hint.event_order.clone(),
+            guild_id: hint.guild_id.clone(),
+            panel_id: hint.panel_id.clone(),
+            member_id: hint.member_id.clone(),
+            source_id: hint.source_id.clone(),
+            option_key: hint.option_key.clone(),
+            role_id: hint.role_id.clone(),
+            source: hint.source,
+            operation: hint.operation,
+            outcome: SettledOutcome::Rejected,
+            code: Some("superseded_by_later_event".into()),
+            reason,
+            effects: effects.clone(),
+            desired_role_ids,
+            pre_mutation_role_ids,
+        };
+        let claim = SupersededClaim {
+            event: EventClaim {
+                event_id: hint.event_id.clone(),
+                token: Secret::new(token),
+                generation,
+                recovered: true,
+                intent_initialized: initialized,
+                compensating,
+                exchange_pending: pending,
+                effects,
+                desired_role_ids: audit.desired_role_ids.clone(),
+                pre_mutation_role_ids: audit.pre_mutation_role_ids.clone(),
+                renew_after_ms: self_role_renew_after_ms(self.lease_ms),
+            },
+            audit,
+        };
+        tx.commit().await?;
+        Ok(Some(claim))
+    }
+
+    pub async fn owns_superseded_claim(&self, claim: &SupersededClaim) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, &claim.event).await?;
+        let now = self.now(&mut tx).await?;
+        let owned = owns_terminal(&mut tx, claim, now).await?;
+        tx.commit().await?;
+        Ok(owned)
+    }
+
+    pub async fn renew_superseded_claim(
+        &self,
+        claim: &SupersededClaim,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_event(&mut tx, &claim.event).await?;
+        let now = self.now(&mut tx).await?;
+        let changed = sqlx::query(
+            "UPDATE self_role_audit SET repair_expires_at=$5 WHERE event_id=$1
+             AND claim_token=$2 AND claim_generation=$3 AND outcome='rejected'
+             AND code='superseded_by_later_event' AND NOT repair_complete AND repair_expires_at > $4",
+        )
+        .bind(&claim.event.event_id)
+        .bind(claim.event.token.expose())
+        .bind(claim.event.generation)
+        .bind(now)
+        .bind(self.expiry(now)?)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() == 1;
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    /// Journal only with BOTH live fences after panel -> audit lock waits.
+    /// The caller must check both again after journaling/pacing and after REST.
+    pub async fn journal_superseded_repair(
+        &self,
+        claim: &SupersededClaim,
+        panel: &PanelClaim,
+        effects: &AuditEffects,
+    ) -> Result<bool, StoreError> {
+        check_repair_scope(claim, panel)?;
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, panel).await?;
+        lock_event(&mut tx, &claim.event).await?;
+        let now = self.now(&mut tx).await?;
+        if !owns_terminal(&mut tx, claim, now).await?
+            || !owns_repair_panel(&mut tx, panel, now).await?
+            || !claim.intent_initialized()
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let effects = claim.preserve_unknown(effects);
+        let changed = record_terminal_exchange(&mut tx, &claim.event, &effects, Some(true)).await?;
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    /// Late evidence is fenced but is not authority to send. An unknown exchange
+    /// inherited at acquisition cannot be cleared by this repair's responses.
+    pub async fn record_superseded_repair(
+        &self,
+        claim: &SupersededClaim,
+        effects: &AuditEffects,
+        exchange_pending: bool,
+    ) -> Result<bool, StoreError> {
+        let effects = claim.preserve_unknown(effects);
+        let mut conn = self.pool.acquire().await?;
+        record_terminal_exchange(
+            &mut conn,
+            &claim.event,
+            &effects,
+            Some(exchange_pending || claim.exchange_pending()),
+        )
+        .await
+    }
+
+    /// Acknowledge externally verified convergence, NOT success of the old event.
+    /// Require a live evidence owner and unchanged committed maintenance target;
+    /// never rewrite outcome, original intent, or panel chronology/target.
+    pub async fn finish_superseded_repair(
+        &self,
+        claim: &SupersededClaim,
+        panel: &PanelClaim,
+    ) -> Result<bool, StoreError> {
+        check_repair_scope(claim, panel)?;
+        let mut tx = self.pool.begin().await?;
+        lock_panel(&mut tx, panel).await?;
+        lock_event(&mut tx, &claim.event).await?;
+        let now = self.now(&mut tx).await?;
+        if !owns_terminal(&mut tx, claim, now).await?
+            || !owns_repair_panel(&mut tx, panel, now).await?
+            || !claim.intent_initialized()
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let (pending, unresolved): (bool, bool) = sqlx::query_as(
+            "SELECT exchange_pending,(jsonb_array_length(unresolved_added_role_ids::jsonb)>0
+             OR jsonb_array_length(unresolved_removed_role_ids::jsonb)>0)
+             FROM self_role_audit WHERE event_id=$1",
+        )
+        .bind(&claim.event.event_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if pending || unresolved || claim.exchange_pending() {
+            return Err(StoreError::PendingExchange);
+        }
+        sqlx::query("UPDATE self_role_audit SET repair_complete=TRUE,repair_expires_at=NULL WHERE event_id=$1")
+            .bind(&claim.event.event_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Insert-first deduplication with an already computed immutable intent.
@@ -680,6 +1018,7 @@ impl SelfRoleStore {
             generation,
             target,
             renew_after_ms: self_role_renew_after_ms(self.lease_ms),
+            maintenance: event.is_none(),
         }))
     }
 
@@ -856,33 +1195,8 @@ impl SelfRoleStore {
         effects: &AuditEffects,
         exchange_pending: Option<bool>,
     ) -> Result<bool, StoreError> {
-        let mut query = sqlx::query(
-            "UPDATE self_role_audit SET added_role_ids=$1,removed_role_ids=$2,
-             attempted_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
-                 FROM jsonb_array_elements_text(attempted_added_role_ids::jsonb || $3::jsonb)),
-             attempted_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
-                 FROM jsonb_array_elements_text(attempted_removed_role_ids::jsonb || $4::jsonb)),
-             compensated_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
-                 FROM jsonb_array_elements_text(compensated_added_role_ids::jsonb || $5::jsonb)),
-             compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
-                 FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
-             unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8,
-             exchange_pending=COALESCE($12,exchange_pending)
-             WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11
-             AND outcome='rejected' AND code='superseded_by_later_event'",
-        );
-        for effect in effects.encoded() {
-            query = query.bind(effect);
-        }
-        Ok(query
-            .bind(&claim.event_id)
-            .bind(claim.token.expose())
-            .bind(claim.generation)
-            .bind(exchange_pending)
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-            == 1)
+        let mut conn = self.pool.acquire().await?;
+        record_terminal_exchange(&mut conn, claim, effects, exchange_pending).await
     }
 
     /// Explicit claim is required (no unsafe implicit lookup of another worker's
@@ -949,6 +1263,94 @@ impl SelfRoleStore {
 fn ids_json(ids: &Vec<String>) -> String {
     // Serialization of a Vec<String> cannot fail.
     serde_json::to_string(ids).expect("role-id array serializes")
+}
+
+fn check_repair_scope(claim: &SupersededClaim, panel: &PanelClaim) -> Result<(), StoreError> {
+    if claim.audit.guild_id != panel.key.guild_id
+        || claim.audit.member_id != panel.key.member_id
+        || claim.audit.panel_id != panel.key.panel_id
+        || !panel.maintenance
+    {
+        return Err(StoreError::WrongPanel);
+    }
+    Ok(())
+}
+
+async fn owns_terminal(
+    conn: &mut PgConnection,
+    claim: &SupersededClaim,
+    now: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let (owned,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM self_role_audit WHERE event_id=$1
+         AND claim_token=$2 AND claim_generation=$3 AND outcome='rejected'
+         AND code='superseded_by_later_event' AND NOT repair_complete AND repair_expires_at > $4)",
+    )
+    .bind(&claim.event.event_id)
+    .bind(claim.event.token.expose())
+    .bind(claim.event.generation)
+    .bind(now)
+    .fetch_one(conn)
+    .await?;
+    Ok(owned)
+}
+
+async fn owns_repair_panel(
+    conn: &mut PgConnection,
+    claim: &PanelClaim,
+    now: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let (owned,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM self_role_panel_claims WHERE guild_id=$1
+         AND member_id=$2 AND panel_id=$3 AND claim_token=$4 AND claim_generation=$5
+         AND processing_expires_at > $6 AND target_committed
+         AND latest_option_key IS NOT DISTINCT FROM $7)",
+    )
+    .bind(&claim.key.guild_id)
+    .bind(&claim.key.member_id)
+    .bind(&claim.key.panel_id)
+    .bind(claim.token.expose())
+    .bind(claim.generation)
+    .bind(now)
+    .bind(&claim.target.option_key)
+    .fetch_one(conn)
+    .await?;
+    Ok(owned && claim.target.committed)
+}
+
+async fn record_terminal_exchange(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+    effects: &AuditEffects,
+    exchange_pending: Option<bool>,
+) -> Result<bool, StoreError> {
+    let mut query = sqlx::query(
+        "UPDATE self_role_audit SET added_role_ids=$1,removed_role_ids=$2,
+         attempted_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(attempted_added_role_ids::jsonb || $3::jsonb)),
+         attempted_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(attempted_removed_role_ids::jsonb || $4::jsonb)),
+         compensated_added_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(compensated_added_role_ids::jsonb || $5::jsonb)),
+         compensated_removed_role_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value ORDER BY value),'[]'::jsonb)::text
+             FROM jsonb_array_elements_text(compensated_removed_role_ids::jsonb || $6::jsonb)),
+         unresolved_added_role_ids=$7,unresolved_removed_role_ids=$8,
+         exchange_pending=COALESCE($12,exchange_pending),repair_complete=FALSE
+         WHERE event_id=$9 AND claim_token=$10 AND claim_generation=$11
+         AND outcome='rejected' AND code='superseded_by_later_event'",
+    );
+    for effect in effects.encoded() {
+        query = query.bind(effect);
+    }
+    Ok(query
+        .bind(&claim.event_id)
+        .bind(claim.token.expose())
+        .bind(claim.generation)
+        .bind(exchange_pending)
+        .execute(conn)
+        .await?
+        .rows_affected()
+        == 1)
 }
 
 async fn lock_event(conn: &mut PgConnection, claim: &EventClaim) -> Result<(), StoreError> {

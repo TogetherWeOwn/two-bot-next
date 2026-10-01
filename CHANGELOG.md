@@ -28,9 +28,13 @@
   evidence. Gate reaction dispatch through the shared router and add actual
   partial/duplicate add/remove fixtures. Add optional shared-supervisor recovery
   registration with bounded cadence/timeout and discovery I/O, per-name parked
-  status, and cancellation/evidence-preservation fixtures. Production boot remains
-  disabled until terminal stale repair, approved shared boot configuration,
-  unresolved-work continuation and compiled acceptance are complete.
+  status, and cancellation/evidence-preservation fixtures. Add separate terminal
+  supersession discovery, fresh typed evidence leases, dual-fenced repair
+  journaling/completion receipts and inherited-unknown preservation (migration
+  0204), with isolated source regressions. Terminal runtime repair is not yet wired.
+  Production boot remains disabled until terminal stale repair, approved shared
+  boot configuration, unresolved-work continuation and compiled acceptance are
+  complete.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
   legacy-compatible audit/panel tables (migration 0200). Shared event and

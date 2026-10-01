@@ -254,6 +254,53 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   and their committed-target repair are not covered by processing discovery;
   those and the unknown-work lifecycle remain activation blockers.
 
+### Terminal repair storage checkpoint (not runtime activation)
+
+- Migration `0204_self_role_terminal_repair.sql` adds `repair_expires_at` and
+  `repair_complete` (32 audit columns after upgrade), plus a configured-source
+  partial due index. Processing admission deliberately still refuses terminal
+  rows. `superseded_audits` discovers only exact supersession rejections with
+  pending/effect evidence and no completed receipt, scoped to guild/panel/message/
+  surface, with null/due attempt expiry, stable C-collated ordering and a 32-row
+  cap. Discovery is a hint, not authority; claimed expiry yields to other rows.
+- `claim_superseded_audit` locks/rechecks the exact metadata, reloads immutable
+  initialized intent and all eight effect arrays, and grants a **new** secret
+  token/generation in a distinct `SupersededClaim`. It never reads/borrows the
+  stored old token or exposes a processing claim. Rejection, original snapshots,
+  chronology and exchange uncertainty remain unchanged. Malformed snapshots fail
+  closed, including when an initialized empty target would otherwise be valid.
+- Explicit terminal ownership/renewal use strict expiry and post-lock database
+  time. Journaling additionally requires a live, same-scope **maintenance** lane
+  with the unchanged committed target, including committed null/empty. Normal
+  event lanes and unknown targets are refused. Paired journal/completion lock
+  panel then audit and sample time only after both waits. These store fences do
+  not replace executor checks after pacing/journaling or around each REST call.
+- Terminal late evidence remains token/generation-fenced, not send authority.
+  Attempted/compensated history is cumulative; a late accepted write invalidates
+  any prior repair receipt. Inherited unknown exchanges remain pending and their
+  unresolved IDs survive repair journaling/response evidence. Acknowledged repair,
+  a timer, or an authoritative snapshot cannot prove the original request stopped.
+- `finish_superseded_repair` is only a receipt for caller-verified convergence:
+  it requires both live fences, initialized intent, and no pending/unresolved
+  work. It never makes the superseded event successful or publishes a panel
+  target. Completion removes the row from discovery until new accepted evidence.
+- Rotation refuses the former worker's later response writes. Consequently an
+  inherited unknown send can remain permanently uncertain in this conservative
+  seam; there is no implemented automatic retirement of such work. This is an
+  explicit activation blocker, not a justification to clear the flag.
+- Added isolated store source fixtures cover scope/due/limit/race discovery,
+  fresh secret generation and former-worker refusal, initialized empty targets,
+  malformed intent, terminal renewal/expiry, panel-to-audit lock waits, selected/
+  empty committed targets, unknown/nonmaintenance lane refusal, inherited pending
+  preservation, completion and late-evidence invalidation. The fixtures are
+  **uncompiled** while the mandated Cargo pool is unavailable. SQL-only smoke
+  evidence does not substitute for Rust acceptance.
+
+The terminal **runtime** consumer, fair processing/terminal sweep composition,
+shared-executor repair orchestration and cancellation-owned renewal are not yet
+wired. Production dispatch/boot remains disabled. Repair must use the latest
+committed panel target, never the superseded audit's before/desired snapshots.
+
 Interrupted remote work stays explicitly unresolved; its durable continuation/
 reconciliation lifecycle must be wired before activation, not silently cleared
 by a timer or member snapshot. Added Rust regressions remain unverified locally
