@@ -25,7 +25,7 @@ jobs:
     needs: self-role-store
     # A skipped dependency must not make the required check appear green.
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
@@ -194,7 +194,7 @@ jobs:
 
   self-role-store:
     name: self-role store leases
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     # A job container resolves service names directly. The test's fixed
     # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
@@ -224,7 +224,7 @@ jobs:
 
   container:
     name: container smoke
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -263,7 +263,7 @@ jobs:
 
   community-db:
     name: community db
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 15
     services:
       postgres:
@@ -295,7 +295,7 @@ jobs:
 
   feeds-db:
     name: feeds db check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 15
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
@@ -324,7 +324,7 @@ jobs:
 
   worker:
     name: worker check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 10
     defaults:
       run:
