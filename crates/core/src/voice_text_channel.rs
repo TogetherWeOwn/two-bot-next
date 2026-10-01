@@ -195,7 +195,7 @@ pub fn occupancy_diff(
         grants: after_set.difference(&before_set).copied().collect(),
         revokes: before_set
             .difference(&after_set)
-            .filter(|id| !protected_set.contains(id))
+            .filter(|id| !protected_set.contains(*id))
             .copied()
             .collect(),
     }
