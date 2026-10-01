@@ -359,7 +359,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         assert_eq!(requests.len(), (boot + 1) * 2, "registry sync on each boot");
         let identity = &requests[boot * 2];
         assert_eq!(identity.method, "GET");
-        assert_eq!(identity.path, "/api/v10/oauth2/applications/@me");
+        assert_eq!(identity.path, "/api/v10/applications/@me");
         let publish = &requests[boot * 2 + 1];
         assert_eq!(publish.method, "PUT");
         assert_eq!(
