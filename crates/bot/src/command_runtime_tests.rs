@@ -42,7 +42,8 @@ use twilight_model::util::Timestamp;
 use two_bot_core::funnel::now_millis_for_test;
 use two_bot_core::sticky::{store, ActivityOutcome};
 use two_bot_core::{
-    RouterGates, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY, MANAGE_SERVER_REQUIRED,
+    RouterGates, RouterRefusal, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY,
+    MANAGE_SERVER_REQUIRED,
 };
 use two_bot_discord::ActionExecutor;
 
@@ -541,24 +542,151 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
-async fn non_sticky_automation_admin_names_are_ignored() {
-    let (mock, origin) = MockRest::start(Vec::new()).await;
-    // Other slices own both their accepted commands and their refusals.
-    for enabled in [true, false] {
-        let runtime = runtime_without_db(gates(enabled, false), enabled, origin.clone());
-        for name in ["command", "command-remove", "schedule", "ban", "attendance"] {
+async fn published_unwired_commands_reply_without_defer_or_store_work() {
+    for router_gates in [
+        gates(false, false),
+        RouterGates {
+            scorecard: true,
+            moderation: true,
+            ..gates(true, true)
+        },
+    ] {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(
+            router_gates,
+            router_gates.automations,
+            origin,
+        );
+        runtime.publish_registry(Some(1111)).await;
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "one full registry publication");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let unwired: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "sticky" | "sticky-remove" | "feed-add" | "feed-remove" | "feed-list"
+                )
+            })
+            .collect();
+        assert!(
+            unwired.contains(&"rank"),
+            "rank publishes even with all gates off"
+        );
+        if router_gates.announcements {
+            assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
+        }
+        for name in &unwired {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+            interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
             runtime.on_interaction(&interaction).await;
+        }
+        let callbacks = mock.posts_to("/callback").await;
+        assert_eq!(
+            callbacks.len(),
+            unwired.len(),
+            "each published unwired name replies"
+        );
+        for callback in callbacks {
+            let reply: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
+            assert_eq!(reply["type"], 4, "immediate response, not a defer");
+            assert_eq!(reply["data"]["flags"], 64);
+            assert_eq!(
+                reply["data"]["content"],
+                "This command is not available in this build yet."
+            );
+        }
+        assert_eq!(
+            mock.requests().len(),
+            1 + unwired.len(),
+            "no other REST effects"
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn unwired_commands_preserve_disabled_and_permission_refusals() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    // A stale picker entry after a gate transition must still receive its
+    // existing refusal, before considering runtime availability.
+    for (router_gates, name, permitted, expected) in [
+        (
+            gates(false, false),
+            "schedule",
+            true,
+            AUTOMATIONS_DISABLED_REPLY,
+        ),
+        (
+            gates(true, false),
+            "rsvp",
+            true,
+            ANNOUNCEMENTS_DISABLED_REPLY,
+        ),
+        (
+            gates(true, true),
+            "command",
+            false,
+            MANAGE_SERVER_REQUIRED,
+        ),
+    ] {
+        let runtime = runtime_without_db(
+            router_gates,
+            router_gates.automations,
+            origin.clone(),
+        );
+        let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+        if !permitted {
             interaction.member.as_mut().unwrap().permissions = Some(Permissions::empty());
-            runtime.on_interaction(&interaction).await;
-            interaction.guild_id = Some(Id::new(9999));
+        }
+        runtime.on_interaction(&interaction).await;
+        let callbacks = mock.posts_to("/callback").await;
+        let reply: serde_json::Value =
+            serde_json::from_slice(&callbacks.last().unwrap().body).unwrap();
+        assert_eq!(reply["type"], 4);
+        assert_eq!(reply["data"]["flags"], 64);
+        assert_eq!(reply["data"]["content"], expected);
+    }
+    assert_eq!(mock.requests().len(), 3, "only refusal callbacks");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_and_foreign_non_moderation_commands_remain_silent() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime
+        .on_interaction(&slash("not-a-command", Some(CHANNEL), Vec::new()))
+        .await;
+    for name in ["rank", "rsvp", "command", "schedule"] {
+        for guild in [Some(Id::new(9999)), None] {
+            let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+            interaction.guild_id = guild;
             runtime.on_interaction(&interaction).await;
         }
     }
-    assert!(
-        mock.requests().is_empty(),
-        "non-sticky names must not reach Discord"
-    );
+    assert!(mock.requests().is_empty(), "router Ignore stays silent");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn foreign_moderation_preserves_the_router_guild_refusal() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let mut interaction = slash("ban", Some(CHANNEL), Vec::new());
+    interaction.guild_id = Some(Id::new(9999));
+    runtime.on_interaction(&interaction).await;
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1);
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["flags"], 64);
+    assert_eq!(reply["data"]["content"], RouterRefusal::GuildRestricted.message());
+    assert_eq!(mock.requests().len(), 1, "no foreign-guild effects");
     mock.shutdown().await;
 }
 
@@ -907,6 +1035,146 @@ async fn duplicate_ready_republishes_the_identical_set() {
         puts[0].body, puts[1].body,
         "set_guild_commands is a full replace — the repeat is identical"
     );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn resumed_boot_synchronizes_current_gates_once_without_ready() {
+    // A saved gateway session carries no application id or old process gates.
+    // Both transitions must replace the remote registry using the new gates.
+    for announcements in [false, true] {
+        let (mock, origin) = MockRest::start_script(vec![RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"1111"}"#.to_owned()),
+            delay: Duration::from_millis(50),
+        }])
+        .await;
+        let runtime = runtime_without_db(gates(true, announcements), true, origin);
+        runtime.dispatch(&Event::Resumed);
+        runtime.dispatch(&Event::Resumed);
+        wait_for(
+            || mock.requests().iter().any(|r| r.method == "PUT"),
+            "resumed boot registry publish",
+        )
+        .await;
+        // Wait behind the in-flight sync; this and the second RESUMED must
+        // observe successful publication instead of issuing another lookup.
+        runtime.publish_registry(None).await;
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2, "one lookup and one full replacement");
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/v10/applications/@me");
+        assert_eq!(requests[1].method, "PUT");
+        assert_eq!(
+            requests[1].path,
+            "/api/v10/applications/1111/guilds/2222/commands"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let names: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        for name in ["rank", "leaderboard", "sticky", "sticky-remove"] {
+            assert!(names.contains(&name), "resumed registry is complete");
+        }
+        for name in ["feed-add", "feed-remove", "feed-list", "rsvp", "lfg"] {
+            assert_eq!(
+                names.contains(&name),
+                announcements,
+                "current gates for {name}"
+            );
+        }
+        runtime.publish_registry(Some(1111)).await;
+        let puts: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 2, "READY still republishes after RESUMED");
+        assert_eq!(puts[0].body, puts[1].body, "identical complete set");
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn ready_sync_makes_later_resumed_connections_no_ops() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime.publish_registry(Some(1111)).await;
+    runtime.publish_registry(None).await;
+    runtime.publish_registry(None).await;
+    let requests = mock.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "no application lookup or redundant resume PUT"
+    );
+    assert_eq!(requests[0].method, "PUT");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn resumed_lookup_failure_or_invalid_id_never_guesses_a_publish_target() {
+    for (status, body) in [
+        (403, "{}"),
+        (200, "not json"),
+        (200, r#"{"id":"0"}"#),
+        (200, r#"{"id":"not-a-snowflake"}"#),
+        (200, "{}"),
+    ] {
+        let (mock, origin) = MockRest::start_script(vec![RestResponse {
+            status,
+            body: Some(body.to_owned()),
+            delay: Duration::ZERO,
+        }])
+        .await;
+        let runtime = runtime_without_db(gates(true, true), true, origin);
+        runtime.publish_registry(None).await;
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "failed discovery has no PUT");
+        assert_eq!(requests[0].method, "GET");
+        runtime.publish_registry(Some(1111)).await;
+        runtime.publish_registry(None).await;
+        assert_eq!(
+            mock.requests().len(),
+            2,
+            "later READY can synchronize"
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn failed_resumed_publication_can_retry_on_a_later_connection() {
+    let application = || RestResponse {
+        status: 200,
+        body: Some(r#"{"id":"1111"}"#.to_owned()),
+        delay: Duration::ZERO,
+    };
+    let (mock, origin) = MockRest::start_script(vec![
+        application(),
+        RestResponse::status(403),
+        application(),
+        RestResponse::status(200),
+    ])
+    .await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime.publish_registry(None).await;
+    runtime.publish_registry(None).await;
+    runtime.publish_registry(None).await;
+    let requests = mock.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "retry only until one successful sync"
+    );
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[1].method, "PUT");
+    assert_eq!(requests[2].method, "GET");
+    assert_eq!(requests[3].method, "PUT");
+    assert_eq!(requests[1].body, requests[3].body);
     mock.shutdown().await;
 }
 

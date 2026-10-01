@@ -19,9 +19,10 @@
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
-//! duplicate READY is a harmless repeat). No custom-command store exists on
-//! `main` yet — `publish_set` gets an empty custom slice until that slice
-//! lands its own reader.
+//! duplicate READY is a harmless repeat). A resumed process also synchronizes
+//! once: a persisted gateway session does not preserve this process's gates
+//! or command definitions. No custom-command store exists on `main` yet —
+//! `publish_set` gets an empty custom slice until that slice lands its own reader.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -70,6 +71,8 @@ const FEED_STORE_FAILURE_REPLY: &str = "Feed command failed; try again.";
 /// Reply when the interaction arrives without a channel (pathological —
 /// Discord always sends `channel_id` for guild slash commands).
 const NO_CHANNEL_REPLY: &str = "This command only works in a channel.";
+/// The merged registry includes builtins whose runtime slices have not landed.
+const UNAVAILABLE_REPLY: &str = "This command is not available in this build yet.";
 
 /// Router handler marker: this runtime is the `AutomationAdmin` executor for
 /// the sticky commands. Registration documents the ownership the router
@@ -106,6 +109,9 @@ pub struct CommandRuntime {
     /// `TWO_AUTOMATIONS=1`: fast-path gate for the message hook (the router
     /// still answers `/sticky*` refusals when it is off).
     automations: bool,
+    /// Serialize publication and remember a successful sync for this process.
+    /// Repeated RESUMED events need no work; READY still replaces the full set.
+    registry_synced: tokio::sync::Mutex<bool>,
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
     attempts: AtomicU64,
@@ -163,6 +169,7 @@ impl CommandRuntime {
             router,
             guild_id,
             automations: features.automations,
+            registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
         }))
     }
@@ -183,6 +190,7 @@ impl CommandRuntime {
             router,
             guild_id,
             automations,
+            registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
         })
     }
@@ -191,8 +199,8 @@ impl CommandRuntime {
     /// so the shard loop never awaits runtime work; the DB claims tolerate
     /// the reorder/crash windows spawning opens.
     ///
-    /// READY publishes the router's full merged command set; RESUMED does not
-    /// (the session continued, so the guild registry is unchanged).
+    /// READY replaces the full merged set; a first RESUMED also synchronizes
+    /// this process's definitions/gates, even without a preceding READY.
     pub fn dispatch(self: &Arc<Self>, event: &Event) {
         match event {
             Event::MessageCreate(message) => {
@@ -215,7 +223,13 @@ impl CommandRuntime {
                 let runtime = Arc::clone(self);
                 let application_id = ready.application.id.get();
                 drop(tokio::spawn(async move {
-                    runtime.publish_registry(application_id).await;
+                    runtime.publish_registry(Some(application_id)).await;
+                }));
+            }
+            Event::Resumed => {
+                let runtime = Arc::clone(self);
+                drop(tokio::spawn(async move {
+                    runtime.publish_registry(None).await;
                 }));
             }
             _ => {}
@@ -226,7 +240,24 @@ impl CommandRuntime {
     /// on `ready`). `publish_set` assembles every gated builtin plus DB custom
     /// rows — none on `main` yet, so `&[]` — and `set_guild_commands` is a
     /// full replace, making a duplicate READY idempotent rather than stale.
-    async fn publish_registry(&self, application_id: u64) {
+    /// RESUMED supplies no application id: resolve it through the same executor
+    /// and synchronize once per process. Failed syncs remain eligible to retry
+    /// on a later gateway connection event, never a polling timer.
+    pub(crate) async fn publish_registry(&self, application_id: Option<u64>) {
+        let mut synced = self.registry_synced.lock().await;
+        if application_id.is_none() && *synced {
+            return;
+        }
+        let application_id = match application_id {
+            Some(id) => id,
+            None => match self.executor.current_application_id().await {
+                Ok(id) => id,
+                Err(err) => {
+                    warn!(error = %err, "application lookup failed; publish skipped");
+                    return;
+                }
+            },
+        };
         let defs = match self.router.publish_set(&[]) {
             Ok(defs) => defs,
             Err(err) => {
@@ -241,31 +272,37 @@ impl CommandRuntime {
             .await
         {
             warn!(error = %err, "command registry publish failed");
+        } else {
+            *synced = true;
         }
     }
 
-    /// Route one interaction through the shared router: refusals get the
-    /// ephemeral legacy text, `Handled` commands this runtime owns run their
-    /// slice, and everything else (including `command`/`command-remove`,
-    /// owned by the custom-commands slice) is ignored.
+    /// Route all slash commands through the shared router. Refusals get the
+    /// existing ephemeral text; accepted builtins without a wired slice get
+    /// an unavailable reply. Only the five implemented names defer and run
+    /// their slice. Router Ignore (unknown names/guild fence) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
         let RoutedInteraction::Slash { name, outcome } =
             route_interaction(&self.router, interaction, None)
         else {
             return;
         };
-        let owner = match name.as_str() {
-            "sticky" | "sticky-remove" => HandlerId::AutomationAdmin,
-            "feed-add" => HandlerId::FeedAdd,
-            "feed-remove" => HandlerId::FeedRemove,
-            "feed-list" => HandlerId::FeedList,
-            _ => return,
-        };
         if let Some(response) = response_for_slash(&outcome) {
             self.answer(interaction, response).await;
             return;
         }
-        if outcome != (SlashOutcome::Handled { handler: owner }) {
+        let SlashOutcome::Handled { handler } = outcome else {
+            return;
+        };
+        let owner = match name.as_str() {
+            "sticky" | "sticky-remove" => Some(HandlerId::AutomationAdmin),
+            "feed-add" => Some(HandlerId::FeedAdd),
+            "feed-remove" => Some(HandlerId::FeedRemove),
+            "feed-list" => Some(HandlerId::FeedList),
+            _ => None,
+        };
+        if owner != Some(handler) {
+            self.answer(interaction, ephemeral(UNAVAILABLE_REPLY)).await;
             return;
         }
         // Acknowledge before any database wait or Discord cleanup. If the
@@ -897,7 +934,6 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
 
 /// Ephemeral channel-message reply (same shape the router's refusal builder
 /// produces).
-#[cfg(test)]
 pub(crate) fn ephemeral(text: impl Into<String>) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
