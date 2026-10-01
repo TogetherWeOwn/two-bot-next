@@ -19,7 +19,8 @@ use sqlx::{Pool, Postgres};
 use super::presence::{PresenceReading, ProbeDecision};
 
 /// Presence store failure: transport only. A malformed count can never come
-/// back — the column CHECK plus the domain's [`sanitize`] gate keep rows clean.
+/// back — the column CHECK plus the domain's
+/// [`sanitize_presence_count`](crate::presence::sanitize_presence_count) gate keep rows clean.
 #[derive(Debug, thiserror::Error)]
 pub enum PresenceStoreError {
     #[error("presence store database error: {0}")]
