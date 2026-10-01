@@ -30,6 +30,7 @@ pub mod member_erasure;
 pub mod message_scan;
 pub mod parse;
 pub mod rest;
+pub mod self_role_store;
 pub mod settings;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
