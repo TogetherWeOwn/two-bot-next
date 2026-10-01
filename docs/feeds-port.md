@@ -46,25 +46,35 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
 
 ## Required transport enforcement
 
-`feeds_http` is a **pure policy**, not proof that an HTTP connector is deployed.
-The future adapter must:
+`feeds_http` is the pure policy; `feeds_connector` is the transport that consumes
+it. `fetch_feed`/`fetch_feed_with` enforce the full contract:
 
 1. Normalize/validate the source, resolve **all** A/AAAA answers per request,
    and create a `PublicRequest`. Empty or mixed-public/private results fail closed.
 2. Dial **only `PublicRequest::addresses()`**, retaining the original hostname
-   for certificate verification/SNI and Host. Never resolve again in the
-   connector; no environment proxies, implicit proxy DNS, or connection reuse
-   that bypasses this request's validated addresses. IPv4-special networks,
-   mapped/compatible IPv6, NAT64, ULA, link-local and non-global IPv6 are refused.
-3. Disable automatic redirects. Only 301/302/303/307/308, same-host HTTPS targets,
-   at most three hops. Cancel redirect bodies; validate and resolve each hop
-   again. No credentials, cross-host moves or downgrades.
-4. Check content type and advertised length, then feed **decompressed chunks**
-   into `LimitedBody` before allocating beyond the ceiling. Cancel/drop on any
-   error. One total 15-second timeout must cover the whole operation.
-5. Test the real connector against an injected resolver/mock transport, including
-   rebinding, before activation. Current tests prove policy/pinned target plans;
-   they do not prove a real HTTP stack consumes them correctly.
+   for certificate verification/SNI and Host. `PinnedResolver` answers hyper's
+   connector for exactly the pinned host and refuses every other name; a fresh
+   `Client` per request means no pooling, no proxies and no second DNS lookup.
+   IPv4-special networks, mapped/compatible IPv6, NAT64, ULA, link-local and
+   non-global IPv6 are refused at `PublicRequest::prepare`.
+3. Automatic redirects are off. Only 301/302/303/307/308, same-host HTTPS targets,
+   at most three hops, each hop re-resolved and re-pinned before dialling.
+   No credentials, cross-host moves or downgrades.
+4. Content type and advertised length are checked, the compressed wire read is
+   capped at `MAX_FEED_BYTES`, and decompressed output is capped again before
+   `LimitedBody` and the UTF-8 check — a zip bomb dies in the stream, not the
+   parser. DNS names resolve from the parsed URL host (IPv6 literals stay
+   bracket-free); concatenated gzip members all decode; stacked
+   `Content-Encoding` layers are refused before the body drains; non-ASCII
+   content-type, content-encoding and location headers fail closed. One total
+   15-second deadline (`FetchOptions::default`) covers DNS, every hop, the
+   blocking decode and the body read, and is re-checked before success.
+5. The injected `FeedResolver`/`FeedConnector` seams prove the orchestration
+   without opening sockets: pinned dials, all-answer validation, rebinding,
+   cross-host/downgrade/credential redirects, the three-hop budget, the single
+   deadline, wire/decompressed caps, encoding refusal and fixture parity. The
+   private-fixture bypass (`PinnedResolver::for_test`) exists only under
+   `#[cfg(test)]`.
 
 ## Delivery state and crash boundary
 
@@ -96,6 +106,7 @@ claims; missing in a bounded 100-message search is not authoritative absence.
 cargo fmt --all -- --check
 cargo clippy -p two-bot-core --all-targets --all-features --locked -- -D warnings
 cargo test -p two-bot-core --test feeds --locked
+cargo test -p two-bot-core --test feeds_connector --locked
 TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
   cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
 ```
@@ -109,6 +120,7 @@ round-trip, 16 simultaneous claimants, lease expiry/stale-owner fencing, reopene
 pools, mocked Discord crash reconciliation, and 20+5 overflow across two passes.
 
 Remaining on the runtime slice: register shared-router handlers, consume these
-plans through the shared REST executor, enforce the real HTTP connector policy,
-start/stop the poll timer, attach bounded audit/failure recovery, and run the
-connector/mock-Discord end-to-end acceptance tests. Keep activation default-off.
+plans through the shared REST executor, wire `fetch_feed` into the poll adapter
+behind its delivery-store orchestration, start/stop the poll timer, attach
+bounded audit/failure recovery, and run the connector/mock-Discord end-to-end
+acceptance tests. Keep activation default-off.

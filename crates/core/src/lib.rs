@@ -28,10 +28,12 @@ pub mod config;
 pub mod containment;
 #[cfg(feature = "db")]
 pub mod database_roles;
+pub mod database_url;
 pub mod events;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod feeds;
+pub mod feeds_connector;
 pub mod feeds_http;
 #[cfg(feature = "db")]
 pub mod feeds_store;
@@ -68,6 +70,8 @@ pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
 pub mod scheduled_events;
+pub mod secret;
+pub use secret::Secret;
 pub mod settings;
 pub mod sticky;
 pub mod voice;

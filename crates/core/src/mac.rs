@@ -218,13 +218,13 @@ pub fn outcome_for(action: &str) -> &'static str {
 pub fn moderation_audit_secret(
     vars: &std::collections::HashMap<String, String>,
     credential_dir: Option<&std::path::Path>,
-) -> Result<Option<String>, SecretError> {
+) -> Result<Option<crate::Secret<String>>, SecretError> {
     if let Some(dir) = credential_dir {
         match std::fs::read_to_string(dir.join("moderation_audit_secret")) {
             Ok(raw) => {
                 let trimmed = raw.trim_matches(is_ecmascript_trim_space);
                 if !trimmed.is_empty() {
-                    return Ok(Some(trimmed.to_owned()));
+                    return Ok(Some(crate::Secret::new(trimmed.to_owned())));
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -234,7 +234,8 @@ pub fn moderation_audit_secret(
     Ok(vars
         .get("TWO_MODERATION_AUDIT_SECRET")
         .filter(|s| !s.is_empty())
-        .cloned())
+        .cloned()
+        .map(crate::Secret::new))
 }
 
 // ECMAScript TrimString uses WhiteSpace + LineTerminator, not Unicode
@@ -513,10 +514,13 @@ mod tests {
             )]
             .into();
             let loaded = moderation_audit_secret(&vars, None).expect("reads");
-            assert_eq!(loaded.as_deref(), Some(vector.secret.as_str()));
+            assert_eq!(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                Some(vector.secret.as_str())
+            );
             assert_eq!(
                 moderation_audit_reason(
-                    loaded.as_deref(),
+                    loaded.as_ref().map(|secret| secret.expose().as_str()),
                     GUILD,
                     "idem-1",
                     "moderation.ban",
@@ -525,10 +529,12 @@ mod tests {
                 ),
                 vector.reason
             );
-            assert!(
-                parse_moderation_audit_reason(loaded.as_deref(), GUILD, Some(&vector.reason))
-                    .is_some()
-            );
+            assert!(parse_moderation_audit_reason(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                GUILD,
+                Some(&vector.reason)
+            )
+            .is_some());
         }
         let vars = [("TWO_MODERATION_AUDIT_SECRET".to_owned(), String::new())].into();
         assert_eq!(moderation_audit_secret(&vars, None).expect("reads"), None);
@@ -585,10 +591,13 @@ mod tests {
         for vector in fixture.vectors {
             std::fs::write(&path, &vector.raw).expect("write public fixture");
             let loaded = moderation_audit_secret(&vars, Some(&dir)).expect("reads");
-            assert_eq!(loaded.as_deref(), Some(vector.secret.as_str()));
+            assert_eq!(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                Some(vector.secret.as_str())
+            );
             assert_eq!(
                 moderation_audit_reason(
-                    loaded.as_deref(),
+                    loaded.as_ref().map(|secret| secret.expose().as_str()),
                     GUILD,
                     "idem-1",
                     "moderation.ban",
@@ -597,15 +606,17 @@ mod tests {
                 ),
                 vector.reason
             );
-            assert!(
-                parse_moderation_audit_reason(loaded.as_deref(), GUILD, Some(&vector.reason))
-                    .is_some()
-            );
+            assert!(parse_moderation_audit_reason(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                GUILD,
+                Some(&vector.reason)
+            )
+            .is_some());
             // File trimming must never leak into environment-key semantics.
             let env = [("TWO_MODERATION_AUDIT_SECRET".to_owned(), vector.raw.clone())].into();
             assert_eq!(
                 moderation_audit_secret(&env, None).expect("reads"),
-                Some(vector.raw)
+                Some(crate::Secret::new(vector.raw))
             );
         }
         std::fs::remove_dir_all(&dir).expect("remove fixtures");
@@ -629,18 +640,18 @@ mod tests {
         // Credential file wins over env, trimmed.
         assert_eq!(
             moderation_audit_secret(&vars, Some(&dir)).expect("reads"),
-            Some(vectors[0].secret.clone())
+            Some(crate::Secret::new(vectors[0].secret.clone()))
         );
         // Missing and blank credential files retain the raw environment value.
         std::fs::write(&path, &vectors[2].secret).expect("blank fixture");
         assert_eq!(
             moderation_audit_secret(&vars, Some(&dir)).expect("reads"),
-            Some(vectors[2].secret.clone())
+            Some(crate::Secret::new(vectors[2].secret.clone()))
         );
         std::fs::remove_file(&path).expect("remove fixture");
         assert_eq!(
             moderation_audit_secret(&vars, Some(&dir)).expect("reads"),
-            Some(vectors[2].secret.clone())
+            Some(crate::Secret::new(vectors[2].secret.clone()))
         );
         // A credential path that exists but is not readable as a file must
         // fail; never substitute the otherwise usable environment value.
