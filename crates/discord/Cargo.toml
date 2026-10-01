@@ -5,9 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-db = ["two-bot-core/db"]
-
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.
 [dependencies]
@@ -24,10 +21,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+sqlx = { workspace = true, optional = true }
 twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
+
+[features]
+default = []
+db = ["two-bot-core/db", "dep:sqlx"]
 
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
