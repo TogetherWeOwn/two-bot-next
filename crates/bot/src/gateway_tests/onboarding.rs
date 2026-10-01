@@ -830,7 +830,8 @@ async fn onboarding_gateway_interrupted_callback_is_token_free_and_requires_rese
             defer["data"]["flags"], 64,
             "the live in-memory callback was attempted"
         );
-        let saved = receipt(&db, 2).await;
+        // Ingress ACK can arrive before the ordered owner claims the receipt.
+        let saved = wait_receipt(&db, 2, "running").await;
         assert_eq!((saved.0.as_str(), saved.1), ("running", 1));
         let payload = saved.2.as_deref().unwrap();
         assert_eq!(
