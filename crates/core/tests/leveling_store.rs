@@ -2,9 +2,9 @@
 
 //! Database proof restricted to the named disposable agent-testdb service.
 //! Create an empty two_bot_test_local bootstrap as described in CONTRIBUTING.md,
-//! then run all 13 tests:
+//! then run all 15 tests:
 //! TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
-//! cargo test -p two-bot-core --features db --locked --test leveling_store
+//! python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test leveling_store
 //! No DATABASE_URL or inherited application credentials are consulted.
 //!
 //! Ports the runtime half of legacy `test/unit.leveling.test.ts` against the
@@ -114,7 +114,8 @@ async fn profile_and_leaderboard_break_xp_ties_by_member_id(
             .collect::<Vec<_>>(),
         vec![(A.to_owned(), 1), (B.to_owned(), 2)]
     );
-    assert_eq!(store::profile(&pool, GUILD, B).await?.rank, 2);
+    assert_eq!(store::profile(&pool, GUILD, A).await?.rank, Some(1));
+    assert_eq!(store::profile(&pool, GUILD, B).await?.rank, Some(2));
     let reply = leaderboard_reply(&board);
     assert!(reply.suppress_mentions);
     assert_eq!(
@@ -124,6 +125,86 @@ async fn profile_and_leaderboard_break_xp_ties_by_member_id(
     // Limit clamps to the legacy 1–25 bounds.
     assert_eq!(store::leaderboard(&pool, GUILD, 0).await?.len(), 1);
     assert_eq!(store::leaderboard(&pool, GUILD, 100).await?.len(), 2);
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn profile_without_xp_row_is_unranked_on_empty_and_populated_boards(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
+    for member_count in [0, 1] {
+        if member_count == 1 {
+            store::award_message(&pool, GUILD, B, &at(0), None).await?;
+            // An XP row in another guild does not rank this member here.
+            store::award_message(&pool, "other-guild", A, &at(0), None).await?;
+        }
+        let profile = store::profile(&pool, GUILD, A).await?;
+        assert_eq!(profile.rank, None);
+        assert_eq!(profile.member_count, member_count);
+        assert_eq!(
+            (
+                profile.xp,
+                profile.level,
+                profile.message_xp,
+                profile.voice_xp,
+                profile.imported_xp
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(profile.next_level_xp, 100);
+        assert_eq!(
+            rank_reply(&profile, "New Member").content,
+            "**New Member**\nLevel **0** · Rank **Unranked** (no XP recorded)\nXP **0** · 0/100 this level · **100** to level 1"
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM member_levels WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(A)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(rows, 0, "profile read must not create an XP row");
+    }
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn profile_with_stored_zero_xp_keeps_numeric_rank_and_tie_order(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
+    let higher = "100000000000000003";
+    store::award_message(&pool, GUILD, higher, &at(0), None).await?;
+    for member in [B, A] {
+        sqlx::query(
+            "INSERT INTO member_levels (guild_id, member_id, xp, updated_at)
+             VALUES ($1, $2, 0, $3::text::timestamptz)",
+        )
+        .bind(GUILD)
+        .bind(member)
+        .bind(at(0))
+        .execute(&pool)
+        .await?;
+    }
+    for (member, rank) in [(A, 2), (B, 3)] {
+        let profile = store::profile(&pool, GUILD, member).await?;
+        assert_eq!((profile.xp, profile.level, profile.rank), (0, 0, Some(rank)));
+        assert_eq!(profile.member_count, 3);
+        assert!(rank_reply(&profile, "Zero XP")
+            .content
+            .contains(&format!("Rank **#{rank}** of **3**")));
+    }
+    let board = store::leaderboard(&pool, GUILD, 10).await?;
+    assert_eq!(
+        board
+            .iter()
+            .map(|e| (e.member_id.as_str(), e.rank))
+            .collect::<Vec<_>>(),
+        vec![(higher, 1), (A, 2), (B, 3)]
+    );
     fixture.close().await.expect("drop test database");
     Ok(())
 }
@@ -283,10 +364,9 @@ async fn level_up_crosses_threshold_and_plans_grants(
         bad,
         Err(two_bot_core::LevelingStoreError::InvalidTimestamp(_))
     ));
-    // Unknown members read zero XP and rank below everyone holding XP
-    // (COUNT(*) + 1 over strictly-greater rows) — never an error.
+    // Unknown members read zero XP and remain unranked — never an error.
     let ghost = store::profile(&pool, GUILD, "100000000000000099").await?;
-    assert_eq!((ghost.xp, ghost.rank), (0, 2));
+    assert_eq!((ghost.xp, ghost.rank), (0, None));
     fixture.close().await.expect("drop test database");
     Ok(())
 }
@@ -357,8 +437,11 @@ async fn profile_stays_consistent_under_concurrent_awards(
         awarded?;
         let profile = profile?;
         assert_eq!(profile.member_count, 1, "round {round}");
-        assert_eq!(profile.rank, 1, "round {round}");
-        assert!(profile.rank <= profile.member_count, "round {round}");
+        assert_eq!(profile.rank, Some(1), "round {round}");
+        assert!(
+            profile.rank.expect("stored member ranks") <= profile.member_count,
+            "round {round}"
+        );
     }
     fixture.close().await.expect("drop test database");
     Ok(())
