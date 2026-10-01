@@ -88,7 +88,11 @@ impl TestDb {
     }
 
     async fn seed(&self, sql: &str) -> TestResult {
-        sqlx::query(sql).execute(&self.pool).await?;
+        // Seed SQL is static string literals at the call sites; the wrapper
+        // copies into an Arc so no 'static borrow escapes this method.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
