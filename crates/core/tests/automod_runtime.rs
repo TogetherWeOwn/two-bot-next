@@ -354,6 +354,80 @@ fn keys_dedupe_receipt_retries_but_not_edit_revisions_or_modes() {
 }
 
 #[test]
+fn identical_revision_retry_identity_survives_member_role_changes() {
+    for edited_timestamp_ms in [None, Some(20_000)] {
+        let mut edit = delivery(MessageDeliveryKind::Update, "same");
+        edit.edited_timestamp_ms = edited_timestamp_ms;
+        let key = DeliveryKey::from_delivery(&edit, false).unwrap();
+        edit.observed_timestamp_ms += 60_000;
+        edit.snapshot
+            .as_mut()
+            .unwrap()
+            .role_ids
+            .push("777777777777777777".into());
+        assert_eq!(DeliveryKey::from_delivery(&edit, false).unwrap(), key);
+        edit.snapshot.as_mut().unwrap().role_ids.clear();
+        assert_eq!(DeliveryKey::from_delivery(&edit, false).unwrap(), key);
+        edit.snapshot.as_mut().unwrap().content = "different".into();
+        assert_ne!(DeliveryKey::from_delivery(&edit, false).unwrap(), key);
+    }
+}
+
+#[test]
+fn roles_remain_authoritative_for_inspection_and_preserved_target_protection() {
+    let mut config = AutomodConfig::from_map(&HashMap::from([
+        ("TWO_AUTOMOD".into(), "1".into()),
+        ("TWO_AUTOMOD_ENFORCE".into(), "1".into()),
+        ("TWO_AUTOMOD_BAD_WORDS".into(), "blocked".into()),
+    ]))
+    .unwrap();
+    config
+        .policy
+        .bypass_role_ids
+        .insert("666666666666666666".into());
+    let mut runtime = AutomodRuntime::new(
+        config,
+        AutomodScope {
+            guild_id: STAGING_GUILD_ID.into(),
+            live_approved: false,
+        },
+    );
+    let mut edit = delivery(MessageDeliveryKind::Update, "blocked");
+    edit.edited_timestamp_ms = Some(20_000);
+    let key = DeliveryKey::from_delivery(&edit, false).unwrap();
+    let preserved = matched(&mut runtime, &edit);
+    edit.snapshot
+        .as_mut()
+        .unwrap()
+        .role_ids
+        .push("666666666666666666".into());
+    assert_eq!(DeliveryKey::from_delivery(&edit, false).unwrap(), key);
+    // A fresh inspection still sees bypass roles; stable identity does not
+    // discard current role facts. Preserved retries skip inspection instead.
+    assert_eq!(
+        runtime.inspect(&edit),
+        Inspection::Accepted(FunnelDisposition::None)
+    );
+    let mut current = facts();
+    current.target.role_ids = edit.snapshot.as_ref().unwrap().role_ids.clone();
+    assert_eq!(
+        runtime.target_gate(&preserved, Some(&current)),
+        TargetGate::Protected(TargetProtection::StaffRole)
+    );
+    assert!(runtime
+        .plan(
+            &preserved,
+            ViolationRecord {
+                count: 1,
+                inserted: true
+            },
+            Some(&current)
+        )
+        .effects
+        .is_empty());
+}
+
+#[test]
 fn already_counted_message_never_repeats_effects_on_a_different_edit() {
     let mut runtime = runtime(true);
     let matched = matched(
@@ -452,6 +526,91 @@ fn timed_delivery(
     snapshot.message_id = id.into();
     snapshot.observed_timestamp_ms = at_ms;
     msg
+}
+
+#[test]
+fn future_fetched_revision_must_not_destroy_delayed_create_history() {
+    fn batch(with_update: bool, revised_content: &str) -> Inspection {
+        let mut runtime = runtime(true);
+        for (id, at_ms) in [("1", 0), ("2", 10_000)] {
+            assert_eq!(
+                runtime.inspect(&timed_delivery(
+                    MessageDeliveryKind::Create,
+                    id,
+                    "same",
+                    at_ms
+                )),
+                Inspection::Accepted(FunnelDisposition::Accept)
+            );
+        }
+        if with_update {
+            // A queued metadata UPDATE fetches the latest REST revision before
+            // the still-queued CREATE at 20s is dispatched.
+            let mut edit =
+                timed_delivery(MessageDeliveryKind::Update, "1", revised_content, 60_000);
+            edit.edited_timestamp_ms = Some(60_000);
+            assert_eq!(
+                runtime.inspect(&edit),
+                Inspection::Accepted(FunnelDisposition::None)
+            );
+            // Unknown message IDs must not insert future rows and evict creates either.
+            for id in ["99", "100", "101", "102"] {
+                edit.message_id = id.into();
+                edit.snapshot.as_mut().unwrap().message_id = id.into();
+                assert_eq!(
+                    runtime.inspect(&edit),
+                    Inspection::Accepted(FunnelDisposition::None)
+                );
+            }
+        }
+        runtime.inspect(&timed_delivery(
+            MessageDeliveryKind::Create,
+            "3",
+            "same",
+            20_000,
+        ))
+    }
+    assert!(matches!(batch(false, "same"), Inspection::Matched(m)
+        if m.filter == two_bot_core::AutomodFilter::RepeatedMessage));
+    for content in ["same", "different"] {
+        assert!(matches!(batch(true, content), Inspection::Matched(m)
+            if m.filter == two_bot_core::AutomodFilter::RepeatedMessage
+            && m.funnel == FunnelDisposition::CaptureOnly));
+    }
+}
+
+#[test]
+fn stamped_updates_inspect_content_without_rewriting_create_history() {
+    let mut runtime = runtime(true);
+    for (id, at_ms) in [("1", 0), ("2", 10_000)] {
+        runtime.inspect(&timed_delivery(
+            MessageDeliveryKind::Create,
+            id,
+            "same",
+            at_ms,
+        ));
+    }
+    let mut edit = timed_delivery(MessageDeliveryKind::Update, "3", "same", 20_000);
+    edit.edited_timestamp_ms = Some(20_000);
+    assert!(matches!(runtime.inspect(&edit), Inspection::Matched(m)
+        if m.filter == two_bot_core::AutomodFilter::RepeatedMessage
+        && m.funnel == FunnelDisposition::None));
+    edit.message_id = "1".into();
+    edit.snapshot.as_mut().unwrap().message_id = "1".into();
+    assert_eq!(
+        runtime.inspect(&edit),
+        Inspection::Accepted(FunnelDisposition::None)
+    );
+    edit.snapshot.as_mut().unwrap().content = "different".into();
+    assert_eq!(
+        runtime.inspect(&edit),
+        Inspection::Accepted(FunnelDisposition::None)
+    );
+    assert!(
+        matches!(runtime.inspect(&timed_delivery(MessageDeliveryKind::Create, "3", "same", 20_000)),
+        Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage
+        && m.funnel == FunnelDisposition::CaptureOnly)
+    );
 }
 
 #[test]

@@ -326,8 +326,8 @@ fn has_bad_word(normalized: &str, words: &[String]) -> bool {
 
 /// Pure repeat tracker (legacy `MemoryRepeatTracker` minus timers): explicit
 /// timestamps and at most `repeated_message_count` rows per guild+author.
-/// Creates advance history; historical revisions never expire newer rows, and
-/// unstamped updates inspect without recording a receipt-clock observation.
+/// Only creates advance history. Updates inspect their bounded interval without
+/// recording, replacing or expiring any CREATE observation.
 ///
 /// Content identity is a non-cryptographic hash of the normalized text; the
 /// legacy HMAC key only avoids storing message text, which this tracker
@@ -417,31 +417,29 @@ impl RepeatTracker {
                 + 1
                 >= keep
         };
-        if observation == RepeatObservation::UnstampedUpdate {
-            // No revision clock: evaluate content at receipt time, but do not
-            // prune or insert metadata into a delayed author's create history.
+        if observation != RepeatObservation::Create {
+            // REST may return a future revision while older CREATEs are queued.
+            // Inspect edits against CREATE history without replacing a row or
+            // inserting one that could evict history needed by that batch.
             return matches_window(self.rows.get(&key).map_or(&[], Vec::as_slice));
         }
         let rows = self.rows.entry(key).or_default();
         if rows.iter().any(|row| {
             row.message_id == message.message_id && row.at_ms > message.observed_timestamp_ms
         }) {
-            // An old revision can be inspected, but cannot replace a newer
-            // observation of this message already needed by later dispatches.
+            // An older CREATE cannot replace a newer retained observation
+            // of the same message.
             return matches_window(rows);
         }
-        rows.retain(|row| {
-            row.message_id != message.message_id
-                && (observation != RepeatObservation::Create || row.at_ms >= cutoff)
-        });
+        rows.retain(|row| row.message_id != message.message_id && row.at_ms >= cutoff);
         let matched = matches_window(rows);
         rows.push(RepeatRow {
             message_id: message.message_id.clone(),
             digest,
             at_ms: message.observed_timestamp_ms,
         });
-        // Historical revisions must not evict newer observations by arrival
-        // order. Evaluate their bounded interval before retaining newest rows.
+        // Retain the newest CREATE observations by message clock, not arrival
+        // order, after evaluating this message's bounded interval.
         rows.sort_by_key(|row| row.at_ms);
         if rows.len() > keep {
             rows.drain(..rows.len() - keep);

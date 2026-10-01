@@ -78,10 +78,10 @@ impl DeliveryKey {
         {
             return None;
         }
-        let mut roles = message.role_ids.clone();
+        // Member roles are current resolver facts, not part of the message's
+        // revision identity. Role changes must not bypass a preserved claim.
         let mut mentions = message.mentioned_user_ids.clone();
         let mut attachments = message.attachment_names.clone();
-        roles.sort();
         mentions.sort();
         attachments.sort();
         let revision = match delivery.kind {
@@ -95,7 +95,6 @@ impl DeliveryKey {
                 delivery.channel_id,
                 message.author_id,
                 message.author_is_bot,
-                roles,
                 mentions,
                 attachments,
                 message.content,

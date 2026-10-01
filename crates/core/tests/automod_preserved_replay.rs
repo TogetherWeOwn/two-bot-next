@@ -219,12 +219,19 @@ async fn pre_count_release_preserves_matched_retry() {
         .await
         .unwrap());
 
-    // Same revision, same key — but the repeat history is swept, so a fresh
-    // re-inspection would silently accept. The retry must replay the
-    // preserved IDs/reason code instead of acquiring a fresh claim.
+    // Same revision with changed authoritative roles. History is swept, so
+    // fresh inspection would accept; the rebuilt key must still reacquire the
+    // preserved IDs/reason code rather than bypass it with a fresh claim.
     edit.observed_timestamp_ms = 60_000;
-    assert_eq!(DeliveryKey::from_delivery(&edit, false).unwrap(), key);
-    let ClaimResult::Preserved(retry_claim, replayed) = store.claim(&key).await.unwrap() else {
+    edit.snapshot
+        .as_mut()
+        .unwrap()
+        .role_ids
+        .push("777777777777777777".into());
+    let retry_key = DeliveryKey::from_delivery(&edit, false).unwrap();
+    assert_eq!(retry_key, key);
+    let ClaimResult::Preserved(retry_claim, replayed) = store.claim(&retry_key).await.unwrap()
+    else {
         panic!("released decision must replay Preserved, not a fresh Acquire")
     };
     assert_eq!(replayed.filter, AutomodFilter::RepeatedMessage);

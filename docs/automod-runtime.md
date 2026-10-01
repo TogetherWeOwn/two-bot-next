@@ -32,8 +32,10 @@ No legacy or production service is changed.
    `Message` requires and fail decoding upstream of enrichment. The delivery
    carries no snapshot, so `inspect` returns `FetchMessage` for it.
 2. Build `DeliveryKey::from_delivery`. Its SHA-256 fingerprint excludes receipt
-   time; creates key on message identity, edits on stable revision/facts. Text
-   is not persisted. Acquire `AutomodStore::claim` **before** `inspect` changes
+   time and mutable member roles; creates key on message identity, edits on
+   stable message revision/facts. Current roles remain authoritative for fresh
+   inspection exemptions and target protection, not retry identity. Text is
+   not persisted. Acquire `AutomodStore::claim` **before** `inspect` changes
    repeat history. `InFlight` and `Replayed` must not inspect, award, or send
    effects again; use `FunnelDisposition::None` for their cache-only handling.
    An enforcing released pre-count claim replays as `Preserved(claim, match)`
@@ -83,12 +85,15 @@ No legacy or production service is changed.
 9. Invoke `expire_repeat_history(now_ms)` from the shared maintenance tick.
    CREATE inspection also sweeps inactive authors on the message clock; an
    idle tick never sweeps ahead of the newest CREATE observation. Updates do
-   not advance expiry or prune an author's delayed CREATE history. Stamped
+   not advance expiry, replace, insert or prune CREATE history. Stamped
    updates inspect the bounded interval `[edit time - window, edit time]`,
-   excluding future rows without discarding them. The bounded tracker retains
-   the newest observations by timestamp, not revision arrival order.
-   Unstamped updates evaluate content at receipt time without recording or
-   pruning repeat history: metadata is not a new message-clock observation.
+   excluding future rows and their own message ID without discarding them.
+   Only CREATEs enter the bounded tracker, which retains the newest CREATE
+   observations by timestamp. A REST-fetched future edit cannot remove an
+   original CREATE row needed by still-queued older deliveries, even if its
+   content changed. Edits evaluate their current content against CREATE
+   history; they are not additional messages. Unstamped updates likewise
+   evaluate at receipt time without recording or pruning repeat history.
    They still re-inspect all other filters and never award XP. Same-revision
    enforcing matched retries must use the durable preserved decision rather
    than assume mutable repeat history remains unchanged. No private ticker
@@ -102,6 +107,10 @@ from `TWO_AUTOMOD_ENFORCE` itself.
 ## Persistence and recovery
 
 Apply migrations `0220`–`0223` via the existing cutover migration runner.
+The reviewed database-role matrix grants runtime CRUD on the three automod
+relations, with no web-reader access, DDL or broad future-table grants. Matrix
+coverage includes these migrations, and the scratch role fixture exercises
+claim/ledger access as the non-owner runtime and reader/DDL refusal.
 The legacy table/column names remain unchanged. Delivery claims are separate
 from the legacy processed-message ledger. Claim capabilities fence stale
 completions and safe reacquisition; keep them internal and do not log them.

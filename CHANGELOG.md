@@ -28,6 +28,10 @@
 
 ### Fixed
 
+- Grant runtime-only CRUD on the automod relations and cover migrations 0220–0223
+  in least-privilege role tests. Keep edit retry identity stable across member
+  role changes, and inspect updates without replacing or evicting CREATE repeat
+  history needed by queued deliveries. (TOG-10089)
 - Give owned disposable-database teardown a separate finite 30-second statement
   timeout for checkpoint waits, retaining five-second fixture query deadlines and
   verified cleanup after failures or caller cancellation.
