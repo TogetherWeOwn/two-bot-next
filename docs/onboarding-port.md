@@ -121,8 +121,12 @@ all changes; unavailable fallback hubs are never linked. View-only game routing
 accepts the hub's forum type, but a plain welcome cannot post to a forum. Existing
 game submissions are gated by mode, not by destinations for posting new menus.
 Permission reads preserve unavailable REST evidence separately from proven
-403/404 absence or permission denial: an unsent welcome/goodbye stays in the
-bounded recovery queue on transient failure instead of clearing its payload.
+403/404 absence or permission denial. Individually successful role/member reads
+can disagree, and unreadable channel schemas are not proven denials: an unsent
+welcome/goodbye retains its payload for bounded recovery on either case. Session
+routing reads only deduplicated submitted known destinations; an unselected room
+cannot add an availability dependency. Every selected room still requires live
+permission evidence, and unknown keys still poison the whole routing plan.
 
 Combined `onboarding_tests` exercise these adapters through actual mock HTTP
 requests and isolated agent-testdb schemas, including two independent pools for

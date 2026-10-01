@@ -164,6 +164,10 @@ enum PauseAt {
     Callback,
     UnavailableMember,
     UnavailableChannel,
+    InconsistentMemberRoles,
+    MissingChannelOverwrites,
+    MalformedChannelOverwrites,
+    DeniedChannel,
     HeldGameTransaction,
 }
 
@@ -185,25 +189,62 @@ async fn discord(paused: Arc<AtomicBool>, pause_at: PauseAt) -> MockRest {
             ("GET", "/guilds/2222") => {
                 ScriptedResponse::json(200, json!({"id":GUILD,"owner_id":"888"}))
             }
-            ("GET", "/guilds/2222/roles") => ScriptedResponse::json(
-                200,
-                json!([
+            ("GET", "/guilds/2222/roles") => {
+                let mut roles = json!([
                     {"id":GUILD,"permissions":"3072"},
                     {"id":GAME_PICKS[0].role_id,"permissions":"0"}
-                ]),
-            ),
+                ]);
+                if matches!(pause_at, PauseAt::InconsistentMemberRoles)
+                    && !paused.load(Ordering::SeqCst)
+                {
+                    roles
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"id":"5555","permissions":"0"}));
+                }
+                ScriptedResponse::json(200, roles)
+            }
             ("GET", "/guilds/2222/members/999") => {
-                ScriptedResponse::json(200, json!({"user":{"id":"999"},"roles":[]}))
+                // Each HTTP 200 document is individually valid, but the member
+                // acquired a new role after the first role-catalog snapshot.
+                let roles = if matches!(pause_at, PauseAt::InconsistentMemberRoles) {
+                    json!(["5555"])
+                } else {
+                    json!([])
+                };
+                ScriptedResponse::json(200, json!({"user":{"id":"999"},"roles":roles}))
             }
             ("GET", "/guilds/2222/members/77") => {
                 ScriptedResponse::json(200, json!({"user":{"id":"77"},"roles":[]}))
             }
             ("GET", "/channels/10" | "/channels/11" | "/channels/12" | "/channels/13") => {
                 let id = path.strip_prefix("/channels/").unwrap();
-                ScriptedResponse::json(
-                    200,
-                    json!({"id":id,"guild_id":GUILD,"type":if id == "11" { 2 } else { 0 },"permission_overwrites":[]}),
-                )
+                let mut channel = json!({
+                    "id":id,"guild_id":GUILD,"type":if id == "11" { 2 } else { 0 },
+                    "permission_overwrites":[]
+                });
+                if paused.load(Ordering::SeqCst) {
+                    match pause_at {
+                        PauseAt::MissingChannelOverwrites => {
+                            channel
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("permission_overwrites");
+                        }
+                        PauseAt::MalformedChannelOverwrites => {
+                            channel["permission_overwrites"] = json!([
+                                {"id":GUILD,"type":0,"allow":"oops","deny":"0"}
+                            ]);
+                        }
+                        PauseAt::DeniedChannel => {
+                            channel["permission_overwrites"] = json!([
+                                {"id":GUILD,"type":0,"allow":"0","deny":"3072"}
+                            ]);
+                        }
+                        _ => {}
+                    }
+                }
+                ScriptedResponse::json(200, channel)
             }
             ("POST", "/channels/12/messages" | "/channels/13/messages") => {
                 ScriptedResponse::json(201, json!({"id":"99"}))
@@ -211,7 +252,9 @@ async fn discord(paused: Arc<AtomicBool>, pause_at: PauseAt) -> MockRest {
             ("POST", path) if path.starts_with("/interactions/") && path.ends_with("/callback") => {
                 ScriptedResponse::status(204)
             }
-            ("PATCH", path) if path.starts_with("/webhooks/1111/") && path.ends_with("/messages/@original") => {
+            ("PATCH", path)
+                if path.starts_with("/webhooks/1111/") && path.ends_with("/messages/@original") =>
+            {
                 ScriptedResponse::json(200, json!({"id":"98"}))
             }
             _ => ScriptedResponse::status(404),
@@ -219,7 +262,13 @@ async fn discord(paused: Arc<AtomicBool>, pause_at: PauseAt) -> MockRest {
         let pause = match pause_at {
             PauseAt::PermissionRead => request.method == "GET" && path == "/guilds/2222",
             PauseAt::Callback => request.method == "POST" && path.ends_with("/callback"),
-            PauseAt::UnavailableMember | PauseAt::UnavailableChannel | PauseAt::HeldGameTransaction => false,
+            PauseAt::UnavailableMember
+            | PauseAt::UnavailableChannel
+            | PauseAt::InconsistentMemberRoles
+            | PauseAt::MissingChannelOverwrites
+            | PauseAt::MalformedChannelOverwrites
+            | PauseAt::DeniedChannel
+            | PauseAt::HeldGameTransaction => false,
         };
         if matches!(pause_at, PauseAt::HeldGameTransaction)
             && paused.load(Ordering::SeqCst)
@@ -739,6 +788,17 @@ async fn unavailable_permission_restart(goodbye: bool, failure: PauseAt) {
             2
         };
         wait_sequence(&db.store, seq).await;
+        wait_request(
+            &mock,
+            "GET",
+            match failure {
+                PauseAt::UnavailableChannel
+                | PauseAt::MissingChannelOverwrites
+                | PauseAt::MalformedChannelOverwrites => "/api/v10/channels/13",
+                _ => "/api/v10/guilds/2222/members/999",
+            },
+        )
+        .await;
         tokio::time::timeout(DEADLINE, async {
             while !runner.task.is_finished() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -748,10 +808,46 @@ async fn unavailable_permission_restart(goodbye: bool, failure: PauseAt) {
         .expect("transient evidence failure stops the owner for bounded recovery");
         let saved = receipt(&db, seq as i64).await;
         assert_eq!((saved.0.as_str(), saved.1), ("running", 1));
+        let payload = saved
+            .2
+            .as_deref()
+            .expect("unavailable evidence must retain captured delivery");
         assert!(
-            saved.2.is_some(),
-            "unavailable evidence must retain captured delivery"
+            !payload.contains(TOKEN),
+            "durable delivery contains no bot token"
         );
+        match OnboardingJob::recover(payload).unwrap().unwrap() {
+            OnboardingJob::Goodbye {
+                guild_id,
+                bot,
+                joined_at_ms,
+                ..
+            } if goodbye => {
+                assert_eq!(
+                    (guild_id, bot, joined_at_ms),
+                    (2222, false, Some(RECEIPT_AT))
+                );
+            }
+            OnboardingJob::Welcome {
+                guild_id,
+                member_id,
+                bot,
+                pending,
+                trigger,
+                roles,
+            } if !goodbye => {
+                assert_eq!(
+                    (guild_id, member_id, bot, pending),
+                    (2222, 77, false, false)
+                );
+                assert!(matches!(
+                    trigger,
+                    MembershipTrigger::Joined { pending: false }
+                ));
+                assert_eq!(roles, vec![GAME_PICKS[0].role_id.to_owned()]);
+            }
+            _ => panic!("expected captured delivery kind"),
+        }
         assert!(
             posts(&mock).is_empty(),
             "no send on uncertain permission evidence"
@@ -764,7 +860,15 @@ async fn unavailable_permission_restart(goodbye: bool, failure: PauseAt) {
         let mut second = gateway(true).await;
         repoint_resume(&db, &second.mock).await;
         let runner = spawn_onboarding(&db, &mock, &second.mock.url, mode).await;
-        assert_eq!(second.mock.authentication().await["op"], 6);
+        assert!(runner
+            .pipeline
+            .cache()
+            .member(Id::new(2222), Id::new(77))
+            .is_none());
+        let auth = second.mock.authentication().await;
+        assert_eq!(auth["op"], 6);
+        assert_eq!(auth["d"]["session_id"], SESSION);
+        assert_eq!(auth["d"]["seq"], seq);
         second.send(resumed(seq + 1)).await;
         wait_sequence(&db.store, seq + 1).await;
         let delivered = wait_receipt(&db, seq as i64, "completed").await;
@@ -786,6 +890,15 @@ async fn unavailable_permission_restart(goodbye: bool, failure: PauseAt) {
             i64::from(!goodbye)
         );
         assert_eq!(event_count(&db, "member_join").await, 1);
+        assert_eq!(event_count(&db, "member_leave").await, i64::from(goodbye));
+        assert_eq!(count_jobs(&db).await, 1 + i64::from(goodbye));
+        assert!(
+            mock.requests().iter().all(|request| {
+                request.method == "GET"
+                    || (request.method == "POST" && request.path.starts_with("/api/v10/channels/"))
+            }),
+            "recovery never uses callback credentials or mutates roles"
+        );
         assert!(!runner.task.is_finished());
         runner.stop().await;
     })
@@ -803,6 +916,146 @@ async fn onboarding_gateway_unavailable_member_evidence_retains_welcome_for_rest
 #[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
 async fn onboarding_gateway_unavailable_channel_evidence_retains_goodbye_for_restart() {
     unavailable_permission_restart(true, PauseAt::UnavailableChannel).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
+async fn onboarding_gateway_inconsistent_role_snapshots_retain_welcome_for_restart() {
+    unavailable_permission_restart(false, PauseAt::InconsistentMemberRoles).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
+async fn onboarding_gateway_missing_channel_overwrites_retain_goodbye_for_restart() {
+    unavailable_permission_restart(true, PauseAt::MissingChannelOverwrites).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
+async fn onboarding_gateway_malformed_channel_overwrites_retain_goodbye_for_restart() {
+    unavailable_permission_restart(true, PauseAt::MalformedChannelOverwrites).await;
+}
+
+async fn terminal_permission_noop(goodbye: bool, configured_empty: bool) {
+    let db = TestDb::new().await;
+    let denied = Arc::new(AtomicBool::new(true));
+    let mock = discord(denied.clone(), PauseAt::DeniedChannel).await;
+    let result = bounded(async {
+        let mode = if goodbye { "session" } else { "legacy" };
+        let setting_key = if goodbye {
+            "DISCORD_GOODBYE_CHANNEL_IDS"
+        } else {
+            "DISCORD_LANDING_CHANNEL_IDS"
+        };
+        if configured_empty {
+            two_bot_cutover::settings::SettingsStore::new(&db.pool)
+                .set(GUILD, setting_key, Some(json!("")), "mock-test")
+                .await
+                .unwrap();
+        }
+        let joined_at = joined_at_wire(RECEIPT_AT);
+        let mut first = gateway(false).await;
+        let runner = spawn_onboarding(&db, &mock, &first.mock.url, mode).await;
+        assert_eq!(first.mock.authentication().await["op"], 2);
+        wait_sequence(&db.store, 1).await;
+        first.send(member_add(2, goodbye, &joined_at)).await;
+        let (seq, replay) = if goodbye {
+            wait_sequence(&db.store, 2).await;
+            wait_receipt(&db, 2, "completed").await;
+            let departure = leave(3);
+            first.send(departure.clone()).await;
+            (3, departure)
+        } else {
+            (2, member_add(2, false, &joined_at))
+        };
+        wait_sequence(&db.store, seq).await;
+        let saved = wait_receipt(&db, seq as i64, "completed").await;
+        assert_eq!(
+            saved.1, 1,
+            "intentional no-op is terminal on its first claim"
+        );
+        assert!(saved.2.is_none(), "terminal no-op clears captured payload");
+        assert!(posts(&mock).is_empty());
+        assert_eq!(event_count(&db, EVENT_ONBOARDING_PROMPTED).await, 0);
+        if configured_empty {
+            assert!(
+                mock.requests().is_empty(),
+                "empty destinations need no REST evidence"
+            );
+        } else {
+            wait_request(
+                &mock,
+                "GET",
+                if goodbye {
+                    "/api/v10/channels/13"
+                } else {
+                    "/api/v10/channels/12"
+                },
+            )
+            .await;
+            assert!(mock
+                .requests()
+                .iter()
+                .all(|request| request.method == "GET"));
+        }
+        let evidence_reads = mock.requests().len();
+        assert!(
+            !runner.task.is_finished(),
+            "proven no-op does not fail the owner"
+        );
+        runner.stop().await;
+        drop(first);
+
+        // A later usable destination does not resurrect already completed work.
+        denied.store(false, Ordering::SeqCst);
+        if configured_empty {
+            two_bot_cutover::settings::SettingsStore::new(&db.pool)
+                .set(GUILD, setting_key, None, "mock-test")
+                .await
+                .unwrap();
+        }
+        let mut second = gateway(true).await;
+        repoint_resume(&db, &second.mock).await;
+        let runner = spawn_onboarding(&db, &mock, &second.mock.url, mode).await;
+        let auth = second.mock.authentication().await;
+        assert_eq!(auth["op"], 6);
+        assert_eq!(auth["d"]["session_id"], SESSION);
+        assert_eq!(auth["d"]["seq"], seq);
+        second.send(replay).await;
+        second.send(resumed(seq + 1)).await;
+        wait_sequence(&db.store, seq + 1).await;
+        assert_eq!(receipt(&db, seq as i64).await, saved);
+        assert!(posts(&mock).is_empty());
+        assert_eq!(
+            mock.requests().len(),
+            evidence_reads,
+            "terminal receipt is never retried"
+        );
+        assert_eq!(event_count(&db, EVENT_ONBOARDING_PROMPTED).await, 0);
+        assert_eq!(event_count(&db, "member_join").await, 1);
+        assert_eq!(event_count(&db, "member_leave").await, i64::from(goodbye));
+        assert_eq!(count_jobs(&db).await, 1 + i64::from(goodbye));
+        assert!(!runner.task.is_finished());
+        runner.stop().await;
+    })
+    .await;
+    cleanup(db, Some(mock), result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
+async fn onboarding_gateway_configured_empty_destinations_are_terminal_noops() {
+    for goodbye in [false, true] {
+        terminal_permission_noop(goodbye, true).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; local mock Discord only"]
+async fn onboarding_gateway_proven_channel_denial_is_terminal_noop() {
+    for goodbye in [false, true] {
+        terminal_permission_noop(goodbye, false).await;
+    }
 }
 
 #[tokio::test]

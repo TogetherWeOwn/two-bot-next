@@ -582,14 +582,19 @@ impl OnboardingRuntime {
                 .await
                 .map_err(|_| RuntimeError::Member)?
                 .ok_or(RuntimeError::Member)?;
+            let channels: HashSet<_> = keys
+                .iter()
+                .filter_map(|key| session_pick_by_key(key, &config.session_picks))
+                .map(|pick| pick.channel_id.as_str())
+                .collect();
             let mut visible = HashSet::new();
-            for pick in &config.session_picks {
+            for channel in channels {
                 if access
-                    .permits(&self.executor, &pick.channel_id, false)
+                    .permits(&self.executor, channel, false)
                     .await
                     .map_err(|_| RuntimeError::Member)?
                 {
-                    visible.insert(pick.channel_id.clone());
+                    visible.insert(channel.to_owned());
                 }
             }
             let outcome = adjudicate_session_select(

@@ -46,6 +46,10 @@ impl TestSchema {
             include_str!("../../cutover/migrations/0001_funnel.sql"),
             include_str!("../../cutover/migrations/0190_onboarding.sql"),
             include_str!("../../cutover/migrations/0330_guild_settings.sql"),
+            include_str!("../../cutover/migrations/0331_guild_settings_versions.sql"),
+            include_str!("../../cutover/migrations/0332_guild_settings_allocator.sql"),
+            include_str!("../../cutover/migrations/0333_guild_settings_revision.sql"),
+            include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await.unwrap();
         }
@@ -113,6 +117,7 @@ impl TestSchema {
 struct DiscordState {
     roles: HashSet<String>,
     dark_primary: bool,
+    unavailable_channel: Option<String>,
     reject_next_post: bool,
     reject_roles: bool,
     member_reads: usize,
@@ -147,6 +152,9 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
             }
             ("GET", path) if path.starts_with("/channels/") => {
                 let id = path.strip_prefix("/channels/").unwrap();
+                if state.unavailable_channel.as_deref() == Some(id) {
+                    return ScriptedResponse::status(503);
+                }
                 let overwrites = if state.dark_primary && GAME_PICKS.iter().any(|pick| pick.primary_channel_id == Some(id)) {
                     json!([{"id":"44","type":1,"allow":"0","deny":"1024"}])
                 } else if id == GAME_PICKS[0].primary_channel_id.unwrap() {
@@ -654,6 +662,88 @@ async fn onboarding_runtime_roleless_session_reselection_stale_menu_and_goodbye_
             0,
             "leave funnel remains single-owned"
         );
+    })
+    .catch_unwind()
+    .await;
+    db.close().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn onboarding_runtime_session_reads_only_selected_destinations() {
+    let db = TestSchema::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mock = discord(Arc::new(Mutex::new(DiscordState {
+            unavailable_channel: Some("11".into()),
+            ..Default::default()
+        })))
+        .await;
+        let runtime = runtime(&db.pool, &mock, &vars("session", false));
+        runtime
+            .handle(
+                component(SESSION_SELECT_ID, &["find-players", "find-players"]),
+                NOW,
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
+        let requests = mock.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path == "/api/v10/channels/10")
+                .count(),
+            1,
+            "duplicate picks resolve their shared destination once"
+        );
+        assert!(!requests
+            .iter()
+            .any(|request| request.path == "/api/v10/channels/11"));
+        let reply: Value = serde_json::from_slice(&replies(&mock)[0].body).unwrap();
+        assert_eq!(reply["content"], "On it - head to <#10>.");
+        let metadata: String =
+            sqlx::query_scalar("SELECT metadata FROM events WHERE event_type = $1")
+                .bind(EVENT_CHANNEL_ROUTED)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let routed: Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(routed["picks"], json!(["find-players"]));
+        assert_eq!(routed["channels"], json!(["10"]));
+
+        runtime
+            .handle(component(SESSION_SELECT_ID, &["join-voice"]), NOW + 1)
+            .await
+            .unwrap();
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
+        assert!(mock
+            .requests()
+            .iter()
+            .any(|request| request.path == "/api/v10/channels/11"));
+        let reply: Value = serde_json::from_slice(&replies(&mock)[1].body).unwrap();
+        assert_eq!(
+            reply["content"],
+            "I couldn't finish routing your session selection. Please open the menu and try again."
+        );
+
+        runtime
+            .handle(
+                component(SESSION_SELECT_ID, &["find-players", "unknown"]),
+                NOW + 2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
+        let reply: Value = serde_json::from_slice(&replies(&mock)[2].body).unwrap();
+        assert!(reply["content"].as_str().unwrap().contains("gone or stale"));
+        assert_eq!(db.count(EVENT_GAME_ROLES_SELECTED).await, 0);
+        assert!(!mock
+            .requests()
+            .iter()
+            .any(|request| matches!(request.method.as_str(), "PUT" | "DELETE")));
     })
     .catch_unwind()
     .await;

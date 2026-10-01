@@ -89,41 +89,51 @@ impl MemberAccess {
                 };
                 evidence.push(value);
             }
-            Ok(Self::from_json(
-                guild_id,
-                user_id,
-                &evidence[0],
-                &evidence[1],
-                &evidence[2],
-            ))
+            // Sequential reads can disagree after a role change. Unusable
+            // evidence is retryable, not proof that the member is absent.
+            Self::from_json(guild_id, user_id, &evidence[0], &evidence[1], &evidence[2])
+                .map(Some)
+                .ok_or(AccessUnavailable)
         })
         .await
         .map_err(|_| AccessUnavailable)?
     }
 
-    fn channel_permissions(&self, channel: &Value) -> Option<u64> {
-        if snowflake(&channel["guild_id"])? != self.guild_id {
-            return None;
+    fn channel_permissions(&self, channel: &Value) -> Result<Option<u64>, AccessUnavailable> {
+        if snowflake(&channel["guild_id"]).ok_or(AccessUnavailable)? != self.guild_id {
+            return Ok(None);
         }
         // Guild forum/media visibility uses the same overwrites. Whether the
         // executor can post a plain message is a separate check in permits.
         // DMs and threads still require different membership evidence.
-        if !matches!(channel["type"].as_u64()?, 0 | 2 | 5 | 13 | 15 | 16) {
-            return None;
+        if !matches!(
+            channel["type"].as_u64().ok_or(AccessUnavailable)?,
+            0 | 2 | 5 | 13 | 15 | 16
+        ) {
+            return Ok(None);
         }
         let mut everyone = (0, 0);
         let mut roles = (0, 0);
         let mut member = (0, 0);
         let role_ids: HashSet<_> = self.role_ids.iter().map(String::as_str).collect();
         let mut seen = HashSet::new();
-        for overwrite in channel["permission_overwrites"].as_array()? {
-            let id = snowflake(&overwrite["id"])?;
-            let kind = overwrite["type"].as_u64()?;
+        for overwrite in channel["permission_overwrites"]
+            .as_array()
+            .ok_or(AccessUnavailable)?
+        {
+            let id = snowflake(&overwrite["id"]).ok_or(AccessUnavailable)?;
+            let kind = overwrite["type"].as_u64().ok_or(AccessUnavailable)?;
             if kind > 1 || !seen.insert((kind, id)) {
-                return None;
+                return Err(AccessUnavailable);
             }
-            let allow = overwrite["allow"].as_str()?.parse::<u64>().ok()?;
-            let deny = overwrite["deny"].as_str()?.parse::<u64>().ok()?;
+            let allow = overwrite["allow"]
+                .as_str()
+                .and_then(|bits| bits.parse::<u64>().ok())
+                .ok_or(AccessUnavailable)?;
+            let deny = overwrite["deny"]
+                .as_str()
+                .and_then(|bits| bits.parse::<u64>().ok())
+                .ok_or(AccessUnavailable)?;
             if kind == 0 && id == self.guild_id {
                 everyone = (allow, deny);
             } else if kind == 0 && role_ids.contains(id.to_string().as_str()) {
@@ -134,13 +144,13 @@ impl MemberAccess {
             }
         }
         if self.owner || self.permissions & ADMINISTRATOR != 0 {
-            return Some(u64::MAX);
+            return Ok(Some(u64::MAX));
         }
         let mut permissions = self.permissions;
         for (allow, deny) in [everyone, roles, member] {
             permissions = (permissions & !deny) | allow;
         }
-        Some(permissions)
+        Ok(Some(permissions))
     }
 
     /// Validate the requested identity too: a proxy/cache returning another
@@ -164,14 +174,25 @@ impl MemberAccess {
         let Some(channel) = channel else {
             return Ok(false);
         };
-        if snowflake(&channel["id"]) != Some(expected)
-            || (post && !matches!(channel["type"].as_u64(), Some(0 | 2 | 5 | 13)))
-        {
+        self.permits_channel(&channel, expected, post)
+    }
+
+    fn permits_channel(
+        &self,
+        channel: &Value,
+        expected: u64,
+        post: bool,
+    ) -> Result<bool, AccessUnavailable> {
+        if snowflake(&channel["id"]).ok_or(AccessUnavailable)? != expected {
+            return Err(AccessUnavailable);
+        }
+        let kind = channel["type"].as_u64().ok_or(AccessUnavailable)?;
+        if post && !matches!(kind, 0 | 2 | 5 | 13) {
             return Ok(false);
         }
         let needed = VIEW_CHANNEL | if post { SEND_MESSAGES } else { 0 };
         Ok(self
-            .channel_permissions(&channel)
+            .channel_permissions(channel)?
             .is_some_and(|bits| bits & needed == needed))
     }
 }
@@ -200,29 +221,52 @@ mod tests {
         ]});
         assert_eq!(
             access(&[]).channel_permissions(&channel),
-            Some(SEND_MESSAGES)
+            Ok(Some(SEND_MESSAGES))
         );
-        assert_eq!(access(&["55"]).channel_permissions(&channel), Some(3072));
+        assert_eq!(
+            access(&["55"]).channel_permissions(&channel),
+            Ok(Some(3072))
+        );
         channel["permission_overwrites"]
             .as_array_mut()
             .unwrap()
             .push(json!({"id":"44","type":1,"allow":"0","deny":"1024"}));
         assert_eq!(
             access(&["55"]).channel_permissions(&channel),
-            Some(SEND_MESSAGES)
+            Ok(Some(SEND_MESSAGES))
         );
     }
 
     #[test]
-    fn malformed_foreign_and_dm_channels_fail_closed() {
+    fn malformed_channel_evidence_is_unavailable() {
         for channel in [
-            json!({"guild_id":"23","type":0,"permission_overwrites":[]}),
-            json!({"guild_id":"22","type":1,"permission_overwrites":[]}),
-            json!({"guild_id":"22","type":0}),
-            json!({"guild_id":"22","type":0,"permission_overwrites":[{"id":"22","type":0,"allow":"oops","deny":"0"}]}),
+            json!({"id":"12","type":0,"permission_overwrites":[]}),
+            json!({"id":"12","guild_id":"22","permission_overwrites":[]}),
+            json!({"id":"12","guild_id":"22","type":0}),
+            json!({"id":"12","guild_id":"22","type":0,"permission_overwrites":[{"id":"22","type":0,"allow":"oops","deny":"0"}]}),
+            json!({"id":"12","guild_id":"22","type":0,"permission_overwrites":[{"id":"22","type":2,"allow":"0","deny":"0"}]}),
+            json!({"id":"12","guild_id":"22","type":0,"permission_overwrites":[{"id":"22","type":0,"allow":"0","deny":"0"},{"id":"22","type":0,"allow":"0","deny":"0"}]}),
+            json!({"id":"13","guild_id":"22","type":0,"permission_overwrites":[]}),
         ] {
-            assert_eq!(access(&[]).channel_permissions(&channel), None);
+            assert_eq!(
+                access(&[]).permits_channel(&channel, 12, true),
+                Err(AccessUnavailable)
+            );
         }
+    }
+
+    #[test]
+    fn foreign_unsupported_and_denied_channels_are_terminal_skips() {
+        for channel in [
+            json!({"id":"12","guild_id":"23","type":0,"permission_overwrites":[]}),
+            json!({"id":"12","guild_id":"22","type":1,"permission_overwrites":[]}),
+            json!({"id":"12","guild_id":"22","type":15,"permission_overwrites":[]}),
+            json!({"id":"12","guild_id":"22","type":0,"permission_overwrites":[{"id":"22","type":0,"allow":"0","deny":"2048"}]}),
+        ] {
+            assert_eq!(access(&[]).permits_channel(&channel, 12, true), Ok(false));
+        }
+        let forum = json!({"id":"12","guild_id":"22","type":15,"permission_overwrites":[]});
+        assert_eq!(access(&[]).permits_channel(&forum, 12, false), Ok(true));
     }
 
     #[test]
