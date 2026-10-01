@@ -27,6 +27,9 @@
 
 ### Fixed
 
+- Give owned disposable-database teardown a separate finite 30-second statement
+  timeout for checkpoint waits, retaining five-second fixture query deadlines and
+  verified cleanup after failures or caller cancellation.
 - Bound automod repeat inspection to each revision's time window without letting
   unstamped updates prune delayed creates; retain immutable CREATE facts during
   role enrichment and clarify enforce-only preserved-match recovery. Run the
