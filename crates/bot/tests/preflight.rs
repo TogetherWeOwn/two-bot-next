@@ -278,7 +278,9 @@ async fn roles_fail_for_missing_managed_or_high_targets_even_with_administrator(
 #[tokio::test]
 async fn ticket_staff_role_and_category_fail_closed() {
     // PASS path: staff role below the bot + GuildCategory destination.
-    let mock = mock(script_channels(
+    // (Named pass_mock so later mock(...) calls in this fn still resolve
+    // to the helper instead of the local binding.)
+    let pass_mock = mock(script_channels(
         permissions(),
         (1 << 15) | (1 << 18),
         1,
@@ -286,14 +288,14 @@ async fn ticket_staff_role_and_category_fail_closed() {
         vec![channel(), category_channel()],
     ))
     .await;
-    let output = cli(&mock, &["--json"], &ticket_triple("5555")).await;
+    let output = cli(&pass_mock, &["--json"], &ticket_triple("5555")).await;
     assert_eq!(
         output.status.code(),
         Some(0),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
-    mock.shutdown().await;
+    pass_mock.shutdown().await;
 
     // Staff-role failures: missing (deleted), managed, @everyone, and above
     // the bot. Equal position still passes here: Twilight orders equal
@@ -334,7 +336,9 @@ async fn ticket_staff_role_and_category_fail_closed() {
     }
 
     // Category mismatch: the category slot served a text channel.
-    let mock = mock(script_channels(
+    // (Distinct binding names: each `let mock = mock(...)` initializer
+    // must resolve to the helper, not an earlier MockRest binding.)
+    let mismatch_mock = mock(script_channels(
         permissions(),
         (1 << 15) | (1 << 18),
         1,
@@ -342,7 +346,7 @@ async fn ticket_staff_role_and_category_fail_closed() {
         vec![channel(), category_channel_as_text()],
     ))
     .await;
-    let output = cli(&mock, &["--json"], &ticket_triple("5555")).await;
+    let output = cli(&mismatch_mock, &["--json"], &ticket_triple("5555")).await;
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -355,10 +359,10 @@ async fn ticket_staff_role_and_category_fail_closed() {
         .unwrap()
         .iter()
         .any(|check| check["check"] == format!("channel {CATEGORY}") && check["status"] == "FAIL"));
-    mock.shutdown().await;
+    mismatch_mock.shutdown().await;
 
     // Partial triple: only one of the three ticket keys set.
-    let mock = mock(script(
+    let partial_mock = mock(script(
         permissions(),
         (1 << 15) | (1 << 18),
         1,
@@ -367,7 +371,7 @@ async fn ticket_staff_role_and_category_fail_closed() {
     ))
     .await;
     let output = cli(
-        &mock,
+        &partial_mock,
         &["--json"],
         &[("DISCORD_TICKET_STAFF_ROLE_ID", "5555")],
     )
@@ -384,7 +388,7 @@ async fn ticket_staff_role_and_category_fail_closed() {
         .unwrap()
         .iter()
         .any(|check| check["check"] == "ticket configuration" && check["status"] == "FAIL"));
-    mock.shutdown().await;
+    partial_mock.shutdown().await;
 }
 
 #[tokio::test]

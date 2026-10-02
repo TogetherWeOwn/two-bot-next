@@ -87,7 +87,7 @@ impl TestDb {
         command.output().unwrap()
     }
 
-    async fn seed(&self, sql: &str) -> TestResult {
+    async fn seed(&self, sql: &'static str) -> TestResult {
         sqlx::raw_sql(sql).execute(&self.pool).await?;
         Ok(())
     }
