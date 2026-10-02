@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::command_runtime_tests::{message, slash};
 use crate::discord_test_common::{MockRest, ScriptedResponse};

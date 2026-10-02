@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::discord_test_common::{MockRest, ScriptedResponse};
 use serde_json::json;
