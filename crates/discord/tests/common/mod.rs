@@ -594,7 +594,7 @@ async fn handle_rest(
         method,
         path,
         headers,
-        body,
+        body: body.clone(),
         received_at: std::time::Instant::now(),
     });
     let (next, gate) = queue
@@ -609,18 +609,30 @@ async fn handle_rest(
     if !next.delay.is_zero() {
         tokio::time::sleep(next.delay).await;
     }
+    // A guild-command replace echoes the stored command list back (Discord's
+    // PUT contract) and the executor validates that receipt; a scripted bare
+    // 200 self-heals into the echo, while an explicit body wins.
+    let body = if next.status == 200
+        && method == "PUT"
+        && path.ends_with("/commands")
+        && next.body.is_empty()
+    {
+        body
+    } else {
+        next.body
+    };
     let mut head = format!(
         "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
         next.status,
         reason_phrase(next.status),
-        next.body.len(),
+        body.len(),
     );
     for (name, value) in &next.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
-    let _ = stream.write_all(&next.body).await;
+    let _ = stream.write_all(&body).await;
     if let Some(gate) = gate {
         gate.completed.notify_one();
     }
