@@ -2322,6 +2322,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
+ "tracing-subscriber",
  "two-bot-testsupport",
  "unicode-normalization",
  "url",
