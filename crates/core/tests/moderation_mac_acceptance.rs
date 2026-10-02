@@ -77,12 +77,21 @@ fn token_is_stable_32_hex_one_way_binding() {
 #[test]
 fn no_secret_passes_through_and_parses_none() {
     let plain = "plain reason without marker";
+    // Empty secret built at runtime, as in the inline `mac` tests.
+    let empty_secret = String::new();
     assert_eq!(
         moderation_audit_reason(None, GUILD, KEY, "moderation.ban", ACTOR, plain),
         plain
     );
     assert_eq!(
-        moderation_audit_reason(Some(""), GUILD, KEY, "moderation.ban", ACTOR, plain),
+        moderation_audit_reason(
+            Some(empty_secret.as_str()),
+            GUILD,
+            KEY,
+            "moderation.ban",
+            ACTOR,
+            plain
+        ),
         plain
     );
     assert_eq!(
@@ -90,7 +99,7 @@ fn no_secret_passes_through_and_parses_none() {
         None
     );
     assert_eq!(
-        parse_moderation_audit_reason(Some(""), GUILD, Some(plain)),
+        parse_moderation_audit_reason(Some(empty_secret.as_str()), GUILD, Some(plain)),
         None
     );
     // Even a well-formed marker is uncorrelated without a secret.
@@ -101,7 +110,7 @@ fn no_secret_passes_through_and_parses_none() {
         None
     );
     assert_eq!(
-        parse_moderation_audit_reason(Some(""), GUILD, Some(&minted)),
+        parse_moderation_audit_reason(Some(empty_secret.as_str()), GUILD, Some(&minted)),
         None
     );
 }
@@ -152,16 +161,16 @@ fn minted_marker_verifies_and_tampering_fails() {
     };
     tampered_mac.replace_range(mac_start..mac_start + 1, replacement);
     assert_ne!(tampered_token, marker_only);
-    for tampered in [
-        tampered_action,
-        tampered_actor,
-        tampered_token,
-        tampered_mac,
+    for (field, tampered) in [
+        ("action", tampered_action),
+        ("actor", tampered_actor),
+        ("token", tampered_token),
+        ("mac", tampered_mac),
     ] {
         assert_eq!(
             parse_moderation_audit_reason(Some(secret), GUILD, Some(&tampered)),
             None,
-            "tampered marker must not verify: {tampered}"
+            "tampered {field} must not verify"
         );
     }
     // Untouched marker prose stays correlated; a different guild does not.
@@ -171,8 +180,9 @@ fn minted_marker_verifies_and_tampering_fails() {
         None
     );
     // A secret that was never used to mint fails verification.
+    let wrong_secret = format!("{secret}-wrong");
     assert_eq!(
-        parse_moderation_audit_reason(Some("wrong-secret-not-the-minter"), GUILD, Some(&minted)),
+        parse_moderation_audit_reason(Some(&wrong_secret), GUILD, Some(&minted)),
         None
     );
 }
