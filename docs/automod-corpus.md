@@ -29,7 +29,7 @@ The coverage test requires all 212 references, unique case IDs, valid references
 matching row/assertion counts, and a separate expected outcome for every deferred
 assertion. Removing a table row and its mapping fails coverage.
 
-There are **173 fixture cases: 150 executable core cases and 23 explicitly
+There are **176 fixture cases: 153 executable core cases and 23 explicitly
 deferred cases**. The latter include 92 expanded legacy checks plus one scrubbed
 native-rule export record with no unit-test assertion. Supplemental cases have
 empty source-reference lists and are not added to the legacy assertion count.
@@ -64,7 +64,11 @@ Counts distinguish mapped expectations from executed/verified parity.
   lists, plus every one of the eleven default blocked extensions.
 - First-hit filter precedence and explicit repeat sequences: same-ID edits,
   distinct IDs, author/guild isolation, blank content, window expiration,
-  inclusive cutoff, and NFKC/case/whitespace identity.
+  inclusive cutoff, and NFKC/case/whitespace identity. Legacy lookback depth
+  ([TOG-12582](/TOG/issues/TOG-12582)): with count 3 the verdict counts the new
+  row plus up to 3 earlier rows, so `supplement-repeat-lookback-filler-first`
+  (`X,Y,X,X`) and `supplement-repeat-lookback-filler-middle` (`X,X,Y,X`) trip
+  on the 4th while the two-filler control stays clean.
 - Config enable/dry-run/enforce gates, parsed policy, invalid sanctions, and
   supplementary selection of `1:delete,2:warn,3:timeout:600` at counts 0/1/2/3/99.
   `supplement-first-timeout-sanction` proves core selection of `1:timeout:600`

@@ -19,6 +19,10 @@
 //! - channel moderation (`/purge`, `/slowmode`, `/lockdown`, `/unlock`): shared
 //!   router authorization → ephemeral defer → durable claim/lane → REST effect →
 //!   atomic result/audit → original-response edit. Ambiguity retains the lane.
+//! - schedules (`/schedule`, `/schedule-remove`, `/schedule-list`; TOG-12237
+//!   over the TOG-10081 domain and store): validate → guild-scoped CRUD →
+//!   `automation_audit_log` row → ephemeral completion. The handlers live in
+//!   [`crate::schedule_runtime`]; the runtime only registers and dispatches.
 //! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
 //!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
 //!   award path shares this runtime's pool, executor and onboarding gates.
@@ -480,7 +484,7 @@ impl CommandRuntime {
     /// Route all slash commands through the shared router. Refusals get the
     /// existing ephemeral text; accepted builtins without a wired slice get
     /// an unavailable reply. Channel commands own their defer/audit lifecycle;
-    /// sticky/feed defer ephemerally; leveling sends its own immediate
+    /// sticky/feed/schedule defer ephemerally; leveling sends its own immediate
     /// callback. Router Ignore (unknown names/guild fence) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
         if ChannelModerationRuntime::accepts(interaction) {
@@ -526,7 +530,9 @@ impl CommandRuntime {
             return;
         }
         let owner = match name.as_str() {
-            "sticky" | "sticky-remove" => Some(HandlerId::AutomationAdmin),
+            "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
+                Some(HandlerId::AutomationAdmin)
+            }
             "feed-add" => Some(HandlerId::FeedAdd),
             "feed-remove" => Some(HandlerId::FeedRemove),
             "feed-list" => Some(HandlerId::FeedList),
@@ -562,6 +568,33 @@ impl CommandRuntime {
             "feed-add" => self.feed_add(interaction).await,
             "feed-remove" => self.feed_remove(interaction).await,
             "feed-list" => self.feed_list(interaction).await,
+            "schedule" => {
+                crate::schedule_runtime::schedule_create(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
+            }
+            "schedule-remove" => {
+                crate::schedule_runtime::schedule_remove(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
+            }
+            "schedule-list" => {
+                crate::schedule_runtime::schedule_list(
+                    &self.pool,
+                    &self.executor,
+                    &self.guild_id.to_string(),
+                    interaction,
+                )
+                .await;
+            }
             _ => {}
         }
     }
