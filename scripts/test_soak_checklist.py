@@ -1,12 +1,13 @@
 """Coverage guard regressions: local fixtures only, no Discord or databases."""
 
+from collections import Counter
 import copy
 import json
 from pathlib import Path
 import subprocess
 import unittest
 
-from check_soak_checklist import parity_rows, render, validate
+from check_soak_checklist import delta_rows, parity_rows, render, validate
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,7 +20,7 @@ class SoakChecklistTests(unittest.TestCase):
 
     def test_repository_coverage_and_render(self):
         counts = validate(self.parity, self.checklist)
-        self.assertEqual(set(counts), set(range(1, 9)))
+        self.assertEqual(set(counts), set(range(1, 9)) | {12, 13})
         self.assertEqual((ROOT / "docs/soak-checklist.md").read_text(), render(self.checklist))
 
     def test_unnumbered_section_ends_parity_table_scope(self):
@@ -188,6 +189,173 @@ class SoakChecklistTests(unittest.TestCase):
     def test_escaped_pipe_stays_in_cell(self):
         changed = self.parity.replace("## 9. Drops", "| Behaviour | Detail | Map |\n|---|---|---|\n|new observable | one \\| two | **S5** |\n\n## 9. Drops")
         self.assertIn((8, ("new observable", "one | two")), parity_rows(changed))
+
+
+class DeltaChecklistTests(unittest.TestCase):
+    """Parity §12 additions and §13 non-dropped ledger rows (B4 gate)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parity = (ROOT / "docs/parity.md").read_text()
+        cls.checklist = json.loads((ROOT / "docs/soak-checklist.json").read_text())
+
+    def line(self, needle):
+        return next(line for line in self.parity.splitlines() if needle in line)
+
+    def entry(self, data, entry_id):
+        return next(e for e in data["entries"] if e["id"] == entry_id)
+
+    def without_entry(self, entry_id):
+        data = copy.deepcopy(self.checklist)
+        data["entries"] = [e for e in data["entries"] if e["id"] != entry_id]
+        return data
+
+    def test_ledger_coverage_is_every_non_dropped_row(self):
+        # Independent of the table scanner: split the delimited ledger by hand.
+        ledger = self.parity.split("<!-- post-freeze-ledger:start -->")[1].split("<!-- post-freeze-ledger:end -->")[0]
+        statuses = {}
+        for line in ledger.splitlines():
+            if line.startswith("| ["):
+                cells = [c.strip() for c in line.strip("|").split("|")]
+                statuses[cells[0][1:cells[0].index("]")]] = cells[3]
+        covered = {row[0][1:row[0].index("]")] for section, row in delta_rows(self.parity) if section == 13}
+        self.assertEqual(covered, {sha for sha, status in statuses.items() if status != "dropped"})
+        replays = [line for line in ledger.splitlines() if "| dropped | drop: history-rewrite replay" in line]
+        self.assertGreater(len(replays), 100)
+        for line in replays:
+            self.assertFalse(line[3:line.index("]")] in covered)
+        counts = Counter(section for section, _ in delta_rows(self.parity))
+        self.assertEqual(counts[12], len([e for e in self.checklist["entries"] if e["parity"]["section"] == 12]))
+
+    def test_removing_delta_entry_fails(self):
+        for entry_id in ("s12-01", "s12-14", "s13-f114c44", "s13-90ab4b7"):
+            with self.subTest(entry=entry_id):
+                with self.assertRaisesRegex(ValueError, "missing=\\[\\(1[23],"):
+                    validate(self.parity, self.without_entry(entry_id))
+
+    def test_removing_delta_source_row_leaves_stale_entry(self):
+        for needle in ("| Temporary voice creator channels", "| [Lookup failure", "| [f114c44]", "| [bffccf3]"):
+            with self.subTest(row=needle):
+                changed = self.parity.replace(self.line(needle) + "\n", "", 1)
+                with self.assertRaisesRegex(ValueError, "missing=\\[\\]; stale=\\[\\(1[23],"):
+                    validate(changed, self.checklist)
+
+    def test_new_delta_rows_need_entries(self):
+        for needle, row in (
+            ("| [Lookup failure", "| New surface | evidence | [TOG-1](/TOG/issues/TOG-1) |"),
+            ("| [bffccf3]", "| [abc1234](https://example.invalid) | `src/x/` | fix(x): new | gap | [TOG-1](/TOG/issues/TOG-1) — obligation |"),
+        ):
+            with self.subTest(row=row):
+                line = self.line(needle)
+                changed = self.parity.replace(line, line + "\n" + row, 1)
+                with self.assertRaisesRegex(ValueError, "missing="):
+                    validate(changed, self.checklist)
+
+    def test_ledger_status_changes_are_stale(self):
+        line = self.line("| [bffccf3]")
+        dropped = line.replace("| carded | ", "| dropped | drop: superseded; ", 1)
+        with self.assertRaisesRegex(ValueError, "missing=\\[\\]; stale="):
+            validate(self.parity.replace(line, dropped, 1), self.checklist)
+        with self.assertRaisesRegex(ValueError, "missing=\\[\\(13,.*stale=\\[\\(13,"):
+            validate(self.parity.replace(line, line.replace("| carded |", "| gap |", 1), 1), self.checklist)
+
+    def test_drop_and_replay_rows_are_excluded(self):
+        rows = delta_rows(self.parity)
+        for needle, row in (
+            ("| [Lookup failure", "| Retired surface | evidence | **DROP** — intentionally absent |"),
+            ("| [bffccf3]", "| [abc1234](https://example.invalid) | `src/x/` | replayed | dropped | drop: history-rewrite replay |"),
+        ):
+            with self.subTest(row=row):
+                line = self.line(needle)
+                changed = self.parity.replace(line, line + "\n" + row, 1)
+                self.assertEqual(delta_rows(changed), rows)
+                self.assertEqual(validate(changed, self.checklist), validate(self.parity, self.checklist))
+        # A DROP prefix naming an owner card keeps the §12 row in scope.
+        line = self.line("| [Lookup failure")
+        mixed = line + "\n| Mixed surface | evidence | **DROP** the Node hop; [TOG-1](/TOG/issues/TOG-1) keeps the contract |"
+        self.assertIn((12, ("Mixed surface", "evidence")), delta_rows(self.parity.replace(line, mixed, 1)))
+
+    def test_retained_delta_rows_need_owner_cards(self):
+        line = self.line("| [Lookup failure")
+        with self.assertRaisesRegex(ValueError, "§12: row needs an owner card"):
+            delta_rows(self.parity.replace(line, line + "\n| Orphan surface | evidence | to be decided |", 1))
+        line = self.line("| [bffccf3]")
+        for status in ("carded", "gap"):
+            with self.subTest(status=status):
+                row = f"| [abc1234](https://example.invalid) | `src/x/` | fix(x): new | {status} | no card yet |"
+                with self.assertRaisesRegex(ValueError, f"§13: {status} row needs an owner card"):
+                    delta_rows(self.parity.replace(line, line + "\n" + row, 1))
+        # Ported rows cite source evidence instead, yet still need an entry.
+        row = "| [abc1234](https://example.invalid) | `src/x/` | fix(x): new | ported | implemented in `x.rs:1` |"
+        with self.assertRaisesRegex(ValueError, "missing="):
+            validate(self.parity.replace(line, line + "\n" + row, 1), self.checklist)
+
+    def test_owner_cards_must_match_disposition(self):
+        data = copy.deepcopy(self.checklist)
+        self.entry(data, "s13-1d64196")["owner"] = ["TOG-11146"]
+        with self.assertRaisesRegex(ValueError, "s13-1d64196: stale owner"):
+            validate(self.parity, data)
+        self.entry(data, "s13-1d64196")["owner"] = ["TOG-11145"]
+        line = self.line("| [1d64196]")
+        moved = self.parity.replace(line, line.replace("TOG-11145", "TOG-99999"), 1)
+        with self.assertRaisesRegex(ValueError, "s13-1d64196: stale owner"):
+            validate(moved, data)
+        for owner in (None, [], ["owner"], "TOG-11145"):
+            with self.subTest(owner=owner):
+                self.entry(data, "s13-1d64196")["owner"] = owner
+                with self.assertRaisesRegex(ValueError, "requires owner cards"):
+                    validate(self.parity, data)
+        # A ported row with no cited card still names its owning slice.
+        data = copy.deepcopy(self.checklist)
+        self.entry(data, "s13-3dc9720").pop("owner")
+        with self.assertRaisesRegex(ValueError, "s13-3dc9720: §13 entry requires owner cards"):
+            validate(self.parity, data)
+
+    def test_delta_tables_fail_closed(self):
+        header = "| Legacy commit | Area | Change | Status | Disposition |"
+        with self.assertRaisesRegex(ValueError, "ledger columns"):
+            delta_rows(self.parity.replace(header, "| Legacy commit | Area | Change | State | Disposition |", 1))
+        with self.assertRaisesRegex(ValueError, "must end in Disposition"):
+            delta_rows(self.parity.replace(header, "| Legacy commit | Area | Change | Status | Outcome |", 1))
+        line = self.line("| [bffccf3]")
+        with self.assertRaisesRegex(ValueError, "unknown ledger status 'pending'"):
+            delta_rows(self.parity.replace(line, line.replace("| carded |", "| pending |", 1), 1))
+        with self.assertRaisesRegex(ValueError, "malformed table row"):
+            delta_rows(self.parity.replace(line, line.replace("| carded |", "|", 1), 1))
+        with self.assertRaisesRegex(ValueError, "sections 12 and 13"):
+            delta_rows(self.parity.replace("## 13. Exact-range", "## 31. Exact-range", 1))
+        line = self.line("| [Lookup failure")
+        with self.assertRaisesRegex(ValueError, "without leading border"):
+            delta_rows(self.parity.replace(line, line + "\nNew surface | evidence | [TOG-1](/TOG/issues/TOG-1) |", 1))
+
+    def test_delta_waivers_and_voice_rows_keep_their_rules(self):
+        waived = [e for e in self.checklist["entries"] if e["parity"]["section"] in (12, 13) and e["status"] == "waived"]
+        self.assertGreater(len(waived), 0)
+        for field in ("reason", "approver"):
+            with self.subTest(field=field):
+                data = copy.deepcopy(self.checklist)
+                self.entry(data, waived[0]["id"]).pop(field)
+                with self.assertRaisesRegex(ValueError, f"waiver requires {field}"):
+                    validate(self.parity, data)
+        for entry_id in ("s12-01", "s13-59965d0", "s13-f114c44"):
+            with self.subTest(entry=entry_id):
+                data = copy.deepcopy(self.checklist)
+                self.entry(data, entry_id).pop("reference")
+                with self.assertRaisesRegex(ValueError, "TOG-10119"):
+                    validate(self.parity, data)
+
+    def test_ported_rows_verify_through_the_cache_wrapper(self):
+        automated = [e for e in self.checklist["entries"] if e["parity"]["section"] == 13 and e["status"] == "automated"]
+        self.assertEqual({e["parity"]["row"][3] for e in automated}, {"ported"})
+        for entry in automated:
+            self.assertTrue(entry["verification"].startswith("python3 scripts/cargo_cache.py run -- test -p two-bot-core "))
+
+    def test_render_lists_delta_sections_and_owners(self):
+        output = render(self.checklist)
+        self.assertIn("\n## 12. ", output)
+        self.assertIn("\n## 13. ", output)
+        self.assertIn("\n### s13-f114c44: f114c44 — TOG-3052: temp-voice generator", output)
+        self.assertIn("- **Owner:** [TOG-11145](/TOG/issues/TOG-11145)\n", output)
 
 
 if __name__ == "__main__":
