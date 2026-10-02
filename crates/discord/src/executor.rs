@@ -592,7 +592,7 @@ impl ActionExecutor {
     /// Same single-attempt send as [`Self::call_once`], but returns the raw
     /// exchange so callers that must distinguish "proven absent" from
     /// "unreadable" can validate the body themselves.
-    async fn call_once_raw(
+    pub(crate) async fn call_once_raw(
         &self,
         request: Request,
         accepted: &[u16],
@@ -1805,7 +1805,7 @@ impl IntoOther for DiscordError {
     }
 }
 
-fn snowflake<T>(value: &str) -> Result<Id<T>, DiscordError> {
+pub(crate) fn snowflake<T>(value: &str) -> Result<Id<T>, DiscordError> {
     // `Id::new` panics on zero, so zero and garbage both reject here.
     value
         .parse::<u64>()
