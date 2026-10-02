@@ -101,6 +101,32 @@ async fn post_mirror_classifies_each_discord_failure() {
 }
 
 #[tokio::test]
+async fn post_mirror_malformed_success_receipt_is_uncertain_without_retry() {
+    for receipt in [
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!({"id": "0"}),
+        serde_json::json!({"id": "not-an-id"}),
+    ] {
+        let mock = MockRest::start(
+            vec![ScriptedResponse::json(200, receipt)],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let exec = executor_for(&mock);
+        let outcome = exec
+            .post_mirror(CHANNEL, "x", &delivery_nonce(&mock.origin()))
+            .await;
+        assert!(
+            matches!(outcome, Err(MirrorError::Uncertain(_))),
+            "malformed mutation receipt remains uncertain, got {outcome:?}"
+        );
+        assert_eq!(mock.requests().len(), 1, "uncertain post is not retried");
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn post_mirror_timeout_is_uncertain_never_rejected() {
     // The 5 s executor abort: a post that may have landed must classify
     // Uncertain (reconcile-only), never Rejected (retryable).

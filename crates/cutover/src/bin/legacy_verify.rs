@@ -1,6 +1,9 @@
 //! Read-only legacy-versus-next verification. Exit 0 equal, 1 mismatch,
 //! 2 usage, unsafe mapping, connection or query failure. URLs are never printed.
 
+// Operator commands intentionally emit human-readable/JSON output to stdout.
+#![allow(clippy::print_stdout)]
+
 use std::str::FromStr;
 
 use sqlx::{postgres::PgConnectOptions, ConnectOptions, Connection, PgConnection};

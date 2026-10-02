@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::test_clock::{
     advance, mark_progress, stall_watchdog, stall_watchdog_on, ClockHold, STALL_GRACE,
@@ -13,6 +15,9 @@ use tokio::{
     net::TcpListener,
     task::JoinHandle,
 };
+
+#[cfg(feature = "db-tests")]
+mod admission;
 
 /// Private counter: this fixture must stall-detect without borrowing progress
 /// from concurrently running sibling fixtures.
@@ -31,6 +36,10 @@ struct Reply {
     stall_body: bool,
     truncate: bool,
     disconnect: bool,
+    /// Real-time header delay for the Postgres admission journeys only; the
+    /// frozen-clock fixtures model slowness with `stall_*` and `advance`.
+    #[cfg(feature = "db-tests")]
+    delay: Duration,
 }
 
 impl Reply {
@@ -43,6 +52,8 @@ impl Reply {
             stall_body: false,
             truncate: false,
             disconnect: false,
+            #[cfg(feature = "db-tests")]
+            delay: Duration::ZERO,
         }
     }
 
@@ -58,6 +69,8 @@ struct Recorded {
     method: String,
     path: String,
     user_agent: Option<String>,
+    #[cfg(feature = "db-tests")]
+    authorization: Option<String>,
     body: Value,
 }
 
@@ -125,7 +138,7 @@ impl MockDiscord {
                                 name.eq_ignore_ascii_case("content-length")
                                     .then(|| value.trim().parse::<usize>().unwrap())
                             })
-                            .unwrap();
+                            .unwrap_or(0);
                         break (end + 4, length);
                     }
                 };
@@ -146,8 +159,17 @@ impl MockDiscord {
                         name.eq_ignore_ascii_case("user-agent")
                             .then(|| value.trim().to_owned())
                     }),
-                    body: serde_json::from_slice(&bytes[head_end..head_end + content_length])
-                        .unwrap(),
+                    #[cfg(feature = "db-tests")]
+                    authorization: head.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_owned())
+                    }),
+                    body: if content_length == 0 {
+                        Value::Null
+                    } else {
+                        serde_json::from_slice(&bytes[head_end..head_end + content_length]).unwrap()
+                    },
                 });
                 received.notify_one();
                 mark_progress();
@@ -157,6 +179,10 @@ impl MockDiscord {
                 };
                 if reply.disconnect {
                     continue;
+                }
+                #[cfg(feature = "db-tests")]
+                if !reply.delay.is_zero() {
+                    tokio::time::sleep(reply.delay).await;
                 }
                 if reply.stall_response {
                     std::future::pending::<()>().await;

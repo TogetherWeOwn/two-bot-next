@@ -29,11 +29,24 @@ pub fn router(state: SharedState) -> Router {
 }
 
 pub fn router_with_jobs(state: SharedState, jobs: crate::jobs::SharedStatus) -> Router {
+    router_with_guard(
+        state,
+        jobs,
+        two_bot_discord::ratelimit_guard::process_guard(),
+    )
+}
+
+fn router_with_guard(
+    state: SharedState,
+    jobs: crate::jobs::SharedStatus,
+    guard: Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
         .with_state((state, jobs))
+        .layer(axum::Extension(guard))
         // Internal metrics live on the same listener (Worker never proxies it).
         .merge(crate::metrics_http::router())
         .layer(TraceLayer::new_for_http())
@@ -56,6 +69,7 @@ async fn readyz(
         SharedState,
         crate::jobs::SharedStatus,
     )>,
+    axum::Extension(guard): axum::Extension<Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>>,
 ) -> (StatusCode, Json<ReadinessReport>) {
     // Sample informational jobs before the ping/gateway fence too: awaiting
     // their lock afterward could publish a readiness snapshot from before stop.
@@ -71,7 +85,30 @@ async fn readyz(
         }
     })
     .await;
+    let (code, health) = with_token_state(code, health, guard.snapshot().token_invalid);
     (code, Json(ReadinessReport { health, jobs }))
+}
+
+/// A rejected bot token is fatal: surface it as its own readiness component.
+fn with_token_state(
+    code: StatusCode,
+    mut health: HealthReport,
+    token_invalid: bool,
+) -> (StatusCode, HealthReport) {
+    health.components.push((
+        "token_invalid".to_owned(),
+        if token_invalid {
+            ComponentStatus::Down
+        } else {
+            ComponentStatus::Ready
+        },
+    ));
+    let code = if token_invalid {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        code
+    };
+    (code, health)
 }
 
 async fn readiness_after_ping(
@@ -129,6 +166,7 @@ pub async fn serve(
             }
             *gateway.write().await = GatewayState::Draining;
             shutdown.send_replace(true);
+            crate::shutdown::exit_on_second_signal();
         })
         .await
 }
@@ -171,6 +209,48 @@ mod tests {
             gateway: Arc::new(RwLock::new(s)),
             database: None,
         }
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_fatal_bot_token_while_health_stays_live() {
+        let guard = Arc::new(
+            two_bot_discord::ratelimit_guard::RateLimitGuard::new(Default::default()).unwrap(),
+        );
+        guard.observe_status(401, true);
+        let app = router_with_guard(
+            state(GatewayState::Connected),
+            crate::jobs::statuses(&[], true),
+            guard,
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["components"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(["token_invalid", "down"])));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -263,7 +343,8 @@ mod tests {
             serde_json::json!([
                 ["process", "ready"],
                 ["gateway", "down"],
-                ["database", "down"]
+                ["database", "down"],
+                ["token_invalid", "ready"]
             ])
         );
     }

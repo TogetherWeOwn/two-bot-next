@@ -43,6 +43,9 @@ export const FORWARDED_FLAGS = [
   "TWO_ONBOARDING_DRY_RUN",
   "TWO_SELF_ROLE_PANELS",
   "TWO_SELF_ROLE_DRY_RUN",
+  // Guild command registry drift CLI and opt-in boot publish (TOG-10860).
+  "TWO_COMMANDS_PUBLISH_ON_BOOT",
+  "TWO_COMMANDS_ALLOW_LIVE_GUILD",
   // Community scorecard, classifier and jobs.
   "TWO_COMMUNITY_SCORECARD",
   "TWO_COMMUNITY_RECOMMENDATIONS",
@@ -110,6 +113,8 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_BACKUP_S3_ACCESS_KEY_ID: SECRET,
   TWO_BACKUP_S3_SECRET_ACCESS_KEY: SECRET,
   TWO_DB_POOL_MAX: "cutover CLI pool size, not read by the Container runtime",
+  TWO_ERASURE_ACTOR: "erase-member operator CLI audit actor, set per invocation; not read by the Container runtime",
+  TWO_GUILD_CONFIG_OFFLINE_TEST: "guild-config backup CLI offline-fixture gate, set only by CLI tests; not read by the Container runtime",
   TWO_BACKUP_DIR: BACKUP,
   TWO_BACKUP_KEEP: BACKUP,
   TWO_BACKUP_S3_BUCKET: BACKUP,
