@@ -1370,6 +1370,51 @@ pub fn resolve_majority_game(
 }
 
 // ---------------------------------------------------------------------------
+// Room create/rename wiring (V5b)
+// ---------------------------------------------------------------------------
+
+/// Default name template for new rooms (spec V5).
+pub const DEFAULT_NAME_TEMPLATE: &str =
+    "@@random_emoji@@ @@owner@@'s [[den/crew/lair/hangout/base/club]]";
+
+/// Resolve the channel name for a room create or rename.
+///
+/// `template` is the creator channel's (or standalone channel's) configured
+/// name template, `ctx` carries the current room state, and `raw_name` is the
+/// caller-supplied name (custom `/name` value, or the previous channel name
+/// on rename).
+///
+/// Intended call sites (no room-lifecycle runtime exists yet; V1 owns it):
+/// create renders once after the room number is allocated, rename re-renders
+/// on join/leave, activity, limit or privacy changes (spec V5).
+///
+/// Template errors never propagate: a blank or oversized template falls back
+/// to `raw_name` without touching the engine, and an empty render falls back
+/// through [`RoomContext::fallback_name`] (wired to `raw_name` here).
+/// Output is never empty and never over [`MAX_NAME_LEN`] characters.
+#[must_use]
+pub fn resolve_room_name(template: &str, ctx: &RoomContext, raw_name: &str) -> String {
+    let fallback = finalize_raw(raw_name);
+    if template.trim().is_empty() || template.len() > MAX_TEMPLATE_BYTES {
+        return fallback;
+    }
+    let mut ctx = ctx.clone();
+    ctx.fallback_name = fallback;
+    render_str(template, &ctx)
+}
+
+/// Trim → truncate → built-in default, mirroring the engine's pipeline tail.
+fn finalize_raw(raw_name: &str) -> String {
+    let mut out = truncate_chars(raw_name.trim(), MAX_NAME_LEN);
+    out = out.trim_end().to_string();
+    if out.is_empty() {
+        DEFAULT_FALLBACK_NAME.to_string()
+    } else {
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2496,5 +2541,71 @@ mod tests {
             }
             assert_eq!(render_str(&input, &ctx()), expected, "input {input:?}");
         }
+    }
+
+    // -- create/rename wiring (V5b) ------------------------------------------
+
+    #[test]
+    fn wiring_create_renders_template() {
+        let c = ctx();
+        assert_eq!(resolve_room_name("@@owner@@ ##", &c, "Hangout"), "Ava #3");
+        let name = resolve_room_name(DEFAULT_NAME_TEMPLATE, &c, "Hangout");
+        assert!(name.contains("Ava's "), "unexpected {name:?}");
+    }
+
+    #[test]
+    fn wiring_rename_rerenders_and_random_stays_stable() {
+        let template = "@@random_emoji@@ @@num@@ <<person/people>>";
+        let mut c = ctx();
+        c.member_count = 1;
+        let solo = resolve_room_name(template, &c, "old");
+        assert!(solo.ends_with("1 person"), "unexpected {solo:?}");
+        c.member_count = 4;
+        let busy = resolve_room_name(template, &c, "old");
+        assert!(busy.ends_with("4 people"), "unexpected {busy:?}");
+        // Same seed: the emoji pick never re-rolls across renames.
+        assert_eq!(
+            solo.split(' ').next(),
+            busy.split(' ').next(),
+            "random pick re-rolled"
+        );
+    }
+
+    #[test]
+    fn wiring_blank_or_oversized_template_falls_back_raw() {
+        let c = ctx();
+        assert_eq!(resolve_room_name("", &c, "  Hangout  "), "Hangout");
+        assert_eq!(resolve_room_name("   ", &c, "Hangout"), "Hangout");
+        let big = "x".repeat(MAX_TEMPLATE_BYTES + 1);
+        assert_eq!(resolve_room_name(&big, &c, "Hangout"), "Hangout");
+        // At exactly the limit the engine still runs.
+        let edge = format!(
+            "@@owner@@{}",
+            "x".repeat(MAX_TEMPLATE_BYTES - "@@owner@@".len())
+        );
+        let out = resolve_room_name(&edge, &c, "Hangout");
+        assert!(out.starts_with("Ava"), "unexpected {out:?}");
+        assert_eq!(out.chars().count(), MAX_NAME_LEN);
+    }
+
+    #[test]
+    fn wiring_empty_render_falls_back_raw_then_builtin() {
+        let c = ctx();
+        // Unknown token renders empty; the live raw name wins over the
+        // context fallback ("Lounge").
+        assert_eq!(resolve_room_name("@@bogus@@", &c, "Custom"), "Custom");
+        // Blank raw degrades to the built-in default, never empty.
+        assert_eq!(resolve_room_name("@@bogus@@", &c, "   "), "Voice Room");
+        assert_eq!(resolve_room_name("", &c, ""), "Voice Room");
+    }
+
+    #[test]
+    fn wiring_raw_fallback_is_trimmed_and_truncated() {
+        let c = ctx();
+        assert_eq!(resolve_room_name("", &c, "  Hangout  "), "Hangout");
+        let long = "🎮".repeat(500);
+        let out = resolve_room_name("@@bogus@@", &c, &long);
+        assert_eq!(out.chars().count(), MAX_NAME_LEN);
+        assert!(out.is_char_boundary(out.len()));
     }
 }
