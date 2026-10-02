@@ -80,8 +80,8 @@ these tests:
    - In Rust, the BOM-only message repeats and the NEL-only message never counts.
 
 The legacy results were reproduced with node against the pinned `matcher.ts`.
-The Rust side comes from reading `crates/core/src/automod.rs` and has not yet
-been executed. TOG-12560 decides whether to fix each difference or record it in
+The Rust side is executed by CI: `cargo test --workspace --test '*'` runs this
+file. TOG-12560 decides whether to fix each difference or record it in
 §8.
 
 ## Run
