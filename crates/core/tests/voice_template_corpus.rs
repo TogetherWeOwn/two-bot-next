@@ -205,17 +205,16 @@ struct StabilityGroup {
 }
 
 /// Adapt the implementation-independent snapshot to the engine's context,
-/// following V5 and V7: owner name prefers `/nick`, live means Discord or
-/// external, the game is the alias-resolved majority, and parties are
-/// deduplicated by ID in first-seen order.
+/// following V5 and V7: owner name prefers `/nick`, the game is the
+/// alias-resolved majority, and parties are deduplicated by ID in first-seen
+/// order.
 fn room_context(context: &CorpusContext) -> RoomContext {
     let owner = context.members.iter().find(|m| m.id == context.owner_id);
-    let live = |m: &Member| m.live_discord || m.live_external;
     let mut parties: Vec<(&str, PartyInfo)> = Vec::new();
     for party in context.members.iter().filter_map(|m| m.party.as_ref()) {
         if !parties.iter().any(|(id, _)| *id == party.id) {
             parties.push((
-                &party.id,
+                party.id.as_str(),
                 PartyInfo {
                     size: party.size,
                     max: party.maximum,
@@ -245,7 +244,7 @@ fn room_context(context: &CorpusContext) -> RoomContext {
         original_creator_name: context.original_creator_name.clone(),
         member_count: context.members.len() as u32,
         owner_present: owner.is_some(),
-        live_count: context.members.iter().filter(|m| live(m)).count() as u32,
+        live_count: context.members.iter().filter(|m| is_live(m)).count() as u32,
         user_limit: context.limit,
         game_name: resolve_majority_game(
             &activities,
@@ -253,7 +252,7 @@ fn room_context(context: &CorpusContext) -> RoomContext {
             &game_options,
         ),
         stream_title: owner
-            .filter(|m| live(m))
+            .filter(|m| is_live(m))
             .and_then(|m| m.stream_title.clone())
             .unwrap_or_default(),
         members_playing: context.members.iter().filter(|m| m.game.is_some()).count() as u32,
@@ -266,11 +265,16 @@ fn room_context(context: &CorpusContext) -> RoomContext {
     }
 }
 
+/// V5: `@@num_live@@` counts members streaming in Discord or externally.
+fn is_live(member: &Member) -> bool {
+    member.live_discord || member.live_external
+}
+
 /// The corpus clock is already guild-local civil time. Pick the first day of
 /// that month in 2026 with that weekday, at that hour, as a UTC timestamp.
 fn civil_timestamp(clock: &Clock) -> i64 {
     assert_eq!(clock.timezone, "UTC", "corpus clocks are UTC");
-    let month = (1..=12)
+    let month = (1..=12u8)
         .map(|m| Month::try_from(m).expect("month"))
         .find(|m| m.to_string() == clock.month)
         .unwrap_or_else(|| panic!("unknown month {}", clock.month));
@@ -320,10 +324,11 @@ fn invariant_failure(case: &Case, contexts: &BTreeMap<String, RoomContext>) -> O
     if *stable_for_same_context && render_case(case, contexts) != output {
         failures.push("repeat render differs".to_string());
     }
-    if let Some(allowed) = allowed_outputs {
-        if !allowed.contains(&output) {
-            failures.push(format!("not one of {allowed:?}"));
-        }
+    if let Some(allowed) = allowed_outputs
+        .as_ref()
+        .filter(|allowed| !allowed.contains(&output))
+    {
+        failures.push(format!("not one of {allowed:?}"));
     }
     if let Some(target) = casefold_equals {
         // Lowercasing equals Unicode case folding for ASCII targets only.
