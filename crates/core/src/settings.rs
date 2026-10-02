@@ -110,7 +110,10 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_INTERNAL_ALLOW_EVENT_READ", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_MODERATION", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_SETTINGS", SettingClass::EnvOnly),
+    // Combined `IP:port` socket; the split HOST/PORT pair below is legacy.
+    ("TWO_INTERNAL_BIND", SettingClass::EnvOnly),
     ("TWO_INTERNAL_BIND_HOST", SettingClass::EnvOnly),
+    ("TWO_INTERNAL_CALLERS", SettingClass::EnvOnly),
     ("TWO_INTERNAL_CHANNEL_KEYS", SettingClass::EnvOnly),
     ("TWO_INTERNAL_PORT", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ROLE_KEYS", SettingClass::EnvOnly),
@@ -782,7 +785,9 @@ mod tests {
         "TWO_INTERNAL_ALLOW_EVENT_READ",
         "TWO_INTERNAL_ALLOW_MODERATION",
         "TWO_INTERNAL_ALLOW_SETTINGS",
+        "TWO_INTERNAL_BIND",
         "TWO_INTERNAL_BIND_HOST",
+        "TWO_INTERNAL_CALLERS",
         "TWO_INTERNAL_CHANNEL_KEYS",
         "TWO_INTERNAL_PORT",
         "TWO_INTERNAL_ROLE_KEYS",
@@ -816,7 +821,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 117, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 119, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,

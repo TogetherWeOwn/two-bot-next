@@ -38,12 +38,12 @@ voice slice.
 
 ## Residual parent work
 
-Conditionals stay on [TOG-10097](/TOG/issues/TOG-10097); they need the V5
-evaluator ([TOG-10095](/TOG/issues/TOG-10095), in review). The runtime wiring
-stays on the parent card, behind its V1 edge: seeding per room, parsing the
-`""mode:text""` chain, nesting inside conditionals, enforcing the 100-character
-output bound, and authenticating template admin permissions. No runtime, Discord,
-or staging behaviour is performed or verified by this component's tests.
+[voice-template-core](voice-template-core.md) composes this library with the
+V6 conditions into the naming engine: per-room `rand` seeding, chain parsing,
+nesting inside conditionals and the 100-character bound. Runtime wiring and
+template admin permissions stay with the runtime that renames rooms. No
+runtime, Discord, or staging behaviour is performed or verified by this
+component's tests.
 
 ## Hermetic verification
 

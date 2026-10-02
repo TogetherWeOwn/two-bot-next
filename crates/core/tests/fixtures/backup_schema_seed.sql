@@ -226,6 +226,11 @@ VALUES (71, '100000000000000001', '2026-07-27T00:00:00.000Z', '2026-08-03T00:00:
         'maintain', '2026-08-03T00:00:01.000Z');
 INSERT INTO community_scorecard_alerts (guild_id, week_start, alert_key, created_at)
 VALUES ('100000000000000001', '2026-07-27T00:00:00.000Z', 'backup:alert:dedupe', '2026-08-03T00:00:02.000Z');
+-- Preserve both a spent-but-pending retry budget and terminal completion.
+INSERT INTO community_scorecard_attempts
+    (guild_id, week_key, attempts, next_attempt_at, completed)
+VALUES ('100000000000000001', '2026-08-10', 2, 1786343100000, FALSE),
+       ('100000000000000001', '2026-08-03', 1, 1785738000000, TRUE);
 INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at)
 VALUES ('100000000000000001', 2, 'backup-resume-session', 9007199254740993,
         'wss://gateway.example.invalid', '2026-08-01T10:00:00.123456Z');
@@ -305,6 +310,23 @@ INSERT INTO self_role_panel_claims
 VALUES ('100000000000000001', '100000000000000002', 'backup:panel', 'backup-self-role-claim',
         23, '2026-08-01T10:01:00.123456Z', 'backup:self-role:event', 'backup-option',
         'backup-event-order', TRUE);
+-- Send receipts and uncertainty baselines hang off the seeded audit event, so
+-- the complete-schema coverage test archives and restores them too.
+INSERT INTO self_role_exchanges
+    (exchange_id, event_id, origin_generation, role_id, adding, compensating,
+     disposition, created_at)
+VALUES ('backup:self-role:exchange', 'backup:self-role:event', 23,
+        '100000000000000010', TRUE, FALSE, 'pending', '2026-08-01T10:00:30.000Z');
+INSERT INTO self_role_exchange_baselines
+    (event_id, legacy_pending, unresolved_added_role_ids, unresolved_removed_role_ids)
+VALUES ('backup:self-role:event', FALSE, '[]', '[]');
+-- Main's newer durable delivery table rides the same complete-schema coverage:
+-- a delivery arbitration claim. gateway_boot_directives is already seeded by
+-- main's own consumed+armed rows above; a second (guild, shard 0) row would
+-- collide on the primary key.
+INSERT INTO automod_delivery_claims
+    (guild_id, message_id, delivery_kind, dry_run, request_hash)
+VALUES ('100000000000000001', 'backup:message', 'create', FALSE, 'backup-request');
 
 -- Operator erasure receipts carry no subject; accountability survives restore.
 INSERT INTO member_erasure_audit (actor, erased_at)
