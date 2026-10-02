@@ -29,6 +29,7 @@ mod jobs;
 mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
+mod schedule_runtime;
 mod server;
 // TOG-10292: boot composes the gated service below; fixture-only seams keep
 // the module-level allowance.
