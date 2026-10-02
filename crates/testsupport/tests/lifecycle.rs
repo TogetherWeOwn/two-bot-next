@@ -165,7 +165,8 @@ async fn databases_are_migrated_isolated_and_removed_even_after_setup_failure() 
     // A fresh fixture sees both old databases disappear. Its migration also
     // proves that teardown did not modify/drop the shared bootstrap database.
     let witness = TestDatabase::create(&url, &migrations).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    // Allow the 10s admin acquisition plus the bounded 30s checkpoint teardown.
+    tokio::time::timeout(Duration::from_secs(40), async {
         loop {
             let exists: bool =
                 sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")

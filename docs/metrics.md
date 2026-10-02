@@ -2,11 +2,12 @@
 
 The Rust process exposes `GET /metrics` on its existing `LISTEN_ADDR` listener.
 This is **internal-only**, unauthenticated operational data: scrape only from the
-container/private network. Do not expose the container port publicly, add a Worker
-proxy route, or route this through a public ingress. Both the Worker entrypoint
+container/private network. Do not expose the container port publicly or route it through a
+public ingress; the only off-container path is the authenticated
+`/ops/metrics` route below. Both the Worker entrypoint
 and the Container DO refuse `/metrics`; the Worker also reserves `/metrics`,
 `/metrics/*` and canonical case/encoding/slash aliases before
-invite-campaign lookup. No Prometheus server is added by this change.
+invite-campaign lookup. No Prometheus server exists; see the off-container path below.
 
 Format: Prometheus text 0.0.4, `text/plain; version=0.0.4; charset=utf-8`, `no-store`.
 Counters reset when the process restarts; timestamps use Unix seconds. Missing
@@ -173,3 +174,42 @@ controller's bounded cache pool was missing at implementation time.
   <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Latency.html#method.recent>
 - Axum router composition follows the existing router/state pattern (0.8.9 in
   `Cargo.lock`); no middleware or additional dependency is introduced.
+
+## Off-container scrape and alert rules
+
+Chosen path: the Container Durable Object (the only caller that can reach the
+container-internal listener) pulls `/metrics` via `containerFetch` on every
+keepalive tick, evaluates the checked-in rules and posts transitions to the
+optional `OPS_ALERT_WEBHOOK_URL` Discord-compatible webhook. No Prometheus
+server, no new infrastructure.
+
+- Authenticated pull: `GET /ops/metrics` on the Worker with
+  `Authorization: Bearer <METRICS_SCRAPE_TOKEN>`. The token is an optional
+  Worker secret (never a plain var). Unset → `404`; missing or wrong bearer →
+  `401` (compared via SHA-256 digests); non-GET → `404`. Unauthenticated
+  requests never reach the container. `/metrics` itself stays `404`.
+- Rules live in `wrangler/src/alert-rules.ts`; each links to a
+  [runbook](runbook.md#metrics-alerts) section (a test enforces the anchors):
+
+| Rule | Fires when | Runbook |
+| --- | --- | --- |
+| `job_stale:<job>` | last success older than 2 x the job cadence (never-succeeded is ignored) | [job stale](runbook.md#alert-job-stale) |
+| `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
+| `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
+| `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
+
+Packet identity (TOG-12100): rule ids above are the single shared spelling
+used on both sides of the B2 soak evidence seam. The Rust canonical list is
+`ALERT_RULE_IDS` in `crates/core/src/evidence.rs`; the Worker mirrors it in
+`packetFilename` (`wrangler/src/alert-rules.ts`). Every evidence/alert packet
+is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
+`soak_expected_committed` ledger identity), so the QA evidence table can
+attribute packets when several rules fire in one window. Both sides pin all
+four spellings with tests; the payload shape is unchanged.
+
+Known gaps: there is no DB error counter (the pool rule is a proxy) and no
+send-admission series, so neither is alerted. Add the series first, then a rule.
+A forced job failure on staging (three failures) raises
+`job_consecutive_failures:<job>` within about one keepalive tick. Counter resets
+(process restart) skip the 429 window. Alert state is persisted in DO storage
+before notifying, so delivery is at most once per transition.
