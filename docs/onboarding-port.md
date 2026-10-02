@@ -24,9 +24,10 @@ welcomes and session picker acknowledgements/routing records remain active.
 This matches frozen `sessionWelcome.ts` (dry run logs but does not return before
 its welcome send). Session mode also suppresses leveling reward-role writes.
 
-Session submissions with unknown keys route nowhere and offer a retry, matching
-the frozen spec. Legacy main after the freeze changed partially-stale session
-handling; this port does not silently change the frozen baseline.
+Wholly unknown or empty session submissions route nowhere and offer a retry.
+Mixed submissions keep their valid picks alongside stale keys and record the
+routed destinations with a partial-retry note, per merged correction #128
+(ported from legacy baseline `bffccf3`).
 
 The anchor welcome computes the next/live Sunday 20:00 America/New_York
 occurrence from the provided clock, including US DST boundaries. The date

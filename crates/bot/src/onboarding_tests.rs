@@ -615,8 +615,8 @@ async fn onboarding_runtime_roleless_session_reselection_stale_menu_and_goodbye_
             .unwrap();
         assert_eq!(
             db.count(EVENT_CHANNEL_ROUTED).await,
-            2,
-            "unknown selection routes nowhere"
+            3,
+            "valid picks route alongside stale keys; wholly unknown selections route nowhere"
         );
         let sources: Vec<String> = sqlx::query_scalar("SELECT source FROM events")
             .fetch_all(&db.pool)
@@ -736,7 +736,11 @@ async fn onboarding_runtime_session_reads_only_selected_destinations() {
             )
             .await
             .unwrap();
-        assert_eq!(db.count(EVENT_CHANNEL_ROUTED).await, 1);
+        assert_eq!(
+            db.count(EVENT_CHANNEL_ROUTED).await,
+            2,
+            "valid picks route alongside stale keys; wholly unknown selections route nowhere"
+        );
         let reply: Value = serde_json::from_slice(&replies(&mock)[2].body).unwrap();
         assert!(reply["content"].as_str().unwrap().contains("gone or stale"));
         assert_eq!(db.count(EVENT_GAME_ROLES_SELECTED).await, 0);
