@@ -104,6 +104,7 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     gateway: server::SharedState,
     shutdown: watch::Sender<bool>,
+    automod: crate::automod_gateway::Slot,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
@@ -158,13 +159,20 @@ pub async fn serve(
                 let registration = community_jobs::register(context);
                 registered.extend(registration.jobs);
                 parked = registration.parked;
+                // Repeat-history expiry rides the shared supervisor.
+                if crate::automod_gateway::enabled() {
+                    registered.push(crate::automod_gateway::expiry_job(automod));
+                }
             }
             Err(_) => tracing::warn!("website jobs parked: invalid REST configuration"),
         }
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
+    let mut names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
+    if crate::automod_gateway::enabled() {
+        names.push(crate::automod_gateway::JOB_NAME);
+    }
     // All six names park together when nothing registered; otherwise only the
     // env-gated community names are parked and the rest report live status.
     let status = jobs::statuses(&names, registered.is_empty());

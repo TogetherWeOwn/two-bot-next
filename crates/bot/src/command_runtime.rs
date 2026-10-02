@@ -244,6 +244,12 @@ impl CommandRuntime {
         *self.registry_synced.lock().await = true;
     }
 
+    /// The shared REST executor, for runtimes (automod) that must use it
+    /// rather than build a private client.
+    pub(crate) fn executor(&self) -> ActionExecutor {
+        self.executor.clone()
+    }
+
     pub(crate) fn start_tickets(&self) -> Option<crate::ticket_runtime::TicketSupervisor> {
         self.tickets.as_ref().and_then(|tickets| tickets.start())
     }

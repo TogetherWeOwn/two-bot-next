@@ -216,6 +216,9 @@ enum ReceivedWork {
     Clear(std::time::Duration),
     Dispatch {
         dispatch: Option<Box<ReceivedDispatch>>,
+        /// A MESSAGE_UPDATE decoded from its raw dispatch before Twilight's
+        /// parse, with its receipt stamp. Only set while automod is active.
+        edit: Option<(two_bot_core::automod_runtime::MessageDelivery, String)>,
         checkpoint: GatewaySession,
         deadline: std::time::Duration,
         generation: u64,
@@ -239,6 +242,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     state: Arc<RwLock<GatewayState>>,
     store: GatewaySessionStore,
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
+    automod: Option<Arc<crate::automod_gateway::ProductionAutomod>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
     let generation = Arc::new(AtomicU64::new(0));
@@ -246,6 +250,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // Tickets run beside reception and are cancelled/joined before return.
     let tickets = runtime.as_ref().and_then(|runtime| runtime.start_tickets());
     let receive_generation = Arc::clone(&generation);
+    let automod_enabled = automod.is_some();
+    // The worker dispatches text automations itself once automod has decided.
+    let command_runtime = runtime.clone();
     let receive_state = Arc::clone(&state);
     let events = futures_util::stream::unfold(
         (
@@ -300,16 +307,32 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
                         if dispatch_action(received.as_ref(), &checkpoint.session_id, sequence) == DispatchAction::Duplicate { continue; }
-                        let parsed = twilight_gateway::parse(text, EventTypeFlags::all()).map_err(|_| sqlx::Error::InvalidArgument("gateway dispatch parse failed".into()))?;
+                        // A partial MESSAGE_UPDATE omits fields a full Twilight
+                        // Message needs: decode its raw IDs before parsing.
+                        let edit = if automod_enabled {
+                            crate::automod_gateway::partial_edit(&text, crate::automod_gateway::receipt_ms(&observed_at))
+                                .map(|delivery| (delivery, observed_at.clone()))
+                        } else {
+                            None
+                        };
+                        let parsed = match twilight_gateway::parse(text, EventTypeFlags::all()) {
+                            Ok(parsed) => parsed,
+                            Err(_) if edit.is_some() => None,
+                            Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
+                        };
                         received = Some(checkpoint.clone());
                         let dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at }));
                         // Detached command ingress must not wait behind the
                         // serial funnel writer's REST/SQL latency. Main's
                         // command claims remain independent of this checkpoint.
+                        // With automod active a create waits in the worker for its
+                        // disposition: rejected creates never reach automations.
                         if let (Some(runtime), Some(dispatch)) = (runtime.as_ref(), dispatch.as_ref()) {
-                            runtime.dispatch(&dispatch.event);
+                            if !(automod_enabled && matches!(dispatch.event, Event::MessageCreate(_))) {
+                                runtime.dispatch(&dispatch.event);
+                            }
                         }
-                        return Ok(Some(ReceivedWork::Dispatch { dispatch, checkpoint, deadline, generation: generation.load(std::sync::atomic::Ordering::Acquire) }));
+                        return Ok(Some(ReceivedWork::Dispatch { dispatch, edit, checkpoint, deadline, generation: generation.load(std::sync::atomic::Ordering::Acquire) }));
                     }
                     Ok(None)
                 }.await;
@@ -342,15 +365,49 @@ pub async fn run_shard<I: InviteSource + 'static>(
             ReceivedWork::Failed => panic!("gateway receive failed; checkpoint unchanged"),
             ReceivedWork::Dispatch {
                 dispatch,
+                edit,
                 checkpoint,
                 deadline,
                 generation: observed_generation,
             } => {
                 let timer = crate::gateway_metrics::DispatchTimer::start();
                 let mut connected = false;
+                // Automod decides first, in gateway order, once per delivery.
+                let disposition = automod.as_ref().and_then(|automod| {
+                    let (delivery, at) = match (edit, dispatch.as_deref()) {
+                        (Some(edit), _) => edit,
+                        (None, Some(dispatch)) => (
+                            two_bot_discord::automod::event_to_automod(
+                                &dispatch.event,
+                                crate::automod_gateway::receipt_ms(&dispatch.observed_at),
+                            )?,
+                            dispatch.observed_at.clone(),
+                        ),
+                        (None, None) => return None,
+                    };
+                    Some(handle.block_on(crate::automod_gateway::process(automod, delivery, &at)))
+                });
                 if let Some(dispatch) = dispatch {
                     connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed);
-                    pipeline.handle_at(&dispatch.event, &dispatch.observed_at);
+                    // Exactly one funnel call per dispatch.
+                    match disposition {
+                        Some(disposition) => pipeline.handle_at_with_message_disposition(
+                            &dispatch.event,
+                            &dispatch.observed_at,
+                            disposition,
+                        ),
+                        None => pipeline.handle_at(&dispatch.event, &dispatch.observed_at),
+                    }
+                    if automod_enabled
+                        && matches!(dispatch.event, Event::MessageCreate(_))
+                        && crate::automod_gateway::runs_text_automations(disposition)
+                    {
+                        if let Some(runtime) = command_runtime.as_ref() {
+                            // Detached spawn from the blocking worker needs the runtime.
+                            let _guard = handle.enter();
+                            runtime.dispatch(&dispatch.event);
+                        }
+                    }
                 }
                 handle
                     .block_on(checkpoint_io(
