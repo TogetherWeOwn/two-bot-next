@@ -273,6 +273,8 @@ VALUES (1, '2026-08-01T10:00:00Z', '100000000000000002');
 
 INSERT INTO internal_nonces (nonce_hash, burned_at, expires_at)
 VALUES (repeat('a', 64), '2026-08-01T10:00:00Z', '2026-08-01T10:04:01Z');
+INSERT INTO internal_clock_high_water (domain, high_water_ms, observed_at)
+VALUES ('internal_nonce_db', 1785578400000, '2026-08-01T10:00:00Z');
 INSERT INTO internal_idempotency
     (intent_id, caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id,
      target_id, created_at, updated_at, response_code, http_status, resource_id, affected)

@@ -4,6 +4,9 @@
 
 ### Added
 
+- Pure `scan_joins_for_bursts` raid replay over recorded joins (fresh watch per
+  call, instant-ordered, strict RFC 3339) with the legacy historical-raid
+  scenarios as integration tests. No runtime or database wiring. (TOG-12378)
 - Wire leveling through the shared command runtime, interaction router and REST executor with ordered, awaited gateway awards. Preserve message eligibility, measured voice duration, session/dry-run reward suppression, ephemeral rank and mention-suppressed public top 10. Ordinary level-ups only grant roles; explicit revokes require a pinned staging fence and whole-set permission/hierarchy preflight. Mock REST and migrated disposable database proofs run in CI, including a shared-runtime single-callback regression.
 - Automod gateway decision/enrichment seams and capture-only funnel handoff,
   staging/live-approval and dry-run fences, protected-target enforcement plans,
