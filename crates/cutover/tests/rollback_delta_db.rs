@@ -191,6 +191,7 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
             "level_role_rewards",
             "rank_ladder",
             "lfg_roles",
+            "moderation_channel_executions",
             "web_contract_meta",
         ] {
             let entry = summary.tables.iter().find(|t| t.table == table).unwrap_or_else(|| {

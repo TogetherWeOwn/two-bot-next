@@ -35,7 +35,8 @@ failure, or an export-cap refusal. Database errors and URLs are not printed.
 Each table reports `{table, status, columns?, count?, reason?}`. `status` is
 `measured` (exact post-`T_f` row count), `unmeasurable` (no usable timestamp
 column, with a reason: `guild_settings_revision`, `level_role_rewards`,
-`lfg_roles`, `rank_ladder`, `web_contract_meta`), or `missing` (table absent
+`lfg_roles`, `moderation_channel_executions`, `rank_ladder`,
+`web_contract_meta`), or `missing` (table absent
 from this database, e.g. a partially migrated one). Every classified table
 appears exactly once: the unit test fails on any unclassified
 `sql/database_role_matrix.sql` / backup-allowlist table, and on any spec

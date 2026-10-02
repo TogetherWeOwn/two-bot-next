@@ -60,6 +60,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },
     TableSpec { table: "automation_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "automation_commands", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Flag flips (matched/mutation_started/counted/released) happen inside the
+    // claim's lifetime, so a delta claim shows up via claimed_at/completed_at.
+    TableSpec { table: "automod_delivery_claims", measure: TableMeasure::Columns(&["claimed_at", "completed_at"]) },
     TableSpec { table: "automod_processed_messages", measure: TableMeasure::Columns(&["processed_at"]) },
     TableSpec { table: "automod_violations", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "community_facts", measure: TableMeasure::Columns(&["recorded_at"]) },
@@ -74,6 +77,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "gateway_boot_directives", measure: TableMeasure::Columns(&["armed_at", "consumed_at"]) },
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
     // Collector read-times ride the same row write, so their maximum is the
     // row's last write.
@@ -110,6 +114,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         ),
     },
     TableSpec { table: "lfg_signups", measure: TableMeasure::Columns(&["joined_at"]) },
+    TableSpec { table: "member_erasure_audit", measure: TableMeasure::Columns(&["erased_at"]) },
     TableSpec { table: "member_exclusions", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_levels", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_ranks", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -128,6 +133,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         ]),
     },
     TableSpec { table: "moderation_audit", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec {
+        table: "moderation_channel_executions",
+        measure: TableMeasure::Unmeasurable(
+            "no timestamp column; the execution fence row is written with its parent moderation_idempotency claim (measured via claimed_at)",
+        ),
+    },
     TableSpec { table: "moderation_idempotency", measure: TableMeasure::Columns(&["claimed_at"]) },
     TableSpec { table: "moderation_lockdowns", measure: TableMeasure::Columns(&["locked_at"]) },
     TableSpec { table: "moderation_scheduled_unbans", measure: TableMeasure::Columns(&["created_at"]) },
