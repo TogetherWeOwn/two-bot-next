@@ -1154,7 +1154,7 @@ async fn onboarding_capture_requires_real_pending_transition_and_preserves_leave
     let executor =
         ActionExecutor::with_proxy("mock-token".into(), Some("http://127.0.0.1:1".into())).unwrap();
     let runtime = OnboardingRuntime::new(pool, executor, &vars("session", false), 22, 999).unwrap();
-    let pipeline = build_pipeline(vec![]);
+    let pipeline = build_pipeline(vec![], None);
     let add = || {
         Event::MemberAdd(Box::new(serde_json::from_value(json!({
         "guild_id":"22","user":{"id":"44","username":"member","discriminator":"0"},
@@ -1174,9 +1174,17 @@ async fn onboarding_capture_requires_real_pending_transition_and_preserves_leave
         runtime.capture(&update(), &pipeline).is_none(),
         "missing cache is not proof of a true->false transition"
     );
-    pipeline.handle(&add());
+    let _ = pipeline.collect_at(
+        &add(),
+        &two_bot_core::now_iso(),
+        two_bot_discord::MessageEligibility::default(),
+    );
     let captured = runtime.capture(&update(), &pipeline).unwrap();
-    pipeline.handle(&update());
+    let _ = pipeline.collect_at(
+        &update(),
+        &two_bot_core::now_iso(),
+        two_bot_discord::MessageEligibility::default(),
+    );
     assert!(matches!(
         captured,
         OnboardingJob::Welcome {
@@ -1195,7 +1203,11 @@ async fn onboarding_capture_requires_real_pending_transition_and_preserves_leave
         .unwrap(),
     );
     let captured = runtime.capture(&remove, &pipeline).unwrap();
-    pipeline.handle(&remove);
+    let _ = pipeline.collect_at(
+        &remove,
+        &two_bot_core::now_iso(),
+        two_bot_discord::MessageEligibility::default(),
+    );
     assert!(matches!(
         captured,
         OnboardingJob::Goodbye {

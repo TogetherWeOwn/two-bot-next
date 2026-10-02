@@ -5,6 +5,8 @@
 //! REST executor. Rejected creates go to raw capture only; edits never award XP
 //! or advance the funnel. A failed/uncertain inspection must not be accepted.
 
+use std::future::Future;
+
 use crate::automod::{
     match_automod_with_clock, sanction_for, AutomodConfig, AutomodFilter, AutomodMessage,
     AutomodSanction, RepeatObservation, RepeatTracker, SanctionAction,
@@ -197,6 +199,14 @@ impl AutomodRuntime {
     #[must_use]
     pub fn dry_run(&self) -> bool {
         self.config.dry_run
+    }
+
+    /// Activation fence applied BEFORE any claim, fetch or inspection: a
+    /// guild delivery inside the approved scope with automod enabled. DMs,
+    /// other guilds and a disabled config take the ordinary funnel path.
+    #[must_use]
+    pub fn admits(&self, guild_id: Option<&str>) -> bool {
+        self.config.enabled && guild_id.is_some_and(|guild_id| self.scope.permits(guild_id))
     }
 
     /// The shared maintenance tick can expire idle authors without receiving
@@ -418,4 +428,79 @@ pub struct EnforcementPlan {
     pub violation_count: Option<u64>,
     pub outcome: PlanOutcome,
     pub effects: Vec<AutomodEffect>,
+}
+
+/// Execution receipt, not a plan: `deleted` is true only after confirmed REST
+/// success. Completion has no arbitrary metadata field to smuggle message text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredOutcome {
+    pub matched: bool,
+    pub deleted: bool,
+    pub outcome: CompletionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionKind {
+    Accepted,
+    AlreadyProcessed,
+    DryRun,
+    Protected,
+    Deleted,
+    Warned,
+    TimedOut,
+    SanctionRefused,
+}
+
+/// Store-agnostic arbitration outcome, mirroring the durable store's claim
+/// result so the shared activation orchestrator (TOG-10261) runs against
+/// `AutomodStore` in production and an in-memory ledger in fast tests.
+#[derive(Debug)]
+pub enum LedgerClaim<C> {
+    Acquired(C),
+    InFlight,
+    Replayed(StoredOutcome),
+    /// Released pre-count claim with its preserved decision: replay these
+    /// IDs/reason code without re-running the mutable repeat tracker.
+    Preserved(C, AutomodMatch),
+}
+
+/// Claim-ledger seam for the shared activation orchestrator. One method per
+/// durable store operation it needs. Implementations must honour the store
+/// contract: claims fence stale completions, counting is insert-first
+/// idempotent per message, only an active unmutated enforce claim can carry a
+/// preserved decision, and nothing releases a started or counted claim.
+pub trait AutomodClaimLedger: Send + Sync {
+    type Claim: Send + Sync;
+    type Error: std::fmt::Display + Send;
+
+    fn ledger_claim(
+        &self,
+        key: &DeliveryKey,
+    ) -> impl Future<Output = Result<LedgerClaim<Self::Claim>, Self::Error>> + Send;
+    fn ledger_preserve(
+        &self,
+        claim: &Self::Claim,
+        matched: &AutomodMatch,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+    fn ledger_mark_started(
+        &self,
+        claim: &Self::Claim,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+    fn ledger_complete(
+        &self,
+        claim: &Self::Claim,
+        outcome: &StoredOutcome,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+    fn ledger_release(
+        &self,
+        claim: &Self::Claim,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+    fn ledger_record(
+        &self,
+        claim: &Self::Claim,
+        subject: &MessageSubject,
+        filter: AutomodFilter,
+        at_iso: &str,
+    ) -> impl Future<Output = Result<ViolationRecord, Self::Error>> + Send;
 }

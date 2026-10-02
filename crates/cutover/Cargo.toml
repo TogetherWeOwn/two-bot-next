@@ -14,7 +14,7 @@ license.workspace = true
 # path): cargo-deny `wildcards = "deny"` rejects version-less deps.
 
 [dependencies]
-# `db` for the shared redacting `database_url::connect_options` parse helper.
+# `db` for shared durable admission and the redacting database URL helper.
 # sqlx is already a direct dependency, so no new driver burden.
 two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
 two-bot-discord = { version = "0.2.0", path = "../discord" }
@@ -36,6 +36,7 @@ url = { workspace = true }
 libc = "0.2.189"
 
 [dev-dependencies]
+rustls = { workspace = true }
 two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
 
 [[bin]]

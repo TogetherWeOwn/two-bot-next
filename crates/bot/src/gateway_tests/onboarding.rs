@@ -330,7 +330,7 @@ async fn spawn_onboarding_with_store(
             .build(),
     );
     // Both the runtime and cache are newly constructed, not reused at restart.
-    let pipeline = Arc::new(build_pipeline(store.milestones().await.unwrap()));
+    let pipeline = Arc::new(build_pipeline(store.milestones().await.unwrap(), None));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
     let task = tokio::spawn(run_shard(
         shard,

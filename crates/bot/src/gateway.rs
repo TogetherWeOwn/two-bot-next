@@ -2,7 +2,7 @@
 //!
 //! Owns the shard lifecycle state the /readyz gate reads and runs the
 //! twilight [`Shard`] event loop. Every gateway dispatch goes through the
-//! [`Pipeline`]: the cache updates inside `handle()`, so dispatch here is
+//! [`GatewayPipeline`]: the cache updates inside `handle()`, so dispatch here is
 //! one line plus the `Error` row (parity matrix §3: legacy `client_error`
 //! log → `tracing::warn!`).
 //!
@@ -28,10 +28,10 @@ use two_bot_core::gateway_session::{
     boot_action_with, dispatch_action, invalidates_session, BootAction, DispatchAction,
     GatewaySession,
 };
-use two_bot_core::{ComponentStatus, Config, InviteState, NoopFacts, NoopLeveling, Snowflake};
+use two_bot_core::{ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
 use two_bot_discord::{
-    gateway_intents, needs_message_content, InviteSource, NoClassification, Pipeline,
+    gateway_intents, needs_message_content, InviteSource, LevelingRuntime, OrderedLevelingPipeline,
 };
 
 /// Install the process-wide rustls crypto provider (ring) unless one is set.
@@ -113,14 +113,11 @@ pub fn intents_from_env() -> Intents {
     gateway_intents(message_content)
 }
 
-pub type GatewayPipeline<I = two_bot_discord::NoInvites> = Pipeline<
-    GatewayFunnelBuffer,
-    NoopLeveling,
-    NoopFacts,
-    I,
-    NoClassification,
-    GatewayFunnelBuffer,
->;
+/// Gateway pipeline: ordered leveling awards over the persistent funnel
+/// buffer. `I` serves invite counters (HTTP at runtime, none in tests); the
+/// funnel buffer doubles as the invite snapshot store, seeded at boot.
+pub type GatewayPipeline<I = two_bot_discord::NoInvites> =
+    OrderedLevelingPipeline<GatewayFunnelBuffer, I, GatewayFunnelBuffer>;
 
 pub async fn load_boot_session(
     store: &GatewaySessionStore,
@@ -261,7 +258,10 @@ enum ReceivedWork {
 ///
 /// The shared command runtime dispatches detached work at reception (after the
 /// replay guard), so slash acknowledgements do not queue behind slow funnel I/O.
-/// It never awaits REST/store work on the transport polling path. Shutdown ends
+/// It never awaits REST/store work on the transport polling path. Ordered
+/// XP/reward processing runs on the serial checkpoint writer: the funnel half
+/// stays synchronous under the checkpoint deadline, then deferred awards drain
+/// through the leveling runtime before the cursor commits. Shutdown ends
 /// reception cooperatively so the bounded writer remains supervised through drain.
 pub async fn run_shard<I: InviteSource + 'static>(
     shard: Shard,
@@ -431,7 +431,34 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     onboarding_job = writer_onboarding
                         .as_ref()
                         .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
-                    pipeline.handle_at(&dispatch.event, &dispatch.observed_at);
+                    // Funnel first (synchronous), then drain deferred XP
+                    // awards through the leveling runtime under the checkpoint
+                    // deadline before the cursor commits. Without a leveling
+                    // runtime the drain is a no-op and the requests stay inert.
+                    let requests = pipeline.collect_at(
+                        &dispatch.event,
+                        &dispatch.observed_at,
+                        two_bot_discord::MessageEligibility::default(),
+                    );
+                    if !requests.is_empty() {
+                        handle
+                            .block_on(checkpoint_io(&worker_state, &generation, deadline, async {
+                                pipeline.drain(requests).await.map(drop).map_err(|error| {
+                                    // Runtime Display is sanitized; never
+                                    // log its SQL/HTTP source.
+                                    tracing::warn!(
+                                        error = %error,
+                                        "gateway leveling dispatch failed"
+                                    );
+                                    sqlx::Error::InvalidArgument(
+                                        "leveling gateway dispatch failed".into(),
+                                    )
+                                })
+                            }))
+                            .unwrap_or_else(|_| {
+                                panic!("gateway leveling dispatch failed; checkpoint unchanged")
+                            });
+                    }
                 }
                 let durable_job = onboarding_job
                     .as_ref()
@@ -719,14 +746,15 @@ impl InviteSource for HttpInvites {
 
 #[cfg(test)]
 #[must_use]
-pub fn build_pipeline(milestones: Vec<two_bot_core::FunnelEvent>) -> GatewayPipeline {
+pub fn build_pipeline(
+    milestones: Vec<two_bot_core::FunnelEvent>,
+    runtime: Option<LevelingRuntime>,
+) -> GatewayPipeline {
     let buffer = GatewayFunnelBuffer::from_milestones(milestones);
-    Pipeline::with_snapshots(
+    OrderedLevelingPipeline::with_snapshots(
         buffer.clone(),
-        Some(NoopLeveling),
-        Some(NoopFacts),
+        runtime,
         two_bot_discord::NoInvites,
-        NoClassification,
         buffer,
     )
 }
@@ -735,19 +763,18 @@ pub async fn build_persistent_pipeline(
     store: &GatewaySessionStore,
     guild_id: Snowflake,
     token: String,
+    leveling: Option<LevelingRuntime>,
 ) -> Result<GatewayPipeline<HttpInvites>, sqlx::Error> {
     tokio::time::timeout(CHECKPOINT_IO_MAX, async {
         let buffer = GatewayFunnelBuffer::from_milestones(store.milestones().await?);
         buffer.seed_snapshots(guild_id, store.invite_snapshots().await?);
-        Ok(Pipeline::with_snapshots(
+        Ok(OrderedLevelingPipeline::with_snapshots(
             buffer.clone(),
-            Some(NoopLeveling),
-            Some(NoopFacts),
+            leveling,
             HttpInvites {
                 client: twilight_http::Client::new(token),
                 handle: tokio::runtime::Handle::current(),
             },
-            NoClassification,
             buffer,
         ))
     })

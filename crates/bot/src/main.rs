@@ -5,6 +5,9 @@
 //! `GUILD_ID` the shard stays parked and `/readyz` reports `gateway: down`
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
+#[cfg(test)]
+mod admission_test_support;
+mod audit_runtime;
 mod backup_cli;
 mod command_runtime;
 #[cfg(test)]
@@ -31,6 +34,9 @@ mod onboarding_tests;
 mod preflight;
 mod server;
 mod ticket_runtime;
+#[cfg(test)]
+#[path = "../../core/tests/support/tracing_capture.rs"]
+mod tracing_capture;
 mod website_jobs;
 
 use std::sync::Arc;
@@ -164,30 +170,42 @@ async fn main() {
                     0,
                 );
                 let saved = gateway::load_boot_session(&store).await?;
-                let pipeline =
-                    Arc::new(build_persistent_pipeline(&store, guild_id, token.clone()).await?);
-                // Onboarding identity probe must honor the mock REST seam
-                // (`DISCORD_API_BASE`), mirroring the command runtime: the
-                // alive acceptance serves `/users/@me` on loopback.
-                let proxy = std::env::var("DISCORD_API_BASE")
-                    .ok()
-                    .filter(|value| !value.is_empty());
-                let executor = two_bot_discord::ActionExecutor::with_proxy(token.clone(), proxy)
-                    .map_err(|_| {
-                        sqlx::Error::InvalidArgument(
-                            "Discord executor initialization failed".into(),
-                        )
-                    })?;
-                let onboarding = Arc::new(
-                    onboarding::OnboardingRuntime::from_env(pool.clone(), executor, guild_id)
-                        .await
-                        .map_err(|_| {
-                            sqlx::Error::InvalidArgument("onboarding initialization failed".into())
-                        })?,
-                );
+                let gates = two_bot_core::OnboardingGates::from_env()
+                    .map_err(|_| sqlx::Error::InvalidArgument("invalid onboarding mode".into()))?;
                 // ONE router + REST executor + sqlx stores over the feature pool.
                 // Bad command env gates still park only the command surface.
-                let runtime = command_runtime::CommandRuntime::from_env(pool, &token, guild_id);
+                // The ordered leveling path shares this runtime's
+                // executor/pacing for XP awards and role rewards.
+                let runtime = command_runtime::CommandRuntime::from_env(
+                    pool.clone(),
+                    &token,
+                    guild_id,
+                    gates,
+                );
+                // Onboarding renders through that same executor: one shared
+                // admission lane and pacing, never a private Discord client.
+                // Its identity probe honors the mock REST seam through the
+                // executor's `DISCORD_API_BASE` proxy. A parked command
+                // runtime (bad env gates) parks onboarding too.
+                let onboarding = match runtime.as_ref() {
+                    Some(runtime) => Some(Arc::new(
+                        onboarding::OnboardingRuntime::from_env(pool, runtime.executor(), guild_id)
+                            .await
+                            .map_err(|_| {
+                                sqlx::Error::InvalidArgument(
+                                    "onboarding initialization failed".into(),
+                                )
+                            })?,
+                    )),
+                    None => {
+                        tracing::warn!("command runtime parked; onboarding runtime disabled");
+                        None
+                    }
+                };
+                let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
+                let pipeline = Arc::new(
+                    build_persistent_pipeline(&store, guild_id, token.clone(), leveling).await?,
+                );
                 let shard = build_shard(
                     token,
                     intents_from_env(),
@@ -203,7 +221,7 @@ async fn main() {
                     pipeline,
                     Arc::clone(&state),
                     store,
-                    Some(onboarding),
+                    onboarding,
                     runtime,
                     async move {
                         server::shutdown_requested(stopping).await;
