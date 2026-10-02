@@ -1021,6 +1021,24 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
+### s12-15: Staging rollout gate receipt: intended Worker version at 100% traffic, `/readyz` 200 with compiled revision/build ID, allowlisted receipt fields, plus Neon `channel_binding` acceptance
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** Attach the staging rollout-gate receipt for the deployed soak build: require the intended Worker version at 100% traffic, `/readyz` 200 with the exact compiled revision/build ID and only allowlisted receipt fields, then a control-plane re-check; a 503 or a previous-instance response never passes.
+- **Expected:** The deployed soak build serves the intended Worker version at 100% traffic with `/readyz` 200 carrying the compiled revision/build ID; the receipt carries only allowlisted fields. The gate refuses stale-instance responses.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-9699](/TOG/issues/TOG-9699)
+
+### s12-16: Bootstrap migration accepts the `Security` release-notes section in `migrate-release-notes`
+
+- **Method:** `waived` (not an execution verdict).
+- **Action:** Run the `migrate-release-notes` bootstrap fixture with a hand-written `Security` section in Unreleased: confirm the migration preserves the Security tail, removes Unreleased, and stays idempotent; confirm any other section still fails closed.
+- **Expected:** `Security` migrates alongside Added/Fixed/Changed/Notes; unknown sections fail closed; later releases do not repeat the bootstrap tail.
+- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Owner:** [TOG-12801](/TOG/issues/TOG-12801)
+- **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+
 ## 13. Post-freeze ledger obligations (non-dropped rows)
 
 ### s13-f114c44: f114c44 — TOG-3052: temp-voice generator (join-to-create), staging only
