@@ -91,6 +91,7 @@ pub mod tickets;
 pub mod voice;
 pub mod voice_alias;
 pub mod voice_assistant_cap;
+pub mod voice_assistant_request;
 pub mod voice_config;
 pub mod voice_config_diff;
 pub mod voice_naming;
