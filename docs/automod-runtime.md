@@ -147,6 +147,39 @@ Shared integration must make the funnel's own writes idempotent for crash
 recovery and mode transitions; the synchronous S3 in-memory pipeline is not
 a durable production store.
 
+## Shared activation orchestrator (TOG-10261)
+
+`two_bot_discord::automod_activation::AutomodActivation` is the one call the
+shared async gateway makes per translated delivery, before the funnel:
+`process(delivery, at_iso)` returns the `FunnelDisposition` to hand once to
+`Pipeline::handle_with_message_disposition` plus a typed outcome. It owns no
+client, router, timer or task; every read and mutation goes through the shared
+`ActionExecutor`, and the runtime mutex is never held across an await.
+
+1. Outside the fence (`admits`) → `Bypassed`, ordinary funnel, no claim.
+2. A delivery without a snapshot (partial edit, role-less create) is enriched
+   from `GET /channels/{c}/messages/{m}` and the author's member roles. A failed
+   lookup is `Unavailable` (create → `CaptureOnly`, update → `None`), unclaimed.
+3. The claim comes before inspection. `InFlight`/`Replayed` → `Duplicate`
+   (`None`): nothing inspected, awarded or sent. `Preserved` replays the stored
+   decision straight into enforcement.
+4. Dry-run settles `DryRun` with no preservation, target fetch, count or call.
+5. Enforce preserves the match, resolves target facts (guild owner, Owen,
+   configured and dangerous-permission roles, hierarchy, bot permissions; any
+   unknown role fails closed), counts once, plans, commits the mutation fence,
+   then deletes. A `Rejected` delete settles `SanctionRefused` with no ladder
+   step; any other delete failure is retained (`UncertainDelete`). Warn is the
+   counted ledger row only (no Discord call). Timeout follows the confirmed
+   delete; an uncertain timeout is retained (`UncertainTimeout`).
+6. Only real typed receipts complete the claim. Retained claims are never
+   retried, leased or resent; they wait for recorded reconciliation.
+
+`RestAutomodFacts` is the production `AutomodFacts`; `AutomodStore` is the
+production `AutomodClaimLedger`. The bot's gateway loop wiring (calling
+`process` in gateway order, `expire_repeat_history` on the maintenance tick,
+partial-edit routing before parse, text-automation suppression and durable
+funnel idempotency) is the next slice.
+
 ## Gates and evidence
 
 - `TWO_AUTOMOD=1` enables inspection; absent `TWO_AUTOMOD_ENFORCE=1` is dry-run.
@@ -161,6 +194,11 @@ a durable production store.
 - The ignored DB test uses only `agent_test@agent-testdb:5432/agent_test` (empty
   password), or the explicit GitHub Actions Postgres service container. It has
   no `DATABASE_URL` fallback and creates/drops only its isolated test schema.
+- `crates/discord/tests/automod_activation.rs` drives the orchestrator over the
+  scripted mock REST double: dry-run sends nothing, protected targets are
+  untouched, the delete/warn/timeout ladder, duplicate delivery once with one
+  XP award, partial-edit fetch and re-inspection with no award, uncertain
+  delete/timeout retention, refused fence, rejected delete and preserved retry.
 - DB assertions cover 20-way claim contention, edit contention, replay,
   stale-token fencing, dry-run refusal, uncertain-mutation retention,
   counted-claim reconciliation, preserved pre-count decision replay, five
@@ -169,11 +207,11 @@ a durable production store.
 Commands (existing Rust installation, target directory outside the synced tree):
 
 ```sh
-cargo test --offline --locked -p two-bot-core -p two-bot-discord --test automod_runtime --test automod_translation
+cargo test --offline --locked -p two-bot-core -p two-bot-discord --test automod_runtime --test automod_translation --test automod_activation
 cargo test --offline --locked -p two-bot-core --features db --test automod_store --test automod_preserved_replay -- --ignored
-cargo clippy --offline --locked -p two-bot-core -p two-bot-discord --features two-bot-core/db --lib --test automod_runtime --test automod_translation --test automod_store --test automod_preserved_replay -- -D warnings
+cargo clippy --offline --locked -p two-bot-core -p two-bot-discord --features two-bot-core/db --lib --test automod_runtime --test automod_translation --test automod_activation --test automod_store --test automod_preserved_replay -- -D warnings
 cargo fmt --all -- --check
 ```
 
-REST/mock-executor call assertions, real shard orchestration, durable production
-funnel integration and staging soak remain the follow-up's acceptance gates.
+Gateway-loop wiring, durable production funnel integration and staging soak
+remain the follow-up's acceptance gates.
