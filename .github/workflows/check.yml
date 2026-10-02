@@ -108,20 +108,18 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      # Restore on every run; save only on pushes to main (below). A PR-scoped
-      # cache is unreadable by other PRs, and uploading the ~4 GiB target dir
-      # from a busy self-hosted runner pushed PR jobs past their timeout.
+      # TOG-11810: dependency build cache. The raw ~4 GiB target/ upload
+      # blew the 30-minute PR timeout (#147); rust-cache stores ~/.cargo and
+      # the dependency builds in target/, stripping workspace crates, so
+      # restore/save stay small. The key includes the job id (no shared-key),
+      # so this job's entry is separate from `tickets postgres`. Restore on
+      # every run; save only on pushes to main (a PR-scoped entry is
+      # unreadable by other PRs, so a PR upload is pure waste).
       - name: Restore cargo cache
-        id: cargo-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Verify Docker dependency layer
         run: python3 scripts/test-docker-deps.py --cargo
@@ -189,6 +187,11 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
+      - name: automod durable dedupe (CI service container only)
+        env:
+          AUTOMOD_CI_TESTDB: '1'
+        run: cargo test -p two-bot-core --features db --locked --test automod_store --test automod_preserved_replay -- --ignored
+
       - name: leveling Postgres parity tests
         env:
           TWO_LEVELING_TEST_CI: '1'
@@ -208,7 +211,7 @@ jobs:
       - name: Store Postgres integration (isolated CI schemas)
         env:
           TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
-        run: cargo test -p two-bot-store --locked --test postgres -- --ignored
+        run: cargo test -p two-bot-store --locked --test postgres --test journal -- --ignored
 
       - name: legacy copy acceptance (two owned databases on CI service only)
         run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
@@ -258,19 +261,10 @@ jobs:
         with:
           command: check all
 
-      - name: Save cargo cache (main only)
-        if: github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-
   parity-docs:
     name: parity docs
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'parity-docs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -507,13 +501,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # TOG-11810: dependency build cache, as in the `check` job. The key
+      # includes the job id, so this job keeps its own entry (it builds a
+      # different dependency set); saved only on pushes to main.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-tickets-cargo-${{ hashFiles('Cargo.lock') }}
+          prefix-key: ${{ runner.os }}-cargo
+          save-if: ${{ github.event_name == 'push' }}
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
       - name: Ticket shared router and mock Discord lifecycle acceptance
@@ -552,6 +546,8 @@ jobs:
         run: python3 ../scripts/test-pr-lint.py
       - name: Verify secret-scan trigger and concurrency surface
         run: python3 ../scripts/test-secret-scan.py
+      - name: Verify production deploy guards
+        run: python3 ../scripts/test-deploy-production.py
       - name: Verify release reconciliation retries
         run: python3 ../scripts/test-release-retry.py
       - name: Verify offline release lifecycle
