@@ -74,10 +74,9 @@ pub const MAX_ROOMS_PER_USER: u32 = 10;
 /// Smallest `max_per_guild` a config accepts. Legacy: `TWO_TEMP_VOICE_MAX_PER_GUILD` min 1.
 pub const MIN_ROOMS_PER_GUILD: u32 = 1;
 
-/// Largest `max_per_guild` a config accepts. Legacy: `TWO_TEMP_VOICE_MAX_PER_GUILD`
-/// max 45, staying under Discord's 50-channels-per-category ceiling with room
-/// for the generator itself.
-/// Legacy: `TWO_TEMP_VOICE_MAX_PER_GUILD` max 45.
+/// Largest `max_per_guild` a config accepts (legacy max 45), staying under
+/// Discord's 50-channels-per-category ceiling with room for the generator
+/// itself.
 pub const MAX_ROOMS_PER_GUILD: u32 = 45;
 
 /// Smallest `cooldown_secs` a config accepts: zero disables the cooldown check.
@@ -308,14 +307,14 @@ pub fn decide_admission(
             reason: RefusalReason::GuildCap,
         });
     }
-    if config.cooldown_secs > 0 {
-        if let Some(last) = request.last_created_at_secs {
-            if now_secs.saturating_sub(last) < i64::from(config.cooldown_secs) {
-                return Ok(AdmissionDecision::Deny {
-                    reason: RefusalReason::Cooldown,
-                });
-            }
-        }
+    let cooling_down = config.cooldown_secs > 0
+        && request
+            .last_created_at_secs
+            .is_some_and(|last| now_secs.saturating_sub(last) < i64::from(config.cooldown_secs));
+    if cooling_down {
+        return Ok(AdmissionDecision::Deny {
+            reason: RefusalReason::Cooldown,
+        });
     }
     let cutoff = now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS);
     let mut mine = 0u32;
