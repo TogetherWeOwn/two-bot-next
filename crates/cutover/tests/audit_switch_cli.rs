@@ -82,6 +82,7 @@ impl TestDb {
         command
             .env_clear()
             .env("TWO_DATABASE_URL", &self.url)
+            .env("TWO_DATABASE_TLS", "local-only")
             .env("TWO_DB_POOL_MAX", "1")
             .args(args);
         command.output().unwrap()
@@ -286,6 +287,7 @@ fn fenced_target() -> TestResult {
             "TWO_DATABASE_URL",
             "postgres://agent_test:@agent-testdb:5432/postgres",
         )
+        .env("TWO_DATABASE_TLS", "local-only")
         .env("TWO_DB_POOL_MAX", "1")
         .arg("--status");
     let out = command.output().unwrap();

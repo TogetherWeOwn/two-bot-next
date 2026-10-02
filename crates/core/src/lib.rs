@@ -28,6 +28,7 @@ pub mod config;
 pub mod containment;
 #[cfg(feature = "db")]
 pub mod database_roles;
+pub mod database_tls;
 pub mod database_url;
 pub mod events;
 pub mod evidence;
