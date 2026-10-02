@@ -103,13 +103,22 @@ class SoakChecklistTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate(self.parity, data)
 
-    def test_waiver_requires_reason_and_automation_requires_command(self):
-        for status, required in (("waived", "reason"), ("automated", "verification")):
+    def test_waiver_requires_reason_and_approver_and_automation_requires_command(self):
+        for status, required in (("waived", "reason"), ("waived", "approver"),
+                                 ("automated", "verification")):
             data = copy.deepcopy(self.checklist)
             data["entries"][0]["status"] = status
             data["entries"][0].pop(required, None)
             with self.assertRaisesRegex(ValueError, "requires"):
                 validate(self.parity, data)
+
+    def test_every_filed_waiver_carries_reason_and_approver(self):
+        waived = [e for e in self.checklist["entries"] if e["status"] == "waived"]
+        self.assertGreater(len(waived), 0, "expected the first filed waivers to exist")
+        for entry in waived:
+            with self.subTest(entry=entry["id"]):
+                self.assertTrue(entry.get("reason", "").strip())
+                self.assertTrue(entry.get("approver", "").strip())
 
     def test_voice_requires_external_reference(self):
         data = copy.deepcopy(self.checklist)
