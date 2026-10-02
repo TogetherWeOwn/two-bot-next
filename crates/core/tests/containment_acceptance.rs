@@ -6,8 +6,10 @@ use std::collections::{HashSet, VecDeque};
 
 use two_bot_core::{
     plan_quarantine, quarantine_outcome, role_removal_status, ClaimedContainmentEvent,
-    ContainmentEventState, ContainmentIncident, ContainmentIncidentState, ContainmentPolicy,
-    ContainmentRole, DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan,
+    ContainmentAlert, ContainmentEventState, ContainmentIncident, ContainmentIncidentState,
+    ContainmentPolicy, ContainmentRole, ContainmentSignal, DestructiveAction,
+    DestructiveAuditEvent, MentionPolicy, QuarantineFailure, QuarantinePlan,
+    CONTAINMENT_ALERT_EVENT, CONTAINMENT_SUPPRESSED_EVENT,
 };
 
 const NOW: i64 = 1_000_000;
@@ -241,6 +243,169 @@ fn partial_removal_stops_and_uncertain_incident_blocks_after_cooldown() {
         .is_none());
     assert_eq!(fixture.incidents.len(), 1);
     assert_eq!(discord.requests.len(), 2);
+}
+
+/// Parity §8: per-executor cooldown plus pinned alert shape.
+///
+/// First threshold crossing posts exactly one `containment_alert` staff
+/// message; a repeat offence inside the cooldown suppresses the re-alert
+/// (still logged under `containment_alert_suppressed`) while the staff text
+/// stays free of tokens/options/user text and the join path never kicks.
+#[test]
+fn cooldown_suppresses_realert_but_still_logs_with_stable_alert_shape() {
+    let policy = ContainmentPolicy::default();
+    let mut fixture = ClaimedEvidenceFixture::default();
+    let mut posted: Vec<String> = Vec::new();
+    let mut logged: Vec<&'static str> = Vec::new();
+
+    // Four sub-threshold observes stay quiet: no log, no post.
+    for id in ["a", "b", "c", "d"] {
+        let row = event(id, DestructiveAction::MemberKick, NOW - 500);
+        let before = fixture.rows.len();
+        assert!(fixture.observe(&policy, row, NOW).is_none());
+        let trigger = &fixture.rows[before];
+        assert_eq!(
+            policy.signal(trigger, &fixture.rows, &fixture.incidents, NOW),
+            ContainmentSignal::Quiet
+        );
+        assert_eq!(
+            policy
+                .signal(trigger, &fixture.rows, &fixture.incidents, NOW)
+                .log_event(),
+            None
+        );
+    }
+
+    // The fifth observe trips heat 5: one alert. Probe the signal first with
+    // the pre-insert snapshot (Observe trigger, no blocking incident), exactly
+    // as the adapter must before claiming the incident: post-insert the stored
+    // row reads Contain, which never counts as fresh heat.
+    let trigger_row = event("e", DestructiveAction::MemberKick, NOW);
+    let probe = ClaimedContainmentEvent {
+        event: trigger_row.clone(),
+        state: ContainmentEventState::Observe,
+    };
+    let mut pre_insert = fixture.rows.clone();
+    pre_insert.push(probe.clone());
+    let signal = policy.signal(&probe, &pre_insert, &fixture.incidents, NOW);
+    assert_eq!(signal.log_event(), Some(CONTAINMENT_ALERT_EVENT));
+    assert!(signal.staff_post_required());
+    let ContainmentSignal::Alert(proposal) = signal else {
+        panic!("threshold heat must alert");
+    };
+    let incident = fixture.observe(&policy, trigger_row.clone(), NOW).unwrap();
+    assert_eq!(proposal.id, incident.id);
+    assert_eq!((proposal.heat, incident.heat), (5, 5));
+    logged.push(CONTAINMENT_ALERT_EVENT);
+
+    let alert = ContainmentAlert::from_trigger(
+        &trigger_row,
+        proposal.heat,
+        5,
+        ContainmentIncidentState::Contained,
+        ids(&["danger-a", "danger-b"]),
+    );
+    let message = alert.staff_message();
+    assert_eq!(message.mentions, MentionPolicy::None);
+    assert_eq!(
+        message.content,
+        "**Anti-nuke contained** — destructive heat 5/5.\n\
+         Executor: `executor` · action: `member.kick` · target: `target`.\n\
+         Removed dangerous roles (2): `danger-a` `danger-b`.\n\
+         Restore check: unavailable.\n\
+         \n\
+         No member join was kicked or banned by this feature. Verify the executor and run the guarded staging restore procedure if drift is reported."
+    );
+    posted.push(message.content.clone());
+
+    // Repeat offence inside the per-executor cooldown: suppressed re-alert,
+    // still logged, no second post. Heat is 6: the five prior observes plus
+    // the repeat itself; the suppression proof carries that count.
+    let repeat_row = event("f", DestructiveAction::MemberKick, NOW + 1_000);
+    assert!(fixture.observe(&policy, repeat_row, NOW + 1_000).is_none());
+    let repeat = fixture.rows.last().unwrap().clone();
+    assert_eq!(
+        repeat.event.audit_entry_id, "f",
+        "suppressed rows are still claimed evidence"
+    );
+    let suppressed = policy.signal(&repeat, &fixture.rows, &fixture.incidents, NOW + 1_000);
+    assert_eq!(suppressed.log_event(), Some(CONTAINMENT_SUPPRESSED_EVENT));
+    assert!(!suppressed.staff_post_required());
+    match suppressed {
+        ContainmentSignal::Suppressed {
+            guild_id,
+            executor_id,
+            heat,
+            threshold,
+        } => {
+            assert_eq!(
+                (guild_id.as_str(), executor_id.as_str()),
+                ("guild", "executor")
+            );
+            assert_eq!((heat, threshold), (6, 5));
+        }
+        other => panic!("repeat inside cooldown must suppress, got {other:?}"),
+    }
+    logged.push(CONTAINMENT_SUPPRESSED_EVENT);
+
+    assert_eq!(posted.len(), 1, "one staff post for the whole cooldown");
+    assert_eq!(
+        logged,
+        [CONTAINMENT_ALERT_EVENT, CONTAINMENT_SUPPRESSED_EVENT]
+    );
+}
+
+/// The pinned staff text carries only IDs, the wire action name, counters and
+/// the outcome label; the `…and N more` cap mirrors legacy
+/// `removedRoleIds.slice(0, 20)`.
+#[test]
+fn containment_alert_shape_caps_ids_and_names_no_member_effect() {
+    let trigger = event("t", DestructiveAction::ChannelDelete, NOW);
+    let removed: Vec<String> = (0..22).map(|i| format!("role-{i}")).collect();
+    let message = ContainmentAlert::from_trigger(
+        &trigger,
+        9,
+        5,
+        ContainmentIncidentState::Contained,
+        removed,
+    )
+    .staff_message();
+    assert_eq!(message.mentions, MentionPolicy::None);
+    for i in 0..20 {
+        assert!(message.content.contains(&format!("`role-{i}`")));
+    }
+    assert!(!message.content.contains("`role-20`"));
+    assert!(message.content.contains("…and 2 more"));
+    assert!(message.content.contains("destructive heat 9/5"));
+    assert!(message.content.contains("action: `channel.delete`"));
+    assert!(message.content.contains("No member join was kicked"));
+
+    let empty = ContainmentAlert::from_trigger(
+        &trigger,
+        5,
+        5,
+        ContainmentIncidentState::DryRun,
+        Vec::new(),
+    )
+    .staff_message();
+    assert!(empty.content.contains("**Anti-nuke dry_run**"));
+    assert!(empty.content.contains("No role removal was confirmed."));
+
+    // Unknown executor/target render as `unknown`, never guessed text.
+    let mut anonymous = trigger.clone();
+    anonymous.executor_id = None;
+    anonymous.target_id = None;
+    let text = ContainmentAlert::from_trigger(
+        &anonymous,
+        5,
+        5,
+        ContainmentIncidentState::Refused,
+        Vec::new(),
+    )
+    .staff_message()
+    .content;
+    assert!(text.contains("Executor: `unknown`"));
+    assert!(text.contains("target: `unknown`"));
 }
 
 #[test]
