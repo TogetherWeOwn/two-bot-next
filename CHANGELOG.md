@@ -4,6 +4,7 @@
 
 ### Added
 
+- Wire leveling through the shared command runtime, interaction router and REST executor with ordered, awaited gateway awards. Preserve message eligibility, measured voice duration, session/dry-run reward suppression, ephemeral rank and mention-suppressed public top 10. Ordinary level-ups only grant roles; explicit revokes require a pinned staging fence and whole-set permission/hierarchy preflight. Mock REST and migrated disposable database proofs run in CI, including a shared-runtime single-callback regression.
 - Wire LFG commands and role selects through the shared interaction runtime and REST executor, with ephemeral replies, mention-free message refresh, serialized capacity/closure, nonce recovery, failed-post cleanup and shared announcement audit outcomes.
 - Automod gateway decision/enrichment seams and capture-only funnel handoff,
   staging/live-approval and dry-run fences, protected-target enforcement plans,

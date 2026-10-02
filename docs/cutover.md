@@ -152,7 +152,7 @@ Do **not** run `two-bot backup --help` or
 `two-bot guild-config-snapshot --help`: dispatch ignores their trailing arguments
 and executes the backup/prune/upload or Discord snapshot/upload instead. The
 usage comment claiming help after any subcommand is not the dispatch behavior:
-[argument dispatch](../crates/bot/src/backup_cli.rs#L129). Other binaries or future
+[argument dispatch](../crates/bot/src/backup_cli.rs#L162). Other binaries or future
 subcommand help paths require source/fixture verification before approval; a
 `--help` suffix is not a read-only safety boundary.
 
@@ -165,8 +165,8 @@ subcommand help paths require source/fixture verification before approval; a
 | `two-bot backup-upload <dump.ndjson.gz>` | Uploads one dump using approved S3 bindings; an upload is not proof of completeness or restore compatibility |
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
-Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L82),
-[restore implementation](../crates/bot/src/backup_cli.rs#L354) and
+Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L99),
+[restore implementation](../crates/bot/src/backup_cli.rs#L380) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -180,12 +180,15 @@ env -u TWO_RESTORE_URL two-bot restore fixture.ndjson.gz --dry-run
 
 Use a disposable fixture for a test. Missing/tampered file or nonzero exit means
 FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
-verify canonical content and required table coverage. The generic allowlist
-omits leveling, gateway checkpoints, guild settings, internal actions and other
-Next tables, and requires some legacy tables absent from embedded migrations.
-It can fail against a fresh Next schema. See
-[`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44). Do not treat its
-per-table count checks as complete final-copy verification.
+verify canonical content and required table coverage. A v4 dump covers every
+table that `crates/cutover/migrations` creates, except `xp_cooldowns` and the
+migration ledgers ([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L117)),
+plus retired legacy tables when the source still has them
+([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
+target migrated to the dump's schema, and refuses before any write when a
+current table is missing. Coverage and the trigger and sequence handling are in
+[backup.md](backup.md#coverage-and-recovery-semantics-v4-tog-11142). Do not
+treat its per-table count checks as complete final-copy verification.
 
 MEE6 XP/backfill/capture/reward utilities are **separate binaries**, not a
 legacy-table copier or rollback journal. Some default to writes, and even some
@@ -215,47 +218,105 @@ attach a reviewed, fixture-rehearsed execution/restore command sheet covering
 them before GO. Likewise, the merged generic backup is not a complete snapshot
 of all Next state; a backup upload receipt alone cannot satisfy the data gate.
 
-### Worker/DO ownership fence: required, not implemented in the baseline
+### Worker/DO ownership fence: implemented; rehearsal still required
 
-The Worker uses `@cloudflare/containers` **0.3.7**. Its health/readyz fetch calls
-`containerFetch`, which can auto-start the Container, and arms durable keepalive.
-The already scheduled `keepalive` calls `containerFetch("http://c/readyz")` and
-re-arms itself; `onStart` arms it too. Merely stopping the process, pausing an
-external monitor or changing public routing does **not** fence that durable work.
-Source: [fetch/auto-start](../wrangler/src/index.ts#L98),
-[keepalive/onStart](../wrangler/src/index.ts#L128),
-[version](../wrangler/package.json#L12).
+The persisted fence is implemented in [`ownership.ts`](../wrangler/src/ownership.ts)
+and the [`Worker/DO wrapper`](../wrangler/src/index.ts), using pinned
+`@cloudflare/containers` **0.3.7**. Implementation is not a staging receipt or
+production authorization. **No rehearsed durable fence = NO-GO** for B4.
 
-B4 must supply a reviewed execution sheet for a **persisted, fail-closed** fence
-covering Worker ingress, the singleton DO and every scheduled/SDK startup path.
-It must prevent Container startup/reconnect while fenced, not just reject bot
-commands inside an already connected gateway. Do not invent a maintenance env
-flag or clear DO storage/SDK alarms to approximate this missing capability.
+The singleton remains `TWO_BOT.getByName("two-bot")`. Its SQLite DO storage owns
+`two-bot:owner:v1`: `deploymentId`, monotonically increasing `epoch`, `phase`,
+`actor`, `timestamp`, `oldEpoch` and `oldDeploymentId`. `deploymentId` is the
+Cloudflare **Worker version ID** from `CF_VERSION_METADATA.id` (not a Git SHA,
+release label, or Cloudflare deployment resource ID). The Worker overwrites the
+ingress identity header, and the DO requires caller identity, its own version,
+and the active stored owner to agree. Missing metadata/record, malformed state,
+a storage read failure, another version, or `phase=fenced` refuses with 503
+`ownership_fenced`, without forwarding/startup. There is no first-request claim.
 
-Required ordering and rehearsal receipts:
+All supported SDK startup entries (`start`, `startAndWaitForPorts`,
+`containerFetch`) and health/readyz, keepalive and `onStart` scheduling are gated.
+A DO concurrency gate drains admitted starts/probes before ownership changes;
+legacy/stale keepalive payloads cannot renew, probe, or rearm. Constructor
+reconciliation destroys an inactive already-running process. The base SDK alarm
+is left intact; only application `keepalive` schedules are removed. Do not
+clear DO storage or SDK alarms. The fence is **per singleton/namespace**: it
+cannot revoke legacy, another namespace, or a separate directly started gateway.
+Those writers still need their own containment receipts.
 
-1. **Before Next configuration/startup while legacy runs**, activate the fence
-   through the authorized deployment/control mechanism. Record the actual
-   Worker/DO version, singleton identity, persisted state and release owner.
-2. **Before stopping Next on rollback**, activate/confirm the fence, pause Next
-   health callers and drain admitted work. Account for already admitted fetches,
-   pending keepalive tasks and `onStart` races; the stop alone is insufficient.
-3. Rehearse on an isolated disposable target that health/readyz calls while
-   fenced return maintenance without `containerFetch`, pending scheduled work
-   cannot start/re-arm the Container, and DO eviction/restart plus a deployment
-   cannot lose the fence. Observe beyond at least two configured keepalive
-   intervals and verify terminal Container state and no new gateway session.
-   Production verification uses the authorized control-plane/log receipts, not
-   an unfenced Next health probe that might restart it.
-4. Keep the fence active **throughout legacy ownership**, including recovered
-   health watch, future deployments and retirement wait. Remove it only for an
-   explicit Next handoff after legacy and all other writers are fenced, data and
-   registry checks pass, and the lead authorizes the single Next startup.
+#### Authenticated control contract
 
-**No rehearsed durable fence = NO-GO** for cutover. If rollback cannot establish
-it, do not start legacy alongside an auto-restarting Next; preserve maintenance
-and escalate to the Director of Engineering. This PR documents the gate, not a
-fence implementation or an authorization to change the Worker.
+`GET /internal/ownership` reads the current version, owner record (or `null`) and
+native `running` flag without starting the Container. `POST` takes JSON:
+
+```json
+{"action":"takeover","expectedEpoch":0,"actor":"release-operator"}
+```
+
+Both require `Authorization: Bearer <OWNERSHIP_CONTROL_TOKEN>` at Worker and DO;
+the dedicated secret must already be approved/provisioned in that environment.
+Absent/short/mismatched tokens return 401. It is never forwarded into the bot.
+The actor is an authenticated caller's audit label, **not** independent identity
+proof. Bodies are bounded to 1 KiB. Takeover targets only the currently executing
+version; there is no client-supplied target deployment. `expectedEpoch` is 0 only
+for a never-initialized record; a stale/replayed epoch returns 409. It is not safe
+to invent 0 or retry a conflict without reading and reconciling the new state.
+
+Each accepted change increments the epoch, atomically persists a **fenced**
+owner and audit receipt, then awaits native destruction and checks `running=false`.
+Only a successful takeover writes `phase=active`; it does **not** start the new
+container. A stop/crash/final-write failure leaves persisted denial and must be
+reconciled with a fresh authenticated epoch change. The independent audit keys
+`two-bot:ownership-audit:v1:<epoch>:fenced|active` retain actor, timestamp, old/new
+epoch and owner identities. Logs emit only the receipt/fixed refusal reason.
+`{"action":"fence","expectedEpoch":N,"actor":"release-operator"}` leaves
+`deploymentId=null`, blocking **all** versions until explicit takeover. A
+fence failure does not prove the old gateway has stopped: require control-plane
+termination evidence before starting legacy.
+
+Use the environment-bound client in the [runbook](runbook.md#persisted-ownership-control)
+for staging. Production execution stays on B4's reviewed authorized sheet. The
+staging workflow validates the control configuration **before deploy**, then
+transfers only an active owner. An uninitialized/parked singleton requires the
+explicit `workflow_dispatch.release_fence=true` handoff; a push cannot release it.
+
+#### Required staging rehearsal receipts
+
+1. Verify staging Worker, DO namespace/singleton, staging guild/token binding and
+   staging database binding. Retain exact Git SHA, versions A/B and image. Never
+   copy a production binding. Provisioning/rotation of the control credential is
+   a separate governed step, not authorized by these commands.
+2. Read authenticated state; take over A using its exact current epoch. Check
+   actor/time/old-new epoch receipt and `running=false`. Probe health/readyz to
+   start A, verify one gateway session and retain its keepalive epoch.
+3. Deploy fence-capable version B against the **same** namespace/singleton,
+   without takeover. Before health traffic, confirm constructor reconciliation
+   stops the old process. A stale A ingress and B health/readyz must be refused;
+   neither may start/forward. Retain storage readback and container/log receipts.
+4. Authenticated takeover of B must increment the epoch and confirm teardown
+   before release. Replaying the previous epoch must return 409. A/B parallel
+   probes and old A/epoch keepalive work must not produce a second owner. Start
+   B only by a subsequent allowed probe; record readiness/gateway evidence.
+5. Apply `fence` (parking owner), verify `running=false`, pause external health
+   callers and observe beyond **two configured keepalive intervals**. Probe
+   both health routes: require 503 ownership refusal, no forwards/starts and no
+   new gateway session. Reconstruct/evict the DO and deploy/roll back between
+   **fence-capable** versions; the parked record/epoch must survive. Local
+   Miniflare fixtures prove read-error behavior and reload persistence; they do
+   not replace these staging termination/session receipts. Never fault-inject
+   storage by clearing or corrupting the deployed DO.
+6. Keep the fence active throughout legacy ownership, recovered monitors,
+   deployments and retirement wait. Only release Next after other writers,
+   data/registry gates and the lead's handoff are confirmed. Restoring an active
+   version without a new takeover is not a rollback release procedure.
+
+**Do not roll back to a pre-fence wrapper:** that code ignores persisted state.
+Retain a reviewed fence-capable known-good Worker/image pair before rollout.
+Merely stopping a process, pausing a monitor or changing routing never replaces
+this control operation. If durable containment cannot be established, preserve
+maintenance and escalate to the Director of Engineering; never start legacy
+alongside an unconfirmed Next gateway.
 
 ### Runtime gates found in the baseline
 
@@ -437,7 +498,7 @@ receipt is **NO-GO**. The same allocator gate applies to a rollback recovery tar
 Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L13)
 is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L98)
 that handle only idempotency-key conflicts, not primary-key collisions. The
-[limited restore's events sequence adjustment](../crates/core/src/backup/dump.rs#L371)
+[restore's sequence restart](../crates/core/src/backup/dump.rs#L523)
 illustrates the hazard; it does not prove the planned copier covers every table.
 
 Do not start either gateway while verification is unresolved. Record the baseline

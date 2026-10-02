@@ -83,6 +83,9 @@ test("every rule links to an existing runbook heading", () => {
 test("/ops/metrics: 404 without a configured token, 401 without/with a wrong bearer, proxied with the right one", async () => {
   const calls: Request[] = [];
   const env = (token?: string) => ({
+    // The fence stamps the deployment header on every DO forward, so the
+    // fixture must carry the version-metadata binding like production.
+    CF_VERSION_METADATA: { id: "synthetic-metrics-deployment" },
     METRICS_SCRAPE_TOKEN: token,
     REDIRECT_MAPPINGS_JSON: "[]",
     TWO_BOT: { getByName: () => ({ fetch: async (r: Request) => { calls.push(r); return new Response("ok"); } }) },

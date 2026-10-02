@@ -8,6 +8,8 @@ license.workspace = true
 [features]
 default = []
 db = ["two-bot-core/db", "dep:sqlx", "dep:time"]
+# Explicit service-DB acceptance lane; no credentialed Discord traffic.
+db-tests = ["db"]
 
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.

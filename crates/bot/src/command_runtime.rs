@@ -18,6 +18,9 @@
 //! - feed relays (`/feed-add`, `/feed-remove`, `/feed-list`; TOG-10085 domain
 //!   and store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
 //!   completion. The generated relay/audit ids replace legacy `randomUUID()`.
+//! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
+//!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
+//!   award path shares this runtime's pool, executor and onboarding gates.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
@@ -57,7 +60,8 @@ use two_bot_core::{
     InteractionRouter, ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
-    publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
+    publish_commands, response_for_slash, route_interaction, ActionExecutor, LevelingRuntime,
+    RoutedInteraction,
 };
 
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
@@ -89,11 +93,11 @@ impl InteractionHandler for StickyHandler {
     }
 }
 
-/// Router handler marker for the feed-relay commands; one instance per id.
+/// Router handler marker for the feed and leveling slices; one per id.
 #[derive(Debug)]
-struct FeedHandler(HandlerId);
+struct SliceHandler(HandlerId);
 
-impl InteractionHandler for FeedHandler {
+impl InteractionHandler for SliceHandler {
     fn id(&self) -> HandlerId {
         self.0
     }
@@ -109,6 +113,7 @@ pub struct CommandRuntime {
     interactions: two_bot_discord::interactions::InteractionRuntime,
     custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
     application_id: AtomicU64,
+    leveling: LevelingRuntime,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
     tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
@@ -147,6 +152,7 @@ impl CommandRuntime {
         pool: Pool<Postgres>,
         executor: ActionExecutor,
         router: InteractionRouter,
+        leveling: LevelingRuntime,
         guild_id: u64,
         custom_commands: Option<Vec<two_bot_core::CustomCommand>>,
         tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
@@ -164,6 +170,7 @@ impl CommandRuntime {
             interactions,
             custom_commands,
             application_id: AtomicU64::new(0),
+            leveling,
             guild_id,
             tickets,
             automations,
@@ -182,7 +189,12 @@ impl CommandRuntime {
     /// `DISCORD_API_BASE` proxy override. Returns `None` (gateway still boots)
     /// when gate parsing or executor construction fails.
     #[must_use]
-    pub fn from_env(pool: Pool<Postgres>, token: &str, guild_id: u64) -> Option<Arc<Self>> {
+    pub fn from_env(
+        pool: Pool<Postgres>,
+        token: &str,
+        guild_id: u64,
+        onboarding: two_bot_core::OnboardingGates,
+    ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
             Err(err) => {
@@ -203,6 +215,7 @@ impl CommandRuntime {
             &features,
             &moderation,
             SurfaceFlags {
+                session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                 tickets: ticket_config.is_some(),
                 ..SurfaceFlags::default()
             },
@@ -210,13 +223,27 @@ impl CommandRuntime {
         let proxy = std::env::var("DISCORD_API_BASE")
             .ok()
             .filter(|value| !value.is_empty());
-        let executor = match ActionExecutor::with_proxy(token.to_owned(), proxy) {
+        let admission =
+            match two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token) {
+                Ok(admission) => Arc::new(admission),
+                Err(err) => {
+                    warn!(error = %err, "send admission invalid; command runtime disabled");
+                    return None;
+                }
+            };
+        let executor = match ActionExecutor::with_admission(token.to_owned(), proxy, admission) {
             Ok(executor) => executor,
             Err(err) => {
                 warn!(error = %err, "REST executor failed to build; command runtime disabled");
                 return None;
             }
         };
+        let leveling = LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            guild_id,
+            onboarding,
+        );
         let tickets = match ticket_config {
             Some(config) => match crate::ticket_runtime::TicketRuntime::new(
                 pool.clone(),
@@ -234,6 +261,7 @@ impl CommandRuntime {
             pool,
             executor,
             router_with_commands(gates),
+            leveling,
             guild_id,
             Some(Vec::new()),
             tickets,
@@ -251,8 +279,31 @@ impl CommandRuntime {
         automations: bool,
     ) -> Arc<Self> {
         assert_eq!(automations, router.gates().automations);
+        let leveling = LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            guild_id,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
         // Tests provide an authoritative empty custom-command fixture.
-        Self::build(pool, executor, router, guild_id, Some(Vec::new()), None)
+        Self::build(
+            pool,
+            executor,
+            router,
+            leveling,
+            guild_id,
+            Some(Vec::new()),
+            None,
+        )
+    }
+
+    /// Shares this runtime's pool, executor/pacing and onboarding gates with
+    /// the ordered award path; only this runtime dispatches interactions.
+    pub fn leveling(&self) -> LevelingRuntime {
+        self.leveling.clone()
     }
 
     #[cfg(test)]
@@ -429,8 +480,9 @@ impl CommandRuntime {
     }
 
     /// Route slash commands and LFG selects once through the shared router.
-    /// Refusals get the existing ephemeral text; wired slices defer before I/O.
-    /// Unwired builtins get an unavailable reply; Ignore stays silent.
+    /// Refusals get the existing ephemeral text; LFG/sticky/feed defer before
+    /// I/O; leveling sends its own immediate callback. Unwired builtins get an
+    /// unavailable reply; router Ignore (unknown/guild) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
         let application_id = self.application_id.load(Ordering::Relaxed);
         if application_id != 0 && interaction.application_id.get() != application_id {
@@ -491,6 +543,14 @@ impl CommandRuntime {
         let SlashOutcome::Handled { handler } = outcome else {
             return;
         };
+        if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) {
+            // Leveling owns its immediate rank-ephemeral/leaderboard-public
+            // callback. Never send the generic ephemeral defer as well.
+            if let Err(error) = self.leveling.handle_interaction(interaction, handler).await {
+                warn!(interaction_id = %interaction.id.get(), command = %name, error = %error, "leveling interaction failed");
+            }
+            return;
+        }
         let owner = match name.as_str() {
             "sticky" | "sticky-remove" => Some(HandlerId::AutomationAdmin),
             "feed-add" => Some(HandlerId::FeedAdd),
@@ -1159,7 +1219,8 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
         })
 }
 
-/// Shared sticky/feed registrations; LFG is composed by `InteractionRuntime`.
+/// Shared sticky/feed/leveling registrations; LFG is composed by
+/// `InteractionRuntime`.
 pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
     router.register(Box::new(StickyHandler));
@@ -1167,8 +1228,10 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
         HandlerId::FeedAdd,
         HandlerId::FeedRemove,
         HandlerId::FeedList,
+        HandlerId::Rank,
+        HandlerId::Leaderboard,
     ] {
-        router.register(Box::new(FeedHandler(id)));
+        router.register(Box::new(SliceHandler(id)));
     }
     router
 }

@@ -246,7 +246,8 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
         serde_json::json!([
             ["process", "ready"],
             ["gateway", "down"],
-            ["database", "down"]
+            ["database", "down"],
+            ["token_invalid", "ready"]
         ])
     );
 

@@ -21,6 +21,13 @@
  */
 
 import { Container } from "@cloudflare/containers";
+// SDK 0.3.7 reattaches outbound callbacks even for an already-running process.
+// https://developers.cloudflare.com/containers/container-package/
+export { ContainerProxy } from "@cloudflare/containers";
+import {
+  OwnershipFence, OwnershipRefused, CONTROL_PATH, DEPLOYMENT_HEADER,
+  authenticated, deploymentId, readChange, refused,
+} from "./ownership.ts";
 import {
   TokenBuckets,
   RedirectMissCache,
@@ -43,6 +50,10 @@ import {
 /** Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020). */
 export interface Env extends ForwardedFlagEnv {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
+  /** Cloudflare version identity, never a client-supplied owner name. */
+  CF_VERSION_METADATA?: { id: string };
+  /** Dedicated control bearer secret; absent means no control operations. */
+  OWNERSHIP_CONTROL_TOKEN?: string;
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
   GUILD_ID?: string;
@@ -99,6 +110,8 @@ function redirectStore(env: Env): RedirectStore {
 
 interface KeepalivePayload {
   startedAt: number;
+  deploymentId?: string;
+  epoch?: number;
 }
 
 interface ReadinessState {
@@ -165,47 +178,149 @@ export class TwoBotContainer extends Container<Env> {
   // https://developers.cloudflare.com/containers/examples/env-vars-and-secrets/
   override envVars = containerEnvVars(this.env, this.defaultPort);
 
+  private readonly ownership = new OwnershipFence(this.ctx.storage);
+  private readonly initialization: Promise<void>;
+  private recoveryFailed = false;
+  private static readonly KEEPALIVE_KEY = "two-bot:keepalive:v1";
+
+  constructor(ctx: DurableObjectState<{}>, env: Env) {
+    super(ctx, env);
+    // A deployment can reattach to a running old process. Reconcile before
+    // ingress or alarms are delivered, not just before the next cold start.
+    this.initialization = ctx.blockConcurrencyWhile(async () => {
+      try {
+        await this.ownership.require(this.id());
+      } catch (error) {
+        refused(error);
+        try { await this.destroyInactive(); }
+        catch { this.recoveryFailed = true; }
+      }
+    });
+  }
+
+  private id(): string { return deploymentId(this.env.CF_VERSION_METADATA?.id); }
+
+  /** Nested SDK calls use nested DO gates, never a non-reentrant JS mutex.
+   * Catch inside the gate: throwing there resets the DO. All container I/O
+   * stays inside the gate, so a takeover drains admitted starts/probes first.
+   * https://developers.cloudflare.com/durable-objects/api/state/#blockconcurrencywhile
+   */
+  private async gated<T>(operation: () => Promise<T>): Promise<T> {
+    await this.initialization;
+    const result = await this.ctx.blockConcurrencyWhile(async () => {
+      try { return { ok: true as const, value: await operation() }; }
+      catch (error) { return { ok: false as const, error }; }
+    });
+    if (!result.ok) throw result.error;
+    return result.value;
+  }
+
+  private async owned<T>(operation: () => Promise<T>): Promise<T> {
+    return this.gated(async () => {
+      if (this.recoveryFailed) throw new OwnershipRefused("shutdown_unconfirmed");
+      await this.ownership.require(this.id());
+      return operation();
+    });
+  }
+
+  private async destroyInactive(): Promise<void> {
+    this.deleteSchedules("keepalive");
+    await this.ctx.storage.delete(TwoBotContainer.KEEPALIVE_KEY);
+    if (this.ctx.container?.running) await super.destroy();
+    if (this.ctx.container?.running) throw new OwnershipRefused("shutdown_unconfirmed");
+  }
+
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-
-    if (url.pathname === "/health" || url.pathname === "/readyz") {
-      await this.armKeepalive();
-      return this.containerFetch(request);
+    if (url.pathname === CONTROL_PATH) return this.control(request);
+    if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH) {
+      return new Response("not found", { status: 404 });
     }
-
-    // Reached only through the Worker's bearer-token gate (see default export).
-    if (url.pathname === OPS_METRICS_PATH && request.method === "GET") {
-      await this.armKeepalive();
-      const upstream = await this.containerFetch("http://c/metrics");
-      return new Response(await upstream.text(), {
-        status: upstream.status,
-        headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
+    try {
+      return await this.owned(async () => {
+        await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
+        // Reached only through the Worker's bearer-token gate (see default export).
+        if (url.pathname === OPS_METRICS_PATH) {
+          await this.armKeepalive();
+          const upstream = await this.containerFetch("http://c/metrics");
+          return new Response(await upstream.text(), {
+            status: upstream.status,
+            headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
+          });
+        }
+        // Bound the entire probe, including auto-start, below the 30s DO gate.
+        const probe = new Request(request, { signal: AbortSignal.timeout(6000) });
+        const response = await this.containerFetch(probe);
+        await this.armKeepalive();
+        return response;
       });
-    }
+    } catch (error) { return refused(error); }
+  }
 
-    return new Response("not found", { status: 404 });
+  private async control(request: Request): Promise<Response> {
+    if (!await authenticated(request, this.env.OWNERSHIP_CONTROL_TOKEN)) {
+      return new Response("unauthorized", { status: 401 });
+    }
+    if (request.method !== "GET" && request.method !== "POST") {
+      return new Response("method not allowed", { status: 405, headers: { allow: "GET, POST" } });
+    }
+    const change = request.method === "POST" ? await readChange(request) : null;
+    if (request.method === "POST" && !change) {
+      return new Response("invalid ownership change", { status: 400 });
+    }
+    try {
+      return await this.gated(async () => {
+        const id = this.id();
+        if (request.headers.get(DEPLOYMENT_HEADER) !== id) throw new OwnershipRefused("deployment_mismatch");
+        const owner = change
+          ? await this.ownership.change(id, change, () => this.destroyInactive())
+          : await this.ownership.read();
+        if (change) {
+          this.recoveryFailed = false;
+          console.log(`two-bot ownership change: ${JSON.stringify(owner)}`);
+        }
+        // Takeover does not start the gateway. A subsequent owned probe does.
+        return Response.json({ deploymentId: id, owner: owner ?? null, running: this.ctx.container?.running ?? false }, {
+          headers: { "cache-control": "no-store" },
+        });
+      });
+    } catch (error) { return refused(error); }
+  }
+
+  // SDK 0.3.7 containerFetch auto-starts via startAndWaitForPorts, NOT start.
+  // Guard all three supported entries, including direct binding/RPC calls.
+  override async start(...args: Parameters<Container<Env>["start"]>): Promise<void> {
+    return this.owned(() => super.start(...args));
+  }
+
+  override async startAndWaitForPorts(...args: Parameters<Container<Env>["startAndWaitForPorts"]>): Promise<void> {
+    return this.owned(() => super.startAndWaitForPorts(...args));
+  }
+
+  override async containerFetch(...args: Parameters<Container<Env>["containerFetch"]>): Promise<Response> {
+    return this.owned(() => super.containerFetch(...args));
   }
 
   private keepaliveArming: Promise<void> | undefined;
   private keepaliveRunning = false;
 
-  /** Arm one persistent chain, including after Container restart/DO eviction. */
-  private armKeepalive(): Promise<void> {
-    if (this.keepaliveRunning) return Promise.resolve();
+  /** One persisted chain, with ownership checked outside fail-open monitoring. */
+  private async armKeepalive(): Promise<void> {
+    const owner = await this.ownership.require(this.id());
+    if (this.keepaliveRunning) return;
     if (this.keepaliveArming) return this.keepaliveArming;
-    // SDK 0.3.7 creates a new task ID on EVERY schedule() call. Coalesce local
-    // callers and check persisted schedules before inserting a new task.
-    // Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
+    // SDK 0.3.7 inserts a new row on every schedule() call. An old epoch's
+    // pending callback is never authority to keep this deployment alive.
     this.keepaliveArming = (async () => {
-      if ((await this.listSchedules("keepalive")).length === 0) {
-        await this.schedule(this.keepaliveSeconds(), "keepalive", {
-          startedAt: Date.now(),
-        } satisfies KeepalivePayload);
-      }
+      const [pending] = await this.listSchedules<KeepalivePayload>("keepalive");
+      if (pending?.payload?.deploymentId === this.id() && pending.payload.epoch === owner.epoch) return;
+      this.deleteSchedules("keepalive");
+      await this.schedule(this.keepaliveSeconds(), "keepalive", {
+        startedAt: Date.now(), deploymentId: this.id(), epoch: owner.epoch,
+      } satisfies KeepalivePayload);
     })().catch(() => {
-      // Monitoring setup must not replace health/readiness responses or fail
-      // SDK startup via onStart. Later callers retry; never log error details.
-      // https://developers.cloudflare.com/containers/api/container-class/#onstart
+      // Scheduling failures are monitoring failures, not permission failures.
+      // Never suppress the ownership read above or expose provider error text.
       console.warn(JSON.stringify({ event: "container_keepalive_arm_failed" }));
     }).finally(() => { this.keepaliveArming = undefined; });
     return this.keepaliveArming;
@@ -216,51 +331,51 @@ export class TwoBotContainer extends Container<Env> {
     return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_KEEPALIVE_SECONDS;
   }
 
-  /**
-   * Periodic keepalive: called by the Container scheduler every
-   * KEEPALIVE_SECONDS. Renews the activity timeout (so the instance never
-   * idles out from under the gateway) and probes /readyz; then re-arms.
-   * Invoked by name via schedule() — keep public.
-   */
+  /** Stale epochs drain without renewing, probing, notifying or rearming. */
   public async keepalive(payload: KeepalivePayload, schedule?: { taskId: string }): Promise<void> {
-    // SDK 0.3.7 passes undefined when an earlier callback deleted a row in
-    // its due-task snapshot. Such stale callbacks must not sample or re-arm.
+    // The SDK can pass undefined for rows deleted from its due-task snapshot.
     if (!schedule || this.keepaliveRunning) return;
     this.keepaliveRunning = true;
     try {
-      await this.keepaliveArming;
-      // The SDK already looked up this due task by ID before invoking us.
-      // listSchedules() in 0.3.7 is unordered LIMIT 1: it can select a future
-      // legacy row, and a failed extra lookup loses this task when the SDK
-      // deletes it after the callback. Trust the live callback context instead.
-      // Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
-      this.renewActivityTimeout();
-      try {
-        let status: number | null = null;
-        try {
-          const res = await this.containerFetch("http://c/readyz", {
-            signal: AbortSignal.timeout(6000),
-          });
-          status = res.status;
-          if (!res.ok) {
-            console.warn(`two-bot /readyz unhealthy: ${status}`);
-          }
-          // /readyz is a small JSON response. Drain rather than cancel: SDK
-          // 0.3.7's proxy pipe has an unhandled rejection on cancellation.
-          await res.arrayBuffer();
-        } catch {
-          status = null;
-          console.warn("two-bot keepalive probe failed");
+      await this.owned(async () => {
+        const owner = await this.ownership.require(this.id());
+        if (payload?.deploymentId !== this.id() || payload.epoch !== owner.epoch) {
+          throw new OwnershipRefused("stale_keepalive");
         }
-        await this.recordReadiness(status);
-        await this.evaluateMetricsAlerts();
-      } finally {
-        // Replace the executing row AND any legacy duplicate chains with one
-        // successor. onStart/inbound requests must not arm during this tick.
-        // https://developers.cloudflare.com/containers/api/container-class/#schedule
-        this.deleteSchedules("keepalive");
-        await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
-      }
+        await this.keepaliveArming;
+        this.renewActivityTimeout();
+        let admitted = true;
+        try {
+          let status: number | null = null;
+          try {
+            const res = await this.containerFetch("http://c/readyz", { signal: AbortSignal.timeout(6000) });
+            status = res.status;
+            if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${status}`);
+            // Drain rather than cancel the SDK 0.3.7 proxy response pipe.
+            await res.arrayBuffer();
+          } catch (error) {
+            if (error instanceof OwnershipRefused) {
+              admitted = false;
+              throw error;
+            }
+            status = null;
+            console.warn("two-bot keepalive probe failed");
+          }
+          await this.recordReadiness(status);
+          await this.evaluateMetricsAlerts();
+        } finally {
+          // Collapse duplicate chains, preserving unrelated SDK schedules.
+          // No takeover can interleave with this owned callback's I/O.
+          this.deleteSchedules("keepalive");
+          if (admitted) {
+            await this.ownership.require(this.id());
+            await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
+          }
+        }
+      });
+    } catch (error) {
+      if (error instanceof OwnershipRefused) refused(error);
+      else throw error;
     } finally {
       this.keepaliveRunning = false;
     }
@@ -389,8 +504,18 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override async onStart(): Promise<void> {
-    console.log("two-bot container started");
-    await this.armKeepalive();
+    try {
+      await this.owned(async () => {
+        console.log("two-bot container started");
+        await this.armKeepalive();
+      });
+    } catch (error) {
+      // A read/write failure after native startup cannot leave an unconfirmed
+      // gateway running just because the HTTP request will fail closed.
+      try { await this.destroyInactive(); }
+      catch { this.recoveryFailed = true; }
+      throw error;
+    }
   }
 
   override onStop(): void {
@@ -410,6 +535,19 @@ export default {
     ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
+
+    if (url.pathname === CONTROL_PATH) {
+      if (!await authenticated(request, env.OWNERSHIP_CONTROL_TOKEN)) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      try {
+        const forwarded = new Request(request);
+        // A stale Worker sharing this namespace cannot impersonate the current
+        // DO version; always overwrite untrusted ingress identity.
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch (error) { return refused(error); }
+    }
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {
       // Public probes carry no credentials, so only GET/HEAD are meaningful.
@@ -436,15 +574,18 @@ export default {
         });
       }
       // Sanitize the forwarded probe: keep the origin (Host) the Container
-      // expects, but drop the query, caller headers and body.
+      // expects, but drop the query, caller headers and body. The only header
+      // the DO sees is the Worker-stamped deployment id the fence requires.
       const clean = new URL(request.url);
       clean.search = "";
       clean.hash = "";
-      const sanitized = new Request(clean.toString(), {
-        method: request.method,
-      });
-      const container = env.TWO_BOT.getByName(SINGLETON_NAME);
-      return container.fetch(sanitized);
+      try {
+        const sanitized = new Request(clean.toString(), {
+          method: request.method,
+          headers: { [DEPLOYMENT_HEADER]: deploymentId(env.CF_VERSION_METADATA?.id) },
+        });
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
+      } catch (error) { return refused(error); }
     }
 
     // Authenticated off-container scrape path. No configured token → 404 (the
@@ -455,7 +596,13 @@ export default {
       if (!m || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
         return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
       }
-      return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(request);
+      try {
+        // The fenced DO route requires the deployment header (see fetch);
+        // stamp it here like the health/readyz forward above.
+        const forwarded = new Request(request);
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch (error) { return refused(error); }
     }
 
     // Internal metrics and healthz aliases never become invite campaigns.

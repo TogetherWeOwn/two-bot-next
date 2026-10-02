@@ -12,6 +12,8 @@
 //! boost tier. A headcount of `0` passed as the lock snapshot means the room is
 //! empty, which maps to unlimited (there is nobody to lock in).
 
+use unicode_normalization::UnicodeNormalization;
+
 /// Highest settable room user limit. Discord uses `0` for unlimited, so the
 /// settable range is `1..=MAX_ROOM_LIMIT`.
 pub const MAX_ROOM_LIMIT: u32 = 99;
@@ -187,11 +189,25 @@ pub fn room_bitrate(prefs: &[Option<u32>], creator_default: u32, tier_max: u32) 
     clamp_bitrate(raw, tier_max)
 }
 
+/// Fold one channel name for the unique-name collision check: NFKC, Unicode
+/// lowercase, then trim (legacy `rename.ts` rule). Literal names only: no
+/// template expansion is applied here.
+fn fold_collision_name(value: &str) -> String {
+    value
+        .nfkc()
+        .collect::<String>()
+        .to_lowercase()
+        .trim()
+        .to_owned()
+}
+
 /// Decide whether a literal name candidate conflicts under the guild's
-/// "unique names" setting. Literal names only: no template expansion,
-/// normalization or trimming is applied here.
+/// "unique names" setting. Literal names only: no template expansion is
+/// applied here.
 ///
-/// Comparison is case-sensitive byte equality (`"Room" != "room"`).
+/// Comparison folds NFKC + Unicode lowercase and trims before comparing, so
+/// `"Room"`, `"room"` and full-width `"Ｒｏｏｍ"` all conflict (legacy
+/// `rename.ts` rule).
 /// Returns `false` whenever `unique_names_enabled` is off, even on an exact
 /// match. The caller supplies the current voice-channel names to compare
 /// against (whether the candidate's own channel is included is the parent's
@@ -204,9 +220,10 @@ pub fn name_conflicts<S: AsRef<str>>(
     if !unique_names_enabled {
         return false;
     }
+    let folded = fold_collision_name(candidate);
     existing_voice_names
         .iter()
-        .any(|name| name.as_ref() == candidate)
+        .any(|name| fold_collision_name(name.as_ref()) == folded)
 }
 
 #[cfg(test)]
