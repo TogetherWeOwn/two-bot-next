@@ -132,6 +132,15 @@ class NightlyRoutingTests(unittest.TestCase):
         self.assertEqual(bare, [], "rustdoc reads bare <placeholder> as an unclosed HTML tag")
         self.assertNotIn("invalid_html_tags", source)
 
+    def test_store_pool_doc_link_is_fully_qualified_without_suppressing_doc_lint(self):
+        source = (ROOT / "crates/store/src/lib.rs").read_text()
+        self.assertIn("[`sqlx::Pool<sqlx::Postgres>`]", source)
+        # rustdoc resolves crate-level intra-doc links without the child
+        # modules' `use` imports, so a bare [`Pool`] is a broken link
+        # under -D warnings even though the type is imported elsewhere.
+        bare = re.findall(r"\[`Pool(?:<[^`]*>)?`\]", source)
+        self.assertEqual(bare, [], "Pool doc links must be sqlx:: qualified")
+
     def test_method_doc_links_are_self_qualified_without_suppressing_doc_lint(self):
         source = (ROOT / "crates/cutover/src/rest.rs").read_text()
         self.assertIn("[`Self::scan_channel`]", source)
