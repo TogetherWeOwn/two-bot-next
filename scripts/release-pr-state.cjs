@@ -105,8 +105,11 @@ module.exports = {findReleasePr, canReuseReleasePr, findNewestNativeCommit, find
 if (require.main === module) {
   const outputs = inspectReleasePr(process.env.GH_REPO, process.env.GITHUB_SHA, (endpoint, paginate) => {
     const args = ['api', endpoint];
-    if (paginate) args.push('--paginate', '--slurp');
-    return JSON.parse(execFileSync('gh', args, {encoding: 'utf8'}));
+    // Older runner CLIs lack --slurp. Emit one compact JSON page per line,
+    // including escaped newlines in release bodies and commit messages.
+    if (paginate) args.push('--paginate', '--jq', '@json');
+    const output = execFileSync('gh', args, {encoding: 'utf8'});
+    return paginate ? output.trim().split('\n').map(page => JSON.parse(page)) : JSON.parse(output);
   }, process.argv[2]);
   for (const [name, value] of Object.entries(outputs)) {
     assert(!value.includes('\n'), 'Unexpected multiline output');

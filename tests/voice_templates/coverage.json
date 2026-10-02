@@ -1,0 +1,1165 @@
+{
+  "version": 1,
+  "features": [
+    {
+      "id": "token:##",
+      "literal": "##",
+      "section": "V5",
+      "case_ids": [
+        "number-1-hash",
+        "number-2-hash",
+        "number-3-hash",
+        "number-4-hash",
+        "number-9-hash",
+        "number-10-hash",
+        "number-12-hash",
+        "number-19-hash",
+        "number-26-hash",
+        "number-27-hash",
+        "number-50-hash",
+        "number-99-hash",
+        "game-spec-example",
+        "numeric-excluded-##"
+      ]
+    },
+    {
+      "id": "token:$#",
+      "literal": "$#",
+      "section": "V5",
+      "case_ids": [
+        "number-1-bare",
+        "number-2-bare",
+        "number-3-bare",
+        "number-4-bare",
+        "number-9-bare",
+        "number-10-bare",
+        "number-12-bare",
+        "number-19-bare",
+        "number-26-bare",
+        "number-27-bare",
+        "number-50-bare",
+        "number-99-bare",
+        "compare-room-number"
+      ]
+    },
+    {
+      "id": "token:$0#",
+      "literal": "$0#",
+      "section": "V5",
+      "case_ids": [
+        "number-1-pad2",
+        "number-2-pad2",
+        "number-3-pad2",
+        "number-4-pad2",
+        "number-9-pad2",
+        "number-10-pad2",
+        "number-12-pad2",
+        "number-19-pad2",
+        "number-26-pad2",
+        "number-27-pad2",
+        "number-50-pad2",
+        "number-99-pad2"
+      ]
+    },
+    {
+      "id": "token:$00#",
+      "literal": "$00#",
+      "section": "V5",
+      "case_ids": [
+        "number-1-pad3",
+        "number-2-pad3",
+        "number-3-pad3",
+        "number-4-pad3",
+        "number-9-pad3",
+        "number-10-pad3",
+        "number-12-pad3",
+        "number-19-pad3",
+        "number-26-pad3",
+        "number-27-pad3",
+        "number-50-pad3",
+        "number-99-pad3"
+      ]
+    },
+    {
+      "id": "token:+#",
+      "literal": "+#",
+      "section": "V5",
+      "case_ids": [
+        "number-1-roman",
+        "number-2-roman",
+        "number-3-roman",
+        "number-4-roman",
+        "number-9-roman",
+        "number-10-roman",
+        "number-12-roman",
+        "number-19-roman",
+        "number-26-roman",
+        "number-27-roman",
+        "number-50-roman",
+        "number-99-roman",
+        "numeric-excluded-+#"
+      ]
+    },
+    {
+      "id": "token:@@nato@@",
+      "literal": "@@nato@@",
+      "section": "V5",
+      "case_ids": [
+        "nato-spec-example",
+        "nato-unresolved-1",
+        "nato-unresolved-26",
+        "nato-unresolved-27",
+        "nato-unresolved-52",
+        "nato-unresolved-53"
+      ]
+    },
+    {
+      "id": "token:@@owner@@",
+      "literal": "@@owner@@",
+      "section": "V5",
+      "case_ids": [
+        "name-Alex-owner",
+        "name-Zoë-owner",
+        "name-مرحبا-owner",
+        "name-Display-owner",
+        "condition-name-not-expanded",
+        "order-condition-token-style",
+        "discarded-branch",
+        "default-template-stable"
+      ]
+    },
+    {
+      "id": "token:@@creator@@",
+      "literal": "@@creator@@",
+      "section": "V5",
+      "case_ids": [
+        "name-Alex-creator",
+        "name-Zoë-creator",
+        "name-مرحبا-creator",
+        "name-Display-creator"
+      ]
+    },
+    {
+      "id": "token:@@original_creator@@",
+      "literal": "@@original_creator@@",
+      "section": "V5",
+      "case_ids": [
+        "original-Alex",
+        "original-Zoë",
+        "original-مرحبا",
+        "original-Display"
+      ]
+    },
+    {
+      "id": "token:@@num@@",
+      "literal": "@@num@@",
+      "section": "V5",
+      "case_ids": [
+        "nato-spec-example",
+        "humans-0",
+        "humans-1",
+        "humans-2",
+        "humans-3",
+        "humans-4",
+        "humans-7",
+        "humans-10",
+        "humans-25",
+        "humans-99",
+        "compare-equal-lt",
+        "compare-equal-gt",
+        "compare-equal-le",
+        "compare-equal-ge",
+        "compare-equal-eq",
+        "compare-equal-ne",
+        "compare-num-limit",
+        "resting-tokens-empty",
+        "resting-tokens-busy"
+      ]
+    },
+    {
+      "id": "token:@@num_others@@",
+      "literal": "@@num_others@@",
+      "section": "V5",
+      "case_ids": [
+        "others-0",
+        "others-1",
+        "others-2",
+        "others-3",
+        "others-4",
+        "others-7",
+        "others-10",
+        "others-25",
+        "others-99"
+      ]
+    },
+    {
+      "id": "token:@@num_live@@",
+      "literal": "@@num_live@@",
+      "section": "V5",
+      "case_ids": [
+        "live-count-offline",
+        "live-count-discord",
+        "live-count-external",
+        "live-count-both"
+      ]
+    },
+    {
+      "id": "token:@@limit@@",
+      "literal": "@@limit@@",
+      "section": "V5",
+      "case_ids": [
+        "limit-0-1",
+        "limit-1-1",
+        "limit-2-1",
+        "limit-4-3",
+        "limit-4-4",
+        "limit-99-2",
+        "compare-num-limit",
+        "compare-slots-limit"
+      ]
+    },
+    {
+      "id": "token:@@slots@@",
+      "literal": "@@slots@@",
+      "section": "V5",
+      "case_ids": [
+        "slots-0-1",
+        "slots-1-1",
+        "slots-2-1",
+        "slots-4-3",
+        "slots-4-4",
+        "slots-99-2",
+        "compare-slots-limit"
+      ]
+    },
+    {
+      "id": "token:@@game_name@@",
+      "literal": "@@game_name@@",
+      "section": "V5",
+      "case_ids": [
+        "game-spec-example",
+        "game-none",
+        "game-custom-none",
+        "game-alias",
+        "game-three-tie",
+        "game-two-tie",
+        "force-owner-minority",
+        "inactive-game-majority"
+      ]
+    },
+    {
+      "id": "token:@@stream_name@@",
+      "literal": "@@stream_name@@",
+      "section": "V5",
+      "case_ids": [
+        "stream-title-discord",
+        "stream-title-external",
+        "stream-title-both",
+        "stream-offline"
+      ]
+    },
+    {
+      "id": "token:@@num_playing@@",
+      "literal": "@@num_playing@@",
+      "section": "V5",
+      "case_ids": [
+        "party-1-num_playing",
+        "party-2-num_playing",
+        "party-4-num_playing",
+        "party-10-num_playing",
+        "playing-no-party-0",
+        "playing-no-party-1",
+        "playing-no-party-3"
+      ]
+    },
+    {
+      "id": "token:@@party_size@@",
+      "literal": "@@party_size@@",
+      "section": "V5",
+      "case_ids": [
+        "party-1-party_size",
+        "party-2-party_size",
+        "party-4-party_size",
+        "party-10-party_size",
+        "party-fallback-0",
+        "party-fallback-1",
+        "party-fallback-3",
+        "party-no-maximum",
+        "party-three-tie-party_size"
+      ]
+    },
+    {
+      "id": "token:@@party_state@@",
+      "literal": "@@party_state@@",
+      "section": "V5",
+      "case_ids": [
+        "party-1-party_state",
+        "party-2-party_state",
+        "party-4-party_state",
+        "party-10-party_state",
+        "party-three-tie-party_state",
+        "party-no-state"
+      ]
+    },
+    {
+      "id": "token:@@party_details@@",
+      "literal": "@@party_details@@",
+      "section": "V5",
+      "case_ids": [
+        "party-1-party_details",
+        "party-2-party_details",
+        "party-4-party_details",
+        "party-10-party_details",
+        "party-three-tie-party_details",
+        "party-no-state"
+      ]
+    },
+    {
+      "id": "token:@@weekday@@",
+      "literal": "@@weekday@@",
+      "section": "V5",
+      "case_ids": [
+        "weekday-Monday",
+        "weekday-Tuesday",
+        "weekday-Wednesday",
+        "weekday-Thursday",
+        "weekday-Friday",
+        "weekday-Saturday",
+        "weekday-Sunday"
+      ]
+    },
+    {
+      "id": "token:@@month@@",
+      "literal": "@@month@@",
+      "section": "V5",
+      "case_ids": [
+        "month-January",
+        "month-February",
+        "month-March",
+        "month-April",
+        "month-May",
+        "month-June",
+        "month-July",
+        "month-August",
+        "month-September",
+        "month-October",
+        "month-November",
+        "month-December"
+      ]
+    },
+    {
+      "id": "token:@@hour@@",
+      "literal": "@@hour@@",
+      "section": "V5",
+      "case_ids": [
+        "hour-0",
+        "hour-1",
+        "hour-9",
+        "hour-12",
+        "hour-23",
+        "compare-hour"
+      ]
+    },
+    {
+      "id": "token:@@random_emoji@@",
+      "literal": "@@random_emoji@@",
+      "section": "V5",
+      "case_ids": [
+        "random-emoji-stable",
+        "default-template-stable",
+        "random-emoji-stable-rename"
+      ]
+    },
+    {
+      "id": "plural:members",
+      "literal": "<<singular/plural>>",
+      "section": "V5",
+      "case_ids": [
+        "nato-spec-example",
+        "plural-members-0",
+        "plural-members-1",
+        "plural-members-2",
+        "plural-members-3",
+        "plural-members-4",
+        "plural-members-7",
+        "plural-members-10",
+        "plural-members-25",
+        "plural-members-99"
+      ]
+    },
+    {
+      "id": "plural:others",
+      "literal": "\\",
+      "section": "V5",
+      "case_ids": [
+        "plural-others-0",
+        "plural-others-1",
+        "plural-others-2",
+        "plural-others-3",
+        "plural-others-4",
+        "plural-others-7",
+        "plural-others-10",
+        "plural-others-25",
+        "plural-others-99"
+      ]
+    },
+    {
+      "id": "plural:party",
+      "literal": "|",
+      "section": "V5",
+      "case_ids": [
+        "party-plural-1",
+        "party-plural-2",
+        "party-plural-4",
+        "party-plural-10",
+        "party-no-state"
+      ]
+    },
+    {
+      "id": "random:choice",
+      "literal": "[[a/b/c]]",
+      "section": "V5",
+      "case_ids": [
+        "random-choice-stable",
+        "random-choice-single",
+        "default-template-stable",
+        "random-choice-stable-rename"
+      ]
+    },
+    {
+      "id": "random:list",
+      "literal": "[[list:name]]",
+      "section": "V5",
+      "case_ids": [
+        "random-list-stable",
+        "random-list-single",
+        "random-list-missing",
+        "random-list-stable-rename"
+      ]
+    },
+    {
+      "id": "state:resting",
+      "literal": "__resting/in use__",
+      "section": "V5",
+      "case_ids": [
+        "resting-0",
+        "resting-1",
+        "resting-4",
+        "resting-tokens-empty",
+        "resting-tokens-busy",
+        "resting-temporary"
+      ]
+    },
+    {
+      "id": "condition:PLAYING",
+      "literal": "PLAYING",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-PLAYING"
+      ]
+    },
+    {
+      "id": "condition:LIVE",
+      "literal": "LIVE",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-LIVE"
+      ]
+    },
+    {
+      "id": "condition:LIVE_DISCORD",
+      "literal": "LIVE_DISCORD",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-LIVE_DISCORD"
+      ]
+    },
+    {
+      "id": "condition:LIVE_EXTERNAL",
+      "literal": "LIVE_EXTERNAL",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-LIVE_EXTERNAL"
+      ]
+    },
+    {
+      "id": "condition:ANY_LIVE",
+      "literal": "ANY_LIVE",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-ANY_LIVE"
+      ]
+    },
+    {
+      "id": "condition:ROLE:id",
+      "literal": "ROLE:id",
+      "section": "V6",
+      "case_ids": [
+        "role-solo",
+        "role-role-owner",
+        "role-role-other",
+        "optional-else-true",
+        "nested-role-owner",
+        "nested-private-temporary-True",
+        "nested-solo",
+        "order-condition-token-style",
+        "discarded-branch"
+      ]
+    },
+    {
+      "id": "condition:ANY_ROLE:id",
+      "literal": "ANY_ROLE:id",
+      "section": "V6",
+      "case_ids": [
+        "any-role-solo",
+        "any-role-role-owner",
+        "any-role-role-other"
+      ]
+    },
+    {
+      "id": "condition:MEMBER:id",
+      "literal": "MEMBER:id",
+      "section": "V6",
+      "case_ids": [
+        "person-condition-MEMBER:owner",
+        "person-condition-MEMBER:absent"
+      ]
+    },
+    {
+      "id": "condition:OWNER:id",
+      "literal": "OWNER:id",
+      "section": "V6",
+      "case_ids": [
+        "person-condition-OWNER:owner",
+        "person-condition-OWNER:absent"
+      ]
+    },
+    {
+      "id": "condition:OWNER",
+      "literal": "OWNER",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-OWNER"
+      ]
+    },
+    {
+      "id": "condition:GAME",
+      "literal": "GAME",
+      "section": "V6",
+      "case_ids": [
+        "game-condition-GAME:Ape",
+        "game-condition-GAME=Apex",
+        "game-condition-GAME!=Apex",
+        "game-condition-GAME=Chess"
+      ]
+    },
+    {
+      "id": "condition:PLAYERS",
+      "literal": "PLAYERS",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-PLAYERS"
+      ]
+    },
+    {
+      "id": "condition:MAX",
+      "literal": "MAX",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-MAX"
+      ]
+    },
+    {
+      "id": "condition:RICH",
+      "literal": "RICH",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-RICH"
+      ]
+    },
+    {
+      "id": "condition:FULL",
+      "literal": "FULL",
+      "section": "V6",
+      "case_ids": [
+        "full-unlimited",
+        "full-full",
+        "full-space"
+      ]
+    },
+    {
+      "id": "condition:PRIVATE",
+      "literal": "PRIVATE",
+      "section": "V6",
+      "case_ids": [
+        "private-temporary-False",
+        "private-temporary-True",
+        "private-standalone-False",
+        "private-standalone-True",
+        "optional-else-false",
+        "nested-role-owner",
+        "nested-private-temporary-True",
+        "nested-solo",
+        "discarded-branch",
+        "malformed-template-delimiter"
+      ]
+    },
+    {
+      "id": "condition:WEEKEND",
+      "literal": "WEEKEND",
+      "section": "V6",
+      "case_ids": [
+        "weekend-Monday",
+        "weekend-Tuesday",
+        "weekend-Wednesday",
+        "weekend-Thursday",
+        "weekend-Friday",
+        "weekend-Saturday",
+        "weekend-Sunday"
+      ]
+    },
+    {
+      "id": "condition:WEEKDAY",
+      "literal": "WEEKDAY",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-WEEKDAY"
+      ]
+    },
+    {
+      "id": "condition:MONTH",
+      "literal": "MONTH",
+      "section": "V6",
+      "case_ids": [
+        "condition-unresolved-MONTH"
+      ]
+    },
+    {
+      "id": "compare:<",
+      "literal": "<",
+      "section": "V6",
+      "case_ids": [
+        "compare-equal-lt",
+        "compare-num-limit"
+      ]
+    },
+    {
+      "id": "compare:>",
+      "literal": ">",
+      "section": "V6",
+      "case_ids": [
+        "compare-equal-gt",
+        "compare-literal"
+      ]
+    },
+    {
+      "id": "compare:<=",
+      "literal": "<=",
+      "section": "V6",
+      "case_ids": [
+        "compare-equal-le"
+      ]
+    },
+    {
+      "id": "compare:>=",
+      "literal": ">=",
+      "section": "V6",
+      "case_ids": [
+        "compare-equal-ge",
+        "compare-hour"
+      ]
+    },
+    {
+      "id": "compare:=",
+      "literal": "=",
+      "section": "V6",
+      "case_ids": [
+        "compare-equal-eq",
+        "compare-room-number"
+      ]
+    },
+    {
+      "id": "compare:!=",
+      "literal": "!=",
+      "section": "V6",
+      "case_ids": [
+        "compare-equal-ne",
+        "compare-slots-limit"
+      ]
+    },
+    {
+      "id": "style:upper",
+      "literal": "upper",
+      "section": "V6",
+      "case_ids": [
+        "order-condition-token-style",
+        "discarded-branch",
+        "style-upper",
+        "style-chain",
+        "style-unknown-chain"
+      ]
+    },
+    {
+      "id": "style:caps",
+      "literal": "caps",
+      "section": "V6",
+      "case_ids": [
+        "style-caps"
+      ]
+    },
+    {
+      "id": "style:lower",
+      "literal": "lower",
+      "section": "V6",
+      "case_ids": [
+        "style-lower",
+        "style-chain"
+      ]
+    },
+    {
+      "id": "style:title",
+      "literal": "title",
+      "section": "V6",
+      "case_ids": [
+        "style-title",
+        "style-apostrophe"
+      ]
+    },
+    {
+      "id": "style:swap",
+      "literal": "swap",
+      "section": "V6",
+      "case_ids": [
+        "style-swap"
+      ]
+    },
+    {
+      "id": "style:scaps",
+      "literal": "scaps",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-scaps"
+      ]
+    },
+    {
+      "id": "style:rand",
+      "literal": "rand",
+      "section": "V6",
+      "case_ids": [
+        "random-case-stable",
+        "random-case-stable-rename"
+      ]
+    },
+    {
+      "id": "style:spaces",
+      "literal": "spaces",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-spaces"
+      ]
+    },
+    {
+      "id": "style:acro",
+      "literal": "acro",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-acro"
+      ]
+    },
+    {
+      "id": "style:remshort",
+      "literal": "remshort",
+      "section": "V6",
+      "case_ids": [
+        "style-remshort",
+        "style-short-case"
+      ]
+    },
+    {
+      "id": "style:<N>w",
+      "literal": "<N>w",
+      "section": "V6",
+      "case_ids": [
+        "style-1w",
+        "style-2w",
+        "style-zero-words"
+      ]
+    },
+    {
+      "id": "style:uwu",
+      "literal": "uwu",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-uwu"
+      ]
+    },
+    {
+      "id": "style:usd",
+      "literal": "usd",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-usd"
+      ]
+    },
+    {
+      "id": "style:bold",
+      "literal": "bold",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-bold"
+      ]
+    },
+    {
+      "id": "style:italic",
+      "literal": "italic",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-italic"
+      ]
+    },
+    {
+      "id": "style:bolditalic",
+      "literal": "bolditalic",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-bolditalic"
+      ]
+    },
+    {
+      "id": "style:script",
+      "literal": "script",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-script"
+      ]
+    },
+    {
+      "id": "style:boldscript",
+      "literal": "boldscript",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-boldscript"
+      ]
+    },
+    {
+      "id": "style:fraktur",
+      "literal": "fraktur",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-fraktur"
+      ]
+    },
+    {
+      "id": "style:boldfraktur",
+      "literal": "boldfraktur",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-boldfraktur"
+      ]
+    },
+    {
+      "id": "style:double",
+      "literal": "double",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-double"
+      ]
+    },
+    {
+      "id": "style:sans",
+      "literal": "sans",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-sans"
+      ]
+    },
+    {
+      "id": "style:boldsans",
+      "literal": "boldsans",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-boldsans"
+      ]
+    },
+    {
+      "id": "style:italicsans",
+      "literal": "italicsans",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-italicsans"
+      ]
+    },
+    {
+      "id": "style:bolditalicsans",
+      "literal": "bolditalicsans",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-bolditalicsans"
+      ]
+    },
+    {
+      "id": "style:mono",
+      "literal": "mono",
+      "section": "V6",
+      "case_ids": [
+        "style-unresolved-mono"
+      ]
+    },
+    {
+      "id": "rule:order",
+      "literal": "conditionals (innermost first)",
+      "section": "V5",
+      "case_ids": [
+        "order-condition-token-style",
+        "discarded-branch",
+        "trim-before-truncate"
+      ]
+    },
+    {
+      "id": "rule:trim",
+      "literal": "trim",
+      "section": "V5",
+      "case_ids": [
+        "trim-literal",
+        "trim-before-truncate",
+        "space-fallback"
+      ]
+    },
+    {
+      "id": "rule:truncate",
+      "literal": "truncate to 100 characters",
+      "section": "V5",
+      "case_ids": [
+        "truncate-1",
+        "truncate-99",
+        "truncate-100",
+        "truncate-101",
+        "truncate-150",
+        "trim-before-truncate",
+        "unicode-boundary"
+      ]
+    },
+    {
+      "id": "rule:fallback",
+      "literal": "fallback name if empty",
+      "section": "V5",
+      "case_ids": [
+        "empty-fallback",
+        "space-fallback",
+        "unicode-boundary"
+      ]
+    },
+    {
+      "id": "rule:unknown-condition",
+      "literal": "An unknown condition is false.",
+      "section": "V6",
+      "case_ids": [
+        "condition-unknown",
+        "condition-name-not-expanded"
+      ]
+    },
+    {
+      "id": "rule:unknown-style",
+      "literal": "Unknown modes leave the text unchanged.",
+      "section": "V6",
+      "case_ids": [
+        "style-unknown",
+        "style-unknown-chain"
+      ]
+    },
+    {
+      "id": "rule:nested",
+      "literal": "blocks nest.",
+      "section": "V6",
+      "case_ids": [
+        "nested-role-owner",
+        "nested-private-temporary-True",
+        "nested-solo",
+        "discarded-branch"
+      ]
+    },
+    {
+      "id": "rule:optional-else",
+      "literal": "`// no` is optional",
+      "section": "V6",
+      "case_ids": [
+        "optional-else-false",
+        "optional-else-true"
+      ]
+    },
+    {
+      "id": "rule:style-chain",
+      "literal": "Modes chain with `+`",
+      "section": "V6",
+      "case_ids": [
+        "style-chain",
+        "style-unknown-chain"
+      ]
+    },
+    {
+      "id": "rule:name-in-condition",
+      "literal": "they never match inside",
+      "section": "V6",
+      "case_ids": [
+        "condition-name-not-expanded"
+      ]
+    },
+    {
+      "id": "rule:non-numeric",
+      "literal": "`##` and `+#` are not numeric",
+      "section": "V6",
+      "case_ids": [
+        "numeric-excluded-##",
+        "numeric-excluded-+#"
+      ]
+    },
+    {
+      "id": "rule:default-template",
+      "literal": "@@random_emoji@@ @@owner@@'s [[den/crew/lair/hangout/base/club]]",
+      "section": "V5",
+      "case_ids": [
+        "default-template-stable"
+      ]
+    }
+  ],
+  "ambiguities": [
+    {
+      "id": "nato-spelling-cycle",
+      "question": "Exact alphabet spelling, cycle separator and first wrapped cycle suffix are not specified. Pin Charlie from the example only until the spec defines these.",
+      "case_ids": [
+        "nato-unresolved-1",
+        "nato-unresolved-26",
+        "nato-unresolved-27",
+        "nato-unresolved-52",
+        "nato-unresolved-53"
+      ]
+    },
+    {
+      "id": "game-tie-format",
+      "question": "A two-way tie must show both names, but their ordering and joining separator are unspecified.",
+      "case_ids": [
+        "game-two-tie"
+      ]
+    },
+    {
+      "id": "force-single-game",
+      "question": "Does preferring the owner override a strict majority, or only break a tie?",
+      "case_ids": [
+        "force-owner-minority"
+      ]
+    },
+    {
+      "id": "inactive-game-vote",
+      "question": "How do no-visible-activity members vote, and what label wins against an active game?",
+      "case_ids": [
+        "inactive-game-majority"
+      ]
+    },
+    {
+      "id": "offline-stream",
+      "question": "The owner stream title is specified while live, but its output when offline or title is absent is not specified.",
+      "case_ids": [
+        "stream-offline"
+      ]
+    },
+    {
+      "id": "party-tie-and-empty",
+      "question": "Two equally largest parties, no-party state/details, and party plurals without a party are unspecified.",
+      "case_ids": [
+        "party-no-state"
+      ]
+    },
+    {
+      "id": "condition-grammar",
+      "question": "PLAYING/LIVE variants do not state owner-vs-room scope; bare OWNER, PLAYERS, MAX, RICH, WEEKDAY and MONTH lack operand grammar or truth definitions. These examples are probes, not chosen semantics.",
+      "case_ids": [
+        "condition-unresolved-PLAYING",
+        "condition-unresolved-LIVE",
+        "condition-unresolved-LIVE_DISCORD",
+        "condition-unresolved-LIVE_EXTERNAL",
+        "condition-unresolved-ANY_LIVE",
+        "condition-unresolved-OWNER",
+        "condition-unresolved-PLAYERS",
+        "condition-unresolved-MAX",
+        "condition-unresolved-RICH",
+        "condition-unresolved-WEEKDAY",
+        "condition-unresolved-MONTH"
+      ]
+    },
+    {
+      "id": "numeric-##",
+      "question": "The spec excludes ## from numeric comparisons but does not specify parser rejection vs false-condition fallback.",
+      "case_ids": [
+        "numeric-excluded-##"
+      ]
+    },
+    {
+      "id": "numeric-+#",
+      "question": "The spec excludes +# from numeric comparisons but does not specify parser rejection vs false-condition fallback.",
+      "case_ids": [
+        "numeric-excluded-+#"
+      ]
+    },
+    {
+      "id": "style-mappings",
+      "question": "scaps, spaces, acro, uwu, usd and Unicode fonts need exact mappings, punctuation/spacing rules and unsupported-character behaviour. Names alone do not define an exact output oracle.",
+      "case_ids": [
+        "style-unresolved-scaps",
+        "style-unresolved-spaces",
+        "style-unresolved-acro",
+        "style-unresolved-uwu",
+        "style-unresolved-usd",
+        "style-unresolved-bold",
+        "style-unresolved-italic",
+        "style-unresolved-bolditalic",
+        "style-unresolved-script",
+        "style-unresolved-boldscript",
+        "style-unresolved-fraktur",
+        "style-unresolved-boldfraktur",
+        "style-unresolved-double",
+        "style-unresolved-sans",
+        "style-unresolved-boldsans",
+        "style-unresolved-italicsans",
+        "style-unresolved-bolditalicsans",
+        "style-unresolved-mono"
+      ]
+    },
+    {
+      "id": "word-boundaries",
+      "question": "Word splitting, remshort case-sensitivity, title apostrophes and zero-word behaviour are unspecified.",
+      "case_ids": [
+        "style-short-case",
+        "style-apostrophe",
+        "style-zero-words"
+      ]
+    },
+    {
+      "id": "random-details",
+      "question": "Seed format/hash/PRNG, emoji inventory, choice identity across template edits, missing/empty lists and slash escaping are unspecified. Different seeds are not required to yield different outputs.",
+      "case_ids": [
+        "random-list-missing"
+      ]
+    },
+    {
+      "id": "resting-other-kinds",
+      "question": "Resting applies only to standalone channels; handling its syntax on temporary or stage channels is unspecified.",
+      "case_ids": [
+        "resting-temporary"
+      ]
+    },
+    {
+      "id": "fallback-and-unicode",
+      "question": "The fallback literal and character counting (code points vs graphemes/UTF-16 units) are unspecified.",
+      "case_ids": [
+        "unicode-boundary"
+      ]
+    },
+    {
+      "id": "malformed-template",
+      "question": "Invalid templates are flagged by V7, but unmatched/nested delimiters, escaping and unknown tokens lack a parser/error contract. Fixture-schema failures are tested separately.",
+      "case_ids": [
+        "malformed-template-delimiter"
+      ]
+    }
+  ]
+}
