@@ -169,7 +169,7 @@ impl std::fmt::Debug for SigningKey {
 pub enum KeySpecError {
     #[error("TWO_INTERNAL_KEYS entries must be \"key-id:secret\"")]
     MalformedEntry,
-    #[error("TWO_INTERNAL_KEYS: secret for \"{0}\" is shorter than 32 characters")]
+    #[error("TWO_INTERNAL_KEYS: secret for \"{0}\" is shorter than 32 bytes")]
     SecretTooShort(String),
     #[error("TWO_INTERNAL_ACTIONS=1 but no signing keys are configured")]
     NoKeys,
