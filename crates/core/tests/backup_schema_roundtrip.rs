@@ -9,8 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -1161,5 +1162,262 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
         "v3-missing audit history resumes an empty serial sequence"
     );
     assert_guards_work(pool).await;
+    db.close().await.unwrap();
+}
+
+/// The bootstrap's service URL with only the database path replaced.
+/// TestDatabase::create already refused anything but agent_test with an
+/// explicit empty password on agent-testdb:5432 and no query, so the shipped
+/// binary below can reach nothing else.
+fn fixture_url(db: &TestDatabase) -> String {
+    let bootstrap = std::env::var("TWO_TEST_DATABASE_URL").expect("bootstrap already validated");
+    let (service, _) = bootstrap
+        .rsplit_once('/')
+        .expect("validated bootstrap names a database");
+    format!("{service}/{}", db.name())
+}
+
+/// The drill script interpolates both paths unquoted, as the unit does.
+fn shell_word(path: &Path) -> &str {
+    let text = path.to_str().expect("UTF-8 path");
+    assert!(
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b)),
+        "path must not need shell quoting: {text}"
+    );
+    text
+}
+
+/// The shipped drill's own ExecStart body, with only its archive directory and
+/// binary replaced, so a changed selector or restore invocation is exercised
+/// here rather than a copy of it.
+fn shipped_drill_script(archives: &Path, binary: &Path) -> String {
+    let unit = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/two-bot-next-restore-drill.service"),
+    )
+    .expect("read the shipped restore drill unit");
+    // systemd joins a line ending in a backslash with the next one and
+    // replaces the backslash with a space (systemd.syntax(7)).
+    let joined = unit.replace("\\\n", " ");
+    let exec = joined
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .expect("drill unit has an ExecStart");
+    let script = exec
+        .trim_end()
+        .strip_prefix("/usr/bin/bash -o pipefail -c '")
+        .and_then(|rest| rest.strip_suffix('\''))
+        .expect("drill runs one single-quoted bash -o pipefail script");
+    for shipped in ["/var/backups/two-bot-next/", "/opt/two-bot-next/two-bot "] {
+        assert_eq!(script.matches(shipped).count(), 1, "{shipped} in {script}");
+    }
+    script
+        .replace(
+            "/var/backups/two-bot-next/",
+            &format!("{}/", shell_word(archives)),
+        )
+        .replace(
+            "/opt/two-bot-next/two-bot ",
+            &format!("{} ", shell_word(binary)),
+        )
+}
+
+fn shipped_cli(command: &mut Command, label: &str) -> Output {
+    let output = command.output().expect("start the shipped two-bot binary");
+    // Drill evidence for the CI log. The CLI never prints database URLs.
+    println!(
+        "--- {label}: {}\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+async fn schema_version(pool: &PgPool) -> (i64, String, i64) {
+    sqlx::query_as(
+        "SELECT version, description, (SELECT count(*) FROM _sqlx_migrations) \
+         FROM _sqlx_migrations ORDER BY version DESC LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn assert_drill_verified(output: &Output, archive: &Path, tables: &[String]) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "drill failed");
+    assert!(
+        stdout.contains(&format!(
+            "drill: restoring {} into the scratch database",
+            archive.display()
+        )),
+        "the drill must select the newest archive, not the older decoy"
+    );
+    assert_eq!(stdout.lines().last(), Some("RESTORE VERIFIED"));
+    assert!(!stdout.contains("MISMATCH"));
+    assert!(!stderr.contains("WARNING"), "no baseline rows initialized");
+    assert!(
+        !stderr.contains("does not have"),
+        "no archived column dropped"
+    );
+    let verified = stdout
+        .lines()
+        .filter(|line| line.contains(" manifest ") && line.ends_with(" ok"))
+        .count();
+    assert_eq!(verified, tables.len(), "one verified count line per table");
+    for table in tables {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{table} "))
+                    && line.ends_with(" ok")),
+            "{table} restored with a matching count"
+        );
+    }
+}
+
+/// The shipped monthly drill on the complete migrated schema (TOG-11804): the
+/// built `two-bot backup`, then the restore drill unit's own ExecStart script,
+/// into an independent freshly migrated scratch database, twice. CI's backup
+/// CLI step supplies the binary; without TWO_BOT_TEST_BACKUP_BIN this skips.
+#[tokio::test]
+async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema() {
+    let Some(binary) = std::env::var_os("TWO_BOT_TEST_BACKUP_BIN").map(PathBuf::from) else {
+        eprintln!("SKIP shipped restore drill: TWO_BOT_TEST_BACKUP_BIN is not set");
+        return;
+    };
+    let Some(db) = database().await else {
+        return;
+    };
+    let source = db.pool();
+    seed(source).await;
+    let tables = covered_tables(source).await;
+    let before = snapshot(source, &tables).await;
+    let version = schema_version(source).await;
+    println!(
+        "drill: schema at migration {} {} ({} applied), {} bot-owned tables",
+        version.0,
+        version.1,
+        version.2,
+        tables.len()
+    );
+
+    // An older archive the newest-file selector must pass over.
+    let directory = ArchiveDirectory::new();
+    let decoy = directory.path("two-funnel-20000101T000000Z.ndjson.gz");
+    std::fs::write(&decoy, b"not a backup").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&decoy)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(946_684_800))
+        .unwrap();
+    let backup = shipped_cli(
+        Command::new(&binary)
+            .arg("backup")
+            .current_dir(&directory.0)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TWO_DATABASE_URL", fixture_url(&db))
+            .env("TWO_BACKUP_DIR", &directory.0)
+            .env("TWO_BACKUP_KEEP", "14"),
+        "two-bot backup",
+    );
+    assert!(backup.status.success(), "backup failed");
+    assert!(String::from_utf8_lossy(&backup.stdout).contains("backup: done"));
+    let published: Vec<PathBuf> = std::fs::read_dir(&directory.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| *path != decoy)
+        .collect();
+    let [archive] = published.as_slice() else {
+        panic!("exactly one published archive besides the decoy: {published:?}");
+    };
+    let contents = inspect(archive).unwrap();
+    assert_archive_matches(&contents, &before);
+    assert_eq!(contents.manifest.events_sequence, 107);
+
+    // Independent, freshly migrated scratch target, as the drill unit expects.
+    let target = database().await.expect("test bootstrap already configured");
+    let pool = target.pool();
+    assert_eq!(schema_version(pool).await, version);
+    sqlx::raw_sql(
+        "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY); \
+         INSERT INTO schema_migrations VALUES ('destination-ledger-only'); \
+         ALTER TABLE members ADD COLUMN backup_identity BIGINT GENERATED ALWAYS AS IDENTITY \
+             (START WITH 17 INCREMENT BY 3) UNIQUE;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let guard_before = triggers(pool).await;
+    let script = shipped_drill_script(&directory.0, &binary);
+    let target_url = fixture_url(&target);
+    // Month one restores into a dirtied scratch; month two into the previous
+    // drill's result, as the monthly timer does.
+    for month in 1..=2 {
+        dirty_target(pool).await;
+        let cas_before = next_cas_token(pool).await;
+        let drill = shipped_cli(
+            Command::new("/usr/bin/bash")
+                .args(["-o", "pipefail", "-c", script.as_str()])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("TWO_RESTORE_URL", &target_url),
+            &format!("restore drill, month {month}"),
+        );
+        assert_drill_verified(&drill, archive, &tables);
+        let after = snapshot(pool, &tables).await;
+        for table in &tables {
+            println!(
+                "drill: month {month} {table:32} source {:5} restored {:5}",
+                before[table].rows.len(),
+                after[table].rows.len()
+            );
+        }
+        assert_eq!(after, before, "month {month}: every archived row");
+        assert_fresh_cas_tokens(pool, cas_before).await;
+        assert_eq!(triggers(pool).await, guard_before);
+        let cooldowns: i64 = sqlx::query_scalar("SELECT count(*) FROM xp_cooldowns")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(cooldowns, 0, "excluded throttles are not replayed");
+    }
+    assert_guards_work(pool).await;
+
+    let allocations = allocate_owned_sequences(pool, false).await;
+    for ((table, column), (next, increment)) in &allocations {
+        println!("drill: sequence {table}.{column} resumed at {next} (increment {increment})");
+    }
+    assert_default_inserts(pool, &allocations).await;
+    let allocated_version: i64 = sqlx::query_scalar("SELECT nextval('guild_settings_version_seq')")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        allocated_version, 84,
+        "standalone settings version resumes beyond restored max"
+    );
+    println!("drill: sequence guild_settings_version_seq resumed at {allocated_version}");
+    let inserted_version: i64 = sqlx::query_scalar("INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES ('100000000000000001', 'TWO_BACKUP_TEST', 'true', nextval('guild_settings_version_seq'), 'post-restore') RETURNING version").fetch_one(pool).await.unwrap();
+    assert_eq!(inserted_version, 85);
+    for (table, statement) in [
+        ("internal_nonces", "INSERT INTO internal_nonces SELECT * FROM internal_nonces WHERE nonce_hash = repeat('a', 64)"),
+        ("internal_discord_events", "INSERT INTO internal_discord_events SELECT * FROM internal_discord_events WHERE event_hash = repeat('3', 64)"),
+        ("internal_idempotency", "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')"),
+        ("feed_deliveries", "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'"),
+        ("self_role_panel_claims", "INSERT INTO self_role_panel_claims SELECT * FROM self_role_panel_claims"),
+        ("automod_delivery_claims", "INSERT INTO automod_delivery_claims SELECT * FROM automod_delivery_claims"),
+    ] {
+        assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
+        println!("drill: replay refused (23505) in {table}");
+    }
+    target.close().await.unwrap();
     db.close().await.unwrap();
 }
