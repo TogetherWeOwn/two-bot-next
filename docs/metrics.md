@@ -36,9 +36,9 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
-`community_scorecard`, `inactivity`, `audit_retry` and `scheduled_messages` (the
-15 s scheduled-message ticker). The community and audit names may be parked by
-configuration.
+`community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery` and
+`scheduled_messages` (the 15 s scheduled-message ticker). The community, audit,
+recovery and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.

@@ -12,9 +12,14 @@ import uuid
 
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
-# Raised from 10 MiB: the durable store runtime plus the ticket runtime from main
-# measured 10.01 MiB under opt-level z/LTO/strip; image budget unchanged.
-BINARY_MAX_BYTES = 11 * MIB
+# Recalibrated for the linked S4 self-role runtime (TOG-10292): PR head
+# measured 10,805,344 bytes (10.30 MiB) on the ephemeral runner vs main
+# baseline 10,377,112 bytes (9.90 MiB) at ec49663. Growth is linked
+# runtime/handlers/REST + previously-dead domain/store code, no new
+# dependencies; release profile already minimal (opt-level=z, lto, strip).
+# Per b1-baseline calibration (measured * 1.4 rounded up to the next MiB):
+# 10.30 * 1.4 = 14.42 -> 15 MiB. Image still within budget (101.61/112).
+BINARY_MAX_BYTES = 15 * MIB
 BINARY = "/home/two-bot/two-bot"
 CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
@@ -132,17 +137,20 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             ["token_invalid", "ready"],
         ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
         # The runtime always reports informational job status alongside
-        # readiness; with no credentials all eight jobs must be parked,
-        # non-running and never started. Jobs never flip the 503 above.
+        # readiness; with no credentials all nine jobs must be parked,
+        # non-running and never started. Jobs never flip the 503 above. The
+        # audit-retry and self-role recovery entries are always listed
+        # (parked when their services are unregistered).
         parked = {"parked": True, "running": False, "last_start": None,
                   "last_success": None, "last_error_class": None,
                   "consecutive_failures": 0}
         require(body.get("jobs") == {
             name: dict(parked) for name in (
                 "counter", "rank", "scheduled_events", "presence_probe",
-                "community_scorecard", "inactivity", "audit_retry", "scheduled_messages",
+                "community_scorecard", "inactivity", "audit_retry",
+                "self_role_recovery", "scheduled_messages",
             )
-        }, "/readyz body must report all eight jobs parked, non-running, never started")
+        }, "/readyz body must report all nine jobs parked, non-running, never started")
         # Check PID 1, not merely Docker's configured user or an exec helper.
         status = docker("exec", name, "cat", "/proc/1/status").stdout
         uid = next(line.split()[1:] for line in status.splitlines() if line.startswith("Uid:"))
