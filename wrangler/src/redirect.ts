@@ -132,12 +132,14 @@ export function clickIdempotencyKey(click: RedirectClick): string {
  *   (`capacity / refillPerSecond`), so eviction can only discard buckets that
  *   refill would already have restored to full — a key that still owes tokens
  *   is never idle-expired, and expiry never grants tokens refill would not.
- * - Cardinality cap: at most `maxBuckets` entries. A new key past the cap is
- *   denied (fail closed) — overflow sheds load, it never disables throttling.
- *   Buckets already tracked are unaffected by the cap.
+ * - Cardinality cap: at most `maxBuckets` entries. A new key at the cap first
+ *   reaps idle-expired entries; it is denied (fail closed) only if the map is
+ *   still full of live ones, so overflow sheds load and never disables
+ *   throttling. Buckets already tracked are unaffected by the cap.
  * - Bounded cleanup: every `take` touches its key (LRU order, most-recent at
  *   the back) then reaps at most `sweepBudget` idle-expired entries from the
- *   front. Per-call work is O(sweepBudget), independent of map size.
+ *   front; a new key at the cap runs the same reap before its verdict. Per-call
+ *   work is O(sweepBudget), independent of map size.
  */
 export class TokenBuckets {
   private buckets = new Map<string, { tokens: number; updatedAt: number }>();
@@ -200,7 +202,13 @@ export class TokenBuckets {
     }
     if (!b) {
       if (this.buckets.size >= this.maxBuckets) {
-        // Fail closed: shed the unknown caller, keep every tracked throttle.
+        // Reap first, so a map filled with one-time keys drains on new-key
+        // traffic alone instead of waiting for a tracked key to return.
+        this.sweep(t);
+      }
+      if (this.buckets.size >= this.maxBuckets) {
+        // Still full of live entries. Fail closed: shed the unknown caller and
+        // keep every tracked throttle.
         return {
           allowed: false,
           retryAfter: Math.max(1, Math.ceil(this.idleTtlMs / 1000)),
