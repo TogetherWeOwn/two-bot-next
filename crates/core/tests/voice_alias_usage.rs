@@ -69,7 +69,7 @@ fn nick_set_and_reset_drive_owner_display() {
         NickUpdate::Set(nick) => nick.into_inner(),
         NickUpdate::Reset => unreachable!("Captain is not the reset keyword"),
     };
-    assert_eq!(owner_display(Some(&stored), "Rick"), "Captain");
+    assert_eq!(owner_display(Some(stored.as_str()), "Rick"), "Captain");
     // No nick stored: the display name shows.
     assert_eq!(owner_display(None, "Rick"), "Rick");
     // Reset (any ASCII case, with whitespace) forgets the name.
