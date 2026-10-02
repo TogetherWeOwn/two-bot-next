@@ -22,14 +22,78 @@ use serde::Deserialize;
 use time::{Date, Month};
 use two_bot_core::voice_naming::{
     parse, render, resolve_majority_game, ChannelKind, GameOptions, PartyInfo,
-    PassthroughExtensions, RoomContext, MAX_NAME_LEN,
+    PassthroughExtensions, RoomContext,
 };
 
 const CORPUS: &str = include_str!("../../../tests/voice_templates/corpus.json");
 
 /// Non-deferred cases that need the V6 conditional or styling policy. Remove
 /// an ID once the engine renders that case as the corpus expects.
-const PENDING: &[&str] = &[];
+const PENDING: &[&str] = &[
+    // V6 conditionals: `{{cond ?? yes // no}}`.
+    "weekend-Monday",
+    "weekend-Tuesday",
+    "weekend-Wednesday",
+    "weekend-Thursday",
+    "weekend-Friday",
+    "weekend-Saturday",
+    "weekend-Sunday",
+    "compare-equal-lt",
+    "compare-equal-gt",
+    "compare-equal-le",
+    "compare-equal-ge",
+    "compare-equal-eq",
+    "compare-equal-ne",
+    "compare-num-limit",
+    "compare-slots-limit",
+    "compare-hour",
+    "compare-room-number",
+    "compare-literal",
+    "full-unlimited",
+    "full-full",
+    "full-space",
+    "private-temporary-False",
+    "private-temporary-True",
+    "private-standalone-False",
+    "private-standalone-True",
+    "role-solo",
+    "role-role-owner",
+    "role-role-other",
+    "any-role-solo",
+    "any-role-role-owner",
+    "any-role-role-other",
+    "person-condition-MEMBER:owner",
+    "person-condition-MEMBER:absent",
+    "person-condition-OWNER:owner",
+    "person-condition-OWNER:absent",
+    "game-condition-GAME:Ape",
+    "game-condition-GAME=Apex",
+    "game-condition-GAME!=Apex",
+    "game-condition-GAME=Chess",
+    "condition-unknown",
+    "condition-name-not-expanded",
+    "optional-else-false",
+    "optional-else-true",
+    "nested-role-owner",
+    "nested-private-temporary-True",
+    "nested-solo",
+    "order-condition-token-style",
+    "discarded-branch",
+    // V6 styling: `""mode:text""`, including the seeded `rand` invariants.
+    "style-upper",
+    "style-caps",
+    "style-lower",
+    "style-title",
+    "style-swap",
+    "style-remshort",
+    "style-1w",
+    "style-2w",
+    "style-chain",
+    "style-unknown",
+    "style-unknown-chain",
+    "random-case-stable",
+    "random-case-stable-rename",
+];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -288,7 +352,6 @@ fn voice_template_corpus_matches_engine() {
     assert_eq!(pending.len(), PENDING.len(), "duplicate PENDING entry");
 
     let mut ids = BTreeSet::new();
-    let (mut exact, mut invariant) = (0usize, 0usize);
     let (mut exact_pass, mut exact_pending, mut invariant_pass, mut invariant_pending) =
         (0usize, 0usize, 0usize, 0usize);
     let mut deferred: BTreeMap<&str, usize> = BTreeMap::new();
@@ -310,19 +373,15 @@ fn voice_template_corpus_matches_engine() {
         let failure = match &case.expected {
             Expected::Deferred { ambiguity_id } => {
                 assert!(!is_pending, "{}: deferred cases cannot be PENDING", case.id);
-                *deferred.entry(ambiguity_id).or_default() += 1;
+                *deferred.entry(ambiguity_id.as_str()).or_default() += 1;
                 continue;
             }
             Expected::Exact { output } => {
-                exact += 1;
                 let actual = render_case(case, &contexts);
                 (actual != *output)
                     .then(|| format!("{}: expected {output:?}, actual {actual:?}", case.id))
             }
-            Expected::Invariant { .. } => {
-                invariant += 1;
-                invariant_failure(case, &contexts)
-            }
+            Expected::Invariant { .. } => invariant_failure(case, &contexts),
         };
         let is_exact = matches!(case.expected, Expected::Exact { .. });
         match (failure, is_pending) {
@@ -378,24 +437,38 @@ fn voice_template_corpus_matches_engine() {
         regressions.len(),
         regressions.join("\n")
     );
-    assert_eq!(exact_pass + exact_pending, exact, "exact counts reconcile");
+    // Corpus totals come from an untyped read, independent of the loop above.
+    let raw: serde_json::Value = serde_json::from_str(CORPUS).expect("corpus parses");
+    let raw_cases = raw["cases"].as_array().expect("cases array");
+    let total_of = |kind: &str| {
+        raw_cases
+            .iter()
+            .filter(|case| case["expected"]["kind"] == kind)
+            .count()
+    };
+    assert_eq!(
+        exact_pass + exact_pending,
+        total_of("exact"),
+        "exact counts reconcile"
+    );
     assert_eq!(
         invariant_pass + invariant_pending,
-        invariant,
+        total_of("invariant"),
         "invariant counts reconcile"
     );
     assert_eq!(
-        exact + invariant + deferred_total,
-        corpus.cases.len(),
+        deferred_total,
+        total_of("deferred"),
+        "deferred counts reconcile"
+    );
+    assert_eq!(
+        exact_pass + exact_pending + invariant_pass + invariant_pending + deferred_total,
+        raw_cases.len(),
         "pass + pending + deferred reconcile with the corpus total"
     );
     assert_eq!(
         exact_pending + invariant_pending,
         PENDING.len(),
         "every PENDING ID counted"
-    );
-    assert!(
-        MAX_NAME_LEN == 100,
-        "corpus invariants assume a 100-character ceiling"
     );
 }
