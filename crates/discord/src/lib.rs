@@ -23,6 +23,7 @@ pub mod internal_events;
 pub mod leveling_runtime;
 mod message_safety;
 pub mod pipeline;
+pub mod ratelimit_guard;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};

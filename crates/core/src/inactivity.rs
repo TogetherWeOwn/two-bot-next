@@ -152,6 +152,95 @@ pub fn flag_inactive(
     InactivityOutcome { flagged }
 }
 
+/// Header row of the reengagement CSV (always the first line).
+pub const REENGAGEMENT_CSV_HEADER: &str = "guild_id,member_id,occurred_at,threshold_days";
+
+/// Unscoped invocation (no `--guild`): the header plus a `#`-prefixed hint,
+/// so the CLI exits 0 with parseable, empty CSV and never opens a database.
+#[must_use]
+pub fn render_reengagement_unscoped() -> String {
+    format!("{REENGAGEMENT_CSV_HEADER}\n# no --guild given; pass --guild <ID> to list one guild\n")
+}
+
+/// On-demand reengagement list (parity §4/§9: on-demand CLI only, never
+/// scheduled): render the selector's flagged members row-for-row as CSV.
+/// The header always prints; an empty outcome yields the header plus one
+/// `#`-prefixed hint line the CSV parser skips, and the CLI exits 0.
+///
+/// The outcome carries no channel/message/DM field, so this renderer cannot
+/// feed a send path (parity forbids DMs). IDs are validated as snowflakes
+/// before emission, mirroring the `raid_tools::cohort_csv` gate: a bad ID is
+/// a hard error, not a skipped row.
+pub fn render_reengagement_csv(outcome: &InactivityOutcome) -> Result<String, &'static str> {
+    let mut out = format!("{REENGAGEMENT_CSV_HEADER}\n");
+    if outcome.flagged.is_empty() {
+        out.push_str("# no members past the inactivity cutoff; list is empty\n");
+        return Ok(out);
+    }
+    for f in &outcome.flagged {
+        if !is_snowflake_like(&f.guild_id) || !is_snowflake_like(&f.member_id) {
+            return Err("reengagement CSV emits snowflake IDs only");
+        }
+        out.push_str(&format!(
+            "{},{},{},{}\n",
+            f.guild_id, f.member_id, f.occurred_at, f.threshold_days
+        ));
+    }
+    Ok(out)
+}
+
+/// Canonical Discord snowflake shape (17–20 ASCII digits, no leading zero),
+/// mirroring [`crate::raid_removal::validate_targets`] without its
+/// non-emptiness/dedup list semantics.
+#[must_use]
+pub fn is_snowflake_like(id: &str) -> bool {
+    (17..=20).contains(&id.len())
+        && !id.starts_with('0')
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && id.parse::<u64>().is_ok()
+}
+
+/// Parse the CSV [`render_reengagement_csv`] emits back into flagged rows
+/// (round-trip acceptance: CSV parseable, row-for-row identical to the
+/// selector). `#`-prefixed lines are skipped (the empty-state hint).
+/// Returns an error for a bad header, a bad row, or a non-snowflake ID.
+pub fn parse_reengagement_csv(text: &str) -> Result<Vec<FlaggedMember>, &'static str> {
+    let mut lines = text.lines();
+    if lines.next() != Some(REENGAGEMENT_CSV_HEADER) {
+        return Err("reengagement CSV has an unexpected header");
+    }
+    let mut rows = Vec::new();
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cells: Vec<_> = line.split(',').collect();
+        if cells.len() != 4 {
+            return Err("reengagement CSV row must have 4 cells");
+        }
+        let [guild_id, member_id, occurred_at, threshold_days] = cells[..] else {
+            unreachable!();
+        };
+        if !is_snowflake_like(guild_id) || !is_snowflake_like(member_id) {
+            return Err("reengagement CSV row has a non-snowflake ID");
+        }
+        if super::funnel::parse_iso_millis(occurred_at).is_none() {
+            return Err("reengagement CSV row has an invalid timestamp");
+        }
+        let threshold_days: u64 = threshold_days
+            .parse()
+            .map_err(|_| "reengagement CSV row has an invalid threshold")?;
+        rows.push(FlaggedMember {
+            guild_id: guild_id.to_owned(),
+            member_id: member_id.to_owned(),
+            occurred_at: occurred_at.to_owned(),
+            threshold_days,
+        });
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +437,102 @@ mod tests {
             member_inactive_event_key("g", "m", "2026-09-07T00:00:00.000Z"),
             "g:m:member_inactive:2026-09-07T00:00:00.000Z"
         );
+    }
+
+    fn snowflake_candidate(member: &str, last_seen: i64) -> InactivityCandidate {
+        InactivityCandidate {
+            guild_id: "100000000000000010".to_owned(),
+            member_id: member.to_owned(),
+            last_seen_ms: Some(last_seen),
+            flagged_at_ms: None,
+            is_bot: false,
+            has_left: false,
+        }
+    }
+
+    #[test]
+    fn reengagement_csv_matches_selector_row_for_row() {
+        // The CSV renders exactly the selector's flagged set, in order: the
+        // acceptance row-for-row check.
+        let now = ms("2026-09-07T00:00:00.000Z");
+        let rows = vec![
+            snowflake_candidate("100000000000000001", now - 20 * DAY),
+            snowflake_candidate("100000000000000002", now - DAY),
+            snowflake_candidate("100000000000000003", now - 60 * DAY),
+        ];
+        let outcome = flag_inactive(&rows, now, 14);
+        let expected: Vec<String> = select_inactive(&rows, inactivity_cutoff_ms(now, 14))
+            .into_iter()
+            .map(|c| c.member_id.clone())
+            .collect();
+        assert_eq!(expected, ["100000000000000001", "100000000000000003"]);
+        let csv = render_reengagement_csv(&outcome).unwrap();
+        let lines: Vec<_> = csv.lines().collect();
+        assert_eq!(lines[0], "guild_id,member_id,occurred_at,threshold_days");
+        let body: Vec<_> = lines[1..].to_vec();
+        assert_eq!(body.len(), expected.len());
+        for (line, id) in body.iter().zip(&expected) {
+            let cells: Vec<_> = line.split(',').collect();
+            assert_eq!(
+                cells,
+                [
+                    "100000000000000010",
+                    id.as_str(),
+                    "2026-09-07T00:00:00.000Z",
+                    "14"
+                ]
+            );
+        }
+        // Round-trip: the CSV parses back to the selector's rows exactly.
+        assert_eq!(parse_reengagement_csv(&csv).unwrap(), outcome.flagged);
+    }
+
+    #[test]
+    fn reengagement_csv_empty_state_hint_parses_to_nothing() {
+        let outcome = InactivityOutcome { flagged: vec![] };
+        let csv = render_reengagement_csv(&outcome).unwrap();
+        let lines: Vec<_> = csv.lines().collect();
+        assert_eq!(lines[0], "guild_id,member_id,occurred_at,threshold_days");
+        assert_eq!(lines.len(), 2, "header plus one hint line");
+        assert!(lines[1].starts_with('#'), "hint is a CSV comment");
+        assert!(parse_reengagement_csv(&csv).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reengagement_unscoped_is_header_plus_hint_and_parses_to_nothing() {
+        let csv = render_reengagement_unscoped();
+        let lines: Vec<_> = csv.lines().collect();
+        assert_eq!(lines, [REENGAGEMENT_CSV_HEADER, lines[1]]);
+        assert!(lines[1].starts_with('#') && lines[1].contains("--guild"));
+        assert!(parse_reengagement_csv(&csv).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reengagement_csv_rejects_bad_header_rows_and_ids() {
+        assert!(parse_reengagement_csv("guild_id,member_id\n").is_err());
+        assert!(
+            parse_reengagement_csv("guild_id,member_id,occurred_at,threshold_days\n1,2,3\n")
+                .is_err()
+        );
+        assert!(parse_reengagement_csv(
+            "guild_id,member_id,occurred_at,threshold_days\nnot-an-id,100000000000000001,2026-09-07T00:00:00.000Z,14\n"
+        )
+        .is_err());
+        assert!(parse_reengagement_csv(
+            "guild_id,member_id,occurred_at,threshold_days\n100000000000000010,100000000000000001,not-a-time,14\n"
+        )
+        .is_err());
+        assert!(!is_snowflake_like("guild-a"));
+        assert!(is_snowflake_like("100000000000000010"));
+        // Render fails closed on a non-snowflake ID instead of emitting it.
+        let bad = InactivityOutcome {
+            flagged: vec![FlaggedMember {
+                guild_id: "guild-a".to_owned(),
+                member_id: "m".to_owned(),
+                occurred_at: "2026-09-07T00:00:00.000Z".to_owned(),
+                threshold_days: 14,
+            }],
+        };
+        assert!(render_reengagement_csv(&bad).is_err());
     }
 }
