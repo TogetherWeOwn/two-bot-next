@@ -475,30 +475,28 @@ impl RestAutomodFacts {
 }
 
 impl AutomodFacts for RestAutomodFacts {
-    fn fetch_message(
+    async fn fetch_message(
         &self,
         guild_id: &str,
         channel_id: &str,
         message_id: &str,
-    ) -> impl Future<Output = Option<FetchedMessage>> + Send {
-        async move {
-            let value = self
-                .get(&format!("/channels/{channel_id}/messages/{message_id}"))
-                .await?;
-            let message: Message = serde_json::from_value(value).ok()?;
-            let author_id = message.author.id.to_string();
-            let member = self
-                .get(&format!("/guilds/{guild_id}/members/{author_id}"))
-                .await?;
-            if text(member.get("user")?, "id")? != author_id {
-                return None;
-            }
-            let author_role_ids = member_roles(&member)?;
-            Some(FetchedMessage {
-                message,
-                author_role_ids,
-            })
+    ) -> Option<FetchedMessage> {
+        let value = self
+            .get(&format!("/channels/{channel_id}/messages/{message_id}"))
+            .await?;
+        let message: Message = serde_json::from_value(value).ok()?;
+        let author_id = message.author.id.to_string();
+        let member = self
+            .get(&format!("/guilds/{guild_id}/members/{author_id}"))
+            .await?;
+        if text(member.get("user")?, "id")? != author_id {
+            return None;
         }
+        let author_role_ids = member_roles(&member)?;
+        Some(FetchedMessage {
+            message,
+            author_role_ids,
+        })
     }
 
     fn target_facts(

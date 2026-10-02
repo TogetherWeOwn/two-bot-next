@@ -57,11 +57,11 @@ impl AutomodClaimLedger for AutomodStore {
     type Claim = DeliveryClaim;
     type Error = sqlx::Error;
 
-    fn ledger_claim(
+    async fn ledger_claim(
         &self,
         key: &DeliveryKey,
-    ) -> impl Future<Output = Result<LedgerClaim<DeliveryClaim>, sqlx::Error>> + Send {
-        async move { self.claim(key).await.map(LedgerClaim::from) }
+    ) -> Result<LedgerClaim<DeliveryClaim>, sqlx::Error> {
+        self.claim(key).await.map(LedgerClaim::from)
     }
 
     fn ledger_preserve(
