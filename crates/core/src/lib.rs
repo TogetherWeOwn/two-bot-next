@@ -71,7 +71,10 @@ pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
+pub mod scheduled;
 pub mod scheduled_events;
+#[cfg(feature = "db")]
+pub mod scheduled_store;
 pub mod secret;
 pub use secret::Secret;
 pub mod self_roles;
@@ -125,9 +128,11 @@ pub use community_snapshots::{
 pub use config::Config;
 pub use containment::{
     plan_quarantine, quarantine_outcome, role_removal_status, ClaimedContainmentEvent,
-    ContainmentDisposition, ContainmentEventState, ContainmentIncident, ContainmentIncidentState,
-    ContainmentPolicy, ContainmentPolicyError, ContainmentReason, ContainmentRole,
-    DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan, QuarantineRefusal,
+    ContainmentAlert, ContainmentDisposition, ContainmentEventState, ContainmentIncident,
+    ContainmentIncidentState, ContainmentPolicy, ContainmentPolicyError, ContainmentReason,
+    ContainmentRole, ContainmentSignal, DestructiveAction, DestructiveAuditEvent,
+    QuarantineFailure, QuarantinePlan, QuarantineRefusal, CONTAINMENT_ALERT_EVENT,
+    CONTAINMENT_ALERT_MAX_IDS, CONTAINMENT_SUPPRESSED_EVENT,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
@@ -251,9 +256,25 @@ pub use rsvp::{
 pub use rsvp_store::{
     list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
 };
+pub use scheduled::{
+    advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
+    next_run_at_ms, no_such_schedule_text, no_unique_match_text, parse_iso_ms,
+    post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text, schedule_confirm_text,
+    schedule_list_line, schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome,
+    ScheduleError, ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX,
+    EVERY_MINUTES_MIN, INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
+    MAX_BODY_CHARS as SCHEDULED_MAX_BODY_CHARS, RETRY_DEFAULT_MS, RETRY_MAX_MS, RETRY_MIN_MS,
+    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+};
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
     ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+};
+#[cfg(feature = "db")]
+pub use scheduled_store::{
+    audit_scheduled, claim_due, complete_run, delete_scheduled, get_scheduled, list_scheduled,
+    put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store, retry_scheduled,
+    ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError, ScheduledWrite,
 };
 pub use self_roles::{
     emoji_identity, event_order_for_event_id, event_order_from_snowflake,

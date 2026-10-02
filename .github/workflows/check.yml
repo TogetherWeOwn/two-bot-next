@@ -272,7 +272,7 @@ jobs:
 
   container:
     name: container smoke
-    runs-on: [self-hosted, two-ephemeral]
+    runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     env:
       IMAGE: two-bot-next:smoke-${{ github.run_id }}-${{ github.run_attempt }}
