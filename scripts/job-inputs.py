@@ -15,12 +15,16 @@ Job map (each a pure function of the changed paths):
 - ``parity``: the ``parity-docs`` job (baseline ancestry + link guard).
 
 Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
-- Rust tests read a pinned doc set (parity/cutover/preflight/staging-soak/
-  backup/commands/configuration/voice-rooms plus the soak/parity JSON): those
-  docs select ``rust``. Every other doc has no file reader in PR-run code, so
-  docs-only PRs skip the Rust matrix -- but ANY docs/ change still selects
-  ``worker`` because wrangler/test/runbook.test.ts asserts on the docs/
-  directory listing itself.
+- Rust tests read a pinned doc set by content (parity/cutover/commands/
+  configuration/voice-rooms plus the soak/parity JSON): those docs select
+  ``rust``. staging-soak/backup/preflight/runbook are existence-only inputs
+  to the preconditions binary (is_file, never content), so a content edit
+  cannot break Rust and they fall through to the worker rule below; any
+  deletion forces all jobs via the deletion rule. Every other doc has no
+  file reader in PR-run code, so docs-only PRs skip the Rust matrix -- but
+  ANY docs/ change still selects ``worker`` because
+  wrangler/test/runbook.test.ts asserts on the docs/ directory listing
+  itself.
 - The worker drift test (wrangler/test/container-env.test.ts) reads every
   ``TWO_*`` name in crates/ and src/, so Rust changes select ``worker``.
 - The corpus test (crates/core/tests/voice_template_corpus.rs) includes
