@@ -23,6 +23,7 @@
 import { Container } from "@cloudflare/containers";
 import {
   TokenBuckets,
+  RedirectMissCache,
   handleRedirect,
   isReservedInternal,
   isValidFallback,
@@ -64,6 +65,21 @@ export interface Env extends ForwardedFlagEnv {
 // Per-isolate crawler cap (60 burst, 1/sec refill — matches legacy
 // CLICK_BUCKET). Module-level so one isolate shares the budget.
 const clickBuckets = new TokenBuckets();
+// Store instances are request-scoped; misses must survive across requests —
+// but only while the backing configuration is identical. A changed snapshot
+// or mapping source must not inherit another config's misses, or a newly
+// added slug would 404 until the TTL expires.
+let redirectMissKey = "";
+let redirectMisses = new RedirectMissCache();
+function missCacheFor(env: Env): RedirectMissCache {
+  const raw = env.REDIRECT_MAPPINGS_JSON;
+  const key = `${env.REDIRECT_DB === undefined ? "snapshot" : "live"}:${typeof raw === "string" ? raw : typeof raw}`;
+  if (key !== redirectMissKey) {
+    redirectMissKey = key;
+    redirectMisses = new RedirectMissCache();
+  }
+  return redirectMisses;
+}
 
 function redirectStore(env: Env): RedirectStore {
   const raw = env.REDIRECT_MAPPINGS_JSON;
@@ -430,6 +446,8 @@ export default {
     const result = await handleRedirect(
       request.method,
       url.pathname,
+      // Cloudflare supplies this at ingress. Never trust X-Forwarded-For;
+      // when no edge IP exists, callers share the conservative unknown bucket.
       request.headers.get("cf-connecting-ip") ?? "unknown",
       {
         guildId: env.GUILD_ID ?? "",
@@ -439,6 +457,7 @@ export default {
         onError: (msg, detail) =>
           console.error(`${msg} ${JSON.stringify(detail)}`),
         isThrottled: (key) => !clickBuckets.take(key).allowed,
+        missCache: missCacheFor(env),
       },
     );
     if (result.click) {
