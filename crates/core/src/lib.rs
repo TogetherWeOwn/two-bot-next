@@ -89,6 +89,7 @@ pub mod voice_naming;
 pub mod voice_ownership;
 pub mod voice_permissions;
 pub mod voice_placement;
+pub mod voice_room_controls;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
