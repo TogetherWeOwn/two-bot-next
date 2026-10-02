@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "two-bot"
 path = "src/main.rs"
@@ -14,7 +17,7 @@ path = "src/main.rs"
 # version pins the API contract between crates at a glance.
 [dependencies]
 two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
-two-bot-discord = { version = "0.2.0", path = "../discord" }
+two-bot-discord = { version = "0.2.0", path = "../discord", features = ["db"] }
 two-bot-store = { version = "0.2.0", path = "../store" }
 two-bot-cutover = { version = "0.2.0", path = "../cutover" }
 # Relay/audit ids: 16 CSPRNG bytes hex-encoded (same shape as core's

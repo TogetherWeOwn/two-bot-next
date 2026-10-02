@@ -74,6 +74,8 @@ def check(path: Path) -> list[str]:
                 f"{prefix}: missing [exports.{REQUIRED_CONTAINERS_CLASS}] "
                 "DO class export (exports are not inherited from the top level)"
             )
+        if env.get("version_metadata", {}).get("binding") != "CF_VERSION_METADATA":
+            errors.append(f"{prefix}: missing version_metadata binding 'CF_VERSION_METADATA'")
         missing_vars = required_vars - set(env.get("vars", {}))
         if missing_vars:
             errors.append(

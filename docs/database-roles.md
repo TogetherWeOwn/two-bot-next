@@ -17,7 +17,10 @@ BYPASSRLS attributes.
 No runtime or reader grants carry grant options. Runtime cannot create schemas,
 tables, temporary tables or functions, alter tables, truncate them, or read the
 SQLx migration ledger. Existing append-only audit triggers continue to constrain
-DML; a grant does not disable those controls.
+DML; a grant does not disable those controls. The `discord_send_admission`
+lane is a restricted exception: runtime has SELECT, INSERT and UPDATE only,
+never DELETE/TRUNCATE; reader and PUBLIC receive no lane access. The verifier
+requires these three privileges and rejects extra erase privileges.
 
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
@@ -55,7 +58,8 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 45 bot tables, SQLx ledger, eight named SERIAL sequences and
+current migrations' 45 ordinary bot tables plus the restricted admission lane,
+SQLx ledger, eight named SERIAL sequences and
 `guild_settings_version_seq`, nine web views and five functions. A detached SERIAL
 sequence remains required even after `OWNED BY NONE`. New relations/sequences need
 a reviewed matrix update; there are **no wildcard future-table grants**.
