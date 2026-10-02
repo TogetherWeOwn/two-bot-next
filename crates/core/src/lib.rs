@@ -13,6 +13,9 @@ pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
 pub mod automod;
+pub mod automod_runtime;
+#[cfg(feature = "db")]
+pub mod automod_store;
 pub mod backup;
 pub mod channel_moderation;
 #[cfg(feature = "db")]
@@ -30,6 +33,7 @@ pub mod containment;
 pub mod database_roles;
 pub mod database_url;
 pub mod events;
+pub mod evidence;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod feeds;
@@ -83,11 +87,16 @@ pub mod settings;
 pub mod sticky;
 pub mod tickets;
 pub mod voice;
+pub mod voice_assistant_cap;
 pub mod voice_config;
+pub mod voice_config_diff;
 pub mod voice_naming;
 pub mod voice_ownership;
+pub mod voice_permission_health;
 pub mod voice_permissions;
 pub mod voice_placement;
+pub mod voice_room_controls;
+pub mod voice_text_channel;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
@@ -139,6 +148,12 @@ pub use containment::{
     CONTAINMENT_ALERT_MAX_IDS, CONTAINMENT_SUPPRESSED_EVENT,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
+pub use evidence::{
+    evidence_packet_filename, family_of, Disposition, EventFamily, EvidenceLedger, ExpectedAction,
+    ReceiptingStore, ReconciledItem, Reconciliation, StoreReceipt, ALERT_RULE_IDS,
+    EVIDENCE_SCHEMA_VERSION, MATCH_WINDOW_MS, MAX_EXPECTED_ACTIONS, MAX_RECEIPTS,
+    SOAK_LEDGER_RULE_ID,
+};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
     announcement_commands, automation_commands, feature_commands, scorecard_attendance_command,
@@ -272,7 +287,7 @@ pub use scheduled::{
 };
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
-    ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+    ScheduledEventMirror, ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 #[cfg(feature = "db")]
 pub use scheduled_store::{
@@ -310,12 +325,18 @@ pub use voice::{
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
 };
+pub use voice_permission_health::{
+    evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
+    NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,
+    PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS, PERM_ADMINISTRATOR,
+    PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS, PERM_VIEW_CHANNEL,
+};
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
     VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts, VOTE_KICK_TTL_MS,
 };
 #[cfg(feature = "db")]
 pub use website_store::{
-    apply_web_contract, read_raid_windows, replace_events, write_counter, write_rank_snapshot,
-    WebsiteStoreError, WEB_CONTRACT_VERSION, WEB_CONTRACT_VIEWS,
+    apply_web_contract, read_raid_windows, replace_events, upsert_event, write_counter,
+    write_rank_snapshot, WebsiteStoreError, WEB_CONTRACT_VERSION, WEB_CONTRACT_VIEWS,
 };

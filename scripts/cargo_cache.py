@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
 import subprocess
@@ -98,14 +99,34 @@ def acquire(pool, policy):
             os.close(fd)
             continue
         try:
-            usable = not (slot / 'lease.json').exists() and usage(slot) < policy['slot_budget_bytes']
+            if (slot / 'lease.json').exists():
+                # The slot flock is the liveness proof: it is passed to Cargo
+                # through pass_fds, so holding it means no wrapper, Cargo, or
+                # fd-inheriting descendant is alive. A stale under-budget
+                # lease whose recorded Cargo process group is also dead is
+                # recovered here; anything else still needs the Operator.
+                try:
+                    lease = json.loads((slot / 'lease.json').read_text())
+                except (OSError, ValueError):
+                    lease = None
+                pgid = lease.get('cargo_pgid') if isinstance(lease, dict) else None
+                if (isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 0
+                        and usage(slot) < policy['slot_budget_bytes']
+                        and not group_alive(pgid)):
+                    print(json.dumps({'finding': 'stale_lease_recovered',
+                                      'slot': slot.name, **lease}, sort_keys=True),
+                          file=sys.stderr)
+                    (slot / 'lease.json').unlink()
+                    return slot, target, fd
+                os.close(fd)
+                continue  # Interrupted/oversized/live run: Operator must inspect it.
+            if usage(slot) >= policy['slot_budget_bytes']:
+                os.close(fd)
+                continue  # Oversized retained output: Operator must inspect it.
+            return slot, target, fd
         except Exception:
             os.close(fd)
             raise
-        if not usable:
-            os.close(fd)
-            continue  # Interrupted/oversized run: Operator must inspect it.
-        return slot, target, fd
     raise Refusal('no idle, below-budget slot; no per-worktree fallback')
 
 
@@ -120,6 +141,26 @@ def validate_cargo_args(args, workspace):
             value = arg.split('=', 1)[1] if '=' in arg else args[number + 1]
             if not (workspace / value).resolve().is_relative_to(workspace):
                 raise Refusal('manifest must stay in this workspace')
+
+
+def resolve_cargo(cargo):
+    """Executable Cargo path, resolved before any pool access.
+
+    Agent PATH may lack rustup's bin directory, so a bare name falls back to
+    $CARGO_HOME/bin, then ~/.cargo/bin. A miss is a Refusal: a spawn that
+    cannot exec must never be able to leave a lease behind.
+    """
+    found = shutil.which(cargo)
+    if found:
+        return found
+    if os.sep not in cargo:
+        for home in (os.environ.get('CARGO_HOME'), os.path.expanduser('~/.cargo')):
+            if home:
+                candidate = os.path.join(home, 'bin', cargo)
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return candidate
+    raise Refusal(f'{cargo} not found on PATH, in $CARGO_HOME/bin or ~/.cargo/bin; '
+                  'no lease taken')
 
 
 def group_alive(pid):
@@ -152,6 +193,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
     pool = real_directory(pool)
     workspace = real_directory(Path.cwd())
     validate_cargo_args(args, workspace)
+    cargo = resolve_cargo(cargo)
     if args[0] != 'fmt':
         cargo_flags = args[:args.index('--')] if '--' in args else args
         required = [flag for flag in ('--offline', '--locked') if flag not in cargo_flags]
@@ -163,6 +205,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
     child = None
     previous = {}
     clean_exit = False
+    spawn_failed = False
     cancelling = False
     spawning = True
     pending_signal = None
@@ -202,9 +245,30 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
                    PAPERCLIP_SCRATCH_DIR=str(slot / 'scratch'),
                    CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0',
                    CARGO_PROFILE_TEST_DEBUG='0')
+        # A fallback-resolved rustup proxy needs its sibling proxies (rustc,
+        # cargo-fmt, clippy-driver) on the child PATH as well.
+        bindir = os.path.dirname(cargo)
+        if bindir not in env.get('PATH', '').split(os.pathsep):
+            env['PATH'] = os.pathsep.join(filter(None, (bindir, env.get('PATH'))))
         # Pass the lease FD to Cargo as well: wrapper SIGKILL must not free it.
-        child = subprocess.Popen([cargo] + args, env=env, start_new_session=True,
-                                 pass_fds=(fd,))
+        try:
+            child = subprocess.Popen([cargo] + args, env=env, start_new_session=True,
+                                     pass_fds=(fd,))
+        except OSError:
+            # Exec/fork failed: Popen reaped any forked child, so no writer
+            # ever existed, and our flock still guards the slot. Release our
+            # own sentinel instead of wedging the slot for the Operator.
+            spawn_failed = True
+            raise
+        # Record Cargo's process group (start_new_session: pgid == child pid)
+        # so a later acquire can tell a dead group from an escaped descendant
+        # that closed the fd. Atomic rewrite; the temp file lives in scratch
+        # so a crash can never leave an unexpected top-level slot entry.
+        tmp_path = slot / 'scratch' / 'lease.json.tmp'
+        with tmp_path.open('w') as output:
+            json.dump({**json.loads((slot / 'lease.json').read_text()),
+                       'cargo_pgid': child.pid}, output)
+        os.replace(tmp_path, slot / 'lease.json')
         spawning = False
         if pending_signal is not None:
             raise Refusal(f'build interrupted by signal {pending_signal}; lease retained')
@@ -237,7 +301,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
-            if clean_exit:
+            if clean_exit or spawn_failed:
                 (slot / 'lease.json').unlink()
             os.close(fd)
 
