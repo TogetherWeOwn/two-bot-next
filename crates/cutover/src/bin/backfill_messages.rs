@@ -13,8 +13,8 @@ use twilight_model::id::Id;
 use two_bot_cutover::cli::{open_db, Args, ScanReport};
 use two_bot_cutover::{
     find_early_messages, fold_messages, is_conversation_channel, iso_to_millis, record_earliest,
-    touch_activity, FunnelWrite, MemberMessages, RestClient, ScannedMessage, FORUM_CHANNEL_TYPES,
-    THREAD_CHANNEL_TYPES,
+    touch_activity, FunnelWrite, MemberMessages, RestClient, ScannedMessage,
+    DEFAULT_ARCHIVED_THREAD_PAGES, FORUM_CHANNEL_TYPES, THREAD_CHANNEL_TYPES,
 };
 
 const MESSAGE_RUNGS: [&str; 3] = ["first_message", "second_message", "third_message"];
@@ -107,13 +107,33 @@ async fn main() {
             }
         }
     }
+    let mut archived_truncated: Vec<String> = Vec::new();
     for forum in conversation
         .iter()
         .filter(|c| channel_type_code(&c.kind) == FORUM_CHANNEL_TYPES[0])
     {
-        if let Ok(Some(arch)) = rest.public_archived_threads(forum.id).await {
-            for t in &arch.threads {
-                thread_ids.push(t.id.get().to_string());
+        match rest
+            .list_all_archived_threads(forum.id, DEFAULT_ARCHIVED_THREAD_PAGES)
+            .await
+        {
+            Ok(Some(outcome)) => {
+                if !outcome.is_complete() {
+                    archived_truncated.push(forum.id.get().to_string());
+                }
+                for t in outcome.threads() {
+                    thread_ids.push(t.id.get().to_string());
+                }
+            }
+            Ok(None) => {
+                // Unreadable forum: same as the legacy one-page consumer —
+                // nothing discovered, nothing scanned.
+            }
+            Err(e) => {
+                eprintln!(
+                    "archived-thread discovery for forum {} failed: {e}",
+                    forum.id.get()
+                );
+                archived_truncated.push(forum.id.get().to_string());
             }
         }
     }
@@ -204,7 +224,7 @@ async fn main() {
     println!(
         "  members with 3+ posts   {}   (AM7 text bar, {})",
         pad(summary.authors_with_full_ladder),
-        if scan_report.has_incomplete_history() {
+        if scan_report.has_incomplete_history() || !archived_truncated.is_empty() {
             "lower bound - incomplete history"
         } else {
             "exactly"
@@ -272,6 +292,13 @@ async fn main() {
             summary.truncated.len(),
             max_pages * 4,
             summary.truncated.join(", ")
+        );
+    }
+    if !archived_truncated.is_empty() {
+        println!(
+            "\n  INCOMPLETE: archived-thread discovery stopped early on {} forum(s).\n  Threads beyond the pages we read were not scanned, so their posts are\n  missing from the milestones above rather than silently complete.\n  {}",
+            archived_truncated.len(),
+            archived_truncated.join(", ")
         );
     }
     println!(
