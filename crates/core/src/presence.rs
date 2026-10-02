@@ -660,11 +660,17 @@ mod tests {
             ProbeLeaseDecision::Takeover
         );
         // A stale holder's lease never leaks into the next decision: after
-        // takeover the new holder's own start governs the following trigger.
+        // takeover the new holder's own start governs the following trigger,
+        // so a prompt next trigger skips while a holder that never finishes
+        // is taken over again once its own lease expires.
         let taken_over = now + lease_ms as i64;
         assert_eq!(
-            decide_probe_lease(Some(taken_over), taken_over + H, lease_ms),
+            decide_probe_lease(Some(taken_over), taken_over + 60_000, lease_ms),
             ProbeLeaseDecision::Skip
+        );
+        assert_eq!(
+            decide_probe_lease(Some(taken_over), taken_over + lease_ms as i64, lease_ms),
+            ProbeLeaseDecision::Takeover
         );
     }
 
