@@ -118,7 +118,9 @@ async fn due_one_shot_posts_once_with_legacy_mentions_and_leaves_the_due_set() {
 
     let sent = posts(&mock);
     assert_eq!(sent.len(), 1, "only the due row posts");
-    assert_eq!(sent[0]["content"], "standup @everyone");
+    // The shared send path defuses @everyone in the text as well as sending
+    // `allowed_mentions.parse = []`.
+    assert_eq!(sent[0]["content"], "standup @\u{200b}everyone");
     assert_eq!(sent[0]["allowed_mentions"], json!({"parse": []}));
     assert_eq!(sent[0]["enforce_nonce"], true);
     assert_eq!(sent[0]["nonce"].as_str().map(str::len), Some(24));
