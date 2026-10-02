@@ -115,7 +115,10 @@ the env gates below.
   read writes nothing — not a null row, not a zero. Rescan the bot floor only
   when `bot_floor_due`; a failed listing keeps the presence row with a NULL
   floor. Drive the probe every `PRESENCE_PROBE_INTERVAL_MS` (1 h), unref'd,
-  with one reading at startup.
+  with one reading at startup. A per-process overlap lease
+  (`PRESENCE_PROBE_LEASE_MS`, 30 min) makes a concurrent trigger skip with
+  `presence_probe_overlap_skipped` before any REST call; a holder older than
+  the lease is presumed dead and taken over.
 - Drive the scorecard every `SCORECARD_TICK_INTERVAL_MS` (60 s); fire at most
   once per Monday via `scorecard_tick`. Before scoring, persist full-week
   stream coverage (`mark_stream_coverage` for all six streams); a mid-week
