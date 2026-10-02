@@ -92,7 +92,7 @@ fn runtime(store: Arc<Store>, http: GatedHttp) -> Runtime {
 
 fn ready_event() -> Event {
     Event::Ready(serde_json::from_value::<Ready>(json!({
-        "v": 10, "user": {"id": "999", "username": "mock-bot", "discriminator": "0", "bot": true},
+        "v": 10, "user": {"id": "999", "username": "mock-bot", "discriminator": "0", "bot": true, "mfa_enabled": false},
         "session_id": "session", "resume_gateway_url": "wss://gateway.discord.gg",
         "guilds": [{"id": "100", "unavailable": true}], "application": {"id": "1111", "flags": 0}
     })).unwrap())
