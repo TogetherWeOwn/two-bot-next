@@ -1928,6 +1928,22 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
                 channel_id,
                 limit: query_param(query, "limit").and_then(|v| v.parse().ok()),
             }),
+            // Automod enriches partial edits and role-less creates from the
+            // authoritative message; there is no query form of this route.
+            Some(message) if message.starts_with("messages/") && query.is_empty() => {
+                let message_id = message
+                    .strip_prefix("messages/")
+                    .unwrap()
+                    .parse::<u64>()
+                    .map_err(|_| err())?;
+                if message_id == 0 {
+                    return Err(err());
+                }
+                Ok(Route::GetMessage {
+                    channel_id,
+                    message_id,
+                })
+            }
             _ => Err(err()),
         };
     }
