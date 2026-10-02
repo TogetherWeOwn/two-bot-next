@@ -32,7 +32,7 @@
 //! only the S6 staging shape-check ports it, matrix §9 drop 6),
 //! `/rota-acknowledge` #13 (dropped with the rota stack).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::commands::{
     CommandChoice, CommandDefinition, CommandOption, CommandOptionType, OCCURRENCE_ID_MAX_CHARS,
@@ -259,6 +259,54 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new("feed-list", "List this server's feed relays")
             .permissions(PERM_MANAGE_GUILD),
     ]
+}
+
+/// Parse a `!<trigger>` prefix from message text (parity §1 #23).
+///
+/// Pure first-token rule: only the first whitespace-separated token is
+/// inspected, and it must match legacy `TRIGGER_PATTERN =
+/// /^![a-z0-9_-]{1,32}$/` (same shape as
+/// [`crate::leveling::valid_text_trigger`], re-stated here so this module
+/// stays dependency-free). The returned name excludes the leading `!`.
+///
+/// - `text_commands_enabled` is the `FeatureGates::text_commands` flag
+///   (`TWO_AUTOMATIONS=1` AND `TWO_TEXT_COMMANDS=1`). Off rejects everything.
+/// - `builtin_names` holds bare builtin slash names (no `!` prefix: `rank`,
+///   `ban`, `rsvp-attendance`, …). A trigger colliding with a builtin is
+///   rejected so prefix traffic can never shadow a slash command.
+/// - First token only: `"!faq extra"` yields `faq`; `"hi !faq"` yields
+///   nothing. Leading/trailing ASCII and Unicode whitespace around the first
+///   token is ignored (`str::split_whitespace` semantics).
+///
+/// Gateway wiring and custom-command storage are out of scope (follow-ups
+/// under TOG-10080); the caller resolves the returned name against its store.
+#[must_use]
+pub fn parse_prefix_trigger(
+    text: &str,
+    text_commands_enabled: bool,
+    builtin_names: &HashSet<String>,
+) -> Option<String> {
+    if !text_commands_enabled {
+        return None;
+    }
+    let name = text.split_whitespace().next()?.strip_prefix('!')?;
+    if !is_trigger_name(name) {
+        return None;
+    }
+    if builtin_names.contains(name) {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+/// Bare trigger-name check: `^[a-z0-9_-]{1,32}$` (byte length; the charset is
+/// ASCII-only so bytes and chars agree on rejections).
+fn is_trigger_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 /// Slice-2 definitions in legacy publish order (community, automation,
