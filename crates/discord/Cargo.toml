@@ -34,6 +34,8 @@ db = ["two-bot-core/db", "dep:sqlx"]
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+anyhow = { workspace = true }
+two-bot-cutover = { version = "0.2.0", path = "../cutover" }
 sqlx = { workspace = true }
 two-bot-testsupport = { path = "../testsupport", version = "0.2.0" }
 futures-util = { workspace = true, features = ["sink"] }
