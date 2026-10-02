@@ -2389,7 +2389,7 @@ mod receipt_tests {
                         false,
                         &[],
                         &[],
-                        &[completed.clone()],
+                        std::slice::from_ref(&completed),
                     );
                     assert!(!evidence.exchange_pending);
                     let unresolved = if adding {
@@ -2427,7 +2427,7 @@ mod receipt_tests {
                         true,
                         if adding { &legacy } else { &[] },
                         if adding { &[] } else { &legacy },
-                        &[completed.clone()],
+                        std::slice::from_ref(&completed),
                     );
                     assert!(inherited.exchange_pending);
                     assert!(if adding {
