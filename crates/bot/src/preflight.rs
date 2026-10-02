@@ -117,6 +117,8 @@ struct ChannelTarget {
     moderate: bool,
     // View-only references can be text, forum, category or voice destinations.
     text_only: bool,
+    // Ticket category destinations must be GuildCategory channels.
+    category: bool,
 }
 
 struct Targets {
@@ -125,6 +127,9 @@ struct Targets {
     roles: BTreeMap<u64, &'static str>,
     level_roles_known: bool,
     role_writes: bool,
+    // Any ticket key present means tickets are intended: a partial triple
+    // must fail closed rather than silently run with tickets disabled.
+    ticket_complete: bool,
 }
 
 #[derive(Deserialize)]
@@ -183,12 +188,26 @@ impl Targets {
             snowflake(&guild).map_err(|_| "GUILD_ID must be a nonzero Discord snowflake")?;
         let gates = OnboardingGates::from_map(vars).map_err(|_| "invalid TWO_ONBOARDING_MODE")?;
         let role_writes = level_role_writes_allowed(gates.mode) && !gates.dry_run;
+        let ticket_keys = [
+            "DISCORD_TICKET_CATEGORY_ID",
+            "DISCORD_TICKET_STAFF_ROLE_ID",
+            "DISCORD_TICKET_PANEL_CHANNEL_ID",
+        ];
+        let present = ticket_keys
+            .iter()
+            .filter(|key| !env(key).trim().is_empty())
+            .count();
+        // Any ticket key set means tickets are intended. Zero keys is
+        // tickets-disabled (pass); all three is the wired triple (checked
+        // below); one or two is a partial triple that must fail closed.
+        let ticket_complete = present == 0 || present == ticket_keys.len();
         let mut targets = Self {
             guild_id,
             channels: BTreeMap::new(),
             roles: BTreeMap::new(),
             level_roles_known: !role_writes || level_ids.is_some(),
             role_writes,
+            ticket_complete,
         };
         if let Some(raw) = level_ids {
             let rewards = ids(raw).map_err(|_| "invalid --level-role-ids CSV")?;
@@ -219,7 +238,6 @@ impl Targets {
         }
         for key in [
             "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID",
-            "DISCORD_TICKET_CATEGORY_ID",
             "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID",
             "TWO_TEMP_VOICE_CATEGORY_ID",
             "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
@@ -230,6 +248,25 @@ impl Targets {
             for id in ids(&env(key)).map_err(|_| "invalid configured channel reference")? {
                 targets.channel(id, false, false);
             }
+        }
+        // Ticket category destinations must be GuildCategory channels. They are
+        // tracked separately so a text/voice channel in this slot fails closed
+        // instead of passing as a generic view-only reference.
+        for id in ids(&env("DISCORD_TICKET_CATEGORY_ID"))
+            .map_err(|_| "invalid configured channel reference")?
+        {
+            targets.ticket_category(id);
+        }
+        // Ticket staff is a hierarchy target, not a channel. A missing,
+        // deleted, managed, @everyone, or above-the-bot role must fail here,
+        // not at the first staff claim at runtime. Reuses the same
+        // exist/unmanaged/below-bot gate as every other role target;
+        // Administrator never bypasses hierarchy.
+        let staff_raw = env("DISCORD_TICKET_STAFF_ROLE_ID");
+        if !staff_raw.trim().is_empty() {
+            let staff_id =
+                snowflake(staff_raw.trim()).map_err(|_| "invalid configured staff role ID")?;
+            targets.roles.insert(staff_id, "ticket staff");
         }
         let raw = env("TWO_SELF_ROLE_PANELS");
         if !raw.trim().is_empty() {
@@ -281,6 +318,11 @@ impl Targets {
         let target = self.channels.entry(id).or_default();
         target.post |= post;
         target.text_only |= text_only;
+    }
+
+    fn ticket_category(&mut self, id: u64) {
+        let target = self.channels.entry(id).or_default();
+        target.category = true;
     }
 }
 
@@ -451,6 +493,15 @@ async fn check_discord(
             "no configured channel IDs; feature destinations were not checked",
         );
     }
+    // Any ticket key set without the other two is a fail-closed
+    // misconfiguration: tickets would silently stay disabled (or half-wired)
+    // instead of running with the intended category/staff/panel triple.
+    // Static guidance only; never echo values.
+    report.require(
+        targets.ticket_complete,
+        "ticket configuration",
+        "set DISCORD_TICKET_CATEGORY_ID, DISCORD_TICKET_STAFF_ROLE_ID and DISCORD_TICKET_PANEL_CHANNEL_ID together, or none",
+    );
     for (&id, target) in &targets.channels {
         let channel = client
             .channel(Id::new(id))
@@ -464,6 +515,7 @@ async fn check_discord(
             channel.kind,
             ChannelType::GuildText | ChannelType::GuildAnnouncement
         );
+        let category = channel.kind == ChannelType::GuildCategory;
         let access = resolve_channel_access(
             targets.guild_id,
             user.id.get(),
@@ -473,14 +525,16 @@ async fn check_discord(
         );
         let usable = correct_guild
             && (!target.text_only || text)
+            && (!target.category || category)
             && access.view
             && (!target.post || (access.send && access.embed))
             && (!target.moderate || !text || access.manage_messages);
         report.require(usable, format!("channel {id}"), format!(
-            "guild={correct_guild} type={:?} View={} Send={} Embed={} ManageMessages={} required: View{}{}",
+            "guild={correct_guild} type={:?} View={} Send={} Embed={} ManageMessages={} required: View{}{}{}",
             channel.kind, access.view, access.send, access.embed, access.manage_messages,
             if target.post { "/Send/Embed (text or announcement)" } else { "" },
             if target.moderate && text { "/ManageMessages" } else { "" },
+            if target.category { "/GuildCategory" } else { "" },
         ));
     }
     Ok(())
