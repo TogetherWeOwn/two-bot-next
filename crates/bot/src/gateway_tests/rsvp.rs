@@ -72,6 +72,7 @@ async fn spawn_with_shutdown(
             GUILD.parse().unwrap(),
             true,
         )),
+        None,
         async move {
             match shutdown {
                 Some(receiver) => crate::server::shutdown_requested(receiver).await,

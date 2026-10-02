@@ -9,7 +9,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
-    "check.yml": {"check", "parity-docs", "self-role-store", "container-inputs", "container",
+    "check.yml": {"check", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
                   "community-db", "feeds-db", "tickets-postgres", "worker"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},

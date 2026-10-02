@@ -12,6 +12,7 @@ import {
   type RedirectClick,
 } from "../src/redirect.ts";
 import {
+  CampaignLookupCache,
   DbTimeoutError,
   RedirectStore,
   type ConnectFn,
@@ -50,7 +51,9 @@ function fakeDb(opts: {
       async query(text, params) {
         fake.queries.push({ text, params });
         await opts.query?.();
-        return { rows: opts.rows ?? [] };
+        // Like the real `WHERE slug = $1`: only the requested slug's row.
+        const slug = params[0];
+        return { rows: (opts.rows ?? []).filter((r) => r.slug === slug) };
       },
       async end() {
         fake.ends++;
@@ -204,6 +207,121 @@ describe("store failures fall back without leaking the connection string", () =>
     const fake = fakeDb({ rows: [ROW], end: async () => { throw new Error(SECRET_URL); } });
     assert.equal((await store(fake).lookup("reddit"))?.inviteCode, "aB3xY9");
     assert.equal(fake.ends, 1);
+  });
+});
+
+describe("bounded short miss cache (TOG-11153 parity §12 row 1)", () => {
+  test("repeated misses inside the negative TTL cause one DB query", async () => {
+    let now = 1_000_000;
+    const fake = fakeDb({ rows: [] });
+    const s = new RedirectStore(
+      { connectionString: SECRET_URL },
+      fake.connect,
+      [],
+      undefined,
+      new CampaignLookupCache({ hitTtlMs: 30_000, negativeTtlMs: 2_000 }, () => now),
+    );
+    for (let i = 0; i < 3; i++) {
+      assert.equal(await s.lookup("never-created"), null);
+    }
+    assert.equal(fake.queries.length, 1, "one query must serve the repeated misses");
+    assert.equal(fake.ends, 1);
+  });
+
+  test("discovery after TTL: a miss becomes a hit once the row exists", async () => {
+    let now = 1_000_000;
+    let rows: Record<string, unknown>[] = [];
+    const fake = fakeDb();
+    const client: DbClient = {
+      async query(text, params) {
+        fake.queries.push({ text, params });
+        // Like the real `WHERE slug = $1`: only the requested slug's row.
+        return { rows: rows.filter((r) => r.slug === params[0]) };
+      },
+      async end() { fake.ends++; },
+    };
+    const s = new RedirectStore(
+      { connectionString: SECRET_URL },
+      async () => client,
+      [],
+      undefined,
+      new CampaignLookupCache({ hitTtlMs: 30_000, negativeTtlMs: 2_000 }, () => now),
+    );
+    assert.equal(await s.lookup("new-link"), null);
+    rows = [{ ...ROW, slug: "other-link" }];
+    now += 1_999;
+    assert.equal(await s.lookup("reddit"), null, "a different slug still queries");
+    // Replace the row set with the new slug's row and expire the negative entry.
+    rows = [{ ...ROW, slug: "new-link", invite_code: "freshCode" }];
+    now += 1;
+    const found = await s.lookup("new-link");
+    assert.equal(found?.inviteCode, "freshCode", "the miss must expire within 2s");
+    const queries = fake.queries.length;
+    assert.equal((await s.lookup("new-link"))?.inviteCode, "freshCode");
+    assert.equal(fake.queries.length, queries, "the fresh hit must be served from cache");
+  });
+
+  test("hits cache for 30s; the negative TTL clamps to at most 2s", async () => {
+    let now = 1_000_000;
+    const fake = fakeDb({ rows: [ROW] });
+    const s = new RedirectStore(
+      { connectionString: SECRET_URL },
+      fake.connect,
+      [],
+      undefined,
+      new CampaignLookupCache({ hitTtlMs: 30_000, negativeTtlMs: 60_000 }, () => now),
+    );
+    assert.equal((await s.lookup("reddit"))?.inviteCode, "aB3xY9");
+    now += 29_999;
+    assert.equal((await s.lookup("reddit"))?.inviteCode, "aB3xY9");
+    assert.equal(fake.queries.length, 1, "the hit must be cached for 30s");
+    now += 1;
+    assert.equal((await s.lookup("reddit"))?.inviteCode, "aB3xY9");
+    assert.equal(fake.queries.length, 2, "the hit must expire at 30s");
+
+    // The clamp: an oversized negative TTL still expires within 2s.
+    const missy = new RedirectStore(
+      { connectionString: SECRET_URL },
+      fake.connect,
+      [],
+      undefined,
+      new CampaignLookupCache({ hitTtlMs: 30_000, negativeTtlMs: 60_000 }, () => now),
+    );
+    const misses = fake.queries.length;
+    assert.equal(await missy.lookup("never-created"), null);
+    now += 2_000;
+    assert.equal(await missy.lookup("never-created"), null);
+    assert.equal(fake.queries.length, misses + 2, "negatives must never be long-lived");
+  });
+
+  test("failures are never cached; invalid slugs never reach the DB", async () => {
+    let now = 1_000_000;
+    const fake = fakeDb({ query: async () => { throw new Error("fixture outage"); } });
+    const s = new RedirectStore(
+      { connectionString: SECRET_URL },
+      fake.connect,
+      [],
+      undefined,
+      new CampaignLookupCache({}, () => now),
+    );
+    await assert.rejects(s.lookup("reddit"));
+    await assert.rejects(s.lookup("reddit"));
+    assert.equal(fake.queries.length, 2, "an outage must retry the DB every time");
+    assert.equal(await s.lookup("healthz"), null);
+    assert.equal(fake.queries.length, 2, "an invalid slug must not consume a slot or query");
+  });
+
+  test("capacity eviction keeps a slug spray bounded", async () => {
+    let now = 1_000_000;
+    const fake = fakeDb({ rows: [] });
+    const cache = new CampaignLookupCache({ hitTtlMs: 30_000, negativeTtlMs: 2_000, maxEntries: 2 }, () => now);
+    const s = new RedirectStore({ connectionString: SECRET_URL }, fake.connect, [], undefined, cache);
+    for (const slug of ["aa-missing", "bb-missing", "cc-missing"]) {
+      assert.equal(await s.lookup(slug), null);
+    }
+    assert.ok(cache.size <= 2, `cache must stay bounded, saw ${cache.size}`);
+    assert.equal(await s.lookup("aa-missing"), null);
+    assert.equal(fake.queries.length, 4, "the evicted slug must re-query");
   });
 });
 
