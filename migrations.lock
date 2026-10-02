@@ -125,6 +125,10 @@
       "sha256": "d1a9abe893e8b030db21452f29506a924d60bd7b880d7cef9debc53deb0dd4b4",
       "justification": "New V1 nullable creator-limit inherit for TOG-10093; follows renumbered 0220 voice schema, SQL unchanged."
     },
+    "crates/cutover/migrations/0410_member_erasure_audit.sql": {
+      "sha256": "712f85817c15262f42907114e35dbaeccdada1044833d8bac6b5bd661ca62fe5",
+      "justification": "TOG-11141: minimal actor/time erasure receipt with no subject or content."
+    },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
       "justification": "Add unpublished S6 funnel foundation for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
