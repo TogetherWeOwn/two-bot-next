@@ -217,7 +217,7 @@ enum ReceivedWork {
         dispatch: Option<Box<ReceivedDispatch>>,
         /// A MESSAGE_UPDATE decoded from its raw dispatch before Twilight's
         /// parse, with its receipt stamp. Only set while automod is active.
-        edit: Option<(two_bot_core::automod_runtime::MessageDelivery, String)>,
+        edit: Option<Box<(two_bot_core::automod_runtime::MessageDelivery, String)>>,
         checkpoint: GatewaySession,
         deadline: std::time::Duration,
         generation: u64,
@@ -263,6 +263,7 @@ fn voice_disconnected(voice: Option<&Arc<dyn VoiceEventSink>>) {
 /// token + database configured (see [`build_voice_runtime`]). The serial
 /// writer feeds it after each cache update; reception invalidates occupancy
 /// at every transport loss, so a disconnect is never deferred behind backlog.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_shard<I: InviteSource + 'static>(
     shard: Shard,
     pipeline: Arc<GatewayPipeline<I>>,
@@ -362,7 +363,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // Message needs: decode its raw IDs before parsing.
                         let edit = if automod_enabled {
                             crate::automod_gateway::partial_edit(&text, crate::automod_gateway::receipt_ms(&observed_at))
-                                .map(|delivery| (delivery, observed_at.clone()))
+                                .map(|delivery| Box::new((delivery, observed_at.clone())))
                         } else {
                             None
                         };
@@ -443,7 +444,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 // Automod decides first, in gateway order, once per delivery.
                 let disposition = automod.as_ref().and_then(|automod| {
                     let (delivery, at) = match (edit, dispatch.as_deref()) {
-                        (Some(edit), _) => edit,
+                        (Some(edit), _) => *edit,
                         (None, Some(dispatch)) => (
                             two_bot_discord::automod::event_to_automod(
                                 &dispatch.event,
