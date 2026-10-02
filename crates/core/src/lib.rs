@@ -102,6 +102,7 @@ pub mod voice_channelinfo;
 pub mod voice_conditions;
 pub mod voice_config;
 pub mod voice_config_diff;
+pub mod voice_create_admission;
 pub mod voice_custom_id;
 pub mod voice_logging;
 pub mod voice_name_filter;
