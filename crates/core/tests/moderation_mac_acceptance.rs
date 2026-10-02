@@ -134,7 +134,15 @@ fn minted_marker_verifies_and_tampering_fails() {
     // replacements keep the public shape so each case exercises the MAC.
     let tampered_action = marker_only.replace("moderation.ban", "moderation.kick");
     let tampered_actor = marker_only.replace(ACTOR, "987654321098765433");
-    let tampered_token = marker_only.replacen("v1:7f5125dc", "v1:8f5125dc", 1);
+    // Flip the first token nibble whatever it is; shape stays valid 32-hex.
+    let token_start = marker_only.find("v1:").expect("version") + 3;
+    let mut tampered_token = marker_only.clone();
+    let token_replacement = if &tampered_token[token_start..token_start + 1] == "a" {
+        "b"
+    } else {
+        "a"
+    };
+    tampered_token.replace_range(token_start..token_start + 1, token_replacement);
     let mac_start = marker_only.rfind(':').expect("mac field") + 1;
     let mut tampered_mac = marker_only.clone();
     let replacement = if &tampered_mac[mac_start..mac_start + 1] == "a" {
