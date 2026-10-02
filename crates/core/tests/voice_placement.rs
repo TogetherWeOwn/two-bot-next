@@ -594,5 +594,6 @@ fn position_for_index_appends_one_past_the_last_channel() {
 fn position_for_index_never_goes_negative() {
     let order = [creator(5, -3), room(6, -1)];
     assert_eq!(position_for_index(&order, 0), 0);
-    assert_eq!(position_for_index(&order, 2), 0);
+    // Appending still lands one past the clamped last position.
+    assert_eq!(position_for_index(&order, 2), 1);
 }
