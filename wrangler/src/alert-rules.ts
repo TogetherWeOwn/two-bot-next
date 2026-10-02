@@ -122,6 +122,21 @@ export function ruleFor(key: string): RuleDef | undefined {
   return RULES.find((r) => r.id === id);
 }
 
+/**
+ * Fired-packet filename carrying the producer identity (TOG-12100):
+ * `evidence-{ruleId}-{window}.json`. The rule id is the single shared
+ * spelling also pinned in Rust (`ALERT_RULE_IDS` in
+ * `crates/core/src/evidence.rs`) and documented in `docs/metrics.md`, so the
+ * QA evidence table can attribute packets when several rules fire in one soak
+ * window. Returns `undefined` for unknown keys rather than a misleading name.
+ */
+export function packetFilename(key: string, window: string): string | undefined {
+  const rule = ruleFor(key);
+  if (!rule) return undefined;
+  const safe = (part: string) => part.replace(/[^A-Za-z0-9._-]/g, "-");
+  return `evidence-${safe(rule.id)}-${safe(window)}.json`;
+}
+
 /** Alert-message lines for transitions; no mentions, no secrets. */
 export function transitionMessages(before: string[], after: string[]): string[] {
   const out: string[] = [];

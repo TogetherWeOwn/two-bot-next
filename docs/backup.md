@@ -1,7 +1,8 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v3 dump format, SigV4 off-box upload, retention
+`two-bot` `main @ d5d11793`): v4 dump format with v3 read compatibility,
+SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
 restore | backup-upload | guild-config-snapshot | guild-config-restore`
@@ -15,7 +16,8 @@ require `--force`. This confirmation is not authorization to target production.
 
 ## The format
 
-Gzipped NDJSON, one object per line: `manifest` / `row` / `end` (v3, frozen).
+Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
+write **v4**; the reader also accepts frozen **v3**. Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, and
 the source's applied migrations. Values are stored in Postgres text-output
@@ -42,8 +44,81 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-All 22 bot-owned tables are dumped (see `DUMP_TABLES` in
-`crates/core/src/backup/dump_file.rs`); the website's tables are not ours.
+### Coverage and recovery semantics (v4, TOG-11142)
+
+`DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
+inventory for both dump and restore. It includes **44 durable tables from the
+current cutover migrations**, including the bot-owned website-contract backing
+tables, plus **11 optional retired legacy tables**. A dump from a fresh Rust
+schema has 44 table entries; a compatible legacy-extended schema may have up to
+55. A missing current table refuses a dump/restore: migrate the target first.
+An optional legacy table may be absent only when there are no archived rows for
+it. Nonempty legacy data without a matching target table refuses **before any
+truncate**, rather than silently discarding it.
+
+The only application exclusion is `xp_cooldowns` (short-lived award throttles);
+restore clears target cooldowns. Migration ledgers (`_sqlx_migrations` and
+`schema_migrations`) describe target DDL and are never restored. Replay guards,
+idempotency records, gateway sessions, lease-bearing durable tables and audit
+history are **not** ephemeral exclusions. Derived `web_v1` views contain no
+independent table data; the website service's own separate database is out of
+scope. The migration-backed coverage test compares real tables against these
+classifications, so adding an unclassified table fails CI.
+
+v3 must contain its original 22 table entries. It can lack later tables, but
+restore clears their old target rows and emits a warning in both dry-run and
+real-restore CLI output. One explicit infrastructure exception is the required
+`guild_settings_revision` singleton: an old archive that lacks it initializes
+`(TRUE, 0)` so subsequent settings writes work. `RestoreReport.initialized_tables`
+and CLI warnings identify that baseline as synthesized, **not archived data**.
+No settings values, rank ladder or other application history are synthesized.
+
+Restore ignores manifest ordering and inserts parents before children using the
+inventory. It acquires explicit `ACCESS EXCLUSIVE` table locks and truncates the
+owned set in one transaction, **without CASCADE**. It temporarily disables only
+`trg_guild_settings_revision` and `trg_guild_settings_audit_append_only`, preserving
+archived revision and audit rows exactly; their original enable modes are
+restored before commit. FK, CHECK and other triggers remain active. An explicit
+restore role must already own these tables/sequences (or have equivalent existing
+authority); this implementation grants **no** runtime privileges. Run restoration
+with application writers stopped and rehearse into an isolated test target.
+
+Serial and identity sequences are discovered from the **target catalog**, not a
+hardcoded list of `id` columns or untrusted archive sequence names. This includes
+`internal_idempotency.intent_id` and `internal_action_log.audit_id`. The standalone
+`guild_settings_version_seq` is also restarted. Next allocation is beyond restored
+values (or the target's configured start for an empty table), respecting sequence
+increment/bounds; exhaustion refuses and rolls back. `ALTER SEQUENCE RESTART` is
+transactional, unlike `setval`, so a failed restore cannot advance the standalone
+settings sequence outside the rolled-back transaction. Identity `GENERATED ALWAYS`
+columns use `OVERRIDING SYSTEM VALUE` during inserts.
+
+PostgreSQL behavior references:
+- [Serial/identity ownership discovery](https://www.postgresql.org/docs/16/functions-info.html)
+- [Transactional RESTART semantics](https://www.postgresql.org/docs/16/sql-altersequence.html)
+- [Identity override](https://www.postgresql.org/docs/16/sql-insert.html)
+
+### Migration-backed regression suite
+
+`crates/core/tests/backup_schema_roundtrip.rs` creates uniquely named isolated
+fixtures through `two_bot_testsupport::TestDatabase` and runs the actual cutover
+migrations. CI sets `TWO_TEST_DATABASE_URL` to its passwordless `agent_test`
+bootstrap on `agent-testdb`; without that variable the DB test reports a skip,
+which is not database verification. Fixture cleanup is awaited. Unit/integration
+tests must never use staging or production databases.
+
+On the persistent controller, compiling commands must use the bounded cache
+wrapper from the isolated workspace:
+
+```bash
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test backup_schema_roundtrip -- --nocapture
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --lib backup::dump_file -- --nocapture
+```
+
+A missing/refused/busy pool is **not** permission to run Cargo directly or use a
+new target directory. Use the existing ephemeral hosted CI path for compilation
+and record the local refusal. Existing synthetic/native-v3 and real-CLI publication
+regressions remain in `backup_roundtrip` and `backup_dump_publication`.
 
 ## Nightly DB backup — daily 04:17
 
@@ -52,8 +127,8 @@ All 22 bot-owned tables are dumped (see `DUMP_TABLES` in
 1. Parse `TWO_BACKUP_KEEP` **before** dumping — a malformed value aborts the
    run while it is still a no-op (a typo must never prune everything).
 2. Dump to `TWO_BACKUP_DIR/two-funnel-<stamp>.ndjson.gz` (default 14 kept).
-   Empty event log → exit non-zero after upload: a backup that quietly
-   reports zero events is worse than none.
+   Empty event log → exit non-zero **before retention/upload**, preserving
+   previous archives: a backup that quietly reports zero events is worse than none.
 3. Prune to the newest `TWO_BACKUP_KEEP` files (by mtime).
 4. Run `TWO_BACKUP_UPLOAD_CMD` with the file path as its **last** argument
    (the `uploadCmd` contract: suits `cp -t DIR FILE`; point wrapper-needing
@@ -215,9 +290,10 @@ cutover plan and gates separately; these examples are scratch-only.
 
 ## S6 hook (Founding Engineer)
 
-`cmd_restore` does **not** run migrations: two-bot-next migrations land
-under S6, so the target must already carry the schema and `dump()` refuses
-with a named table when it does not. S6 plugs `migrate()` in at the marked
-`NOTE` in `crates/bot/src/backup_cli.rs` (same position legacy
-`pg-restore.ts` ran it). The dump reader already tolerates dumps whose
-columns the target lacks (`droppedColumns` report, target types win).
+`cmd_restore` does **not** run migrations. Provision the target with the current
+`crates/cutover/migrations` schema through the separately authorized cutover path;
+backup/restore refuses a missing required table rather than migrating implicitly.
+The reader tolerates archived columns the target lacks (`dropped_columns` report,
+target types win), but it never silently drops nonempty archived legacy tables
+that have no target. Cutover execution and production restore remain separately
+gated; this table-coverage slice grants neither authority.
