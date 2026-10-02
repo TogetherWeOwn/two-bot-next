@@ -60,8 +60,9 @@ REQUIRED_TWO_KEYS = ("TWO_GUILD_NAME",)
 STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 READYZ_TIMEOUT_SECONDS = 10
 READYZ_BODY_CAP = 64 << 10
-# Owned serial/identity sequences, discovered as the restore does
-# (crates/core/src/backup/dump.rs), plus whether last_value is readable:
+# Owned serial/identity sequences via pg_get_serial_sequence, plus the standalone
+# guild_settings_version_seq (guarded by to_regclass), mirroring the restore
+# (crates/core/src/backup/dump.rs). Also reports whether last_value is readable:
 # pg_sequences reports NULL both for "never called" and "no privilege".
 SEQUENCES_QUERY = """\
 SELECT coalesce(json_agg(json_build_object(
@@ -73,7 +74,11 @@ FROM (SELECT table_name, column_name,
              pg_get_serial_sequence(
                quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) AS seq
       FROM information_schema.columns
-      WHERE table_schema = current_schema()) t
+      WHERE table_schema = current_schema()
+      UNION ALL
+      SELECT 'guild_settings' AS table_name, 'version' AS column_name,
+             format('%I.%I', current_schema(), 'guild_settings_version_seq') AS seq
+      WHERE to_regclass('guild_settings_version_seq') IS NOT NULL) t
 JOIN pg_sequences s ON format('%I.%I', s.schemaname, s.sequencename) = t.seq
 WHERE t.seq IS NOT NULL;
 """
@@ -246,7 +251,10 @@ def check_sequences(manifest, rows):
 def staging_readyz_url(url):
     if not url:
         raise ProbeError("no staging Worker URL given (--staging-url or STAGING_WORKER_URL)")
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        raise ProbeError("refusing: not the two-bot-next-staging workers.dev origin")
     try:
         port = parts.port
     except ValueError:

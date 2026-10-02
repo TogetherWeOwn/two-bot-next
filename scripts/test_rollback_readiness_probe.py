@@ -215,6 +215,25 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 self.assert_only_failure(name, reason, code, results)
                 self.assertEqual(summary, "rollback readiness: 3/4 checks passed")
 
+    def test_standalone_settings_sequence_without_mark_fails(self):
+        head = manifest(tables=[
+            {"name": "events", "columns": ["id", "guild_id"], "columnTypes": ["bigint", "text"], "count": 2},
+            {"name": "rsvp_events", "columns": ["id"], "columnTypes": ["bigint"], "count": 1},
+            {"name": "guild_settings", "columns": ["version"], "columnTypes": ["bigint"], "count": 0},
+        ])
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz", archive_lines(head),
+                              mtime=2_000_000_000)
+        self.fx.write_live([*LIVE, {"table": "guild_settings", "column": "version",
+                                    "sequence": "public.guild_settings_version_seq",
+                                    "last_value": 500, "readable": True}])
+        code, results, _ = self.probe()
+        self.assert_only_failure("sequences", "guild_settings.version (no manifest high-water)",
+                                 code, results)
+
+    def test_malformed_staging_url_fails_check_without_crashing(self):
+        code, results, _ = self.probe("--staging-url", "https://[::1")
+        self.assert_only_failure("readyz", "refusing: not the two-bot-next-staging", code, results)
+
     def test_malformed_manifest_fails_manifest_and_sequences(self):
         def lines(**overrides):
             return archive_lines(manifest(**overrides))
