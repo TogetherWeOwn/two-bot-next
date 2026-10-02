@@ -2332,6 +2332,7 @@ name = "two-bot-cutover"
 version = "0.2.0"
 dependencies = [
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2343,6 +2344,7 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "two-bot-core",
+ "two-bot-discord",
  "two-bot-testsupport",
  "url",
 ]

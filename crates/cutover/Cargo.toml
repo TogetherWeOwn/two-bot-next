@@ -17,6 +17,7 @@ license.workspace = true
 # `db` for the shared redacting `database_url::connect_options` parse helper.
 # sqlx is already a direct dependency, so no new driver burden.
 two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
+two-bot-discord = { version = "0.2.0", path = "../discord" }
 hex = { workspace = true }
 serde = { workspace = true }
 # Preserve JSON syntax kinds and exact numeric tokens during parity checks.
@@ -30,6 +31,9 @@ tokio = { workspace = true, features = ["time"] }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 url = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 
 [dev-dependencies]
 two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
@@ -69,3 +73,11 @@ path = "src/bin/dedupe_events.rs"
 [[bin]]
 name = "legacy_copy"
 path = "src/bin/legacy_copy.rs"
+
+[[bin]]
+name = "raid-list"
+path = "src/bin/raid_list.rs"
+
+[[bin]]
+name = "raid-remove"
+path = "src/bin/raid_remove.rs"
