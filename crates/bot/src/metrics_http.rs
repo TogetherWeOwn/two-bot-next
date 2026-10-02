@@ -105,9 +105,12 @@ mod tests {
             metrics::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8"
         );
-        let state = Arc::new(tokio::sync::RwLock::new(
-            crate::gateway::GatewayState::Unconfigured,
-        ));
+        let state = crate::server::SharedState {
+            gateway: Arc::new(tokio::sync::RwLock::new(
+                crate::gateway::GatewayState::Unconfigured,
+            )),
+            database: None,
+        };
         let response = crate::server::router(state)
             .oneshot(
                 Request::builder()
