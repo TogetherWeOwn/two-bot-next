@@ -7,7 +7,11 @@ use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use twilight_model::application::interaction::Interaction;
 use two_bot_core::{commands::PERM_MANAGE_EVENTS, lfg, lfg_store as store, RouterGates};
-use two_bot_discord::{interactions::InteractionRuntime, ActionExecutor};
+use two_bot_discord::{
+    interactions::InteractionRuntime,
+    lfg_interactions::{LfgInteractions, LfgRequest},
+    ActionExecutor,
+};
 
 const GUILD: &str = "2222";
 const CHANNEL: &str = "4444";
@@ -647,5 +651,83 @@ async fn router_fences_guild_permissions_and_disabled_announcements() {
     mock.shutdown().await;
     drop(rt);
     drop(off);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs agent-testdb or the CI service container"]
+async fn queued_lfg_work_leaves_pool_connections_for_the_gateway() {
+    // TOG-12174: every lock waiter used to hold a pool connection, starving the
+    // lock holder and the gateway checkpoint writer of the 5-connection pool.
+    let db = TestDb::new().await;
+    let post = lfg::LfgPost {
+        id: "lfg-7601".into(),
+        guild_id: GUILD.into(),
+        channel_id: CHANNEL.into(),
+        message_id: Some("5006".into()),
+        title: "Crowded raid".into(),
+        starts_at: "2099-09-11T20:00:00.000Z".into(),
+        status: lfg::LfgStatus::Open,
+        created_by: "3333".into(),
+        created_at: "2026-10-02T00:00:00.000Z".into(),
+        closed_at: None,
+    };
+    let roles = lfg::spec_roles(&post.id, &lfg::parse_role_spec("dps:DPS:10").unwrap());
+    store::put_lfg(&db.pool, &post, &roles, true).await.unwrap();
+    // The first message edit stays unanswered: its execution holds the lock.
+    let (mock, gate) = MockRest::start_gated(
+        vec![ScriptedResponse::json(200, json!({}))],
+        ScriptedResponse::json(200, json!({})),
+    )
+    .await;
+    let executor = std::sync::Arc::new(
+        ActionExecutor::with_proxy("lfg-test-token".into(), Some(mock.origin())).expect("executor"),
+    );
+    let service = std::sync::Arc::new(LfgInteractions::new(db.pool.clone()));
+    let tasks: Vec<_> = (0..6u64)
+        .map(|n| {
+            let (executor, service, post_id) = (executor.clone(), service.clone(), post.id.clone());
+            tokio::spawn(async move {
+                let request = LfgRequest::Select(lfg::LfgSelectAction::Signup {
+                    post_id,
+                    role_key: "dps".into(),
+                });
+                let actor = (4000 + n).to_string();
+                service
+                    .execute(&executor, request, GUILD, &actor, 7601 + n, BOT)
+                    .await
+            })
+        })
+        .collect();
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait_for_request())
+        .await
+        .expect("the lock holder reaches Discord");
+    // Let the other five queue; uncapped, each would now hold a connection.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Stand-in for the checkpoint writer, which panics after a 5 s deadline.
+    let spare = tokio::time::timeout(std::time::Duration::from_secs(2), db.pool.acquire())
+        .await
+        .expect("a pool connection stays free while LFG work queues")
+        .expect("acquire");
+    drop(spare);
+    gate.release();
+    for task in tasks {
+        task.await.expect("join").expect("signup succeeds");
+    }
+    assert_eq!(
+        store::list_lfg_signups(&db.pool, &post.id)
+            .await
+            .unwrap()
+            .len(),
+        6
+    );
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|r| r.method == "PATCH")
+            .count(),
+        6
+    );
+    mock.shutdown().await;
     db.cleanup().await;
 }

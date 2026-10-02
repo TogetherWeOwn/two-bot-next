@@ -33,15 +33,28 @@ pub enum LfgError {
     Uncertain,
 }
 
+/// LFG executions allowed to hold a pool connection at once, per process.
+///
+/// Each execution keeps its advisory-lock transaction open across paced REST
+/// and takes one more connection for every store call. With the production
+/// pool of 5 (`two_bot_store::pool::DB_POOL_MAX`), one in-flight execution uses
+/// at most 2, so the gateway checkpoint writer and the other features always
+/// find a free connection. Waiters queue here before `begin()`, holding none.
+pub const LFG_MAX_IN_FLIGHT: usize = 1;
+
 /// Store-backed feature service. The shared interaction runtime owns routing and replies.
 #[derive(Debug)]
 pub struct LfgInteractions {
     pool: sqlx::PgPool,
+    in_flight: tokio::sync::Semaphore,
 }
 
 impl LfgInteractions {
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            in_flight: tokio::sync::Semaphore::new(LFG_MAX_IN_FLIGHT),
+        }
     }
 
     pub async fn execute(
@@ -62,6 +75,13 @@ impl LfgInteractions {
                 LfgSelectAction::Signup { post_id, .. } | LfgSelectAction::Leave { post_id },
             ) => post_id.clone(),
         };
+        // Cap pool use before taking a connection: blocked lock waiters must not
+        // starve the lock holder or the gateway checkpoint writer.
+        let _permit = self
+            .in_flight
+            .acquire()
+            .await
+            .expect("LFG semaphore is never closed");
         // Serialize store changes + refresh across runtime instances. This key is
         // distinct from the capacity/close lock taken by the domain store.
         let mut guard = self.pool.begin().await?;

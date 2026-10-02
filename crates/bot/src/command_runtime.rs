@@ -100,8 +100,9 @@ impl InteractionHandler for FeedHandler {
 }
 
 /// The shared command runtime: one router + one REST executor + the sqlx
-/// stores, driven by bounded gateway tasks. Cheap to clone behind `Arc`; no
-/// REST or feature-store work is awaited while polling the shard.
+/// stores, driven by detached gateway tasks. Cheap to clone behind `Arc`; no
+/// REST or feature-store work is awaited while polling the shard. Dispatch
+/// itself is unbounded; LFG caps its own pool use (`LFG_MAX_IN_FLIGHT`).
 pub struct CommandRuntime {
     pool: Pool<Postgres>,
     executor: ActionExecutor,
@@ -120,6 +121,24 @@ pub struct CommandRuntime {
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
     attempts: AtomicU64,
+}
+
+// Each in-flight LFG execution holds up to two connections of the shared pool;
+// the gateway checkpoint writer must still find one free.
+const _: () = assert!(
+    two_bot_discord::lfg_interactions::LFG_MAX_IN_FLIGHT * 2 < two_bot_store::DB_POOL_MAX as usize
+);
+
+/// Why an attempted registry sync did not publish. Kept detail-free: the
+/// underlying REST errors are not logged.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RegistrySyncError {
+    /// The merged command set failed to assemble.
+    Invalid,
+    /// RESUMED needed the application id and the lookup failed.
+    ApplicationLookup,
+    /// Discord refused or did not answer the bulk overwrite.
+    Publish,
 }
 
 impl CommandRuntime {
@@ -366,11 +385,13 @@ impl CommandRuntime {
         }
     }
 
-    /// Boot must distinguish deferred publication from a failed attempted sync.
+    /// [`Self::publish_registry`] with the outcome returned. `Ok(())` covers a
+    /// completed sync and a deferred one (custom-command rows unknown, nothing
+    /// sent); `Err` means an attempted sync failed and a later READY/RESUMED retries it.
     pub(crate) async fn publish_registry_checked(
         &self,
         application_id: Option<u64>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RegistrySyncError> {
         let mut synced = self.registry_synced.lock().await;
         if application_id.is_none() && *synced {
             return Ok(());
@@ -386,9 +407,11 @@ impl CommandRuntime {
         let application_id = match application_id {
             Some(id) => id,
             None => {
-                let id = self.executor.current_application_id().await.map_err(|_| {
-                    sqlx::Error::InvalidArgument("command application lookup failed".into())
-                })?;
+                let id = self
+                    .executor
+                    .current_application_id()
+                    .await
+                    .map_err(|_| RegistrySyncError::ApplicationLookup)?;
                 // RESUMED carries no application: arm the interaction fence from
                 // this registry lookup instead of a separate identity read.
                 self.interactions.set_application_id(id);
@@ -400,7 +423,7 @@ impl CommandRuntime {
         self.executor
             .publish_guild_commands(application_id, self.guild_id, &commands)
             .await
-            .map_err(|_| sqlx::Error::InvalidArgument("command registry publish failed".into()))?;
+            .map_err(|_| RegistrySyncError::Publish)?;
         *synced = true;
         Ok(())
     }
@@ -1208,7 +1231,7 @@ pub(crate) fn publication_definitions(
     router: &InteractionRouter,
     gates: RouterGates,
     custom: Option<&[two_bot_core::CustomCommand]>,
-) -> Result<Option<Vec<two_bot_core::CommandDefinition>>, sqlx::Error> {
+) -> Result<Option<Vec<two_bot_core::CommandDefinition>>, RegistrySyncError> {
     if gates.automations && custom.is_none() {
         warn!("registry publication deferred: custom-command store unavailable");
         return Ok(None);
@@ -1216,5 +1239,5 @@ pub(crate) fn publication_definitions(
     router
         .publish_set(custom.unwrap_or_default())
         .map(Some)
-        .map_err(|_| sqlx::Error::InvalidArgument("command registry invalid".into()))
+        .map_err(|_| RegistrySyncError::Invalid)
 }

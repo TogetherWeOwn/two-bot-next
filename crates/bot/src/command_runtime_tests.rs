@@ -51,7 +51,7 @@ use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
-    sticky_options, CommandRuntime,
+    sticky_options, CommandRuntime, RegistrySyncError,
 };
 
 const GUILD: u64 = 2222;
@@ -1019,9 +1019,7 @@ async fn boot_publication_failure_is_reported_and_remains_retryable() {
         .publish_registry_checked(Some(1111))
         .await
         .unwrap_err();
-    assert!(
-        matches!(error, sqlx::Error::InvalidArgument(message) if message == "command registry publish failed")
-    );
+    assert_eq!(error, RegistrySyncError::Publish);
     runtime.publish_registry_checked(None).await.unwrap();
     runtime.publish_registry_checked(None).await.unwrap();
     let requests = mock.requests();
