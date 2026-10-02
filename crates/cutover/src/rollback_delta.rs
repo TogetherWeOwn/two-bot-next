@@ -170,6 +170,15 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Columns(&["created_at", "closing_started_at", "closed_at"]),
     },
     TableSpec {
+        table: "voice_creators",
+        measure: TableMeasure::Unmeasurable(
+            "no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)",
+        ),
+    },
+    // Insert-once rows (PgRoomStore::add_room never overwrites). An ownership
+    // transfer that updates owner_id must add its own timestamp column.
+    TableSpec { table: "voice_rooms", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec {
         table: "web_contract_meta",
         measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column"),
     },

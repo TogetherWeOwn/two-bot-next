@@ -115,6 +115,9 @@ BEGIN
       INSERT INTO ticket_transcripts
         (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at, purge_after)
         VALUES ('t-' || k, g, 'c-' || k, u, u, 'fixture', 1, '2026-10-01T00:00:00Z', '2026-12-30T00:00:00Z');
+      INSERT INTO voice_rooms
+        (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at)
+        VALUES (g, 'v-' || k, 'vc-' || g, u, u, '7', '2026-10-01T00:00:00Z');
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);

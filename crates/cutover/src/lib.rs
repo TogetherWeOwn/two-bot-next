@@ -38,6 +38,7 @@ pub mod rollback_delta;
 pub mod self_role_store;
 pub mod settings;
 pub mod tickets;
+pub mod voice_rooms;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
 pub use db::{
