@@ -106,8 +106,7 @@ impl ActionExecutor {
                 .topic(&topic)
                 .permission_overwrites(&overwrites),
         )?;
-        self.pace(false).await;
-        let res = self.call_once_raw(req, &[200, 201]).await?;
+        let res = self.call_once_raw_paced(req, &[200, 201]).await?;
         let doc = ticket_json(&res)?;
         let id = doc
             .get("id")
@@ -125,8 +124,7 @@ impl ActionExecutor {
         guild_id: &str,
     ) -> Result<Vec<Value>, DiscordError> {
         let req = Self::request_of(self.inner.factory.guild_channels(snowflake(guild_id)?))?;
-        self.pace(false).await;
-        let res = self.call_once_raw(req, &[200]).await?;
+        let res = self.call_once_raw_paced(req, &[200]).await?;
         serde_json::from_slice(&res.body)
             .map_err(|_| DiscordError::Unavailable("invalid guild channel list".into()))
     }
@@ -136,9 +134,8 @@ impl ActionExecutor {
         channel_id: &str,
     ) -> Result<ChannelPresence<Value>, DiscordError> {
         let req = Self::request_of(self.inner.factory.channel(snowflake(channel_id)?))?;
-        self.pace(false).await;
         // Accept 404 only to inspect its structured code; generic 404 is NOT absence.
-        let res = self.call_once_raw(req, &[200, 404]).await?;
+        let res = self.call_once_raw_paced(req, &[200, 404]).await?;
         if res.status == 404 {
             return if unknown_channel(&res) {
                 Ok(ChannelPresence::Absent)
@@ -204,8 +201,7 @@ impl ActionExecutor {
         }
 
         let req = Self::request_of(self.inner.factory.guild_member(guild, bot))?;
-        self.pace(false).await;
-        let res = self.call_once_raw(req, &[200]).await?;
+        let res = self.call_once_raw_paced(req, &[200]).await?;
         let member_doc = ticket_json(&res)?;
         if ticket_evidence_id(&member_doc["user"]["id"])? != bot.get() {
             return Err(invalid_ticket_permissions());
@@ -217,8 +213,7 @@ impl ActionExecutor {
             .map(ticket_evidence_id)
             .collect::<Result<std::collections::HashSet<_>, _>>()?;
         let req = Self::request_of(self.inner.factory.roles(guild))?;
-        self.pace(false).await;
-        let res = self.call_once_raw(req, &[200]).await?;
+        let res = self.call_once_raw_paced(req, &[200]).await?;
         let roles_doc = ticket_json(&res)?;
         let roles = roles_doc
             .as_array()
@@ -266,8 +261,7 @@ impl ActionExecutor {
 
     pub async fn delete_ticket_channel(&self, channel_id: &str) -> Result<(), DiscordError> {
         let req = Self::request_of(self.inner.factory.delete_channel(snowflake(channel_id)?))?;
-        self.pace(false).await;
-        let res = self.call_once_raw(req, &[200, 204, 404]).await?;
+        let res = self.call_once_raw_paced(req, &[200, 204, 404]).await?;
         if res.status == 404 && !unknown_channel(&res) {
             return Err(throw_for_status(&res));
         }
@@ -304,8 +298,7 @@ impl ActionExecutor {
                 .factory
                 .update_channel_permission(snowflake(channel_id)?, &overwrite),
         )?;
-        self.pace(false).await;
-        self.call_once(req, &[200, 204]).await.map(|_| ())
+        self.call_once_raw_paced(req, &[200, 204]).await.map(|_| ())
     }
 
     pub async fn post_ticket_message(
@@ -348,8 +341,7 @@ impl ActionExecutor {
         .body(bytes)
         .build()
         .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
-        self.pace(false).await;
-        let res = self.call_once_raw(req, &[200, 201]).await?;
+        let res = self.call_once_raw_paced(req, &[200, 201]).await?;
         let doc = ticket_json(&res)?;
         let id = doc
             .get("id")

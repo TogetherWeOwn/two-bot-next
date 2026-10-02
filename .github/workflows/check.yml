@@ -25,12 +25,18 @@ jobs:
     needs: [self-role-store, parity-docs]
     # A skipped dependency must not make the required check appear green.
     if: ${{ always() }}
-    # Overflow switch (TOG ops, 2026-10-01): stays on self-hosted unless repo vars
-    # CI_OVERFLOW_RUNNER (JSON runs-on, e.g. ["ubuntu-latest"]), CI_OVERFLOW_JOBS
-    # (JSON job ids) and CI_OVERFLOW_EVENTS (JSON event names) all select this job.
-    # Flip back without a PR by deleting CI_OVERFLOW_RUNNER. Private repo: hosted
-    # minutes come from the included allowance; an rbx1 guard reverts at 45k.
-    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing (TOG-12339). Every job in every workflow uses this
+    # expression with its own job id; scripts/test-runner-routing.py pins it.
+    # - Public repo: GitHub-hosted ubuntu-latest, free. The org runner group
+    #   refuses public repos, so a self-hosted label would queue forever. An
+    #   event payload without `repository` (schedule) also lands here.
+    # - Private repo: [self-hosted, two-selfhosted], unless repo vars
+    #   CI_OVERFLOW_RUNNER (JSON runs-on, e.g. ["ubuntu-latest"]),
+    #   CI_OVERFLOW_JOBS (JSON job ids) and CI_OVERFLOW_EVENTS (JSON event
+    #   names) all select the job (TOG ops, 2026-10-01). Flip back without a PR
+    #   by deleting CI_OVERFLOW_RUNNER. Hosted minutes then come from the
+    #   included allowance; an rbx1 guard reverts at 45k.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -209,6 +215,10 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
+      - name: leveling gateway and interaction integration (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
       - name: automod durable dedupe (CI service container only)
         env:
           AUTOMOD_CI_TESTDB: '1'
@@ -270,7 +280,9 @@ jobs:
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
-      - name: Command runtime acceptance tests (sticky and feeds, CI service only)
+      - name: Command runtime acceptance tests (sticky, feeds and leveling, CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked command_runtime_tests -- --ignored --test-threads=1
 
       - name: Real binary lifecycle acceptance (CI service only, under 60 s)
@@ -321,8 +333,8 @@ jobs:
 
   parity-docs:
     name: parity docs
-    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
-    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'parity-docs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'parity-docs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -340,8 +352,8 @@ jobs:
 
   self-role-store:
     name: self-role store leases
-    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
-    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'self-role-store') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'self-role-store') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     # A job container resolves service names directly. The test's fixed
     # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
@@ -381,7 +393,8 @@ jobs:
   # writes stay on the merge ref), so no scope-string change is needed.
   container-inputs:
     name: container inputs changed
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container-inputs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     outputs:
       build: ${{ steps.select.outputs.build }}
@@ -414,8 +427,14 @@ jobs:
   container:
     name: container smoke
     needs: container-inputs
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
+    env:
+      # Unique per run: runners share one Docker host, so the historical
+      # shared two-bot:ci tag let a concurrent PR's image replace the one
+      # just built before the smoke below ran against it.
+      SMOKE_TAG: two-bot:ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -444,30 +463,35 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: two-bot:ci
+          tags: ${{ env.SMOKE_TAG }}
           cache-from: type=gha,scope=two-bot-runtime-amd64
           cache-to: type=gha,mode=max,scope=two-bot-runtime-amd64
       - name: Runtime contract and size budgets
         if: needs.container-inputs.outputs.build == 'true'
-        run: python3 scripts/container-smoke.py two-bot:ci
+        run: python3 scripts/container-smoke.py "$SMOKE_TAG"
       - name: Prove deliberate budget breakage fails
         if: needs.container-inputs.outputs.build == 'true'
         run: |
           set -euo pipefail
           for budget in image binary; do
             log="$RUNNER_TEMP/container-negative-$budget.log"
-            if python3 scripts/container-smoke.py two-bot:ci "--$budget-max-bytes" 1 >"$log" 2>&1; then
+            if python3 scripts/container-smoke.py "$SMOKE_TAG" "--$budget-max-bytes" 1 >"$log" 2>&1; then
               printf 'FAIL: deliberate %s budget violation was accepted\n' "$budget"
               exit 1
             fi
             grep -F "exceeds size budget" "$log"
             printf 'PASS: deliberate %s budget violation rejected\n' "$budget"
           done
+      # Per-run tags (SMOKE_TAG) would otherwise accumulate ~100 MiB images
+      # on the shared Docker host; always remove our own tag when done.
+      - name: Remove per-run smoke image
+        if: always() && needs.container-inputs.outputs.build == 'true'
+        run: docker rmi --force "$SMOKE_TAG" || true
 
   community-db:
     name: community db
-    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
-    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'community-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'community-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -502,8 +526,8 @@ jobs:
 
   feeds-db:
     name: feeds db check
-    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
-    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'feeds-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'feeds-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -534,8 +558,8 @@ jobs:
 
   tickets-postgres:
     name: tickets postgres
-    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
-    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tickets-postgres') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tickets-postgres') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
     # Service DNS stays inside this job's network; never publish a shared port.
     container:
@@ -574,8 +598,8 @@ jobs:
 
   worker:
     name: worker check
-    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
-    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'worker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: see the note on the first job above.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'worker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
     defaults:
       run:
@@ -608,6 +632,8 @@ jobs:
         run: python3 ../scripts/test-deploy-production.py
       - name: Verify release reconciliation retries
         run: python3 ../scripts/test-release-retry.py
+      - name: Verify runner routing for every workflow job
+        run: python3 ../scripts/test-runner-routing.py
       - name: Verify offline release lifecycle
         run: |
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0

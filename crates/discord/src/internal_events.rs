@@ -14,6 +14,7 @@ use two_bot_core::internal_actions::{ActionError, ErrorCode, EventInput, EventPl
 use two_bot_core::{normalize_event, EventStatus, RawScheduledEvent, ScheduledEventMirror};
 
 use crate::executor::snowflake;
+use crate::ratelimit_guard::GuardError;
 use crate::{ActionExecutor, DiscordError};
 
 /// An already-validated action. `None` creates; a mapped ID updates. Cancelling
@@ -54,6 +55,20 @@ impl EventActionError {
     #[must_use]
     pub fn action_error(&self) -> ActionError {
         let (code, reason) = match self {
+            // Local guard refusals never reached the wire: a dead token is an
+            // outage, any other refusal is a retryable local pause. Neither is
+            // a Discord rejection.
+            Self::Discord(DiscordError::Guard(GuardError::TokenInvalid)) => {
+                (ErrorCode::DiscordUnavailable, "discord_guard_refused")
+            }
+            Self::Discord(DiscordError::Guard(_)) => {
+                return ActionError::new(
+                    ErrorCode::RateLimited,
+                    self.to_string(),
+                    "discord_guard_refused",
+                )
+                .with_retry_after(1);
+            }
             Self::Discord(DiscordError::Rejected(_)) => {
                 (ErrorCode::DiscordRejected, "discord_rejected")
             }
