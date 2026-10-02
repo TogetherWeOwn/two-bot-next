@@ -20,7 +20,7 @@ use two_bot_cutover::rollback_delta::{export_delta, report, TABLE_SPECS};
 
 static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// The `T_f` baseline every seed is measured against.
 const SINCE: &str = "2026-09-30T12:00:00Z";
