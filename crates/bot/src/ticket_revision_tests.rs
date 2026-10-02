@@ -1,5 +1,5 @@
 use super::*;
-use crate::mock_rest::{MockRest, ScriptedResponse};
+use crate::discord_test_common::{MockRest, ScriptedResponse};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 

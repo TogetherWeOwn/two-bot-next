@@ -138,7 +138,7 @@ gateway feature delivery.
 
 ## Delivery recovery checkpoint
 
-Migration `0360_gateway_onboarding_jobs.sql` stores captured welcome/goodbye
+Migration `0361_gateway_onboarding_jobs.sql` stores captured welcome/goodbye
 state and component delivery receipts in the **same transaction** as the S3
 funnel batch and sequence. Workers claim committed rows, not an in-memory copy
 of a member cache. The original dispatch clock remains stable on retry. Session

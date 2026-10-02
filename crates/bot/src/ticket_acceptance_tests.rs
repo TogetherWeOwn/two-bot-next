@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     command_runtime::CommandRuntime,
-    mock_rest::{MockRest, ScriptedResponse},
+    discord_test_common::{MockRest, ScriptedResponse},
 };
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};

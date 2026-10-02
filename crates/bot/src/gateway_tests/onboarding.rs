@@ -6,7 +6,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::AtomicBool;
 
-use crate::mock_rest::{MockRest, RestRequest, ScriptedResponse};
+use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
 use twilight_gateway::EventTypeFlags;
 use twilight_model::gateway::event::Event;

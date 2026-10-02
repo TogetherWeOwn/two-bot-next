@@ -11,6 +11,10 @@ mod command_runtime;
 mod command_runtime_tests;
 mod community_jobs;
 mod database_roles_cli;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../discord/tests/common/mod.rs"]
+mod discord_test_common;
 mod dispatch;
 mod gateway;
 mod gateway_metrics;
@@ -20,10 +24,6 @@ mod jobs;
 #[cfg(test)]
 mod lifecycle_tests;
 mod metrics_http;
-#[cfg(test)]
-#[allow(dead_code)]
-#[path = "../../discord/tests/common/mod.rs"]
-mod mock_rest;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;

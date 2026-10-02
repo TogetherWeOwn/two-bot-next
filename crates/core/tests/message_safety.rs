@@ -1,7 +1,7 @@
 use two_bot_core::{
     audit::{format_audit_event, has_audit_event_identity, AuditEvent, AuditKind},
     lfg::{lfg_content, LfgPost, LfgRole, LfgStatus},
-    message_safety::{text_len, CONTENT_LIMIT},
+    message_safety::{contains_mass_mention, content, text_len, CONTENT_LIMIT},
 };
 
 #[test]
@@ -34,6 +34,44 @@ fn lfg_title_and_role_labels_are_safe_and_bounded_after_rendering() {
         ..post
     };
     assert!(text_len(&lfg_content(&long, &roles, &[])) <= CONTENT_LIMIT);
+}
+
+#[test]
+fn zero_width_split_mentions_refuse_while_multilingual_text_is_kept() {
+    // Refused: raw mass mentions and every zero-width-split obfuscation,
+    // including the U+2060 word-joiner automod also treats as a gap.
+    for separator in ['\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}'] {
+        for mention in ["everyone", "here"] {
+            let disguised = format!(
+                "@{separator}{}",
+                mention
+                    .chars()
+                    .map(|ch| format!("{ch}{separator}"))
+                    .collect::<String>()
+            );
+            assert!(
+                contains_mass_mention(&disguised),
+                "{disguised:?} must refuse"
+            );
+            let safe = content(&disguised);
+            assert!(!safe.contains("@everyone"));
+            assert!(!safe.contains("@here"));
+            assert!(!contains_mass_mention(&safe));
+        }
+    }
+    // Preserved: Persian ZWNJ, ZWJ emoji, ZWSP line-breaks and word joiners
+    // are legitimate text, never a refusal.
+    for text in [
+        "می\u{200c}روم",
+        "👩\u{200d}💻",
+        "line\u{200b}break",
+        "\u{feff}text",
+        "word\u{2060}joiner",
+        "@user\u{200c}name",
+    ] {
+        assert_eq!(content(text), text);
+        assert!(!contains_mass_mention(text), "{text:?} must be kept");
+    }
 }
 
 #[test]

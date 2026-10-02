@@ -1,7 +1,7 @@
 //! Receive-relative ACK and ordered-commit fences through real mock sockets.
 use super::*;
 
-async fn wait_response(mock: &MockRest, path: &str) -> crate::mock_rest::RestResponse {
+async fn wait_response(mock: &MockRest, path: &str) -> crate::discord_test_common::RestResponse {
     tokio::time::timeout(DEADLINE, async {
         loop {
             if let Some(response) = mock

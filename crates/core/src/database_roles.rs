@@ -71,7 +71,7 @@ mod tests {
             include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
             include_str!("../../cutover/migrations/0340_operational_audit.sql"),
             include_str!("../../cutover/migrations/0350_internal_actions.sql"),
-            include_str!("../../cutover/migrations/0360_gateway_onboarding_jobs.sql"),
+            include_str!("../../cutover/migrations/0361_gateway_onboarding_jobs.sql"),
         ] {
             let mut table = None;
             for line in migration.lines() {

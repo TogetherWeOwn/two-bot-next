@@ -173,9 +173,11 @@ async fn shutdown_and_timeout_drop_active_work_and_allow_later_retry() {
 
 #[tokio::test]
 async fn gateway_scope_starts_once_joins_buttons_and_rejects_work_after_stop() {
-    let mock =
-        crate::mock_rest::MockRest::start(vec![], crate::mock_rest::ScriptedResponse::status(500))
-            .await;
+    let mock = crate::discord_test_common::MockRest::start(
+        vec![],
+        crate::discord_test_common::ScriptedResponse::status(500),
+    )
+    .await;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
         .unwrap();

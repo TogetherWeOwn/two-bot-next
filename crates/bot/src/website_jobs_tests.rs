@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 use two_bot_testsupport::TestDatabase;
 
-use crate::mock_rest::{MockRest, ScriptedResponse};
+use crate::discord_test_common::{MockRest, ScriptedResponse};
 
 async fn tick(
     kind: Kind,

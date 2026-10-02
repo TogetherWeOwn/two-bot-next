@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::mock_rest::{MockRest, RestRequest, ScriptedResponse};
+use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use futures_util::FutureExt as _;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;

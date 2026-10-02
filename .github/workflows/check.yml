@@ -174,6 +174,16 @@ jobs:
       - name: onboarding shared runtime acceptance (mock Discord and CI service only)
         run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
 
+      - name: leveling Postgres parity tests
+        env:
+          TWO_LEVELING_TEST_CI: '1'
+        run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
+
+      - name: Raid cohort query (CI service container only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test raid_list_db --locked -- --ignored
+
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
