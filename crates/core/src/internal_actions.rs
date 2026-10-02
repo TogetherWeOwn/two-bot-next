@@ -50,6 +50,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
+use super::clock_guard::ClockGuard;
 use super::moderation::{require_moderation_reason, ModerationAction, ReasonError};
 
 /// Route path the canonical string signs (legacy `ACTIONS_PATH`).
@@ -63,8 +64,9 @@ pub const SKEW_SECONDS: u64 = 120;
 /// fresh up to a second past its nominal skew distance, and a nonce burned at
 /// delivery must still be live then. 241 s is the smallest TTL that covers
 /// every accepted instant for the default skew while the clocks advance together
-/// without rollback. Expiry followed by wall-clock rollback can reopen freshness;
-/// the receiver needs an explicit clock policy (see `docs/threat-model.md`, F8).
+/// without rollback. Expiry followed by wall-clock rollback used to reopen
+/// freshness; the pipeline now evaluates against a [`ClockGuard`] high-water
+/// mark and refuses regressed clocks fail-closed (see `docs/threat-model.md`, F8).
 pub const NONCE_TTL_SECONDS: u64 = 241;
 /// Diagnostic cutoff for `in_flight` idempotency claims (legacy
 /// `CLAIM_STALE_SECONDS`). Durable stale claims require reconciliation, never
@@ -345,8 +347,10 @@ pub fn valid_nonce_format(nonce: &str) -> bool {
 /// keeping them consistent: a nonce is live while `now - seen <= ttl`.
 /// This coverage assumes expiry and freshness clocks advance together without
 /// rollback. Saturating subtraction protects retained entries, not entries already
-/// swept; wall-clock rollback can make an expired capture fresh again. The receiver
-/// must supply a clock policy rather than treating TTL coverage as unconditional.
+/// swept; wall-clock rollback used to make an expired capture fresh again. The
+/// pipeline now evaluates `now_ms` against a caller-supplied [`ClockGuard`]
+/// before burning (see [`authorize`]), so a sweep can never reopen a signed
+/// window the high-water mark has already passed.
 #[derive(Debug, Clone)]
 pub struct NonceCache {
     seen: HashMap<String, u64>,
@@ -1551,6 +1555,11 @@ impl std::fmt::Debug for AuthDecision {
 /// Buckets 5 and 8 run after verification on purpose: rate-limiting an
 /// unverified key id would let anyone lock out a legitimate caller by spamming
 /// its id.
+///
+/// The `clock` guard closes the F8 rollback gap: `now_ms` is evaluated against
+/// the caller's [`ClockGuard`] high-water mark before the nonce burns, and the
+/// mark (not a regressed reading) decides freshness. The receiver owns one
+/// guard per clock domain and persists its mark across restart/failover.
 #[allow(clippy::too_many_arguments)]
 pub fn authorize(
     headers: &AuthHeaders<'_>,
@@ -1560,10 +1569,10 @@ pub fn authorize(
     has_store: bool,
     has_settings: bool,
     skew_seconds: u64,
-    now_unix_secs: u64,
     now_ms: u64,
     nonces: &mut NonceCache,
     buckets: &mut TokenBuckets,
+    clock: &mut ClockGuard,
 ) -> Result<AuthDecision, ActionError> {
     if headers.key_id.is_empty()
         || headers.timestamp.is_empty()
@@ -1584,7 +1593,23 @@ pub fn authorize(
     ) {
         return Err(auth_failure("bad_signature"));
     }
-    if !within_skew(headers.timestamp, skew_seconds, now_unix_secs) {
+    // Fail closed on clock rollback (F8): evaluate the freshness clock against
+    // the high-water mark before trusting it. Within tolerance the mark itself
+    // decides freshness, so a sweep can never reopen a window the mark has
+    // already passed; past tolerance the decision refuses without burning.
+    let guarded_ms = clock.evaluate(now_ms).map_err(|rollback| {
+        ActionError::new(
+            ErrorCode::StaleRequest,
+            format!("Timestamp is outside the ±{skew_seconds}s window"),
+            format!(
+                "clock_rollback: observed {roll}ms against high-water {mark}ms",
+                roll = rollback.observed_ms,
+                mark = rollback.high_water_ms
+            ),
+        )
+    })?;
+    let guarded_secs = guarded_ms / 1000;
+    if !within_skew(headers.timestamp, skew_seconds, guarded_secs) {
         return Err(ActionError::new(
             ErrorCode::StaleRequest,
             format!("Timestamp is outside the ±{skew_seconds}s window"),
@@ -1609,14 +1634,18 @@ pub fn authorize(
             "nonce_ttl_too_short",
         ));
     }
-    if !nonces.offer(headers.nonce, now_ms) {
+    if !nonces.offer(headers.nonce, guarded_ms) {
         return Err(ActionError::new(
             ErrorCode::Replayed,
             "This nonce has already been used",
             "replayed_nonce",
         ));
     }
-    let per_key = buckets.take(&format!("key:{}", headers.key_id), DEFAULT_BUCKET, now_ms);
+    let per_key = buckets.take(
+        &format!("key:{}", headers.key_id),
+        DEFAULT_BUCKET,
+        guarded_ms,
+    );
     if !per_key.allowed {
         return Err(ActionError::new(
             ErrorCode::RateLimited,
@@ -1643,7 +1672,7 @@ pub fn authorize(
         let per_action = buckets.take(
             &format!("key:{}:add_member", headers.key_id),
             ADD_MEMBER_BUCKET,
-            now_ms,
+            guarded_ms,
         );
         if !per_action.allowed {
             return Err(ActionError::new(
@@ -3081,6 +3110,7 @@ mod tests {
         now_ms: u64,
         nonces: &mut NonceCache,
         buckets: &mut TokenBuckets,
+        clock: &mut ClockGuard,
     ) -> Result<AuthDecision, ActionError> {
         authorize(
             headers,
@@ -3090,10 +3120,10 @@ mod tests {
             true,
             true,
             SKEW_SECONDS,
-            now_ms / 1000,
             now_ms,
             nonces,
             buckets,
+            clock,
         )
     }
 
@@ -3169,6 +3199,7 @@ mod tests {
         ] {
             let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
             let mut buckets = TokenBuckets::new();
+            let mut clock = ClockGuard::new();
             let nonce = test_nonce();
             let sig = sign(
                 vector.secret.as_bytes(),
@@ -3183,6 +3214,7 @@ mod tests {
                 now_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             );
             if accepted {
                 assert!(result.is_ok(), "{timestamp}");
@@ -3197,21 +3229,26 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_clock_rollback_after_nonce_expiry_reopens_capture() {
-        // Characterize the clock-policy gap, not a deployed replay guarantee:
-        // once swept, a nonce cannot guard a capture made fresh by wall rollback.
+    fn pipeline_clock_rollback_after_nonce_expiry_refuses_capture() {
+        // F8 fail-closed: accept a capture, expire and sweep its nonce, then
+        // roll time back into its signed window. The high-water guard refuses
+        // the rolled-back capture on both sweep paths — explicit sweep and a
+        // sweep via another fresh request's offer — even though the nonce is
+        // forgotten. A retained nonce still refuses rollback as a replay.
         let vector = vec1();
         let seen_ms = 1_720_000_000_000;
         let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
         for explicit_sweep in [true, false] {
             let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
             let mut buckets = TokenBuckets::new();
+            let mut clock = ClockGuard::new();
             authorize_for_test(
                 &headers,
                 vector.body.as_bytes(),
                 seen_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect("first delivery accepted");
             let err = authorize_for_test(
@@ -3220,6 +3257,7 @@ mod tests {
                 seen_ms - 1_000,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect_err("rollback cannot bypass an entry still in memory");
             assert_eq!(err.code, ErrorCode::Replayed);
@@ -3231,6 +3269,7 @@ mod tests {
                 expired_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect_err("old capture is stale before rollback");
             assert_eq!(err.code, ErrorCode::StaleRequest);
@@ -3252,19 +3291,124 @@ mod tests {
                     expired_ms,
                     &mut nonces,
                     &mut buckets,
+                    &mut clock,
                 )
                 .expect("another fresh request sweeps expired entries via offer");
             }
             assert!(!nonces.seen.contains_key(&vector.nonce));
-            authorize_for_test(
+            let err = authorize_for_test(
                 &headers,
                 vector.body.as_bytes(),
                 seen_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
-            .expect("known gap: expiry then rollback makes the capture acceptable again");
+            .expect_err("expiry then rollback must refuse, not reopen the capture");
+            assert_eq!(err.code, ErrorCode::StaleRequest);
+            assert_eq!(
+                err.log_reason.lines().next().unwrap_or(""),
+                "clock_rollback: observed 1720000000000ms against high-water 1720000241001ms"
+            );
         }
+    }
+
+    #[test]
+    fn pipeline_clock_within_tolerance_decides_at_high_water() {
+        // A freshness sample within tolerance of the mark evaluates against
+        // the mark: delivery 1 s behind the high-water mark still authorizes
+        // (it is not rollback), while the mark itself does not regress.
+        let vector = vec1();
+        let seen_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        authorize_for_test(
+            &headers,
+            vector.body.as_bytes(),
+            seen_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect("first delivery accepted");
+        assert_eq!(clock.high_water_ms(), Some(seen_ms));
+        // A second nonce delivered 1 s behind the mark is still fresh at the
+        // mark and authorizes; the mark does not move backwards.
+        let nonce = test_nonce();
+        let sig = sign(
+            vector.secret.as_bytes(),
+            &vector.timestamp,
+            &nonce,
+            vector.body.as_bytes(),
+        );
+        let lagging = signed_headers("web", &vector.timestamp, &nonce, &sig);
+        authorize_for_test(
+            &lagging,
+            vector.body.as_bytes(),
+            seen_ms - 1_000,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect("within-tolerance delivery authorizes at the high-water mark");
+        assert_eq!(clock.high_water_ms(), Some(seen_ms));
+    }
+
+    #[test]
+    fn pipeline_clock_forward_jump_behaves_as_before() {
+        // Forward jumps keep prior behavior: the mark advances, fresh requests
+        // authorize, and stale captures refuse as stale — not as rollback.
+        let vector = vec1();
+        let seen_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
+        let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
+        authorize_for_test(
+            &headers,
+            vector.body.as_bytes(),
+            seen_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect("first delivery accepted");
+        // The jump must clear the ±120 s skew window: at +60 s the old
+        // capture is still fresh and its still-live nonce (TTL 241 s)
+        // correctly refuses as replay, not stale. +180 s makes it stale.
+        let jumped_ms = seen_ms + 180_000;
+        let nonce = test_nonce();
+        let timestamp = (jumped_ms / 1000).to_string();
+        let sig = sign(
+            vector.secret.as_bytes(),
+            &timestamp,
+            &nonce,
+            vector.body.as_bytes(),
+        );
+        let fresh = signed_headers("web", &timestamp, &nonce, &sig);
+        authorize_for_test(
+            &fresh,
+            vector.body.as_bytes(),
+            jumped_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect("forward jump authorizes fresh captures");
+        assert_eq!(clock.high_water_ms(), Some(jumped_ms));
+        // The old capture is stale at the jumped clock — same as before.
+        let err = authorize_for_test(
+            &headers,
+            vector.body.as_bytes(),
+            jumped_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("old capture is stale after forward jump");
+        assert_eq!(err.code, ErrorCode::StaleRequest);
     }
 
     #[test]
@@ -3275,21 +3419,44 @@ mod tests {
         raw.resize(MAX_BODY_BYTES, b' ');
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let nonce = test_nonce();
         let sig = sign(vector.secret.as_bytes(), &vector.timestamp, &nonce, &raw);
         let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
-        assert!(authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets).is_ok());
+        assert!(authorize_for_test(
+            &headers,
+            &raw,
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock
+        )
+        .is_ok());
 
         raw.push(b' ');
         let nonce = test_nonce();
         let sig = sign(vector.secret.as_bytes(), &vector.timestamp, &nonce, &raw);
         let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
-        let err = authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets)
-            .expect_err("one byte over cap");
+        let err = authorize_for_test(
+            &headers,
+            &raw,
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("one byte over cap");
         assert_eq!(err.code, ErrorCode::Malformed);
         assert_eq!(err.log_reason, "body_too_large");
-        let err = authorize_for_test(&headers, &raw, now_ms, &mut nonces, &mut buckets)
-            .expect_err("oversized request already burned its nonce");
+        let err = authorize_for_test(
+            &headers,
+            &raw,
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("oversized request already burned its nonce");
         assert_eq!(err.code, ErrorCode::Replayed);
         assert_eq!(nonces.len(), 2);
     }
@@ -3300,6 +3467,7 @@ mod tests {
         let now_ms = 1_720_000_000_000;
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let wrong = signed_headers("web", &vector.timestamp, &vector.nonce, &vec2().signature);
         let unknown = signed_headers(
             "unknown",
@@ -3314,6 +3482,7 @@ mod tests {
                 now_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect_err("wrong signature");
             let unknown_err = authorize_for_test(
@@ -3322,6 +3491,7 @@ mod tests {
                 now_ms,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect_err("unknown caller");
             assert_eq!(wrong_err, unknown_err);
@@ -3336,6 +3506,7 @@ mod tests {
             now_ms,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .is_ok());
     }
@@ -3346,6 +3517,7 @@ mod tests {
         let now_ms = 1_720_000_000_000;
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let marker = "synthetic-oauth-body-marker";
         let raw = format!("{{\"access_token\":\"{marker}\",\"action\":");
         let nonce = test_nonce();
@@ -3356,14 +3528,28 @@ mod tests {
             raw.as_bytes(),
         );
         let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
-        let err = authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
-            .expect_err("malformed JSON");
+        let err = authorize_for_test(
+            &headers,
+            raw.as_bytes(),
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("malformed JSON");
         assert_eq!(err.code, ErrorCode::Malformed);
         assert_eq!(err.log_reason, "bad_json");
         assert!(!format!("{err:?}").contains(marker));
         assert!(!format!("{err}").contains(marker));
-        let err = authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
-            .expect_err("rejected JSON still burned its nonce");
+        let err = authorize_for_test(
+            &headers,
+            raw.as_bytes(),
+            now_ms,
+            &mut nonces,
+            &mut buckets,
+            &mut clock,
+        )
+        .expect_err("rejected JSON still burned its nonce");
         assert_eq!(err.code, ErrorCode::Replayed);
     }
 
@@ -3421,6 +3607,7 @@ mod tests {
         let now_ms = 1_720_000_000_000;
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let headers = signed_headers("web", &vector.timestamp, &vector.nonce, &vector.signature);
         authorize_for_test(
             &headers,
@@ -3428,6 +3615,7 @@ mod tests {
             now_ms,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect("old key accepted during overlap");
         let rotated = KeyRing::new(vec![SigningKey {
@@ -3456,10 +3644,10 @@ mod tests {
             true,
             true,
             SKEW_SECONDS,
-            now_ms / 1000,
             now_ms,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("rotation must not reset global replay memory");
         assert_eq!(err.code, ErrorCode::Replayed);
@@ -3503,6 +3691,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let headers = signed_headers(
             "web",
             vec1().timestamp.as_str(),
@@ -3517,10 +3706,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect("valid request authorizes");
         assert_eq!(decision.action, "role.assign");
@@ -3540,10 +3729,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_001,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("replay");
         assert_eq!(err.code, ErrorCode::Replayed);
@@ -3559,6 +3748,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let raw = br#"{"action":"role.assign"}"#;
         let nonce = test_nonce();
         let sig = sign(vec1().secret.as_bytes(), "1000120", &nonce, raw);
@@ -3571,14 +3761,15 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_000_000,
             1_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect("boundary-fresh request authorizes");
         // Same request at its last fresh instant, buckets refilled.
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let headers = signed_headers("web", "1000120", &nonce, &sig);
         let err = authorize(
             &headers,
@@ -3588,10 +3779,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_000_240,
             1_000_240_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("boundary replay");
         assert_eq!(err.code, ErrorCode::Replayed);
@@ -3602,6 +3793,7 @@ mod tests {
         // is 240001 ms old, past a 240 s TTL. With the coverage TTL it is
         // still live, so this is a replay, not a second acceptance.
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let headers = signed_headers("web", "1000120", &nonce, &sig);
         let err = authorize(
             &headers,
@@ -3611,10 +3803,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_000_240,
             1_000_240_001,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("fractional-ms replay");
         assert_eq!(err.code, ErrorCode::Replayed);
@@ -3630,6 +3822,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let raw = br#"{"action":"role.assign"}"#;
         let nonce = test_nonce();
         let sig = sign(vec1().secret.as_bytes(), "1000180", &nonce, raw);
@@ -3642,10 +3835,10 @@ mod tests {
             false,
             false,
             180,
-            1_000_000,
             1_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("wide skew refused");
         assert_eq!(err.code, ErrorCode::Internal);
@@ -3659,6 +3852,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         // Stale timestamp AND bad signature: the signature refusal wins,
         // because everything after it trusts the key id.
         let headers = signed_headers("web", "1000000000", vec1().nonce.as_str(), "sha256=nope");
@@ -3670,10 +3864,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("bad signature");
         assert_eq!(err.code, ErrorCode::Unauthorized);
@@ -3686,6 +3880,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         // Stale but correctly signed → stale_request.
         let sig = sign(
             vec1().secret.as_bytes(),
@@ -3702,10 +3897,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("stale");
         assert_eq!(err.code, ErrorCode::StaleRequest);
@@ -3727,10 +3922,10 @@ mod tests {
             true,
             true,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_001,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("unknown action");
         assert_eq!(err.code, ErrorCode::ActionNotAllowed);
@@ -3743,6 +3938,7 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         // Exhaust the 20-burst key bucket with distinct valid nonces.
         for i in 0..20 {
             let nonce = format!("{i:032x}");
@@ -3761,10 +3957,10 @@ mod tests {
                 false,
                 false,
                 SKEW_SECONDS,
-                1_720_000_000,
                 1_720_000_000_000,
                 &mut nonces,
                 &mut buckets,
+                &mut clock,
             )
             .expect("burst allows 20");
         }
@@ -3784,10 +3980,10 @@ mod tests {
             false,
             false,
             SKEW_SECONDS,
-            1_720_000_000,
             1_720_000_000_000,
             &mut nonces,
             &mut buckets,
+            &mut clock,
         )
         .expect_err("21st is limited");
         assert_eq!(err.code, ErrorCode::RateLimited);
@@ -3800,10 +3996,12 @@ mod tests {
         let flags = InternalFlags::from_map(&HashMap::new());
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let attempt = |raw: &[u8],
                        nonce: &str,
                        nonces: &mut NonceCache,
-                       buckets: &mut TokenBuckets|
+                       buckets: &mut TokenBuckets,
+                       clock: &mut ClockGuard|
          -> ActionError {
             let sig = sign(
                 vec1().secret.as_bytes(),
@@ -3820,19 +4018,33 @@ mod tests {
                 true,
                 true,
                 SKEW_SECONDS,
-                1_720_000_000,
                 1_720_000_000_000,
                 nonces,
                 buckets,
+                clock,
             )
             .expect_err("malformed")
         };
         assert_eq!(
-            attempt(b"not json", &test_nonce(), &mut nonces, &mut buckets).code,
+            attempt(
+                b"not json",
+                &test_nonce(),
+                &mut nonces,
+                &mut buckets,
+                &mut clock
+            )
+            .code,
             ErrorCode::Malformed
         );
         assert_eq!(
-            attempt(b"[1,2]", &test_nonce(), &mut nonces, &mut buckets).code,
+            attempt(
+                b"[1,2]",
+                &test_nonce(),
+                &mut nonces,
+                &mut buckets,
+                &mut clock
+            )
+            .code,
             ErrorCode::Malformed
         );
         assert_eq!(
@@ -3840,7 +4052,8 @@ mod tests {
                 br#"{"no_action":1}"#,
                 &test_nonce(),
                 &mut nonces,
-                &mut buckets
+                &mut buckets,
+                &mut clock
             )
             .code,
             ErrorCode::Malformed

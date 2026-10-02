@@ -10,6 +10,9 @@
 //!   The report is JSON on stdout; missing-item lines go to stderr. URLs and
 //!   secrets never appear: only relative paths and section names are named.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "Usage: preconditions [--repo-root <path>]\n\
