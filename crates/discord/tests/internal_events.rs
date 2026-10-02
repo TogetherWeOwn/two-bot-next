@@ -13,8 +13,10 @@ use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use two_bot_core::internal_actions::{validate_event_input, EventInput, EventPlace};
 use two_bot_core::{EventStatus, ScheduledEvent, ScheduledEventMirror};
+use two_bot_discord::ratelimit_guard::GuardError;
 use two_bot_discord::{
-    event_status_name, scheduled_event_body, ActionExecutor, EventActionError, EventCall,
+    event_status_name, scheduled_event_body, ActionExecutor, DiscordError, EventActionError,
+    EventCall,
 };
 
 const GUILD: &str = "100000000000000001";
@@ -118,6 +120,29 @@ fn body_and_status_golden_contracts() {
     }
     for status in [Value::Null, json!("4"), json!(true), json!({})] {
         assert_eq!(event_status_name(&status), None);
+    }
+}
+
+#[test]
+fn local_guard_refusals_are_unsent_and_never_discord_rejections() {
+    let fatal = EventActionError::Discord(DiscordError::Guard(GuardError::TokenInvalid));
+    let wire = fatal.action_error();
+    assert_eq!(wire.code.as_str(), "discord_unavailable");
+    assert_eq!(wire.log_reason, "discord_guard_refused");
+    assert_eq!(wire.retry_after_secs, None);
+    assert!(fatal.is_safe_pre_mutation());
+
+    for refusal in [
+        GuardError::CircuitOpen,
+        GuardError::AdmissionTimeout,
+        GuardError::GlobalPaused,
+    ] {
+        let error = EventActionError::Discord(DiscordError::Guard(refusal));
+        let wire = error.action_error();
+        assert_eq!(wire.code.as_str(), "rate_limited");
+        assert_eq!(wire.log_reason, "discord_guard_refused");
+        assert_eq!(wire.retry_after_secs, Some(1));
+        assert!(error.is_safe_pre_mutation());
     }
 }
 

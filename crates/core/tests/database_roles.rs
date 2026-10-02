@@ -95,6 +95,54 @@ async fn denied(pool: &PgPool, role: &str, sql: &str) -> Result<(), sqlx::Error>
     }
 }
 
+async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    use two_bot_core::send_admission::{
+        AdmissionError, PgSendAdmission, SendAdmission, SendCooldown,
+    };
+
+    let role = role.to_owned();
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _| {
+            let role = role.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await?;
+    let result = async {
+        let error = |error: AdmissionError| sqlx::Error::InvalidArgument(error.to_string());
+        let gate = PgSendAdmission::new(runtime.clone(), "offline-database-role-admission")
+            .map_err(error)?;
+        gate.admit()
+            .await
+            .map_err(error)?
+            .complete(None)
+            .await
+            .map_err(error)?;
+        gate.admit()
+            .await
+            .map_err(error)?
+            .complete(Some(SendCooldown::Indefinite))
+            .await
+            .map_err(error)?;
+        gate.extend(SendCooldown::FiniteMs(1))
+            .await
+            .map_err(error)?;
+        require(
+            matches!(gate.admit().await, Err(AdmissionError::Blocked)),
+            "runtime lost indefinite admission hold",
+        )
+    }
+    .await;
+    runtime.close().await;
+    result
+}
+
 async fn scheduled_runtime_probe(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {role}")))
@@ -164,6 +212,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0310_presence_probe.sql"),
         include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
         include_str!("../../cutover/migrations/0320_gateway_sessions.sql"),
+        include_str!("../../cutover/migrations/0321_gateway_boot_directives.sql"),
         include_str!("../../cutover/migrations/0330_guild_settings.sql"),
         include_str!("../../cutover/migrations/0331_guild_settings_versions.sql"),
         include_str!("../../cutover/migrations/0332_guild_settings_allocator.sql"),
@@ -171,6 +220,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
         include_str!("../../cutover/migrations/0340_operational_audit.sql"),
         include_str!("../../cutover/migrations/0350_internal_actions.sql"),
+        include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
+        include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
     ] {
         sqlx::raw_sql(migration).execute(pool).await?;
     }
@@ -279,7 +330,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     ] {
         as_role(pool, &roles[2], &format!("SELECT * FROM web_v1.{view}")).await?;
     }
+    admission_as_runtime(pool, &roles[1]).await?;
     for sql in [
+        "DELETE FROM public.discord_send_admission",
+        "TRUNCATE public.discord_send_admission",
         "CREATE TABLE public.runtime_probe (id int)",
         "CREATE SCHEMA runtime_probe",
         "CREATE TEMP TABLE runtime_probe (id int)",
@@ -296,6 +350,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         denied(pool, &roles[1], sql).await?;
     }
     for sql in [
+        "SELECT * FROM public.discord_send_admission",
+        "INSERT INTO public.discord_send_admission (token_key) VALUES ('offline')",
+        "UPDATE public.discord_send_admission SET in_flight = FALSE",
+        "DELETE FROM public.discord_send_admission",
         "SELECT * FROM public.members",
         "INSERT INTO public.members (member_id) VALUES ('test')",
         "SELECT * FROM public.self_role_audit",
@@ -323,6 +381,18 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // PUBLIC/column access, attributes, inheritance and future grants all count.
     let (migrator, runtime, reader) = (&roles[0], &roles[1], &roles[2]);
     for (change, restore) in [
+        (format!("REVOKE SELECT ON public.discord_send_admission FROM {runtime}"),
+         format!("GRANT SELECT ON public.discord_send_admission TO {runtime}")),
+        (format!("REVOKE INSERT ON public.discord_send_admission FROM {runtime}"),
+         format!("GRANT INSERT ON public.discord_send_admission TO {runtime}")),
+        (format!("REVOKE UPDATE ON public.discord_send_admission FROM {runtime}"),
+         format!("GRANT UPDATE ON public.discord_send_admission TO {runtime}")),
+        (format!("GRANT DELETE ON public.discord_send_admission TO {runtime}"),
+         format!("REVOKE DELETE ON public.discord_send_admission FROM {runtime}")),
+        (format!("GRANT TRUNCATE ON public.discord_send_admission TO {runtime}"),
+         format!("REVOKE TRUNCATE ON public.discord_send_admission FROM {runtime}")),
+        ("GRANT SELECT ON public.discord_send_admission TO PUBLIC".to_owned(),
+         "REVOKE SELECT ON public.discord_send_admission FROM PUBLIC".to_owned()),
         ("GRANT SELECT (member_id) ON public.members TO PUBLIC".to_owned(),
          "REVOKE SELECT (member_id) ON public.members FROM PUBLIC".to_owned()),
         (format!("GRANT CREATE ON SCHEMA public TO {runtime}"),

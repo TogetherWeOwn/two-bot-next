@@ -7,6 +7,9 @@
 //!
 //! `backfill-messages --dry-run` reports and writes nothing.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use std::collections::HashMap;
 use twilight_model::channel::ChannelType;
 use twilight_model::id::Id;
@@ -59,7 +62,12 @@ async fn main() {
     }
 
     let t0 = std::time::Instant::now();
-    let rest = RestClient::with_proxy(token, args.values.get("discord-base").cloned());
+    let rest = RestClient::from_env(token, args.values.get("discord-base").cloned())
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("send admission bootstrap failed: {error}");
+            std::process::exit(1);
+        });
     let db = open_db(&args, false).await;
     let guild: Id<twilight_model::id::marker::GuildMarker> = Id::new(guild_id.parse().unwrap_or(0));
 
