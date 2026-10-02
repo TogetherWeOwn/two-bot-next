@@ -80,7 +80,10 @@ channel or substitute credentials.
    fixture-only disposition. Raw rows stay with the reader and are discarded
    after the export.
 3. **Reconcile.** Feed both lists to `EvidenceLedger` with the deployed
-   revision and attach `export()` to the soak card. `gaps > 0` or any
+   revision and attach `export()` to the soak card, stamped as
+   `evidence-soak_expected_committed-{window}.json` (see
+   `evidence_packet_filename` and the rule-id spelling in
+   [metrics.md](metrics.md)). `gaps > 0` or any
    overflow flag fails that window. File a card; do not restart anything
    only to fill a table.
 

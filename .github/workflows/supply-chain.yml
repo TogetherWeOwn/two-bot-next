@@ -1,5 +1,16 @@
-name: PR lint
+name: supply-chain
 
+# Folded lightweight gate (TOG-11810): the old `pr-lint.yml` and
+# `secret-scan.yml` workflows each occupied a whole `two-selfhosted` runner
+# slot per PR push. This single workflow runs both checks serially
+# (`gitleaks` needs `pr-lint`, but runs whatever pr-lint concluded), so one
+# PR push costs one slot at a time.
+#
+# Required-check names are pinned: the `protect-main` ruleset requires the
+# `gitleaks` context and the `pr-conventions` ruleset requires the `pr-lint`
+# context, so both job `name:` fields below must stay exactly as they are.
+# (A check-run name is the job name, not the workflow name.)
+#
 # Org convention for every change that lands on main (TogetherWeOwn GitHub standard):
 #   * PR title = Conventional Commits header: `type(scope): summary`, <= 100 chars, no trailing period.
 #     Types: feat fix perf refactor test docs build ci chore revert style security.
@@ -16,10 +27,10 @@ on:
     branches: [main]
   # Dispatched by the release workflow (TOG-10035) on release-please branches:
   # PRs opened with GITHUB_TOKEN trigger no workflows, so the required
-  # `pr-lint` check would never run on the release PR without this path.
-  # The release workflow passes the release PR number; this job fetches the
-  # title/body via the API (needs pull-requests: read) and validates them with
-  # the same inline script as the pull_request path.
+  # `pr-lint` / `gitleaks` checks would never run on the release PR without
+  # this path. The release workflow passes the release PR number; the pr-lint
+  # job fetches the title/body via the API (needs pull-requests: read) and
+  # validates them with the same inline script as the pull_request path.
   workflow_dispatch:
     inputs:
       pr_number:
@@ -31,8 +42,11 @@ permissions:
   contents: read
   pull-requests: read
 
+# Superseded PR runs (pushes and title/body edits) cancel the in-flight one.
+# Push-to-main runs key on the commit SHA, so every main commit still gets
+# exactly one pr-lint and one gitleaks run.
 concurrency:
-  group: pr-lint-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
+  group: supply-chain-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
   cancel-in-progress: true
 
 env:
@@ -233,3 +247,47 @@ jobs:
           if failed:
               sys.exit(1)
           print("PR conventions OK")
+
+  # name pinned equal to the required-check context: `gitleaks` is required
+  # on main. Runs after pr-lint in the same workflow so the pair holds one
+  # runner slot at a time instead of two.
+  #
+  # Full-history gitleaks scan. Uses the gitleaks binary (the gitleaks-action
+  # wrapper needs a paid licence for organizations). --redact so findings
+  # never print the value. A secret that reaches a branch is already leaked:
+  # report it, do not just delete the line.
+  gitleaks:
+    name: gitleaks
+    needs: pr-lint
+    # Never skipped: a skipped job passes a required check. An `edited` run
+    # shares the concurrency group above and can cancel the synchronize run's
+    # scan, so it must rescan the head itself; and a failed pr-lint (e.g. a
+    # bypassed squash title on main) must not leave a commit unscanned.
+    # Only a cancellation by a newer run in the group skips the scan.
+    if: ${{ !cancelled() }}
+    # Overflow switch: see CI_OVERFLOW_* note in the main CI workflow.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'gitleaks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: a secret added and then removed in an earlier commit
+          # on the same branch is still a leak, and a shallow clone hides it.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          chmod 0755 "$RUNNER_TEMP/gitleaks"
+          "$RUNNER_TEMP/gitleaks" version
+
+      - name: Scan the full history
+        run: |
+          set -euo pipefail
+          # --log-opts=HEAD: scan only history reachable from HEAD, not every fetched branch.
+          "$RUNNER_TEMP/gitleaks" git . --redact --verbose --exit-code 1 --log-opts=HEAD
