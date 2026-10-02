@@ -157,6 +157,10 @@
       "sha256": "e3215b7b6b878e710a75acf33ecdc61ce3c2955b60ce4e523509bdc1fa92aea2",
       "justification": "Add legacy join-risk evidence schema for manually approved raid-list and raid-remove tooling (TOG-10867); no containment activation or automatic removal."
     },
+    "crates/cutover/migrations/0361_discord_send_admission.sql": {
+      "sha256": "5f5986ae81173571aaea237bff45f09d6e23256f5023ed7a3570697796da791d",
+      "justification": "TOG-11045: add durable token-wide Discord send admission; no existing migration SQL changed."
+    },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."

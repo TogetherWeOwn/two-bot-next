@@ -577,20 +577,6 @@ async fn unreachable_dependencies_fail_the_job_and_retry_next_sweep() {
     );
 }
 
-#[derive(Clone)]
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn sweep_logs_carry_ids_and_counts_only() {
     let Some(db) = database("sweep_logs_carry_ids_and_counts_only").await else {
@@ -613,16 +599,9 @@ async fn sweep_logs_carry_ids_and_counts_only() {
         "transport detail 7f3a".to_owned(),
     )));
 
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogWriter(buffer.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .without_time()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
+    let capture = crate::tracing_capture::Capture::default();
     let deliveries = {
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = tracing::subscriber::set_default(capture.clone());
         drained(&runtime).await
     };
     assert_eq!(
@@ -637,7 +616,7 @@ async fn sweep_logs_carry_ids_and_counts_only() {
         ]
     );
 
-    let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let logs = capture.text();
     for expected in [
         "audit_retry_swept",
         "rows=3",
