@@ -270,3 +270,62 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
         thread::sleep(Duration::from_millis(20));
     }
 }
+
+fn signal_term(child: &Child) {
+    // Bash's builtin works in slim test containers without /bin/kill; the PID is
+    // an inert positional argument, never interpolated into shell code.
+    let status = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "kill -TERM \"$1\"",
+            "signal-child",
+            &child.id().to_string(),
+        ])
+        .status()
+        .expect("SIGTERM command");
+    assert!(status.success());
+}
+
+#[test]
+fn second_signal_abandons_a_stalled_drain() {
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+    let addr = reserved.local_addr().unwrap();
+    drop(reserved);
+    let mut bot = Bot(command(&format!("127.0.0.1:{}", addr.port()))
+        .env("SHUTDOWN_TIMEOUT_SECONDS", "600")
+        .spawn()
+        .expect("start test bot"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get(addr, "/health").is_err() {
+        assert!(Instant::now() < deadline, "bot did not serve health");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // A request whose headers never finish keeps graceful HTTP shutdown waiting.
+    let mut stalled = TcpStream::connect(addr).expect("stalled connection");
+    stalled
+        .write_all(b"GET /health HTTP/1.1\r\nHost: l")
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    signal_term(&bot.0);
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        bot.0.try_wait().unwrap().is_none(),
+        "first signal must start a bounded drain, not exit"
+    );
+
+    signal_term(&bot.0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = bot.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second signal must exit immediately"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(1));
+}

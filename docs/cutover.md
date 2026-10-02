@@ -276,10 +276,9 @@ fence implementation or an authorization to change the Worker.
   [session policy](../crates/core/src/gateway_session.rs#L4),
   [boot resume](../crates/bot/src/gateway.rs#L315). A reviewed force-fresh path is
   required for first production boot; do not assume a restart gives IDENTIFY.
-- SIGTERM drains HTTP only, then main aborts the gateway task. No final
-  gateway/job checkpoint-drain acknowledgment exists here:
-  [shutdown](../crates/bot/src/server.rs#L50),
-  [gateway abort](../crates/bot/src/main.rs#L156).
+- SIGTERM drains accepted gateway dispatches, jobs and HTTP within
+  `SHUTDOWN_TIMEOUT_SECONDS` (default 35 s), then exits; a second signal exits
+  immediately. See [Shutdown](configuration.md#shutdown).
 - The baseline has no wired scheduled-unban handoff/sweeper. Moderator sign-off
   must identify a verified executor for every pending deadline before GO:
   [moderation port boundary](../crates/core/src/moderation.rs#L7).

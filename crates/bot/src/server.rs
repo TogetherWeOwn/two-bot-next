@@ -129,6 +129,7 @@ pub async fn serve(
             }
             *gateway.write().await = GatewayState::Draining;
             shutdown.send_replace(true);
+            crate::shutdown::exit_on_second_signal();
         })
         .await
 }
