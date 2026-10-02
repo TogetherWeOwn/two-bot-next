@@ -35,13 +35,13 @@ url = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 
+[dev-dependencies]
+rustls = { workspace = true }
+two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
+
 [[bin]]
 name = "legacy_verify"
 path = "src/bin/legacy_verify.rs"
-
-[dev-dependencies]
-rustls = { workspace = true }
-two-bot-testsupport = { path = "../testsupport", version = "0.2.0" }
 
 [[bin]]
 name = "levels-import-mee6"
@@ -82,3 +82,7 @@ path = "src/bin/raid_list.rs"
 [[bin]]
 name = "raid-remove"
 path = "src/bin/raid_remove.rs"
+
+[[bin]]
+name = "gateway-force-identify"
+path = "src/bin/gateway_force_identify.rs"

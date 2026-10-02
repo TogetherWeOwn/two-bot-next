@@ -20,7 +20,9 @@ fn token() -> String {
 fn announcement_executor(mock: &MockDiscord, gate: Arc<dyn SendAdmission>) -> AnnouncementExecutor {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = Arc::new(TwilightClient::builder().token(token()).build());
-    let mut executor = AnnouncementExecutor::with_admission(client, keys(), gate).unwrap();
+    let mut executor =
+        AnnouncementExecutor::with_admission(client, keys(), CooldownGovernor::new(), gate)
+            .unwrap();
     executor.api_origin = mock.origin.clone();
     executor.timeout = Duration::from_millis(500);
     executor
