@@ -315,14 +315,13 @@ VALUES ('backup:self-role:exchange', 'backup:self-role:event', 23,
 INSERT INTO self_role_exchange_baselines
     (event_id, legacy_pending, unresolved_added_role_ids, unresolved_removed_role_ids)
 VALUES ('backup:self-role:event', FALSE, '[]', '[]');
--- Main's newer durable tables ride the same complete-schema coverage: a
--- delivery arbitration claim and an armed boot directive.
+-- Main's newer durable delivery table rides the same complete-schema coverage:
+-- a delivery arbitration claim. gateway_boot_directives is already seeded by
+-- main's own consumed+armed rows above; a second (guild, shard 0) row would
+-- collide on the primary key.
 INSERT INTO automod_delivery_claims
     (guild_id, message_id, delivery_kind, dry_run, request_hash)
 VALUES ('100000000000000001', 'backup:message', 'create', FALSE, 'backup-request');
-INSERT INTO gateway_boot_directives
-    (guild_id, shard_id, armed_at, reason)
-VALUES ('100000000000000001', 0, '2026-08-01T10:00:00Z', 'backup directive');
 
 -- Operator erasure receipts carry no subject; accountability survives restore.
 INSERT INTO member_erasure_audit (actor, erased_at)
