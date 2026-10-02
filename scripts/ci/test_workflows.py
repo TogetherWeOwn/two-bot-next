@@ -9,7 +9,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
-    "check.yml": {"check", "parity-docs", "self-role-store", "container-inputs", "container",
+    "check.yml": {"check", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},
@@ -17,6 +17,7 @@ JOB_INVENTORY = {
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"release-please", "dispatch-checks", "sbom-target", "release-sbom",
                     "attach-sbom"},
+    "staging-migrate.yml": {"migrate"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     "sbom.yml": {"image"},
@@ -89,6 +90,49 @@ def staging_dispatch_errors(workflow):
     return errors
 
 
+def staging_migrate_errors(workflow):
+    """Manual staging-only SQLx migration runner (TOG-11572).
+
+    Dispatch-only with exactly the six reviewed inputs (plan/apply defaulting
+    to plan, everything else required), reading the pre-existing
+    staging-migrate Environment binding, main-branch dispatches only, and the
+    routed runner for job 'migrate'. No push/pull_request/schedule trigger, no
+    production path, no wrangler/probe markers: anything else is an activation
+    route and must fail closed.
+    """
+    name = "staging-migrate.yml"
+    errors = []
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
+    expected = {"mode", "source_sha", "staging_host", "staging_database",
+                "recovery_evidence_ref", "acl_plan_ref"}
+    if set(inputs) != expected:
+        errors.append(f"{name}: workflow_dispatch inputs must be exactly {sorted(expected)}")
+    else:
+        mode = inputs.get("mode") or {}
+        if (mode.get("type") != "choice"
+                or set(mode.get("options") or []) != {"plan", "apply"}
+                or mode.get("default") != "plan"):
+            errors.append(f"{name}: mode must be plan/apply defaulting to plan")
+        for key in expected - {"mode"}:
+            field = inputs.get(key) or {}
+            if str(field.get("required")).lower() != "true":
+                errors.append(f"{name}: input {key} must be required")
+    job = (workflow.get("jobs") or {}).get("migrate", {})
+    if job.get("environment") != "staging-migrate":
+        errors.append(f"{name}:migrate: must read the staging-migrate Environment binding")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:migrate: must run only from main")
+    if not runner_allowed("migrate", job.get("runs-on")):
+        errors.append(f"{name}:migrate: must use the routed runner expression for job 'migrate'")
+    text = str(job).lower()
+    if job.get("uses") is not None or any(marker in text for marker in DEPLOY_MARKERS):
+        errors.append(f"{name}:migrate: deployment/probe alternative outside suspended workflow")
+    return errors
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch-only, human-gated, chained to staging."""
     name = "deploy-production.yml"
@@ -132,6 +176,12 @@ def suspension_errors(workflows):
             continue
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
+        if name == "staging-migrate.yml":
+            # Manual runner (TOG-11572): pinned shape above, not the
+            # suspended-deploy policy. The generic environment/marker scan
+            # below would flag its staging-migrate Environment binding.
+            errors.extend(staging_migrate_errors(workflow))
+            continue
         for job_id, job in jobs.items():
             if name == "deploy-staging.yml":
                 if job.get("if") != STATIC_FALSE:
@@ -258,6 +308,47 @@ class WorkflowTests(unittest.TestCase):
                         if "run" in step:
                             step["run"] = step["run"].replace(pin, "")
                 self.assertTrue(mutated(drop))
+
+    def test_staging_migrate_runner_shape_is_pinned(self):
+        # TOG-11572: the slice's own workflow must satisfy its carve-out, and
+        # every widening (extra trigger, dropped input, lost environment,
+        # retargeted runner, wrangler/probe step) must fail closed here.
+        migrate = self.workflows["staging-migrate.yml"]
+        self.assertEqual(staging_migrate_errors(migrate), [])
+        self.assertEqual(suspension_errors(self.workflows), [])
+
+        def mutated(change):
+            workflow = deepcopy(migrate)
+            change(workflow)
+            return staging_migrate_errors(workflow)
+
+        for trigger in ("push", "pull_request", "schedule", "workflow_call"):
+            with self.subTest(trigger=trigger):
+                self.assertTrue(mutated(lambda w, t=trigger: w["on"].update({t: ""})))
+        with self.subTest(missing="acl_plan_ref"):
+            def drop(w):
+                del w["on"]["workflow_dispatch"]["inputs"]["acl_plan_ref"]
+            self.assertTrue(mutated(drop))
+        with self.subTest(mode="apply-default"):
+            def widen(w):
+                mode = w["on"]["workflow_dispatch"]["inputs"]["mode"]
+                mode["default"] = "apply"
+            self.assertTrue(mutated(widen))
+        for key, value in (("environment", None), ("environment", "production"),
+                           ("if", None), ("if", "${{ always() }}"),
+                           ("runs-on", "ubuntu-latest")):
+            with self.subTest(job_key=key, value=value):
+                def change(w, key=key, value=value):
+                    job = w["jobs"]["migrate"]
+                    if value is None:
+                        job.pop(key, None)
+                    else:
+                        job[key] = value
+                self.assertTrue(mutated(change))
+        for step in ({"run": "npx wrangler deploy"},
+                     {"run": 'curl "$STAGING_WORKER_URL/readyz"'}):
+            with self.subTest(deploy_step=step):
+                self.assertTrue(mutated(lambda w, s=step: w["jobs"]["migrate"]["steps"].append(s)))
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))

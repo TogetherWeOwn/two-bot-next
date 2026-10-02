@@ -6,6 +6,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CLI_MODULES = {
     "crates/bot/src/backup_cli.rs",
+    "crates/bot/src/commands_cli.rs",
     "crates/bot/src/database_roles_cli.rs",
     "crates/bot/src/preflight.rs",
     "crates/core/examples/metrics_rss.rs",
@@ -26,6 +27,9 @@ CLI_MODULES = {
     "crates/cutover/src/bin/preconditions.rs",
     "crates/cutover/src/bin/raid_list.rs",
     "crates/cutover/src/bin/raid_remove.rs",
+    "crates/cutover/src/bin/reengagement_list.rs",
+    "crates/cutover/src/bin/rollback_delta.rs",
+    "crates/cutover/src/bin/staging_migrate.rs",
 }
 
 

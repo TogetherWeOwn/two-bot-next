@@ -32,11 +32,20 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
 # Real sources; the release profile (opt-level=z, lto, strip) targets the
 # `lite` 256 MiB ceiling from ADR 0001.
 COPY . .
+# Non-secret build provenance, compiled into readiness (not a runtime override).
+ARG BOT_BUILD_REVISION=unknown
+ARG BOT_BUILD_ID=unknown
 RUN cargo build --release --locked
 
 # The runtime base already ships Debian trust data (ca-certificates) and the
 # nonroot account (uid/gid 65532, home /home/nonroot); nothing is installed.
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2 AS runtime
+
+# Non-secret build provenance (main #137/#156), recorded as image labels.
+ARG BOT_BUILD_REVISION=unknown
+ARG BOT_BUILD_ID=unknown
+LABEL org.opencontainers.image.revision=$BOT_BUILD_REVISION \
+      com.togetherweown.build-id=$BOT_BUILD_ID
 
 # Non-root user: the bot never needs container root.
 USER 65532:65532
