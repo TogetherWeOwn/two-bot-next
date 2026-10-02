@@ -149,6 +149,7 @@ is copied before referencing snapshots/member ranks.
 | guild_settings / `guild_settings_audit` | `id` | `id:bigint`, `guild_id:text`, `key:text`, `old_value:jsonb`, `new_value:jsonb`, `actor:text`, `at:timestamptz` |
 | operational_audit / `operational_audit_log` | `entry_id` | `entry_id:text`, `event_kind:text`, `guild_id:text`, `occurred_at:timestamptz`, `actor_id:text`, `target_id:text`, `source_channel_id:text`, `destination_channel_id:text`, `message_id:text`, `action:text`, `metadata_json:text`, `created_at:timestamptz`, `mirror_channel_id:text`, `delivery_state:text`, `delivery_attempts:integer`, `delivery_attempted_at:timestamptz`, `delivery_last_error:text`, `delivery_lease_until:timestamptz`, `mirrored_at:timestamptz`, `delivery_nonce:text`, `mirror_message_id:text`, `delivery_search_before:text`, `delivery_claim_token:text`, `mirror_checked_at:timestamptz` |
 | operational_audit / `audit_kill_switch` | `id` | `id:integer`, `engaged_at:timestamptz`, `engaged_by:text` |
+| invite_campaigns / `invite_campaigns` | `slug` | `slug:text`, `invite_code:text`, `label:text`, `disabled_at:timestamptz`, `created_at:timestamptz` |
 
 ## Pending and retired groups
 
@@ -162,7 +163,7 @@ is copied before referencing snapshots/member ranks.
 | `automod` | **pending** — automod/anti-nuke/containment target migrations are not shipped |
 | `self_roles` | **pending** — self-role panel/audit/recovery target migrations are not shipped |
 | `feeds` | **pending** — feed relay/delivery target migrations are not shipped |
-| `invite_campaigns` | **pending** — invite_campaigns target migration is not shipped |
+| `invite_campaigns` | **ready** — legacy 0006 invite campaigns → next 0407/0411 |
 | `lfg_rsvp_temp_voice` | **pending** — LFG/RSVP need authoritative legacy runtime DDL; temp-voice target migration is not shipped |
 | `onboarding_rota` | **retired** — rota is explicitly retired; no row-copy target |
 
