@@ -150,7 +150,7 @@ fn malformed_voice_shapes_are_unknown_never_panic() {
     let router = InteractionRouter::new(all_on());
     let long = format!("two:voice:name-custom:{}", "1".repeat(90));
     assert!(long.len() > MAX_VOICE_CUSTOM_ID_CHARS);
-    let mut malformed = vec![
+    let malformed = vec![
         String::new(),
         "two:voice:".to_owned(),
         "two:voice:join-approve".to_owned(),
