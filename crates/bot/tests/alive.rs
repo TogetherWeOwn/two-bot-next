@@ -357,6 +357,9 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>
                 request_body.extend_from_slice(&chunk[..n]);
             }
             request_body.truncate(content_len);
+            // Copy before the record takes ownership so the registry PUT can
+            // echo the submitted command list as its JSON receipt.
+            let registry_echo = request_body.clone();
             recorded.lock().await.push(RestRequest {
                 method: method.clone(),
                 path: path.clone(),
@@ -367,13 +370,15 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>
             // Registry and job requests can interleave, so never script replies
             // by arrival order. The fixture grounds no raid windows; only the
             // events mirror reads. Unknown routes fail closed on this socket.
-            let (status, body): (&str, &[u8]) = match (method.as_str(), path.as_str()) {
-                ("GET", "/api/v10/applications/@me") => ("200 OK", b"{\"id\":\"1111\"}"),
-                ("PUT", "/api/v10/applications/1111/guilds/2222/commands") => ("200 OK", b""),
-                ("GET", path) if path.contains("scheduled-events") => ("200 OK", b"[]"),
+            let (status, body): (&str, Vec<u8>) = match (method.as_str(), path.as_str()) {
+                ("GET", "/api/v10/applications/@me") => ("200 OK", b"{\"id\":\"1111\"}".to_vec()),
+                ("PUT", "/api/v10/applications/1111/guilds/2222/commands") => {
+                    ("200 OK", registry_echo)
+                }
+                ("GET", path) if path.contains("scheduled-events") => ("200 OK", b"[]".to_vec()),
                 _ => (
                     "404 Not Found",
-                    b"{\"message\":\"alive mock: unknown route\"}",
+                    b"{\"message\":\"alive mock: unknown route\"}".to_vec(),
                 ),
             };
             let response = format!(
@@ -381,7 +386,7 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>
                 body.len(),
             );
             let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.write_all(body).await;
+            let _ = stream.write_all(&body).await;
         });
     }
 }
