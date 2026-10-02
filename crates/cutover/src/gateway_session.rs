@@ -5,10 +5,27 @@
 
 use sqlx::{PgConnection, PgPool};
 use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
-use two_bot_core::gateway_session::{dispatch_action, DispatchAction, GatewaySession};
+use two_bot_core::gateway_session::{
+    dispatch_action, BootDirective, DispatchAction, GatewaySession,
+};
 use two_bot_core::{format_iso_millis, idempotency_key, FunnelEvent};
 
 use crate::db::{project_event, FunnelWrite};
+
+/// Operator view of the one-shot force-fresh directive for this key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForceIdentifyStatus {
+    pub armed_at_ms: i64,
+    pub reason: String,
+    pub consumed_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmOutcome {
+    Armed,
+    /// A pending directive already exists; it was left unchanged.
+    AlreadyArmed,
+}
 
 #[derive(Clone)]
 pub struct GatewaySessionStore {
@@ -47,6 +64,84 @@ impl GatewaySessionStore {
             })
         })
         .transpose()
+    }
+
+    /// Boot read: one transaction locks this key's pending directive
+    /// (`FOR UPDATE`), reads the checkpoint and consumes the directive. A
+    /// concurrent boot read waits on the row lock, then re-checks
+    /// `consumed_at IS NULL` and finds nothing armed. The checkpoint is only
+    /// read; whether to clear it stays the caller's boot policy.
+    pub async fn load_for_boot(
+        &self,
+    ) -> Result<(Option<GatewaySession>, BootDirective), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let armed: Option<i32> = sqlx::query_scalar(
+            "SELECT shard_id FROM gateway_boot_directives
+             WHERE guild_id = $1 AND shard_id = $2 AND consumed_at IS NULL FOR UPDATE",
+        )
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let saved = self.read(&mut tx).await?;
+        let directive = if armed.is_some() {
+            sqlx::query(
+                "UPDATE gateway_boot_directives SET consumed_at = now()
+                 WHERE guild_id = $1 AND shard_id = $2 AND consumed_at IS NULL",
+            )
+            .bind(&self.guild_id)
+            .bind(self.shard_id)
+            .execute(&mut *tx)
+            .await?;
+            BootDirective::ForceIdentify
+        } else {
+            BootDirective::None
+        };
+        tx.commit().await?;
+        Ok((saved, directive))
+    }
+
+    /// Arms the next boot of this key to IDENTIFY whatever the checkpoint's
+    /// age. A pending directive is kept as it is; a consumed one is re-armed.
+    /// Never deletes or rewrites the `gateway_sessions` row.
+    pub async fn arm_force_identify(&self, reason: &str) -> Result<ArmOutcome, sqlx::Error> {
+        let armed = sqlx::query(
+            "INSERT INTO gateway_boot_directives (guild_id, shard_id, armed_at, reason)
+             VALUES ($1, $2, now(), $3)
+             ON CONFLICT (guild_id, shard_id) DO UPDATE SET
+             armed_at = EXCLUDED.armed_at, reason = EXCLUDED.reason, consumed_at = NULL
+             WHERE gateway_boot_directives.consumed_at IS NOT NULL",
+        )
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(if armed.rows_affected() == 1 {
+            ArmOutcome::Armed
+        } else {
+            ArmOutcome::AlreadyArmed
+        })
+    }
+
+    /// Read-only: the directive row for this key, armed or consumed.
+    pub async fn force_identify_status(&self) -> Result<Option<ForceIdentifyStatus>, sqlx::Error> {
+        let row: Option<(i64, String, Option<i64>)> = sqlx::query_as(
+            "SELECT floor(extract(epoch FROM armed_at) * 1000)::bigint, reason,
+                    floor(extract(epoch FROM consumed_at) * 1000)::bigint
+             FROM gateway_boot_directives WHERE guild_id = $1 AND shard_id = $2",
+        )
+        .bind(&self.guild_id)
+        .bind(self.shard_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(armed_at_ms, reason, consumed_at_ms)| ForceIdentifyStatus {
+                armed_at_ms,
+                reason,
+                consumed_at_ms,
+            },
+        ))
     }
 
     pub async fn clear(&self) -> Result<(), sqlx::Error> {
