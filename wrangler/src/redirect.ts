@@ -21,7 +21,9 @@
  *   included, never a redirect, never a click.
  * - Non-GET/HEAD on non-reserved paths → 405 with `Allow: GET, HEAD`.
  * - Per-caller 60-burst / 1-per-sec token bucket runs BEFORE the DB lookup;
- *   denied → 429 + `retry-after: 1`, nothing recorded.
+ *   denied → 429 + the bucket's own `retry-after` (whole seconds, at least 1:
+ *   the refill wait, what remains of a terminal hold, or the idle window for
+ *   a cap refusal), nothing recorded.
  * - Caller keys are canonicalized before bucketing (case, surrounding
  *   whitespace, IPv6 zone id, `::ffff:`-mapped quad and empty/missing all
  *   share one bucket), so aliases cannot multiply quota. Callers with no edge
@@ -70,10 +72,20 @@ export interface RedirectDeps {
   onError?: (msg: string, detail: Record<string, string>) => void;
   now?: () => number;
   uuid?: () => string;
-  /** Rate-limit decision for this caller; true = over budget. */
-  isThrottled?: (callerKey: string) => boolean;
+  /**
+   * Rate-limit verdict for this caller (`TokenBuckets.take`). A denial answers
+   * 429 with the verdict's `retryAfter`, so a held caller learns the real
+   * remaining hold instead of a one-second retry loop.
+   */
+  throttle?: (callerKey: string) => ThrottleVerdict;
   /** Shared by requests in one isolate; caches only confirmed missing slugs. */
   missCache?: RedirectMissCache;
+}
+
+/** One bucket decision. `retryAfter` is whole seconds; 0 when allowed. */
+export interface ThrottleVerdict {
+  allowed: boolean;
+  retryAfter: number;
 }
 
 export interface RedirectResult {
@@ -180,7 +192,16 @@ export function canonicalCallerKey(raw: unknown): string {
  *   the hold, so a retry loop can neither succeed early nor keep the hold
  *   alive; one success resets the streak. A held entry is enforcement state,
  *   never idle: expiry and the sweep skip it. Like the Rust `CooldownGovernor`,
- *   this only refuses — it never queues, sleeps or retries.
+ *   this only refuses — it never queues, sleeps or retries. The verdict
+ *   carries the remaining hold, and the redirect 429 forwards it.
+ * - Refill accrues across a hold (TOG-12533, deliberate): refill is measured
+ *   from the last pre-hold take, capped at capacity, so a caller that honors
+ *   the advertised wait returns to the bucket any idle caller would have.
+ *   The hold bounds the denial streak, not admissions: admits stay within
+ *   `capacity + refillPerSecond × elapsed` with or without it (review sim,
+ *   100 rps for 600 s: 600 admits with the hold, 659 without). Withholding
+ *   refill would leave a caller that obeys `retry-after` no better off than
+ *   one that ignores it.
  */
 export class TokenBuckets {
   private buckets = new Map<
@@ -253,7 +274,7 @@ export class TokenBuckets {
     return this.buckets.size;
   }
 
-  take(key: string): { allowed: boolean; retryAfter: number } {
+  take(key: string): ThrottleVerdict {
     // Canonicalize first: aliases share one bucket, and every no-signal
     // caller shares the single `unknown` budget instead of minting entries.
     const canonical = canonicalCallerKey(key);
@@ -305,7 +326,7 @@ export class TokenBuckets {
     // Move to the back: map order is recency order, so the sweep below always
     // reaps the least-recently-touched entries first.
     this.buckets.delete(canonical);
-    let verdict: { allowed: boolean; retryAfter: number };
+    let verdict: ThrottleVerdict;
     if (b.tokens >= 1) {
       b.tokens -= 1;
       b.denials = 0;
@@ -409,6 +430,10 @@ const text = (status: number, body: string, extra?: Record<string, string>): Red
   body,
 });
 
+/** Whole seconds, at least 1; a non-finite wait falls back to the legacy 1. */
+const retryAfterSeconds = (seconds: number): number =>
+  Number.isFinite(seconds) ? Math.max(1, Math.ceil(seconds)) : 1;
+
 /**
  * Reserved internal paths that are never invite campaigns. Recognize only the
  * first segment, stripping literal/encoded leading slashes and decoding once.
@@ -481,9 +506,13 @@ export async function handleRedirect(
   // Per-caller cap before the database is touched. The bucket canonicalizes
   // the key (aliases share one quota; no-signal callers share one bounded
   // unknown budget), and a sustained-denial hold is terminal for its
-  // cooldown. The key never leaves this function.
-  if (deps.isThrottled?.(callerKey)) {
-    return text(429, "slow down\n", { "retry-after": "1" });
+  // cooldown. The key never leaves this function; only the verdict's wait
+  // does, so a held caller is told the real remaining hold.
+  const verdict = deps.throttle?.(callerKey);
+  if (verdict && !verdict.allowed) {
+    return text(429, "slow down\n", {
+      "retry-after": String(retryAfterSeconds(verdict.retryAfter)),
+    });
   }
 
   let slug: string;

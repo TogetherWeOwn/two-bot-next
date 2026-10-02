@@ -44,6 +44,18 @@ resolved from legacy `TWO_DATABASE_URL` / `DISCORD_GUILD_ID`. Token, database UR
 and guild ID have no embedded deployment value; the listen address defaults to
 `0.0.0.0:8080`. Missing configuration is not proof of readiness.
 
+### Shutdown
+
+SIGTERM/SIGINT flips `/readyz` to 503, stops gateway intake, drains accepted
+dispatches and jobs, commits the gateway checkpoint and closes the pool. The
+whole drain is bounded by `SHUTDOWN_TIMEOUT_SECONDS` (whole seconds, 1–900;
+default 35 = the 30 s dispatch drain plus 5 s margin). Past the bound the process
+logs `shutdown_deadline_exceeded` and exits 1, so the supervisor restarts from the
+last committed checkpoint; a blocking checkpoint writer cannot be abandoned
+safely. A second SIGTERM/SIGINT exits 1 immediately. The Container stop
+grace period (SIGTERM, 15 minutes, SIGKILL) is a wrangler setting and is not
+configured here.
+
 Under the Worker, the Container also receives the reviewed `TWO_*` runtime
 flags in `wrangler/src/container-env.ts` (`FORWARDED_FLAGS`), forwarded
 verbatim when the Worker env defines them as strings. Secrets never pass
