@@ -140,11 +140,13 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(value(concurrency["group"]), "deploy-production")
         self.assertEqual(value(concurrency["cancel-in-progress"]), "false")
 
-    def test_every_job_runs_on_the_self_hosted_pool(self):
+    def test_every_job_uses_the_shared_runner_routing(self):
+        # scripts/test-runner-routing.py pins the full expression (TOG-12339).
         self.assertEqual(list(JOBS), ["guard", "production"])
         for name, job in JOBS.items():
-            self.assertEqual(value(children(job[1:], 4)["runs-on"]), "[self-hosted, two-selfhosted]", name)
-        self.assertNotIn("ubuntu-", WORKFLOW.read_text())
+            runs_on = value(children(job[1:], 4)["runs-on"])
+            self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
+            self.assertIn(f"vars.CI_OVERFLOW_JOBS || '[]'), '{name}')", runs_on)
 
     def test_permissions_are_least_privilege(self):
         self.assertEqual(value(TOP["permissions"]), "{}")
