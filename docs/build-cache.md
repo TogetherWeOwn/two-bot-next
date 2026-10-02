@@ -44,7 +44,17 @@ inspection. A crashed wrapper's sentinel is **never stolen**, regardless of PID
 reuse or issue status. Cargo inherits the lease FD too. Normal completed Cargo
 invocations release the lease, including commands returning a compile/test error.
 An outliving process group leaves the sentinel. Do not clear a sentinel without
-both control-plane and actual-process checks. Build cancellation is idempotent
+both control-plane and actual-process checks.
+
+The wrapper resolves Cargo **before** touching the pool: `PATH`, then
+`$CARGO_HOME/bin/cargo`, then `~/.cargo/bin/cargo` (agent PATH may lack rustup's
+bin directory). If none exists it exits 75 without a lease. A fallback-resolved
+directory is prepended to the child's `PATH` only, so rustup's sibling proxies
+resolve too. If the spawn itself fails (`Popen` raises `OSError`: exec/fork
+failed, so no writer ever existed), the wrapper still holds the slot flock and
+removes its **own** `lease.json` before exiting 75. Before this fix such runs
+left sentinels in both slots (TOG-11995). Signal, budget/floor and
+outliving-group paths still retain the sentinel. Build cancellation is idempotent
 from the first signal onward: the first SIGINT/SIGTERM raises out of the poll
 loop, and every later signal is a no-op, so cleanup always reaches the
 SIGTERM/SIGKILL process-group stop and a second signal can never abandon a live
@@ -144,7 +154,9 @@ Cargo/temp/**repository-scratch** overrides
 prefer over `temp_dir`), real `tempfile` placement, unchanged parent
 environment, repeated signals during shutdown plus a deterministic second-signal
 transition fixture, missing/symlink scratch refusal,
-retained-scratch admission limits, missing scratch-coverage attestation, and
+retained-scratch admission limits, missing scratch-coverage attestation, a
+missing Cargo refused before leasing, `$CARGO_HOME`/`~/.cargo` resolution, a
+failed spawn (mocked and real exec failure) releasing its own lease, and
 preservation of the three external path fixtures. Retention tests
 include an **actual Linux child process with an open FD and mmap**, plus container
 path aliases checked by device/inode identity, attested Operator

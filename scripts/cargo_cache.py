@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
 import subprocess
@@ -122,6 +123,26 @@ def validate_cargo_args(args, workspace):
                 raise Refusal('manifest must stay in this workspace')
 
 
+def resolve_cargo(cargo):
+    """Executable Cargo path, resolved before any pool access.
+
+    Agent PATH may lack rustup's bin directory, so a bare name falls back to
+    $CARGO_HOME/bin, then ~/.cargo/bin. A miss is a Refusal: a spawn that
+    cannot exec must never be able to leave a lease behind.
+    """
+    found = shutil.which(cargo)
+    if found:
+        return found
+    if os.sep not in cargo:
+        for home in (os.environ.get('CARGO_HOME'), os.path.expanduser('~/.cargo')):
+            if home:
+                candidate = os.path.join(home, 'bin', cargo)
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return candidate
+    raise Refusal(f'{cargo} not found on PATH, in $CARGO_HOME/bin or ~/.cargo/bin; '
+                  'no lease taken')
+
+
 def group_alive(pid):
     try:
         os.killpg(pid, 0)
@@ -152,6 +173,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
     pool = real_directory(pool)
     workspace = real_directory(Path.cwd())
     validate_cargo_args(args, workspace)
+    cargo = resolve_cargo(cargo)
     if args[0] != 'fmt':
         cargo_flags = args[:args.index('--')] if '--' in args else args
         required = [flag for flag in ('--offline', '--locked') if flag not in cargo_flags]
@@ -163,6 +185,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
     child = None
     previous = {}
     clean_exit = False
+    spawn_failed = False
     cancelling = False
     spawning = True
     pending_signal = None
@@ -202,9 +225,21 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
                    PAPERCLIP_SCRATCH_DIR=str(slot / 'scratch'),
                    CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0',
                    CARGO_PROFILE_TEST_DEBUG='0')
+        # A fallback-resolved rustup proxy needs its sibling proxies (rustc,
+        # cargo-fmt, clippy-driver) on the child PATH as well.
+        bindir = os.path.dirname(cargo)
+        if bindir not in env.get('PATH', '').split(os.pathsep):
+            env['PATH'] = os.pathsep.join(filter(None, (bindir, env.get('PATH'))))
         # Pass the lease FD to Cargo as well: wrapper SIGKILL must not free it.
-        child = subprocess.Popen([cargo] + args, env=env, start_new_session=True,
-                                 pass_fds=(fd,))
+        try:
+            child = subprocess.Popen([cargo] + args, env=env, start_new_session=True,
+                                     pass_fds=(fd,))
+        except OSError:
+            # Exec/fork failed: Popen reaped any forked child, so no writer
+            # ever existed, and our flock still guards the slot. Release our
+            # own sentinel instead of wedging the slot for the Operator.
+            spawn_failed = True
+            raise
         spawning = False
         if pending_signal is not None:
             raise Refusal(f'build interrupted by signal {pending_signal}; lease retained')
@@ -237,7 +272,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
-            if clean_exit:
+            if clean_exit or spawn_failed:
                 (slot / 'lease.json').unlink()
             os.close(fd)
 

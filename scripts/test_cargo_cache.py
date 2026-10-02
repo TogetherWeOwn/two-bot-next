@@ -309,6 +309,76 @@ class CacheTests(unittest.TestCase):
                 cache.run_cargo(self.pool, ['check'], cargo=str(self.fake))
         self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
 
+    def no_cargo_environment(self):
+        # PATH, CARGO_HOME and HOME all point at empty directories.
+        empty = self.root / 'no-cargo'
+        empty.mkdir(exist_ok=True)
+        return patch.dict(os.environ, PATH=str(empty), CARGO_HOME=str(empty), HOME=str(empty))
+
+    def assert_slots_reusable(self):
+        self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
+        slot, _, fd = cache.acquire(self.pool, self.policy)
+        os.close(fd)
+        self.assertEqual(slot.name, 'slot-0')
+
+    def test_missing_cargo_is_refused_before_leasing(self):
+        # TOG-11995: agent PATH had no cargo, so every run wedged a slot.
+        with self.no_cargo_environment():
+            with patch.object(cache, 'acquire', side_effect=AssertionError('pool touched')):
+                with self.assertRaisesRegex(cache.Refusal, 'not found on PATH'):
+                    cache.run_cargo(self.pool, ['check'])
+            err = io.StringIO()
+            with patch.object(sys, 'argv', ['cargo_cache.py', 'run', '--pool', str(self.pool),
+                                           '--', 'check']):
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(cache.main(), 75)
+            self.assertIn('not found on PATH', err.getvalue())
+        self.assert_slots_reusable()
+
+    def test_cargo_resolves_from_cargo_home_then_home(self):
+        self.fake.write_text('#!' + sys.executable + '\n'
+                             'import os,sys\n'
+                             'path=os.environ["PATH"].split(os.pathsep)\n'
+                             'sys.exit(0 if path[0]==os.path.dirname(sys.argv[0]) else 3)\n')
+        with self.no_cargo_environment():
+            for variable in ('CARGO_HOME', 'HOME'):
+                home = self.root / f'from-{variable}'
+                bindir = home / 'bin' if variable == 'CARGO_HOME' else home / '.cargo' / 'bin'
+                bindir.mkdir(parents=True)
+                shutil.copy2(self.fake, bindir / 'cargo')
+                with self.subTest(variable=variable), patch.dict(os.environ, {variable: str(home)}):
+                    self.assertEqual(cache.resolve_cargo('cargo'), str(bindir / 'cargo'))
+                    # The child PATH gains the proxy directory; the parent's does not.
+                    self.assertEqual(cache.run_cargo(self.pool, ['check']), 0)
+                    self.assertNotIn(str(bindir), os.environ['PATH'])
+                    self.assert_slots_reusable()
+            self.assertEqual(cache.resolve_cargo(str(self.fake)), str(self.fake))
+            with self.assertRaises(cache.Refusal):
+                cache.resolve_cargo(str(self.root / 'missing' / 'cargo'))
+
+    def test_failed_spawn_releases_its_own_lease(self):
+        # Popen raising OSError means exec/fork failed and no writer ever
+        # existed, while this process still holds the slot flock: the
+        # wrapper removes its own sentinel. Covers a mocked FileNotFoundError
+        # and a real exec failure (executable with a missing interpreter).
+        import signal as sigmod
+        lease = self.pool / 'slot-0' / 'lease.json'
+
+        def failing_popen(*args, **kwargs):
+            self.assertTrue(lease.exists(), 'lease must exist before spawn')
+            raise FileNotFoundError(2, 'No such file or directory', args[0][0])
+
+        broken = self.root / 'broken-cargo'
+        broken.write_text('#!' + str(self.root / 'missing-interpreter') + '\n')
+        broken.chmod(0o700)
+        before = sigmod.getsignal(sigmod.SIGTERM)
+        for name, popen in (('mocked', failing_popen), ('real', subprocess.Popen)):
+            with self.subTest(name), patch.object(subprocess, 'Popen', popen):
+                with self.assertRaises(FileNotFoundError):
+                    cache.run_cargo(self.pool, ['check'], cargo=str(broken))
+                self.assertIs(sigmod.getsignal(sigmod.SIGTERM), before)
+                self.assert_slots_reusable()
+
     def test_budget_escape_arguments_refused(self):
         for args in (['clean'], ['run'], ['check', '--target-dir=/tmp/other'],
                      ['check', '--config', 'build.target-dir="/tmp/other"'],
