@@ -2,8 +2,9 @@
 //!
 //! Table tests for
 //! [`two_bot_core::feature_commands::parse_prefix_trigger`]: first token
-//! only, legacy trigger shape, builtin-name exclusion, gate-off rejection,
-//! and unicode/whitespace edges. No gateway, store or Discord surface.
+//! only, legacy `triggerWord` case fold and JS-`\s` split, legacy trigger
+//! shape, builtin-name exclusion, gate-off rejection, and unicode/whitespace
+//! edges. No gateway, store or Discord surface.
 
 use std::collections::HashSet;
 
@@ -38,14 +39,26 @@ fn parity_row_23_parse_and_reject_table() {
         ("!0", Some("0")),
         ("!-a_9", Some("-a_9")),
         ("!a-b_c9", Some("a-b_c9")),
-        // Leading/trailing ASCII whitespace is ignored; only first token.
-        ("  !faq  ", Some("faq")),
-        ("\t!faq\nmore", Some("faq")),
+        // Trailing whitespace ends the word; only the first token counts.
+        ("!faq  ", Some("faq")),
         ("!faq\nmore", Some("faq")),
-        // Unicode spaces (NBSP, narrow NBSP, ideographic space) split the
-        // same way (`char::is_whitespace`).
-        ("\u{a0}!faq\u{202f}", Some("faq")),
-        ("\u{3000}!faq\u{3000}", Some("faq")),
+        ("!faq\tmore", Some("faq")),
+        // Unicode spaces in JS `\s` (NBSP, narrow NBSP, ideographic space,
+        // BOM) end the word too.
+        ("!faq\u{a0}x", Some("faq")),
+        ("!faq\u{202f}", Some("faq")),
+        ("!faq\u{3000}x", Some("faq")),
+        ("!faq\u{feff}x", Some("faq")),
+        // Case folds like JS `toLowerCase` before the shape check.
+        ("!FAQ", Some("faq")),
+        ("!Faq-Bot_2", Some("faq-bot_2")),
+        // U+212A KELVIN SIGN folds to ASCII `k`.
+        ("!\u{212A}eep", Some("keep")),
+        // Legacy requires `!` as the very first character.
+        ("  !faq  ", None),
+        ("\t!faq\nmore", None),
+        ("\u{a0}!faq", None),
+        ("\u{3000}!faq", None),
         // Not a trigger.
         ("", None),
         ("   ", None),
@@ -55,11 +68,13 @@ fn parity_row_23_parse_and_reject_table() {
         ("! ", None),
         ("!!faq", None),
         ("!faq!", None),
-        ("!FAQ", None),
         ("!café", None),
+        ("!CAFÉ", None),
         // Full-width exclamation (U+FF01) is not the ASCII `!` prefix.
         ("\u{ff01}faq", None),
+        // ZWSP is not JS `\s`; NEL (U+0085) is not JS `\s` either.
         ("!faq\u{200b}more", None),
+        ("!faq\u{85}x", None),
         ("!\u{a0}faq", None),
         // Builtin slash names are excluded even with the gate on.
         ("!rank", None),
@@ -68,6 +83,10 @@ fn parity_row_23_parse_and_reject_table() {
         ("!rsvp-attendance", None),
         ("!feed-add", None),
         ("!slowmode", None),
+        // ... and after the case fold.
+        ("!Rank", None),
+        ("!BAN", None),
+        ("!\u{212A}ick", None),
         // Near-misses of builtins still parse.
         ("!rank2", Some("rank2")),
         ("!bans", Some("bans")),
@@ -84,7 +103,7 @@ fn parity_row_23_parse_and_reject_table() {
 #[test]
 fn gate_off_rejects_everything() {
     let builtins = builtin_names();
-    for text in ["!faq", "!rank", "!a-b_c9", "  !faq  extra"] {
+    for text in ["!faq", "!FAQ", "!rank", "!a-b_c9", "!faq extra"] {
         assert_eq!(
             parse_prefix_trigger(text, false, &builtins),
             None,
