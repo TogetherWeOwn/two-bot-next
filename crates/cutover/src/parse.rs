@@ -257,18 +257,34 @@ pub struct LeaveAttributionRecord {
     pub occurred_at: String,
 }
 
+/// Byte offset of the first occurrence of `needle` in `haystack`, comparing
+/// bytes case-insensitively over ASCII only. Unicode case folding changes
+/// byte lengths (the Kelvin sign lowercases to `k`; `İ` grows to `i` plus a
+/// combining dot), so an offset found in a lowercased copy can point inside
+/// another character of the original. Matching raw bytes keeps every match
+/// boundary a real character boundary in `haystack`.
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let needle = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// Parse the invite-tracker bot's leave line. Good for counting churn only —
 /// it never logs joins and never records a snowflake.
 pub fn parse_leave_attribution(msg: &MessageView) -> Option<LeaveAttributionRecord> {
     let content = msg.content.as_deref()?;
-    let lower = content.to_lowercase();
     let marker = "left the server.";
-    let pos = lower.find(marker)?;
+    let pos = find_ignore_ascii_case(content, marker)?;
     let username = content[..pos].trim().to_owned();
     if username.is_empty() {
         return None;
     }
-    let tail = lower[pos + marker.len()..].to_lowercase();
+    let tail = content[pos + marker.len()..].to_lowercase();
     let joined_via = if tail.contains("vanity") {
         "vanity"
     } else if tail.contains("oauth") {
@@ -455,16 +471,105 @@ mod tests {
 
     #[test]
     fn leave_attribution_parses_and_limits() {
-        let m = MessageView {
-            content: Some("someuser left the server. joined via vanity".to_owned()),
-            timestamp: AT.to_owned(),
-            ..Default::default()
-        };
-        let r = parse_leave_attribution(&m).unwrap();
+        let r = parse_leave_attribution(&leave_msg("someuser left the server. joined via vanity"))
+            .unwrap();
         assert_eq!(
             (r.username.as_str(), r.joined_via.as_str()),
             ("someuser", "vanity")
         );
+    }
+
+    fn leave_msg(content: &str) -> MessageView {
+        MessageView {
+            content: Some(content.to_owned()),
+            timestamp: AT.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn leave_attribution_returns_multibyte_usernames_byte_exact() {
+        // U+212A KELVIN SIGN lowercases to `k` (3 bytes → 1) and U+0130 grows
+        // to `i` plus a combining dot (2 → 3): offsets found in a lowercased
+        // copy of these lines land inside the username. Each accepted case
+        // must return the original username exactly, never a mid-character
+        // slice.
+        let cases = [
+            (
+                "\u{212A}é left the server. joined via vanity",
+                "\u{212A}é",
+                "vanity",
+            ),
+            (
+                "\u{0130}stanbul left the server. joined via oauth",
+                "\u{0130}stanbul",
+                "oauth",
+            ),
+            (
+                "Ünicode left the server. joined via vanity",
+                "Ünicode",
+                "vanity",
+            ),
+            (
+                "日本語ユーザー left the server. joined via oauth",
+                "日本語ユーザー",
+                "oauth",
+            ),
+            (
+                "🦀かに left the server. joined via unknown",
+                "🦀かに",
+                "unknown",
+            ),
+        ];
+        for (content, username, joined_via) in cases {
+            let r = parse_leave_attribution(&leave_msg(content))
+                .unwrap_or_else(|| panic!("no record for {content:?}"));
+            assert_eq!(r.username, username, "username for {content:?}");
+            assert_eq!(r.joined_via, joined_via, "attribution for {content:?}");
+        }
+    }
+
+    #[test]
+    fn leave_attribution_matches_marker_regardless_of_case() {
+        let cases = [
+            (
+                "Alice LEFT THE SERVER. joined via vanity",
+                "Alice",
+                "vanity",
+            ),
+            ("Bob LeFt ThE SeRvEr. Joined via OAUTH", "Bob", "oauth"),
+            (
+                "\u{0130}van LEFT THE SERVER. joined via vanity",
+                "\u{0130}van",
+                "vanity",
+            ),
+        ];
+        for (content, username, joined_via) in cases {
+            let r = parse_leave_attribution(&leave_msg(content))
+                .unwrap_or_else(|| panic!("no record for {content:?}"));
+            assert_eq!(r.username, username, "username for {content:?}");
+            assert_eq!(r.joined_via, joined_via, "attribution for {content:?}");
+        }
+    }
+
+    #[test]
+    fn leave_attribution_needs_content_marker_and_username() {
+        let no_content = MessageView {
+            timestamp: AT.to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(parse_leave_attribution(&no_content), None);
+        for content in [
+            "someuser left the guild. joined via vanity",
+            "  left the server. joined via vanity",
+            "\n\tleft the server. joined via oauth",
+        ] {
+            assert_eq!(
+                parse_leave_attribution(&leave_msg(content)),
+                None,
+                "for {content:?}"
+            );
+        }
     }
 
     #[test]

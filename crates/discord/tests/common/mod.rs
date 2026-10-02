@@ -384,8 +384,6 @@ pub struct ScriptedResponse {
     pub body: Vec<u8>,
     /// Delay before answering (drives the 5 s abort test).
     pub delay: Duration,
-    /// Optional deterministic acceptance gate for persist-before-send tests.
-    pub gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl ScriptedResponse {
@@ -396,7 +394,6 @@ impl ScriptedResponse {
             headers: Vec::new(),
             body: Vec::new(),
             delay: Duration::ZERO,
-            gate: None,
         }
     }
 
@@ -407,7 +404,6 @@ impl ScriptedResponse {
             headers: Vec::new(),
             body: body.to_string().into_bytes(),
             delay: Duration::ZERO,
-            gate: None,
         }
     }
 
@@ -421,14 +417,7 @@ impl ScriptedResponse {
                 .to_string()
                 .into_bytes(),
             delay: Duration::ZERO,
-            gate: None,
         }
-    }
-
-    /// Answer only after the test explicitly releases acceptance.
-    pub fn gated(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
-        self.gate = Some(gate);
-        self
     }
 
     /// Answer only after `delay` (the abort test uses a delay past 5 s).
@@ -475,6 +464,30 @@ impl RestRequest {
     }
 }
 
+/// Synchronize request arrival, response release and handler completion without timers.
+#[derive(Default)]
+pub struct ResponseGate {
+    arrived: tokio::sync::Notify,
+    released: tokio::sync::Notify,
+    completed: tokio::sync::Notify,
+}
+
+impl ResponseGate {
+    pub async fn wait_for_request(&self) {
+        self.arrived.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.released.notify_one();
+    }
+
+    pub async fn wait_for_completion(&self) {
+        self.completed.notified().await;
+    }
+}
+
+type ResponseQueue = Arc<Mutex<VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)>>>;
+
 /// The running scripted REST double.
 pub struct MockRest {
     /// Listener address; `origin()` renders the `DISCORD_API_BASE` override.
@@ -487,10 +500,39 @@ impl MockRest {
     /// Bind on 127.0.0.1 and start serving `script` in order; once the queue
     /// is spent, every further request gets `default`.
     pub async fn start(script: Vec<ScriptedResponse>, default: ScriptedResponse) -> Self {
+        Self::start_inner(
+            script
+                .into_iter()
+                .map(|response| (response, None))
+                .collect(),
+            default,
+        )
+        .await
+    }
+
+    /// Hold the final scripted response until the caller releases its gate.
+    pub async fn start_gated(
+        mut script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+    ) -> (Self, Arc<ResponseGate>) {
+        let last = script.pop().expect("a gated response needs a script");
+        let gate = Arc::new(ResponseGate::default());
+        let mut queue: VecDeque<_> = script
+            .into_iter()
+            .map(|response| (response, None))
+            .collect();
+        queue.push_back((last, Some(Arc::clone(&gate))));
+        (Self::start_inner(queue, default).await, gate)
+    }
+
+    async fn start_inner(
+        script: VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)>,
+        default: ScriptedResponse,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let queue = Arc::new(Mutex::new(VecDeque::from(script)));
+        let queue = Arc::new(Mutex::new(script));
         let handle = {
             let recorded = Arc::clone(&recorded);
             tokio::spawn(async move {
@@ -525,7 +567,7 @@ impl MockRest {
 async fn rest_task(
     listener: TcpListener,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
-    queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    queue: ResponseQueue,
     default: ScriptedResponse,
 ) {
     loop {
@@ -542,7 +584,7 @@ async fn rest_task(
 async fn handle_rest(
     mut stream: TcpStream,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
-    queue: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    queue: ResponseQueue,
     default: ScriptedResponse,
 ) {
     let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
@@ -555,13 +597,14 @@ async fn handle_rest(
         body,
         received_at: std::time::Instant::now(),
     });
-    let next = queue
+    let (next, gate) = queue
         .lock()
         .expect("queue")
         .pop_front()
-        .unwrap_or_else(|| default.clone());
-    if let Some(gate) = &next.gate {
-        gate.notified().await;
+        .unwrap_or_else(|| (default.clone(), None));
+    if let Some(gate) = &gate {
+        gate.arrived.notify_one();
+        gate.released.notified().await;
     }
     if !next.delay.is_zero() {
         tokio::time::sleep(next.delay).await;
@@ -578,6 +621,9 @@ async fn handle_rest(
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
     let _ = stream.write_all(&next.body).await;
+    if let Some(gate) = gate {
+        gate.completed.notify_one();
+    }
 }
 
 /// Read one HTTP/1.1 request: request line, all headers, `content-length`

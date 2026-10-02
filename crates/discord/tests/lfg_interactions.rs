@@ -292,11 +292,10 @@ async fn router_runs_create_signup_full_switch_leave_close_with_audit() {
 #[ignore = "needs agent-testdb or the CI service container"]
 async fn router_persists_post_and_roles_before_discord_accepts() {
     let db = TestDb::new().await;
-    let acceptance = std::sync::Arc::new(tokio::sync::Notify::new());
-    let mock = MockRest::start(
+    let (mock, acceptance) = MockRest::start_gated(
         vec![
             ScriptedResponse::status(204),
-            ScriptedResponse::json(200, json!({"id": "5001"})).gated(acceptance.clone()),
+            ScriptedResponse::json(200, json!({"id": "5001"})),
         ],
         ScriptedResponse::json(200, json!({})),
     )
@@ -306,18 +305,16 @@ async fn router_persists_post_and_roles_before_discord_accepts() {
         let rt = rt.clone();
         tokio::spawn(async move { rt.handle(&create(7201, PERM_MANAGE_EVENTS)).await })
     };
-    // Bounded wait for a local mock request, not a live-service or CI poll.
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !mock
-            .requests()
-            .iter()
-            .any(|r| r.method == "POST" && r.path.starts_with("/api/v10/channels/"))
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        acceptance.wait_for_request(),
+    )
     .await
     .expect("POST reached mock");
+    assert!(mock
+        .requests()
+        .iter()
+        .any(|r| r.method == "POST" && r.path.starts_with("/api/v10/channels/")));
     let post = store::get_lfg(&db.pool, GUILD, "lfg-7201")
         .await
         .unwrap()
@@ -330,7 +327,7 @@ async fn router_persists_post_and_roles_before_discord_accepts() {
             .len(),
         2
     );
-    acceptance.notify_one();
+    acceptance.release();
     assert!(worker.await.unwrap().unwrap());
     assert_eq!(
         store::get_lfg(&db.pool, GUILD, &post.id)
