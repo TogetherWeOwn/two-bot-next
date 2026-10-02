@@ -5,6 +5,7 @@
 //! `GUILD_ID` the shard stays parked and `/readyz` reports `gateway: down`
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
+mod audit_runtime;
 mod backup_cli;
 mod command_runtime;
 #[cfg(test)]
