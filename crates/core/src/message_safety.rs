@@ -54,6 +54,18 @@ pub fn neutralize_mentions(text: &str) -> String {
     safe
 }
 
+/// True when the text carries a raw mass mention (`@everyone`/`@here`,
+/// including zero-width-split obfuscation) that [`neutralize_mentions`]
+/// would rewrite. Already-neutralized text returns false: the ZWSP break
+/// means it can no longer ping. Legitimate multilingual text — Persian ZWNJ,
+/// ZWJ emoji, ZWSP line-breaks, word joiners, `@user\u{200c}name` — also
+/// returns false. The refusal boundary is the mass mention itself, never
+/// the joiner.
+#[must_use]
+pub fn contains_mass_mention(text: &str) -> bool {
+    neutralize_mentions(text) != text
+}
+
 fn mention_end(text: &str, mention: &str) -> Option<usize> {
     let mut chars = text
         .char_indices()
@@ -69,8 +81,17 @@ fn mention_end(text: &str, mention: &str) -> Option<usize> {
     Some(end)
 }
 
+/// Invisible characters skipped only inside a matched mass mention (and
+/// never text on their own). Matches the automod `ZERO_WIDTH` class, which
+/// additionally treats U+2060 WORD JOINER as a zero-width gap: an attacker
+/// splitting `@everyone` with a word joiner must not reach the wire raw.
+/// These are stripped nowhere else — Persian ZWNJ, ZWJ emoji and ZWSP breaks
+/// survive [`neutralize_mentions`] untouched outside a matched mention.
 fn invisible_separator(ch: char) -> bool {
-    matches!(ch, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}')
+    matches!(
+        ch,
+        '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
+    )
 }
 
 /// A standalone invisible/whitespace-only body cannot carry a text message.
@@ -132,7 +153,7 @@ mod tests {
         ] {
             assert_eq!(content(text), text);
         }
-        for separator in ['\u{200b}', '\u{200c}', '\u{200d}', '\u{feff}'] {
+        for separator in ['\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}'] {
             for mention in ["everyone", "here"] {
                 let disguised = format!(
                     "@{separator}{}",
@@ -175,6 +196,45 @@ mod tests {
         assert_eq!(truncate("😀", 0), "");
         assert_eq!(truncate("😀", 1), "");
         assert_eq!(truncate("😀", 2), "😀");
+    }
+
+    #[test]
+    fn refusal_boundary_pins_obfuscated_mentions_but_not_multilingual_text() {
+        // Refusals: raw mentions and every zero-width-split obfuscation.
+        for mention in ["@everyone", "@here"] {
+            assert!(contains_mass_mention(mention), "{mention:?} must refuse");
+        }
+        for separator in ['\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}'] {
+            for mention in ["everyone", "here"] {
+                let disguised = format!(
+                    "@{separator}{}",
+                    mention
+                        .chars()
+                        .map(|ch| format!("{ch}{separator}"))
+                        .collect::<String>()
+                );
+                assert!(
+                    contains_mass_mention(&disguised),
+                    "{disguised:?} must refuse"
+                );
+                assert!(
+                    !contains_mass_mention(&content(&disguised)),
+                    "neutralized output must not refuse"
+                );
+            }
+        }
+        // Preserved: the refusal boundary is the mass mention, never the joiner.
+        for text in [
+            "می\u{200c}روم",
+            "👩\u{200d}💻",
+            "line\u{200b}break",
+            "\u{feff}text",
+            "@user\u{200c}name",
+            "word\u{2060}joiner",
+            "<@&123> <@456>",
+        ] {
+            assert!(!contains_mass_mention(text), "{text:?} must be kept");
+        }
     }
 
     #[test]
