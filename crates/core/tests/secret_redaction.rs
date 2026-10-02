@@ -478,7 +478,6 @@ fn channel_store_rejects_unknown_query_secrets_without_sqlx_warning() {
 #[cfg(feature = "db")]
 #[test]
 fn channel_store_tls_refusals_never_echo_urls_or_reach_logs() {
-    use std::error::Error as _;
     use two_bot_core::database_tls::TlsPolicy;
     let cases = [
         (
