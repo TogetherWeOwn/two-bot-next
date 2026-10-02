@@ -641,7 +641,7 @@ impl<E: ExtensionPolicy> Linter<'_, E> {
                 self.push(kind, Some(scope.position(at)));
             }
         }
-        for ((offset, branch), template) in branches.iter().zip(&parsed) {
+        for (&(offset, branch), template) in branches.iter().zip(&parsed) {
             self.walk(&template.0, scope.child(Some(branch), at + 2 + offset), 0);
         }
     }

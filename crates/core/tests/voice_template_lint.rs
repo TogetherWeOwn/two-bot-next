@@ -48,7 +48,10 @@ fn unclosed(construct: Construct) -> FindingKind {
     FindingKind::ParseError(ParseError::Unclosed(construct))
 }
 
-fn located(report: &LintReport) -> Vec<(FindingKind, Option<usize>)> {
+/// Findings as `(kind, byte offset)` pairs.
+type Located = Vec<(FindingKind, Option<usize>)>;
+
+fn located(report: &LintReport) -> Located {
     report
         .findings
         .iter()
@@ -61,7 +64,7 @@ fn located(report: &LintReport) -> Vec<(FindingKind, Option<usize>)> {
         .collect()
 }
 
-fn errors<E: ExtensionPolicy>(source: &str, extensions: &E) -> Vec<(FindingKind, Option<usize>)> {
+fn errors<E: ExtensionPolicy>(source: &str, extensions: &E) -> Located {
     lint(source, extensions)
         .findings
         .into_iter()
@@ -111,7 +114,7 @@ fn parse_error_closed_constructs_report_nothing() {
         "[[list:colors]] $00# +# ##",
         "plain text, 50% off: a/b \\ c | d",
     ] {
-        assert_eq!(errors(source, &PASSTHROUGH), vec![], "{source}");
+        assert_eq!(errors(source, &PASSTHROUGH), Located::new(), "{source}");
     }
 }
 
@@ -178,7 +181,7 @@ fn parse_error_too_deep_is_one_whole_template_finding() {
         vec![(FindingKind::ParseError(ParseError::TooDeep), Some(0))]
     );
     let shallow = format!("{}x{}", "<<".repeat(8), ">>".repeat(8));
-    assert_eq!(errors(&shallow, &PASSTHROUGH), vec![]);
+    assert_eq!(errors(&shallow, &PASSTHROUGH), Located::new());
 }
 
 // --- unknown tokens -----------------------------------------------------------
@@ -209,8 +212,11 @@ fn unknown_token_known_names_are_accepted_in_any_case() {
         .iter()
         .map(|name| format!("@@{name}@@ "))
         .collect();
-    assert_eq!(errors(&all, &PASSTHROUGH), vec![]);
-    assert_eq!(errors("@@OWNER@@ @@Game_Name@@", &PASSTHROUGH), vec![]);
+    assert_eq!(errors(&all, &PASSTHROUGH), Located::new());
+    assert_eq!(
+        errors("@@OWNER@@ @@Game_Name@@", &PASSTHROUGH),
+        Located::new()
+    );
 }
 
 // --- empty renders ------------------------------------------------------------
@@ -391,9 +397,31 @@ fn preview_renders_the_six_fixed_scenarios_in_order() {
     );
 }
 
-const GOLDEN_OWNER_GAME: [&str; 6] = ["", "", "", "", "", ""];
-const GOLDEN_COUNTS: [&str; 6] = ["", "", "", "", "", ""];
-const GOLDEN_TIME_RANDOM: [&str; 6] = ["", "", "", "", "", ""];
+const GOLDEN_OWNER_GAME: [&str; 6] = [
+    "#1 Avery · General",
+    "#2 Blake · Apex",
+    "#3 Casey · Chess",
+    "#4 Devon · Apex",
+    "#5 Emery · Chess",
+    "#6 Finley · General",
+];
+const GOLDEN_COUNTS: [&str; 6] = [
+    "1 member ·  ·",
+    "3 members ·  ·",
+    "2 members ·  ·",
+    "4 members ·  · In Match",
+    "4 members · 1 ·",
+    "2 members · 0 ·",
+];
+// One seed for every scenario, so the seeded picks are the same in each.
+const GOLDEN_TIME_RANDOM: [&str; 6] = [
+    "Monday January 9 Alpha c 🎭",
+    "Saturday March 21 Bravo c 🎭",
+    "Wednesday May 18 Charlie c 🎭",
+    "Sunday July 15 Delta c 🎭",
+    "Friday September 23 Echo c 🎭",
+    "Tuesday November 2 Foxtrot c 🎭",
+];
 
 #[test]
 fn preview_marks_fallback_names() {
