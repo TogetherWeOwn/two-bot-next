@@ -10,6 +10,7 @@ pub mod audit_mirror;
 pub mod automod;
 pub mod automod_activation;
 pub mod channel_access;
+pub mod command_registry;
 pub mod executor;
 mod executor_metrics;
 pub mod intents;
@@ -25,6 +26,7 @@ pub mod pipeline;
 pub mod ratelimit_guard;
 #[cfg(feature = "db")]
 pub mod rsvp;
+pub mod voice_rooms;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};

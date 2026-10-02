@@ -33,6 +33,7 @@ pub mod config;
 pub mod containment;
 #[cfg(feature = "db")]
 pub mod database_roles;
+pub mod database_tls;
 pub mod database_url;
 pub mod events;
 pub mod evidence;
@@ -97,9 +98,14 @@ pub mod voice_alias;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_assistant_validate;
+pub mod voice_channelinfo;
+pub mod voice_conditions;
 pub mod voice_config;
 pub mod voice_config_diff;
+pub mod voice_create_admission;
 pub mod voice_custom_id;
+pub mod voice_logging;
+pub mod voice_name_filter;
 pub mod voice_naming;
 pub mod voice_ownership;
 pub mod voice_permission_health;
@@ -108,6 +114,7 @@ pub mod voice_placement;
 pub mod voice_private;
 pub mod voice_rename_coalescer;
 pub mod voice_room_controls;
+pub mod voice_rooms;
 pub mod voice_style;
 pub mod voice_template_lint;
 pub mod voice_text_channel;
@@ -197,17 +204,18 @@ pub use inactivity::{
 pub use internal_actions::{
     assert_allowed, assert_private_bind, auth_failure, authorize, body_hash, build_channel_keys,
     build_key_map, build_role_keys, canonical_string, check_setting_value_size, is_private_address,
-    new_request_id, normalise_bind_host, parse_keys, require_field_str, require_reason,
-    require_settings_key, require_snowflake, require_timestamp, sign, signatures_match, utf16_len,
-    valid_idempotency_key, valid_nonce_format, validate_announcement, validate_event_input,
-    validate_guild_add_member, validate_idempotency_key, validate_moderation_numbers,
-    validate_role_assign, within_skew, ActionError, AuthDecision, AuthHeaders, BindError,
-    BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace, InternalFlags, KeyMapError,
-    KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets, ACTIONS_PATH, ADD_MEMBER_BUCKET,
-    AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET, IMPLEMENTED_ACTIONS, MAX_BODY_BYTES,
-    MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS, MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN,
-    MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN, MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY,
-    NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS, REQUEST_ID_LEN, SKEW_SECONDS,
+    new_request_id, normalise_bind_host, parse_body_object, parse_keys, require_field_str,
+    require_reason, require_settings_key, require_snowflake, require_timestamp, sign,
+    signatures_match, utf16_len, valid_idempotency_key, valid_nonce_format, validate_announcement,
+    validate_event_input, validate_guild_add_member, validate_idempotency_key,
+    validate_moderation_numbers, validate_role_assign, within_skew, ActionError, AuthDecision,
+    AuthHeaders, BindError, BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace,
+    InternalFlags, KeyMapError, KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets,
+    ACTIONS_PATH, ADD_MEMBER_BUCKET, AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET,
+    IMPLEMENTED_ACTIONS, MAX_BODY_BYTES, MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS,
+    MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN, MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN,
+    MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY, NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS,
+    REQUEST_ID_LEN, SKEW_SECONDS,
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
@@ -352,6 +360,15 @@ pub use voice_permission_health::{
     NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,
     PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS, PERM_ADMINISTRATOR,
     PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS, PERM_VIEW_CHANNEL,
+};
+pub use voice_rooms::{
+    category_full_message, decide_room_join, decide_room_leave, fail_backoff_ms,
+    parse_retry_after_ms, reconcile, voice_commands, ActionQueue, CreatorChannel,
+    CreatorSettingsError, FailedAction, MemRoomStore, NewRoomSpec, PermissionSource,
+    ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction, RoomJoinDecision,
+    RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore, SeenChannel,
+    VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT,
+    QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,

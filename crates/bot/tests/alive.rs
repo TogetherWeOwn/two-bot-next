@@ -23,6 +23,7 @@ use tokio::{
     time::{sleep, timeout, Instant},
 };
 use tokio_websockets::{Message, ServerBuilder};
+use two_bot_core::database_tls::TlsPolicy;
 use two_bot_cutover::gateway_session::GatewaySessionStore;
 
 const STEP: Duration = Duration::from_secs(5);
@@ -69,7 +70,7 @@ impl TestDb {
         // The gateway binary is DML-only and never migrates: the harness
         // performs the operator's migration step before spawning the child,
         // exactly like the documented production bootstrap.
-        two_bot_cutover::connect(&child_url, 1, false)
+        two_bot_cutover::connect_with_tls(&child_url, 1, false, TlsPolicy::LocalOnly)
             .await
             .expect("operator-equivalent migration bootstrap")
             .close()
@@ -125,6 +126,8 @@ impl Bot {
             .env("DISCORD_TOKEN", "alive-synthetic-token")
             .env("GUILD_ID", GUILD)
             .env("DATABASE_URL", &db.child_url)
+            // Website jobs open the same CI-service URL through cutover.
+            .env("TWO_DATABASE_TLS", "local-only")
             .env("DISCORD_GATEWAY_URL", gateway)
             .env("DISCORD_API_BASE", api)
             .env("TWO_ANNOUNCEMENTS", "1")

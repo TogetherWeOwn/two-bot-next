@@ -45,6 +45,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
 
+### Pre-push checklist
+
+Run this before every push. It mirrors the CI `check` job's fail-fast order:
+cheap lint/format/offline checks first, so a local failure is found in seconds
+instead of after CI restores the ~4 GiB cargo cache.
+
+```sh
+cargo fmt --all -- --check
+python3 scripts/check-secret-debug.py --test
+python3 scripts/check-secret-debug.py
+python3 scripts/test-docker-deps.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
+python3 scripts/check_soak_checklist.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+python3 tests/voice_templates/validate.py
+python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
+```
+
+(`test-docker-deps.py` without `--cargo` covers the offline layer shape; CI
+additionally runs the real locked `cargo fetch` after the cache restore.)
+
 ### Database tests
 
 Tests run only on the disposable `agent-testdb` service or a CI Postgres service

@@ -33,6 +33,7 @@ mod member_journey;
 mod persistent;
 mod recovery;
 mod rsvp;
+mod voice;
 
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";

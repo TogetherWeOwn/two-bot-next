@@ -34,14 +34,17 @@ pub mod parse;
 pub mod raid_tools;
 pub mod reengagement;
 pub mod rest;
+pub mod rollback_delta;
 pub mod self_role_store;
 pub mod settings;
+pub mod staging_migrate;
 pub mod tickets;
+pub mod voice_rooms;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
 pub use db::{
-    connect, mark_bot, record_earliest, record_event, replace_role_rewards, role_rewards,
-    touch_activity, CutoverDb, FunnelWrite, ReplaceRewardsError, DB_POOL_MAX_DEFAULT,
+    connect, connect_with_tls, mark_bot, record_earliest, record_event, replace_role_rewards,
+    role_rewards, touch_activity, CutoverDb, FunnelWrite, ReplaceRewardsError, DB_POOL_MAX_DEFAULT,
     STATEMENT_TIMEOUT_MS,
 };
 pub use dedupe::{

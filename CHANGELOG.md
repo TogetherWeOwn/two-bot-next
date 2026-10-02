@@ -37,6 +37,10 @@
 
 - RSVP and host check-in now use the shared S4 router and REST executor; other feature integrations remain follow-up slices. RSVP mutations validate live events with legacy missing/cancelled/error replies, while totals remain readable from persisted rows without Discord event access. Automated scorecard and probe collection are not enabled by this change.
 
+### Security
+
+- Require authenticated TLS for `two_bot_cutover::connect` (threat-model F6). `TWO_DATABASE_TLS` defaults to `required`, which refuses local hosts and missing, `disable`, `allow` or `prefer` sslmode, and always connects as `verify-full`. `local-only` (tests and CI only) allows loopback, CI service and socket hosts and refuses remote ones. Refusals are fixed strings that never echo the URL. See `docs/database-tls.md`.
+
 ### Fixed
 
 - Preserve ticket readiness and its authenticated bot-user lookup alongside ordered RSVP dispatch, without a competing registry publication. On graceful gateway shutdown, stop admission and drain accepted RSVP replies before joining ticket work; cover both integration seams with regressions.

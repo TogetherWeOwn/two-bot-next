@@ -12,6 +12,12 @@ HMAC provisioning HOLD. Future receiver work owns those steps.
 core phase-1 defaults. The receiver must intersect its enabled/authorized actions
 with this capability; the core's 19-verb catalogue is not executor parity.
 
+Pass the body `authorize` returned (or `parse_body_object` output); never
+re-parse the signed bytes with a lenient parser. That parser refuses a JSON
+object key repeated at any depth, so the executor and any later reader see the
+one value the MAC covered. `execute_stored_member` applies it to its raw bytes
+before any claim or REST call (threat model F3).
+
 Construct with the application's `Arc<twilight_http::Client>`, configured
 channel-key map and the bot token's one `CooldownGovernor`. The application's
 rustls provider must already be installed.
