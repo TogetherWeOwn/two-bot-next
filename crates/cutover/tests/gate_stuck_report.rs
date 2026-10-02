@@ -102,9 +102,11 @@ impl TestDb {
     }
 
     async fn snapshot(&self) -> Result<serde_json::Value, sqlx::Error> {
+        // Tables only: sequences (e.g. events_id_seq from BIGSERIAL) hold no
+        // row data and cannot be selected as rowsets.
         let names: Vec<String> = sqlx::query_scalar(
             "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'S') ORDER BY c.relname",
+             WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') ORDER BY c.relname",
         )
         .fetch_all(&self.pool)
         .await?;
