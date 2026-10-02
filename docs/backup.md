@@ -52,11 +52,12 @@ selectors ignore it.
 ### Coverage and recovery semantics (v4, TOG-11142)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **57 durable tables from the
+inventory for both dump and restore. It includes **58 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
-tables and the member-moderation ledger, plus **3 optional retired legacy tables**. A dump from a fresh Rust
-schema has 57 table entries; a compatible legacy-extended schema may have up to
-60. A missing current table refuses a dump/restore: migrate the target first.
+tables, the member-moderation ledger and the internal clock high-water mark,
+plus **3 optional retired legacy tables**. A dump from a fresh Rust
+schema has 58 table entries; a compatible legacy-extended schema may have up to
+61. A missing current table refuses a dump/restore: migrate the target first.
 A v4 archive written before a table joined the inventory is refused at inspect
 ("manifest is missing tables"); take a fresh dump after upgrading.
 An optional legacy table may be absent only when there are no archived rows for
