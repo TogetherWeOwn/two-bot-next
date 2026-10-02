@@ -405,6 +405,16 @@ impl HyperTransport {
     }
 }
 
+/// Prior DELETE attempts supplied to a paced kick's safety guard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KickAttemptState {
+    /// Number of DELETE attempts already made, excluding the pending send.
+    pub attempts: u32,
+    /// A prior timeout or transport failure may have applied a mutation.
+    /// Sticky across retries: a later 429/5xx does not resolve that uncertainty.
+    pub mutation_uncertain: bool,
+}
+
 #[path = "internal_exec/member.rs"]
 pub mod member;
 
@@ -690,44 +700,87 @@ impl ActionExecutor {
     /// retried. Never throws — every ending is a [`KickResult`] (legacy
     /// `DiscordKicker::kick`).
     pub async fn kick_paced(&self, guild_id: &str, user_id: &str, reason: &str) -> KickResult {
+        match self
+            .kick_paced_guarded(guild_id, user_id, reason, |_| async {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Reauthorize after pacing and before every DELETE, including retries.
+    /// The callback receives prior attempts and any pending mutation uncertainty
+    /// so a refusal can be audited as failed rather than cleanly protected.
+    /// The kick lane stays reserved through authorization and the bounded
+    /// exchange, with no additional pacing wait after the final safety read.
+    pub async fn kick_paced_guarded<F, Fut, E>(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        reason: &str,
+        mut authorize: F,
+    ) -> Result<KickResult, E>
+    where
+        F: FnMut(KickAttemptState) -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
         let path_guild = guild_id.to_owned();
         let path_user = user_id.to_owned();
         let reason = match audit_reason(reason) {
             Ok(r) => r,
             Err(e) => {
-                return KickResult {
+                return Ok(KickResult {
                     outcome: KickOutcome::Failed,
                     status: None,
                     detail: e.to_string(),
                     attempts: 0,
-                }
+                })
             }
         };
         let mut attempts: u32 = 0;
+        let mut mutation_uncertain = false;
         loop {
-            self.pace(true).await;
-            attempts += 1;
+            let mut lane = self.paced_lane(true).await;
             let request = match self.kick_request(&path_guild, &path_user, &reason) {
                 Ok(r) => r,
                 Err(detail) => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Failed,
                         status: None,
                         detail,
                         attempts,
-                    }
+                    })
                 }
             };
-            let res = match self.send(&request).await {
+            authorize(KickAttemptState {
+                attempts,
+                mutation_uncertain,
+            })
+            .await?;
+            attempts += 1;
+            // A deadline covers both headers and body, not just connection
+            // setup. A timeout is ambiguous: retry only after fresh safety
+            // authorization, and report failure if the bounded budget runs out.
+            *lane = std::time::Instant::now();
+            let exchange = tokio::time::timeout(self.inner.moderation_timeout, self.send(&request))
+                .await
+                .unwrap_or_else(|_| Err("DELETE timed out; mutation may have applied".into()));
+            // Backoff belongs to this caller, not the shared kick reservation.
+            drop(lane);
+            let res = match exchange {
                 Ok(r) => r,
                 Err(detail) => {
+                    mutation_uncertain = true;
                     if attempts > MAX_HTTP_TRIES - 1 {
-                        return KickResult {
+                        return Ok(KickResult {
                             outcome: KickOutcome::Failed,
                             status: None,
                             detail: format!("network: {detail}"),
                             attempts,
-                        };
+                        });
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms(attempts - 1))).await;
                     continue;
@@ -735,67 +788,67 @@ impl ActionExecutor {
             };
             match classify_kick_status(res.status) {
                 KickStatus::Removed => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Kicked,
                         status: Some(res.status),
                         detail: "removed".to_owned(),
                         attempts,
-                    }
+                    })
                 }
                 KickStatus::AlreadyGone => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::AlreadyGone,
                         status: Some(res.status),
                         detail: "not a member".to_owned(),
                         attempts,
-                    }
+                    })
                 }
                 KickStatus::Forbidden => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Forbidden,
                         status: Some(res.status),
                         detail: "missing Kick Members, or the target outranks the bot".to_owned(),
                         attempts,
-                    }
+                    })
                 }
                 KickStatus::Unauthorized => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Failed,
                         status: Some(res.status),
                         detail: "token rejected".to_owned(),
                         attempts,
-                    }
+                    })
                 }
                 KickStatus::RateLimited => {
                     let wait = res.retry_after_wait_ms();
                     if attempts > MAX_HTTP_TRIES - 1 {
-                        return KickResult {
+                        return Ok(KickResult {
                             outcome: KickOutcome::RateLimited,
                             status: Some(res.status),
                             detail: format!("still rate limited after {attempts} attempts"),
                             attempts,
-                        };
+                        });
                     }
                     tokio::time::sleep(Duration::from_millis(wait)).await;
                 }
                 KickStatus::ServerError => {
                     if attempts > MAX_HTTP_TRIES - 1 {
-                        return KickResult {
+                        return Ok(KickResult {
                             outcome: KickOutcome::Failed,
                             status: Some(res.status),
                             detail: "server error".to_owned(),
                             attempts,
-                        };
+                        });
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms(attempts - 1))).await;
                 }
                 KickStatus::Other => {
-                    return KickResult {
+                    return Ok(KickResult {
                         outcome: KickOutcome::Failed,
                         status: Some(res.status),
                         detail: "unexpected status".to_owned(),
                         attempts,
-                    }
+                    })
                 }
             }
         }
@@ -855,6 +908,31 @@ impl ActionExecutor {
                 }
                 _ => return Ok(None),
             }
+        }
+    }
+
+    /// Safety-critical operator read. Only 404 is absence; authorization,
+    /// rate-limit, malformed JSON and upstream failures must stop the caller.
+    /// Uses the shared paced transport, without silently retrying credentials.
+    pub async fn get_json_strict(
+        &self,
+        path: &str,
+    ) -> Result<Option<serde_json::Value>, DiscordError> {
+        let route = raw_get_route(path).map_err(DiscordError::Rejected)?;
+        self.pace(false).await;
+        let res = tokio::time::timeout(
+            self.inner.moderation_timeout,
+            self.send(&Request::from_route(&route)),
+        )
+        .await
+        .map_err(|_| DiscordError::Unavailable("Discord safety read timed out".into()))?
+        .map_err(DiscordError::Unavailable)?;
+        match res.status {
+            200..=299 => serde_json::from_slice(&res.body)
+                .map(Some)
+                .map_err(|_| DiscordError::Unavailable("invalid JSON response".into())),
+            404 => Ok(None),
+            _ => Err(throw_for_status(&res)),
         }
     }
 
@@ -1783,6 +1861,9 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
         Some((b, q)) => (b, q),
         None => (path, ""),
     };
+    if base == "/users/@me" && query.is_empty() {
+        return Ok(Route::GetCurrentUser);
+    }
     // Route borrows nothing here (u64/bool fields); the 'static bound is
     // satisfied because no borrowed variant is constructed.
     if let Some(id) = base.strip_prefix("/guilds/") {
@@ -1804,6 +1885,18 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
                 guild_id,
                 limit: query_param(query, "limit").and_then(|v| v.parse().ok()),
             }),
+            Some("roles") if query.is_empty() => Ok(Route::GetGuildRoles { guild_id }),
+            Some(member) if member.starts_with("members/") && query.is_empty() => {
+                let user_id = member
+                    .strip_prefix("members/")
+                    .unwrap()
+                    .parse::<u64>()
+                    .map_err(|_| err())?;
+                if user_id == 0 {
+                    return Err(err());
+                }
+                Ok(Route::GetMember { guild_id, user_id })
+            }
             Some("scheduled-events") => Ok(Route::GetGuildScheduledEvents {
                 guild_id,
                 with_user_count: query_param(query, "with_user_count").is_some_and(|v| v == "true"),

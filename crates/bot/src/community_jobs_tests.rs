@@ -82,6 +82,81 @@ fn gates_follow_legacy_env_semantics() {
     );
 }
 
+#[test]
+fn parked_reason_taxonomy_selects_warn_vs_info() {
+    // Contract: `register` logs WARN exactly when a parked job's `reason`
+    // is `"invalid_config"` and INFO otherwise (its match on the reason).
+    // This pins the reason every gate state produces, so a future refactor
+    // cannot silently move a misconfiguration onto the info path — or a
+    // plain disable onto warn — without failing here.
+    let reasons_for = |parked: &[Parked], name: &str| {
+        parked
+            .iter()
+            .filter(|p| p.name == name)
+            .map(|p| p.reason)
+            .collect::<Vec<_>>()
+    };
+
+    // Default env: the scorecard is off (a plain disable) and the sweep
+    // runs at the legacy default.
+    let (gates, parked) = resolve_gates(&HashMap::new());
+    assert_eq!(gates.inactivity_days, Some(14));
+    assert_eq!(
+        parked
+            .iter()
+            .map(|p| (p.name, p.reason))
+            .collect::<Vec<_>>(),
+        [("community_scorecard", "disabled")]
+    );
+
+    // Presence explicitly off is a disable (info), not a config error.
+    let vars = HashMap::from([("TWO_PRESENCE_PROBE".to_owned(), "0".to_owned())]);
+    let (gates, parked) = resolve_gates(&vars);
+    assert!(!gates.presence);
+    assert_eq!(reasons_for(&parked, "presence_probe"), ["disabled"]);
+
+    // A bad scorecard value is a config error (warn).
+    let vars = HashMap::from([
+        ("TWO_COMMUNITY_SCORECARD".to_owned(), "1".to_owned()),
+        (
+            "TWO_COMMUNITY_CORRECTION_CYCLES".to_owned(),
+            "bogus".to_owned(),
+        ),
+    ]);
+    let (gates, parked) = resolve_gates(&vars);
+    assert!(gates.scorecard.is_none());
+    assert_eq!(
+        reasons_for(&parked, "community_scorecard"),
+        ["invalid_config"]
+    );
+
+    // Every non-numeric TWO_INACTIVITY_DAYS shape parks the sweep as
+    // invalid_config (warn): never "disabled", never the raw value.
+    for raw in ["many", "", "-1", "14.5", "18446744073709551616"] {
+        let vars = HashMap::from([("TWO_INACTIVITY_DAYS".to_owned(), raw.to_owned())]);
+        let (gates, parked) = resolve_gates(&vars);
+        assert_eq!(gates.inactivity_days, None, "days {raw:?} parks the sweep");
+        assert_eq!(
+            reasons_for(&parked, "inactivity"),
+            ["invalid_config"],
+            "days {raw:?} must select the warn path"
+        );
+    }
+
+    // Parseable shapes stay green — including the saturation extreme, which
+    // `inactivity_cutoff_ms` pins to the `i64::MIN`-bounded floor, and
+    // surrounding whitespace, which the parser trims.
+    for (raw, days) in [("0", 0), (" 30 ", 30), ("18446744073709551615", u64::MAX)] {
+        let vars = HashMap::from([("TWO_INACTIVITY_DAYS".to_owned(), raw.to_owned())]);
+        let (gates, parked) = resolve_gates(&vars);
+        assert_eq!(gates.inactivity_days, Some(days), "days {raw:?} parses");
+        assert!(
+            reasons_for(&parked, "inactivity").is_empty(),
+            "days {raw:?} parks nothing"
+        );
+    }
+}
+
 #[tokio::test]
 async fn scorecard_attempt_is_once_per_monday_per_process() {
     // 2026-09-28 is a Monday; the window opens at 06:15 UTC.
