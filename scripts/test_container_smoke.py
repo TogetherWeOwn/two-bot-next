@@ -8,6 +8,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -18,17 +19,31 @@ smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 
 
+def tar_of(path, data, mode=0o644, extra=()):
+    """The archive `docker cp CONTAINER:PATH -` writes for one file."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        for name, content, member_mode in ((Path(path).name, data, mode), *extra):
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(content), member_mode
+            tar.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
 class DockerFixture:
     def __init__(self):
         self.calls = []
         self.image_size = 110 * smoke.MIB
         self.binary_size = 7 * smoke.MIB
-        self.user = "two-bot"
+        self.user = "65532:65532"
         self.health_command = ["CMD", smoke.BINARY, "--healthcheck"]
         self.ca_bundle = "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n"
-        self.uid = "1000"
+        self.bundle_mode = 0o644
+        self.archives = {}
+        self.pid = 4242
+        self.uids = ["65532"] * 4
+        self.top_header = "PID   RUID   EUID   SUID   FSUID"
         self.live_health_exit = 0
-        self.trust_bundle_exit = 0
         self.dead_health_exit = 1
         self.health_status = "healthy"
         self.exit_code = "0"
@@ -50,23 +65,28 @@ class DockerFixture:
         elif args[0] == "history":
             # Two layers summing to image_size (inspect .Size is not used).
             output = f"{self.image_size - 4096}\n4096\n0\n"
-        elif args[0] == "run" and "stat" in args:
+        elif args[0] == "create":
+            output = "f" * 64 + "\n"
+        elif args[0] == "cp":
             if self.measure_timeout:
                 raise subprocess.TimeoutExpired(["docker", *args], kwargs.get("timeout"))
-            output = str(self.binary_size)
+            path = args[2].partition(":")[2]
+            if path in self.archives:
+                output = self.archives[path]
+            elif path == smoke.BINARY:
+                output = tar_of(path, bytes(self.binary_size), 0o755)
+            else:
+                output = tar_of(path, self.ca_bundle.encode(), self.bundle_mode)
         elif args[0] == "port":
             output = self.port
         elif args[0] == "inspect":
             output = json.dumps([{"State": {
-                "Running": not self.stopped, "OOMKilled": self.oom,
+                "Running": not self.stopped, "OOMKilled": self.oom, "Pid": self.pid,
                 "Health": {"Status": self.health_status},
             }}])
-        elif args[0] == "exec" and tuple(args[-2:]) == ("cat", smoke.CA_BUNDLE):
-            output = self.ca_bundle
-        elif args[0] == "exec" and "cat" in args:
-            output = "Name:\ttwo-bot\nUid:\t" + "\t".join([self.uid] * 4) + "\n"
-        elif args[0] == "exec" and "grep" in args:
-            code = self.trust_bundle_exit
+        elif args[0] == "top":
+            # A sibling process first: PID 1 is selected by host PID, not order.
+            output = f"{self.top_header}\n4300   0   0   0   0\n4242   " + "   ".join(self.uids) + "\n"
         elif args[0] == "exec":
             code = self.live_health_exit
         elif args[0] == "run" and "--healthcheck" in args:
@@ -224,8 +244,8 @@ class ContainerSmokeTests(unittest.TestCase):
         image_id = "sha256:" + "a" * 64
         self.run_smoke(image=image_id)
         self.assertEqual(self.fixture.calls[0][0], ("image", "inspect", image_id))
-        runs = [args for args, _ in self.fixture.calls if args[0] == "run"]
-        self.assertEqual(len(runs), 3)
+        runs = [args for args, _ in self.fixture.calls if args[0] in ("create", "run")]
+        self.assertEqual([args[0] for args in runs], ["create", "run", "run"])
         for args in runs:
             self.assertIn(image_id, args)
             self.assertNotIn("two-bot:fixture", args)
@@ -243,17 +263,45 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assertIn('docker image rm "$IMAGE"', job)
         self.assertNotIn("docker image prune", job)
 
-    def test_runtime_trust_bundle_is_checked_as_configured_non_root_user(self):
+    def test_image_files_are_read_from_a_never_started_container_without_exec_helpers(self):
         self.run_smoke()
-        check = next(args for args, _ in self.fixture.calls if args[0] == "exec" and "grep" in args)
-        self.assertEqual(check[-4:], ("grep", "-q", "^-----BEGIN CERTIFICATE-----$", smoke.CA_BUNDLE))
-        self.assertNotIn("--user", check)
+        calls = [args for args, _ in self.fixture.calls]
+        create = next(args for args in calls if args[0] == "create")
+        measure = create[create.index("--name") + 1]
+        self.assertIn("none", create)
+        copies = [args for args in calls if args[0] == "cp"]
+        self.assertEqual(copies, [("cp", "--follow-link", f"{measure}:{path}", "-")
+                                  for path in (smoke.BINARY, smoke.CA_BUNDLE)])
+        self.assertTrue(all(kwargs["text"] is False for args, kwargs in self.fixture.calls if args[0] == "cp"))
+        self.assertLess(calls.index(("rm", "--force", measure)), next(
+            index for index, args in enumerate(calls) if "--detach" in args))
+        # The distroless runtime has no shell, cat or grep: the only exec is
+        # the image's own binary.
+        execs = [args for args in calls if args[0] == "exec"]
+        self.assertEqual([args[2:] for args in execs], [(smoke.BINARY, "--healthcheck")])
 
     def test_missing_or_non_pem_trust_bundle_fails_and_cleans_up(self):
-        for exit_code in (1, 2):
-            with self.subTest(exit_code=exit_code):
-                self.fixture.trust_bundle_exit = exit_code
-                self.assert_rejected("trust bundle must contain PEM certificates")
+        for bundle, mode in (("-----BEGIN CERTIFICATE-----x\n-----END CERTIFICATE-----\n", 0o644),
+                             (DockerFixture().ca_bundle, 0o640), (DockerFixture().ca_bundle, 0o600)):
+            with self.subTest(bundle=bundle, mode=oct(mode)):
+                self.fixture.ca_bundle, self.fixture.bundle_mode = bundle, mode
+                self.assert_rejected("trust bundle must contain PEM certificates readable by the runtime user")
+                self.assertEqual(self.fixture.calls[-1][0][:2], ("rm", "--force"))
+                self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
+
+    def test_image_file_must_be_one_regular_file(self):
+        directory = io.BytesIO()
+        with tarfile.open(fileobj=directory, mode="w") as tar:
+            info = tarfile.TarInfo("certs")
+            info.type = tarfile.DIRTYPE
+            tar.addfile(info)
+        empty = b"\0" * 1024
+        for archive in (directory.getvalue(), empty,
+                        tar_of(smoke.CA_BUNDLE, b"pem", extra=[("extra", b"x", 0o644)])):
+            with self.subTest(size=len(archive)):
+                self.fixture.calls.clear()
+                self.fixture.archives = {smoke.CA_BUNDLE: archive}
+                self.assert_rejected("must be one regular file")
                 self.assertEqual(self.fixture.calls[-1][0][:2], ("rm", "--force"))
 
     def test_image_budget_is_enforced_before_runtime_start(self):
@@ -292,7 +340,7 @@ class ContainerSmokeTests(unittest.TestCase):
     def test_missing_binary_fails(self):
         original = self.fixture
         def missing(*args, **kwargs):
-            if "stat" in args:
+            if args[0] == "cp" and args[2].endswith(":" + smoke.BINARY):
                 raise subprocess.CalledProcessError(1, args, stderr="binary missing")
             return original(*args, **kwargs)
         self.fixture = missing
@@ -304,9 +352,25 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assert_rejected("non-root user")
 
     def test_root_pid_fails_even_with_non_root_image_metadata(self):
-        self.fixture.uid = "0"
-        self.assert_rejected("PID 1 is root")
-        self.assertEqual(self.fixture.calls[-1][0][:2], ("rm", "--force"))
+        for index in range(4):
+            with self.subTest(uid_field=index):
+                self.fixture = DockerFixture()
+                self.fixture.uids[index] = "0"
+                self.assert_rejected("PID 1 is root")
+                self.assertEqual(self.fixture.calls[-1][0][:2], ("rm", "--force"))
+        top = next(args for args, _ in self.fixture.calls if args[0] == "top")
+        self.assertEqual(top[2:], ("-o", "pid,ruid,euid,suid,fsuid"))
+
+    def test_unprovable_pid1_identity_fails(self):
+        for field, value, message in (("pid", 0, "no host process"), ("pid", None, "no host process"),
+                                      ("pid", 9999, "did not report PID 1"),
+                                      ("top_header", "PID USER", "unexpected docker top header"),
+                                      ("uids", ["65532"] * 3, "did not report PID 1")):
+            with self.subTest(field=field, value=value):
+                self.fixture = DockerFixture()
+                setattr(self.fixture, field, value)
+                self.assert_rejected(message)
+                self.assertEqual(self.fixture.calls[-1][0][:2], ("rm", "--force"))
 
     def test_broken_docker_healthcheck_fails(self):
         self.fixture.health_command = ["CMD", "/bin/true"]
@@ -416,8 +480,8 @@ class ContainerSmokeTests(unittest.TestCase):
 
     def test_auxiliary_containers_are_named_capped_and_removed(self):
         self.run_smoke()
-        runs = [args for args, _ in self.fixture.calls if args[0] == "run"]
-        self.assertEqual(len(runs), 3)  # measure, detached main, probe
+        runs = [args for args, _ in self.fixture.calls if args[0] in ("create", "run")]
+        self.assertEqual(len(runs), 3)  # created measure, detached main, probe
         names = set()
         for args in runs:
             self.assertNotIn("--rm", args)

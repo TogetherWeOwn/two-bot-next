@@ -31,144 +31,68 @@ security exceptions also need CISO agreement. Do not ignore a whole severity,
 a whole ecosystem or every unfixed finding. An expired exception restores the
 gate. New findings must be triaged on the same PR, never bypassed to get green.
 
-### Conditional-decision tuple preflight (no suppression)
+### Exact-tuple preflight (no acceptance, no suppression)
 
 `scripts/vulnerability-preflight.py` binds the raw pinned-Trivy v0.69.3 image
-report to the source SHA, immutable image ID, Debian 12.15/amd64 metadata and a
-successful, lossless installed-package probe. It checks each HIGH/CRITICAL
-finding against both scan and dpkg inventory, including PURL package/version,
-architecture, distro and epoch. Duplicate qualifiers/rows, missing/null PURLs,
-inventory mismatches and failed/partial probes fail closed. Trivy's normalized
-`Version` and `SrcVersion` are not full Debian binary/source versions; the check
-uses installed versions and package IDs, not inferred downstream revisions.
+report to the source SHA, immutable image ID, Debian 13.7/amd64 metadata (the
+measured release of the digest-pinned distroless runtime) and complete, lossless
+filesystem evidence (below). It checks each HIGH/CRITICAL finding against both
+the scan inventory and the image's `status.d` package inventory, including PURL
+package/version, architecture, distro and epoch. Duplicate qualifiers/rows,
+missing/null PURLs, inventory mismatches and failed/partial evidence fail closed.
+Trivy's normalized `Version` and `SrcVersion` are not full Debian binary/source
+versions; the check uses installed versions and package IDs.
 
-The frozen [CISO revision 3 decision](/TOG/issues/TOG-11261#document-vulnerability-disposition)
-lists 17 conditional tuples expiring at **2026-10-08T00:00:00Z**. Matching tuples
-are reported as `conditions-and-selector-proof-required`, never approved or
-suppressed. At or after expiry they are `expired`; any other tuple is
-`not-conditionally-accepted`. Every row retains `suppressed: false` and the
-report always has `suppressed_count: 0`. It does not distinguish previously
-rejected tuples from newly discovered tuples: neither is accepted.
+No tuple is accepted. The Bookworm conditional decision in
+[CISO revision 3](/TOG/issues/TOG-11261#document-vulnerability-disposition)
+(17 tuples expiring 2026-10-08) retired with the Bookworm runtime and does not
+carry over to Debian 13 tuples. Every row is `not-accepted` with
+`suppressed: false`, and `suppressed_count` is always 0. A new HIGH/CRITICAL
+tuple keeps the gate red until a base-digest update fixes it or the CISO
+re-dispositions it on that thread; any exception still follows the rules above.
 
-CI retains `vulnerability-preflight.json` and its checksum after diagnostics,
-including failed image gates. Successful preflight means only that observations
-were bound and classified; **it is not a vulnerability PASS**. Both existing
-Trivy gates, their exit codes and the empty ignore file remain unchanged. This
-preflight does not implement affected-code conditions, source/package
-authentication, extra/injected implementation exclusion or scanner suppression.
-Those checks, actual pinned-scanner positive/negative selector/expiry tests and
-independent final-head approval remain required before any activation. Changes
-to modules, interpreters, payloads or startup environment cannot be waived by a
-matching tuple. Stock-image observations are not deployed privilege controls.
-
-### Actual pinned-scanner selector diagnostics (no activation)
-
-`scripts/probe-trivy-selectors.py` runs the installed **Trivy v0.69.3** binary's
-`convert` command against isolated copies of the retained raw image report.
-Upstream `convert` calls the same `result.Filter` implementation used during
-scans. This tests native filtering, not a Python approximation, but **does not
-rescan an image or refresh a vulnerability database**. It never edits the raw
-reports or `.trivyignore.yaml` and never feeds filtered copies to either gate.
-The four-minute CI step retains `trivy-selector-probes.json` and its checksum.
-
-For each observed conditional tuple, the matrix measures exact selection,
-different packages/versions/architectures, unknown CVEs, missing/null PURLs and
-identifiers, epoch changes where applicable, source/image/distro binding changes
-and expiry. Consistent alternative tuples update both inventories; malformed
-fixtures intentionally do not. Receipts distinguish native exit/finding counts
-from prerequisite preflight rejection or an unaccepted classification. Binary,
-input, synthetic ignore and output hashes identify the experiment. Zero observed
-candidates means zero selector coverage, not exception safety.
-
-Each subprocess executes one private, hashed snapshot of the installed binary,
-so a concurrent setup action cannot replace its executable during the matrix.
-It has an explicit empty config and isolated HOME/cache, with only PATH/HOME
-inherited and a 20-second timeout. Synthetic YAML expiry controls use
-RFC3339 timestamps in the distant past/future; JSON-quoted date-only strings do
-not decode into Trivy's timestamp field. These test dates do **not** renew the
-real decision. The preflight's exclusive expiry boundary is independently
-checked at the original **2026-10-08T00:00:00Z**; Trivy's wall clock is unchanged.
-
-Native conversion shows why YAML alone is insufficient: missing/null target
-PURLs can match a selected CVE, and source/image/distro provenance is not a YAML
-PURL condition. Missing identifiers may also be repaired from scan inventory.
-A null whole `PkgIdentifier` triggers a v0.69.3 JSON decoder panic; its nonzero
-exit/no output is recorded separately, never as suppression or successful
-conversion. All these malformed prerequisites are rejected by the preflight.
-Unexpected conversion failures or failed controls fail the diagnostic step.
-This does not implement the remaining affected-code, authenticated payload or
-injection conditions, does not clear the rejected tuples and does not authorize
-any exception. Independent exact-head review and successful real gates remain
-mandatory.
-
-To reproduce with an already verified raw artifact and verified pinned binary:
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/probe-trivy-selectors.py <artifact-directory> --trivy <verified-trivy-binary>
-```
+CI retains `vulnerability-preflight.json` and its checksum, including after
+failed image gates. Successful preflight means only that observations were
+bound and classified; **it is not a vulnerability PASS**. Both Trivy gates,
+their exit codes and the empty ignore file are unchanged.
 
 ## Exact-image applicability evidence
 
 After the vulnerability gates, including when either fails, CI runs
 `scripts/runtime-image-evidence.py` against the immutable image ID recorded with
-the BOMs. The `supply-chain` artifact additionally retains
-`runtime-image-evidence.json` and its separate SHA-256 checksum. These diagnostic
-files are not release assets and do not affect ignore selectors or waive findings.
+the BOMs. The `supply-chain` artifact retains `runtime-image-evidence.json` and
+its separate SHA-256 checksum. These diagnostic files are not release assets and
+do not affect ignore selectors or waive findings.
 
-The report records image architecture, declared runtime user and entrypoint,
-installed package versions/architectures and file lists, selected utility/module
-presence, Perl build width, ELF/linkage probes, SUID/SGID files, capability-tool
-output and mount configuration. Each fixed probe runs in its own named container
-with a read-only filesystem, no network, no mounts or passed secrets, all
-capabilities dropped and no-new-privileges. Inspection uses container root for
-file visibility, not to exercise privileged operations or the bot entrypoint.
-Each probe has a 20-second client timeout, CPU/memory/PID limits and removal of
-only its own container even on timeout. The enclosing job retains its 40-minute
-bound. Docker inspection does not record image environment values.
+Nothing executes inside the image: the distroless runtime has no shell, package
+manager or `getcap`. The script creates one named, never-started container
+(`--network none --no-healthcheck`), streams `docker export` of its merged
+filesystem (120-second client timeout) and removes only that container
+(30-second timeout), even after a failure. Only the daemon's exact
+missing-container response for that name confirms absence after a failed
+create; other cleanup errors or timeouts fail the job. Docker inspection does
+not record image environment values.
 
-The dependency probe queries the full dpkg inventory, not a selected list that
-fails when an optional package (such as `openssl`) is absent. Its seven tab-separated
-fields are binary package, full version, architecture, Essential flag, dpkg status,
-Depends and Pre-Depends. This preserves reverse consumers outside the affected
-package list and distinguishes installed packages from residual configuration
-records. Interpret dependency alternatives/version constraints with Debian package
-semantics; this is not an apt removal simulation, linkage closure or permission
-to remove Essential packages. A successful query alone does not clear a CVE.
-The existing 16-probe count, isolation and timeout bounds are unchanged.
+From the exported tar stream, schema version 2 records:
 
-Nonzero exits, unavailable tools and timeouts are retained explicitly; they are
-not absence proof. For example, missing `getcap` leaves capabilities unresolved.
-Completed and timed-out output is decoded as UTF-8; invalid bytes are replaced and
-marked per stream in `lossy_decoding` for both the probe and cleanup result. Such
-output is incomplete evidence, not a valid filename or absence determination.
-A valid UTF-8 replacement character alone does not set the loss marker.
-Each probe retains its exact UUID `container_name` and original result separately
-from cleanup, so a cleanup timeout or daemon transport failure still leaves an
-ownership-scoped follow-up target in the partial report. Only the daemon's
-exact missing-container response for that probe's UUID confirms absence after a
-startup failure; other cleanup errors/timeouts stop further probes and fail the
-job. The report is saved incrementally and checksummed even on cleanup failure,
-with `complete: false` and an explicit collection error. `complete: true` means
-all probes were attempted, not that their commands or vulnerability gates passed.
-Module absence and linkage observations still need package/CVE-specific analysis
-and source/caller evidence. CI kernel, mounts and inspection privileges do not
-prove production kernel, namespace restrictions or exploit reachability. Keep
-all unresolved gates red; pursue supported Bookworm fixes or compatible removal
-of unnecessary packages before requesting a new disposition on the existing
-security-decision thread.
+- installed packages from `/var/lib/dpkg/status.d/<package>`: exactly one deb822
+  paragraph per regular UTF-8 file, with `Package`, `Version` and `Architecture`,
+  a file name equal to `Package` (or `Package:Arch`) and a `Status` that is absent
+  or exactly `install ok installed`. A classic `/var/lib/dpkg/status`, duplicate,
+  multi-paragraph, malformed, non-installed or empty inventories fail closed;
+- SUID/SGID files, file capabilities (`security.capability` pax xattrs) and
+  shells, package managers or privilege tools present on standard paths, with
+  links resolved inside the image;
+- the runtime binary's size, mode, owner, SHA-256, ELF interpreter and
+  `DT_NEEDED` libraries, each resolved through image symlinks to a file and to
+  its owning packages via `status.d/*.md5sums`. An unresolved library fails closed.
 
-The mount-configuration probe records the full dpkg binary/source inventory,
-including exact versions and architectures, then resolves and hashes
-`/usr/bin/nsenter` and the amd64 `libmount.so.1` target. This does not require the
-removed `mount` package or claim its binaries were hashed. Path resolution,
-package-query or hashing failures remain nonzero observations; later help/configuration
-commands cannot hide them. An unavailable mount command is explicitly recorded,
-not treated as a package-absence or CVE test. This keeps the same 16-probe and
-timeout bounds. These are hashes observed inside the scanned image, not authenticated
-Debian package comparisons or automatic evidence of absent vulnerable code.
-Compare them with independently authenticated exact published payloads before
-relying on a source/build applicability decision. No ignore selector or
-vulnerability gate is changed by recording these hashes.
+The report is written before export and again at the end, and is checksummed
+even on failure. Failed export, cleanup or parsing leaves `complete: false` with
+an explicit `collection_error` and a nonzero step. `complete: true` means the
+filesystem was fully read, not that the vulnerability gates passed. Observations
+of the scanned image do not prove production kernel, privilege or namespace
+controls, or exploit reachability.
 
 ## Release and dry-run
 
@@ -215,61 +139,41 @@ persisted in their checkout.
 
 ## Pins and maintenance
 
-Docker base tags remain Rust 1.94 Bookworm and Debian Bookworm slim, with
-multi-platform manifest SHA-256 pins resolved from Docker Hub. Dependabot's
-weekly `docker` updates maintain those digests alongside Cargo/Actions updates.
-The builder argument override was removed so a build arg cannot silently
-select an unpinned builder. Apt fetches signed current Bookworm certificate
-updates in the builder, not the runtime. Digest-pinned bases are not a promise
-of byte-for-byte repeatable apt results.
+The builder is `rust:1.94-trixie` and the runtime is
+`gcr.io/distroless/cc-debian13:nonroot`, both pinned by multi-platform index
+SHA-256. Both are Debian 13, so the binary links against the glibc it runs on.
+Dependabot's weekly `docker` updates follow both references. The distroless
+`nonroot` tag is unversioned: if no digest bump arrives after a Debian point
+release, refresh the pin by hand. There is no builder argument override, so a
+build arg cannot select an unpinned base.
 
-Bookworm's [`ca-certificates` package](https://packages.debian.org/bookworm/ca-certificates)
-depends on `openssl`. The runtime instead copies the updated certificate bundle,
-hashed certificate links, their Mozilla certificate targets and licensing from
-the pinned Bookworm builder. It does not copy OpenSSL executables/libraries or
-change the runtime base's package metadata. This avoids introducing certificate
-maintenance helpers into a rustls runtime; it does not assert that every package
-already in the base is fixed or unnecessary. CI must verify the final inventory,
-linkage and runtime smoke test before treating this as successful remediation.
-The smoke gate checks that the non-root runtime can read PEM certificate data;
-this is not an external TLS handshake or a proof of application input reachability.
-Operator-configured upload hooks can invoke external wrappers, so source-only
-absence of direct utility calls is not a blanket compatibility or CVE waiver.
+On 2026-10-02 the runtime moved off Bookworm under the CEO's TOG-11974 scope
+decision. Step A, `debian:trixie-slim` (13.7), still measured 48 HIGH rows over
+11 CVEs with no CISO disposition. Step B, the distroless image, measured 0
+HIGH/CRITICAL with Trivy v0.69.3. CI re-measures every head; that note is not a
+standing PASS.
 
-### Guarded removal of the non-Essential mount package
+The runtime contains 14 Debian packages (base-files, ca-certificates,
+gcc-14-base, libc6, libgcc-s1, libgomp1, libssl3t64, libstdc++6, libzstd1,
+media-types, netbase, tzdata, tzdata-legacy and zlib1g). It has no shell, apt,
+dpkg or OpenSSL command. Trust data is the base's own `ca-certificates` bundle
+at `/etc/ssl/certs/ca-certificates.crt`; nothing is installed or copied in
+except the release binary. The bot runs as uid/gid 65532 (`nonroot`) from
+`/home/nonroot/two-bot`, and the exec-form `HEALTHCHECK` calls the binary's own
+`--healthcheck`, so no shell is needed.
 
-The amd64 runtime build uses `scripts/purge-runtime-mount.sh` to remove only
-Bookworm's `mount` binary package through ordinary apt purge. The script requires
-the exact stock `2.38.1-5+deb12u3` amd64 non-Essential installed tuple, checks the
-package database, and requires a simulated plan containing exactly one `Purg mount`
-action and no other purge/remove/install/configure action. Automatic removal is
-explicitly disabled. Missing/duplicate inventory records or failed queries fail
-before removal. After purge, every dpkg record except mount must remain identical
-(version, architecture, Essential flag and status), and `apt-get check` must pass.
-There is no forced dependency/Essential removal, package-database rewriting, apt
-repository update, distribution mixing or ignore entry. Changed base tuples/plans
-fail the build rather than silently broadening the removal.
+The container smoke job reads the binary and trust bundle with `docker cp` from
+a never-started container and requires PEM data readable by any account. It
+requires non-zero real, effective, saved and filesystem uids for PID 1 (via
+`docker top`), and its only exec is the binary's `--healthcheck`. It checks only
+that the non-root runtime can read the certificate data; it does not perform an
+external TLS handshake. Incident triage has no in-image shell. Use `docker cp` or
+`docker export` from the runtime image, or a distroless `debug-nonroot` variant
+locally only; never deploy a debug variant. Operator-configured upload hooks
+that need shell utilities are not supported in this image.
 
-The successful full dependency observation from `51a6fac` lists mount as
-non-Essential and no direct installed Depends/Pre-Depends consumer of that package.
-Native apt's build-time simulation/checks, not that raw inventory observation alone,
-are the removal boundary. Essential util-linux still requires util-linux-extra and
-affected libraries; grep, Bash, coreutils and tar retain other affected dependencies.
-This removal does not fix those packages, waive source-family findings or make the
-image vulnerability gate green by itself. New-head CI must verify the build,
-post-purge inventories, payload observations, non-root startup/certificates,
-healthcheck and both vulnerability gates. Offline fake-tool tests are not native
-apt or image compatibility proof.
-
-The container image will no longer supply mount/umount command-line tools. The bot's
-fixed entrypoint/healthcheck do not invoke them; arbitrary operator upload wrappers
-are not covered by that statement and must not rely on those tools in this image.
-Host/systemd deployment packages are not changed. No production mount/privilege
-restriction, downstream image or injected utility guarantee is inferred.
-
-Distroless is a separate follow-up evaluation: assess TLS roots, non-root user,
-healthcheck executable, debug/incident workflow and binary compatibility before
-changing image family. This change deliberately keeps Bookworm.
+The Bookworm-only mount-package purge and the Trivy selector diagnostics
+retired with the Bookworm runtime.
 
 Offline regressions (no Cargo compile, Docker daemon or database access):
 
@@ -277,8 +181,6 @@ Offline regressions (no Cargo compile, Docker daemon or database access):
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-supply-chain.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-runtime-image-evidence.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-vulnerability-preflight.py
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-trivy-selector-probes.py
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-purge-runtime-mount.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_container_smoke.py
 python3 scripts/test-docker-deps.py
 python3 scripts/test-release-retry.py

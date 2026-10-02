@@ -1,12 +1,13 @@
 # two-bot-next: single always-on Cloudflare Container (ADR 0001).
 # Multi-stage: the builder needs the full Rust toolchain; the runtime image
-# carries only the static-ish release binary + CA certs (rustls uses
-# platform/webpki roots, no OpenSSL) and tini-style signal handling via
-# the exec form below (PID 1 receives the Container SIGTERM).
+# carries only the release binary on distroless/cc (glibc, libgcc, CA trust
+# data; no shell, package manager or OpenSSL CLI). rustls uses platform/webpki
+# roots, not OpenSSL. PID 1 receives the Container SIGTERM via the exec form.
 #
 # Multi-platform manifest digests keep tag names readable for Dependabot while
-# making the builder and runtime immutable (same Bookworm image family).
-FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
+# making both stages immutable. The builder and distroless runtime are both
+# Debian 13 (trixie), so the binary links against the same glibc it runs on.
+FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS builder
 
 WORKDIR /app
 
@@ -33,38 +34,21 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
 COPY . .
 RUN cargo build --release --locked
 
-# Bookworm certificate updates stay in the builder. The runtime needs trust
-# data, not ca-certificates' OpenSSL command/library dependency.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
-
-# Purge only the stock non-Essential mount package through apt. Refuse any
-# additional package action or metadata change; never force Essential removal.
-COPY --from=builder /app/scripts/purge-runtime-mount.sh /usr/local/libexec/purge-runtime-mount.sh
-RUN /bin/sh /usr/local/libexec/purge-runtime-mount.sh \
-    && rm /usr/local/libexec/purge-runtime-mount.sh
-
-# Keep the bundle and hashed certificate links/targets, without copying the
-# builder's OpenSSL binaries or libraries or their package records.
-COPY --from=builder /etc/ssl/certs/ /etc/ssl/certs/
-COPY --from=builder /usr/share/ca-certificates/ /usr/share/ca-certificates/
-COPY --from=builder /usr/share/doc/ca-certificates/copyright /usr/share/doc/ca-certificates/copyright
+# The runtime base already ships Debian trust data (ca-certificates) and the
+# nonroot account (uid/gid 65532, home /home/nonroot); nothing is installed.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2 AS runtime
 
 # Non-root user: the bot never needs container root.
-RUN useradd --create-home --shell /usr/sbin/nologin two-bot
-USER two-bot
-WORKDIR /home/two-bot
+USER 65532:65532
+WORKDIR /home/nonroot
 
-COPY --from=builder --chown=two-bot:two-bot /app/target/release/two-bot ./two-bot
+COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot
 
 # Liveness + readiness (also the DO keepalive targets, see wrangler/).
 EXPOSE 8080
 ENV LISTEN_ADDR=0.0.0.0:8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/home/two-bot/two-bot", "--healthcheck"]
+    CMD ["/home/nonroot/two-bot", "--healthcheck"]
 
-ENTRYPOINT ["/home/two-bot/two-bot"]
+ENTRYPOINT ["/home/nonroot/two-bot"]

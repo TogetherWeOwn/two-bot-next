@@ -1,12 +1,15 @@
-"""Offline contracts for bounded, non-deploying runtime image inspection."""
+"""Offline contracts for shell-free, non-deploying runtime image inspection."""
 
-import hashlib
+from datetime import datetime, timezone
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -15,446 +18,349 @@ ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("evidence", ROOT / "scripts/runtime-image-evidence.py")
 evidence = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(evidence)
+PREFLIGHT_SPEC = importlib.util.spec_from_file_location("preflight", ROOT / "scripts/vulnerability-preflight.py")
+preflight = importlib.util.module_from_spec(PREFLIGHT_SPEC)
+PREFLIGHT_SPEC.loader.exec_module(preflight)
 IMAGE_ID = "sha256:" + "a" * 64
 SOURCE_SHA = "b" * 40
 METADATA = [{"Id": IMAGE_ID, "Architecture": "amd64", "Os": "linux", "Config": {
-    "User": "two-bot", "Entrypoint": ["/home/two-bot/two-bot"],
+    "User": "65532:65532", "Entrypoint": ["/home/nonroot/two-bot"],
     "Env": ["SECRET=must-not-be-recorded"], "Cmd": None,
 }}]
+LIBS = "usr/lib/x86_64-linux-gnu"
+
+
+def scratch():
+    return tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP"))
+
+
+def elf(needed=("libgcc_s.so.1", "libc.so.6"), interpreter="/lib64/ld-linux-x86-64.so.2"):
+    """A minimal little-endian ELF64 with PT_INTERP, one PT_LOAD and PT_DYNAMIC."""
+    interp = interpreter.encode() + b"\0"
+    strtab, names = b"\0", []
+    for soname in needed:
+        names.append(len(strtab))
+        strtab += soname.encode() + b"\0"
+    interp_at = 64 + 3 * 56
+    strtab_at = interp_at + len(interp)
+    dynamic_at = strtab_at + len(strtab)
+    dynamic = b"".join(struct.pack("<qQ", 1, at) for at in names)
+    dynamic += struct.pack("<qQ", 5, strtab_at) + struct.pack("<qQ", 0, 0)
+    total = dynamic_at + len(dynamic)
+    header = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9)
+    header += struct.pack("<HHIQQQIHHHHHH", 3, 62, 1, 0, 64, 0, 0, 64, 56, 3, 0, 0, 0)
+    phdrs = struct.pack("<IIQQQQQQ", 3, 4, interp_at, interp_at, interp_at, len(interp), len(interp), 1)
+    phdrs += struct.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, total, total, 4096)
+    phdrs += struct.pack("<IIQQQQQQ", 2, 6, dynamic_at, dynamic_at, dynamic_at, len(dynamic), len(dynamic), 8)
+    return header + phdrs + interp + strtab + dynamic
+
+
+def control(package, version, arch="amd64", extra=""):
+    return f"Package: {package}\nVersion: {version}\nArchitecture: {arch}\n{extra}Description: fixture\n multi-line\n"
+
+
+class ImageFixture:
+    """The merged filesystem `docker export` streams for a distroless image."""
+
+    def __init__(self):
+        status = evidence.STATUS_DIR
+        self.entries = {
+            "lib": ("link", "usr/lib"), "lib64": ("link", "usr/lib64"), "bin": ("link", "usr/bin"),
+            "usr/lib64/ld-linux-x86-64.so.2": ("link", "../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+            f"{LIBS}/ld-linux-x86-64.so.2": ("file", b"ld"), f"{LIBS}/libc.so.6": ("file", b"libc"),
+            f"{LIBS}/libgcc_s.so.1": ("file", b"libgcc"),
+            "etc/ssl/certs/ca-certificates.crt": ("file", b"-----BEGIN CERTIFICATE-----\n"),
+            status + "libc6": ("file", control("libc6", "2.41-12+deb13u4").encode()),
+            status + "libc6.md5sums": ("file", (
+                "0" * 32 + f"  {LIBS}/libc.so.6\n" + "1" * 32 + f"  {LIBS}/ld-linux-x86-64.so.2\n").encode()),
+            status + "libgcc-s1": ("file", control("libgcc-s1", "14.2.0-19").encode()),
+            status + "libgcc-s1.md5sums": ("file", ("2" * 32 + f"  {LIBS}/libgcc_s.so.1\n").encode()),
+            status + "zlib1g": ("file", control("zlib1g", "1:1.3.dfsg+really1.3.1-1+b1").encode()),
+            status + "tzdata": ("file", control("tzdata", "2026c-0+deb13u1", "all").encode()),
+            evidence.BINARY: ("file", elf()),
+        }
+        self.modes = {}
+        self.pax = {}
+
+    def archive(self):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for directory in ("etc", "home", "home/nonroot", "usr", "usr/lib", LIBS, "usr/lib64", "var/lib/dpkg",
+                              evidence.STATUS_DIR.rstrip("/")):
+                info = tarfile.TarInfo(directory)
+                info.type, info.mode = tarfile.DIRTYPE, 0o755
+                tar.addfile(info)
+            for name, (kind, value) in self.entries.items():
+                info = tarfile.TarInfo(name)
+                info.mode = self.modes.get(name, 0o644)
+                info.pax_headers = self.pax.get(name, {})
+                if kind == "link":
+                    info.type, info.linkname = tarfile.SYMTYPE, value
+                    tar.addfile(info)
+                else:
+                    info.size = len(value)
+                    tar.addfile(info, io.BytesIO(value))
+        return buffer.getvalue()
+
+
+class FakeDocker:
+    def __init__(self, image):
+        self.image = image
+        self.calls = []
+        self.metadata = METADATA
+        self.create = (0, b"f" * 64 + b"\n", b"")
+        self.export = None
+        self.remove = (0, b"", b"")
+        self.timeouts = set()
+        self.missing_client = False
+
+    def __call__(self, *args, timeout=30):
+        self.calls.append(args)
+        if self.missing_client and args[0] != "image":
+            raise FileNotFoundError("docker")
+        if args[0] in self.timeouts:
+            raise subprocess.TimeoutExpired(["docker", *args], timeout, output=b"partial", stderr=b"\xffslow")
+        if args[:2] == ("image", "inspect"):
+            return subprocess.CompletedProcess(args, 0, json.dumps(self.metadata).encode(), b"")
+        code, stdout, stderr = {
+            "create": self.create, "rm": self.remove,
+            "export": self.export or (0, self.image.archive(), b""),
+        }[args[0]]
+        if args[0] == "rm" and isinstance(stderr, str):
+            stderr = stderr.replace("{name}", args[2]).encode()
+        return subprocess.CompletedProcess(args, code, stdout, stderr)
 
 
 class EvidenceTests(unittest.TestCase):
-    def fixture(self, directory):
-        (directory / "image-id.txt").write_text(IMAGE_ID + "\n")
-        (directory / "source-sha.txt").write_text(SOURCE_SHA + "\n")
+    def setUp(self):
+        self.image = ImageFixture()
+        self.docker = FakeDocker(self.image)
 
-    def test_identity_mismatch_stops_before_any_container_runs(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")) as temporary:
+    def collect(self):
+        with scratch() as temporary:
             directory = Path(temporary)
-            self.fixture(directory)
-            metadata = [{**METADATA[0], "Id": "sha256:" + "c" * 64}]
-            with patch.object(evidence, "docker", return_value=subprocess.CompletedProcess([], 0, json.dumps(metadata), "")) as docker:
-                with self.assertRaisesRegex(ValueError, "identity"):
-                    evidence.collect("two-bot:fixture", directory)
-                self.assertEqual(docker.call_count, 1)
+            (directory / "image-id.txt").write_text(IMAGE_ID + "\n")
+            (directory / "source-sha.txt").write_text(SOURCE_SHA + "\n")
+            with patch.object(evidence, "docker", self.docker):
+                report = evidence.collect("two-bot:fixture", directory)
+            self.assertEqual(json.loads((directory / "runtime-image-evidence.json").read_text()), report)
+            return report
+
+    def rejected(self, message):
+        report = self.collect()
+        self.assertIs(report["complete"], False)
+        self.assertNotIn("filesystem", report)
+        self.assertRegex(report["collection_error"], message)
+        self.assertEqual(self.docker.calls[-1][:2], ("rm", "--force"))
+        return report
+
+    def test_identity_mismatch_stops_before_any_container_is_created(self):
+        self.docker.metadata = [{**METADATA[0], "Id": "sha256:" + "c" * 64}]
+        with self.assertRaisesRegex(ValueError, "identity"):
+            self.collect()
+        self.assertEqual(len(self.docker.calls), 1)
 
     def test_invalid_provenance_stops_before_docker(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")) as temporary:
+        with scratch() as temporary:
             directory = Path(temporary)
-            self.fixture(directory)
+            (directory / "image-id.txt").write_text(IMAGE_ID + "\n")
             (directory / "source-sha.txt").write_text("unknown\n")
-            with patch.object(evidence, "docker") as docker:
-                with self.assertRaises(ValueError):
-                    evidence.collect("two-bot:fixture", directory)
-                docker.assert_not_called()
+            with patch.object(evidence, "docker") as docker, self.assertRaises(ValueError):
+                evidence.collect("two-bot:fixture", directory)
+            docker.assert_not_called()
 
-    def test_report_is_bound_to_image_and_does_not_include_environment(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")) as temporary:
-            directory = Path(temporary)
-            self.fixture(directory)
-            with patch.object(evidence, "docker", return_value=subprocess.CompletedProcess([], 0, json.dumps(METADATA), "")), \
-                    patch.object(evidence, "probe", return_value={"returncode": 2, "stdout": "", "stderr": "module missing", "timed_out": False, "cleanup": {"status": "removed"}}):
-                report = evidence.collect("two-bot:fixture", directory)
-            self.assertEqual(report["image_id"], IMAGE_ID)
-            self.assertEqual(report["source_sha"], SOURCE_SHA)
-            self.assertEqual(report["architecture"], "amd64")
-            self.assertEqual(report["configured_user"], "two-bot")
-            self.assertNotIn("SECRET", json.dumps(report))
-            self.assertNotIn("accepted", report)
-            self.assertEqual(report["probes"]["perl_archive_tar"]["returncode"], 2)
-            self.assertEqual(report["probes"]["perl_archive_tar"]["stderr"], "module missing")
+    def test_report_is_bound_to_image_and_records_status_d_inventory_without_environment(self):
+        report = self.collect()
+        self.assertIs(report["complete"], True)
+        self.assertNotIn("collection_error", report)
+        self.assertEqual((report["schema_version"], report["image_id"], report["source_sha"]), (2, IMAGE_ID, SOURCE_SHA))
+        self.assertEqual((report["architecture"], report["os"], report["configured_user"]), ("amd64", "linux", "65532:65532"))
+        self.assertNotIn("SECRET", json.dumps(report))
+        self.assertNotIn("accepted", json.dumps(report))
+        self.assertEqual([(row["package"], row["version"], row["architecture"], row["status"])
+                          for row in report["filesystem"]["installed_packages"]], [
+            ("libc6", "2.41-12+deb13u4", "amd64", None), ("libgcc-s1", "14.2.0-19", "amd64", None),
+            ("tzdata", "2026c-0+deb13u1", "all", None), ("zlib1g", "1:1.3.dfsg+really1.3.1-1+b1", "amd64", None)])
+        self.assertEqual(report["container"]["cleanup"]["status"], "removed")
+        self.assertEqual(report["container"]["export"]["stdout_bytes"], len(self.image.archive()))
 
-    def test_reported_pcre2_package_has_files_and_unfiltered_dependencies(self):
-        self.assertIn("libpcre2-8-0", evidence.PROBES["affected_package_files"].split())
-        command = evidence.PROBES["package_dependencies"]
-        for field in ["${binary:Package}", "${Version}", "${Architecture}",
-                      "${Essential}", "${Status}", "${Depends}", "${Pre-Depends}"]:
-            with self.subTest(field=field):
-                self.assertIn(field, command)
+    def test_preflight_consumes_the_collected_report_shape(self):
+        report = self.collect()
+        purl = "pkg:deb/debian/zlib1g@1.3.dfsg%2Breally1.3.1-1%2Bb1?arch=amd64&distro=debian-13.7&epoch=1"
+        version = "1:1.3.dfsg+really1.3.1-1+b1"
+        package = {"ID": "zlib1g@" + version, "Name": "zlib1g", "Arch": "amd64", "Identifier": {"PURL": purl}}
+        scan = {"SchemaVersion": 2, "Trivy": {"Version": "0.69.3"}, "ArtifactType": "container_image",
+                "Metadata": {"ImageID": IMAGE_ID, "OS": {"Family": "debian", "Name": "13.7"},
+                             "ImageConfig": {"architecture": "amd64", "os": "linux"}},
+                "Results": [{"Class": "os-pkgs", "Type": "debian", "Packages": [package], "Vulnerabilities": [
+                    {"VulnerabilityID": "CVE-2026-99999", "Severity": "HIGH", "PkgName": "zlib1g",
+                     "InstalledVersion": version, "PkgID": package["ID"], "PkgIdentifier": {"PURL": purl}}]}]}
+        bound = preflight.preflight(scan, report, SOURCE_SHA, IMAGE_ID, datetime.now(timezone.utc))
+        self.assertEqual([(row["package"], row["status"], row["suppressed"]) for row in bound["findings"]],
+                         [("zlib1g", "not-accepted", False)])
 
-    def test_dependency_query_covers_reverse_consumers_without_absent_package_operands(self):
-        scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
-        self.assertTrue(scratch, "Fake tools require run-owned scratch")
-        rows = (
-            "libpcre2-8-0:amd64\t10.42-1\tamd64\tno\tinstall ok installed\tlibc6\t\n"
-            "grep\t3.8-5\tamd64\tyes\tinstall ok installed\t\tlibc6, libpcre2-8-0\n"
-        )
-        for failed in (False, True):
-            with self.subTest(failed=failed), tempfile.TemporaryDirectory(dir=scratch) as temporary:
-                directory = Path(temporary)
-                executable = directory / "dpkg-query"
-                executable.write_text(
-                    f"#!{sys.executable}\n"
-                    "import sys\n"
-                    "assert sys.argv[1] == '-W' and sys.argv[2].startswith('-f=')\n"
-                    "if len(sys.argv) != 3:\n"
-                    "    print('fixture: explicitly requested openssl is not installed', file=sys.stderr)\n"
-                    "    sys.exit(1)\n"
-                    f"print({rows!r}, end='')\n"
-                    f"sys.exit({7 if failed else 0})\n"
-                )
-                executable.chmod(0o700)
-                result = subprocess.run(["/bin/sh", "-c", evidence.PROBES["package_dependencies"]],
-                                        env={"PATH": str(directory)}, capture_output=True, text=True)
-                self.assertEqual(result.returncode, 7 if failed else 0, result.stderr)
-                self.assertEqual(result.stdout, rows)
-                self.assertEqual(result.stderr, "")
+    def test_nothing_executes_inside_the_image(self):
+        self.collect()
+        name = self.docker.calls[1][self.docker.calls[1].index("--name") + 1]
+        self.assertTrue(name.startswith("two-bot-inspect-"))
+        self.assertEqual(self.docker.calls, [
+            ("image", "inspect", "two-bot:fixture"),
+            ("create", "--name", name, "--network", "none", "--no-healthcheck", IMAGE_ID),
+            ("export", name), ("rm", "--force", name)])
 
-    def test_mount_probe_records_package_source_and_resolved_payload_identity(self):
-        command = evidence.PROBES["mount_configuration"]
-        for field in ["${binary:Package}", "${Version}", "${Architecture}",
-                      "${source:Package}", "${source:Version}"]:
-            with self.subTest(field=field):
-                self.assertIn(field, command)
-        for path in ["/usr/bin/nsenter", "/usr/lib/x86_64-linux-gnu/libmount.so.1"]:
-            with self.subTest(path=path):
-                self.assertIn(path, command)
-        self.assertIn("readlink -e", command)
-        self.assertIn("sha256sum", command)
+    def test_binary_linkage_resolves_through_image_symlinks_to_owning_packages(self):
+        binary = self.collect()["filesystem"]["binary"]
+        self.assertEqual(binary["path"], "/home/nonroot/two-bot")
+        self.assertEqual(binary["size"], len(elf()))
+        self.assertEqual(binary["interpreter"], {"path": "/lib64/ld-linux-x86-64.so.2",
+                                                 "resolved": f"/{LIBS}/ld-linux-x86-64.so.2", "packages": ["libc6"]})
+        self.assertEqual(list(binary["needed"]), ["libgcc_s.so.1", "libc.so.6"])
+        self.assertEqual(binary["needed"]["libgcc_s.so.1"]["packages"], ["libgcc-s1"])
+        self.assertEqual(binary["needed"]["libc.so.6"]["resolved"], f"/{LIBS}/libc.so.6")
 
-    def test_payload_identity_shell_preserves_hashes_and_fails_on_missing_evidence(self):
-        scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
-        self.assertTrue(scratch, "Fake tools require run-owned scratch")
-        paths = ["/usr/bin/nsenter", "/usr/lib/x86_64-linux-gnu/libmount.so.1"]
-        failures = [(None, None), ("dpkg-query", None), ("sha256sum", None)]
-        failures += [("readlink", path) for path in paths]
-        for failed_tool, failed_path in failures:
-            with self.subTest(tool=failed_tool, path=failed_path), tempfile.TemporaryDirectory(dir=scratch) as temporary:
-                directory = Path(temporary)
-                payload = directory / "payload with spaces"
-                payload.write_bytes(b"offline payload fixture\n")
-                calls_path = directory / "calls.jsonl"
-                tool = (
-                    f"#!{sys.executable}\n"
-                    "import hashlib, json, sys\n"
-                    "from pathlib import Path\n"
-                    "name = Path(sys.argv[0]).name\n"
-                    f"with open({str(calls_path)!r}, 'a') as calls:\n"
-                    "    calls.write(json.dumps([name, *sys.argv[1:]]) + '\\n')\n"
-                    f"if name == {failed_tool!r} and ({failed_path!r} is None or sys.argv[-1] == {failed_path!r}):\n"
-                    "    print('fixture evidence unavailable', file=sys.stderr)\n"
-                    "    sys.exit(7)\n"
-                    "if name == 'dpkg-query':\n"
-                    "    print('bsdutils\\t1:2.38.1-5+deb12u3\\tamd64\\tutil-linux\\t2.38.1-5+deb12u3')\n"
-                    "elif name == 'readlink':\n"
-                    f"    assert sys.argv[1] == '-e' and sys.argv[2] in {paths!r}\n"
-                    f"    print({str(payload)!r})\n"
-                    "elif name == 'sha256sum':\n"
-                    f"    assert sys.argv[1:] == [{str(payload)!r}]\n"
-                    "    print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() + '  ' + sys.argv[1])\n"
-                )
-                for name in ["dpkg-query", "readlink", "sha256sum"]:
-                    executable = directory / name
-                    executable.write_text(tool)
-                    executable.chmod(0o700)
-                with patch.dict(os.environ, {"PATH": str(directory)}):
-                    result = subprocess.run(["/bin/sh", "-c", evidence.UTIL_LINUX_IDENTITY + "; printf 'later command\\n'"], capture_output=True, text=True)
-                calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
-                self.assertEqual(calls[0][:2], ["dpkg-query", "-W"])
-                self.assertEqual(len(calls[0]), 3, "Source query must not select a removed package")
-                if failed_tool:
-                    self.assertEqual(result.returncode, 7)
-                    self.assertIn("fixture evidence unavailable", result.stderr)
-                    self.assertNotIn("later command", result.stdout)
-                    self.assertEqual(calls[-1][0], failed_tool)
-                else:
-                    digest = hashlib.sha256(payload.read_bytes()).hexdigest()
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn("bsdutils\t1:2.38.1-5+deb12u3\tamd64\tutil-linux\t2.38.1-5+deb12u3", result.stdout)
-                    for path in paths:
-                        self.assertIn(f"resolved\t{path}\t{payload}\n", result.stdout)
-                    self.assertEqual(result.stdout.count(digest + "  " + str(payload)), 2)
-                    self.assertEqual(len(calls), 5)
+    def test_setid_capabilities_and_shell_tools_are_recorded_not_hidden(self):
+        self.image.entries["usr/bin/sh"] = ("file", b"#!")
+        self.image.entries["usr/bin/ping"] = ("file", b"ping")
+        self.image.modes["usr/bin/ping"] = 0o4755
+        self.image.pax["usr/bin/ping"] = {evidence.CAPABILITY: "\x01"}
+        filesystem = self.collect()["filesystem"]
+        self.assertEqual(filesystem["setid_files"], [{"path": "/usr/bin/ping", "mode": "0o4755", "uid": 0, "gid": 0}])
+        self.assertEqual(filesystem["file_capabilities"], ["/usr/bin/ping"])
+        self.assertEqual(filesystem["tools_present"], ["/bin/sh", "/usr/bin/sh"])
 
-    def test_fixed_probe_commands_parse_without_executing(self):
-        self.assertEqual(len(evidence.PROBES), 16)
-        for label, command in evidence.PROBES.items():
-            with self.subTest(probe=label):
-                result = subprocess.run(["sh", "-n", "-c", command], capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
+    def test_clean_distroless_layout_records_no_privileged_files_or_tools(self):
+        filesystem = self.collect()["filesystem"]
+        self.assertEqual((filesystem["setid_files"], filesystem["file_capabilities"], filesystem["tools_present"]), ([], [], []))
 
-    def test_probe_is_isolated_and_always_cleans_its_named_container(self):
-        calls = []
+    def test_explicit_installed_status_and_arch_qualified_file_names_are_accepted(self):
+        status = evidence.STATUS_DIR
+        self.image.entries[status + "libc6"] = ("file", control("libc6", "2.41-12+deb13u4", extra="Status: install ok installed\n").encode())
+        self.image.entries[status + "zlib1g:amd64"] = self.image.entries.pop(status + "zlib1g")
+        rows = self.collect()["filesystem"]["installed_packages"]
+        self.assertEqual(rows[0]["status"], "install ok installed")
+        self.assertEqual(rows[-1]["source_file"], "/" + status + "zlib1g:amd64")
 
-        def docker(*args, **kwargs):
-            calls.append((args, kwargs))
-            return subprocess.CompletedProcess(args, 0, "raw observation\n", "")
+    def test_status_d_inventory_fails_closed(self):
+        status = evidence.STATUS_DIR
+        good = control("libc6", "2.41-12+deb13u4")
+        cases = {
+            "not installed": ("file", control("libc6", "2.41", extra="Status: deinstall ok config-files\n").encode()),
+            "missing Package, Version or": ("file", b"Package: libc6\nArchitecture: amd64\n"),
+            "more than one paragraph": ("file", (good + "\n" + "Source: glibc\n").encode()),
+            "malformed or duplicate": ("file", (good + "Version: 2\n").encode()),
+            "continuation before": ("file", b" orphan\n" + good.encode()),
+            "not UTF-8": ("file", good.encode() + b"Maintainer: \xff\n"),
+            "not a regular": ("link", "libgcc-s1"),
+            "file name differs": ("file", control("libc-bin", "2.41").encode()),
+            "missing Package, Version": ("file", b"Package: libc6\nVersion: 2 41\nArchitecture: amd64\n"),
+        }
+        for message, entry in cases.items():
+            with self.subTest(message):
+                self.image.entries[status + "libc6"] = entry
+                self.rejected("unparseable: .*" + message)
+        self.image.entries[status + "libc6"] = ("file", good.encode())
+        self.image.entries[status + "libc6:amd64"] = ("file", good.encode())
+        self.rejected("duplicate package")
 
-        with patch.object(evidence, "docker", side_effect=docker):
-            result = evidence.probe(IMAGE_ID, "dpkg-query -W")
-        run = calls[0][0]
-        for flag in ["--read-only", "--no-healthcheck"]:
-            self.assertIn(flag, run)
-        for flag, value in [("--network", "none"), ("--cap-drop", "ALL"),
-                            ("--security-opt", "no-new-privileges"), ("--pids-limit", "32"),
-                            ("--memory", "128m"), ("--memory-swap", "128m"), ("--cpus", "0.5"),
-                            ("--entrypoint", "/bin/sh")]:
-            self.assertEqual(run[run.index(flag) + 1], value)
-        self.assertEqual(run[-3:], (IMAGE_ID, "-c", "dpkg-query -W"))
-        for forbidden in ["--publish", "--volume", "--mount", "--env", "--privileged"]:
-            self.assertNotIn(forbidden, run)
-        name = run[run.index("--name") + 1]
-        self.assertEqual(calls[-1][0], ("rm", "--force", name))
-        self.assertEqual(result["container_name"], name)
-        self.assertEqual(calls[0][1]["timeout"], 20)
-        self.assertEqual(result["stdout"], "raw observation\n")
+    def test_missing_or_classic_package_databases_fail_closed(self):
+        self.image.entries = {name: entry for name, entry in self.image.entries.items()
+                              if not name.startswith(evidence.STATUS_DIR) or name.endswith(".md5sums")}
+        self.rejected("Empty status.d package inventory")
+        self.image = ImageFixture()
+        self.docker = FakeDocker(self.image)
+        self.image.entries["var/lib/dpkg/status"] = ("file", control("libc6", "2.41").encode())
+        self.rejected("dpkg status database present")
 
-    def test_timeout_is_explicit_and_still_cleans_container(self):
-        with patch.object(evidence, "docker", side_effect=[subprocess.TimeoutExpired("docker", 20), subprocess.CompletedProcess([], 0, "", "")]) as docker:
-            result = evidence.probe(IMAGE_ID, "sleep 1000")
-        self.assertTrue(result["timed_out"])
-        self.assertIsNone(result["returncode"])
-        self.assertEqual(docker.call_args.args[:2], ("rm", "--force"))
+    def test_binary_and_linkage_fail_closed(self):
+        cases = [("is not a regular file", lambda entries: entries.pop(evidence.BINARY)),
+                 ("not a little-endian ELF64", lambda entries: entries.update({evidence.BINARY: ("file", b"#!/bin/sh\n")})),
+                 ("DT_NEEDED libssl.so.3 does not resolve", lambda entries: entries.update(
+                     {evidence.BINARY: ("file", elf(("libssl.so.3", "libc.so.6")))})),
+                 ("interpreter /lib/ld.so does not resolve", lambda entries: entries.update(
+                     {evidence.BINARY: ("file", elf(interpreter="/lib/ld.so"))})),
+                 ("Symlink loop", lambda entries: entries.update(
+                     {"lib64": ("link", "lib64x"), "lib64x": ("link", "lib64")}))]
+        for message, mutate in cases:
+            with self.subTest(message):
+                self.image = ImageFixture()
+                self.docker = FakeDocker(self.image)
+                mutate(self.image.entries)
+                self.rejected(message)
 
-    def test_cleanup_failure_is_not_hidden(self):
-        with patch.object(evidence, "docker", side_effect=[subprocess.CompletedProcess([], 0, "observation", ""), subprocess.CompletedProcess([], 1, "", "cleanup refused")]):
-            result = evidence.probe(IMAGE_ID, "true")
-        self.assertEqual(result["stdout"], "observation")
-        self.assertEqual(result["cleanup"]["status"], "failed")
-        self.assertEqual(result["cleanup"]["stderr"], "cleanup refused")
+    def test_non_tar_or_duplicate_export_fails_closed(self):
+        self.docker.export = (0, b"not a tar archive" * 64, b"")
+        self.rejected("unparseable")
+        duplicate = io.BytesIO()
+        with tarfile.open(fileobj=duplicate, mode="w") as tar:
+            for _ in range(2):
+                tar.addfile(tarfile.TarInfo("etc/passwd"), io.BytesIO(b""))
+        self.docker.export = (0, duplicate.getvalue(), b"")
+        self.rejected("duplicate archive entry")
 
-    def test_precreation_failure_keeps_startup_error_and_confirms_absence(self):
-        def docker(*args, **kwargs):
-            if args[0] == "run":
-                return subprocess.CompletedProcess(args, 125, "", "OCI runtime create failed before container creation")
-            return subprocess.CompletedProcess(args, 1, "", f"Error response from daemon: No such container: {args[-1]}\n")
+    def test_elf_parser_reports_interpreter_and_needed_in_order(self):
+        self.assertEqual(evidence.elf_linkage(elf(("a.so", "b.so"))), ("/lib64/ld-linux-x86-64.so.2", ["a.so", "b.so"]))
+        static = elf(())
+        self.assertEqual(evidence.elf_linkage(static)[1], [])
+        for data in (b"", b"\x7fELF\x01\x01", b"\x7fELF\x02\x02"):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                evidence.elf_linkage(data + bytes(64))
 
-        with patch.object(evidence, "docker", side_effect=docker):
-            result = evidence.probe(IMAGE_ID, "true")
-        self.assertEqual(result["returncode"], 125)
-        self.assertIn("OCI runtime", result["stderr"])
-        self.assertEqual(result["cleanup"]["status"], "absent")
+    def test_create_failure_skips_export_and_accepts_only_exact_absence(self):
+        self.docker.create = (1, b"", b"Error: No such image")
+        self.docker.remove = (1, b"", "Error response from daemon: No such container: {name}\n")
+        report = self.rejected("export failed")
+        self.assertEqual([call[0] for call in self.docker.calls], ["image", "create", "rm"])
+        self.assertIsNone(report["container"]["export"])
+        self.assertEqual(report["container"]["create"]["stderr"], "Error: No such image")
+        self.assertEqual(report["container"]["cleanup"]["status"], "absent")
+        self.docker.remove = (1, b"", b"Error response from daemon: No such container: two-bot-inspect-other\n")
+        self.assertEqual(self.rejected("cleanup failed")["container"]["cleanup"]["status"], "failed")
 
-    def test_unrelated_missing_container_message_is_not_accepted(self):
-        with patch.object(evidence, "docker", side_effect=[
-            subprocess.CompletedProcess([], 125, "", "startup failed"),
-            subprocess.CompletedProcess([], 1, "", "Error response from daemon: No such container: someone-elses-container"),
-        ]):
-            result = evidence.probe(IMAGE_ID, "true")
-        self.assertEqual(result["cleanup"]["status"], "failed")
+    def test_export_failure_or_timeout_still_removes_the_named_container(self):
+        self.docker.export = (1, b"", b"Error response from daemon: export refused")
+        report = self.rejected("export failed")
+        self.assertEqual(report["container"]["export"]["stderr"], "Error response from daemon: export refused")
+        self.docker.export = (0, b"", b"")
+        self.rejected("export failed")
+        self.docker.export = None
+        self.docker.timeouts = {"export"}
+        report = self.rejected("export failed")
+        export = report["container"]["export"]
+        self.assertIs(export["timed_out"], True)
+        self.assertEqual(export["lossy_decoding"], ["stderr"])
+        self.assertEqual(export["stdout_bytes"], len(b"partial"))
+        self.assertIn("exceeded 120 seconds", export["stderr"])
 
-    def test_client_and_cleanup_timeouts_preserve_partial_output(self):
-        with patch.object(evidence, "docker", side_effect=[
-            subprocess.TimeoutExpired("docker", 20, output=b"partial observation", stderr=b"partial error"),
-            subprocess.TimeoutExpired("docker rm", 30),
-        ]):
-            result = evidence.probe(IMAGE_ID, "true")
-        self.assertEqual(result["stdout"], "partial observation")
-        self.assertIn("partial error", result["stderr"])
-        self.assertTrue(result["timed_out"])
-        self.assertEqual(result["cleanup"]["status"], "failed")
-        self.assertTrue(result["cleanup"]["timed_out"])
+    def test_cleanup_failure_or_timeout_is_not_hidden_even_after_a_good_export(self):
+        for remove, timeouts in (((1, b"", b"Error response from daemon: removal refused"), set()), (None, {"rm"})):
+            with self.subTest(timeouts=timeouts):
+                self.docker = FakeDocker(self.image)
+                if remove:
+                    self.docker.remove = remove
+                self.docker.timeouts = timeouts
+                report = self.rejected("cleanup failed")
+                cleanup = report["container"]["cleanup"]
+                self.assertEqual(cleanup["status"], "failed")
+                self.assertTrue(report["container"]["name"].startswith("two-bot-inspect-"))
 
     def test_missing_docker_client_is_explicit_and_cleanup_is_attempted(self):
-        with patch.object(evidence, "docker", side_effect=FileNotFoundError("docker unavailable")) as docker:
-            result = evidence.probe(IMAGE_ID, "true")
-        self.assertEqual(docker.call_count, 2)
-        self.assertIsNone(result["returncode"])
-        self.assertIn("docker unavailable", result["stderr"])
-        self.assertEqual(result["cleanup"]["status"], "failed")
+        self.docker.missing_client = True
+        report = self.rejected("cleanup failed")
+        self.assertIsNone(report["container"]["create"]["returncode"])
+        self.assertIn("docker", report["container"]["create"]["stderr"])
+        self.assertIsNone(report["container"]["export"])
 
-    def test_success_then_precreation_failure_retains_all_observations(self):
-        calls = []
-
-        def docker(*args, **kwargs):
-            if args[:2] == ("image", "inspect"):
-                return subprocess.CompletedProcess(args, 0, json.dumps(METADATA), "")
-            if args[0] == "run":
-                calls.append(args)
-                code = 125 if len(calls) == 2 else 0
-                return subprocess.CompletedProcess(args, code, "first observation" if len(calls) == 1 else "", "startup failed" if code else "")
-            if len(calls) >= 2 and args[-1] == calls[1][calls[1].index("--name") + 1]:
-                return subprocess.CompletedProcess(args, 1, "", f"Error response from daemon: No such container: {args[-1]}\n")
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")) as temporary:
+    def test_main_fails_after_writing_the_incomplete_report(self):
+        self.docker.export = (1, b"", b"refused")
+        with scratch() as temporary:
             directory = Path(temporary)
-            self.fixture(directory)
-            with patch.object(evidence, "docker", side_effect=docker), patch.object(sys, "argv", ["evidence", "two-bot:fixture", str(directory)]):
+            (directory / "image-id.txt").write_text(IMAGE_ID + "\n")
+            (directory / "source-sha.txt").write_text(SOURCE_SHA + "\n")
+            with patch.object(evidence, "docker", self.docker), \
+                    patch.object(sys, "argv", ["runtime-image-evidence.py", "two-bot:fixture", str(directory)]), \
+                    self.assertRaisesRegex(SystemExit, "export failed"):
                 evidence.main()
-            report = json.loads((directory / "runtime-image-evidence.json").read_text())
-        self.assertEqual(report["probes"]["installed_packages"]["stdout"], "first observation")
-        self.assertEqual(report["probes"]["affected_package_files"]["returncode"], 125)
-        self.assertEqual(report["probes"]["affected_package_files"]["cleanup"]["status"], "absent")
-        self.assertEqual(len(report["probes"]), 16)
-        self.assertTrue(report["complete"])
-
-    def test_cleanup_refusal_saves_partial_report_then_fails_and_stops(self):
-        responses = [subprocess.CompletedProcess([], 0, json.dumps(METADATA), ""),
-                     subprocess.CompletedProcess([], 0, "first observation", ""),
-                     subprocess.CompletedProcess([], 0, "", ""),
-                     subprocess.CompletedProcess([], 125, "", "startup failed"),
-                     subprocess.CompletedProcess([], 1, "", "cleanup refused")]
-        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")) as temporary:
-            directory = Path(temporary)
-            self.fixture(directory)
-            with patch.object(evidence, "docker", side_effect=responses) as docker, patch.object(sys, "argv", ["evidence", "two-bot:fixture", str(directory)]):
-                with self.assertRaisesRegex(SystemExit, "cleanup"):
-                    evidence.main()
-            report = json.loads((directory / "runtime-image-evidence.json").read_text())
-        self.assertEqual(docker.call_count, 5)
-        self.assertFalse(report["complete"])
-        self.assertEqual(len(report["probes"]), 2)
-        self.assertEqual(report["probes"]["installed_packages"]["stdout"], "first observation")
-        self.assertEqual(report["probes"]["affected_package_files"]["stderr"], "startup failed")
-        self.assertEqual(report["probes"]["affected_package_files"]["cleanup"]["stderr"], "cleanup refused")
-
-    def test_cleanup_timeout_and_transport_failures_persist_exact_owned_name(self):
-        for failure in [subprocess.TimeoutExpired("docker rm", 30),
-                        OSError("daemon transport unavailable"),
-                        subprocess.CompletedProcess([], 1, "", "Cannot connect to the Docker daemon")]:
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")) as temporary:
-                directory = Path(temporary)
-                self.fixture(directory)
-                responses = [subprocess.CompletedProcess([], 0, json.dumps(METADATA), ""),
-                             subprocess.CompletedProcess([], 0, "first observation", ""),
-                             subprocess.CompletedProcess([], 0, "", ""),
-                             subprocess.CompletedProcess([], 0, "second observation", ""),
-                             failure]
-                with patch.object(evidence, "docker", side_effect=responses) as docker, patch.object(sys, "argv", ["evidence", "two-bot:fixture", str(directory)]):
-                    with self.assertRaisesRegex(SystemExit, "cleanup"):
-                        evidence.main()
-                report = json.loads((directory / "runtime-image-evidence.json").read_text())
-                run = docker.call_args_list[3].args
-                name = run[run.index("--name") + 1]
-                self.assertRegex(name, r"^two-bot-inspect-[0-9a-f]{32}$")
-                self.assertEqual(docker.call_args_list[4].args, ("rm", "--force", name))
-                result = report["probes"]["affected_package_files"]
-                self.assertEqual(result["container_name"], name)
-                self.assertEqual(result["stdout"], "second observation")
-                self.assertEqual(result["cleanup"]["status"], "failed")
-                self.assertEqual(result["cleanup"]["timed_out"], isinstance(failure, subprocess.TimeoutExpired))
-                self.assertTrue(result["cleanup"]["stderr"])
-                self.assertEqual(report["probes"]["installed_packages"]["stdout"], "first observation")
-                self.assertNotEqual(report["probes"]["installed_packages"]["container_name"], name)
-                self.assertEqual(report["source_sha"], SOURCE_SHA)
-                self.assertEqual(report["image_id"], IMAGE_ID)
-                self.assertFalse(report["complete"])
-                self.assertEqual(docker.call_count, 5)
-
-    def test_non_utf8_subprocess_output_retains_probe_and_failed_cleanup(self):
-        scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
-        self.assertTrue(scratch, "Fake Docker requires PAPERCLIP_RUN_SCRATCH_DIR or RUNNER_TEMP")
-        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
-            directory = Path(temporary)
-            self.fixture(directory)
-            executable = directory / "docker"
-            calls_path = directory / "calls.jsonl"
-            executable.write_text(
-                f"#!{sys.executable}\n"
-                "import json, sys\n"
-                f"with open({str(calls_path)!r}, 'a') as calls:\n"
-                "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                "if sys.argv[1:3] == ['image', 'inspect']:\n"
-                f"    print({json.dumps(METADATA)!r})\n"
-                "elif sys.argv[1] == 'run':\n"
-                f"    if sys.argv[-1] == {evidence.PROBES['affected_files']!r}:\n"
-                "        sys.stdout.buffer.write(b'/tmp/minizip-\\xff\\n')\n"
-                "        sys.stderr.buffer.write(b'find warning: \\xfe\\n')\n"
-                "        sys.exit(2)\n"
-                "    sys.stdout.buffer.write(b'prior observation: \\xef\\xbf\\xbd\\n')\n"
-                "elif sys.argv[1] == 'rm':\n"
-                f"    calls = [json.loads(line) for line in open({str(calls_path)!r})]\n"
-                "    if sum(call[0] == 'run' for call in calls) == 5:\n"
-                "        sys.stdout.buffer.write(b'cleanup partial: \\xff\\n')\n"
-                "        sys.stderr.buffer.write(b'cleanup refused: \\xfe\\n')\n"
-                "        sys.exit(1)\n"
-            )
-            executable.chmod(0o700)
-            # Restrict PATH to the fake executable: never reach a real daemon.
-            with patch.dict(os.environ, {"PATH": str(directory)}), patch.object(sys, "argv", ["evidence", "two-bot:fixture", str(directory)]):
-                with self.assertRaisesRegex(SystemExit, "cleanup"):
-                    evidence.main()
-            report = json.loads((directory / "runtime-image-evidence.json").read_text())
-            calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
-        self.assertEqual(len(calls), 11)
-        self.assertEqual(len(report["probes"]), 5)
-        self.assertFalse(report["complete"])
-        self.assertIn("cleanup", report["collection_error"])
-        for key in list(evidence.PROBES)[:4]:
-            prior = report["probes"][key]
-            self.assertEqual(prior["returncode"], 0)
-            self.assertEqual(prior["stdout"], "prior observation: \ufffd\n")
-            self.assertEqual(prior["lossy_decoding"], [])
-            self.assertFalse(prior["timed_out"])
-            self.assertEqual(prior["cleanup"]["status"], "removed")
-            self.assertEqual(prior["cleanup"]["lossy_decoding"], [])
-        result = report["probes"]["affected_files"]
-        run = calls[-2]
-        name = run[run.index("--name") + 1]
-        self.assertRegex(name, r"^two-bot-inspect-[0-9a-f]{32}$")
-        self.assertEqual(calls[-1], ["rm", "--force", name])
-        self.assertEqual(result["container_name"], name)
-        self.assertNotIn(name, [report["probes"][key]["container_name"] for key in list(evidence.PROBES)[:4]])
-        self.assertEqual(result["command"], evidence.PROBES["affected_files"])
-        self.assertEqual(result["returncode"], 2)
-        self.assertEqual(result["stdout"], "/tmp/minizip-\ufffd\n")
-        self.assertEqual(result["stderr"], "find warning: \ufffd\n")
-        self.assertEqual(result["lossy_decoding"], ["stdout", "stderr"])
-        self.assertFalse(result["timed_out"])
-        cleanup = result["cleanup"]
-        self.assertEqual(cleanup["status"], "failed")
-        self.assertEqual(cleanup["returncode"], 1)
-        self.assertEqual(cleanup["stdout"], "cleanup partial: \ufffd\n")
-        self.assertEqual(cleanup["stderr"], "cleanup refused: \ufffd\n")
-        self.assertEqual(cleanup["lossy_decoding"], ["stdout", "stderr"])
-        self.assertFalse(cleanup["timed_out"])
-        self.assertEqual(report["source_sha"], SOURCE_SHA)
-        self.assertEqual(report["image_id"], IMAGE_ID)
-
-    def test_decoding_loss_marks_only_invalid_utf8_streams(self):
-        for stdout, stderr, lossy in [
-            (b"valid \xef\xbf\xbd\r\n", b"valid \xef\xbf\xbd\n", []),
-            (b"invalid \xff\n", b"valid \xef\xbf\xbd\n", ["stdout"]),
-            (b"valid \xef\xbf\xbd\n", b"incomplete \xe2\x82", ["stderr"]),
-        ]:
-            for timed_out in [False, True]:
-                with self.subTest(lossy=lossy, timed_out=timed_out):
-                    response = subprocess.TimeoutExpired("docker", 20, output=stdout, stderr=stderr) if timed_out else subprocess.CompletedProcess([], 2, stdout, stderr)
-                    with patch.object(evidence, "docker", side_effect=[response]):
-                        result = evidence.observation("run", timeout=20)
-                    self.assertEqual(result["stdout"], stdout.decode("utf-8", errors="replace"))
-                    suffix = "\nDocker command exceeded 20 seconds" if timed_out else ""
-                    self.assertEqual(result["stderr"], stderr.decode("utf-8", errors="replace") + suffix)
-                    self.assertEqual(result["lossy_decoding"], lossy)
-                    self.assertEqual(result["returncode"], None if timed_out else 2)
-                    self.assertEqual(result["timed_out"], timed_out)
-                    self.assertEqual(json.loads(json.dumps(result)), result)
-
-    def test_lossy_timeout_output_persists_owned_name_and_cleanup_failure(self):
-        responses = [subprocess.CompletedProcess([], 0, json.dumps(METADATA), ""),
-                     subprocess.CompletedProcess([], 0, b"first observation", b""),
-                     subprocess.CompletedProcess([], 0, b"", b""),
-                     subprocess.TimeoutExpired("docker", 20, output=b"partial \xe2\x82", stderr=b"valid \xef\xbf\xbd"),
-                     subprocess.TimeoutExpired("docker rm", 30, output=b"valid \xef\xbf\xbd", stderr=b"cleanup \xff")]
-        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")) as temporary:
-            directory = Path(temporary)
-            self.fixture(directory)
-            with patch.object(evidence, "docker", side_effect=responses) as docker, patch.object(sys, "argv", ["evidence", "two-bot:fixture", str(directory)]):
-                with self.assertRaisesRegex(SystemExit, "cleanup"):
-                    evidence.main()
-            report = json.loads((directory / "runtime-image-evidence.json").read_text())
-        result = report["probes"]["affected_package_files"]
-        run = docker.call_args_list[3].args
-        name = run[run.index("--name") + 1]
-        self.assertEqual(result["container_name"], name)
-        self.assertEqual(docker.call_args_list[4].args, ("rm", "--force", name))
-        self.assertIsNone(result["returncode"])
-        self.assertTrue(result["timed_out"])
-        self.assertEqual(result["stdout"], "partial �")
-        self.assertEqual(result["stderr"], "valid �\nDocker command exceeded 20 seconds")
-        self.assertEqual(result["lossy_decoding"], ["stdout"])
-        cleanup = result["cleanup"]
-        self.assertEqual(cleanup["status"], "failed")
-        self.assertIsNone(cleanup["returncode"])
-        self.assertTrue(cleanup["timed_out"])
-        self.assertEqual(cleanup["stdout"], "valid �")
-        self.assertEqual(cleanup["stderr"], "cleanup �\nDocker command exceeded 30 seconds")
-        self.assertEqual(cleanup["lossy_decoding"], ["stderr"])
-        self.assertEqual(report["probes"]["installed_packages"]["stdout"], "first observation")
-        self.assertEqual(len(report["probes"]), 2)
-        self.assertFalse(report["complete"])
-        self.assertEqual(docker.call_count, 5)
+            self.assertIs(json.loads((directory / "runtime-image-evidence.json").read_text())["complete"], False)
 
     def test_ci_retains_evidence_after_failed_gates_without_changing_gates(self):
         workflow = (ROOT / ".github/workflows/supply-chain.yml").read_text()
@@ -464,7 +370,6 @@ class EvidenceTests(unittest.TestCase):
         self.assertLess(diagnostic, workflow.index("name: Retain SBOMs"))
         step = workflow[diagnostic:workflow.index("name: Retain SBOMs")]
         self.assertIn("!cancelled() && steps.inventory.outcome == 'success'", step)
-        self.assertIn('python3 scripts/runtime-image-evidence.py "$IMAGE" sbom', step)
         self.assertIn('python3 scripts/runtime-image-evidence.py "$IMAGE" sbom || status=$?', step)
         self.assertIn("sha256sum runtime-image-evidence.json", step)
         self.assertLess(step.index("sha256sum runtime-image-evidence.json"), step.index('exit "$status"'))

@@ -2,10 +2,12 @@
 
 import argparse
 import http.client
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import tarfile
 import time
 from urllib.parse import urlsplit
 import uuid
@@ -15,7 +17,9 @@ IMAGE_MAX_BYTES = 112 * MIB
 # Raised from 10 MiB: the durable store runtime plus the ticket runtime from main
 # measured 10.01 MiB under opt-level z/LTO/strip; image budget unchanged.
 BINARY_MAX_BYTES = 11 * MIB
-BINARY = "/home/two-bot/two-bot"
+# The distroless runtime has no shell, coreutils or grep: file checks read
+# docker cp archives from a never-started container instead of exec helpers.
+BINARY = "/home/nonroot/two-bot"
 CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 
@@ -24,10 +28,32 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def docker(*args, timeout=30, check=True):
+def docker(*args, timeout=30, check=True, text=True):
     return subprocess.run(
-        ["docker", *args], capture_output=True, text=True, timeout=timeout, check=check
+        ["docker", *args], capture_output=True, text=text, timeout=timeout, check=check
     )
+
+
+def image_file(container, path):
+    """Return (tar header, bytes) for one regular file, following symlinks."""
+    archive = docker("cp", "--follow-link", f"{container}:{path}", "-", timeout=60, text=False).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+        members = tar.getmembers()
+        require(len(members) == 1 and members[0].isreg(), f"{path} must be one regular file")
+        return members[0], tar.extractfile(members[0]).read()
+
+
+def pid1_uids(name):
+    """Real, effective, saved and filesystem uid of the container's PID 1."""
+    pid = json.loads(docker("inspect", name).stdout)[0]["State"]["Pid"]
+    require(isinstance(pid, int) and pid > 0, "container PID 1 has no host process")
+    # `docker top` runs ps beside the daemon and keeps only this container's
+    # processes; select PID 1 by its host PID rather than by row order.
+    table = docker("top", name, "-o", "pid,ruid,euid,suid,fsuid").stdout.split("\n")
+    require(table[0].split() == ["PID", "RUID", "EUID", "SUID", "FSUID"], "unexpected docker top header")
+    rows = [line.split() for line in table[1:] if line.split()[:1] == [str(pid)]]
+    require(len(rows) == 1 and len(rows[0]) == 5, "docker top did not report PID 1")
+    return [int(value) for value in rows[0][1:]]
 
 
 def report(message):
@@ -68,15 +94,14 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     # blobs; the layer sum equals the classic overlay2 Size on both stores.
     history = docker("history", "--no-trunc", "--human=false", "--format", "{{.Size}}", image).stdout
     image_bytes = sum(int(line) for line in history.split())
-    # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
-    # orphan behind; same memory cap as the main run.
+    # Created, never started, and named (not unnamed) so a timed-out Docker
+    # client cannot leave an orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex
     try:
-        binary_bytes = int(docker(
-            "run", "--name", measure, "--memory", "256m",
-            "--network", "none", "--entrypoint", "stat", image,
-            "-c", "%s", BINARY,
-        ).stdout)
+        docker("create", "--name", measure, "--memory", "256m", "--network", "none", image)
+        binary, _ = image_file(measure, BINARY)
+        binary_bytes = binary.size
+        bundle_header, bundle = image_file(measure, CA_BUNDLE)
     finally:
         docker("rm", "--force", measure, check=False)
     for label, size, limit in (
@@ -90,6 +115,15 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     require(config.get("User") not in (None, "", "root", "0", "0:0"), "image must specify a non-root user")
     require(config.get("Healthcheck", {}).get("Test") == ["CMD", BINARY, "--healthcheck"],
             "image HEALTHCHECK must invoke the runtime's --healthcheck")
+    # Any account (including the configured non-root user) must be able to
+    # read the trust bundle; no network or OpenSSL helper is needed to verify
+    # that certificate data is present in the runtime image.
+    pem = bundle.decode("utf-8", errors="replace")
+    require("-----BEGIN CERTIFICATE-----" in pem and "-----END CERTIFICATE-----" in pem,
+            "runtime CA bundle must contain PEM certificates")
+    require("-----BEGIN CERTIFICATE-----" in pem.splitlines() and bundle_header.mode & 0o004,
+            "runtime trust bundle must contain PEM certificates readable by the runtime user")
+    report("PASS runtime trust bundle contains readable PEM certificate data")
 
     # Docker does not inherit host environment without -e. No secrets or DB
     # are supplied, and no deployment/registry access is needed by this test.
@@ -103,10 +137,6 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         port = docker("port", name, "8080/tcp").stdout.strip()
         require(port.startswith("127.0.0.1:"), f"unexpected published port: {port}")
         url = "http://" + port
-        bundle = docker("exec", name, "cat", CA_BUNDLE).stdout
-        require("-----BEGIN CERTIFICATE-----" in bundle and
-                "-----END CERTIFICATE-----" in bundle,
-                "runtime CA bundle must contain PEM certificates")
         deadline = time.monotonic() + 30
         while True:
             code, body = http_response(url + "/health")
@@ -135,16 +165,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                 "community_scorecard", "inactivity",
             )
         }, "/readyz body must report all six jobs parked, non-running, never started")
-        # Read as the configured runtime user; no network or OpenSSL helper is
-        # needed to verify that certificate data survived the stage boundary.
-        require(docker("exec", name, "grep", "-q", "^-----BEGIN CERTIFICATE-----$", CA_BUNDLE,
-                       timeout=5, check=False).returncode == 0,
-                "runtime trust bundle must contain PEM certificates")
-        report("PASS runtime trust bundle contains readable PEM certificate data")
         # Check PID 1, not merely Docker's configured user or an exec helper.
-        status = docker("exec", name, "cat", "/proc/1/status").stdout
-        uid = next(line.split()[1:] for line in status.splitlines() if line.startswith("Uid:"))
-        require(len(uid) == 4 and all(int(value) != 0 for value in uid), "runtime PID 1 is root")
+        uid = pid1_uids(name)
+        require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")
         require(docker("exec", name, BINARY, "--healthcheck", timeout=5, check=False).returncode == 0,
                 "--healthcheck must exit 0 against the live process")
         while True:

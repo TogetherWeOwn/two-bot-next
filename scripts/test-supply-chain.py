@@ -163,33 +163,32 @@ class SupplyChainTests(unittest.TestCase):
         self.assertEqual(len(images), 2)
         for image in images:
             self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
-        self.assertTrue(images[0].startswith("rust:1.94-bookworm@"))
-        self.assertTrue(images[1].startswith("debian:bookworm-slim@"))
+        self.assertTrue(images[0].startswith("rust:1.94-trixie@"))
+        self.assertTrue(images[1].startswith("gcr.io/distroless/cc-debian13:nonroot@"))
         self.assertIn("package-ecosystem: docker", (ROOT / ".github/dependabot.yml").read_text())
 
-    def test_runtime_copies_trust_store_without_installing_openssl_helpers(self):
-        dockerfile = (ROOT / "Dockerfile").read_text()
-        builder, runtime = dockerfile.split(" AS runtime", 1)
-        self.assertIn("apt-get install -y --no-install-recommends ca-certificates", builder)
-        self.assertNotIn("apt-get", runtime)
-        for path in ["/etc/ssl/certs", "/usr/share/ca-certificates"]:
-            self.assertIn(f"COPY --from=builder {path}/ {path}/", runtime)
-        self.assertIn("COPY --from=builder /usr/share/doc/ca-certificates/copyright", runtime)
-        self.assertNotIn("--force-depends", dockerfile)
-        self.assertNotIn("/var/lib/dpkg", dockerfile)
-
-    def test_mount_purge_is_build_only_guarded_and_keeps_real_scan_gates(self):
+    def test_distroless_runtime_installs_nothing_and_runs_as_nonroot(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         runtime = dockerfile.split(" AS runtime", 1)[1]
-        self.assertIn("COPY --from=builder /app/scripts/purge-runtime-mount.sh", runtime)
-        purge = runtime.index("RUN /bin/sh /usr/local/libexec/purge-runtime-mount.sh")
-        self.assertLess(purge, runtime.index("RUN useradd"))
-        self.assertLess(purge, runtime.index("USER two-bot"))
-        self.assertIn("&& rm /usr/local/libexec/purge-runtime-mount.sh", runtime)
+        # No shell exists in the runtime base: no RUN, package manager or
+        # purge step may appear, and trust data comes from the base itself.
+        self.assertNotRegex(runtime, r"(?m)^RUN ")
+        self.assertNotIn("apt-get", dockerfile)
+        self.assertNotIn("useradd", dockerfile)
+        self.assertNotIn("--force-depends", dockerfile)
+        self.assertNotIn("/var/lib/dpkg", dockerfile)
+        self.assertIn("USER 65532:65532", runtime)
+        self.assertLess(runtime.index("USER 65532:65532"), runtime.index("ENTRYPOINT"))
+        self.assertIn('ENTRYPOINT ["/home/nonroot/two-bot"]', runtime)
+        self.assertIn('CMD ["/home/nonroot/two-bot", "--healthcheck"]', runtime)
+        self.assertEqual(re.findall(r"(?m)^COPY .*", runtime),
+                         ["COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot"])
         supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
-        self.assertIn("python3 scripts/test-purge-runtime-mount.py", supply)
         self.assertEqual(supply.count("exit-code: '1'"), 2)
+        self.assertEqual(supply.count("ignore-unfixed: false"), 2)
+        self.assertEqual(supply.count("trivyignores: .trivyignore.yaml"), 2)
         self.assertNotIn("continue-on-error", supply)
+        self.assertRegex((ROOT / ".trivyignore.yaml").read_text(), r"(?m)^vulnerabilities: \[\]$")
 
     def test_pr_dry_run_is_read_only_bounded_and_isolated(self):
         check = (ROOT / ".github/workflows/check.yml").read_text()
@@ -225,16 +224,15 @@ class SupplyChainTests(unittest.TestCase):
         self.assertEqual(supply.count("exit-code: '1'"), 2)
         self.assertNotIn("continue-on-error", supply)
 
-    def test_native_selector_diagnostics_cannot_replace_vulnerability_gates(self):
+    def test_retired_bookworm_diagnostics_are_gone(self):
         supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
-        self.assertIn("python3 scripts/test-trivy-selector-probes.py", supply)
-        selectors = supply.index("python3 scripts/probe-trivy-selectors.py sbom")
-        self.assertLess(supply.index("python3 scripts/vulnerability-preflight.py sbom"), selectors)
-        self.assertLess(selectors, supply.index("Retain SBOMs and findings"))
-        self.assertIn("timeout-minutes: 4", supply)
-        self.assertIn("sha256sum trivy-selector-probes.json", supply)
-        self.assertEqual(supply.count("exit-code: '1'"), 2)
-        self.assertNotIn("continue-on-error", supply)
+        for retired in ("probe-trivy-selectors.py", "test-trivy-selector-probes.py",
+                        "purge-runtime-mount", "trivy-selector-probes.json"):
+            self.assertNotIn(retired, supply)
+            self.assertNotIn(retired, (ROOT / "Dockerfile").read_text())
+        for path in ("probe-trivy-selectors.py", "test-trivy-selector-probes.py",
+                     "purge-runtime-mount.sh", "test-purge-runtime-mount.py"):
+            self.assertFalse((ROOT / "scripts" / path).exists(), path)
 
     def test_required_check_rejects_every_non_success_scan_result(self):
         workflow = (ROOT / ".github/workflows/check.yml").read_text()
