@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Regression coverage for queued defers, accepted-work drain and RESUMED sync.
 use super::*;
 use two_bot_core::{ClassifierConfig, InteractionRouter, RouterGates};
