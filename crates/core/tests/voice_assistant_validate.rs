@@ -6,7 +6,9 @@
 //! identity is used.
 
 use two_bot_core::voice_assistant_validate::{validate_template, TemplateRefusal};
-use two_bot_core::voice_naming::{parse, Evaluation, ExtensionPolicy, Template};
+use two_bot_core::voice_naming::{
+    parse, Evaluation, ExtensionPolicy, Template, MAX_TEMPLATE_BYTES, MAX_TEMPLATE_DEPTH,
+};
 use two_bot_core::voice_template_lint::Scenario;
 
 /// Conditions policy with known truth values over the six scenarios, mirroring
@@ -233,6 +235,27 @@ fn refusal_priority_is_syntax_then_tokens_then_empty_then_conditions() {
         panic!("expected an empty-name refusal");
     };
     assert_eq!(scenarios.len(), 6);
+}
+
+#[test]
+fn syntax_refusal_covers_unclosed_openers_and_engine_limits_only() {
+    // Over the engine's byte or nesting limit the whole template is literal
+    // text, so it is refused as syntax.
+    assert_eq!(
+        validate_template(&"a".repeat(MAX_TEMPLATE_BYTES + 1), &CONDITIONS),
+        Err(TemplateRefusal::UnbalancedSyntax)
+    );
+    assert_eq!(
+        validate_template(&"<<".repeat(MAX_TEMPLATE_DEPTH), &CONDITIONS),
+        Err(TemplateRefusal::UnbalancedSyntax)
+    );
+    // A stray closer with no opener is ordinary literal text, not syntax: it
+    // renders as written in every scenario and is accepted.
+    let valid = validate_template("Room >> 2 ]] }}", &CONDITIONS).expect("stray closers");
+    assert_eq!(
+        valid.previews.map(|render| render.name),
+        ["Room >> 2 ]] }}"; 6].map(String::from)
+    );
 }
 
 #[test]

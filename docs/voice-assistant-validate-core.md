@@ -20,7 +20,7 @@ preview should show — or a typed `TemplateRefusal`:
 
 | Check | Refusal |
 | --- | --- |
-| unclosed or stray delimiter (`@@ << >> [[ ]] {{ }} "" __`) | `UnbalancedSyntax` |
+| unclosed opener (`@@ << [[ {{ "" __`), or over the length/nesting limit | `UnbalancedSyntax` |
 | a `@@name@@` outside the engine's token list | `UnknownToken` |
 | renders empty (fallback used) in at least one scenario | `EmptyName { scenarios }` |
 | a condition false in every scenario | `NeverMatchingCondition` |
@@ -30,6 +30,10 @@ preview should show — or a typed `TemplateRefusal`:
   tokens) come before warnings because they cause them: `@@nope@@` reports the
   unknown token rather than the empty renders it also causes. Syntax is first
   because raw syntax showing to members is the worst outcome.
+- `UnbalancedSyntax` covers only syntax the parser keeps as literal text: an
+  opener that never closes, or a template over the engine's 4096-byte or
+  64-block nesting limit. A stray closer (`>> ]] }}`) with no opener is
+  ordinary literal text — `Room >> 2` is a valid name — and is accepted.
 - A truncated lint report fails closed: a never-matching condition past the
   lint's scan bound would otherwise go unchecked, so the template is refused
   as `TooComplex` instead of accepted.
@@ -78,6 +82,7 @@ title only live in one scenario; owner-plus-number accepted in all six),
 never-matching conditions (`PRIVATE` refused; `FULL`/`GAME`/`WEEKEND`
 accepted with per-scenario goldens), and unknown tokens (misspelled and
 non-English names refused; every engine token accepted). Priority, the
-fail-closed scan bound, preview identity and refusal-message bounds are
-pinned. No network, credential,
+syntax boundary (unclosed openers and engine limits refused, stray closers
+accepted), the fail-closed scan bound, preview identity and refusal-message
+bounds are pinned. No network, credential,
 endpoint, database, Discord or staging identity is used.

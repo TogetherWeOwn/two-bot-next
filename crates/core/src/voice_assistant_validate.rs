@@ -26,9 +26,12 @@
 //!    language is caller-owned and never inspected — this function takes the
 //!    template alone.
 //!
-//! Unclosed or stray delimiters are refused as
-//! [`TemplateRefusal::UnbalancedSyntax`]: the name would show raw syntax to
-//! members. A template the lint could not check completely (more blocks than
+//! Syntax the parser keeps as literal text is refused as
+//! [`TemplateRefusal::UnbalancedSyntax`]: an unclosed opener (`@@ << [[ {{ ""
+//! __`), or a template over the engine's length or nesting limit. The name
+//! would show raw syntax to members. A stray closer (`>> ]] }}`) with no
+//! opener is ordinary literal text — `Room >> 2` is a valid name — and is not
+//! refused. A template the lint could not check completely (more blocks than
 //! its scan bounds) is refused as [`TemplateRefusal::TooComplex`], never
 //! accepted unchecked. Byte/shape hygiene (over-long, multi-line, control
 //! characters) belongs to the V12b strict reply parser, which runs before
@@ -80,8 +83,14 @@ pub enum TemplateRefusal {
     /// English, so this is also the English-only check.
     #[error("template uses a token that does not exist; tokens are always English")]
     UnknownToken,
-    /// An unclosed or stray delimiter; the name would show raw syntax.
-    #[error("template has an unclosed or stray delimiter; it would render as literal text")]
+    /// Syntax the parser keeps as literal text: an unclosed opener, or a
+    /// template over the engine's length or nesting limit. The name would
+    /// show raw syntax. Stray closers with no opener are plain text and are
+    /// not refused.
+    #[error(
+        "template has an unclosed delimiter or exceeds the length or nesting limit; \
+         it would render as literal text"
+    )]
     UnbalancedSyntax,
     /// The lint hit a scan bound before checking every block, so the
     /// template cannot be verified and is refused rather than accepted.
@@ -96,10 +105,10 @@ pub enum TemplateRefusal {
 /// with no finding is refused as [`TemplateRefusal::TooComplex`]. On success
 /// the returned previews are the six rendered names to show the admin, so the
 /// displayed preview is exactly the validated output.
-pub fn validate_template<E: ExtensionPolicy>(
-    template: &str,
+pub fn validate_template<'a, E: ExtensionPolicy>(
+    template: &'a str,
     extensions: &E,
-) -> Result<ValidatedTemplate<'_>, TemplateRefusal> {
+) -> Result<ValidatedTemplate<'a>, TemplateRefusal> {
     let report = lint(template, extensions);
     let mut refusal: Option<(u8, TemplateRefusal)> = None;
     let mut consider = |rank: u8, candidate: TemplateRefusal| {
