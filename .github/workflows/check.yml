@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: check-${{ github.event.pull_request.number || github.ref }}
+  group: check-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -108,11 +108,13 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      # TOG-11810: incremental compile cache. The raw ~4 GiB target/ upload
-      # blew the 30-minute PR timeout (#147); rust-cache stores only the
-      # incremental artifacts so restore/save stay small. Restore on every
-      # run; save only on pushes to main (a PR-scoped entry is unreadable by
-      # other PRs, so a PR upload is pure waste).
+      # TOG-11810: dependency build cache. The raw ~4 GiB target/ upload
+      # blew the 30-minute PR timeout (#147); rust-cache stores ~/.cargo and
+      # the dependency builds in target/, stripping workspace crates, so
+      # restore/save stay small. The key includes the job id (no shared-key),
+      # so this job's entry is separate from `tickets postgres`. Restore on
+      # every run; save only on pushes to main (a PR-scoped entry is
+      # unreadable by other PRs, so a PR upload is pure waste).
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -493,8 +495,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
-      # TOG-11810: same incremental cache as the main check job (shared
-      # prefix-key), replacing the raw target/ upload on every PR run.
+      # TOG-11810: dependency build cache, as in the `check` job. The key
+      # includes the job id, so this job keeps its own entry (it builds a
+      # different dependency set); saved only on pushes to main.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: ${{ runner.os }}-cargo

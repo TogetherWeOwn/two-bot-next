@@ -9,16 +9,19 @@ scripts/test-pr-lint.py does: indentation aware, stdlib only, hermetic.
 Guards:
 - pull_request fires on opened/synchronize/reopened/ready_for_review, plus
   `edited` for the co-hosted pr-lint job (a title/body edit must re-run
-  the convention check). The expensive full-history gitleaks rescan is
-  skipped on `edited` at the job level instead: an edit does not change
-  the head SHA, so the check from the last code run still applies.
+  the convention check).
+- gitleaks is never skipped by an edit or a failed pr-lint. An `edited` run
+  shares the concurrency group, so it can cancel the synchronize run's scan;
+  a skipped gitleaks would then pass the required check with the head never
+  scanned. Only `!cancelled()` may gate the job.
 - push to main is untouched: every main commit still gets a scan.
 - workflow_dispatch is untouched: release-please PRs opened with
   GITHUB_TOKEN trigger no workflows, so the release dispatch in
   release.yml is the only path that runs the required checks there.
-- concurrency keys on the PR number (or dispatch input / ref) with
+- concurrency keys on the PR number (or dispatch input) with
   cancel-in-progress, so superseded pushes cancel the stale scan instead
-  of stacking duplicates.
+  of stacking duplicates; push-to-main falls back to the commit SHA, so
+  back-to-back merges never cancel each other's scan.
 """
 
 import re
@@ -66,17 +69,17 @@ class SecretScanSurfaceTests(unittest.TestCase):
         )
         self.assertEqual(flow_list(types_line.split("types:", 1)[1]), REQUIRED_PR_TYPES)
 
-    def test_gitleaks_skips_edited_rescan(self):
-        # `edited` changes no SHA: pr-lint re-validates the title/body, but
-        # the full-history scan from the last code run still applies.
-        jobs_block, _ = section_lines(self.text, "jobs:", 0)
-        job_line = next(line for line in jobs_block if re.match(r"^\s*gitleaks:\s*$", line))
-        job_indent = len(job_line) - len(job_line.lstrip())
-        if_line = next(
-            line for line in jobs_block
-            if len(line) - len(line.lstrip()) > job_indent and line.strip().startswith("if:")
-        )
-        self.assertIn("edited", if_line)
+    def test_gitleaks_never_skipped_by_edit_or_failed_lint(self):
+        # An `edited` run can cancel the synchronize run's scan (same
+        # concurrency group), and a skipped job passes a required check, so
+        # the edit run must rescan. `needs: pr-lint` alone would also skip
+        # the scan whenever pr-lint fails, including on a main push.
+        job_block, _ = section_lines(self.text, "gitleaks:", 2)
+        keys = [line.strip() for line in job_block
+                if len(line) - len(line.lstrip()) == 4 and not line.strip().startswith("#")]
+        self.assertFalse(any("edited" in key or "event.action" in key for key in keys))
+        if_lines = [key for key in keys if key.startswith("if:")]
+        self.assertEqual(if_lines, ["if: ${{ !cancelled() }}"])
 
     def test_push_to_main_untouched(self):
         on_block, _ = section_lines(self.text, "on:", 0)
@@ -100,6 +103,9 @@ class SecretScanSurfaceTests(unittest.TestCase):
         group_line = next(line for line in concurrency_block if line.strip().startswith("group:"))
         group = group_line.split("group:", 1)[1]
         self.assertIn("github.event.pull_request.number", group)
+        # #217: main pushes key on the SHA so every main commit keeps its scan.
+        self.assertRegex(group, r"\|\|\s*github\.sha\s*\}\}\s*$")
+        self.assertNotIn("github.ref", group)
         cancel_line = next(line for line in concurrency_block if line.strip().startswith("cancel-in-progress:"))
         self.assertEqual(cancel_line.split("cancel-in-progress:", 1)[1].strip(), "true")
 

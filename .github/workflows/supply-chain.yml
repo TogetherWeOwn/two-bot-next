@@ -3,7 +3,8 @@ name: supply-chain
 # Folded lightweight gate (TOG-11810): the old `pr-lint.yml` and
 # `secret-scan.yml` workflows each occupied a whole `two-selfhosted` runner
 # slot per PR push. This single workflow runs both checks serially
-# (`gitleaks` needs `pr-lint`), so one PR push costs one slot at a time.
+# (`gitleaks` needs `pr-lint`, but runs whatever pr-lint concluded), so one
+# PR push costs one slot at a time.
 #
 # Required-check names are pinned: the `protect-main` ruleset requires the
 # `gitleaks` context and the `pr-conventions` ruleset requires the `pr-lint`
@@ -41,8 +42,11 @@ permissions:
   contents: read
   pull-requests: read
 
+# Superseded PR runs (pushes and title/body edits) cancel the in-flight one.
+# Push-to-main runs key on the commit SHA, so every main commit still gets
+# exactly one pr-lint and one gitleaks run.
 concurrency:
-  group: supply-chain-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  group: supply-chain-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
   cancel-in-progress: true
 
 env:
@@ -255,11 +259,12 @@ jobs:
   gitleaks:
     name: gitleaks
     needs: pr-lint
-    # TOG-12059 economy, ported to the folded workflow: a title/body `edited`
-    # event does not change the head SHA, so the full-history scan from the
-    # last code run still applies. pr-lint above still re-validates the edit;
-    # only the expensive rescan is skipped.
-    if: github.event.action != 'edited'
+    # Never skipped: a skipped job passes a required check. An `edited` run
+    # shares the concurrency group above and can cancel the synchronize run's
+    # scan, so it must rescan the head itself; and a failed pr-lint (e.g. a
+    # bypassed squash title on main) must not leave a commit unscanned.
+    # Only a cancellation by a newer run in the group skips the scan.
+    if: ${{ !cancelled() }}
     # Overflow switch: see CI_OVERFLOW_* note in the main CI workflow.
     runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'gitleaks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
