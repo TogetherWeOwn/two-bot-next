@@ -71,6 +71,35 @@ INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, ou
 VALUES ('backup:automation:audit', '100000000000000001', NULL, 'sticky.run',
         '100000000000000003', 'post_failed', 'transient', '2026-08-01T10:00:00Z');
 
+INSERT INTO scheduled_messages
+    (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled, last_run_at,
+     last_message_id, created_by, created_at, updated_by, updated_at, claim_token, claimed_at,
+     occurrence_nonce)
+VALUES ('backup:scheduled:recurring', '100000000000000001', '100000000000000003',
+        E'Backup schedule | NULL\n雪 "quote"', '2026-08-02T10:00:00.000Z', 31536000, TRUE,
+        '2026-08-01T10:00:00.000Z', '100000000000000006', '100000000000000002',
+        '2026-08-01T09:00:00.000Z', '100000000000000004', '2026-08-01T10:00:00.000Z',
+        'backup-scheduled-claim', '2026-08-01T10:00:01.000Z', 'backup-occurrence'),
+       ('backup:scheduled:one-shot', '100000000000000001', '100000000000000003',
+        'One shot', '2026-08-03T10:00:00.000Z', NULL, FALSE, NULL, NULL,
+        '100000000000000002', '2026-08-01T09:00:00.000Z', '100000000000000002',
+        '2026-08-01T09:00:00.000Z', NULL, NULL, NULL);
+
+INSERT INTO tickets
+    (id, guild_id, channel_id, opener_id, claimed_by, status, created_at, closing_started_at,
+     closed_at)
+VALUES ('backup:ticket:closed', '100000000000000001', '100000000000000007',
+        '100000000000000002', '100000000000000004', 'closed', '2026-08-01T09:00:00.000Z',
+        '2026-08-01T09:30:00.000Z', '2026-08-01T09:31:00.000Z'),
+       ('backup:ticket:creating', '100000000000000001', NULL, '100000000000000005', NULL,
+        'creating', '2026-08-01T10:00:00.000Z', NULL, NULL);
+INSERT INTO ticket_transcripts
+    (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at,
+     purge_after)
+VALUES ('backup:ticket:closed', '100000000000000001', '100000000000000007',
+        '100000000000000002', '100000000000000004', E'[09:00] opener: help | NULL\n雪 "quote"',
+        2, '2026-08-01T09:31:00.000Z', '2026-10-30T09:31:00.000Z');
+
 INSERT INTO member_levels (guild_id, member_id, xp, message_xp, voice_xp, imported_xp, updated_at)
 VALUES ('100000000000000001', '100000000000000002', 9007199254740991,
         31, 60, 9007199254740900, '2026-08-01T10:00:00Z');

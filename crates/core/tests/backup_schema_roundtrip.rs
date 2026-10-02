@@ -16,8 +16,9 @@ use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use two_bot_core::backup::dump::{dump, restore, DbDumpError};
 use two_bot_core::backup::dump_file::{
-    finish_gzip, inspect, new_encoder, write_line, DumpContents, DumpTableInfo, DUMP_TABLES,
-    DUMP_VERSION, EXCLUDED_TABLES, OPTIONAL_LEGACY_TABLES,
+    finish_gzip, inspect, is_destination_owned, new_encoder, write_line, DumpContents,
+    DumpTableInfo, DESTINATION_OWNED_COLUMNS, DUMP_TABLES, DUMP_VERSION, EXCLUDED_TABLES,
+    OPTIONAL_LEGACY_TABLES,
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -133,10 +134,12 @@ struct TableSnapshot {
 
 type Snapshot = BTreeMap<String, TableSnapshot>;
 
+/// Every archived column. Destination-owned columns are compared separately:
+/// restore allocates them afresh by design (see [`assert_fresh_cas_tokens`]).
 async fn snapshot(pool: &PgPool, tables: &[String]) -> Snapshot {
     let mut result = BTreeMap::new();
     for table in tables {
-        let columns: Vec<(String, String)> = sqlx::query_as(
+        let mut columns: Vec<(String, String)> = sqlx::query_as(
             "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
              FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -148,6 +151,7 @@ async fn snapshot(pool: &PgPool, tables: &[String]) -> Snapshot {
         .await
         .unwrap();
         assert!(!columns.is_empty(), "table {table} must exist");
+        columns.retain(|(name, _)| !is_destination_owned(table, name));
         let cells = columns
             .iter()
             .map(|(name, _)| format!("{}::text", identifier(name)))
@@ -296,6 +300,69 @@ async fn triggers(pool: &PgPool) -> Vec<(String, String, String, String)> {
     .unwrap()
 }
 
+/// Migrated settings triggers. Restore suspends only the two guards; the CAS
+/// allocator stays enabled so restored rows receive fresh tokens.
+fn assert_settings_triggers(triggers: &[(String, String, String, String)]) {
+    assert_eq!(
+        triggers
+            .iter()
+            .map(|(table, name, _, _)| (table.as_str(), name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("guild_settings", "trg_guild_settings_revision"),
+            ("guild_settings", "trg_guild_settings_version"),
+            (
+                "guild_settings_audit",
+                "trg_guild_settings_audit_append_only"
+            ),
+        ],
+        "every migrated settings trigger exists"
+    );
+}
+
+/// Next token guild_settings_cas_seq would issue. It descends and is never
+/// reseeded, so every token issued so far is strictly greater.
+async fn next_cas_token(pool: &PgPool) -> i64 {
+    let (last, called): (i64, bool) =
+        sqlx::query_as("SELECT last_value, is_called FROM guild_settings_cas_seq")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    if called {
+        last - 1
+    } else {
+        last
+    }
+}
+
+async fn cas_tokens(pool: &PgPool) -> Vec<(String, String, i64)> {
+    sqlx::query_as(
+        "SELECT guild_id, key, cas_version FROM guild_settings \
+         ORDER BY guild_id COLLATE \"C\", key COLLATE \"C\"",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// A committed restore is a genuine write: every restored row carries a token
+/// allocated after `next_before`, so no token issued before it still matches.
+async fn assert_fresh_cas_tokens(pool: &PgPool, next_before: i64) {
+    let tokens = cas_tokens(pool).await;
+    assert!(!tokens.is_empty(), "seeded settings exercise CAS");
+    let distinct: BTreeSet<i64> = tokens.iter().map(|(_, _, token)| *token).collect();
+    assert_eq!(
+        distinct.len(),
+        tokens.len(),
+        "restored CAS tokens are distinct"
+    );
+    assert!(
+        distinct.iter().all(|token| *token <= next_before),
+        "restore must invalidate every earlier CAS token: {tokens:?}, next before {next_before}"
+    );
+    assert!(next_cas_token(pool).await < next_before);
+}
+
 async fn set_guard_modes(pool: &PgPool, revision: &str, audit: &str) {
     for (table, trigger, mode) in [
         ("guild_settings", "trg_guild_settings_revision", revision),
@@ -405,12 +472,16 @@ struct SequenceSnapshot {
     value: (i64, bool),
 }
 
+/// Transactional sequence state. guild_settings_cas_seq is left out: nextval is
+/// not transactional, so even a rolled-back restore consumes CAS tokens. Tests
+/// assert that sequence only descends instead ([`next_cas_token`]).
 async fn sequence_snapshot(pool: &PgPool) -> Vec<SequenceSnapshot> {
     let rows: Vec<(String, i64, i64, i64, i64, i64, bool)> = sqlx::query_as(
         "SELECT format('%I.%I', n.nspname, c.relname), s.seqstart, s.seqincrement, \
          s.seqmin, s.seqmax, s.seqcache, s.seqcycle FROM pg_sequence s \
          JOIN pg_class c ON c.oid = s.seqrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = current_schema() ORDER BY c.relname::text",
+         WHERE n.nspname = current_schema() AND c.relname <> 'guild_settings_cas_seq' \
+         ORDER BY c.relname::text",
     )
     .fetch_all(pool)
     .await
@@ -586,6 +657,40 @@ async fn migrated_tables_are_explicitly_classified_and_catalog_fks_are_parent_fi
             "nonoptional covered table {table} is not migrated"
         );
     }
+    for &(table, column) in DESTINATION_OWNED_COLUMNS {
+        assert!(covered.contains(table), "{table}.{column} must be covered");
+        let migrated: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2)",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            migrated,
+            "destination-owned {table}.{column} is not migrated"
+        );
+    }
+    // Restore resets every owned serial/identity sequence. Any other sequence
+    // must be a deliberate choice: version_seq is restarted explicitly and
+    // cas_seq feeds the destination-owned guild_settings.cas_version.
+    let standalone: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'S' AND n.nspname = current_schema() \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass \
+             AND d.objid = c.oid AND d.deptype IN ('a', 'i')) \
+         ORDER BY c.relname::text COLLATE \"C\"",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        standalone,
+        vec!["guild_settings_cas_seq", "guild_settings_version_seq"],
+        "a new standalone sequence needs an explicit restore decision"
+    );
     let fks: Vec<(String, String, String, bool)> = sqlx::query_as(
         "SELECT constraint_row.conname::text, child.relname::text, parent.relname::text, constraint_row.convalidated \
          FROM pg_constraint constraint_row JOIN pg_class child ON child.oid = constraint_row.conrelid \
@@ -632,7 +737,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         "schema_migrations".to_owned(),
     ];
     let guard_before = triggers(pool).await;
-    assert_eq!(guard_before.len(), 2, "both migrated settings guards exist");
+    assert_settings_triggers(&guard_before);
     assert_guards_work(pool).await;
     let directory = ArchiveDirectory::new();
     let original = directory.path("complete.ndjson.gz");
@@ -664,6 +769,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     .unwrap();
     let ledger_before = snapshot(pool, &ledgers).await;
     dirty_target(pool).await;
+    let cas_before = next_cas_token(pool).await;
     let report = restore(pool, &original).await.unwrap();
     assert!(report.ok);
     assert!(report.dropped_columns.is_empty());
@@ -672,6 +778,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         "v4 restores archived singleton exactly"
     );
     assert_eq!(snapshot(pool, &tables).await, before);
+    assert_fresh_cas_tokens(pool, cas_before).await;
     assert_eq!(triggers(pool).await, guard_before);
     assert_eq!(snapshot(pool, &ledgers).await, ledger_before);
     let cooldowns: i64 = sqlx::query_scalar("SELECT count(*) FROM xp_cooldowns")
@@ -689,6 +796,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         set_guard_modes(pool, revision_mode, audit_mode).await;
         let modes_before = triggers(pool).await;
         dirty_target(pool).await;
+        let cas_before = next_cas_token(pool).await;
         let report = restore(pool, &reversed_path)
             .await
             .expect("restore must ignore manifest and row block order");
@@ -700,6 +808,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
             before,
             "reversed complete rows: {revision_mode}/{audit_mode}"
         );
+        assert_fresh_cas_tokens(pool, cas_before).await;
         assert_eq!(
             triggers(pool).await,
             modes_before,
@@ -833,6 +942,8 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
             let before = snapshot(pool, &tables).await;
             let guards = triggers(pool).await;
             let sequences = sequence_snapshot(pool).await;
+            let tokens = cas_tokens(pool).await;
+            let cas_before = next_cas_token(pool).await;
             let error = restore(pool, archive)
                 .await
                 .expect_err("valid envelope must reach SQL and fail on the original constraint");
@@ -855,6 +966,11 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
                 sequences,
                 "rollback TRUNCATE RESTART IDENTITY"
             );
+            assert_eq!(cas_tokens(pool).await, tokens, "rollback keeps CAS tokens");
+            assert!(
+                next_cas_token(pool).await <= cas_before,
+                "CAS allocation never moves back up"
+            );
         }
     }
     set_guard_modes(pool, "O", "O").await;
@@ -874,6 +990,8 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
     let before = snapshot(pool, &tables).await;
     let guards = triggers(pool).await;
     let sequences = sequence_snapshot(pool).await;
+    let tokens = cas_tokens(pool).await;
+    let cas_before = next_cas_token(pool).await;
     let error = restore(pool, &source)
         .await
         .expect_err("restored max version 83 exhausts target MAXVALUE 83");
@@ -886,6 +1004,8 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
         sequences,
         "owned and standalone sequence state survives late refusal"
     );
+    assert_eq!(cas_tokens(pool).await, tokens);
+    assert!(next_cas_token(pool).await <= cas_before);
     assert_guards_work(pool).await;
     db.close().await.unwrap();
 }

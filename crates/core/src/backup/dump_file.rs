@@ -109,9 +109,6 @@ pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
     "containment_incidents",
     "join_risk_flags",
     "automation_commands",
-    "scheduled_messages",
-    "tickets",
-    "ticket_transcripts",
     "automod_violations",
     "automod_processed_messages",
 ];
@@ -127,6 +124,25 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "_sqlx_migrations",
     "schema_migrations",
 ];
+
+/// Columns the destination allocates itself: never archived, never restored.
+pub const DESTINATION_OWNED_COLUMNS: &[(&str, &str)] = &[
+    // CAS tokens come from the never-reseeded guild_settings_cas_seq, and
+    // trg_guild_settings_version replaces supplied tokens on every write. A
+    // restore therefore allocates fresh tokens that invalidate every token
+    // issued before it, as legacy copy does; archiving them would only record
+    // values that restore cannot and must not reproduce.
+    ("guild_settings", "cas_version"),
+];
+
+/// True when `table.column` is allocated by the destination, see
+/// [`DESTINATION_OWNED_COLUMNS`].
+#[must_use]
+pub fn is_destination_owned(table: &str, column: &str) -> bool {
+    DESTINATION_OWNED_COLUMNS
+        .iter()
+        .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
+}
 
 /// Write the complete-schema envelope; the reader also accepts frozen v3.
 pub const DUMP_VERSION: u32 = 4;

@@ -29,8 +29,8 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 
 use super::dump_file::{
-    cell_input, inspect, is_dump_table, DumpContents, DumpError, DumpManifest, DumpTableInfo,
-    DumpWriter, DUMP_TABLES, DUMP_VERSION, OPTIONAL_LEGACY_TABLES,
+    cell_input, inspect, is_destination_owned, is_dump_table, DumpContents, DumpError,
+    DumpManifest, DumpTableInfo, DumpWriter, DUMP_TABLES, DUMP_VERSION, OPTIONAL_LEGACY_TABLES,
 };
 use super::guild_config::unix_now_iso;
 
@@ -194,6 +194,10 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
             )));
         }
         let count = count_of(&mut tx, name).await? as u64;
+        let cols: Vec<_> = cols
+            .into_iter()
+            .filter(|(c, _)| !is_destination_owned(name, c))
+            .collect();
         tables.push(DumpTableInfo {
             name: (*name).to_owned(),
             columns: cols.iter().map(|(c, _)| c.clone()).collect(),
@@ -323,6 +327,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // Lock before changing guards. Only two named application triggers are
     // suspended, never FK/check constraints or session_replication_role. ALTER
     // TABLE is transactional: error/cancellation rolls back data AND guards.
+    // trg_guild_settings_version stays enabled: it allocates fresh CAS tokens.
     // https://www.postgresql.org/docs/16/sql-altertable.html
     sqlx::query(audited(format!(
         "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
@@ -397,6 +402,8 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             .collect();
         // Dumps written by legacy two-bot carry no column types; the
         // target's own type is the safe fallback (text parses everywhere).
+        // Destination-owned columns are allocated by the target, so an archived
+        // value is skipped rather than restored or reported as dropped.
         let kept: Vec<(&String, &str)> = table
             .columns
             .iter()
@@ -411,12 +418,16 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
                         .unwrap_or("text"),
                 )
             })
-            .filter(|(c, _)| target_names.contains(&c.as_str()))
+            .filter(|(c, _)| {
+                target_names.contains(&c.as_str()) && !is_destination_owned(&table.name, c)
+            })
             .collect();
         let dropped: Vec<String> = table
             .columns
             .iter()
-            .filter(|c| !target_names.contains(&c.as_str()))
+            .filter(|c| {
+                !target_names.contains(&c.as_str()) && !is_destination_owned(&table.name, c)
+            })
             .cloned()
             .collect();
         if !dropped.is_empty() {
