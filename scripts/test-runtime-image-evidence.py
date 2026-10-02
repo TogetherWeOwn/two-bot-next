@@ -363,7 +363,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertIs(json.loads((directory / "runtime-image-evidence.json").read_text())["complete"], False)
 
     def test_ci_retains_evidence_after_failed_gates_without_changing_gates(self):
-        workflow = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        workflow = (ROOT / ".github/workflows/sbom.yml").read_text()
         self.assertIn("python3 scripts/test-runtime-image-evidence.py", workflow)
         diagnostic = workflow.index("name: Collect exact-image applicability evidence")
         self.assertGreater(diagnostic, workflow.index("name: Gate runtime image"))

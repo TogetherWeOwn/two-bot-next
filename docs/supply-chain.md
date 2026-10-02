@@ -1,6 +1,9 @@
 # Container scan and release SBOMs
 
-`check.yml` calls the same read-only `supply-chain.yml` used by releases. It
+`check.yml` calls the same read-only `sbom.yml` used by releases. (The
+reusable SBOM workflow was renamed from `supply-chain.yml` because main's
+TOG-11810 fold uses that filename for the native pr-lint + gitleaks gate,
+which has no `workflow_call` trigger.) It
 builds the Dockerfile on `[self-hosted, two-selfhosted]`, without registry push or deployment,
 then inventories the exact image and all packages in the workspace Cargo.lock
 (including workspace, optional and development dependencies). The Rust BOM is

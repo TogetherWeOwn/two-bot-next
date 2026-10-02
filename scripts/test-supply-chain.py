@@ -183,7 +183,7 @@ class SupplyChainTests(unittest.TestCase):
         self.assertIn('CMD ["/home/nonroot/two-bot", "--healthcheck"]', runtime)
         self.assertEqual(re.findall(r"(?m)^COPY .*", runtime),
                          ["COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot"])
-        supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        supply = (ROOT / ".github/workflows/sbom.yml").read_text()
         self.assertEqual(supply.count("exit-code: '1'"), 2)
         self.assertEqual(supply.count("ignore-unfixed: false"), 2)
         self.assertEqual(supply.count("trivyignores: .trivyignore.yaml"), 2)
@@ -192,7 +192,7 @@ class SupplyChainTests(unittest.TestCase):
 
     def test_pr_dry_run_is_read_only_bounded_and_isolated(self):
         check = (ROOT / ".github/workflows/check.yml").read_text()
-        supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        supply = (ROOT / ".github/workflows/sbom.yml").read_text()
         self.assertIn("pull_request:", check)
         self.assertIn("name: PR SBOM dry-run", check)
         self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", check)
@@ -205,7 +205,10 @@ class SupplyChainTests(unittest.TestCase):
         self.assertEqual(supply.count("image-ref: ${{ env.IMAGE }}"), 2)
         self.assertIn('docker image rm "$IMAGE"', supply)
         self.assertEqual(supply.count("cache-dir: ${{ runner.temp }}/trivy-cache"), 4)
-        for name in ["check", "release", "supply-chain"]:
+        # Folded pr-lint + gitleaks gate (TOG-11810) shares its filename
+        # with the pre-fold SBOM workflow; assert on our renamed file plus
+        # the callers that reference it.
+        for name in ["check", "release", "sbom", "supply-chain"]:
             path = ROOT / ".github/workflows" / f"{name}.yml"
             # Comments may name the overflow example; no runs-on may use it.
             code = "\n".join(
@@ -215,7 +218,7 @@ class SupplyChainTests(unittest.TestCase):
             self.assertNotIn("ubuntu-latest", code, str(path))
 
     def test_candidate_preflight_cannot_replace_existing_gates(self):
-        supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        supply = (ROOT / ".github/workflows/sbom.yml").read_text()
         self.assertIn("python3 scripts/test-vulnerability-preflight.py", supply)
         preflight = supply.index("python3 scripts/vulnerability-preflight.py sbom")
         self.assertLess(supply.index("Collect exact-image applicability evidence"), preflight)
@@ -225,7 +228,7 @@ class SupplyChainTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", supply)
 
     def test_retired_bookworm_diagnostics_are_gone(self):
-        supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        supply = (ROOT / ".github/workflows/sbom.yml").read_text()
         for retired in ("probe-trivy-selectors.py", "test-trivy-selector-probes.py",
                         "purge-runtime-mount", "trivy-selector-probes.json"):
             self.assertNotIn(retired, supply)
@@ -253,11 +256,12 @@ class SupplyChainTests(unittest.TestCase):
                         self.assertEqual(result.returncode, 0 if store == scan == docs == "success" else 1)
 
     def test_shared_gate_and_dry_run_publication_guards(self):
-        supply = (ROOT / ".github/workflows/supply-chain.yml").read_text()
+        supply = (ROOT / ".github/workflows/sbom.yml").read_text()
         release = (ROOT / ".github/workflows/release.yml").read_text()
         check = (ROOT / ".github/workflows/check.yml").read_text()
-        self.assertIn("uses: ./.github/workflows/supply-chain.yml", check)
-        self.assertIn("uses: ./.github/workflows/supply-chain.yml", release)
+        self.assertIn("uses: ./.github/workflows/sbom.yml", check)
+        self.assertIn("uses: ./.github/workflows/sbom.yml", release)
+        self.assertNotIn("uses: ./.github/workflows/supply-chain.yml", check + release)
         self.assertIn("inputs.dry_run != true", release)
         self.assertIn("needs.sbom-target.outputs.tag != ''", release)
         self.assertIn("needs.release-sbom.result == 'success'", release)
