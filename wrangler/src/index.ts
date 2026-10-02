@@ -640,7 +640,7 @@ export default {
         recordClick: (click: RedirectClick) => store.recordClick(click),
         onError: (msg, detail) =>
           console.error(`${msg} ${JSON.stringify(detail)}`),
-        isThrottled: (key) => !clickBuckets.take(key).allowed,
+        throttle: (key) => clickBuckets.take(key),
         missCache: missCacheFor(env),
       },
     );
