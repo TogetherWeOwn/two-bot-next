@@ -205,10 +205,7 @@ pub fn resolve_variables(ctx: &ChannelInfoContext) -> VariableMap {
     let mut entries = Vec::with_capacity(VARIABLE_COUNT);
     for probe in TOKEN_VARIABLES {
         let value = Evaluation::new(&ctx.room, &ext).evaluate(&parse(probe));
-        entries.push(VariableEntry {
-            name: *probe,
-            value,
-        });
+        entries.push(VariableEntry { name: probe, value });
     }
     let full = ctx.room.user_limit != 0 && ctx.room.member_count >= ctx.room.user_limit;
     // V6: PRIVATE is always false on standalone channels.
