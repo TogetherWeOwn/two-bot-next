@@ -887,6 +887,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     // Durable dedupe remains enforceable, not merely present in the dump.
     for statement in [
         "INSERT INTO internal_nonces SELECT * FROM internal_nonces WHERE nonce_hash = repeat('a', 64)",
+        "INSERT INTO internal_clock_high_water SELECT * FROM internal_clock_high_water",
         "INSERT INTO internal_discord_events SELECT * FROM internal_discord_events WHERE event_hash = repeat('3', 64)",
         "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')",
         "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'",
@@ -1593,17 +1594,17 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     .await
     .unwrap();
     let guard_before = triggers(pool).await;
-    // Floors are (re)captured inside the month loop: dirty_target consumes
-    // owned values past the fresh-target positions, so pre-loop floors would
-    // understate the high-water the final restore must not rewind below.
-    let mut floors = BTreeMap::new();
     let script = shipped_drill_script(&directory.0, &binary);
     let target_url = fixture_url(&target);
     // Month one restores into a dirtied scratch; month two into the previous
     // drill's result, as the monthly timer does.
+    let mut floors = BTreeMap::new();
     for month in 1..=2 {
         dirty_target(pool).await;
-        // Keep the floors in force before the last restore.
+        // Keep the floors in force before the last restore, as the
+        // reversed-rows caller does: dirty_target hands out target-only
+        // identities whose rows restore wipes, but the allocator must not
+        // rewind onto them.
         floors.extend(allocation_floors(pool, &contents.manifest.sequence_marks).await);
         let cas_before = next_cas_token(pool).await;
         let drill = shipped_cli(

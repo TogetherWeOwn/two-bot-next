@@ -22,6 +22,7 @@ pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;
+pub mod clock_guard;
 pub mod command_permissions;
 pub mod commands;
 pub mod community;
@@ -99,6 +100,7 @@ pub mod voice_assistant_validate;
 pub mod voice_config;
 pub mod voice_config_diff;
 pub mod voice_custom_id;
+pub mod voice_name_filter;
 pub mod voice_naming;
 pub mod voice_ownership;
 pub mod voice_permission_health;
@@ -139,6 +141,7 @@ pub use channel_moderation_store::{
     ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore, DB_POOL_MAX_DEFAULT,
     STATEMENT_TIMEOUT_MS,
 };
+pub use clock_guard::{ClockGuard, ClockRollback, CLOCK_SKEW_TOLERANCE_MS};
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
@@ -195,17 +198,18 @@ pub use inactivity::{
 pub use internal_actions::{
     assert_allowed, assert_private_bind, auth_failure, authorize, body_hash, build_channel_keys,
     build_key_map, build_role_keys, canonical_string, check_setting_value_size, is_private_address,
-    new_request_id, normalise_bind_host, parse_keys, require_field_str, require_reason,
-    require_settings_key, require_snowflake, require_timestamp, sign, signatures_match, utf16_len,
-    valid_idempotency_key, valid_nonce_format, validate_announcement, validate_event_input,
-    validate_guild_add_member, validate_idempotency_key, validate_moderation_numbers,
-    validate_role_assign, within_skew, ActionError, AuthDecision, AuthHeaders, BindError,
-    BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace, InternalFlags, KeyMapError,
-    KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets, ACTIONS_PATH, ADD_MEMBER_BUCKET,
-    AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET, IMPLEMENTED_ACTIONS, MAX_BODY_BYTES,
-    MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS, MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN,
-    MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN, MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY,
-    NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS, REQUEST_ID_LEN, SKEW_SECONDS,
+    new_request_id, normalise_bind_host, parse_body_object, parse_keys, require_field_str,
+    require_reason, require_settings_key, require_snowflake, require_timestamp, sign,
+    signatures_match, utf16_len, valid_idempotency_key, valid_nonce_format, validate_announcement,
+    validate_event_input, validate_guild_add_member, validate_idempotency_key,
+    validate_moderation_numbers, validate_role_assign, within_skew, ActionError, AuthDecision,
+    AuthHeaders, BindError, BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace,
+    InternalFlags, KeyMapError, KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets,
+    ACTIONS_PATH, ADD_MEMBER_BUCKET, AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET,
+    IMPLEMENTED_ACTIONS, MAX_BODY_BYTES, MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS,
+    MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN, MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN,
+    MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY, NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS,
+    REQUEST_ID_LEN, SKEW_SECONDS,
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,

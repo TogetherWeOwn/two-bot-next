@@ -664,7 +664,11 @@ fn old_revision_must_not_replace_newer_observation_of_same_message() {
 }
 
 #[test]
-fn repeats_preserve_legacy_nearest_observation_capacity() {
+fn repeats_match_legacy_lookback_depth_with_filler() {
+    // Legacy `MemoryRepeatTracker.observe` evaluates the new row plus up to
+    // `count` earlier rows, so with count 3 both X,Y,X,X and the X,X,Y,X
+    // rotation trip on the 4th (TOG-12582). Storage still retains only the
+    // newest `count` rows: a streak evicted by fillers stays clean.
     for kind in [MessageDeliveryKind::Create, MessageDeliveryKind::Update] {
         let mut runtime = runtime(true);
         for (id, content, at_ms) in [
@@ -683,12 +687,40 @@ fn repeats_preserve_legacy_nearest_observation_capacity() {
         if kind == MessageDeliveryKind::Update {
             next.edited_timestamp_ms = Some(3_000);
         }
-        assert_eq!(
-            runtime.inspect(&next),
-            Inspection::Accepted(kind.funnel(false)),
-            "the oldest same-content row is outside the last three observations"
+        assert!(
+            matches!(runtime.inspect(&next), Inspection::Matched(m) if m.filter == two_bot_core::AutomodFilter::RepeatedMessage),
+            "X,Y,X,X must trip on the 4th like legacy"
         );
     }
+    // Capacity: three fillers evict the oldest same-content row from the
+    // 3-row store, so the next same-content create stays clean.
+    let mut runtime = runtime(true);
+    for (id, content, at_ms) in [
+        ("1", "same", 0),
+        ("2", "first filler", 1_000),
+        ("3", "second filler", 2_000),
+        ("4", "third filler", 3_000),
+    ] {
+        assert_eq!(
+            runtime.inspect(&timed_delivery(
+                MessageDeliveryKind::Create,
+                id,
+                content,
+                at_ms
+            )),
+            Inspection::Accepted(FunnelDisposition::Accept)
+        );
+    }
+    assert_eq!(
+        runtime.inspect(&timed_delivery(
+            MessageDeliveryKind::Create,
+            "5",
+            "same",
+            4_000
+        )),
+        Inspection::Accepted(FunnelDisposition::Accept),
+        "evicted streak must not trip"
+    );
 }
 
 fn same_author_batch(with_update: bool) -> Inspection {
