@@ -50,6 +50,7 @@ pub mod health;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
+pub mod internal_action_config;
 #[cfg(feature = "db")]
 pub mod internal_action_store;
 pub mod internal_actions;
