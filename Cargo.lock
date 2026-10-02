@@ -2322,6 +2322,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
+ "tracing-subscriber",
  "two-bot-testsupport",
  "unicode-normalization",
  "url",
@@ -2345,6 +2346,7 @@ dependencies = [
  "twilight-model",
  "two-bot-core",
  "two-bot-discord",
+ "two-bot-testsupport",
  "url",
 ]
 

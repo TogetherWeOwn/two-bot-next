@@ -64,6 +64,7 @@ pub const JOBS: &[&str] = &[
     "presence_probe",
     "community_scorecard",
     "inactivity",
+    "audit_retry",
     "scheduled_messages",
     "other",
 ];

@@ -36,8 +36,9 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
-`community_scorecard`, `inactivity` (these two may be parked by configuration) and
-`scheduled_messages` (the 15 s scheduled-message ticker).
+`community_scorecard`, `inactivity`, `audit_retry` and `scheduled_messages` (the
+15 s scheduled-message ticker). The community and audit names may be parked by
+configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -198,6 +199,15 @@ server, no new infrastructure.
 | `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
+
+Packet identity (TOG-12100): rule ids above are the single shared spelling
+used on both sides of the B2 soak evidence seam. The Rust canonical list is
+`ALERT_RULE_IDS` in `crates/core/src/evidence.rs`; the Worker mirrors it in
+`packetFilename` (`wrangler/src/alert-rules.ts`). Every evidence/alert packet
+is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
+`soak_expected_committed` ledger identity), so the QA evidence table can
+attribute packets when several rules fire in one window. Both sides pin all
+four spellings with tests; the payload shape is unchanged.
 
 Known gaps: there is no DB error counter (the pool rule is a proxy) and no
 send-admission series, so neither is alerted. Add the series first, then a rule.

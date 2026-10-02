@@ -66,6 +66,14 @@ it applies nothing to the running gateway.\n\n\
 resolved from legacy `TWO_DATABASE_URL` / `DISCORD_GUILD_ID`. Token, database URL\n\
 and guild ID have no embedded deployment value; the listen address defaults to\n\
 `0.0.0.0:8080`. Missing configuration is not proof of readiness.\n\n\
+Under the Worker, the Container also receives the reviewed `TWO_*` runtime\n\
+flags in `wrangler/src/container-env.ts` (`FORWARDED_FLAGS`), forwarded\n\
+verbatim when the Worker env defines them as strings. Secrets never pass\n\
+through that allowlist: a Container secret needs its own explicit line in\n\
+`containerEnvVars` (`wrangler/src/index.ts`), like `DISCORD_TOKEN` and\n\
+`DATABASE_URL`. Every other `TWO_*` name the Rust sources mention sits in\n\
+`NOT_FORWARDED` with a reason, and `wrangler/test/container-env.test.ts`\n\
+fails when a name is in neither list.\n\n\
 ## Settings catalog\n\n\
 Default sources (parsed defaults only, not boot wiring): feature/announcement\n\
 gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding\n\

@@ -14,7 +14,7 @@ use two_bot_core::{
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
-    community_jobs,
+    audit_runtime, community_jobs,
     jobs::{self, ErrorClass, Job},
     scheduled_jobs, server,
 };
@@ -156,9 +156,13 @@ pub async fn serve(
                     });
                 }
                 registered.push(scheduled_jobs::register(context.clone()));
-                let registration = community_jobs::register(context);
+                let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
+                match audit_runtime::register(context, shutdown.subscribe()) {
+                    Some(job) => registered.push(job),
+                    None => parked.extend(audit_runtime::NAMES),
+                }
             }
             Err(_) => tracing::warn!("website jobs parked: invalid REST configuration"),
         }
@@ -168,10 +172,11 @@ pub async fn serve(
     let names: Vec<&'static str> = NAMES
         .into_iter()
         .chain(community_jobs::NAMES)
+        .chain(audit_runtime::NAMES)
         .chain(scheduled_jobs::NAMES)
         .collect();
-    // All names park together when nothing registered; otherwise only the
-    // env-gated community names are parked and the rest report live status.
+    // Every name parks when nothing registered; otherwise only the env-gated
+    // community and audit names are parked and the rest report live status.
     let status = jobs::statuses(&names, registered.is_empty());
     {
         let mut entries = status.write().await;

@@ -123,6 +123,6 @@ twilight-model = "0.17"
 opt-level = "z"
 lto = true
 codegen-units = 1
-# Job tasks must unwind so the supervisor can isolate a panic in release too.
+# Router handlers and supervised jobs must unwind to isolate panics in release.
 panic = "unwind"
 strip = true

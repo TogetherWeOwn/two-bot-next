@@ -5,6 +5,7 @@
 //! `GUILD_ID` the shard stays parked and `/readyz` reports `gateway: down`
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
+mod audit_runtime;
 mod backup_cli;
 mod command_runtime;
 #[cfg(test)]
@@ -16,6 +17,7 @@ mod database_roles_cli;
 #[path = "../../discord/tests/common/mod.rs"]
 mod discord_test_common;
 mod dispatch;
+mod erasure_cli;
 mod gateway;
 mod gateway_metrics;
 #[cfg(test)]
@@ -219,6 +221,7 @@ async fn main() {
 /// `--help` covers both the gateway server and the backup CLI.
 async fn print_backup_help_and_exit() -> ! {
     println!("{}", preflight::USAGE);
+    print!("{}", erasure_cli::USAGE);
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
 }
