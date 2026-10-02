@@ -28,6 +28,7 @@ pub mod legacy_verify;
 pub mod mee6_names;
 pub mod mee6_rewards;
 pub mod mee6_xp;
+pub mod member_erasure;
 pub mod message_scan;
 pub mod parse;
 pub mod raid_tools;
@@ -69,7 +70,10 @@ pub use parse::{
     parse_voice_message, snowflake_to_date_ms, EmbedView, LeaveAttributionRecord, MemberLogKind,
     MemberLogRecord, MessageView, VoiceKind, VoiceRecord,
 };
-pub use rest::{iso_to_millis, timestamp_ms, RestClient, RestError, ScanCompletion, ScanPage};
+pub use rest::{
+    iso_to_millis, timestamp_ms, ArchiveIncompleteReason, ArchivedThreadsOutcome, RestClient,
+    RestError, ScanCompletion, ScanPage, DEFAULT_ARCHIVED_THREAD_PAGES,
+};
 pub use settings::{log_refresh_report, SettingsStore, SettingsWriteError};
 
 /// Live TWO guild: every CLI refuses it without `--allow-live-guild`
