@@ -180,9 +180,6 @@ fn non_numeric_operands_make_comparisons_false() {
         "@@owner@@ = Alex",
         "@@owner@@ != Alex",
         "@@game_name@@ = General",
-        // A blank `@@slots@@` (no limit) has no value.
-        "@@slots@@ = 0",
-        "@@slots@@ != 0",
         // Only one comparison per condition.
         "1 < 2 < 3",
         "1 <",
@@ -198,6 +195,17 @@ fn non_numeric_operands_make_comparisons_false() {
     }
     assert_eq!(eval("{{## = 3 ??yes//no}}", &solo, &facts), "no");
     assert_eq!(eval("{{+# = 3 ??yes//no}}", &solo, &facts), "no");
+
+    // A blank `@@slots@@` (no limit) parses but has no value, so every
+    // operator is false.
+    for condition in ["@@slots@@ = 0", "@@slots@@ != 0", "@@slots@@ < @@num@@"] {
+        assert_ne!(
+            parse_condition(condition),
+            Condition::Unknown,
+            "{condition}"
+        );
+        assert!(!holds(condition, &solo, &facts), "{condition}");
+    }
 }
 
 #[test]
@@ -541,10 +549,12 @@ fn nested_conditions_resolve_innermost_first_without_expanding_names() {
     };
     // The inner node picks which condition the outer node tests.
     let template = "{{{{PRIVATE ??FULL//OWNER}} ??yes//no}}";
-    assert_eq!(eval(template, &solo, &facts()), "yes"); // OWNER
-    assert_eq!(eval(template, &solo, &private), "no"); // FULL, no limit
-    assert_eq!(eval(template, &full, &private), "yes"); // FULL
-                                                        // A false inner node without an else branch leaves only the outer text.
+    // Inner branch: OWNER, FULL with no limit, FULL at the limit.
+    assert_eq!(eval(template, &solo, &facts()), "yes");
+    assert_eq!(eval(template, &solo, &private), "no");
+    assert_eq!(eval(template, &full, &private), "yes");
+
+    // A false inner node without an else branch leaves only the outer text.
     assert_eq!(
         eval("{{{{PRIVATE ??!}}FULL ??yes//no}}", &full, &facts()),
         "yes"
