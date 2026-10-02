@@ -114,13 +114,6 @@ pub fn applies_to(token: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn rows<'a>(pairs: &[(&'a str, &'a str)]) -> Vec<AliasRow<'a>> {
-        pairs
-            .iter()
-            .map(|(key, target)| AliasRow { key, target })
-            .collect()
-    }
-
     #[test]
     fn normalize_trims_and_case_folds() {
         assert_eq!(normalize_game_name("  Apex Legends "), "apex legends");
