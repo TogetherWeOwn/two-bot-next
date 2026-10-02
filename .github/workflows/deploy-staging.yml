@@ -24,6 +24,9 @@ jobs:
   deploy:
     name: wrangler deploy + readyz gate
     runs-on: [self-hosted, two-selfhosted]
+    # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
+    # secret (TOG-12030); the job must declare the environment to read it.
+    environment: staging
     timeout-minutes: 30
     defaults:
       run:
