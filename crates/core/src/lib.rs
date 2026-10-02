@@ -35,6 +35,7 @@ pub mod custom_commands;
 pub mod database_roles;
 pub mod database_url;
 pub mod events;
+pub mod evidence;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod feeds;
@@ -72,6 +73,7 @@ pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
 pub mod raid;
+pub mod raid_removal;
 pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
@@ -88,7 +90,12 @@ pub mod sticky;
 pub mod tickets;
 pub mod voice;
 pub mod voice_config;
+pub mod voice_config_diff;
+pub mod voice_naming;
 pub mod voice_ownership;
+pub mod voice_permissions;
+pub mod voice_placement;
+pub mod voice_room_controls;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
@@ -150,11 +157,15 @@ pub use custom_commands::{
     is_builtin_trigger, max_custom_commands, placeholders_in, registry_with_custom,
     render_template, require_automations_enabled, trigger_word, validate_put_input,
     validate_template, AuditRecord, CommandError, DeleteDecision, PutCommandInput, PutDecision,
-    RunOutcome, StoredCommand, TemplateContext, TemplateError, AUTOMATIONS_DISABLED_REPLY,
-    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
-    TEMPLATE_PLACEHOLDERS,
+    RunOutcome, StoredCommand, TemplateContext, TemplateError, MAX_COMMAND_NAME_CHARS,
+    MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS, TEMPLATE_PLACEHOLDERS,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
+pub use evidence::{
+    family_of, Disposition, EventFamily, EvidenceLedger, ExpectedAction, ReceiptingStore,
+    ReconciledItem, Reconciliation, StoreReceipt, EVIDENCE_SCHEMA_VERSION, MATCH_WINDOW_MS,
+    MAX_EXPECTED_ACTIONS, MAX_RECEIPTS,
+};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
     announcement_commands, automation_commands, feature_commands, scorecard_attendance_command,
@@ -288,7 +299,7 @@ pub use scheduled::{
 };
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
-    ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+    ScheduledEventMirror, ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 #[cfg(feature = "db")]
 pub use scheduled_store::{
@@ -332,6 +343,6 @@ pub use voice_vote_kick::{
 };
 #[cfg(feature = "db")]
 pub use website_store::{
-    apply_web_contract, read_raid_windows, replace_events, write_counter, write_rank_snapshot,
-    WebsiteStoreError, WEB_CONTRACT_VERSION, WEB_CONTRACT_VIEWS,
+    apply_web_contract, read_raid_windows, replace_events, upsert_event, write_counter,
+    write_rank_snapshot, WebsiteStoreError, WEB_CONTRACT_VERSION, WEB_CONTRACT_VIEWS,
 };

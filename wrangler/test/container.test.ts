@@ -274,7 +274,7 @@ for (const automod of [undefined, "0", "1", "", "false", " 0", "00"] as const) {
     test(`moderation availability passes through unchanged (${JSON.stringify(automod)}, ${path})`, async (t) => {
       const h = await harness(t, { TWO_AUTOMOD: automod });
       if (path === "keepalive") {
-        await h.bot.keepalive({ startedAt: 0 });
+        await tickKeepalive(h.bot);
       } else {
         await h.bot.fetch(new Request(`https://worker.invalid${path}`));
       }
@@ -721,4 +721,22 @@ test("storage failure still rearms keepalive but does not send an unpersisted al
   assert.equal(h.schedules.mock.callCount(), 1);
   assert.equal(h.posts.length, 0);
   assert.equal(h.events().length, 0);
+});
+
+test("keepalive pulls /metrics, alerts once on a failing job and resolves", async (t) => {
+  const h = await alertHarness(t, { UNREADY_ALERT_FAILURES: "1000", OPS_ALERT_WEBHOOK_URL: WORKER_ENV.OPS_ALERT_WEBHOOK_URL });
+  let failures = 3;
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(`two_bot_job_consecutive_failures{job="rank"} ${failures}\n`);
+    return new Response(null, { status: 200 });
+  });
+  await h.tick();
+  await h.tick();
+  const alerts = h.posts.filter((p) => String(p.init.body).includes("ALERT job_consecutive_failures:rank"));
+  assert.equal(alerts.length, 1);
+  assert.match(String(alerts[0]!.init.body), /runbook\.md#alert-job-failures/);
+  failures = 0;
+  await h.tick();
+  assert.equal(h.posts.filter((p) => String(p.init.body).includes("RESOLVED job_consecutive_failures:rank")).length, 1);
 });

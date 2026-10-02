@@ -29,11 +29,11 @@ pub const MAX_DESCRIPTION_CHARS: usize = 100;
 pub const MAX_COMMAND_NAME_CHARS: usize = 32;
 
 /// Said to anybody who reaches a custom command while automations are off
-/// (legacy `AUTOMATIONS_DISABLED_REPLY`). A row that exists while the feature
-/// is off gets this explicit refusal, not silence: silence from a
-/// still-published command reads to Discord as "the application failed to
-/// respond".
-pub const AUTOMATIONS_DISABLED_REPLY: &str = "Automations are disabled on this server.";
+/// (legacy `AUTOMATIONS_DISABLED_REPLY`; one constant shared with the router).
+/// A row that exists while the feature is off gets this explicit refusal, not
+/// silence: silence from a still-published command reads to Discord as "the
+/// application failed to respond".
+pub use crate::router::AUTOMATIONS_DISABLED_REPLY;
 
 /// Template render context (legacy `TemplateContext`).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -424,7 +424,7 @@ async fn http_shutdown_stops_the_real_gateway_runner_and_preserves_checkpoint() 
     let db = TestDb::new().await;
     let mut mock = MockGateway::new(false, false).await;
     let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
-    let (runner, state) = spawn_runner_until_shutdown(&db, &mock.url, async move {
+    let (runner, state) = spawn_runner_until_shutdown(&db, &mock.url, None, async move {
         stopping.wait_for(|stopping| *stopping).await.unwrap();
     })
     .await;
