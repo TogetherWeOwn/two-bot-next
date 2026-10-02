@@ -139,9 +139,9 @@ pub use containment::{
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{
-    family_of, Disposition, EVIDENCE_SCHEMA_VERSION, EventFamily, EvidenceLedger, ExpectedAction,
-    MATCH_WINDOW_MS, MAX_EXPECTED_ACTIONS, MAX_RECEIPTS, ReceiptingStore, ReconciledItem,
-    Reconciliation, StoreReceipt,
+    family_of, Disposition, EventFamily, EvidenceLedger, ExpectedAction, ReceiptingStore,
+    ReconciledItem, Reconciliation, StoreReceipt, EVIDENCE_SCHEMA_VERSION, MATCH_WINDOW_MS,
+    MAX_EXPECTED_ACTIONS, MAX_RECEIPTS,
 };
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{

@@ -235,10 +235,7 @@ impl EvidenceLedger {
     /// over receipt matching; duplicates are a procedure error only in the
     /// sense that the first declaration wins.
     pub fn declare(&mut self, alias: &str, disposition: Disposition, reason: &str) {
-        if !matches!(
-            disposition,
-            Disposition::Excluded | Disposition::Failed
-        ) {
+        if !matches!(disposition, Disposition::Excluded | Disposition::Failed) {
             return;
         }
         let Some(action) = self.expected.iter().find(|e| e.alias == alias) else {
@@ -291,9 +288,7 @@ impl EvidenceLedger {
                     .receipts
                     .iter()
                     .enumerate()
-                    .filter(|(i, r)| !claimed.contains(i) && r.key == hint)
-                    .map(|(i, _)| i)
-                    .next();
+                    .position(|(i, r)| !claimed.contains(&i) && r.key == hint);
             }
             // Pass 2: nearest same-family receipt inside the window.
             if best.is_none() {
@@ -487,13 +482,14 @@ impl<S: FunnelStore> FunnelStore for ReceiptingStore<S> {
         self.inner.next_message_rung(guild_id, member_id, at)
     }
 
-    fn has_event(
-        &self,
-        guild_id: Snowflake,
-        member_id: Snowflake,
-        event_type: EventType,
-    ) -> bool {
+    fn has_event(&self, guild_id: Snowflake, member_id: Snowflake, event_type: EventType) -> bool {
         self.inner.has_event(guild_id, member_id, event_type)
+    }
+
+    // Forwarded explicitly: the trait default is a no-op, which would silently
+    // drop invite snapshots when wrapping a durable store.
+    fn stage_invite_snapshot(&self, snapshot: crate::gateway_funnel::InviteSnapshotWrite) {
+        self.inner.stage_invite_snapshot(snapshot);
     }
 }
 
@@ -571,7 +567,11 @@ mod tests {
     #[test]
     fn missing_receipt_is_gap_not_zero_loss() {
         let mut ledger = EvidenceLedger::new("rev-test".to_owned());
-        ledger.expect(action("m4", EventFamily::Message, "2026-09-20T12:04:00.000Z"));
+        ledger.expect(action(
+            "m4",
+            EventFamily::Message,
+            "2026-09-20T12:04:00.000Z",
+        ));
         let r = ledger.reconcile();
         assert_eq!(r.items[0].disposition, Disposition::Unknown);
         assert_eq!(r.gaps(), 1);
@@ -599,7 +599,11 @@ mod tests {
     #[test]
     fn declared_exclusion_wins_over_receipts() {
         let mut ledger = EvidenceLedger::new("rev-test".to_owned());
-        ledger.expect(action("b1", EventFamily::Message, "2026-09-20T12:00:00.000Z"));
+        ledger.expect(action(
+            "b1",
+            EventFamily::Message,
+            "2026-09-20T12:00:00.000Z",
+        ));
         ledger.record_store_receipt(
             "k-b1".to_owned(),
             EventType::FirstMessage,
@@ -645,10 +649,14 @@ mod tests {
             alias: "m1".to_owned(),
             family: EventFamily::Message,
             expected_at: "2026-09-20T12:01:00.000Z".to_owned(),
-            key_hint: Some("100000000000000001:900000000000001111:first_message:2026-09-20T12:01:00.000Z".to_owned()),
+            key_hint: Some(
+                "100000000000000001:900000000000001111:first_message:2026-09-20T12:01:00.000Z"
+                    .to_owned(),
+            ),
         });
         ledger.record_store_receipt(
-            "100000000000000001:900000000000001111:first_message:2026-09-20T12:01:00.000Z".to_owned(),
+            "100000000000000001:900000000000001111:first_message:2026-09-20T12:01:00.000Z"
+                .to_owned(),
             EventType::FirstMessage,
             "2026-09-20T12:01:00.000Z".to_owned(),
             true,
@@ -817,14 +825,8 @@ mod tests {
         assert_eq!(packet["counts"]["gaps"], 1);
         let raw = serde_json::to_string(&packet).expect("serializes");
         assert!(!raw.contains("member_join"), "event type material leaked");
-        assert!(
-            !raw.contains("voice_session"),
-            "event type material leaked"
-        );
-        assert!(
-            !raw.contains("first_message"),
-            "event type material leaked"
-        );
+        assert!(!raw.contains("voice_session"), "event type material leaked");
+        assert!(!raw.contains("first_message"), "event type material leaked");
         assert!(!raw.contains("channel:"), "channel material leaked");
         assert!(!raw.contains("fixture-m1"), "message id leaked");
         assert!(!raw.contains("invite:fixture"), "source material leaked");
