@@ -82,7 +82,8 @@ pub struct ConditionFacts {
     /// Members in the room live on an external platform (`ANY_LIVE`).
     pub live_external_count: u32,
     /// Resolved, aliased game titles the room name shows: the majority title,
-    /// both titles on a two-way tie, empty when no game wins (`GAME`).
+    /// both titles on a two-way tie, empty when no game wins (`GAME`). Fill it
+    /// from [`crate::voice_naming::majority_games`].
     pub games: Vec<String>,
     /// The room is locked or hidden (`PRIVATE`).
     pub private: bool,
