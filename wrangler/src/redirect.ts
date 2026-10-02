@@ -132,12 +132,14 @@ export function clickIdempotencyKey(click: RedirectClick): string {
  *   (`capacity / refillPerSecond`), so eviction can only discard buckets that
  *   refill would already have restored to full — a key that still owes tokens
  *   is never idle-expired, and expiry never grants tokens refill would not.
- * - Cardinality cap: at most `maxBuckets` entries. A new key past the cap is
- *   denied (fail closed) — overflow sheds load, it never disables throttling.
- *   Buckets already tracked are unaffected by the cap.
+ * - Cardinality cap: at most `maxBuckets` entries. A new key at the cap first
+ *   reaps idle-expired entries; it is denied (fail closed) only if the map is
+ *   still full of live ones, so overflow sheds load and never disables
+ *   throttling. Buckets already tracked are unaffected by the cap.
  * - Bounded cleanup: every `take` touches its key (LRU order, most-recent at
  *   the back) then reaps at most `sweepBudget` idle-expired entries from the
- *   front. Per-call work is O(sweepBudget), independent of map size.
+ *   front; a new key at the cap runs the same reap before its verdict. Per-call
+ *   work is O(sweepBudget), independent of map size.
  */
 export class TokenBuckets {
   private buckets = new Map<string, { tokens: number; updatedAt: number }>();
@@ -200,7 +202,13 @@ export class TokenBuckets {
     }
     if (!b) {
       if (this.buckets.size >= this.maxBuckets) {
-        // Fail closed: shed the unknown caller, keep every tracked throttle.
+        // Reap first, so a map filled with one-time keys drains on new-key
+        // traffic alone instead of waiting for a tracked key to return.
+        this.sweep(t);
+      }
+      if (this.buckets.size >= this.maxBuckets) {
+        // Still full of live entries. Fail closed: shed the unknown caller and
+        // keep every tracked throttle.
         return {
           allowed: false,
           retryAfter: Math.max(1, Math.ceil(this.idleTtlMs / 1000)),
@@ -309,16 +317,32 @@ const text = (status: number, body: string, extra?: Record<string, string>): Red
  * first segment, stripping literal/encoded leading slashes and decoding once.
  * A malformed suffix cannot unreserve a recognized `metrics`/`healthz` prefix;
  * near-miss campaign slugs like `metricsfoo` still do not match.
+ * The ownership-fence control plane (`internal/ownership`, plus subpaths) is
+ * likewise reserved: it is served by the Worker (TOG-11143), never a campaign.
  */
 export function isReservedInternal(path: string): boolean {
   const bare = path.split("?")[0] ?? "/";
   const prefix = bare.replace(/^(?:\/|%2f)+/i, "").split(/\/|%2f/i, 1)[0] ?? "";
   try {
-    return RESERVED_SLUGS.includes(decodeURIComponent(prefix).toLowerCase());
+    if (RESERVED_SLUGS.includes(decodeURIComponent(prefix).toLowerCase())) {
+      return true;
+    }
   } catch {
     // An undecodable prefix is not provably reserved; callers fail closed.
     return false;
   }
+  let canonical: string;
+  try {
+    canonical = decodeURIComponent(
+      bare.replace(/^\/+/, "").replace(/\/+$/, ""),
+    ).toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    canonical === "internal/ownership" ||
+    canonical.startsWith("internal/ownership/")
+  );
 }
 
 export async function handleRedirect(

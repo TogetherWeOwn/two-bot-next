@@ -3,6 +3,7 @@
 //! Slash wiring must use the same store's channel fence, not execute_outcome's
 //! unrecorded unlock fallback. Uncertain effects retain both durable fences.
 
+use crate::ratelimit_guard::GuardError;
 use crate::{ActionExecutor, DiscordError};
 use serde_json::{json, Map, Value};
 use two_bot_core::channel_moderation::{self, ChannelOutcome, UnlockPlan};
@@ -571,6 +572,12 @@ fn discord_error(failure: DiscordError) -> ActionError {
         DiscordError::Timeout => ErrorCode::UpstreamTimeout,
         DiscordError::RateLimited => ErrorCode::RateLimited,
         DiscordError::Unavailable(_) => ErrorCode::DiscordUnavailable,
+        // Local guard refusals never reached the wire: a dead token is an
+        // outage, any other refusal is a retryable local pause.
+        DiscordError::Guard(GuardError::TokenInvalid) => ErrorCode::DiscordUnavailable,
+        DiscordError::Guard(_) => {
+            return error(ErrorCode::RateLimited, failure.to_string()).with_retry_after(1);
+        }
     };
     error(code, failure.to_string())
 }

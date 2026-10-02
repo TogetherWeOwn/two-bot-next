@@ -6,6 +6,7 @@
 //! or by future transports. Slices S3+ build on these seams.
 
 pub mod action_outcomes;
+pub mod anchor_event;
 pub mod audit;
 pub mod audit_mirror;
 #[cfg(feature = "db")]
@@ -85,14 +86,18 @@ pub mod scheduled_store;
 pub mod secret;
 pub use secret::Secret;
 pub mod self_roles;
+pub mod send_admission;
 pub mod settings;
 pub mod sticky;
 pub mod tickets;
 pub mod voice;
+pub mod voice_access;
 pub mod voice_alias;
 pub mod voice_assistant_cap;
+pub mod voice_assistant_request;
 pub mod voice_config;
 pub mod voice_config_diff;
+pub mod voice_custom_id;
 pub mod voice_naming;
 pub mod voice_ownership;
 pub mod voice_permission_health;
@@ -100,6 +105,7 @@ pub mod voice_permissions;
 pub mod voice_placement;
 pub mod voice_private;
 pub mod voice_room_controls;
+pub mod voice_template_lint;
 pub mod voice_text_channel;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
@@ -249,10 +255,11 @@ pub use onboarding_store::{
     record_prompted, record_session_routed, OnboardingStoreError, PromptGuard,
 };
 pub use presence::{
-    bot_floor_due, daily_peaks, decide_probe_cycle, evaluate_trigger, latest_bot_floor,
-    sanitize_presence_count, BotFloorScan, DailyPeak, PresenceReading, ProbeDecision,
-    TriggerOptions, TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS,
-    PRESENCE_PROBE_INTERVAL_MS, REOPEN_PEAK_THRESHOLD,
+    bot_floor_due, daily_peaks, decide_probe_cycle, decide_probe_lease, evaluate_trigger,
+    latest_bot_floor, release_probe_lease, sanitize_presence_count, BotFloorScan, DailyPeak,
+    PresenceReading, ProbeDecision, ProbeLease, ProbeLeaseDecision, TriggerOptions, TriggerStatus,
+    TriggerVerdict, BOT_FLOOR_MAX_AGE_MS, PRESENCE_PROBE_INTERVAL_MS, PRESENCE_PROBE_LEASE_MS,
+    REOPEN_PEAK_THRESHOLD,
 };
 pub use raid::{
     count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,
@@ -328,6 +335,10 @@ pub use voice::{
     known_voice_durations, parse_voice_end_metadata, resolve_voice_end, summarize_voice_durations,
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
+};
+pub use voice_access::{
+    is_voice_command, may_create_room, may_use_command, validate_access_controls, AccessControls,
+    AccessDecision, AccessDenyReason, AccessError, AccessMember, RoleId, VOICE_COMMANDS,
 };
 pub use voice_permission_health::{
     evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
