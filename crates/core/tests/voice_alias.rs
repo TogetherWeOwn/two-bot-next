@@ -644,7 +644,11 @@ proptest! {
         if let Ok(nick) = validate_nick(&raw) {
             let text = nick.as_str();
             prop_assert!(!text.chars().any(char::is_control));
-            prop_assert!(!text.contains(['\u{2028}', '\u{2029}', '\u{202e}']));
+            // Hoisted: `prop_assert!` formats `stringify!(cond)` into the
+            // failure message, so inline `\u{...}` escapes would parse as
+            // format placeholders and fail to compile.
+            let separators: &[char] = &['\u{2028}', '\u{2029}', '\u{202e}'];
+            prop_assert!(!text.contains(separators));
             prop_assert!((1..=MAX_NICK_CHARS).contains(&text.chars().count()));
             prop_assert_eq!(text, text.trim());
             let lower = text.to_lowercase();
