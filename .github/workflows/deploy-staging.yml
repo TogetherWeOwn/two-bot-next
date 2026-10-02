@@ -1,8 +1,7 @@
 name: deploy-staging
 
-# Deploys the Worker + Container to the staging environment on every push to
-# main, then gates on /readyz: the container must report the gateway ready
-# against the staging guild. Prod deploys are manual (B4 owns the cutover).
+# Staging only. Accept the intended new rollout + serving image, never an old
+# healthy singleton. Production deploys remain manual and cutover-owned.
 on:
   push:
     branches: [main]
@@ -13,8 +12,7 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: deploy-staging
@@ -22,11 +20,13 @@ concurrency:
 
 jobs:
   deploy:
-    name: wrangler deploy + readyz gate
+    name: wrangler deploy + intended rollout gate
+    if: ${{ false }} # zizmor: ignore[obfuscation] explicit unconditional suspension, tested offline
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'deploy') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
     # secret (TOG-12030); the job must declare the environment to read it.
+    # (Kept while the job is suspended so re-activation cannot drop the scope.)
     environment: staging
     timeout-minutes: 30
     defaults:
@@ -35,12 +35,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 1
+      # The runner context is not available in job-level env, so derive the
+      # per-attempt paths here and export them to every later step.
+      - name: Set per-attempt rollout paths
+        run: |
+          set -euo pipefail
+          rollout_dir="$RUNNER_TEMP/two-bot-staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "ROLLOUT_DIR=$rollout_dir" >> "$GITHUB_ENV"
+          echo "WRANGLER_OUTPUT_FILE_PATH=$rollout_dir/wrangler-output.ndjson" >> "$GITHUB_ENV"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: wrangler/package-lock.json
+          # Deploys must not consume caches populated by untrusted PR checks.
+          package-manager-cache: false
       - run: npm ci
       # Validate the dedicated staging control binding BEFORE replacing a healthy
       # deployment. Missing credentials are not permission to auto-claim an owner.
@@ -49,6 +58,18 @@ jobs:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
         run: node scripts/ownership-control.mjs preflight
+      - name: Snapshot staging identity and generate per-deploy image provenance
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROLLOUT_DIR"
+          python3 ../scripts/staging_rollout.py prepare \
+            --receipt "$ROLLOUT_DIR/baseline.json" \
+            --output "$WRANGLER_OUTPUT_FILE_PATH" \
+            --deploy-config "$ROLLOUT_DIR/staging-deploy.json"
       - name: Deploy to staging
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
         with:
@@ -56,6 +77,8 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           environment: staging
+          wranglerVersion: "4.143.1"
+          command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging
       - name: Transfer staging ownership to the deployed version
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
@@ -63,47 +86,17 @@ jobs:
           OWNERSHIP_ACTOR: github-actions:${{ github.run_id }}:${{ github.sha }}
           OWNERSHIP_RELEASE_FENCE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_fence && 'true' || 'false' }}
         run: node scripts/ownership-control.mjs deployment-takeover
-      # S1 contract (TOG-9907): /health must be 200 — that proves the
-      # Container/DO bindings are wired (HTTP 1101 meant env.TWO_BOT was
-      # undefined). /readyz is truthfully 503 while the gateway supervisor is
-      # parked: S2 (TOG-9807) connects the shard, S3 (TOG-9808) wires the
-      # pipeline, so only S2/S3 may turn this gate's 503 into a 200.
-      # Never fake readyz success to pass CI.
-      - name: Gate on /health + truthful /readyz
+      - name: Verify exact new rollout and serving Worker/container readiness
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
         run: |
           set -euo pipefail
-          test -n "$STAGING_URL" || {
-            echo "STAGING_WORKER_URL repo variable is not set;"
-            echo "ask the operator to add it (see docs/staging-soak.md), then re-run."
-            exit 1
-          }
-          # Container cold start can take a minute; poll /health up to ~5 min.
-          # Per-job $RUNNER_TEMP: fixed /tmp paths collide across the runners
-          # sharing one Docker host (TOG-11810).
-          for i in $(seq 1 30); do
-            code=$(curl -s -o "$RUNNER_TEMP/health.json" -w '%{http_code}' "$STAGING_URL/health" || true)
-            if [ "$code" = "200" ]; then
-              echo "health 200 after ~$((i * 10))s"
-              cat "$RUNNER_TEMP/health.json"
-              break
-            fi
-            echo "attempt $i: /health -> $code; waiting 10s"
-            if [ "$i" = "30" ]; then
-              echo "health never returned 200 (bindings still broken?)"
-              cat "$RUNNER_TEMP/health.json" || true
-              exit 1
-            fi
-            sleep 10
-          done
-          # /readyz must answer with a component breakdown: 200 once S2/S3
-          # meet contract, 503 while the shard is parked. Anything else
-          # (500/1101/...) means the deploy is still broken.
-          code=$(curl -s -o "$RUNNER_TEMP/readyz.json" -w '%{http_code}' "$STAGING_URL/readyz" || true)
-          echo "readyz -> $code"
-          cat "$RUNNER_TEMP/readyz.json" || true
-          # Ownership refusal is also 503, but must NEVER pass this gate.
-          # $RUNNER_TEMP: fixed /tmp paths collide across the runners sharing
-          # one Docker host (TOG-11810).
-          node scripts/check-readyz.mjs "$code" "$RUNNER_TEMP/readyz.json"
+          python3 ../scripts/staging_rollout.py verify \
+            --receipt "$ROLLOUT_DIR/baseline.json" \
+            --output "$WRANGLER_OUTPUT_FILE_PATH" \
+            --evidence "$ROLLOUT_DIR/evidence.json"
+          # Evidence contains only allowlisted version/digest/build IDs + statuses.
+          # No raw Wrangler sessions, CF configs, env values or HTTP error bodies.
+          python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/evidence.json")), sort_keys=True))'

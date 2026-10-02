@@ -78,10 +78,10 @@ impl InternalActionConfig {
         // The key ID is not part of the signature. Reusing one secret across
         // different principals would let a caller select the other's identity.
         for (index, key) in keys.iter().enumerate() {
-            if keys[..index]
-                .iter()
-                .any(|other| key.secret == other.secret && callers[&key.id] != callers[&other.id])
-            {
+            if keys[..index].iter().any(|other| {
+                key.secret.expose() == other.secret.expose()
+                    && callers[&key.id] != callers[&other.id]
+            }) {
                 return Err(invalid(
                     "TWO_INTERNAL_KEYS",
                     "a signing secret cannot identify different callers",
@@ -208,19 +208,22 @@ fn parse_callers(spec: &str) -> Result<HashMap<String, String>, ConfigError> {
 mod tests {
     use super::*;
 
-    fn fixture_secret() -> String {
+    fn fixture_secret(index: usize) -> String {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../tests/fixtures/internal-action-signing.json"
         ))
         .unwrap();
-        fixture["vectors"][0]["secret"].as_str().unwrap().to_owned()
+        fixture["vectors"][index]["secret"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     fn vars() -> HashMap<&'static str, String> {
         HashMap::from([
             ("TWO_INTERNAL_ACTIONS", "1".to_owned()),
             ("TWO_INTERNAL_BIND", "127.0.0.1:8091".to_owned()),
-            ("TWO_INTERNAL_KEYS", format!("old:{}", fixture_secret())),
+            ("TWO_INTERNAL_KEYS", format!("old:{}", fixture_secret(0))),
             ("TWO_INTERNAL_CALLERS", "old:website-staging".to_owned()),
             (
                 "TWO_INTERNAL_CHANNEL_KEYS",
@@ -313,8 +316,13 @@ mod tests {
     #[test]
     fn rotation_preserves_caller_identity_without_secret_debug() {
         let mut vars = vars();
-        let secret = fixture_secret();
-        vars.insert("TWO_INTERNAL_KEYS", format!("old:{secret},new:{secret}"));
+        let secret = fixture_secret(0);
+        let new_secret = fixture_secret(1);
+        assert_ne!(secret, new_secret);
+        vars.insert(
+            "TWO_INTERNAL_KEYS",
+            format!("old:{secret},new:{new_secret}"),
+        );
         vars.insert(
             "TWO_INTERNAL_CALLERS",
             "old:website-staging,new:website-staging".to_owned(),
@@ -327,12 +335,22 @@ mod tests {
         assert_eq!(config.channel_keys()["ann"], "333333333333333333");
         let debug = format!("{config:?}");
         assert!(!debug.contains(&secret));
+        assert!(!debug.contains(&new_secret));
         assert!(!debug.contains("website-staging"));
-        vars.insert(
-            "TWO_INTERNAL_CALLERS",
-            "old:website-staging,new:other-caller".to_owned(),
-        );
-        assert!(load(&vars).is_err());
+        // Rotation uses distinct secrets even when the logical caller is the
+        // same. The shared parser refuses aliases before caller resolution.
+        vars.insert("TWO_INTERNAL_KEYS", format!("old:{secret},new:{secret}"));
+        for callers in [
+            "old:website-staging,new:website-staging",
+            "old:website-staging,new:other-caller",
+        ] {
+            vars.insert("TWO_INTERNAL_CALLERS", callers.to_owned());
+            let error = load(&vars).unwrap_err();
+            let debug = format!("{error:?} {error}");
+            assert!(!debug.contains(&secret));
+            assert!(!debug.contains("website-staging"));
+            assert!(!debug.contains("other-caller"));
+        }
     }
 
     #[test]
@@ -350,7 +368,7 @@ mod tests {
             assert!(load(&vars).is_err());
         }
         vars.insert("TWO_INTERNAL_CALLERS", "old:website-staging".to_owned());
-        let secret = fixture_secret();
+        let secret = fixture_secret(0);
         for spec in [
             format!("old:{secret},old:{secret}"),
             "secret-sentinel:short".to_owned(),

@@ -226,6 +226,11 @@ VALUES (71, '100000000000000001', '2026-07-27T00:00:00.000Z', '2026-08-03T00:00:
         'maintain', '2026-08-03T00:00:01.000Z');
 INSERT INTO community_scorecard_alerts (guild_id, week_start, alert_key, created_at)
 VALUES ('100000000000000001', '2026-07-27T00:00:00.000Z', 'backup:alert:dedupe', '2026-08-03T00:00:02.000Z');
+-- Preserve both a spent-but-pending retry budget and terminal completion.
+INSERT INTO community_scorecard_attempts
+    (guild_id, week_key, attempts, next_attempt_at, completed)
+VALUES ('100000000000000001', '2026-08-10', 2, 1786343100000, FALSE),
+       ('100000000000000001', '2026-08-03', 1, 1785738000000, TRUE);
 INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at)
 VALUES ('100000000000000001', 2, 'backup-resume-session', 9007199254740993,
         'wss://gateway.example.invalid', '2026-08-01T10:00:00.123456Z');
@@ -255,6 +260,8 @@ VALUES (1, '2026-08-01T10:00:00Z', '100000000000000002');
 
 INSERT INTO internal_nonces (nonce_hash, burned_at, expires_at)
 VALUES (repeat('a', 64), '2026-08-01T10:00:00Z', '2026-08-01T10:04:01Z');
+INSERT INTO internal_clock_high_water (domain, high_water_ms, observed_at)
+VALUES ('internal_nonce_db', 1785578400000, '2026-08-01T10:00:00Z');
 INSERT INTO internal_idempotency
     (intent_id, caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id,
      target_id, created_at, updated_at, response_code, http_status, resource_id, affected)
@@ -303,8 +310,56 @@ INSERT INTO self_role_panel_claims
 VALUES ('100000000000000001', '100000000000000002', 'backup:panel', 'backup-self-role-claim',
         23, '2026-08-01T10:01:00.123456Z', 'backup:self-role:event', 'backup-option',
         'backup-event-order', TRUE);
+-- Send receipts and uncertainty baselines hang off the seeded audit event, so
+-- the complete-schema coverage test archives and restores them too.
+INSERT INTO self_role_exchanges
+    (exchange_id, event_id, origin_generation, role_id, adding, compensating,
+     disposition, created_at)
+VALUES ('backup:self-role:exchange', 'backup:self-role:event', 23,
+        '100000000000000010', TRUE, FALSE, 'pending', '2026-08-01T10:00:30.000Z');
+INSERT INTO self_role_exchange_baselines
+    (event_id, legacy_pending, unresolved_added_role_ids, unresolved_removed_role_ids)
+VALUES ('backup:self-role:event', FALSE, '[]', '[]');
+-- Main's newer durable delivery table rides the same complete-schema coverage:
+-- a delivery arbitration claim. gateway_boot_directives is already seeded by
+-- main's own consumed+armed rows above; a second (guild, shard 0) row would
+-- collide on the primary key.
+INSERT INTO automod_delivery_claims
+    (guild_id, message_id, delivery_kind, dry_run, request_hash)
+VALUES ('100000000000000001', 'backup:message', 'create', FALSE, 'backup-request');
 
 -- Operator erasure receipts carry no subject; accountability survives restore.
 INSERT INTO member_erasure_audit (actor, erased_at)
 VALUES ('backup-operator', '2026-08-01T10:00:00.123456Z'),
        ('backup-operator', '2026-08-02T10:00:00Z');
+
+-- Tracked short links behind go.two.gg; disabled rows still redirect.
+INSERT INTO invite_campaigns (slug, invite_code, label, disabled_at, created_at)
+VALUES ('backup-link', 'backup-code', 'backup sidebar', NULL, '2026-08-01T10:00:00.123456Z'),
+       ('backup-retired', 'backup-retired-code', 'retired placement',
+        '2026-08-02T10:00:00Z', '2026-08-01T10:00:00Z');
+
+-- Temporary voice rooms: one inheriting and one channel-sourced creator; rooms
+-- outlive their creator config, so one room points at an unmarked creator.
+INSERT INTO voice_creators (guild_id, channel_id, name_template, permission_source,
+  permission_channel_id, default_limit, private_default, text_channels,
+  text_channel_name, text_viewer_role_id, position, first_room_number)
+VALUES ('100000000000000001', '100000000000000030', '{user}''s room', 'creator',
+        NULL, NULL, FALSE, FALSE, NULL, NULL, 'above', 1),
+       ('100000000000000001', '100000000000000031', 'Squad #{n}', 'channel',
+        '100000000000000032', 5, TRUE, TRUE, 'Squad chat', '100000000000000001', 'below', 3);
+INSERT INTO voice_rooms (guild_id, channel_id, creator_channel_id, owner_id,
+  original_creator_id, name_seed, created_at)
+VALUES ('100000000000000001', '100000000000000033', '100000000000000030',
+        '100000000000000002', '100000000000000002', '18446744073709551615',
+        '2026-08-01T10:00:00.123456Z'),
+       ('100000000000000001', '100000000000000034', '100000000000000035',
+        '100000000000000003', '100000000000000002', '7', '2026-08-02T10:00:00Z');
+-- Companion text channels carry the creation-time settings snapshot; one
+-- default-named, one custom-named with an @everyone viewer role.
+INSERT INTO voice_text_companions (guild_id, room_channel_id, text_channel_id,
+  text_channels, text_channel_name, text_viewer_role_id, created_at)
+VALUES ('100000000000000001', '100000000000000033', '100000000000000036',
+        TRUE, NULL, NULL, '2026-08-01T10:00:00.123456Z'),
+       ('100000000000000001', '100000000000000034', '100000000000000037',
+        TRUE, 'Squad chat', '100000000000000001', '2026-08-02T10:00:00Z');

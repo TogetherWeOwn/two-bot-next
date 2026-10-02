@@ -277,6 +277,49 @@ Wrangler lists the ten most recent versions/deployments. Select the actual
 previously healthy version from your deployment record; never silently choose
 "latest" or omit the rollback ID.
 
+### Staging-only migration runner
+
+`.github/workflows/staging-migrate.yml` (manual, staging-only, no production
+path) runs `staging-migrate --plan|--apply` from `crates/cutover/src/bin/staging_migrate.rs`.
+It embeds this crate's migrations through the SQLx **0.9.0 library** (no
+`sqlx-cli`; the pin is asserted against `Cargo.lock`), keeps the ledger in
+`public._sqlx_migrations`, and runs `SET ROLE two_bot_migrator` in SQLx's
+per-connection `after_connect`, verifying `current_user` on every connection.
+Invocation (secret-free; the URL comes only from the existing
+`TWO_BOT_STAGING_MIGRATOR_DATABASE_URL` binding):
+
+```text
+staging-migrate --plan --source-sha <40hex> --staging-host <host> \
+  --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
+```
+
+It refuses (exit 2, before any DDL) when the binding is absent, the target does
+not equal the named staging identity, the database name does not contain
+`staging` or looks like production, the login cannot assume `two_bot_migrator`,
+a reference is missing, or the ledger has a failed/incomplete row, a SHA-384
+mismatch, an unknown version or a non-prefix order. It never resets, reverts,
+restores, creates roles or grants. The sanitized JSON manifest (source SHA,
+per-migration SHA-384, ledger before/after, applied count) is the evidence; on
+failure the ledger-after is preserved, not repaired.
+
+The workflow runs only when dispatched from `main` and reads the binding from
+the `staging-migrate` GitHub environment. That environment must have a required
+reviewer and a main-only deployment-branch rule, and the binding must be an
+environment secret, not a repository secret; otherwise a workflow edited on
+another branch could read it. This change does not create the environment or
+the secret.
+
+Prerequisites the legitimate principal must verify **before dispatch** (the
+runner cannot, and this change does not claim them): the real staging Neon
+identity; that the dedicated migrator binding already exists; the
+`staging-migrate` environment protections above; and a complete
+recovery set covering the Next schema, `_sqlx_migrations` ledger, object
+ownership, ACLs and logins. The generic legacy backup omits Next tables and the
+SQLx history, and unverified Neon PITR is not a working recovery. Apply the
+reviewed ACL sequence in `docs/database-roles.md` so other shared-database
+services keep their access. Real SQLx proof runs only against disposable CI
+services (`crates/cutover/tests/staging_migrate_db.rs`).
+
 ### Redeploy the approved revision
 
 With the correct revision already selected in a separate clean operator checkout,
@@ -377,6 +420,32 @@ Source: [`gateway.rs`](../crates/bot/src/gateway.rs),
 [`gateway_session.rs`](../crates/core/src/gateway_session.rs),
 [`durable store`](../crates/cutover/src/gateway_session.rs),
 [recovery notes](gateway-recovery.md).
+
+### Force-fresh IDENTIFY (first production boot only)
+
+First production boot only: the age policy above alone would RESUME a
+checkpoint up to 15 minutes old, so the first production boot arms a one-shot
+directive to force a fresh IDENTIFY instead. Authority and full contract:
+[Force-fresh IDENTIFY](gateway-recovery.md#force-fresh-identify-first-production-boot).
+`TWO_DATABASE_URL` is the bot database the target Container uses; `GUILD_ID`
+is that Container's configured guild, and `--guild` must equal it. Quoted
+verbatim from the authority (only the `two-bot` binary ships in the image;
+run from an operator checkout):
+
+```sh
+# 1. Dry run (default): prints guild, shard 0, checkpoint age and directive; writes nothing.
+cargo run -p two-bot-cutover --bin gateway-force-identify --locked -- --guild "$GUILD_ID"
+# 2. Arm. The live guild also needs --allow-live-guild.
+cargo run -p two-bot-cutover --bin gateway-force-identify --locked -- \
+  --guild "$GUILD_ID" --apply --reason "first production boot" --allow-live-guild
+# 3. Start the bot, then re-run the dry run: the directive shows "consumed at ...".
+```
+
+The live (production) guild refuses without `--allow-live-guild`. One-shot
+consume semantics: of two concurrent boot reads, exactly one consumes the
+directive; the directive never deletes or rewrites `gateway_sessions` — the
+bot's existing discard path clears the checkpoint before IDENTIFY, and the
+next boot after READY has no directive and RESUMEs normally.
 
 ## Containment, kill switches and feature flags
 

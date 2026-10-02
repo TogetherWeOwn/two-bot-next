@@ -3732,6 +3732,102 @@
       ]
     },
     {
+      "id": "supplement-repeat-lookback-filler-first",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "lookback fixture",
+          "id": "f1",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "unrelated filler",
+          "id": "f2",
+          "at_ms": 1001000,
+          "expected": null
+        },
+        {
+          "content": "lookback fixture",
+          "id": "f3",
+          "at_ms": 1002000,
+          "expected": null
+        },
+        {
+          "content": "lookback fixture",
+          "id": "f4",
+          "at_ms": 1003000,
+          "expected": "repeated_message"
+        }
+      ]
+    },
+    {
+      "id": "supplement-repeat-lookback-filler-middle",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "lookback fixture",
+          "id": "m1",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "lookback fixture",
+          "id": "m2",
+          "at_ms": 1001000,
+          "expected": null
+        },
+        {
+          "content": "unrelated filler",
+          "id": "m3",
+          "at_ms": 1002000,
+          "expected": null
+        },
+        {
+          "content": "lookback fixture",
+          "id": "m4",
+          "at_ms": 1003000,
+          "expected": "repeated_message"
+        }
+      ]
+    },
+    {
+      "id": "supplement-repeat-lookback-two-fillers",
+      "assertions": [],
+      "env": {},
+      "kind": "match",
+      "messages": [
+        {
+          "content": "lookback fixture",
+          "id": "c1",
+          "at_ms": 1000000,
+          "expected": null
+        },
+        {
+          "content": "first filler",
+          "id": "c2",
+          "at_ms": 1001000,
+          "expected": null
+        },
+        {
+          "content": "second filler",
+          "id": "c3",
+          "at_ms": 1002000,
+          "expected": null
+        },
+        {
+          "content": "lookback fixture",
+          "id": "c4",
+          "at_ms": 1003000,
+          "expected": null
+        }
+      ]
+    },
+    {
       "id": "staging-default-mentions-4",
       "assertions": [],
       "env": {},

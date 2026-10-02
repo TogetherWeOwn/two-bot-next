@@ -14,6 +14,33 @@ on HOLD until separately approved and recorded. Never use the signing test
 fixture as a runtime credential. The Worker ingress and secret bindings are
 unchanged.
 
+## Authentication across a durable nonce commit
+
+`AuthenticatedRequest::verify` authenticates the four v1 headers and exact body
+bytes before evaluating the process-clock `ClockGuard` or checking freshness.
+It neither parses JSON nor consumes a bucket. The returned capability is opaque,
+non-cloneable and not printable. It keeps those same bytes, header values and
+guarded process time across the async database wait.
+
+`burn_durably(&InternalActionStore)` consumes that capability and grants a
+`NonceBurnedRequest` only after a successful new nonce commit. The store checks
+freshness again against its independent, persisted DB-clock high-water mark.
+A replay, DB failure, incompatible skew or excessive DB rollback cannot grant
+authorization. There is no volatile fallback. Do not restore a process-clock
+guard from the DB-clock mark: they are different clock domains.
+
+Only the burned capability exposes post-replay `authorize`: per-key bucket,
+unique-key JSON parsing and action/feature checks, in that order. Cancellation
+before commit never authorizes; cancellation after commit may burn an attempt
+without executing it. The existing in-memory `authorize` uses the same stages
+with its cache burn, preserving its ClockGuard and TTL-coverage checks.
+
+This is still the legacy v1 signing contract. The [v2 specification](internal-action-signing-v2.md)
+is not an implemented verifier. No unsigned caller/audience header is trusted.
+Stable caller mapping, idempotency claim, action validation, outbound admission,
+execution and durable finalization remain receiver responsibilities; this
+capability does not itself permit a Discord effect.
+
 ## Configuration contract
 
 `two_bot_core::internal_action_config::InternalActionConfig::from_env` returns
@@ -26,14 +53,15 @@ An enabled receiver requires all of these settings, without defaults:
 | Setting | Meaning |
 | --- | --- |
 | `TWO_INTERNAL_BIND` | Literal private IP plus explicit nonzero port. IPv6 uses brackets. No hostname, URL, wildcard, public address or ephemeral port. |
-| `TWO_INTERNAL_KEYS` | Existing comma-separated `key-id:secret` signing specification; each secret is at least 32 bytes. At most 64 keys, with unique IDs. |
+| `TWO_INTERNAL_KEYS` | Existing comma-separated `key-id:secret` signing specification; each secret is at least 32 bytes. At most 64 keys, with unique IDs and distinct secrets. |
 | `TWO_INTERNAL_CALLERS` | Comma-separated `key-id:caller` mappings. Exactly one entry for each signing key, no unknown entries. The caller is a stable logical identity, not a key-rotation version. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Explicit nonempty comma-separated channel-key/Discord-ID map. Names are unique; IDs are canonical, nonzero, u64-representable snowflakes. |
 
 Key IDs, caller names and channel-key names are 1–128 ASCII alphanumeric,
 period, underscore or hyphen characters. Multiple rotating keys may identify the
-same logical caller. A signing secret cannot be shared by different callers:
-the key ID itself is not authenticated by the legacy signature format.
+same logical caller, but every key ID must have a distinct signing secret, even
+for that same caller. The shared parser refuses secret aliases: the key ID
+itself is not authenticated by the legacy signature format.
 
 Runtime integration must load this separately from the gateway's health-only
 configuration fallback. Invalid enabled configuration is a fatal startup error,
@@ -57,25 +85,18 @@ only the bind address and counts, never keys, secrets or caller mappings.
 
 The announcement adapter's cooldown obligation is not satisfied by core inbound
 `TokenBuckets`, the existing executor's pacing mutexes, or sharing a Twilight
-client. There is currently no durable bot-token-wide governor. See
+client. A shared durable admission gate
+([TOG-11045](/TOG/issues/TOG-11045)) must cover the announcement transport
+before execution is enabled. See
 [the executor contract](internal-action-executor.md#single-attempt-and-safe-results).
-
-Before enabling execution, a shared durable admission gate must cover the
-announcement transport and the existing runtime executor (including sticky
-create/delete and each retry attempt). Install every returned cooldown before
-admitting later work, retain longer or indefinite holds, and fail closed across
-storage failures and restarts. A conservative token-wide gate may promote
-channel cooldowns to global; a receiver-local sleep is not sufficient. Same-token
-cutover/backup tooling must also participate or be explicitly excluded from
-concurrent activation. Unknown action outcomes and terminal 429 keys must never
-be automatically resent.
 
 ## Tests
 
-The configuration unit tests use only the existing public signing vector. They
+The configuration unit tests use only the existing public signing vectors. They
 exercise dark defaults, strict enable values, missing/non-Unicode settings,
-private literal binds, key-rotation caller continuity, duplicate/ambiguous
-mappings, same-secret principal confusion, canonical channels and redaction.
+private literal binds, distinct-key rotation with caller continuity,
+duplicate/ambiguous mappings, same-secret aliases for the same or different
+callers, canonical channels and redaction.
 They do not read runtime credentials, open sockets, access databases or send to
 Discord.
 

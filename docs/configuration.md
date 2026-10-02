@@ -44,6 +44,18 @@ resolved from legacy `TWO_DATABASE_URL` / `DISCORD_GUILD_ID`. Token, database UR
 and guild ID have no embedded deployment value; the listen address defaults to
 `0.0.0.0:8080`. Missing configuration is not proof of readiness.
 
+### Shutdown
+
+SIGTERM/SIGINT flips `/readyz` to 503, stops gateway intake, drains accepted
+dispatches and jobs, commits the gateway checkpoint and closes the pool. The
+whole drain is bounded by `SHUTDOWN_TIMEOUT_SECONDS` (whole seconds, 1–900;
+default 35 = the 30 s dispatch drain plus 5 s margin). Past the bound the process
+logs `shutdown_deadline_exceeded` and exits 1, so the supervisor restarts from the
+last committed checkpoint; a blocking checkpoint writer cannot be abandoned
+safely. A second SIGTERM/SIGINT exits 1 immediately. The Container stop
+grace period (SIGTERM, 15 minutes, SIGKILL) is a wrangler setting and is not
+configured here.
+
 Under the Worker, the Container also receives the reviewed `TWO_*` runtime
 flags in `wrangler/src/container-env.ts` (`FORWARDED_FLAGS`), forwarded
 verbatim when the Worker env defines them as strings. Secrets never pass
@@ -60,7 +72,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 117.
+Catalog entries: 119.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -138,9 +150,11 @@ Catalog entries: 117.
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | env_only | Not specified in Next | environment only | Capability gate for event reads. |
 | `TWO_INTERNAL_ALLOW_MODERATION` | env_only | Not specified in Next | environment only | Capability gate for internal moderation actions. |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | env_only | Not specified in Next | environment only | Capability gate for internal settings actions. |
-| `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Internal-action listener interface; environment-only network bind. |
+| `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined private IP:port for receiver configuration; no default or Container bootstrap wiring. |
+| `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy split internal-action listener interface; receiver configuration uses TWO_INTERNAL_BIND instead. |
+| `TWO_INTERNAL_CALLERS` | env_only | Not specified in Next | environment only | Signing-key-to-stable-caller mappings for receiver configuration; environment-only identity boundary, not loaded by Container bootstrap. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | env_only | Not specified in Next | environment only | Logical channel-key allowlist for internal actions. |
-| `TWO_INTERNAL_PORT` | env_only | Not specified in Next | environment only | Internal-action listener port; environment-only network bind. |
+| `TWO_INTERNAL_PORT` | env_only | Not specified in Next | environment only | Legacy split internal-action listener port; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_ROLE_KEYS` | env_only | Not specified in Next | environment only | Logical role-key allowlist for internal actions. |
 | `TWO_JOIN_RISK_THRESHOLD` | hot | Not specified in Next | stored unwired | Join-risk threshold for protection decisions. |
 | `TWO_JOIN_RISK_WINDOW_SECONDS` | hot | Not specified in Next | stored unwired | Aggregation window for join-risk decisions. |

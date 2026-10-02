@@ -365,7 +365,7 @@ impl RestClient {
     }
 
     /// Bounded archived-thread walk with explicit completion evidence.
-    /// `max_pages` is the same hard cost ceiling [`scan_channel`] uses:
+    /// `max_pages` is the same hard cost ceiling `scan_channel` uses:
     /// hitting it reports `incomplete` rather than dropping older threads
     /// silently. Reports `Ok(None)` when the first page is unreadable, so
     /// the compat helper keeps the legacy no-listing contract; a later

@@ -62,6 +62,8 @@ struct ReadinessReport {
     health: HealthReport,
     // Informational component: not included in HealthReport::ready().
     jobs: std::collections::BTreeMap<String, crate::jobs::JobStatus>,
+    build_revision: &'static str,
+    build_id: &'static str,
 }
 
 async fn readyz(
@@ -86,7 +88,15 @@ async fn readyz(
     })
     .await;
     let (code, health) = with_token_state(code, health, guard.snapshot().token_invalid);
-    (code, Json(ReadinessReport { health, jobs }))
+    (
+        code,
+        Json(ReadinessReport {
+            health,
+            jobs,
+            build_revision: option_env!("BOT_BUILD_REVISION").unwrap_or("unknown"),
+            build_id: option_env!("BOT_BUILD_ID").unwrap_or("unknown"),
+        }),
+    )
 }
 
 /// A rejected bot token is fatal: surface it as its own readiness component.
@@ -166,6 +176,7 @@ pub async fn serve(
             }
             *gateway.write().await = GatewayState::Draining;
             shutdown.send_replace(true);
+            crate::shutdown::exit_on_second_signal();
         })
         .await
 }
@@ -296,6 +307,14 @@ mod tests {
             assert_eq!(json["jobs"]["counter"]["last_error_class"], "timeout");
             assert_eq!(json["jobs"]["counter"]["consecutive_failures"], 2);
             assert_eq!(json["components"][0][0], "process");
+            assert_eq!(
+                json["build_revision"],
+                option_env!("BOT_BUILD_REVISION").unwrap_or("unknown")
+            );
+            assert_eq!(
+                json["build_id"],
+                option_env!("BOT_BUILD_ID").unwrap_or("unknown")
+            );
             assert_eq!(
                 json["components"][1],
                 serde_json::json!(["gateway", gateway.status()])

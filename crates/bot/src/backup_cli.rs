@@ -14,6 +14,9 @@
 //! last line is the only success for restores), 1 failure, 2 usage/guard
 //! refusal, 3 tampered guild-config snapshot.
 
+// Operator commands intentionally emit human-readable/JSON output to stdout.
+#![allow(clippy::print_stdout)]
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +24,11 @@ use two_bot_core::backup::{
     dump, dump_file, guild_config, guild_config_api::GuildConfigDiscordApi, guild_config_restore,
     http, retention, s3,
 };
+
+pub fn print_server_usage() {
+    println!("{}", crate::preflight::USAGE);
+    print!("{}", crate::erasure_cli::USAGE);
+}
 
 fn env_var(name: &str) -> Option<String> {
     env::var(name)
@@ -106,7 +114,7 @@ two-bot operator commands
       Read-only privilege drift inspection. Env: TWO_DATABASE_URL (required).
 
   two-bot backup
-      Dump all bot-owned tables (v3 format) to TWO_BACKUP_DIR
+      Dump all bot-owned tables (v4 format) to TWO_BACKUP_DIR
       (default ./backups) as two-funnel-<stamp>.ndjson.gz, prune to
       TWO_BACKUP_KEEP newest (default 14), then run TWO_BACKUP_UPLOAD_CMD
       with the file path as its last argument.

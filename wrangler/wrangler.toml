@@ -9,6 +9,11 @@
 name = "two-bot-next"
 main = "src/index.ts"
 compatibility_date = "2026-09-29"
+# nodejs_compat lets node-postgres reach Hyperdrive when the optional
+# REDIRECT_DB binding exists (redirect-db.ts, TOG-12194). The second flag
+# keeps secrets and vars out of process.env: bindings stay reachable only
+# through `env`, as they were before nodejs_compat. Inherited by every [env.*].
+compatibility_flags = ["nodejs_compat", "nodejs_compat_do_not_populate_process_env"]
 
 # Identity is supplied by Cloudflare, not a hand-edited env flag. Ownership
 # must be explicitly transferred after each new version is deployed.
@@ -35,9 +40,10 @@ type = "durable-object"
 storage = "sqlite"
 
 [vars]
-# B3 (TOG-9696): go.two.gg redirect source. Hyperdrive binding
-# `REDIRECT_DB` lands with S1; until then REDIRECT_MAPPINGS_JSON carries a
-# snapshot of the invite_campaigns rows (same shape, see redirect-store.ts).
+# B3 (TOG-9696): go.two.gg redirect source. The optional Hyperdrive binding
+# `REDIRECT_DB` (TOG-12194) is created by the Operator, not declared here yet;
+# without it REDIRECT_MAPPINGS_JSON carries a snapshot of the invite_campaigns
+# rows (same shape, see redirect-store.ts) and clicks are dropped.
 # REDIRECT_FALLBACK_CODE is the invite code for `/` and DB outages.
 REDIRECT_FALLBACK_CODE = ""
 REDIRECT_MAPPINGS_JSON = "[]"
