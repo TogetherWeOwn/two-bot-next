@@ -92,18 +92,20 @@ jobs:
           docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_bot_test_tog10090_nightly
           docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_next_backup_nightly
           docker exec "$TEST_DB_CONTAINER" createdb -U agent_test two_next_backup_publication_nightly
-          mkdir -p "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
+          mkdir -p "$RUNNER_TEMP/nightly-workspace" "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
       # Serial execution prevents the ignored stores' shared tables/locks from
       # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
-      # Channel moderation, the discord channel-moderation executor, feeds_store
-      # and legacy_verify_db require agent_test, not the two_bot_test_*
-      # bootstrap used by TestDatabase suites. Skip only those tests here, then
-      # run ALL four suites below with their accepted URL.
+      # Channel moderation, the discord channel-moderation executor, feeds_store,
+      # legacy_verify_db and raid_list_db require agent_test, not the
+      # two_bot_test_* bootstrap used by TestDatabase suites. Skip only those
+      # tests here, then run ALL five suites below with their accepted URL.
+      # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
       # No ignored suite is permanently excluded.
       - name: Full workspace sweep including ignored tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
           MEMBER_TESTDB: agent-testdb
+          TEST_DATABASE_URL: postgresql://agent_test@agent-testdb:5432/postgres
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
         run: >-
           cargo test --workspace --all-features --locked -- --include-ignored --test-threads=1
@@ -141,6 +143,7 @@ jobs:
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance
           --skip dump_inspect_restore_round_trip
+          --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
@@ -168,6 +171,13 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-cutover --all-features --test legacy_verify_db --locked
+          -- --include-ignored --test-threads=1
+      - name: Raid list ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test raid_list_db --locked
           -- --include-ignored --test-threads=1
       # Backup integration tests are opt-in (not #[ignore]); the URL is unset in
       # the broad sweep because they rebuild tables and need dedicated databases.
