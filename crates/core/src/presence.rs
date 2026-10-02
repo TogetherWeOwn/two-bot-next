@@ -42,6 +42,14 @@ pub const PRESENCE_PROBE_INTERVAL_MS: u64 = 60 * 60 * 1000;
 /// move. Once a day is far more often than the floor actually drifts.
 pub const BOT_FLOOR_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Overlap-lease expiry for one probe cycle (TOG-12142).
+///
+/// A cycle slower than this is presumed dead: a later trigger takes over the
+/// lease instead of queueing behind a stuck run. Set well above the 120 s job
+/// supervisor timeout (no legitimate cycle lives that long) and well below
+/// the hourly cadence, so a wedged holder self-heals within one tick.
+pub const PRESENCE_PROBE_LEASE_MS: u64 = 30 * 60 * 1000;
+
 /// Reopen threshold (legacy `REOPEN_PEAK_THRESHOLD`): raw
 /// `approximate_presence_count` peaks at or above this argue roughly 20+
 /// humans online at once against a ~23 bot floor. Compare to a raw reading,
@@ -149,6 +157,46 @@ pub fn decide_probe_cycle(
         presence: count,
         bot_floor,
         bot_floor_scan_truncated,
+    }
+}
+
+/// One probe cycle's overlap lease (TOG-12142): the `started_at_ms` of the
+/// cycle currently holding the probe, or `None` when no cycle is in flight.
+/// The caller holds this in memory; a restart starts unleased, never inheriting
+/// a dead process's claim.
+pub type ProbeLease = Option<i64>;
+
+/// Overlap verdict for one trigger: run this cycle, skip it, or take over a
+/// stale holder's lease. Pure in `now_ms` so tests drive it with a fake clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeLeaseDecision {
+    /// No cycle in flight: take the lease (`started_at_ms = now_ms`) and run.
+    Run,
+    /// A recent cycle is still in flight: skip this trigger, log and return.
+    Skip,
+    /// The holder started at or before `now - lease_ms` and is presumed dead:
+    /// take over the lease (`started_at_ms = now_ms`) and run.
+    Takeover,
+}
+
+/// Decide whether this trigger runs (TOG-12142).
+///
+/// `None` is always runnable — a finished cycle clears the lease, so the next
+/// trigger starts clean. `Some(started)` skips while the holder is fresh
+/// (`now - started < lease_ms`, the `>=` boundary takes over), which keeps a
+/// slow run from duplicating the daily roster scan while letting a wedged
+/// holder self-heal without operator action.
+#[must_use]
+pub fn decide_probe_lease(lease: ProbeLease, now_ms: i64, lease_ms: u64) -> ProbeLeaseDecision {
+    match lease {
+        None => ProbeLeaseDecision::Run,
+        Some(started) => {
+            if now_ms.saturating_sub(started) >= lease_ms as i64 {
+                ProbeLeaseDecision::Takeover
+            } else {
+                ProbeLeaseDecision::Skip
+            }
+        }
     }
 }
 
@@ -568,6 +616,42 @@ mod tests {
         );
         assert_eq!(fires.status, TriggerStatus::Fires);
         assert!(fires.reason.contains("Both halves hold"));
+    }
+
+    #[test]
+    fn overlap_lease_skips_concurrent_cycle_and_heals_stale_holder() {
+        let now = ms("2026-09-07T06:15:00.000Z");
+        let lease_ms = PRESENCE_PROBE_LEASE_MS;
+        // No cycle in flight: take the lease and run.
+        assert_eq!(
+            decide_probe_lease(None, now, lease_ms),
+            ProbeLeaseDecision::Run
+        );
+        // A fresh holder blocks the next trigger: skip, no roster rescan.
+        assert_eq!(
+            decide_probe_lease(Some(now), now, lease_ms),
+            ProbeLeaseDecision::Skip
+        );
+        assert_eq!(
+            decide_probe_lease(Some(now), now + lease_ms as i64 - 1, lease_ms),
+            ProbeLeaseDecision::Skip
+        );
+        // `>=` boundary takes over: a cycle slower than the lease is dead.
+        assert_eq!(
+            decide_probe_lease(Some(now), now + lease_ms as i64, lease_ms),
+            ProbeLeaseDecision::Takeover
+        );
+        assert_eq!(
+            decide_probe_lease(Some(now), now + lease_ms as i64 + 1, lease_ms),
+            ProbeLeaseDecision::Takeover
+        );
+        // A stale holder's lease never leaks into the next decision: after
+        // takeover the new holder's own start governs the following trigger.
+        let taken_over = now + lease_ms as i64;
+        assert_eq!(
+            decide_probe_lease(Some(taken_over), taken_over + H, lease_ms),
+            ProbeLeaseDecision::Skip
+        );
     }
 
     #[test]

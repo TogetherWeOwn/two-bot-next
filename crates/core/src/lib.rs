@@ -19,6 +19,7 @@ pub mod channel_moderation;
 pub mod channel_moderation_store;
 pub mod classify;
 pub mod command_permissions;
+pub mod command_restoration;
 pub mod commands;
 pub mod community;
 pub mod community_snapshots;
@@ -236,10 +237,11 @@ pub use onboarding_store::{
     record_prompted, record_session_routed, OnboardingStoreError, PromptGuard,
 };
 pub use presence::{
-    bot_floor_due, daily_peaks, decide_probe_cycle, evaluate_trigger, latest_bot_floor,
-    sanitize_presence_count, BotFloorScan, DailyPeak, PresenceReading, ProbeDecision,
-    TriggerOptions, TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS,
-    PRESENCE_PROBE_INTERVAL_MS, REOPEN_PEAK_THRESHOLD,
+    bot_floor_due, daily_peaks, decide_probe_cycle, decide_probe_lease, evaluate_trigger,
+    latest_bot_floor, sanitize_presence_count, BotFloorScan, DailyPeak, PresenceReading,
+    ProbeDecision, ProbeLease, ProbeLeaseDecision, TriggerOptions, TriggerStatus, TriggerVerdict,
+    BOT_FLOOR_MAX_AGE_MS, PRESENCE_PROBE_INTERVAL_MS, PRESENCE_PROBE_LEASE_MS,
+    REOPEN_PEAK_THRESHOLD,
 };
 pub use raid::{
     count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,
