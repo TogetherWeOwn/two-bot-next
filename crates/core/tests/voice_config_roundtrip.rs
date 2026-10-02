@@ -122,6 +122,9 @@ fn fixture() -> (VoiceConfiguration, GuildInventory) {
     (config, inventory)
 }
 
+// Mutates an exported JSON value to plant one unknown reference.
+type Mutation = Box<dyn Fn(&mut Value)>;
+
 fn import_value(
     value: &Value,
     inventory: &GuildInventory,
@@ -187,7 +190,7 @@ fn unknown_channel_ids_are_reported_and_skippable_with_nothing_written() {
 
     // Each unknown channel ID is reported with its field and kind, never
     // echoing uploaded text.
-    let rows: Vec<(&str, Box<dyn Fn(&mut Value)>, &str)> = vec![
+    let rows: Vec<(&str, Mutation, &str)> = vec![
         (
             "creator channel",
             Box::new(|value: &mut Value| {
