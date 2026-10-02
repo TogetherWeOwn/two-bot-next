@@ -621,7 +621,7 @@ async fn handle_rest(
         body: body.clone(),
         received_at: std::time::Instant::now(),
     });
-    let (next, gate) = queue
+    let (mut next, gate) = queue
         .lock()
         .expect("queue")
         .pop_front()
