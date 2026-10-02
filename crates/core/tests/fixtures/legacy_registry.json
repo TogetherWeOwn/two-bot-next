@@ -1,6 +1,6 @@
 {
   "source": "TogetherWeOwn/two-bot",
-  "revision": "d5d1179348feb9157bcac8c875de9399d4f5c76a",
+  "revision": "dbee695b95aabf9234cad28a6b24692e2d07314d",
   "configuration": "All builtins enabled (including staging-only rota); no DB custom rows",
   "commands": [
     {
