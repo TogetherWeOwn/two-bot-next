@@ -325,8 +325,17 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         .extend(two_bot_core::send_admission::SendCooldown::Indefinite)
         .await
         .unwrap();
+    let (_stop, shutdown) = watch::channel(false);
     assert_eq!(
-        run_once(Kind::Events, &pool, &guarded, guild, &observation).await,
+        run_once(
+            Kind::Events,
+            &pool,
+            &guarded,
+            guild,
+            &observation,
+            &shutdown
+        )
+        .await,
         Err(ErrorClass::Rest)
     );
     assert_eq!(mock.requests().len(), 8, "held job must not reach HTTP");
