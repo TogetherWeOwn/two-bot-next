@@ -25,13 +25,15 @@
  * - Bare `/` → fallback code redirect (uncounted), else 404.
  * - Lookup outage (throw) → fallback redirect when configured, else 503 +
  *   `retry-after: 30`. Unknown slug (null) → 404 with no Location (no open
- *   redirect). Invalid stored code → 500, nothing recorded.
+ *   redirect). Confirmed misses are cached per isolate for 5s (1,024 slots);
+ *   cache hits still consume caller budget. Outages and live rows are uncached.
+ *   Invalid stored code → 500, nothing recorded.
  * - Slugs: lowercase alnum + internal hyphens, 2–40 chars; lookup is
  *   case-insensitive, tolerates leading/trailing slashes, percent-decodes
  *   (malformed escape → 404). Disabled campaigns still redirect.
  * - Privacy (docs/PRIVACY.md in two-bot): a click is a campaign + timestamp.
  *   No cookies, IP, UA, referrer — nothing about the visitor is stored,
- *   logged, or set. The caller key for rate limiting never survives the call.
+ *   logged, or set. Caller keys stay only in the isolate's rate-limit buckets.
  */
 
 export interface Campaign {
@@ -64,6 +66,8 @@ export interface RedirectDeps {
   uuid?: () => string;
   /** Rate-limit decision for this caller; true = over budget. */
   isThrottled?: (callerKey: string) => boolean;
+  /** Shared by requests in one isolate; caches only confirmed missing slugs. */
+  missCache?: RedirectMissCache;
 }
 
 export interface RedirectResult {
@@ -128,12 +132,14 @@ export function clickIdempotencyKey(click: RedirectClick): string {
  *   (`capacity / refillPerSecond`), so eviction can only discard buckets that
  *   refill would already have restored to full — a key that still owes tokens
  *   is never idle-expired, and expiry never grants tokens refill would not.
- * - Cardinality cap: at most `maxBuckets` entries. A new key past the cap is
- *   denied (fail closed) — overflow sheds load, it never disables throttling.
- *   Buckets already tracked are unaffected by the cap.
+ * - Cardinality cap: at most `maxBuckets` entries. A new key at the cap first
+ *   reaps idle-expired entries; it is denied (fail closed) only if the map is
+ *   still full of live ones, so overflow sheds load and never disables
+ *   throttling. Buckets already tracked are unaffected by the cap.
  * - Bounded cleanup: every `take` touches its key (LRU order, most-recent at
  *   the back) then reaps at most `sweepBudget` idle-expired entries from the
- *   front. Per-call work is O(sweepBudget), independent of map size.
+ *   front; a new key at the cap runs the same reap before its verdict. Per-call
+ *   work is O(sweepBudget), independent of map size.
  */
 export class TokenBuckets {
   private buckets = new Map<string, { tokens: number; updatedAt: number }>();
@@ -196,7 +202,13 @@ export class TokenBuckets {
     }
     if (!b) {
       if (this.buckets.size >= this.maxBuckets) {
-        // Fail closed: shed the unknown caller, keep every tracked throttle.
+        // Reap first, so a map filled with one-time keys drains on new-key
+        // traffic alone instead of waiting for a tracked key to return.
+        this.sweep(t);
+      }
+      if (this.buckets.size >= this.maxBuckets) {
+        // Still full of live entries. Fail closed: shed the unknown caller and
+        // keep every tracked throttle.
         return {
           allowed: false,
           retryAfter: Math.max(1, Math.ceil(this.idleTtlMs / 1000)),
@@ -241,6 +253,46 @@ export class TokenBuckets {
   }
 }
 
+/** Short, bounded negative cache: a new campaign becomes visible within 5s. */
+export class RedirectMissCache {
+  private misses = new Map<string, number>();
+  private ttlMs: number;
+  private maxEntries: number;
+  private clock: () => number;
+
+  constructor(
+    spec: { ttlMs: number; maxEntries: number } = {
+      ttlMs: 5_000,
+      maxEntries: 1_024,
+    },
+    now: () => number = Date.now,
+  ) {
+    this.ttlMs = spec.ttlMs;
+    this.maxEntries = spec.maxEntries;
+    this.clock = now;
+  }
+
+  has(slug: string): boolean {
+    const expiresAt = this.misses.get(slug);
+    if (expiresAt === undefined) return false;
+    if (this.clock() >= expiresAt) {
+      this.misses.delete(slug);
+      return false;
+    }
+    return true;
+  }
+
+  add(slug: string): void {
+    if (this.maxEntries <= 0 || this.ttlMs <= 0) return;
+    this.misses.delete(slug);
+    if (this.misses.size >= this.maxEntries) {
+      const oldest = this.misses.keys().next().value;
+      if (oldest !== undefined) this.misses.delete(oldest);
+    }
+    this.misses.set(slug, this.clock() + this.ttlMs);
+  }
+}
+
 function redirect(location: string): RedirectResult {
   return {
     status: 302,
@@ -265,16 +317,32 @@ const text = (status: number, body: string, extra?: Record<string, string>): Red
  * first segment, stripping literal/encoded leading slashes and decoding once.
  * A malformed suffix cannot unreserve a recognized `metrics`/`healthz` prefix;
  * near-miss campaign slugs like `metricsfoo` still do not match.
+ * The ownership-fence control plane (`internal/ownership`, plus subpaths) is
+ * likewise reserved: it is served by the Worker (TOG-11143), never a campaign.
  */
 export function isReservedInternal(path: string): boolean {
   const bare = path.split("?")[0] ?? "/";
   const prefix = bare.replace(/^(?:\/|%2f)+/i, "").split(/\/|%2f/i, 1)[0] ?? "";
   try {
-    return RESERVED_SLUGS.includes(decodeURIComponent(prefix).toLowerCase());
+    if (RESERVED_SLUGS.includes(decodeURIComponent(prefix).toLowerCase())) {
+      return true;
+    }
   } catch {
     // An undecodable prefix is not provably reserved; callers fail closed.
     return false;
   }
+  let canonical: string;
+  try {
+    canonical = decodeURIComponent(
+      bare.replace(/^\/+/, "").replace(/\/+$/, ""),
+    ).toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    canonical === "internal/ownership" ||
+    canonical.startsWith("internal/ownership/")
+  );
 }
 
 export async function handleRedirect(
@@ -336,9 +404,11 @@ export async function handleRedirect(
     return text(404, "not found\n");
   }
 
-  // Reject malformed input before lookup or logging: slugs are bounded labels,
-  // not arbitrary visitor-supplied paths that may contain identifying data.
-  if (!isValidSlug(slug)) return text(404, "not found\n");
+  // Malformed paths never consume cache slots or touch the store. Cached
+  // misses still pass the caller cap above; cache hits do not extend the TTL.
+  if (!isValidSlug(slug) || deps.missCache?.has(slug)) {
+    return text(404, "not found\n");
+  }
 
   let campaign: Campaign | null;
   try {
@@ -355,6 +425,7 @@ export async function handleRedirect(
   }
 
   if (campaign === null) {
+    deps.missCache?.add(slug);
     return text(404, "not found\n");
   }
 
