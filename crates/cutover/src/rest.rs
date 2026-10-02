@@ -204,8 +204,32 @@ impl RestClient {
         T: serde::de::DeserializeOwned,
         F: Fn() -> Result<Request, TwilightError>,
     {
-        let page: ListPage<T> = self.exec_list(make).await?;
-        Ok(page.into_option())
+        let transport = self
+            .inner
+            .transport
+            .as_ref()
+            .map_err(|e| RestError::Wire(e.clone()))?;
+        for attempt in 0..=4 {
+            self.pace().await;
+            let request = make()?;
+            self.inner.requests.fetch_add(1, Ordering::Relaxed);
+            let res =
+                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
+                    .await
+                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
+                    .map_err(RestError::Wire)?;
+            match res.status {
+                200..=299 => return Ok(Some(serde_json::from_slice(&res.body)?)),
+                403 | 404 => return Ok(None),
+                429 if attempt < 4 => {
+                    tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await
+                }
+                500..=599 if attempt < 4 => tokio::time::sleep(backoff_duration(attempt)).await,
+                500..=599 => return Ok(None),
+                _ => return Err(RestError::Wire(format!("HTTP {}", res.status))),
+            }
+        }
+        unreachable!("last attempt always returns")
     }
 
     /// Page a guild's full member list (`joined_at` is Discord's own record).
