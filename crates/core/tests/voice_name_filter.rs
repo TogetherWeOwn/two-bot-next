@@ -63,10 +63,12 @@ proptest! {
         prop_assert_eq!(sanitize_channel_name(&once), once);
         prop_assert!(!once.contains(['@', '`']));
         // Legacy strips only C0 + DEL (C1 controls survive, as in legacy).
-        prop_assert!(!once.chars().any(|c| matches!(
-            c,
-            '\u{0000}'..='\u{001F}' | '\u{007F}'
-        )));
+        // Hoisted: `matches!` with `\u{...}` char literals inside
+        // `prop_assert!` fails to compile (its braces read as format holes).
+        let has_stripped = once
+            .chars()
+            .any(|c| matches!(c, '\u{0000}'..='\u{001F}' | '\u{007F}'));
+        prop_assert!(!has_stripped);
     }
 }
 
