@@ -209,6 +209,11 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
+      - name: automod durable dedupe (CI service container only)
+        env:
+          AUTOMOD_CI_TESTDB: '1'
+        run: cargo test -p two-bot-core --features db --locked --test automod_store --test automod_preserved_replay -- --ignored
+
       - name: leveling Postgres parity tests
         env:
           TWO_LEVELING_TEST_CI: '1'

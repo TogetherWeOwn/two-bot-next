@@ -13,6 +13,9 @@ pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
 pub mod automod;
+pub mod automod_runtime;
+#[cfg(feature = "db")]
+pub mod automod_store;
 pub mod backup;
 pub mod channel_moderation;
 #[cfg(feature = "db")]
@@ -92,6 +95,7 @@ pub mod voice_config;
 pub mod voice_config_diff;
 pub mod voice_naming;
 pub mod voice_ownership;
+pub mod voice_permission_health;
 pub mod voice_permissions;
 pub mod voice_placement;
 pub mod voice_room_controls;
@@ -323,6 +327,12 @@ pub use voice::{
     known_voice_durations, parse_voice_end_metadata, resolve_voice_end, summarize_voice_durations,
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
+};
+pub use voice_permission_health::{
+    evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
+    NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,
+    PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS, PERM_ADMINISTRATOR,
+    PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS, PERM_VIEW_CHANNEL,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
