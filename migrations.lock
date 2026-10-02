@@ -133,6 +133,10 @@
       "justification": "Pin the validated resolved role in internal-action intents and audits before REST for TOG-10861.",
       "sha256": "889864e3d2768c5b95455b6b1e2071e20921cd65d5f8a017aad8668093b8f489"
     },
+    "crates/cutover/migrations/0360_join_risk_flags.sql": {
+      "sha256": "e3215b7b6b878e710a75acf33ecdc61ce3c2955b60ce4e523509bdc1fa92aea2",
+      "justification": "Add legacy join-risk evidence schema for manually approved raid-list and raid-remove tooling (TOG-10867); no containment activation or automatic removal."
+    },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes.",
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95"

@@ -11,9 +11,9 @@
 //! calls and reconcile ambiguous mutations to the committed target.
 //!
 //! Transactions reborrow the connection as documented by sqlx 0.9:
-//! https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html
+//! <https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html>
 //! Unique-index arbitration uses PostgreSQL ON CONFLICT:
-//! https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+//! <https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT>
 
 use std::sync::{
     atomic::{AtomicI64, Ordering},
