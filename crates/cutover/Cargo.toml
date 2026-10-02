@@ -35,6 +35,9 @@ url = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 
+[dev-dependencies]
+two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
+
 [[bin]]
 name = "legacy_verify"
 path = "src/bin/legacy_verify.rs"

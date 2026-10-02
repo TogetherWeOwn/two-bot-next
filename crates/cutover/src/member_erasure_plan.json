@@ -1,0 +1,191 @@
+{
+  "tables": [
+    {
+      "table": "internal_action_log",
+      "columns": ["actor_id", "target_id", "intent_id"],
+      "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR intent_id IN (SELECT intent_id FROM internal_idempotency WHERE guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR resource_id = $2)))"
+    },
+    {
+      "table": "internal_idempotency",
+      "columns": ["actor_id", "target_id", "resource_id"],
+      "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR resource_id = $2)"
+    },
+    {
+      "table": "lfg_signups",
+      "columns": ["user_id", "lfg_id"],
+      "predicate": "lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1 AND (created_by = $2 OR lfg_signups.user_id = $2))"
+    },
+    {
+      "table": "lfg_roles",
+      "columns": ["lfg_id"],
+      "predicate": "lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1 AND created_by = $2)"
+    },
+    {
+      "table": "lfg_posts",
+      "columns": ["created_by"],
+      "predicate": "guild_id = $1 AND created_by = $2"
+    },
+    {
+      "table": "events",
+      "columns": ["member_id", "metadata", "idempotency_key"],
+      "predicate": "guild_id = $1 AND (member_id = $2 OR metadata ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
+    },
+    {
+      "table": "invite_snapshots",
+      "columns": ["inviter_id"],
+      "predicate": "guild_id = $1 AND inviter_id = $2"
+    },
+    {
+      "table": "member_levels",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "xp_awards",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "xp_cooldowns",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "moderation_idempotency",
+      "columns": ["result_json", "idempotency_key"],
+      "predicate": "guild_id = $1 AND (result_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key IN (SELECT idempotency_key FROM moderation_audit WHERE guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))))"
+    },
+    {
+      "table": "moderation_audit",
+      "columns": ["actor_id", "target_id", "metadata_json"],
+      "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
+    },
+    {
+      "table": "sticky_messages",
+      "columns": ["created_by", "updated_by"],
+      "predicate": "guild_id = $1 AND (created_by = $2 OR updated_by = $2)"
+    },
+    {
+      "table": "scheduled_messages",
+      "columns": ["created_by", "updated_by"],
+      "predicate": "guild_id = $1 AND (created_by = $2 OR updated_by = $2)"
+    },
+    {
+      "table": "automation_audit_log",
+      "columns": ["actor_id"],
+      "predicate": "guild_id = $1 AND actor_id = $2"
+    },
+    {
+      "table": "event_rsvps",
+      "columns": ["user_id"],
+      "predicate": "guild_id = $1 AND user_id = $2"
+    },
+    {
+      "table": "announcements_audit_log",
+      "columns": ["actor_id"],
+      "predicate": "guild_id = $1 AND actor_id = $2"
+    },
+    {
+      "table": "community_facts",
+      "columns": ["actor_id", "metadata", "source_event_id", "idempotency_key"],
+      "predicate": "guild_id = $1 AND (actor_id = $2 OR metadata ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR source_event_id ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
+    },
+    {
+      "table": "community_scorecard_runs",
+      "columns": ["scorecard_json"],
+      "predicate": "guild_id = $1 AND scorecard_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)')"
+    },
+    {
+      "table": "feed_deliveries",
+      "columns": ["feed_id"],
+      "predicate": "feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1 AND created_by = $2)"
+    },
+    {
+      "table": "feed_relays",
+      "columns": ["created_by"],
+      "predicate": "guild_id = $1 AND created_by = $2"
+    },
+    {
+      "table": "member_ranks",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "member_exclusions",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "join_risk_flags",
+      "columns": ["member_id", "event_id", "reasons_json"],
+      "predicate": "guild_id = $1 AND (member_id = $2 OR event_id ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR reasons_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
+    },
+    {
+      "table": "operational_audit_log",
+      "columns": ["actor_id", "target_id", "metadata_json", "entry_id"],
+      "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR entry_id ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
+    },
+    {
+      "table": "self_role_audit",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "self_role_panel_claims",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "ticket_transcripts",
+      "columns": ["opener_id", "claimed_by"],
+      "predicate": "guild_id = $1 AND (opener_id = $2 OR claimed_by = $2)"
+    },
+    {
+      "table": "tickets",
+      "columns": ["opener_id", "claimed_by"],
+      "predicate": "guild_id = $1 AND (opener_id = $2 OR claimed_by = $2)"
+    },
+    {
+      "table": "members",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    }
+  ],
+  "allowlist": [
+    {
+      "table": "guild_settings",
+      "column": "updated_by",
+      "reason": "Configuration attribution is retained with active guild safety/permission settings; member erasure must not delete or broaden policy configuration. A separate reviewed configuration change is required."
+    },
+    {
+      "table": "guild_settings",
+      "column": "value",
+      "reason": "May contain configured staff/test actor ID lists. These are control-plane policy, not member activity; removing an entry could weaken or broaden a safety gate. Requires a separate reviewed policy edit."
+    },
+    {
+      "table": "guild_settings_audit",
+      "column": "actor",
+      "reason": "Immutable configuration audit: the database rejects DELETE/UPDATE/TRUNCATE. Retain operator attribution; no trigger disabling or bypass is authorized by member erasure."
+    },
+    {
+      "table": "guild_settings_audit",
+      "column": "old_value",
+      "reason": "Immutable prior configuration (including policy actor lists); retained for safety change accountability. Not covered by guild-local activity erasure."
+    },
+    {
+      "table": "guild_settings_audit",
+      "column": "new_value",
+      "reason": "Immutable changed configuration (including policy actor lists); retained for safety change accountability. Not covered by guild-local activity erasure."
+    },
+    {
+      "table": "audit_kill_switch",
+      "column": "engaged_by",
+      "reason": "Global incident-control singleton has no guild scope. Preserve the halt and responder attribution; guild-local erasure must never disengage or rewrite a safety control."
+    },
+    {
+      "table": "member_erasure_audit",
+      "column": "actor",
+      "reason": "Minimal operator accountability for erasures: actor and time only, never the erased subject, guild, request or content. Actor records are retained independently of member activity."
+    }
+  ]
+}
