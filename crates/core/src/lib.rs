@@ -72,6 +72,7 @@ pub mod presence;
 pub mod presence_store;
 pub mod raid;
 pub mod raid_removal;
+pub mod rejection_telemetry;
 pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
