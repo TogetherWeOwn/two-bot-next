@@ -105,6 +105,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "internal_discord_events", measure: TableMeasure::Columns(&["claimed_at"]) },
     TableSpec { table: "internal_idempotency", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "internal_nonces", measure: TableMeasure::Columns(&["burned_at"]) },
+    // Retirements rewrite disabled_at without touching created_at, so the
+    // maximum across both is the row's last write (same shape as tickets).
+    TableSpec { table: "invite_campaigns", measure: TableMeasure::Columns(&["created_at", "disabled_at"]) },
     TableSpec { table: "invite_snapshots", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "join_risk_flags", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "level_import_runs", measure: TableMeasure::Columns(&["imported_at"]) },
