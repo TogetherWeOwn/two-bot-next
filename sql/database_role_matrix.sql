@@ -13,6 +13,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'moderation_idempotency', 'table'),
     ('public', 'moderation_channel_executions', 'table'),
     ('public', 'sticky_messages', 'table'),
+    ('public', 'scheduled_messages', 'table'),
     ('public', 'automation_audit_log', 'table'),
     ('public', 'event_rsvps', 'table'),
     ('public', 'announcements_audit_log', 'table'),
