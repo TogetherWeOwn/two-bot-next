@@ -236,7 +236,7 @@ fn pending_groups_fail_loudly_in_copy_and_verify() {
     assert!(mapping::select(&["all".to_owned()]).is_err());
 }
 
-fn group_planned(tables: &[Table], receipts: &[Receipt]) -> BTreeMap<&str, i64> {
+fn group_planned(tables: &[Table], receipts: &[Receipt]) -> BTreeMap<&'static str, i64> {
     let mut totals = BTreeMap::new();
     for (table, receipt) in tables.iter().zip(receipts) {
         *totals.entry(table.group).or_default() += receipt.source_rows;
@@ -292,13 +292,15 @@ async fn initialize(source: &PgPool, target: &PgPool) -> TestResult {
 }
 
 async fn scenario(
-    source: &PgPool,
-    target: &PgPool,
-    db: &CutoverDb,
-    host: &str,
-    source_name: &str,
-    target_name: &str,
+    source: PgPool,
+    target: PgPool,
+    db: CutoverDb,
+    host: String,
+    source_name: String,
+    target_name: String,
 ) -> TestResult {
+    let (source, target, db) = (&source, &target, &db);
+    let (host, source_name, target_name) = (&host, &source_name, &target_name);
     initialize(source, target).await?;
     let tables = mapping::select(&["ready".to_owned()])?;
     assert_eq!(tables.len(), 25);
