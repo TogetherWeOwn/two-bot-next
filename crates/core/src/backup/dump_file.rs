@@ -98,6 +98,9 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "moderation_channel_executions",
+    "automod_delivery_claims",
+    "gateway_boot_directives",
+    "member_erasure_audit",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data
@@ -108,8 +111,6 @@ pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
     "containment_events",
     "containment_incidents",
     "automation_commands",
-    "automod_violations",
-    "automod_processed_messages",
 ];
 
 /// Explicit migrated-schema exclusions, checked by the schema coverage test.
@@ -117,6 +118,11 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // Short-lived XP award throttles, not XP totals/history. Never replay a
     // pre-restore cooldown into a recovered process.
     "xp_cooldowns",
+    // Durable send admission is per-credential runtime lane state: occupancy
+    // generations and Discord cooldown timing, not application data. Never
+    // replay a pre-restore lane hold into a recovered process; a restored
+    // database re-admits from generation zero and re-learns cooldowns.
+    "discord_send_admission",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data.
