@@ -2,8 +2,8 @@
 
 Source pin: [TogetherWeOwn/two-bot #387](https://github.com/TogetherWeOwn/two-bot/pull/387),
 commit [`bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3`](https://github.com/TogetherWeOwn/two-bot/tree/bffccf3e3a9f56a3da37de67c6f272ac10ecb3b3).
-This slice implements the in-memory half, not sqlx wiring, backfill, migrations,
-report CLIs, deployment, or a live Discord journey.
+`MemStore` and the sqlx `PgFunnelStore` both run the contract below; backfill,
+migrations, report CLIs, deployment and a live Discord journey are out of scope.
 
 ## Rules and read boundary
 
@@ -36,9 +36,9 @@ report CLIs, deployment, or a live Discord journey.
 The common entry point is
 `crates/core/tests/support/membership_contract.rs::run(make_store)`.
 It requires `S: MembershipStore`; that read/observation extension itself requires
-`FunnelStore`. A future sqlx integration test can import it with:
+`FunnelStore`. The sqlx integration test imports it with:
 
-```rust
+```rust,ignore
 #[path = "../../core/tests/support/membership_contract.rs"]
 mod contract;
 
@@ -57,23 +57,28 @@ fn sqlx_membership_chronology_contract() {
 
 Each factory call must provide an **empty isolated namespace/store**. The suite
 makes many independent stores and uses scoped OS threads for simultaneous
-writers; the future sync adapter must own a runtime compatible with this seam.
+writers; the sync adapter must own a runtime compatible with this seam.
 It must read actual persisted event/projection data, preserve microseconds
 (e.g. SQL timestamp comparisons or text, not milliseconds), and expose duplicate
 observation updates through `record_observed`. Never substitute `MemStore`
 readbacks for the durable implementation under test.
 
-The sqlx follow-up must additionally exercise its own member/event-row locking,
-metadata compare-and-swap fallback and non-UTC **database session**. The generic
-suite tests their observable guarantees, not a particular lock/CAS algorithm.
-The PostgreSQL offset scenario here injects session-shaped text into `MemStore`;
-it is not evidence of having run `SET TIME ZONE` against a database.
+`PgFunnelStore` derives membership from its persisted `events` rows through the
+shared `project` helper. A duplicate reconfirmation takes the event row lock
+(`SELECT … FOR UPDATE`) and writes the new maximum only while the metadata still
+equals the locked value (`IS NOT DISTINCT FROM`, the compare-and-swap fallback).
+Readbacks format `occurred_at AT TIME ZONE 'UTC'` with the `US` pattern, so text
+keeps microseconds whatever the session zone. The generic suite tests the
+observable guarantees, not this particular lock/CAS algorithm; the
+`_non_utc_session` variant runs it with every connection `SET TIME ZONE
+'America/New_York'` and asserts the session zone before the suite starts. The
+`MemStore` offset scenario only injects session-shaped text.
 
 The clock is injectable: `MembershipClock::next_at(wall_millis)` follows
 `max(wall_millis * 1000, previous + 1)`. Adapters must capture the observation
 **before** asynchronous invite/REST work and carry that stamp into the store;
 `member_observation(page_start, joined_at)` selects their maximum. This slice
-exposes the seams and contract, not production gateway/sqlx/capture wiring.
+exposes the seams and contract, not production gateway/capture wiring.
 
 `ActionExecutor::get_json_observed` adds request-start evidence on the existing
 paced transport. It stamps after pacing, before sending, and repeats stamping
