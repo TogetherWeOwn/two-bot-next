@@ -92,8 +92,10 @@ pub struct ConfigDiff {
     pub logging_removed: Option<LoggingConfiguration>,
     pub logging_changed: Option<LoggingChanged>,
     pub settings_changed: Option<SettingsChanged>,
-    /// Sorted unique channel IDs referenced by `incoming` but absent from the
-    /// inventory. Those entries are excluded from the change lists.
+    /// Sorted unique IDs to report: unknown channel IDs referenced by
+    /// `incoming`, plus the keys of entries skipped because they touch an
+    /// unknown channel (for example a creator whose permission-source channel
+    /// is unknown). Skipped entries are excluded from the change lists.
     pub skipped_unknown_channels: Vec<String>,
 }
 
@@ -615,7 +617,7 @@ fn diff_keyed<'a, T: Clone + PartialEq, C>(
     current: &BTreeMap<&'a str, &'a T>,
     incoming: &BTreeMap<&'a str, &'a T>,
     skipped: &BTreeSet<&'a str>,
-    on_changed: impl Fn(&&'a str, &&'a T, &&'a T) -> C,
+    on_changed: impl Fn(&'a str, &'a T, &'a T) -> C,
 ) -> (Vec<T>, Vec<T>, Vec<C>) {
     let mut added = Vec::new();
     let mut removed = Vec::new();
@@ -625,14 +627,14 @@ fn diff_keyed<'a, T: Clone + PartialEq, C>(
             continue;
         }
         match current.get(*id) {
-            None => added.push((*next).clone()),
-            Some(prev) if **prev != **next => changed.push(on_changed(id, prev, next)),
+            None => added.push((**next).clone()),
+            Some(prev) if **prev != **next => changed.push(on_changed(*id, *prev, *next)),
             Some(_) => {}
         }
     }
     for (id, prev) in current {
         if !incoming.contains_key(*id) && !skipped.contains(*id) {
-            removed.push((*prev).clone());
+            removed.push((**prev).clone());
         }
     }
     (added, removed, changed)

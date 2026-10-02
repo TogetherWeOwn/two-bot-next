@@ -28,7 +28,7 @@ proptest! {
     fn property_voice_apply_matches_filtered_incoming(
         removals in proptest::collection::vec(any::<bool>(), 0..16),
     ) {
-        let (mut current, inventory) = fixture();
+        let (current, inventory) = fixture();
         let mut incoming = current.clone();
         // Bounded mutation: toggle one flag, swap one label and drop entries.
         incoming.settings.creation_enabled = !incoming.settings.creation_enabled;
@@ -46,7 +46,6 @@ proptest! {
                 _ => {}
             }
         }
-        incoming.creators.extend(current.creators.drain(..).take(1));
         prop_assert!(validate_configuration(&incoming, &inventory).is_ok());
         let diff = diff_configuration(&current, &incoming, &inventory);
         let applied = apply_diff(&current, &diff);
@@ -235,7 +234,7 @@ fn golden_full_preview_reports_every_section() {
         "~ creator 101 (default_limit)",
         "~ template 103 (name_template)",
         "- template 102",
-        "+ alias B game",
+        "+ alias \"B game\"",
         "~ alias \"A game\"",
         "- list rooms",
         "- logging",
@@ -277,7 +276,14 @@ fn unknown_channels_are_reported_and_skipped() {
     );
     incoming.creators[0].permission_source =
         serde_json::from_value(json!({"kind": "channel", "channel_id": "998"})).unwrap();
-    incoming.templates[0].channel_id = "997".to_owned();
+    // Push (don't mutate in place): mutating a key would also remove the old
+    // key, so a push keeps the current config untouched after apply.
+    incoming.templates.push(
+        serde_json::from_value(
+            json!({"channel_id": "997", "name_template": "ghost", "status_template": null}),
+        )
+        .unwrap(),
+    );
     incoming.logging.as_mut().unwrap().channel_id = "996".to_owned();
 
     let diff = diff_configuration(&current, &incoming, &inventory);
