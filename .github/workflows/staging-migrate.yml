@@ -40,6 +40,11 @@ concurrency:
 jobs:
   migrate:
     name: staging-migrate (${{ inputs.mode }})
+    # Dispatch from main only. The binding must be scoped to the
+    # staging-migrate environment (required reviewer, main-only deployment
+    # branches) so a workflow edited on another branch cannot read it.
+    if: github.ref == 'refs/heads/main'
+    environment: staging-migrate
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     container:
@@ -61,7 +66,7 @@ jobs:
         run: cargo build -p two-bot-cutover --bin staging-migrate --locked
       - name: Run
         env:
-          # Must already exist as a repository/environment secret; absent means refusal.
+          # Must already exist as a staging-migrate environment secret; absent means refusal.
           TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}
           MODE: ${{ inputs.mode }}
           SOURCE_SHA: ${{ inputs.source_sha }}
