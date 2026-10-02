@@ -64,6 +64,8 @@ pub const DUMP_TABLES: &[&str] = &[
     "automod_processed_messages",
     "self_role_audit",
     "self_role_panel_claims",
+    "self_role_exchanges",
+    "self_role_exchange_baselines",
     "member_levels",
     "xp_awards",
     "level_role_rewards",

@@ -274,3 +274,13 @@ INSERT INTO self_role_panel_claims
 VALUES ('100000000000000001', '100000000000000002', 'backup:panel', 'backup-self-role-claim',
         23, '2026-08-01T10:01:00.123456Z', 'backup:self-role:event', 'backup-option',
         'backup-event-order', TRUE);
+-- Send receipts and uncertainty baselines hang off the seeded audit event, so
+-- the complete-schema coverage test archives and restores them too.
+INSERT INTO self_role_exchanges
+    (exchange_id, event_id, origin_generation, role_id, adding, compensating,
+     disposition, created_at)
+VALUES ('backup:self-role:exchange', 'backup:self-role:event', 23,
+        '100000000000000010', TRUE, FALSE, 'pending', '2026-08-01T10:00:30.000Z');
+INSERT INTO self_role_exchange_baselines
+    (event_id, legacy_pending, unresolved_added_role_ids, unresolved_removed_role_ids)
+VALUES ('backup:self-role:event', FALSE, '[]', '[]');
