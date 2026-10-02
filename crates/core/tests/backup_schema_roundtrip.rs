@@ -1597,8 +1597,14 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     let target_url = fixture_url(&target);
     // Month one restores into a dirtied scratch; month two into the previous
     // drill's result, as the monthly timer does.
+    let mut floors = BTreeMap::new();
     for month in 1..=2 {
         dirty_target(pool).await;
+        // Keep the floors in force before the last restore, as the
+        // reversed-rows caller does: dirty_target hands out target-only
+        // identities whose rows restore wipes, but the allocator must not
+        // rewind onto them.
+        floors.extend(allocation_floors(pool, &contents.manifest.sequence_marks).await);
         let cas_before = next_cas_token(pool).await;
         let drill = shipped_cli(
             Command::new("/usr/bin/bash")
@@ -1628,7 +1634,7 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     }
     assert_guards_work(pool).await;
 
-    let allocations = allocate_owned_sequences(pool, false).await;
+    let allocations = allocate_owned_sequences(pool, false, &floors).await;
     for ((table, column), (next, increment)) in &allocations {
         println!("drill: sequence {table}.{column} resumed at {next} (increment {increment})");
     }
