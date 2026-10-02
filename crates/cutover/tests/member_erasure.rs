@@ -222,6 +222,58 @@ async fn unresolved_side_effect_guards_refuse_without_deleting_any_rows() {
 }
 
 #[tokio::test]
+async fn unsettled_automod_delivery_claims_refuse_erasure() {
+    let Some(db) = database().await else { return };
+    seed(db.pool()).await;
+    let before = erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+        .await
+        .unwrap();
+    assert_eq!(
+        before
+            .iter()
+            .find(|row| row.table == "automod_delivery_claims")
+            .unwrap()
+            .rows,
+        1
+    );
+    // Started-but-uncertain: no recorded outcome, so a retry must stay blocked.
+    sqlx::query("UPDATE automod_delivery_claims SET result_json = NULL, completed_at = NULL WHERE guild_id = $1 AND matched_author_id = $2")
+        .bind(GUILD).bind(USER).execute(db.pool()).await.unwrap();
+    assert!(erase_member(
+        db.pool(),
+        GUILD,
+        USER,
+        ErasureMode::Execute { actor: ACTOR }
+    )
+    .await
+    .is_err());
+    assert_eq!(audit_count(db.pool()).await, 0);
+    assert_eq!(
+        before,
+        erase_member(db.pool(), GUILD, USER, ErasureMode::DryRun)
+            .await
+            .unwrap()
+    );
+    // Another member's unsettled claim does not block this member's erasure.
+    sqlx::query("UPDATE automod_delivery_claims SET result_json = '{}'::jsonb, completed_at = now() WHERE guild_id = $1 AND matched_author_id = $2")
+        .bind(GUILD).bind(USER).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE automod_delivery_claims SET result_json = NULL, completed_at = NULL WHERE guild_id = $1 AND matched_author_id = $2")
+        .bind(GUILD).bind(OTHER).execute(db.pool()).await.unwrap();
+    assert_eq!(
+        erase_member(
+            db.pool(),
+            GUILD,
+            USER,
+            ErasureMode::Execute { actor: ACTOR }
+        )
+        .await
+        .unwrap(),
+        before
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn unresolved_self_role_effects_and_active_claims_refuse_erasure() {
     let Some(db) = database().await else { return };
     seed(db.pool()).await;

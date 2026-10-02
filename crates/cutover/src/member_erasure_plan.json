@@ -71,6 +71,11 @@
       "predicate": "guild_id = $1 AND user_id = $2"
     },
     {
+      "table": "automod_delivery_claims",
+      "columns": ["matched_author_id"],
+      "predicate": "guild_id = $1 AND matched_author_id = $2"
+    },
+    {
       "table": "sticky_messages",
       "columns": ["created_by", "updated_by"],
       "predicate": "guild_id = $1 AND (created_by = $2 OR updated_by = $2)"

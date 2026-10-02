@@ -20,11 +20,13 @@ JOB_INVENTORY = {
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml"}
-DEFAULT_RUNNER = ["self-hosted", "two-selfhosted"]
-# Main's CI-overflow switch (TOG ops, 2026-10-01): repo vars may move a named
-# job to CI_OVERFLOW_RUNNER; otherwise it stays on the private self-hosted pool.
-OVERFLOW_RUNNER = (
-    "${{{{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), '{job}') && "
+# Main's runner routing (#265, 2026-10-02): the repo is public and the org's
+# self-hosted runner group refuses public repos, so every job routes through
+# one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
+# for this named job, then the self-hosted pool. Mirrors scripts/test-runner-routing.py.
+ROUTED_RUNNER = (
+    "${{{{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "
+    "(contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), '{job}') && "
     "contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && "
     "vars.CI_OVERFLOW_RUNNER) || '[\"self-hosted\",\"two-selfhosted\"]') }}}}"
 )
@@ -51,8 +53,8 @@ def load_workflows():
 
 
 def runner_allowed(job_id, runs_on):
-    # The overflow expression must name this job, so one job's switch cannot move another.
-    return runs_on in (DEFAULT_RUNNER, OVERFLOW_RUNNER.format(job=job_id))
+    # The routing expression must name this job, so one job's switch cannot move another.
+    return runs_on == ROUTED_RUNNER.format(job=job_id)
 
 
 def production_errors(workflow):
@@ -207,7 +209,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
-        for runs_on in (OVERFLOW_RUNNER.format(job="check"), "ubuntu-latest", ["self-hosted"],
+        for runs_on in (ROUTED_RUNNER.format(job="check"), "ubuntu-latest", ["self-hosted"],
                         "${{ vars.CI_OVERFLOW_RUNNER }}"):
             with self.subTest(runs_on=runs_on):
                 self.assertFalse(runner_allowed("worker", runs_on))

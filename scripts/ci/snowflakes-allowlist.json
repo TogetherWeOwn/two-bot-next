@@ -1,20 +1,50 @@
 [
   {
-    "path": "crates/core/src/backup/guild_config.rs",
-    "value": "326474832151838730",
-    "source": "pub const LIVE_GUILD_ID: &str = \"326474832151838730\";",
-    "reason": "Existing backup identity/preflight pins reject the live guild and wrong bot identity; removing these guards requires a separate reviewed runtime change."
+    "path": "crates/bot/src/audit_runtime_tests.rs",
+    "value": "18446744073709551611",
+    "source": "const OPERATOR: &str = \"18446744073709551611\";",
+    "reason": "Main's audit mirror-sweep tests (#257) use u64 boundary sentinels (u64::MAX / MAX-4 / MAX-5 / 2^64) as synthetic guild/operator/actor IDs and leak-sweep probes; not real Discord entities, test-only, kept verbatim from main."
+  },
+  {
+    "path": "crates/bot/src/audit_runtime_tests.rs",
+    "value": "18446744073709551613",
+    "source": "\"18446744073709551613\",",
+    "reason": "Main's audit mirror-sweep tests (#257) use u64 boundary sentinels (u64::MAX / MAX-4 / MAX-5 / 2^64) as synthetic guild/operator/actor IDs and leak-sweep probes; not real Discord entities, test-only, kept verbatim from main."
+  },
+  {
+    "path": "crates/bot/src/audit_runtime_tests.rs",
+    "value": "18446744073709551613",
+    "source": "e.target_id = Some(\"18446744073709551613\".to_owned());",
+    "reason": "Main's audit mirror-sweep tests (#257) use u64 boundary sentinels (u64::MAX / MAX-4 / MAX-5 / 2^64) as synthetic guild/operator/actor IDs and leak-sweep probes; not real Discord entities, test-only, kept verbatim from main."
+  },
+  {
+    "path": "crates/bot/src/audit_runtime_tests.rs",
+    "value": "18446744073709551614",
+    "source": "\"18446744073709551614\",",
+    "reason": "Main's audit mirror-sweep tests (#257) use u64 boundary sentinels (u64::MAX / MAX-4 / MAX-5 / 2^64) as synthetic guild/operator/actor IDs and leak-sweep probes; not real Discord entities, test-only, kept verbatim from main."
+  },
+  {
+    "path": "crates/bot/src/audit_runtime_tests.rs",
+    "value": "18446744073709551614",
+    "source": "e.actor_id = Some(\"18446744073709551614\".to_owned());",
+    "reason": "Main's audit mirror-sweep tests (#257) use u64 boundary sentinels (u64::MAX / MAX-4 / MAX-5 / 2^64) as synthetic guild/operator/actor IDs and leak-sweep probes; not real Discord entities, test-only, kept verbatim from main."
+  },
+  {
+    "path": "crates/bot/src/audit_runtime_tests.rs",
+    "value": "18446744073709551615",
+    "source": "const GUILD: &str = \"18446744073709551615\";",
+    "reason": "Main's audit mirror-sweep tests (#257) use u64 boundary sentinels (u64::MAX / MAX-4 / MAX-5 / 2^64) as synthetic guild/operator/actor IDs and leak-sweep probes; not real Discord entities, test-only, kept verbatim from main."
+  },
+  {
+    "path": "crates/bot/src/audit_runtime_tests.rs",
+    "value": "18446744073709551616",
+    "source": "\"18446744073709551616\",",
+    "reason": "Main's audit mirror-sweep tests (#257) use u64 boundary sentinels (u64::MAX / MAX-4 / MAX-5 / 2^64) as synthetic guild/operator/actor IDs and leak-sweep probes; not real Discord entities, test-only, kept verbatim from main."
   },
   {
     "path": "crates/core/src/backup/guild_config.rs",
     "value": "1469137636663758888",
     "source": "pub const STAGING_BOT_APPLICATION_ID: &str = \"1469137636663758888\";",
-    "reason": "Existing backup identity/preflight pins reject the live guild and wrong bot identity; removing these guards requires a separate reviewed runtime change."
-  },
-  {
-    "path": "crates/core/src/backup/guild_config.rs",
-    "value": "1539711683898118154",
-    "source": "pub const LIVE_BOT_APPLICATION_ID: &str = \"1539711683898118154\";",
     "reason": "Existing backup identity/preflight pins reject the live guild and wrong bot identity; removing these guards requires a separate reviewed runtime change."
   },
   {
@@ -25,45 +55,21 @@
   },
   {
     "path": "crates/core/src/backup/guild_config.rs",
+    "value": "1539711683898118154",
+    "source": "pub const LIVE_BOT_APPLICATION_ID: &str = \"1539711683898118154\";",
+    "reason": "Existing backup identity/preflight pins reject the live guild and wrong bot identity; removing these guards requires a separate reviewed runtime change."
+  },
+  {
+    "path": "crates/core/src/backup/guild_config.rs",
     "value": "1545644954272137297",
     "source": "pub const TWO_STAGING_GUILD_ID: &str = \"1545644954272137297\";",
     "reason": "Existing backup identity/preflight pins reject the live guild and wrong bot identity; removing these guards requires a separate reviewed runtime change."
   },
   {
-    "path": "crates/core/src/onboarding.rs",
+    "path": "crates/core/src/backup/guild_config.rs",
     "value": "326474832151838730",
-    "source": "pub const TWO_GUILD_ID: &str = \"326474832151838730\";",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1092312335529541632",
-    "source": "pub const GAME_HUB_CHANNEL_ID: &str = \"1092312335529541632\";",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1087198966346690570",
-    "source": "pub const INTRO_CHANNEL_ID: &str = \"1087198966346690570\";",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1175127344072118405",
-    "source": "pub const ANCHOR_CHANNEL_ID: &str = \"1175127344072118405\";",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1546211377847337020",
-    "source": "pub const STAGING_LOOKING_TO_PLAY_CHANNEL_ID: &str = \"1546211377847337020\";",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1546211378430345286",
-    "source": "pub const STAGING_LOBBY_VOICE_CHANNEL_ID: &str = \"1546211378430345286\";",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+    "source": "pub const LIVE_GUILD_ID: &str = \"326474832151838730\";",
+    "reason": "Existing backup identity/preflight pins reject the live guild and wrong bot identity; removing these guards requires a separate reviewed runtime change."
   },
   {
     "path": "crates/core/src/onboarding.rs",
@@ -73,56 +79,8 @@
   },
   {
     "path": "crates/core/src/onboarding.rs",
-    "value": "1179217198930202735",
-    "source": "primary_channel_id: Some(\"1179217198930202735\"),",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1179233034713702511",
-    "source": "role_id: \"1179233034713702511\",",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1178937094035492884",
-    "source": "primary_channel_id: Some(\"1178937094035492884\"),",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1119666971584237679",
-    "source": "role_id: \"1119666971584237679\",",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1118994447036850369",
-    "source": "primary_channel_id: Some(\"1118994447036850369\"),",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1179233301295284385",
-    "source": "role_id: \"1179233301295284385\",",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1065438504521322526",
-    "source": "role_id: \"1065438504521322526\",",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1065438396069191700",
-    "source": "role_id: \"1065438396069191700\",",
-    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
-  },
-  {
-    "path": "crates/core/src/onboarding.rs",
-    "value": "1065438198316138507",
-    "source": "role_id: \"1065438198316138507\",",
+    "value": "1063245872328081439",
+    "source": "role_id: \"1063245872328081439\",",
     "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
   },
   {
@@ -139,14 +97,26 @@
   },
   {
     "path": "crates/core/src/onboarding.rs",
-    "value": "1063245872328081439",
-    "source": "role_id: \"1063245872328081439\",",
+    "value": "1065438198316138507",
+    "source": "role_id: \"1065438198316138507\",",
     "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
   },
   {
     "path": "crates/core/src/onboarding.rs",
-    "value": "1092247753574330458",
-    "source": "role_id: \"1092247753574330458\",",
+    "value": "1065438396069191700",
+    "source": "role_id: \"1065438396069191700\",",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1065438504521322526",
+    "source": "role_id: \"1065438504521322526\",",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1087198966346690570",
+    "source": "pub const INTRO_CHANNEL_ID: &str = \"1087198966346690570\";",
     "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
   },
   {
@@ -163,6 +133,12 @@
   },
   {
     "path": "crates/core/src/onboarding.rs",
+    "value": "1092247753574330458",
+    "source": "role_id: \"1092247753574330458\",",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
     "value": "1092248449786855595",
     "source": "role_id: \"1092248449786855595\",",
     "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
@@ -174,15 +150,81 @@
     "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
   },
   {
-    "path": "crates/cutover/src/lib.rs",
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1092312335529541632",
+    "source": "pub const GAME_HUB_CHANNEL_ID: &str = \"1092312335529541632\";",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1118994447036850369",
+    "source": "primary_channel_id: Some(\"1118994447036850369\"),",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1119666971584237679",
+    "source": "role_id: \"1119666971584237679\",",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1175127344072118405",
+    "source": "pub const ANCHOR_CHANNEL_ID: &str = \"1175127344072118405\";",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1178937094035492884",
+    "source": "primary_channel_id: Some(\"1178937094035492884\"),",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1179217198930202735",
+    "source": "primary_channel_id: Some(\"1179217198930202735\"),",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1179233034713702511",
+    "source": "role_id: \"1179233034713702511\",",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1179233301295284385",
+    "source": "role_id: \"1179233301295284385\",",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1546211377847337020",
+    "source": "pub const STAGING_LOOKING_TO_PLAY_CHANNEL_ID: &str = \"1546211377847337020\";",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
+    "value": "1546211378430345286",
+    "source": "pub const STAGING_LOBBY_VOICE_CHANNEL_ID: &str = \"1546211378430345286\";",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
+  },
+  {
+    "path": "crates/core/src/onboarding.rs",
     "value": "326474832151838730",
-    "source": "pub const LIVE_GUILD_ID: &str = \"326474832151838730\";",
-    "reason": "Existing cutover guard/parity constant; LIVE_GUILD_ID enforces refusal before any database/file access, and STAGING_GUILD_ID pins the legacy soak fixture."
+    "source": "pub const TWO_GUILD_ID: &str = \"326474832151838730\";",
+    "reason": "Existing frozen legacy onboarding catalog parity data; preserve public constants and current role/channel routing in this CI-only slice. Runtime wiring receives configured per-guild IDs."
   },
   {
     "path": "crates/cutover/src/lib.rs",
     "value": "1545644954272137297",
     "source": "pub const STAGING_GUILD_ID: &str = \"1545644954272137297\";",
+    "reason": "Existing cutover guard/parity constant; LIVE_GUILD_ID enforces refusal before any database/file access, and STAGING_GUILD_ID pins the legacy soak fixture."
+  },
+  {
+    "path": "crates/cutover/src/lib.rs",
+    "value": "326474832151838730",
+    "source": "pub const LIVE_GUILD_ID: &str = \"326474832151838730\";",
     "reason": "Existing cutover guard/parity constant; LIVE_GUILD_ID enforces refusal before any database/file access, and STAGING_GUILD_ID pins the legacy soak fixture."
   }
 ]
