@@ -6,6 +6,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CLI_MODULES = {
     "crates/bot/src/backup_cli.rs",
+    "crates/bot/src/commands_cli.rs",
     "crates/bot/src/database_roles_cli.rs",
     "crates/bot/src/preflight.rs",
     "crates/core/examples/metrics_rss.rs",
