@@ -103,6 +103,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "automod_delivery_claims",
     "gateway_boot_directives",
     "member_erasure_audit",
+    "invite_campaigns",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data

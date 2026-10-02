@@ -43,6 +43,9 @@ export const FORWARDED_FLAGS = [
   "TWO_ONBOARDING_DRY_RUN",
   "TWO_SELF_ROLE_PANELS",
   "TWO_SELF_ROLE_DRY_RUN",
+  // Guild command registry drift CLI and opt-in boot publish (TOG-10860).
+  "TWO_COMMANDS_PUBLISH_ON_BOOT",
+  "TWO_COMMANDS_ALLOW_LIVE_GUILD",
   // Community scorecard, classifier and jobs.
   "TWO_COMMUNITY_SCORECARD",
   "TWO_COMMUNITY_RECOMMENDATIONS",
