@@ -12,6 +12,10 @@
 //! Env: `TWO_DATABASE_URL` (required), `TWO_INACTIVITY_DAYS` (fallback for
 //! `--days`, legacy default 14).
 
+// On-demand operator report: the CSV goes to stdout by contract (header always);
+// diagnostics and usage errors use stderr.
+#![allow(clippy::print_stdout)]
+
 use two_bot_core::inactivity::{
     parse_inactivity_days, render_reengagement_csv, render_reengagement_unscoped, InactivityOutcome,
 };
