@@ -106,10 +106,10 @@ impl Subscriber for PassfileSilencer {
     }
 }
 
-/// Parse a validated database URL into SQLx options.
+/// Validate and parse a database URL into SQLx options.
 ///
-/// Call [`validate`] first so unsupported query keys are refused before the
-/// driver can WARN-log them. The parse itself runs under a thread-scoped
+/// Unsupported query keys are refused before the driver can WARN-log them.
+/// The parse itself runs under a thread-scoped
 /// subscriber that drops the driver's passfile target: a malformed passfile
 /// line (which can contain a credential) must not reach logs, while a
 /// well-formed entry still supplies the password exactly as `FromStr` would.
@@ -117,6 +117,7 @@ impl Subscriber for PassfileSilencer {
 /// ambient subscriber and no await point can interleave on this thread.
 #[cfg(feature = "db")]
 pub fn connect_options(url: &str) -> Result<PgConnectOptions, sqlx::Error> {
+    validate(url).map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
     let current = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
     tracing::subscriber::with_default(PassfileSilencer(current), || {
         PgConnectOptions::from_str(url)

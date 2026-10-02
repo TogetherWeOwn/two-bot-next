@@ -12,8 +12,7 @@ on:
   # / `worker check` would never run on the release PR without this path.
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: check-${{ github.event.pull_request.number || github.sha }}
@@ -22,6 +21,8 @@ concurrency:
 jobs:
   check:
     name: check
+    permissions:
+      contents: read
     needs: [self-role-store, parity-docs]
     # A skipped dependency must not make the required check appear green.
     if: ${{ always() }}
@@ -64,6 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           # The migration guard reads PR base/push-before blobs, including the lock.
           fetch-depth: 0
 
@@ -73,7 +75,7 @@ jobs:
           # runner-owned checkout, so Git refuses it as dubious ownership.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
           # Tests that pin 127.0.0.1/localhost:5432 reach the service through
           # this job-private forward.
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
@@ -94,6 +96,23 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
+
+      - name: Install pinned static audit tools
+        run: |
+          python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/zizmor" 'zizmor==1.30.1' 'PyYAML==6.0.3'
+
+      - name: Source-level CI gate regressions
+        run: PYTHONPATH="$RUNNER_TEMP/zizmor" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
+      - name: Reject hard-coded source snowflakes
+        run: python3 scripts/ci/check-src-snowflakes.py
+
+      - name: Verify CODEOWNERS syntax and coverage
+        run: python3 scripts/ci/verify-codeowners.py
+
+      - name: Audit GitHub Actions workflows
+        # Offline static audits need no GitHub credentials or security-events writes.
+        run: '"$RUNNER_TEMP/zizmor/bin/zizmor" --offline --strict-collection --no-progress .github/workflows'
 
       - name: offline build-cache safety regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
@@ -172,6 +191,9 @@ jobs:
           cargo build -p two-bot --locked
           export TWO_BOT_TEST_BACKUP_BIN="$PWD/target/debug/two-bot"
           cargo test -p two-bot-core --features db --test backup_roundtrip --test backup_dump_publication --locked -- --nocapture --test-threads=1
+          # The shipped monthly drill on the complete migrated schema (TOG-11804).
+          export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          cargo test -p two-bot-core --features db --test backup_schema_roundtrip --locked shipped_backup_and_restore_drill -- --nocapture --test-threads=1
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -214,6 +236,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test raid_list_db --locked -- --ignored
+
+      - name: Reengagement list query (CI service container only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test reengagement_list_db --locked -- --ignored
 
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
@@ -261,6 +288,14 @@ jobs:
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
+      - name: Durable Discord send admission (isolated DBs and mock HTTP only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: |
+          cargo test -p two-bot-core --features db --test send_admission --locked -- --ignored
+          cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --ignored
+          cargo test -p two-bot-cutover --test send_admission --locked -- --ignored
+
       - name: Command runtime acceptance tests (sticky, feeds and leveling, CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -278,6 +313,8 @@ jobs:
 
   parity-docs:
     name: parity docs
+    permissions:
+      contents: read
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'parity-docs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
@@ -297,6 +334,8 @@ jobs:
 
   self-role-store:
     name: self-role store leases
+    permissions:
+      contents: read
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'self-role-store') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
@@ -319,6 +358,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -338,6 +378,8 @@ jobs:
   # writes stay on the merge ref), so no scope-string change is needed.
   container-inputs:
     name: container inputs changed
+    permissions:
+      contents: read
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container-inputs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
@@ -371,6 +413,8 @@ jobs:
 
   container:
     name: container smoke
+    permissions:
+      contents: read
     needs: container-inputs
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
@@ -392,10 +436,11 @@ jobs:
       # green without hiding anything the branch protection demands.
       - name: Skip note (no image inputs changed)
         if: needs.container-inputs.outputs.build != 'true'
+        env:
+          BUILD_SELECTION: ${{ needs.container-inputs.outputs.build }}
         run: |
           printf 'Skipping the runtime image build: no image inputs changed.\n'
-          printf 'Selector output: build=%s\n' \
-            "${{ needs.container-inputs.outputs.build }}"
+          printf 'Selector output: build=%s\n' "$BUILD_SELECTION"
       - name: Set up BuildKit
         if: needs.container-inputs.outputs.build == 'true'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -435,6 +480,8 @@ jobs:
 
   community-db:
     name: community db
+    permissions:
+      contents: read
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'community-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
@@ -445,7 +492,7 @@ jobs:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     services:
       agent-testdb:
-        image: postgres:17
+        image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: postgres
@@ -457,6 +504,8 @@ jobs:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/postgres
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
@@ -471,6 +520,8 @@ jobs:
 
   feeds-db:
     name: feeds db check
+    permissions:
+      contents: read
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'feeds-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
@@ -493,6 +544,8 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
@@ -503,6 +556,8 @@ jobs:
 
   tickets-postgres:
     name: tickets postgres
+    permissions:
+      contents: read
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tickets-postgres') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
@@ -525,6 +580,8 @@ jobs:
       TICKET_TEST_DB_HOST: agent-testdb
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
@@ -543,6 +600,8 @@ jobs:
 
   worker:
     name: worker check
+    permissions:
+      contents: read
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'worker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
@@ -552,6 +611,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -580,7 +640,9 @@ jobs:
       - name: Verify runner routing for every workflow job
         run: python3 ../scripts/test-runner-routing.py
       - name: Verify offline release lifecycle
-        run: |
+        # Match the library bundled by the pinned release action, in an isolated
+        # API-double fixture with lifecycle scripts disabled and no write token.
+        run: | # zizmor: ignore[adhoc-packages] pinned offline release fixture only
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs

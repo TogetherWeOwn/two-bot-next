@@ -5,7 +5,10 @@ Reviewed 2026-10-01 against baseline `5ddab2dfec52853a0c87cc6e555baf6575eae77e`
 `44338b28a7feac0093cbd72dc9cecc45ab33a15d`). The F7 redirect caller-map and
 public-probe text (Denial of service row, redirect rate-limit notes, F7 row)
 was refreshed 2026-10-02 against `c122126d678c98e171bdf92cb20d731a9529c93e`;
-its `wrangler/` line citations refer to that commit.
+its `wrangler/` line citations refer to that commit. The F7 row and the
+redirect `Retry-After` note were refreshed again 2026-10-02 for TOG-12533 on
+top of `36816fba` (#290); the F7 row's `wrangler/` citations refer to that
+change.
 This is a source-based STRIDE assessment, **not deployment approval**. No live
 credentials, Discord mutations, database probes or key rotation were performed.
 The private durable HTTP receiver (PR #114,
@@ -166,7 +169,7 @@ gates for that integration. Current-public-surface findings are marked explicitl
 | STRIDE | Concrete threat / boundary | Existing control | Residual risk / required evidence |
 | --- | --- | --- | --- |
 | Spoofing | Forge a website request or enumerate accepted key IDs | HMAC-SHA256 on exact bytes; unknown key uses a random decoy; unknown ID and wrong signature return the same auth refusal. Secrets and the decoy are now `Secret`-wrapped, shrinking Debug/log exposure (`crates/core/src/internal_actions.rs:150-152`, `:213-234`) | Receiver must reject duplicate/coalesced auth headers and preserve values. No user identity or per-principal action scope is supplied by HMAC. P1 F1/F2. |
-| Spoofing | Replay a capture on another environment, under a rotating identity, or after clock rollback | Timestamp/skew and global nonce burn; durable identity contract requires a stable logical caller | Canonical MAC has no host, environment or caller ID; never reuse secrets across environments or aliases. Preserve ledgers during rotation. Expiry then rollback can reopen freshness after a nonce is forgotten; TTL alone is not a clock policy. F2/F3/F8. |
+| Spoofing | Replay a capture on another environment, under a rotating identity, or after clock rollback | Timestamp/skew and global nonce burn; durable identity contract requires a stable logical caller; monotonic high-water guards refuse regressed freshness clocks fail-closed on both paths (`ClockGuard` in `crates/core/src/clock_guard.rs`, memory pipeline in `crates/core/src/internal_actions.rs:1540`, durable mark in `crates/core/src/internal_action_store.rs:270` + `0353_internal_clock_high_water.sql`) | Canonical MAC has no host, environment or caller ID; never reuse secrets across environments or aliases. Preserve ledgers during rotation. TTL alone is not a clock policy: the guards (not the TTL) close the expiry-then-rollback reopen. F2/F3/F8. |
 | Tampering | Change body/action or exploit different HTTP/JSON parsers | MAC signs raw-body SHA256, not parsed/reencoded JSON; validators and allowlists refuse bad fields | `Idempotency-Key` is not signed; trusted transport is required. Duplicate JSON keys are not explicitly refused. Bound collection before hashing and test proxy/path/method semantics. F1/F3. |
 | Tampering | Bypass role/channel maps, foreign-guild fence or protected-target policy | Symbolic role/channel keys, catalog-only settings, moderation adjudication and guild-fenced persistence exist in libraries. Moderation permission/targets now resolve from one `command_permissions` source (`crates/core/src/moderation.rs:103-112`); website moderation channels are guild/type-checked (`crates/discord/src/executor.rs:887`); role assignment pins `resolved_role_id` at claim time (`crates/core/src/internal_action_store.rs:92`) | Receiver must call every relevant validator and obtain trusted live permission/hierarchy facts; `authorize` alone does not validate action fields. Settings CAS conflicts (`VersionConflict`/409 at `crates/core/src/internal_actions.rs:507`) must refresh, never blind-retry. P1 F2. |
 | Repudiation | Retry a destructive action after an ambiguous outcome, or lose audit linkage | Store commits scalar intent and audit atomically; only `Claimed` allows execution; stale/unknown claims require reconciliation. Ticket close commits transcript atomically under row-lock fences (`crates/cutover/src/tickets.rs:180-199`); later audits copy the original role pin, never a re-evaluated map | Async store seam is not wired. Request/actor IDs need trusted derivation; no arbitrary provider JSON in terminal records. Transcript purge and CAS-token retention are new deletion/conflict surfaces; cleanup must not reopen duplication. P1 F2, F5. |
@@ -254,25 +257,31 @@ second. Hence the nonce retention minimum is `2 * skew + 1 = 241` seconds, **not
 240**. The in-memory guard keeps a nonce through its inclusive TTL boundary and
 rejects short TTL/wider skew configurations. It is global across key IDs but
 lost on restart. Saturating subtraction refuses rollback while the nonce is
-still retained; **it cannot restore a nonce already swept**. For example, accept
-at `t`, sweep at `t + 241001 ms`, then roll wall time back to `t`: the original
-capture is fresh again and the synchronous pipeline accepts it. A new fresh
-request's `offer` can perform the same sweep. This is a characterized gap, not
-remediation; finite TTL alone does not establish replay safety under rollback.
+still retained; the F8 high-water guard (`ClockGuard`,
+`crates/core/src/clock_guard.rs`, wired into the pipeline at
+`crates/core/src/internal_actions.rs:1540`) additionally refuses rollback past
+swept entries: accept at `t`, sweep at `t + 241001 ms`, then roll wall time back
+to `t`, and the rolled-back capture refuses as `stale_request` with a
+`clock_rollback` log reason instead of accepting again — whether the sweep was
+explicit or performed by another fresh request's `offer`. Within 5 s of the
+mark the mark itself decides freshness (covering lock/pool-wait sampling skew);
+further below it refuses fail-closed. Forward jumps behave as before. Finite
+TTL alone does not establish replay safety under rollback; the guard does.
 
 Durable burns store a global nonce digest; expiry replacement is atomic and
-freshness is rechecked against DB time after lock/pool waits
-(`crates/core/src/internal_action_store.rs:298`). Only committed `Ok(true)`
-allows continuation; DB errors and ambiguous outcomes refuse. DB time rechecking
-also depends on a clock policy: rollback between the expiry predicate and the
-freshness sample can make an old capture fresh again. Existing durable rows are
-not automatically pruned, so ordinary rollback while a row is retained is not
-the memory-sweep case; future cleanup must not reopen it. These durable clock
-cases were assessed from source, not executed against a database. F8 requires
-explicit fail-closed freshness/expiry behavior across rollback, restart and
-failover before receiver activation. The route must insert that async burn **between**
-signature/freshness and buckets/body parsing, not call it only after the current
-synchronous `authorize` helper (`crates/core/src/internal_actions.rs:1521`;
+freshness is rechecked against DB time after lock/pool waits, now under the
+persisted high-water mark (`internal_clock_high_water`,
+`crates/cutover/migrations/0353_internal_clock_high_water.sql`, enforced in
+`crates/core/src/internal_action_store.rs:270` in the same transaction as the
+burn). Only committed `Ok(true)` allows continuation; DB errors and ambiguous
+outcomes refuse, and a DB-time regression past the 5 s tolerance rolls the burn
+back with `InvalidInput` even for a fresh nonce. Restart/failover re-derives
+the mark from the table (`nonce_high_water_ms`), so persisted time cannot move
+backwards past burned nonces. Existing durable rows are not automatically
+pruned, so ordinary rollback while a row is retained is not the memory-sweep
+case; future cleanup must not reopen it. The route must insert that async burn
+**between** signature/freshness and buckets/body parsing, not call it only after
+the current synchronous `authorize` helper (`crates/core/src/internal_actions.rs:1540`;
 ordering contract at `crates/core/src/internal_action_store.rs:243`).
 
 Nonce burn precedes parsing, allowlist and key bucket: an authenticated request
@@ -349,9 +358,12 @@ change the legacy canonical format.
   still refused 50 of 50 new keys after 24 idle hours). A new key at the cap now
   runs the same bounded 64-entry reap before its verdict
   (`wrangler/src/redirect.ts:203-216`); the fixture admits 50 of 50
-  (`wrangler/test/redirect.test.ts:670-688`). The redirect 429 always sends
-  `Retry-After: 1` (`:370-371`), including cap refusals. Global quota and
-  starvation resistance stay open under F7.
+  (`wrangler/test/redirect.test.ts:670-688`). The redirect 429 used to send a
+  fixed `Retry-After: 1`, including cap refusals; since TOG-12533 it forwards
+  the bucket's own wait (refill wait, remaining terminal hold, or the idle
+  window for a cap refusal; see the F7 row). Canonical caller identity, the
+  bounded unknown budget and the terminal hold landed in TOG-12469 (#290).
+  Global quota stays open under F7.
 - The moderation `ActionExecutor` (`crates/discord/src/executor.rs`) paces its
   own clones at 110 ms general / 350 ms kick with 5-second-timeout
   moderation mutations (`:63-68`, paced-lane reservation held through the fence
@@ -479,10 +491,25 @@ characterize the remaining clock-policy gap:
 - `buckets_retry_after_includes_clock_recovery_and_refill`: both bucket specs
   include rollback recovery, combine fractional recovery/refill before rounding,
   and allow the next call after the advertised wait without competing traffic.
-- `pipeline_clock_rollback_after_nonce_expiry_reopens_capture`: retained nonce
-  refuses rollback; after explicit sweep or another fresh request's sweep, the
-  old capture is accepted when wall time rolls back. This regression records
-  the known F8 gap; it does **not** demonstrate rollback-safe replay prevention.
+- `pipeline_clock_rollback_after_nonce_expiry_refuses_capture` (replaces the
+  former `..._reopens_capture` gap record): retained nonce refuses rollback as
+  a replay; after explicit sweep or another fresh request's sweep, the
+  rolled-back capture refuses as `stale_request` with a `clock_rollback` log
+  reason. This regression demonstrates F8 fail-closed memory behavior.
+- `pipeline_clock_within_tolerance_decides_at_high_water`: a delivery within
+  5 s behind the mark authorizes against the mark without moving it.
+- `pipeline_clock_forward_jump_behaves_as_before`: forward jumps advance the
+  mark, authorize fresh captures, and leave old captures stale (not rollback).
+- `nonce_db_rollback_after_expiry_refuses_capture`
+  (`crates/core/tests/internal_action_store.rs`, DB): burn, expire and replace
+  a nonce, roll DB time back into its signed window with injected row/mark
+  time (server clock untouched), and the capture refuses — on the live store
+  and on a fresh store restoring `nonce_high_water_ms`; forward DB time still
+  burns fresh captures.
+- `clock_guard` unit tests (`crates/core/src/clock_guard.rs`): first read sets
+  the mark, forward time advances it, within-tolerance reads decide at the
+  mark, past-tolerance reads refuse without moving the mark, and a restored
+  mark refuses an earlier clock while resuming at/above it.
 
 New since the prior review (source regressions, not HTTP, deployment or DB
 acceptance tests): four signing/key/moderation property tests in the same file,
@@ -505,8 +532,8 @@ Remaining proposals are intentionally **not implemented** here:
 | F4 / P2 rejection telemetry | Receiver implementer: scalar structured logger with bounded labels/suppression | Capture every rejection class with token/body/SQL marker fixtures; no marker or full input escapes and rejection flood stays bounded. `Secret`/redaction and `database_url` allowlist work has landed; staging and production log head-sampling 1 make log proof load-bearing in both. |
 | F5 / P2 action-specific safety | Action owners: mapped event ownership, automation import schema/cardinality/overwrite transaction, key-specific setting validation, tempban recovery and lockdown/unlock overwrite serialization | Unmapped events, excessive imports, protected roles, invalid setting types, conflicting channel intents and unknown outcomes fail closed; legitimate operation/reconciliation has scalar evidence. Moderation duration caps and settings CAS have landed as narrowing, not closure. |
 | F6 / P1 deployment gate | Deployment owner with CISO: verify secret custody, per-environment guild/DB/key bindings, least-privilege DB role and mandatory authenticated TLS for Neon | Record non-secret binding/TLS/role receipts on the deployment card; test only fixtures/CI or explicitly authorized staging. Least-privilege roles/verifier/DML-only gateway/operator-migrates-first (via #102) and the `database_url` allowlist are procedure progress, not isolation proof; staging observability is telemetry, not a fence. Source URL-prefix validation is not TLS or isolation proof. |
-| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: global edge/guild/caller quotas, bounded nonce/intent growth (redirect caller map and per-isolate probe limits landed), the shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429 (landed; receiver must share one per token), and total REST deadlines; preserve gateway resources | Landed for the Worker: bounded redirect caller map and public probe gate (TOG-12245, #259). `TokenBuckets` (`wrangler/src/redirect.ts:126-254`) idle-expires only fully refilled buckets, caps at 10,000 keys fail-closed and sweeps at most 64 per call; `/health`/`/readyz` take a separate `healthBuckets` budget before the Container (`wrangler/src/index.ts:84-88`, `:410-433`). Fixtures `wrangler/test/redirect.test.ts:586-763` prove idle reclamation, a fixed ceiling, churn that cannot reset a depleted caller, bounded sweep work and reap-before-refuse at the cap; `wrangler/test/health-probes.test.ts:114-139` proves the probe 429. Reserved-internal 404s and ticket/dispatch budgets have also landed. Residual: buckets are per isolate, not global, and 10,000 live keys in one isolate refuse new callers there; a map of idle keys now drains on new-key traffic alone (fixed, TOG-12387). Still open: prove bounded collection/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. The executor-level 429 governor is proven locally: the first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent before that cooldown elapses is refused as `NoEffect(CoolingDown)` without a Discord send while other channels proceed, and a new intent proceeds only after the cooldown closes; the original key stays terminal throughout. Receiver wiring of one governor per token remains open. No destructive live load tests. |
-| F8 / P1 receiver clock-policy gate | Receiver/store owners with Security review: define fail-closed behavior for backwards freshness/expiry clocks (including DB time), bounded retention and safe recovery across restart/failover; TTL coverage is conditional | Accept a capture, expire/sweep/replace its nonce, then roll time back into its signed window: memory and durable paths must refuse, including across instance restart/failover and lock waits. Record the trusted clock/high-water or equivalent policy and recovery criteria; cleanup (including transcript/intent retention) must not erase replay protection. Legitimate traffic resumes only under that verified policy. |
+| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: global edge/guild/caller quotas, bounded nonce/intent growth (redirect caller map, per-isolate probe limits, canonical caller identity, unknown budget and terminal 429 hold landed), the shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429 (landed; receiver must share one per token, TOG-11045), and total REST deadlines; preserve gateway resources | Landed for the Worker: bounded redirect caller map and public probe gate (TOG-12245, #259). `TokenBuckets` (`wrangler/src/redirect.ts:171-372`) idle-expires only fully refilled buckets, caps at 10,000 keys fail-closed and sweeps at most 64 per call; `/health`/`/readyz` take a separate `healthBuckets` budget before the Container (`wrangler/src/index.ts:99`, `:548-572`). Fixtures `wrangler/test/redirect.test.ts:589-766` prove idle reclamation, a fixed ceiling, churn that cannot reset a depleted caller, bounded sweep work and reap-before-refuse at the cap; `wrangler/test/health-probes.test.ts:122-147` proves the probe 429. **Landed (TOG-12469, #290):** canonical caller identity, so case, whitespace, IPv6 zone-id and `::ffff:` aliases share one bucket (`canonicalCallerKey`, `wrangler/src/redirect.ts:143-169`); one bounded `unknown` budget for callers with no edge signal, which cannot mint entries or starve valid callers; and a terminal hold after 25 straight denials (60 s) that retries can neither shorten nor extend (`take`, `:277-355`). **Landed (TOG-12533):** the redirect 429 forwards the bucket's own `Retry-After` (whole seconds, at least 1), so a held caller is told the remaining hold instead of a one-second retry loop (`:506-516`, wired at `wrangler/src/index.ts:643`). Refill accrues across a hold, capped at capacity, by design: the hold bounds the denial streak, not admissions, and a caller that honors the wait gets what an idle caller would (review sim, 100 rps for 600 s: 600 admits with the hold, 659 without). Fixtures `wrangler/test/redirect.test.ts:768-986` and `wrangler/test/redirect-worker.test.ts:102-132` prove alias folding, the unknown budget, the hold and refill across it, and a counting-down hold `Retry-After` through the handler and the Worker entry with no store lookup during the hold, while a refill denial still gets 1. Reserved-internal 404s and ticket/dispatch budgets have also landed. Residual (open): buckets are per isolate, not global, so quota does not survive other instances or restarts (a recycled or different isolate starts every caller full); 10,000 live keys in one isolate refuse new callers there, and one IPv6 prefix can still mint distinct keys; a map of idle keys drains on new-key traffic alone (fixed, TOG-12387). Still open: prove bounded collection/concurrency. The executor-level 429 governor is proven locally: the first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent before that cooldown elapses is refused as `NoEffect(CoolingDown)` without a Discord send while other channels proceed, and a new intent proceeds only after the cooldown closes; the original key stays terminal throughout. Receiver wiring of one governor per token remains open (TOG-11045). No destructive live load tests. |
+| F8 / P1 receiver clock-policy gate | Landed: `ClockGuard` high-water policy (`crates/core/src/clock_guard.rs`, 5 s tolerance) enforced on the memory pipeline (`crates/core/src/internal_actions.rs:1540`) and the durable burn (`crates/core/src/internal_action_store.rs:270` + `0353_internal_clock_high_water.sql`); restart/failover restores `nonce_high_water_ms`; bounded state (mark only, no per-nonce history) | Accept a capture, expire/sweep/replace its nonce, then roll time back into its signed window: memory and durable paths refuse, including across instance restart/failover and lock waits — pinned by `pipeline_clock_rollback_after_nonce_expiry_refuses_capture` and `nonce_db_rollback_after_expiry_refuses_capture`. Cleanup (including transcript/intent retention) must not erase replay protection. Legitimate traffic resumes only under that verified policy. |
 
 F1/F2/F8 are requirements for the existing receiver slice, not new route work in
 this PR. F6 is evidence required at deployment, not authorization to touch secrets.

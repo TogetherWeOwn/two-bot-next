@@ -215,6 +215,7 @@ fn cli(scratch: &Scratch, fake: &FakeDiscord, subcommand: &str) -> Command {
         .env("DISCORD_STAGING_GUILD_ID", TWO_STAGING_GUILD_ID)
         .env("GUILD_CONFIG_API_BASE", &fake.base)
         .env("GUILD_CONFIG_CDN_BASE", &fake.base)
+        .env("TWO_GUILD_CONFIG_OFFLINE_TEST", "1")
         .env("TWO_GUILD_CONFIG_BACKUP_DIR", scratch.0.join("captured"))
         // Snapshot success requires two uploads. This local no-op performs no
         // network call and inherits only this explicitly scrubbed environment.
@@ -243,6 +244,64 @@ fn restore_command(scratch: &Scratch, fake: &FakeDiscord, source: &Path) -> Comm
         .arg("--confirm-staging-guild")
         .arg("--apply");
     cmd
+}
+
+#[tokio::test]
+async fn unflagged_loopback_requires_admission_before_any_request() {
+    let scratch = Scratch::new();
+    scratch.write_token();
+    let source = scratch.snapshot(fixture(8, 10));
+    let fake = FakeDiscord::start(fixture(8, 10)).await;
+    for mut cmd in [
+        cli(&scratch, &fake, "guild-config-snapshot"),
+        restore_command(&scratch, &fake, &source),
+    ] {
+        cmd.env_remove("TWO_GUILD_CONFIG_OFFLINE_TEST");
+        let (out, text) = output(cmd).await;
+        assert_eq!(out.status.code(), Some(2), "{text}");
+        assert!(
+            text.contains("TWO_DATABASE_URL admission authority required"),
+            "{text}"
+        );
+    }
+    assert!(fake.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn offline_flag_requires_both_explicit_loopback_endpoints() {
+    let scratch = Scratch::new();
+    scratch.write_token();
+    let fake = FakeDiscord::start(fixture(8, 10)).await;
+    for name in ["GUILD_CONFIG_API_BASE", "GUILD_CONFIG_CDN_BASE"] {
+        let mut cmd = cli(&scratch, &fake, "guild-config-snapshot");
+        cmd.env_remove(name);
+        let (out, text) = output(cmd).await;
+        assert_eq!(out.status.code(), Some(2), "{text}");
+        assert!(text.contains("offline fixture"), "{text}");
+
+        let mut cmd = cli(&scratch, &fake, "guild-config-snapshot");
+        cmd.env(name, "https://example.invalid");
+        let (out, text) = output(cmd).await;
+        assert_eq!(out.status.code(), Some(2), "{text}");
+        assert!(text.contains("only accepts loopback"), "{text}");
+    }
+    assert!(fake.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn supplied_empty_authority_is_not_bypassed_by_offline_flag() {
+    let scratch = Scratch::new();
+    scratch.write_token();
+    let fake = FakeDiscord::start(fixture(8, 10)).await;
+    let mut cmd = cli(&scratch, &fake, "guild-config-snapshot");
+    cmd.env("TWO_DATABASE_URL", "");
+    let (out, text) = output(cmd).await;
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("TWO_DATABASE_URL admission authority required"),
+        "{text}"
+    );
+    assert!(fake.state.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
