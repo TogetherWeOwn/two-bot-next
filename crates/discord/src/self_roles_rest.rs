@@ -7,6 +7,7 @@
 //! still an observed effect, not success of the enclosing self-role operation.
 
 use super::{ActionExecutor, RawResponse, MODERATION_TIMEOUT_MS};
+use crate::ratelimit_guard::GuardError;
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{collections::HashSet, future::Future, time::Duration};
 use twilight_http::request::TryIntoRequest;
@@ -147,6 +148,18 @@ fn status_code(code: u16) -> Result<(), SelfRoleRestError> {
     }
 }
 
+/// A local guard refusal never reached the wire, so it is provably no-send.
+/// Transient restrictions defer like rate limiting; a dead token is uncertain
+/// rather than a rejection with a status code.
+fn guard_error(error: GuardError) -> SelfRoleRestError {
+    match error {
+        GuardError::TokenInvalid => SelfRoleRestError::Ambiguous,
+        GuardError::CircuitOpen | GuardError::AdmissionTimeout | GuardError::GlobalPaused => {
+            SelfRoleRestError::RateLimited
+        }
+    }
+}
+
 impl ActionExecutor {
     async fn self_role_read<T: DeserializeOwned>(
         &self,
@@ -155,11 +168,14 @@ impl ActionExecutor {
         let request = builder
             .try_into_request()
             .map_err(|_| SelfRoleRestError::InvalidId)?;
-        let mut lane = self.paced_lane(false).await;
+        let mut lane = self.paced_lane(false).await.map_err(guard_error)?;
         *lane = std::time::Instant::now();
-        let response = tokio::time::timeout(
+        // `send_admitted` skips lane locking: the reservation above is the
+        // pacing. It still collects the bounded body, so a truncated member
+        // document stays `Ambiguous`, never a parsed partial snapshot.
+        let (response, _) = tokio::time::timeout(
             Duration::from_millis(MODERATION_TIMEOUT_MS),
-            self.send(&request),
+            self.send_admitted(&request),
         )
         .await
         .map_err(|_| SelfRoleRestError::Ambiguous)?
@@ -347,13 +363,18 @@ impl ActionExecutor {
                 .try_into_request()
         }
         .map_err(|_| SelfRoleRestError::InvalidId)?;
-        let mut lane = self.paced_lane(false).await;
+        let mut lane = self.paced_lane(false).await.map_err(guard_error)?;
         if !owns().await? {
             return Err(SelfRoleRestError::StaleClaim);
         }
         journal().await?;
         if !owns().await? {
             return Err(SelfRoleRestError::StaleClaim);
+        }
+        // A guard closed during the DB waits refuses instead of sleeping
+        // after the fresh fence (kick pattern): never send unfenced.
+        if let Err(error) = self.inner.transport.guard.check_now(false) {
+            return Err(guard_error(error));
         }
         *lane = std::time::Instant::now();
         let (result, response_status) = match tokio::time::timeout(
