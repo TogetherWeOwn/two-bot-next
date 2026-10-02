@@ -297,6 +297,126 @@ async fn nonce_race_restart_and_expiry_window() {
     db.cleanup().await;
 }
 
+/// F8 durable fail-closed: accept a capture, expire and replace its nonce,
+/// then roll DB time back into its signed window. The persisted high-water
+/// mark refuses the rolled-back capture even though the old row is gone —
+/// on the live store and on a fresh store (restart/failover) that re-derives
+/// the mark from the table. Time is injected only through rows the test owns
+/// and the mark table; the server clock is never changed.
+///
+/// DB-time injection works because `burn_nonce` reads its commit instant from
+/// `clock_timestamp()`: backdating every burned row plus the mark row moves
+/// the transaction's observed DB time into the past for the expiry predicate,
+/// while the signed timestamp stays put. The high-water comparison then sees
+/// a regressed clock and refuses fail-closed.
+#[tokio::test]
+async fn nonce_db_rollback_after_expiry_refuses_capture() {
+    use two_bot_core::clock_guard::{ClockGuard, CLOCK_SKEW_TOLERANCE_MS};
+
+    let db = TestDb::new().await;
+    let store = db.store();
+    let nonce = body_hash(db.fixture.name().as_bytes())[..32].to_owned();
+    let attempt = db_now_secs(&db.pool).await.to_string();
+    assert!(
+        store.burn_nonce(&nonce, &attempt).await.unwrap(),
+        "first burn accepted"
+    );
+    let mark = store
+        .nonce_high_water_ms()
+        .await
+        .unwrap()
+        .expect("first burn persists the high-water mark");
+    // The mark matches DB time to the second (whole-second commit instant).
+    let db_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(
+        (db_ms - mark as i64).abs() <= 2_000,
+        "mark tracks the DB clock: mark={mark} db={db_ms}"
+    );
+
+    // Expire and replace the nonce row so the old capture's only guard is the
+    // mark; a fresh store (new process) sees the same persisted mark.
+    let now = db_now_secs(&db.pool).await.to_string();
+    sqlx::query(
+        "UPDATE internal_nonces SET burned_at = clock_timestamp() - INTERVAL '242 seconds', \
+         expires_at = clock_timestamp() - INTERVAL '1 second'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let replacement =
+        body_hash(format!("{}-replacement", db.fixture.name()).as_bytes())[..32].to_owned();
+    assert!(
+        store.burn_nonce(&replacement, &now).await.unwrap(),
+        "expired row is replaceable before rollback"
+    );
+
+    // Roll DB time back into the first capture's signed window: backdate every
+    // burned row AND the mark row, so the transaction observes a regressed
+    // clock while the signed timestamp stays fresh.
+    let rollback_secs: i64 = 241 + 30;
+    sqlx::query(
+        "UPDATE internal_nonces SET burned_at = clock_timestamp() - ($1::bigint * INTERVAL '1 second'), \
+         expires_at = clock_timestamp() - ($1::bigint * INTERVAL '1 second') + INTERVAL '241 seconds'",
+    )
+    .bind(rollback_secs)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE internal_clock_high_water SET high_water_ms = high_water_ms - $1, \
+         observed_at = clock_timestamp() - ($2::bigint * INTERVAL '1 second') \
+         WHERE domain = 'internal_nonce_db'",
+    )
+    .bind(rollback_secs * 1000 + 60_000)
+    .bind(rollback_secs)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // The rolled-back capture refuses on the live store, even though its nonce
+    // row is expired-and-replaced (only the mark guards it now).
+    assert_eq!(
+        store.burn_nonce(&nonce, &attempt).await,
+        Err(InternalStoreError::InvalidInput),
+        "rolled-back capture must refuse after expiry"
+    );
+
+    // A fresh store with an earlier clock and the persisted mark also refuses:
+    // restore the guard from the table exactly as a restarted process would.
+    let persisted = store.nonce_high_water_ms().await.unwrap();
+    assert!(persisted.is_some(), "mark survives for a restarted process");
+    let mut guard = ClockGuard::restore(persisted.unwrap());
+    let regressed_ago = rollback_secs as u64 * 1000;
+    let regressed = persisted.unwrap().saturating_sub(regressed_ago);
+    assert!(
+        regressed > 0,
+        "injected regression must stay a valid clock reading"
+    );
+    let err = guard.evaluate(regressed).expect_err(
+        "new process with an earlier clock and the persisted mark refuses old captures",
+    );
+    assert!(regressed + CLOCK_SKEW_TOLERANCE_MS < persisted.unwrap());
+    assert_eq!(err.high_water_ms, persisted.unwrap());
+
+    // Forward DB time still behaves as before: a fresh capture burns.
+    sqlx::query("DELETE FROM internal_nonces")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM internal_clock_high_water WHERE domain = 'internal_nonce_db'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let fresh_nonce = body_hash(format!("{}-fresh", db.fixture.name()).as_bytes())[..32].to_owned();
+    let fresh = db_now_secs(&db.pool).await.to_string();
+    assert!(store.burn_nonce(&fresh_nonce, &fresh).await.unwrap());
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn claims_race_bind_payload_action_caller_and_replay_after_restart() {
     let db = TestDb::new().await;

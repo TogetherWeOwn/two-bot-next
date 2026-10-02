@@ -162,7 +162,7 @@ gates for that integration. Current-public-surface findings are marked explicitl
 | STRIDE | Concrete threat / boundary | Existing control | Residual risk / required evidence |
 | --- | --- | --- | --- |
 | Spoofing | Forge a website request or enumerate accepted key IDs | HMAC-SHA256 on exact bytes; unknown key uses a random decoy; unknown ID and wrong signature return the same auth refusal. Secrets and the decoy are now `Secret`-wrapped, shrinking Debug/log exposure (`crates/core/src/internal_actions.rs:150-152`, `:213-234`) | Receiver must reject duplicate/coalesced auth headers and preserve values. No user identity or per-principal action scope is supplied by HMAC. P1 F1/F2. |
-| Spoofing | Replay a capture on another environment, under a rotating identity, or after clock rollback | Timestamp/skew and global nonce burn; durable identity contract requires a stable logical caller | Canonical MAC has no host, environment or caller ID; never reuse secrets across environments or aliases. Preserve ledgers during rotation. Expiry then rollback can reopen freshness after a nonce is forgotten; TTL alone is not a clock policy. F2/F3/F8. |
+| Spoofing | Replay a capture on another environment, under a rotating identity, or after clock rollback | Timestamp/skew and global nonce burn; durable identity contract requires a stable logical caller; monotonic high-water guards refuse regressed freshness clocks fail-closed on both paths (`ClockGuard` in `crates/core/src/clock_guard.rs`, memory pipeline in `crates/core/src/internal_actions.rs:1525`, durable mark in `crates/core/src/internal_action_store.rs:255` + `0352_internal_clock_high_water.sql`) | Canonical MAC has no host, environment or caller ID; never reuse secrets across environments or aliases. Preserve ledgers during rotation. TTL alone is not a clock policy: the guards (not the TTL) close the expiry-then-rollback reopen. F2/F3/F8. |
 | Tampering | Change body/action or exploit different HTTP/JSON parsers | MAC signs raw-body SHA256, not parsed/reencoded JSON; validators and allowlists refuse bad fields | `Idempotency-Key` is not signed; trusted transport is required. Duplicate JSON keys are not explicitly refused. Bound collection before hashing and test proxy/path/method semantics. F1/F3. |
 | Tampering | Bypass role/channel maps, foreign-guild fence or protected-target policy | Symbolic role/channel keys, catalog-only settings, moderation adjudication and guild-fenced persistence exist in libraries. Moderation permission/targets now resolve from one `command_permissions` source (`crates/core/src/moderation.rs:103-112`); website moderation channels are guild/type-checked (`crates/discord/src/executor.rs:887`); role assignment pins `resolved_role_id` at claim time (`crates/core/src/internal_action_store.rs:92`) | Receiver must call every relevant validator and obtain trusted live permission/hierarchy facts; `authorize` alone does not validate action fields. Settings CAS conflicts (`VersionConflict`/409 at `crates/core/src/internal_actions.rs:507`) must refresh, never blind-retry. P1 F2. |
 | Repudiation | Retry a destructive action after an ambiguous outcome, or lose audit linkage | Store commits scalar intent and audit atomically; only `Claimed` allows execution; stale/unknown claims require reconciliation. Ticket close commits transcript atomically under row-lock fences (`crates/cutover/src/tickets.rs:180-199`); later audits copy the original role pin, never a re-evaluated map | Async store seam is not wired. Request/actor IDs need trusted derivation; no arbitrary provider JSON in terminal records. Transcript purge and CAS-token retention are new deletion/conflict surfaces; cleanup must not reopen duplication. P1 F2, F5. |
@@ -250,25 +250,31 @@ second. Hence the nonce retention minimum is `2 * skew + 1 = 241` seconds, **not
 240**. The in-memory guard keeps a nonce through its inclusive TTL boundary and
 rejects short TTL/wider skew configurations. It is global across key IDs but
 lost on restart. Saturating subtraction refuses rollback while the nonce is
-still retained; **it cannot restore a nonce already swept**. For example, accept
-at `t`, sweep at `t + 241001 ms`, then roll wall time back to `t`: the original
-capture is fresh again and the synchronous pipeline accepts it. A new fresh
-request's `offer` can perform the same sweep. This is a characterized gap, not
-remediation; finite TTL alone does not establish replay safety under rollback.
+still retained; the F8 high-water guard (`ClockGuard`,
+`crates/core/src/clock_guard.rs`, wired into the pipeline at
+`crates/core/src/internal_actions.rs:1525`) additionally refuses rollback past
+swept entries: accept at `t`, sweep at `t + 241001 ms`, then roll wall time back
+to `t`, and the rolled-back capture refuses as `stale_request` with a
+`clock_rollback` log reason instead of accepting again — whether the sweep was
+explicit or performed by another fresh request's `offer`. Within 5 s of the
+mark the mark itself decides freshness (covering lock/pool-wait sampling skew);
+further below it refuses fail-closed. Forward jumps behave as before. Finite
+TTL alone does not establish replay safety under rollback; the guard does.
 
 Durable burns store a global nonce digest; expiry replacement is atomic and
-freshness is rechecked against DB time after lock/pool waits
-(`crates/core/src/internal_action_store.rs:298`). Only committed `Ok(true)`
-allows continuation; DB errors and ambiguous outcomes refuse. DB time rechecking
-also depends on a clock policy: rollback between the expiry predicate and the
-freshness sample can make an old capture fresh again. Existing durable rows are
-not automatically pruned, so ordinary rollback while a row is retained is not
-the memory-sweep case; future cleanup must not reopen it. These durable clock
-cases were assessed from source, not executed against a database. F8 requires
-explicit fail-closed freshness/expiry behavior across rollback, restart and
-failover before receiver activation. The route must insert that async burn **between**
-signature/freshness and buckets/body parsing, not call it only after the current
-synchronous `authorize` helper (`crates/core/src/internal_actions.rs:1521`;
+freshness is rechecked against DB time after lock/pool waits, now under the
+persisted high-water mark (`internal_clock_high_water`,
+`crates/cutover/migrations/0352_internal_clock_high_water.sql`, enforced in
+`crates/core/src/internal_action_store.rs:255` in the same transaction as the
+burn). Only committed `Ok(true)` allows continuation; DB errors and ambiguous
+outcomes refuse, and a DB-time regression past the 5 s tolerance rolls the burn
+back with `InvalidInput` even for a fresh nonce. Restart/failover re-derives
+the mark from the table (`nonce_high_water_ms`), so persisted time cannot move
+backwards past burned nonces. Existing durable rows are not automatically
+pruned, so ordinary rollback while a row is retained is not the memory-sweep
+case; future cleanup must not reopen it. The route must insert that async burn
+**between** signature/freshness and buckets/body parsing, not call it only after
+the current synchronous `authorize` helper (`crates/core/src/internal_actions.rs:1525`;
 ordering contract at `crates/core/src/internal_action_store.rs:243`).
 
 Nonce burn precedes parsing, allowlist and key bucket: an authenticated request
@@ -441,10 +447,25 @@ characterize the remaining clock-policy gap:
 - `buckets_retry_after_includes_clock_recovery_and_refill`: both bucket specs
   include rollback recovery, combine fractional recovery/refill before rounding,
   and allow the next call after the advertised wait without competing traffic.
-- `pipeline_clock_rollback_after_nonce_expiry_reopens_capture`: retained nonce
-  refuses rollback; after explicit sweep or another fresh request's sweep, the
-  old capture is accepted when wall time rolls back. This regression records
-  the known F8 gap; it does **not** demonstrate rollback-safe replay prevention.
+- `pipeline_clock_rollback_after_nonce_expiry_refuses_capture` (replaces the
+  former `..._reopens_capture` gap record): retained nonce refuses rollback as
+  a replay; after explicit sweep or another fresh request's sweep, the
+  rolled-back capture refuses as `stale_request` with a `clock_rollback` log
+  reason. This regression demonstrates F8 fail-closed memory behavior.
+- `pipeline_clock_within_tolerance_decides_at_high_water`: a delivery within
+  5 s behind the mark authorizes against the mark without moving it.
+- `pipeline_clock_forward_jump_behaves_as_before`: forward jumps advance the
+  mark, authorize fresh captures, and leave old captures stale (not rollback).
+- `nonce_db_rollback_after_expiry_refuses_capture`
+  (`crates/core/tests/internal_action_store.rs`, DB): burn, expire and replace
+  a nonce, roll DB time back into its signed window with injected row/mark
+  time (server clock untouched), and the capture refuses — on the live store
+  and on a fresh store restoring `nonce_high_water_ms`; forward DB time still
+  burns fresh captures.
+- `clock_guard` unit tests (`crates/core/src/clock_guard.rs`): first read sets
+  the mark, forward time advances it, within-tolerance reads decide at the
+  mark, past-tolerance reads refuse without moving the mark, and a restored
+  mark refuses an earlier clock while resuming at/above it.
 
 New since the prior review (source regressions, not HTTP, deployment or DB
 acceptance tests): four signing/key/moderation property tests in the same file,
@@ -468,7 +489,7 @@ Remaining proposals are intentionally **not implemented** here:
 | F5 / P2 action-specific safety | Action owners: mapped event ownership, automation import schema/cardinality/overwrite transaction, key-specific setting validation, tempban recovery and lockdown/unlock overwrite serialization | Unmapped events, excessive imports, protected roles, invalid setting types, conflicting channel intents and unknown outcomes fail closed; legitimate operation/reconciliation has scalar evidence. Moderation duration caps and settings CAS have landed as narrowing, not closure. |
 | F6 / P1 deployment gate | Deployment owner with CISO: verify secret custody, per-environment guild/DB/key bindings, least-privilege DB role and mandatory authenticated TLS for Neon | Record non-secret binding/TLS/role receipts on the deployment card; test only fixtures/CI or explicitly authorized staging. Least-privilege roles/verifier/DML-only gateway/operator-migrates-first (via #102) and the `database_url` allowlist are procedure progress, not isolation proof; staging observability is telemetry, not a fence. Source URL-prefix validation is not TLS or isolation proof. |
 | F7 / P2 current-public-surface and future ingress | Worker/receiver owners: edge probe limits, global guild/caller quotas, bounded redirect caller-map/nonce/intent growth, a shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429, and total REST deadlines; preserve gateway resources | Local many-caller fixtures, including invalid-slug/unknown-campaign 404s and long simulated idle intervals, prove a fixed caller-state ceiling and idle reclamation (reserved-internal 404s and ticket/dispatch budgets have landed; the uncapped caller map has not). Define eviction/overflow behavior so churn cannot reset a depleted caller's quota or create unbounded work. Also prove bounded collection/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. Prove the 429 governor: first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent admitted before that cooldown elapses is held without a Discord send, then proceeds only after the cooldown closes; the original key stays terminal throughout. No destructive live load tests. |
-| F8 / P1 receiver clock-policy gate | Receiver/store owners with Security review: define fail-closed behavior for backwards freshness/expiry clocks (including DB time), bounded retention and safe recovery across restart/failover; TTL coverage is conditional | Accept a capture, expire/sweep/replace its nonce, then roll time back into its signed window: memory and durable paths must refuse, including across instance restart/failover and lock waits. Record the trusted clock/high-water or equivalent policy and recovery criteria; cleanup (including transcript/intent retention) must not erase replay protection. Legitimate traffic resumes only under that verified policy. |
+| F8 / P1 receiver clock-policy gate | Landed: `ClockGuard` high-water policy (`crates/core/src/clock_guard.rs`, 5 s tolerance) enforced on the memory pipeline (`crates/core/src/internal_actions.rs:1525`) and the durable burn (`crates/core/src/internal_action_store.rs:255` + `0352_internal_clock_high_water.sql`); restart/failover restores `nonce_high_water_ms`; bounded state (mark only, no per-nonce history) | Accept a capture, expire/sweep/replace its nonce, then roll time back into its signed window: memory and durable paths refuse, including across instance restart/failover and lock waits — pinned by `pipeline_clock_rollback_after_nonce_expiry_refuses_capture` and `nonce_db_rollback_after_expiry_refuses_capture`. Cleanup (including transcript/intent retention) must not erase replay protection. Legitimate traffic resumes only under that verified policy. |
 
 F1/F2/F8 are requirements for the existing receiver slice, not new route work in
 this PR. F6 is evidence required at deployment, not authorization to touch secrets.
