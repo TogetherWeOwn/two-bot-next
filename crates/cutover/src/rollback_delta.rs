@@ -342,7 +342,7 @@ async fn report_at(
     generated_at: String,
 ) -> Result<DeltaReport, DeltaError> {
     let mut conn = pool.acquire().await?;
-    let mut tx = crate::legacy_verify::read_only_transaction(&mut *conn)
+    let mut tx = crate::legacy_verify::read_only_transaction(&mut conn)
         .await
         .map_err(|e| match e {
             crate::legacy_verify::VerifyError::Database(inner) => DeltaError::Database(inner),
@@ -379,7 +379,7 @@ pub async fn export_delta(
     writer: &mut dyn FnMut(String) -> std::io::Result<()>,
 ) -> Result<u64, DeltaError> {
     let mut conn = pool.acquire().await?;
-    let mut tx = crate::legacy_verify::read_only_transaction(&mut *conn)
+    let mut tx = crate::legacy_verify::read_only_transaction(&mut conn)
         .await
         .map_err(|e| match e {
             crate::legacy_verify::VerifyError::Database(inner) => DeltaError::Database(inner),

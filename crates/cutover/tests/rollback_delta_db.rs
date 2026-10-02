@@ -225,7 +225,7 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         // Read-only proof in the exact snapshot setup: the session reports
         // read-only and a write to a real table fails with 25006.
         let mut conn = db.pool.acquire().await?;
-        let mut tx = read_only_transaction(&mut *conn).await?;
+        let mut tx = read_only_transaction(&mut conn).await?;
         let readonly: String = sqlx::query_scalar("SHOW transaction_read_only")
             .fetch_one(&mut *tx)
             .await?;
