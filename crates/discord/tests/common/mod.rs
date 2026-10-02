@@ -500,14 +500,24 @@ impl MockRest {
     /// Bind on 127.0.0.1 and start serving `script` in order; once the queue
     /// is spent, every further request gets `default`.
     pub async fn start(script: Vec<ScriptedResponse>, default: ScriptedResponse) -> Self {
-        Self::start_inner(
-            script
-                .into_iter()
-                .map(|response| (response, None))
-                .collect(),
-            default,
-        )
-        .await
+        Self::start_with_body_delay(script, default, Duration::ZERO).await
+    }
+
+    /// Send headers immediately but hold body bytes to exercise header admission.
+    pub async fn start_with_body_delay(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+        body_delay: Duration,
+    ) -> Self {
+        Self::start_inner(ungated(script), default, Some(body_delay)).await
+    }
+
+    /// Send headers but never finish a nonempty body; clients must time out.
+    pub async fn start_with_stalled_bodies(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+    ) -> Self {
+        Self::start_inner(ungated(script), default, None).await
     }
 
     /// Hold the final scripted response until the caller releases its gate.
@@ -517,17 +527,18 @@ impl MockRest {
     ) -> (Self, Arc<ResponseGate>) {
         let last = script.pop().expect("a gated response needs a script");
         let gate = Arc::new(ResponseGate::default());
-        let mut queue: VecDeque<_> = script
-            .into_iter()
-            .map(|response| (response, None))
-            .collect();
+        let mut queue = ungated(script);
         queue.push_back((last, Some(Arc::clone(&gate))));
-        (Self::start_inner(queue, default).await, gate)
+        (
+            Self::start_inner(queue, default, Some(Duration::ZERO)).await,
+            gate,
+        )
     }
 
     async fn start_inner(
         script: VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)>,
         default: ScriptedResponse,
+        body_delay: Option<Duration>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
@@ -536,7 +547,7 @@ impl MockRest {
         let handle = {
             let recorded = Arc::clone(&recorded);
             tokio::spawn(async move {
-                rest_task(listener, recorded, queue, default).await;
+                rest_task(listener, recorded, queue, default, body_delay).await;
             })
         };
         Self {
@@ -564,11 +575,21 @@ impl MockRest {
     }
 }
 
+fn ungated(
+    script: Vec<ScriptedResponse>,
+) -> VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)> {
+    script
+        .into_iter()
+        .map(|response| (response, None))
+        .collect()
+}
+
 async fn rest_task(
     listener: TcpListener,
     recorded: Arc<Mutex<Vec<RestRequest>>>,
     queue: ResponseQueue,
     default: ScriptedResponse,
+    body_delay: Option<Duration>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -577,7 +598,9 @@ async fn rest_task(
         let recorded = Arc::clone(&recorded);
         let queue = Arc::clone(&queue);
         let default = default.clone();
-        tokio::spawn(async move { handle_rest(stream, recorded, queue, default).await });
+        tokio::spawn(
+            async move { handle_rest(stream, recorded, queue, default, body_delay).await },
+        );
     }
 }
 
@@ -586,6 +609,7 @@ async fn handle_rest(
     recorded: Arc<Mutex<Vec<RestRequest>>>,
     queue: ResponseQueue,
     default: ScriptedResponse,
+    body_delay: Option<Duration>,
 ) {
     let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
         return;
@@ -620,6 +644,17 @@ async fn handle_rest(
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
+    if !next.body.is_empty() {
+        let Some(body_delay) = body_delay else {
+            // Retain the socket without delivering bytes until the client
+            // disconnects. No timer/server-side completion can rescue the test.
+            let _ = stream.read(&mut [0u8; 1]).await;
+            return;
+        };
+        if !body_delay.is_zero() {
+            tokio::time::sleep(body_delay).await;
+        }
+    }
     let _ = stream.write_all(&next.body).await;
     if let Some(gate) = gate {
         gate.completed.notify_one();

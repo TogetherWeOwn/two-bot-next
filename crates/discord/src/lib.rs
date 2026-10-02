@@ -22,6 +22,7 @@ pub mod internal_events;
 pub mod leveling_runtime;
 mod message_safety;
 pub mod pipeline;
+pub mod ratelimit_guard;
 pub mod voice_rooms;
 
 #[cfg(feature = "db")]
