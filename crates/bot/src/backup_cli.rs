@@ -416,12 +416,13 @@ async fn cmd_restore(args: &[String]) -> i32 {
             return 1;
         }
     };
-    // NOTE: two-bot-next migrations land under S6 (Founding Engineer). Until
-    // then the target must already carry the schema; dump()/restore() refuse
-    // with a named table when it does not. S6 plugs migrate() in here.
+    // Restore deliberately does not apply migrations. The independently
+    // provisioned target must already carry the current cutover schema;
+    // dump()/restore() refuse with a named table when it does not.
     match dump::restore(&pool, Path::new(&file)).await {
         Ok(report) => {
             println!("restore: dump taken {}", report.manifest.created_at);
+            warn_missing_dump_tables(&report.manifest);
             println!(
                 "restore: migrations in dump: {}",
                 if report.manifest.schema_migrations.is_empty() {
@@ -439,6 +440,9 @@ async fn cmd_restore(args: &[String]) -> i32 {
                     got,
                     if got == table.count { "ok" } else { "MISMATCH" }
                 );
+            }
+            for (table, count) in &report.initialized_tables {
+                eprintln!("restore: WARNING: {table}: initialized {count} schema-required baseline row(s), not archived data");
             }
             for (table, cols) in &report.dropped_columns {
                 eprintln!(
@@ -462,6 +466,17 @@ async fn cmd_restore(args: &[String]) -> i32 {
     0
 }
 
+fn warn_missing_dump_tables(manifest: &dump_file::DumpManifest) {
+    let missing = manifest.missing_tables();
+    if !missing.is_empty() {
+        eprintln!(
+            "restore: WARNING: v{} dump lacks tables that will be cleared (settings revision singleton resets to zero): {}",
+            manifest.version,
+            missing.join(", ")
+        );
+    }
+}
+
 async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
     // Nothing in this branch writes. A dry run must not be able to become
     // the outage it rehearses for.
@@ -476,6 +491,7 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
 
     println!("restore: --dry-run of {file}");
     println!("restore: dump taken {}", contents.manifest.created_at);
+    warn_missing_dump_tables(&contents.manifest);
     println!(
         "restore: migrations in dump: {}",
         if contents.manifest.schema_migrations.is_empty() {
@@ -502,9 +518,8 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
                         (*name).to_owned(),
                         match count {
                             Ok((n,)) => n.to_string(),
-                            Err(_) => {
-                                "(no such table - the restore would migrate first)".to_owned()
-                            }
+                            Err(_) => "(no such table - provision matching schema before restore)"
+                                .to_owned(),
                         },
                     );
                 }
