@@ -713,7 +713,7 @@ async fn repeated_json_key_refuses_before_claim_or_rest() {
         r#"{{"action":"role.assign","discord_id":"{USER}","discord_id":"{BOT}","role_key":"member"}}"#
     );
     let err = exec
-        .execute_stored_member(&store, "website", "dup-key", repeated.as_bytes(), &config)
+        .execute_stored_member(&store, "website", "dup-key-1", repeated.as_bytes(), &config)
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::Malformed);
@@ -727,7 +727,7 @@ async fn repeated_json_key_refuses_before_claim_or_rest() {
     // No claim was taken, so the same key still runs a well-formed body fresh.
     let payload = json!({"action":"role.assign","discord_id":USER,"role_key":"member"}).to_string();
     let first = exec
-        .execute_stored_member(&store, "website", "dup-key", payload.as_bytes(), &config)
+        .execute_stored_member(&store, "website", "dup-key-1", payload.as_bytes(), &config)
         .await
         .unwrap();
     assert_eq!(first.outcome, MemberOutcome::AlreadyHeld);
