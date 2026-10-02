@@ -52,10 +52,10 @@ fn ny_clock(utc_secs: i64) -> (i64, i64) {
         (SPRING_2026..1_825_000_000).contains(&utc_secs),
         "outside table"
     );
-    let offset = if utc_secs < FALL_2026 || utc_secs >= SPRING_2027 {
-        -4 * 3600
-    } else {
+    let offset = if (FALL_2026..SPRING_2027).contains(&utc_secs) {
         -5 * 3600
+    } else {
+        -4 * 3600
     };
     let local = utc_secs + offset;
     (local.div_euclid(86_400), local.rem_euclid(86_400))
