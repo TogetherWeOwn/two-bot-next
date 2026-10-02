@@ -24,7 +24,7 @@ jobs:
     # top level it would otherwise check out this private repo with no token.
     permissions:
       contents: read
-    uses: ./.github/workflows/pipeline-benchmark.yml
+    uses: ./.github/workflows/pipeline-benchmark.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
 
   advisories:
     name: nightly advisories
