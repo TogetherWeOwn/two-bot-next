@@ -453,6 +453,11 @@ impl RestClient {
                 Ok(ListPage::Interrupted(reason)) => break reason,
                 Err(RestError::Body(_)) => break ScanCompletion::InvalidResponse,
                 Err(RestError::Twilight(_)) => break ScanCompletion::RequestFailed,
+                // Member-pagination errors never come from `exec_list`;
+                // propagate rather than mislabel a scan completion.
+                Err(
+                    e @ (RestError::MemberCursorStalled | RestError::MemberCeilingExceeded { .. }),
+                ) => return Err(e),
             };
             if batch.is_empty() {
                 break ScanCompletion::EndOfHistory;
