@@ -16,6 +16,9 @@
 //! - feed relays (`/feed-add`, `/feed-remove`, `/feed-list`; TOG-10085 domain
 //!   and store): plan → guild-scoped CRUD → `announcements_audit_log` row → ephemeral
 //!   completion. The generated relay/audit ids replace legacy `randomUUID()`.
+//! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
+//!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
+//!   award path shares this runtime's pool, executor and onboarding gates.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
@@ -55,7 +58,8 @@ use two_bot_core::{
     InteractionRouter, ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
-    publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
+    publish_commands, response_for_slash, route_interaction, ActionExecutor, LevelingRuntime,
+    RoutedInteraction,
 };
 
 use crate::activation::BootActivation;
@@ -89,11 +93,11 @@ impl InteractionHandler for StickyHandler {
     }
 }
 
-/// Router handler marker for the feed-relay commands; one instance per id.
+/// Router handler marker for the feed and leveling slices; one per id.
 #[derive(Debug)]
-struct FeedHandler(HandlerId);
+struct SliceHandler(HandlerId);
 
-impl InteractionHandler for FeedHandler {
+impl InteractionHandler for SliceHandler {
     fn id(&self) -> HandlerId {
         self.0
     }
@@ -107,6 +111,7 @@ pub struct CommandRuntime {
     pool: Pool<Postgres>,
     executor: ActionExecutor,
     router: InteractionRouter,
+    leveling: LevelingRuntime,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
     /// Token-derived identity; READY/REST cannot substitute a different app.
@@ -133,6 +138,7 @@ impl CommandRuntime {
         pool: Pool<Postgres>,
         token: &str,
         guild_id: u64,
+        onboarding: two_bot_core::OnboardingGates,
         activation: &BootActivation,
     ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
@@ -167,6 +173,7 @@ impl CommandRuntime {
             &features,
             &moderation,
             SurfaceFlags {
+                session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                 tickets: ticket_config.is_some(),
                 ..SurfaceFlags::default()
             },
@@ -199,7 +206,9 @@ impl CommandRuntime {
         } else {
             None
         };
-        Some(Self::from_gates(pool, executor, gates, tickets, activation))
+        Some(Self::from_gates(
+            pool, executor, gates, tickets, onboarding, activation,
+        ))
     }
 
     /// Composition seam shared by boot and mock-Discord tests. Only narrowed
@@ -209,16 +218,26 @@ impl CommandRuntime {
         executor: ActionExecutor,
         gates: RouterGates,
         tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
+        onboarding: two_bot_core::OnboardingGates,
         activation: &BootActivation,
     ) -> Arc<Self> {
         let gates = activation.constrain_router(gates);
+        let guild_id = gates
+            .configured_guild
+            .expect("boot supplies configured guild");
+        // The ordered leveling path shares this runtime's executor/pacing.
+        let leveling = LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            guild_id,
+            onboarding,
+        );
         Arc::new(Self {
             pool,
             executor,
             router: router_with_commands(gates),
-            guild_id: gates
-                .configured_guild
-                .expect("boot supplies configured guild"),
+            leveling,
+            guild_id,
             application_id: activation.application_id(),
             tickets,
             automations: gates.automations,
@@ -242,10 +261,20 @@ impl CommandRuntime {
         guild_id: u64,
         automations: bool,
     ) -> Arc<Self> {
+        let leveling = LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            guild_id,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
         Arc::new(Self {
             pool,
             executor,
             router,
+            leveling,
             guild_id,
             application_id: Some(1111),
             tickets: None,
@@ -253,6 +282,12 @@ impl CommandRuntime {
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
         })
+    }
+
+    /// Shares this runtime's pool, executor/pacing and onboarding gates with
+    /// the ordered award path; only this runtime dispatches interactions.
+    pub fn leveling(&self) -> LevelingRuntime {
+        self.leveling.clone()
     }
 
     #[cfg(test)]
@@ -439,8 +474,8 @@ impl CommandRuntime {
 
     /// Route all slash commands through the shared router. Refusals get the
     /// existing ephemeral text; accepted builtins without a wired slice get
-    /// an unavailable reply. Only the five implemented names defer and run
-    /// their slice. Router Ignore (unknown names/guild fence) stays silent.
+    /// an unavailable reply. Sticky/feed defer ephemerally; leveling sends
+    /// its own immediate callback. Router Ignore (unknown/guild) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
         let routed = route_interaction(&self.router, interaction, None);
         if let RoutedInteraction::Component {
@@ -470,6 +505,14 @@ impl CommandRuntime {
         let SlashOutcome::Handled { handler } = outcome else {
             return;
         };
+        if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) {
+            // Leveling owns its immediate rank-ephemeral/leaderboard-public
+            // callback. Never send the generic ephemeral defer as well.
+            if let Err(error) = self.leveling.handle_interaction(interaction, handler).await {
+                warn!(interaction_id = %interaction.id.get(), command = %name, error = %error, "leveling interaction failed");
+            }
+            return;
+        }
         let owner = match name.as_str() {
             "sticky" | "sticky-remove" => Some(HandlerId::AutomationAdmin),
             "feed-add" => Some(HandlerId::FeedAdd),
@@ -1150,8 +1193,13 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
             HandlerId::FeedRemove,
             HandlerId::FeedList,
         ] {
-            router.register(Box::new(FeedHandler(id)));
+            router.register(Box::new(SliceHandler(id)));
         }
+    }
+    // Leveling is not an activation-fenced capability: the core rank and
+    // leaderboard commands stay available to every permitted identity.
+    for id in [HandlerId::Rank, HandlerId::Leaderboard] {
+        router.register(Box::new(SliceHandler(id)));
     }
     router
 }

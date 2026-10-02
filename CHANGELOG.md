@@ -5,6 +5,7 @@
 ### Added
 
 - Enforce the live-activation identity and capability fence at boot: derive the application id from the bot token (never config), permit every capability only for the staging guild/application pair, and restrict the live pair to the reviewed `LIVE_CLEARED_CAPABILITIES` allowlist (shipped: `self_roles` only). Refused capabilities validate no feature gates, register no commands, construct no runtime, request no privileged intents, and log one structured refusal line while the process stays up for cleared surfaces. The tickets runtime and its ticket-driven `MESSAGE_CONTENT` request land under the same default-deny rule.
+- Wire leveling through the shared command runtime, interaction router and REST executor with ordered, awaited gateway awards. Preserve message eligibility, measured voice duration, session/dry-run reward suppression, ephemeral rank and mention-suppressed public top 10. Ordinary level-ups only grant roles; explicit revokes require a pinned staging fence and whole-set permission/hierarchy preflight. Mock REST and migrated disposable database proofs run in CI, including a shared-runtime single-callback regression.
 - Automod gateway decision/enrichment seams and capture-only funnel handoff,
   staging/live-approval and dry-run fences, protected-target enforcement plans,
   repeat-history expiration, and replay-safe delivery claims with the
