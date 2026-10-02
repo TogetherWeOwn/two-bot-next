@@ -30,6 +30,9 @@ BEGIN
       INSERT INTO sticky_messages
         (guild_id, channel_id, body, created_by, created_at, updated_by, updated_at)
         VALUES (g, u, 'fixture', u, now(), u, now());
+      INSERT INTO scheduled_messages
+        (id, guild_id, channel_id, body, next_run_at, created_by, created_at, updated_by, updated_at)
+        VALUES (k, g, u, 'fixture', '2026-10-01T00:00:00.000Z', u, '2026-10-01T00:00:00.000Z', u, '2026-10-01T00:00:00.000Z');
       INSERT INTO automation_audit_log (id, guild_id, actor_id, action, outcome, created_at)
         VALUES (k, g, u, 'sticky.create', 'ok', now());
       INSERT INTO event_rsvps (guild_id, event_id, user_id, status, responded_at)

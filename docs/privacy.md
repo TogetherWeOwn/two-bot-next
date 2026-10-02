@@ -16,7 +16,7 @@ are outside this implementation's scope.
   voice-session/event keys (`event_rsvps`, `community_facts`). Scorecards normally
   store aggregates; the erasure plan also checks their serialized payloads.
 - LFG posts, creators, role slots and member signups; feed configuration, creators
-  and delivery state. Sticky bodies and their creator/editor IDs are stored.
+  and delivery state. Sticky bodies and their creator/editor IDs are stored. Scheduled messages store creator/editor IDs and are erased with them.
 - Moderation, announcements, automation and operational audit rows, actor/target
   IDs, reasons and metadata. Some legacy-compatible payload columns are arbitrary
   TEXT, not database-validated JSON.
