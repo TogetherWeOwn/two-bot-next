@@ -58,6 +58,8 @@ README. Staging deploys from `main`; production is a separate manual gate.
 - [Staging soak acceptance](docs/staging-soak.md): the evidence required before
   cutover; deployment alone is not acceptance.
 - [Backup/restore runbook](docs/backup.md) and [parity matrix](docs/parity.md).
+- [Command registry drift](docs/command-publish.md): dry-run-first
+  `two-bot commands diff|publish` and opt-in boot publication for cutover.
 
 ### Regenerate the references
 

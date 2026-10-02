@@ -10,3 +10,11 @@
 # Permitted by Director of Engineering decision on TOG-10153 (accepted
 # request_confirmation, resolved 2026-09-30).
 6b05d0646e487058033f7f44bdda472bc6967ae3:crates/bot/tests/startup.rs:discord-client-secret:27
+
+# TOG-10860: exact historical synthetic application-ID fixture, never read from
+# env, Discord or a credential service. Full-history scanning retains this match
+# after shortening the current fixture. Only this commit/file/rule/line is ignored;
+# fresh occurrences remain detectable. Detectors and workflow are unchanged.
+# Permitted by Director of Engineering request_confirmation
+# f5d07c5f-eed3-41c5-8130-5144a4fd2e49 (accepted 2026-10-01).
+c6621c9294097f0a3b1d312fe61db8ad5d68348f:wrangler/test/container.test.ts:discord-client-id:28

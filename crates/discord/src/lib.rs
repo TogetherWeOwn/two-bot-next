@@ -8,7 +8,9 @@
 pub mod adapter;
 pub mod audit_mirror;
 pub mod automod;
+pub mod automod_activation;
 pub mod channel_access;
+pub mod command_registry;
 pub mod executor;
 mod executor_metrics;
 pub mod intents;
@@ -17,8 +19,14 @@ pub mod internal_actions;
 #[cfg(feature = "db")]
 pub mod internal_channel_moderation;
 pub mod internal_events;
+#[cfg(feature = "db")]
+pub mod leveling_runtime;
 mod message_safety;
 pub mod pipeline;
+pub mod ratelimit_guard;
+
+#[cfg(feature = "db")]
+pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};
 
 pub use adapter::event_to_core;
 pub use executor::{
@@ -35,6 +43,6 @@ pub use interactions::{
 };
 pub use internal_events::{event_status_name, scheduled_event_body, EventActionError, EventCall};
 pub use pipeline::{
-    build_cache, ChannelClassifier, InviteSource, MemPipeline, NoClassification, NoInvites,
-    Pipeline, PipelineSnapshots, ScriptedInvites,
+    build_cache, ChannelClassifier, InviteSource, MemPipeline, MessageEligibility,
+    NoClassification, NoInvites, Pipeline, PipelineSnapshots, ScriptedInvites,
 };

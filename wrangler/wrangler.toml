@@ -15,6 +15,11 @@ compatibility_date = "2026-09-29"
 # through `env`, as they were before nodejs_compat. Inherited by every [env.*].
 compatibility_flags = ["nodejs_compat", "nodejs_compat_do_not_populate_process_env"]
 
+# Identity is supplied by Cloudflare, not a hand-edited env flag. Ownership
+# must be explicitly transferred after each new version is deployed.
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
 # Default-environment bindings. Named environments do NOT inherit these —
 # every [env.*] below repeats the full Container/DO wiring explicitly.
 # Verified against wrangler 4.143.1 (`deploy --dry-run --env <name>` warns on
@@ -59,6 +64,9 @@ KEEPALIVE_SECONDS = "60"
 #   wrangler secret put --env staging DISCORD_TOKEN      # staging bot token
 #   wrangler secret put --env staging GUILD_ID           # TWO Staging guild
 #   wrangler secret put --env production DISCORD_TOKEN   # B4 only
+[env.staging.version_metadata]
+binding = "CF_VERSION_METADATA"
+
 [[env.staging.containers]]
 class_name = "TwoBotContainer"
 image = "../Dockerfile"
@@ -85,6 +93,9 @@ BOT_PORT = "8080"
 # (outbound-only, invisible to Container idle billing) never sleeps.
 KEEPALIVE_SECONDS = "60"
 TWO_GUILD_NAME = "TWO Staging"
+
+[env.production.version_metadata]
+binding = "CF_VERSION_METADATA"
 
 # Operator 2026-10-01 (TOG-11131): staging container logs, so the startup
 # exit-1 since #119 can be diagnosed from Workers Logs.

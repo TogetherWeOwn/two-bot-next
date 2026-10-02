@@ -5,9 +5,12 @@ import copy
 import json
 from pathlib import Path
 import subprocess
+import tempfile
+import textwrap
 import unittest
 
-from check_soak_checklist import delta_rows, parity_rows, render, validate
+from check_soak_checklist import (check_verification, delta_rows, parity_rows, render,
+                                  libtest_names, validate)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -189,6 +192,164 @@ class SoakChecklistTests(unittest.TestCase):
     def test_escaped_pipe_stays_in_cell(self):
         changed = self.parity.replace("## 9. Drops", "| Behaviour | Detail | Map |\n|---|---|---|\n|new observable | one \\| two | **S5** |\n\n## 9. Drops")
         self.assertIn((8, ("new observable", "one | two")), parity_rows(changed))
+
+
+WRAPPED = "python3 scripts/cargo_cache.py run -- test "
+FIXTURE = {
+    "Cargo.toml": """
+        [workspace]
+        members = ["crates/demo"]
+    """,
+    "crates/demo/Cargo.toml": """
+        [package]
+        name = "demo"
+    """,
+    "crates/demo/src/lib.rs": """
+        //! #[test] fn doc_ghost() {}
+        /* outer /* nested #[test] fn block_ghost() {} */ still a comment } */
+        pub mod outer;
+        #[path = "elsewhere/renamed.rs"]
+        mod moved;
+        const RAW: &str = r##"{ "#[test] fn raw_ghost() {}" "##;
+        const OPEN: char = '{';
+        fn helper<'a>(x: &'a str) -> &'a str { let _ = "} #[test] fn string_ghost"; x }
+        #[cfg(test)]
+        mod tests {
+            #[test]
+            fn unit() {}
+            fn not_a_test() {
+                #[test]
+                fn nested_hidden() {}
+            }
+            proptest::proptest! {
+                #[test]
+                fn property(x in 0..1u8) { let _ = x; }
+            }
+        }
+    """,
+    "crates/demo/src/outer.rs": """
+        mod inner;
+        #[tokio::test(flavor = "current_thread")]
+        async fn outer_async() {}
+    """,
+    "crates/demo/src/outer/inner.rs": "#[test] fn deep() {}",
+    "crates/demo/src/elsewhere/renamed.rs": """
+        mod sibling;
+        #[test] fn moved_test() {}
+    """,
+    "crates/demo/src/elsewhere/sibling.rs": "#[test] fn sib() {}",
+    "crates/demo/tests/smoke.rs": """
+        mod support;
+        #[test] fn smoke_case() {}
+    """,
+    "crates/demo/tests/support/mod.rs": """
+        pub mod nested;
+        #[test] fn support_case() {}
+    """,
+    "crates/demo/tests/support/nested.rs": "#[test] fn nested_case() {}",
+    "crates/demo/tests/multi/main.rs": "#[test] fn multi_case() {}",
+}
+
+
+class AutomatedVerificationTests(unittest.TestCase):
+    """Automated rows must name a real package, test target and test (offline)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parity = (ROOT / "docs/parity.md").read_text()
+        cls.checklist = json.loads((ROOT / "docs/soak-checklist.json").read_text())
+        cls.fixture = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.fixture.name)
+        for name, source in FIXTURE.items():
+            (cls.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (cls.root / name).write_text(textwrap.dedent(source))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture.cleanup()
+
+    def rewritten(self, entry_id, old, new):
+        data = copy.deepcopy(self.checklist)
+        entry = next(e for e in data["entries"] if e["id"] == entry_id)
+        self.assertIn(old, entry["verification"])
+        entry["verification"] = entry["verification"].replace(old, new)
+        return data
+
+    def test_every_automated_row_resolves(self):
+        automated = [e for e in self.checklist["entries"] if e["status"] == "automated"]
+        self.assertGreater(len(automated), 0)
+        for entry in automated:
+            with self.subTest(entry=entry["id"]):
+                check_verification(entry["id"], entry["verification"])
+
+    def test_unknown_package_fails_with_row_id(self):
+        data = self.rewritten("s6-07", "-p two-bot-core", "-p two-bot-kore")
+        with self.assertRaisesRegex(ValueError, r"^s6-07: unknown package -p two-bot-kore"):
+            validate(self.parity, data)
+
+    def test_missing_test_target_fails_with_row_id(self):
+        data = self.rewritten("s6-07", "--test backup_transport", "--test backup_transports")
+        with self.assertRaisesRegex(
+                ValueError, r"^s6-07: missing test target --test backup_transports "
+                            r"\(crates/core/tests/backup_transports\.rs\)"):
+            validate(self.parity, data)
+
+    def test_renamed_test_fn_fails_with_row_id(self):
+        name = "guild_config_capture_plan_apply_round_trip"
+        data = self.rewritten("s6-03", name, name + "_v2")
+        with self.assertRaisesRegex(ValueError, rf"^s6-03: no test named '{name}_v2'"):
+            validate(self.parity, data)
+        # Without --exact a prefix still selects the test; with it, only the full name.
+        data = self.rewritten("s6-03", name, "guild_config_capture")
+        validate(self.parity, self.rewritten("s6-03", name + " -- --exact", "guild_config_capture"))
+        with self.assertRaisesRegex(ValueError, r"^s6-03: no test named 'guild_config_capture'"):
+            validate(self.parity, data)
+
+    def test_renamed_lib_module_filter_fails_with_row_id(self):
+        data = self.rewritten("s13-90ab4b7", "backup::dump_file", "backup::dump_files")
+        with self.assertRaisesRegex(ValueError, r"^s13-90ab4b7: no test matching 'backup::dump_files'"):
+            validate(self.parity, data)
+
+    def test_every_chained_invocation_is_checked(self):
+        data = self.rewritten("s6-01", "--test executor_regressions", "--test executor_regression")
+        with self.assertRaisesRegex(ValueError, r"^s6-01: missing test target --test executor_regression "):
+            validate(self.parity, data)
+
+    def test_unsupported_command_shapes_fail_closed(self):
+        for command, error in (
+            ("cargo test -p two-bot-core --test backup_transport", "run Cargo as"),
+            ("python3 scripts/cargo_cache.py run -- check -p two-bot-core", "automated verification must be `cargo test`"),
+            (WRAPPED + "--test backup_transport", "name exactly one -p"),
+            (WRAPPED + "-p two-bot-core -p two-bot-discord --lib", "name exactly one -p"),
+            (WRAPPED + "-p two-bot-core --doc", "unsupported target selector --doc"),
+            (WRAPPED + "-p two-bot-next --lib", "no tests in the selected targets"),
+            ("python3 scripts/check_soak_checklist.py", "no cargo test invocation"),
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ValueError, f"^row: {error}"):
+                    check_verification("row", command)
+
+    def test_test_names_follow_modules_and_ignore_comments_and_literals(self):
+        demo = self.root / "crates/demo"
+        self.assertEqual(sorted(libtest_names(demo / "src/lib.rs")), [
+            "moved::moved_test", "moved::sibling::sib", "outer::inner::deep",
+            "outer::outer_async", "tests::property", "tests::unit"])
+        self.assertEqual(sorted(libtest_names(demo / "tests/smoke.rs")), [
+            "smoke_case", "support::nested::nested_case", "support::support_case"])
+
+    def test_fixture_commands_resolve_by_target_and_filter(self):
+        for command in (
+            WRAPPED + "-p demo --lib outer::inner",
+            WRAPPED + "-p demo --test smoke support::nested::nested_case -- --exact",
+            WRAPPED + "-p demo --test multi && " + WRAPPED + "-p demo --tests sib",
+            WRAPPED + "-p demo -- --skip unit --test-threads 1 moved_test",
+        ):
+            with self.subTest(command=command):
+                check_verification("row", command, self.root)
+        for ghost in ("doc_ghost", "block_ghost", "raw_ghost", "string_ghost", "nested_hidden"):
+            with self.subTest(ghost=ghost):
+                with self.assertRaisesRegex(ValueError, f"^row: no test matching '{ghost}'"):
+                    check_verification("row", WRAPPED + "-p demo " + ghost, self.root)
 
 
 class DeltaChecklistTests(unittest.TestCase):
