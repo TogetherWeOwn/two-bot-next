@@ -112,7 +112,7 @@ test("outages and invalid codes are not cached; rate limiting precedes cache hit
   assert.equal((await handleRedirect("GET", "/missing", "caller", deps)).status, 404);
   assert.equal(calls, 4);
   assert.equal((await handleRedirect("GET", "/missing", "caller", {
-    ...deps, isThrottled: () => true,
+    ...deps, throttle: () => ({ allowed: false, retryAfter: 1 }),
   })).status, 429);
   assert.equal(calls, 4);
 });
