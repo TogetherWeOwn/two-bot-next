@@ -117,8 +117,9 @@ as dynamic labels.
   `two_bot_job_consecutive_failures{job}` — `job` is one of
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
   `scheduled_events`, `presence_probe`, `community_scorecard`, `inactivity`,
-  `other`; `outcome` is `success` or `failure`. `session_checkpoint`
-  records successful durable gateway commits; zero means never run.
+  `audit_retry`, `other`; `outcome` is `success` or `failure`.
+  `session_checkpoint` records successful durable gateway commits; zero means
+  never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
   `_sum` and `_count`.

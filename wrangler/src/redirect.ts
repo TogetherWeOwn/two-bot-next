@@ -22,6 +22,12 @@
  * - Non-GET/HEAD on non-reserved paths → 405 with `Allow: GET, HEAD`.
  * - Per-caller 60-burst / 1-per-sec token bucket runs BEFORE the DB lookup;
  *   denied → 429 + `retry-after: 1`, nothing recorded.
+ * - Caller keys are canonicalized before bucketing (case, surrounding
+ *   whitespace, IPv6 zone id, `::ffff:`-mapped quad and empty/missing all
+ *   share one bucket), so aliases cannot multiply quota. Callers with no edge
+ *   signal share one bounded unknown budget that cannot touch valid callers.
+ *   A key denied N times in a row is held terminal for a bounded cooldown;
+ *   retries during the hold neither consume nor extend it.
  * - Bare `/` → fallback code redirect (uncounted), else 404.
  * - Lookup outage (throw) → fallback redirect when configured, else 503 +
  *   `retry-after: 30`. Unknown slug (null) → 404 with no Location (no open
@@ -123,6 +129,34 @@ export function clickIdempotencyKey(click: RedirectClick): string {
 }
 
 /**
+ * Canonical caller identity for quota accounting (TOG-12469).
+ *
+ * Every `take` runs the raw key through this first, so aliases of one caller
+ * share one bucket and quota cannot be multiplied by spelling:
+ * - non-strings, empty and whitespace-only keys share the single `unknown`
+ *   budget; the literal `unknown` (any case) folds into it too, so traffic
+ *   with no edge signal can never mint map entries or touch valid callers;
+ * - ASCII case is folded (IPv6 hex is case-insensitive);
+ * - an IPv6 zone id (`fe80::1%eth0`) is stripped — it names an interface,
+ *   not a caller;
+ * - `::ffff:a.b.c.d` folds to the quad, so one stack is not two callers.
+ *
+ * Keys are capped at 256 chars to bound per-entry memory; truncation can only
+ * merge long keys into a shared bucket, never split one caller into two.
+ */
+export function canonicalCallerKey(raw: unknown): string {
+  if (typeof raw !== "string") return "unknown";
+  let key = raw.trim().toLowerCase();
+  if (key === "" || key === "unknown") return "unknown";
+  const zone = key.indexOf("%");
+  if (zone >= 0) key = key.slice(0, zone);
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(key);
+  if (mapped) key = mapped[1] as string;
+  if (key === "") return "unknown";
+  return key.length > 256 ? key.slice(0, 256) : key;
+}
+
+/**
  * Minimal per-key token buckets (port of two-bot `TokenBuckets.take`).
  * One isolate = one map; acceptable for a 60-burst crawler cap at this scale.
  *
@@ -140,14 +174,26 @@ export function clickIdempotencyKey(click: RedirectClick): string {
  *   the back) then reaps at most `sweepBudget` idle-expired entries from the
  *   front; a new key at the cap runs the same reap before its verdict. Per-call
  *   work is O(sweepBudget), independent of map size.
+ * - Retry lifetime (TOG-12469): `maxConsecutiveDenials` denials in a row put
+ *   the key in a terminal hold until `terminalCooldownMs` elapses. Takes
+ *   during the hold are refused without touching tokens and without extending
+ *   the hold, so a retry loop can neither succeed early nor keep the hold
+ *   alive; one success resets the streak. A held entry is enforcement state,
+ *   never idle: expiry and the sweep skip it. Like the Rust `CooldownGovernor`,
+ *   this only refuses — it never queues, sleeps or retries.
  */
 export class TokenBuckets {
-  private buckets = new Map<string, { tokens: number; updatedAt: number }>();
+  private buckets = new Map<
+    string,
+    { tokens: number; updatedAt: number; denials: number; heldUntil?: number }
+  >();
   private spec: { capacity: number; refillPerSecond: number };
   private clock: () => number;
   private idleTtlMs: number;
   private maxBuckets: number;
   private sweepBudget: number;
+  private maxConsecutiveDenials: number;
+  private terminalCooldownMs: number;
 
   constructor(
     spec: { capacity: number; refillPerSecond: number } = {
@@ -159,6 +205,8 @@ export class TokenBuckets {
       idleTtlMs?: number;
       maxBuckets?: number;
       sweepBudget?: number;
+      maxConsecutiveDenials?: number;
+      terminalCooldownMs?: number;
     } = {},
   ) {
     this.spec = spec;
@@ -183,6 +231,21 @@ export class TokenBuckets {
         ? Math.floor(limits.sweepBudget as number)
         : 64,
     );
+    // Terminal hold after sustained over-budget hammering. The default (25
+    // straight denials → 60s hold) sits far above legitimate burst+retry
+    // traffic, so ordinary callers never see it; hammering callers do.
+    this.maxConsecutiveDenials = Math.max(
+      1,
+      Number.isFinite(limits.maxConsecutiveDenials)
+        ? Math.floor(limits.maxConsecutiveDenials as number)
+        : 25,
+    );
+    this.terminalCooldownMs = Math.max(
+      1,
+      Number.isFinite(limits.terminalCooldownMs)
+        ? Math.floor(limits.terminalCooldownMs as number)
+        : 60_000,
+    );
   }
 
   /** Tracked buckets. For tests/observability; keys are never logged. */
@@ -191,13 +254,30 @@ export class TokenBuckets {
   }
 
   take(key: string): { allowed: boolean; retryAfter: number } {
+    // Canonicalize first: aliases share one bucket, and every no-signal
+    // caller shares the single `unknown` budget instead of minting entries.
+    const canonical = canonicalCallerKey(key);
     const t = this.clock();
-    let b = this.buckets.get(key);
+    let b = this.buckets.get(canonical);
+    if (b && b.heldUntil !== undefined) {
+      if (t < b.heldUntil) {
+        // Terminal hold: refuse without touching tokens, recency or the hold
+        // itself, so retries can neither succeed early nor extend the work.
+        return {
+          allowed: false,
+          retryAfter: Math.max(1, Math.ceil((b.heldUntil - t) / 1000)),
+        };
+      }
+      // Hold elapsed: clear the streak and fall through; idle expiry below
+      // may additionally restart the bucket full.
+      delete b.heldUntil;
+      b.denials = 0;
+    }
     if (b && Math.max(0, t - b.updatedAt) >= this.idleTtlMs) {
       // Untouched for a full refill window: dropping restarts it full, exactly
       // as capped refill would. Cannot apply to a key that still owes tokens
       // (the TTL floor guarantees that), so expiry never resets a throttle.
-      this.buckets.delete(key);
+      this.buckets.delete(canonical);
       b = undefined;
     }
     if (!b) {
@@ -214,7 +294,7 @@ export class TokenBuckets {
           retryAfter: Math.max(1, Math.ceil(this.idleTtlMs / 1000)),
         };
       }
-      b = { tokens: this.spec.capacity, updatedAt: t };
+      b = { tokens: this.spec.capacity, updatedAt: t, denials: 0 };
     }
     const elapsed = Math.max(0, (t - b.updatedAt) / 1000);
     b.tokens = Math.min(
@@ -224,31 +304,48 @@ export class TokenBuckets {
     b.updatedAt = t;
     // Move to the back: map order is recency order, so the sweep below always
     // reaps the least-recently-touched entries first.
-    this.buckets.delete(key);
+    this.buckets.delete(canonical);
     let verdict: { allowed: boolean; retryAfter: number };
     if (b.tokens >= 1) {
       b.tokens -= 1;
+      b.denials = 0;
       verdict = { allowed: true, retryAfter: 0 };
     } else {
       const wait = Math.ceil(
         (1 - b.tokens) / this.spec.refillPerSecond,
       );
-      verdict = { allowed: false, retryAfter: Math.max(1, wait) };
+      b.denials += 1;
+      if (b.denials >= this.maxConsecutiveDenials) {
+        // Bounded retry lifetime: this streak is over. The hold starts now
+        // and the verdict advertises it, so the caller learns the terminal
+        // wait on the denial that earned it.
+        b.heldUntil = t + this.terminalCooldownMs;
+        verdict = {
+          allowed: false,
+          retryAfter: Math.max(1, Math.ceil(this.terminalCooldownMs / 1000)),
+        };
+      } else {
+        verdict = { allowed: false, retryAfter: Math.max(1, wait) };
+      }
     }
-    this.buckets.set(key, b);
+    this.buckets.set(canonical, b);
     this.sweep(t);
     return verdict;
   }
 
-  /** Reap up to `sweepBudget` idle-expired entries from the least-recent end. */
+  /** Visit up to `sweepBudget` entries from the least-recent end. */
   private sweep(t: number): void {
     let budget = this.sweepBudget;
     for (const [key, b] of this.buckets) {
       if (budget <= 0) return;
+      budget -= 1;
+      // A live hold is enforcement state, not idle: skip it without stopping
+      // the reap behind it. The visit cap above keeps per-call work bounded
+      // even when many holds are live at once.
+      if (b.heldUntil !== undefined && t < b.heldUntil) continue;
       // Front is live: recency order means everything behind it is newer.
       if (Math.max(0, t - b.updatedAt) < this.idleTtlMs) return;
       this.buckets.delete(key);
-      budget -= 1;
     }
   }
 }
@@ -381,8 +478,10 @@ export async function handleRedirect(
     return text(404, "not found\n");
   }
 
-  // Per-caller cap before the database is touched. The key picks a bucket and
-  // never leaves this function.
+  // Per-caller cap before the database is touched. The bucket canonicalizes
+  // the key (aliases share one quota; no-signal callers share one bounded
+  // unknown budget), and a sustained-denial hold is terminal for its
+  // cooldown. The key never leaves this function.
   if (deps.isThrottled?.(callerKey)) {
     return text(429, "slow down\n", { "retry-after": "1" });
   }
