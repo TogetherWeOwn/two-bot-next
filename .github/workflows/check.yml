@@ -46,6 +46,19 @@ jobs:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
+      # Disk hygiene for hosted overflow runners (TOG-12134): the integration
+      # link step (`cargo test --workspace --test '*'`) links ~70 test
+      # binaries and exhausted the job-container overlay (98 MB left, rust-lld
+      # bus error on two consecutive main heads). Line tables keep failure
+      # backtraces useful while cutting binary size; codegen, debug
+      # assertions and test semantics are unchanged. `cargo test` compiles
+      # under the `test` profile, so both profiles are pinned.
+      CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
+      # Incremental artifacts multiply with ~70 linked test binaries; a cold
+      # CI link does not reuse them, so skip writing them (TOG-12134).
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
       TWO_LFG_TESTDB_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
     services:
@@ -76,6 +89,9 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          # Disk hygiene for hosted overflow runners (TOG-12134): the package
+          # lists stay on the job-container overlay otherwise.
+          rm -rf /var/lib/apt/lists/*
           # Tests that pin 127.0.0.1/localhost:5432 reach the service through
           # this job-private forward.
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
@@ -127,6 +143,16 @@ jobs:
           python3 tests/voice_templates/validate.py
           python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
 
+      # `check all` reads Cargo.lock by default (no --locked flag exists).
+      # deny.toml's allow-list is verified tight: no unmatched allowances.
+      # Runs before the toolchain install and every compile/link step
+      # (TOG-12134): the deny image ships its own toolchain and rustup-syncs
+      # the pinned one, so it must run while the disk is at its freest.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check all
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -167,6 +193,13 @@ jobs:
       # restore (TOG-12055), so a drifted Dockerfile fails before any download.
       - name: Verify Docker dependency layer (locked fetch)
         run: python3 scripts/test-docker-deps.py --cargo
+
+      # TOG-12134: cheap static guard, adopted from main. The fmt and
+      # secret-Debug checks already ran before the restore (TOG-12055), so
+      # main's post-restore duplicates of them are dropped here — no coverage
+      # change, same steps run once and earlier.
+      - name: Verify check job disk hygiene
+        run: python3 scripts/test-check-disk-hygiene.py
 
       # Compile optional stores and run their safety and scratch-DB tests too.
       # Onboarding/sticky live tests remain explicitly ignored by default.
@@ -311,13 +344,6 @@ jobs:
 
       - name: Real binary lifecycle acceptance (CI service only, under 60 s)
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
-
-      # `check all` reads Cargo.lock by default (no --locked flag exists).
-      # deny.toml's allow-list is verified tight: no unmatched allowances.
-      - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check all
 
   parity-docs:
     name: parity docs
