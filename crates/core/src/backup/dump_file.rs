@@ -88,6 +88,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "community_stream_heartbeats",
     "community_scorecard_runs",
     "community_scorecard_alerts",
+    "community_scorecard_attempts",
     "gateway_sessions",
     "guild_settings_revision",
     "guild_settings",
@@ -103,6 +104,8 @@ pub const DUMP_TABLES: &[&str] = &[
     "gateway_boot_directives",
     "member_erasure_audit",
     "invite_campaigns",
+    "voice_creators",
+    "voice_rooms",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data

@@ -187,6 +187,7 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         );
         // Unmeasurable tables carry a reason, never a silent skip.
         for table in [
+            "community_scorecard_attempts",
             "guild_settings_revision",
             "level_role_rewards",
             "rank_ladder",

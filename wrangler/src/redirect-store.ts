@@ -7,11 +7,12 @@
  * - insert: `EventStore.record` (`events`, `ON CONFLICT (idempotency_key)
  *   DO NOTHING`, `member_id` NULL, `metadata = {"campaign": slug}`).
  *
- * Until S1 (TOG-9671) lands the shared Neon database, `REDIRECT_DB` is
- * unbound and the Worker serves from `REDIRECT_MAPPINGS_JSON` (a JSON snapshot
- * of the same rows, e.g. exported via `npm run campaigns`); clicks are then
- * logged and dropped, never faked into a store. Resolution behavior — the
- * byte-identical acceptance — is the same either way.
+ * With `REDIRECT_DB` bound, every call opens one client through `connect`
+ * (redirect-db.ts), bounds connect + query by `DB_TIMEOUT_MS` and always ends
+ * the client. Unbound, the Worker serves from `REDIRECT_MAPPINGS_JSON` (a JSON
+ * snapshot of the same rows, e.g. exported via `npm run campaigns`); clicks
+ * are then logged and dropped, never faked into a store. Resolution behavior —
+ * the byte-identical acceptance — is the same either way.
  */
 
 import {
@@ -36,6 +37,36 @@ export interface DbClient {
 }
 
 export type ConnectFn = (connectionString: string) => Promise<DbClient>;
+
+/**
+ * Upper bound on connect + query for one store call. A visitor's redirect
+ * waits on the lookup; past this the outage path serves the fallback invite.
+ */
+export const DB_TIMEOUT_MS = 3_000;
+/** Ending a client never holds a redirect longer than this. */
+const END_TIMEOUT_MS = 1_000;
+
+/** Fixed message: the caller logs only the class (see redirectErrorClass). */
+export class DbTimeoutError extends Error {
+  constructor() {
+    super("redirect store timed out");
+  }
+}
+
+/** End a client without throwing or waiting more than END_TIMEOUT_MS. */
+async function endClient(client: DbClient): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => client.end()),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, END_TIMEOUT_MS); }),
+    ]);
+  } catch {
+    // The query already settled; a failed goodbye must not change its result.
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 interface CampaignRow {
   slug: string;
@@ -98,15 +129,18 @@ export class RedirectStore {
   private db: HyperdriveLike | undefined;
   private connect: ConnectFn | undefined;
   private snapshot: Campaign[];
+  private timeoutMs: number;
 
   constructor(
     db: HyperdriveLike | undefined,
     connect: ConnectFn | undefined,
     snapshot: Campaign[] = [],
+    timeoutMs: number = DB_TIMEOUT_MS,
   ) {
     this.db = db;
     this.connect = connect;
     this.snapshot = snapshot;
+    this.timeoutMs = timeoutMs;
   }
 
   get live(): boolean {
@@ -119,33 +153,49 @@ export class RedirectStore {
     if (!this.live) {
       return this.snapshot.find((c) => c.slug === slug) ?? null;
     }
-    const client = await (this.connect as ConnectFn)(
-      (this.db as HyperdriveLike).connectionString,
-    );
-    try {
+    return this.withClient(async (client) => {
       const { rows } = await client.query(LOOKUP_SQL, [slug]);
       const row = rows[0] as CampaignRow | undefined;
       return row ? rowToCampaign(row) : null;
-    } finally {
-      await client.end();
-    }
+    });
   }
 
   async recordClick(click: RedirectClick): Promise<void> {
     if (!this.live) return;
-    const client = await (this.connect as ConnectFn)(
-      (this.db as HyperdriveLike).connectionString,
-    );
-    try {
-      await client.query(INSERT_CLICK_SQL, [
+    await this.withClient((client) =>
+      client.query(INSERT_CLICK_SQL, [
         click.guildId,
         click.occurredAt,
         click.source,
         JSON.stringify({ campaign: click.campaign }),
         clickIdempotencyKey(click),
-      ]);
+      ]),
+    );
+  }
+
+  /**
+   * One client per call: connect + `run` share one deadline, and the client
+   * is always ended — including one that connects after the deadline.
+   */
+  private async withClient<T>(run: (client: DbClient) => Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new DbTimeoutError()), this.timeoutMs);
+    });
+    const connecting = Promise.resolve().then(() =>
+      (this.connect as ConnectFn)((this.db as HyperdriveLike).connectionString),
+    );
+    let client: DbClient | undefined;
+    try {
+      client = await Promise.race([connecting, deadline]);
+      return await Promise.race([run(client), deadline]);
     } finally {
-      await client.end();
+      clearTimeout(timer);
+      if (client) {
+        await endClient(client);
+      } else {
+        connecting.then(endClient, () => undefined);
+      }
     }
   }
 }
