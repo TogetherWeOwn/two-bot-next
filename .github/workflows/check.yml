@@ -211,7 +211,7 @@ jobs:
       - name: Store Postgres integration (isolated CI schemas)
         env:
           TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
-        run: cargo test -p two-bot-store --locked --test postgres -- --ignored
+        run: cargo test -p two-bot-store --locked --test postgres --test journal -- --ignored
 
       - name: legacy copy acceptance (two owned databases on CI service only)
         run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
@@ -545,6 +545,8 @@ jobs:
         run: python3 ../scripts/test-pr-lint.py
       - name: Verify secret-scan trigger and concurrency surface
         run: python3 ../scripts/test-secret-scan.py
+      - name: Verify production deploy guards
+        run: python3 ../scripts/test-deploy-production.py
       - name: Verify release reconciliation retries
         run: python3 ../scripts/test-release-retry.py
       - name: Verify staging rollout provenance (offline fixtures)
