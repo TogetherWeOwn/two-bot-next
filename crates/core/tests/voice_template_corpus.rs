@@ -423,14 +423,14 @@ fn voice_template_corpus_matches_engine() {
     }
 
     let deferred_total: usize = deferred.values().sum();
-    println!(
+    eprintln!(
         "voice template corpus: {} cases | exact {exact_pass} pass / {exact_pending} pending | \
          invariant {invariant_pass} pass / {invariant_pending} pending | {deferred_total} deferred \
          | {} stability groups",
         corpus.cases.len(),
         corpus.stability_groups.len(),
     );
-    println!("deferred by ambiguity: {deferred:?}");
+    eprintln!("deferred by ambiguity: {deferred:?}");
 
     assert!(
         now_passing.is_empty(),

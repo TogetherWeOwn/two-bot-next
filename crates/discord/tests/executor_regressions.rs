@@ -41,7 +41,11 @@ fn context(action: ModerationAction, count: Option<u64>) -> ModerationExecution 
 // pinned Twilight parser accepts (the `Z` form never survived `Timestamp`).
 #[tokio::test]
 async fn timeout_outcome_sends_a_valid_timestamp() {
-    let mock = MockRest::start(vec![], ScriptedResponse::json(200, serde_json::json!({}))).await;
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!({"user": {"id": USER}})),
+    )
+    .await;
     let result = executor_for(&mock)
         .execute_outcome(
             &context(ModerationAction::Timeout, None),

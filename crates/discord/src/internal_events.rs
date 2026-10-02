@@ -198,7 +198,7 @@ impl ActionExecutor {
             .map_err(|error| DiscordError::Rejected(format!("build: {error}")))?;
         // Legacy cancel does not swallow 404 or an already-cancelled 400.
         // Idempotency is durable replay of the original claim, not a new PATCH.
-        let response = self.call_once_raw(request, &[200, 201]).await?;
+        let mut response = self.call_once_raw(request, &[200, 201]).await?;
         let body: Value = serde_json::from_slice(&response.body)
             .map_err(|_| EventActionError::InvalidResponse)?;
         let string = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -221,6 +221,12 @@ impl ActionExecutor {
         {
             return Err(EventActionError::InvalidResponse);
         }
+        // The accepted outcome and required receipt are validated, so the
+        // mutation boundary now owns consuming completion. Reads already
+        // auto-completed in the transport; an invalid identity above drops
+        // the retained permit and keeps the token-wide lane held (fail
+        // closed) instead of authorizing a replay onto another resource.
+        response.complete().await;
         mirror
             .upsert(guild_id, observed_at, &event)
             .await

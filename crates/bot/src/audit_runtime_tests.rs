@@ -577,18 +577,22 @@ async fn unreachable_dependencies_fail_the_job_and_retry_next_sweep() {
     );
 }
 
-#[derive(Clone)]
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+/// Process-wide sweep-log capture. The test binary runs sibling sweeps on
+/// other threads with no subscriber installed, and tracing-core resolves a
+/// callsite's first registration against the registering thread's default
+/// while only one dispatcher is live: `audit_retry_swept` then caches
+/// "never" and a per-test `set_default` capture is never consulted. A global
+/// install is part of every interest computation (same hazard as
+/// `crates/core/tests/reply_lifecycle.rs`). One install per process; each
+/// reader keeps only the text appended after its own start offset.
+fn sweep_log_capture() -> &'static crate::tracing_capture::Capture {
+    static CAPTURE: OnceLock<crate::tracing_capture::Capture> = OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        let capture = crate::tracing_capture::Capture::default();
+        tracing::subscriber::set_global_default(capture.clone())
+            .expect("install global sweep-log capture");
+        capture
+    })
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -613,18 +617,9 @@ async fn sweep_logs_carry_ids_and_counts_only() {
         "transport detail 7f3a".to_owned(),
     )));
 
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogWriter(buffer.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .without_time()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    let deliveries = {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        drained(&runtime).await
-    };
+    let capture = sweep_log_capture();
+    let start = capture.text().len();
+    let deliveries = drained(&runtime).await;
     assert_eq!(
         deliveries,
         [
@@ -637,7 +632,7 @@ async fn sweep_logs_carry_ids_and_counts_only() {
         ]
     );
 
-    let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let logs = capture.text().split_off(start);
     for expected in [
         "audit_retry_swept",
         "rows=3",
