@@ -181,6 +181,7 @@ pub(super) async fn serve_with_shutdown(
                 }
                 *gateway.write().await = GatewayState::Draining;
                 shutdown.send_replace(true);
+                crate::shutdown::exit_on_second_signal();
             }
             .in_current_span()
             .with_current_subscriber(),

@@ -118,6 +118,11 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // Short-lived XP award throttles, not XP totals/history. Never replay a
     // pre-restore cooldown into a recovered process.
     "xp_cooldowns",
+    // Durable send admission is per-credential runtime lane state: occupancy
+    // generations and Discord cooldown timing, not application data. Never
+    // replay a pre-restore lane hold into a recovered process; a restored
+    // database re-admits from generation zero and re-learns cooldowns.
+    "discord_send_admission",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data.

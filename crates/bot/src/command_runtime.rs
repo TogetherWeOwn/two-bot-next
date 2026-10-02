@@ -175,7 +175,15 @@ impl CommandRuntime {
         let proxy = std::env::var("DISCORD_API_BASE")
             .ok()
             .filter(|value| !value.is_empty());
-        let executor = match ActionExecutor::with_proxy(token.to_owned(), proxy) {
+        let admission =
+            match two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token) {
+                Ok(admission) => Arc::new(admission),
+                Err(err) => {
+                    warn!(error = %err, "send admission invalid; command runtime disabled");
+                    return None;
+                }
+            };
+        let executor = match ActionExecutor::with_admission(token.to_owned(), proxy, admission) {
             Ok(executor) => executor,
             Err(err) => {
                 warn!(error = %err, "REST executor failed to build; command runtime disabled");
