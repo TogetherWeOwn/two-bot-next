@@ -25,6 +25,14 @@
       "sha256": "404e6e97fce3bafa5ab20fd7623f2174287ce2435b179dc50c1a576e5c9b6555",
       "justification": "Add durable per-channel execution fencing for website moderation actions in TOG-10864; preserve shared lockdown recovery ordering."
     },
+    "crates/cutover/migrations/0140_scheduled_messages.sql": {
+      "sha256": "eda397a2c691b5001b9aee0bd46f407d7b83cabb47382259c810ad7fc1bbf164",
+      "justification": "Add scheduled-message storage and shared automation audit table for TOG-10081; reserved migration block 0140-0149."
+    },
+    "crates/cutover/migrations/0141_scheduled_messages_legacy_upgrade.sql": {
+      "sha256": "d4f98434aa21dca034e64f3e0a766539450deaeb9fc4aff2fc1f7c7f48a11d6e",
+      "justification": "Upgrade existing legacy scheduled queues to BIGINT and add claim/nonce columns for TOG-10081 without changing locked migration 0140 or row facts."
+    },
     "crates/cutover/migrations/0150_sticky_messages.sql": {
       "sha256": "17d867f772c9f37325c50be959d9f184958e1a632eb47a000ac9ec13b9c30f57",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
