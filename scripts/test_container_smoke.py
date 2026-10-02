@@ -22,6 +22,10 @@ class DockerFixture:
     def __init__(self):
         self.calls = []
         self.image_size = 110 * smoke.MIB
+        self.daemon_size = 140 * smoke.MIB
+        self.image_id = "sha256:" + "a" * 64
+        self.history_output = None
+        self.history_error = None
         self.binary_size = 7 * smoke.MIB
         self.user = "two-bot"
         self.health_command = ["CMD", smoke.BINARY, "--healthcheck"]
@@ -43,12 +47,14 @@ class DockerFixture:
         output = ""
         code = 0
         if args[:2] == ("image", "inspect"):
-            output = json.dumps([{"Size": self.image_size, "Config": {
+            output = json.dumps([{"Id": self.image_id, "Size": self.daemon_size, "Config": {
                 "User": self.user, "Healthcheck": {"Test": self.health_command},
             }}])
         elif args[0] == "history":
+            if self.history_error is not None:
+                raise self.history_error
             # Two layers summing to image_size (inspect .Size is not used).
-            output = f"{self.image_size - 4096}\n4096\n0\n"
+            output = self.history_output if self.history_output is not None else f"{self.image_size - 4096}\n4096\n0\n"
         elif args[0] == "run" and "stat" in args:
             if self.measure_timeout:
                 raise subprocess.TimeoutExpired(["docker", *args], kwargs.get("timeout"))
@@ -204,18 +210,101 @@ class ContainerSmokeTests(unittest.TestCase):
 
     def test_valid_image_contract_and_cleanup(self):
         output = self.run_smoke()
-        self.assertIn("115343360 bytes", output)
+        self.assertIn("image (summed uncompressed Docker history layer bytes): 115343360 bytes", output)
+        self.assertIn("Docker storage-driver Size (diagnostic only): 146800640 bytes", output)
         self.assertIn("7340032 bytes", output)
         self.assertIn("SIGTERM exits 0", output)
         args, _ = self.fixture.calls[-1]
         self.assertEqual(args[:2], ("rm", "--force"))
         run = next(args for args, _ in self.fixture.calls if "--detach" in args)
         self.assertIn("256m", run)
+        self.assertIn(self.fixture.image_id, run)
         self.assertIn("127.0.0.1::8080", run)
         self.assertNotIn("-e", run)
         self.assertNotIn("--env-file", run)
         wait = next(kwargs for args, kwargs in self.fixture.calls if args[0] == "wait")
         self.assertLessEqual(wait["timeout"], 10)
+
+    def assert_history_rejected(self, history, message):
+        self.fixture = DockerFixture()
+        self.fixture.history_output = history
+        self.fixture.daemon_size = 1  # A valid, tiny Size cannot rescue history.
+        self.assert_rejected(message)
+        self.assertEqual([args[0] for args, _ in self.fixture.calls], ["image", "history"])
+
+    def test_measurement_failure_never_falls_back_to_daemon_size(self):
+        self.assert_history_rejected("not a layer size\n", "nonempty nonnegative integers")
+
+    def test_missing_history_is_rejected_before_creating_containers(self):
+        self.assert_history_rejected("", "no layer sizes")
+
+    def test_malformed_history_records_are_rejected_before_creating_containers(self):
+        for history in (
+            "\n", " \t\n", "4096\n\n0\n", "\n4096\n", "4096\n \t\n",
+            "4096 8192\n", "4096B\n", "4.1kB\n", "1.5\n", "NaN\n",
+            "+4096\n", "4_096\n", "1e3\n", "٤٠٩٦\n",
+        ):
+            with self.subTest(history=history):
+                self.assert_history_rejected(history, "nonempty nonnegative integers")
+
+    def test_negative_history_records_are_rejected_before_creating_containers(self):
+        for history in ("-1\n", "4096\n-1\n", "-0\n"):
+            with self.subTest(history=history):
+                self.assert_history_rejected(history, "nonempty nonnegative integers")
+
+    def test_all_zero_history_is_rejected_before_creating_containers(self):
+        for history in ("0\n", "0\n0\n", "000\n"):
+            with self.subTest(history=history):
+                self.assert_history_rejected(history, "only zero-size layers")
+
+    def test_history_sums_integer_records_with_whitespace_and_zero_layers(self):
+        self.fixture.history_output = " 4096 \n\t0\t\n8192\n"
+        output = self.run_smoke()
+        self.assertIn("image (summed uncompressed Docker history layer bytes): 12288 bytes", output)
+
+    def test_history_budget_does_not_fall_back_to_smaller_daemon_size(self):
+        self.fixture.daemon_size = 1
+        self.fixture.image_size = smoke.IMAGE_MAX_BYTES + 1
+        self.assert_rejected("image exceeds size budget")
+        self.assertFalse(any("--detach" in args for args, _ in self.fixture.calls))
+
+    def test_history_and_all_image_probes_use_the_once_inspected_immutable_id(self):
+        self.run_smoke()
+        inspections = [args for args, _ in self.fixture.calls if args[:2] == ("image", "inspect")]
+        self.assertEqual(inspections, [("image", "inspect", "two-bot:fixture")])
+        histories = [args for args, _ in self.fixture.calls if args[0] == "history"]
+        self.assertEqual(histories, [(
+            "history", "--no-trunc", "--human=false", "--format", "{{.Size}}", self.fixture.image_id,
+        )])
+        runs = [args for args, _ in self.fixture.calls if args[0] == "run"]
+        self.assertEqual(len(runs), 3)  # binary measurement, runtime, no-server probe
+        for args in runs:
+            self.assertIn(self.fixture.image_id, args)
+        for args, _ in self.fixture.calls[1:]:
+            self.assertNotIn("two-bot:fixture", args)
+
+    def assert_history_subprocess_failure(self, error):
+        self.fixture.history_error = error
+        self.fixture.daemon_size = 1
+        # Exercise the real docker wrapper, not just the smoke's Docker mock.
+        with patch.object(smoke.subprocess, "run", side_effect=lambda command, **kwargs: self.fixture(*command[1:], **kwargs)), \
+                patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(type(error)) as raised:
+                smoke.smoke("two-bot:fixture")
+        self.assertIs(raised.exception, error)
+        self.assertEqual([args[0] for args, _ in self.fixture.calls], ["image", "history"])
+        args, kwargs = self.fixture.calls[-1]
+        self.assertEqual(args[-1], self.fixture.image_id)
+        self.assertEqual(kwargs, {"capture_output": True, "text": True, "timeout": 30, "check": True})
+
+    def test_history_timeout_aborts_without_size_fallback_or_containers(self):
+        self.assert_history_subprocess_failure(subprocess.TimeoutExpired(["docker", "history"], 30))
+
+    def test_history_nonzero_exit_aborts_without_size_fallback_or_containers(self):
+        self.assert_history_subprocess_failure(subprocess.CalledProcessError(
+            1, ["docker", "history"], stderr="history unavailable",
+        ))
 
     def test_image_budget_is_enforced_before_runtime_start(self):
         self.assert_rejected("image exceeds size budget", image_max_bytes=1)

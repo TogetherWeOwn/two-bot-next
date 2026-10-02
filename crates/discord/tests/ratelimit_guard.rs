@@ -473,9 +473,12 @@ async fn global_retries_reuse_shared_deadline_across_all_retrying_lanes() {
                     .push(("X-RateLimit-Scope".into(), "global".into())),
                 _ => {}
             }
+            // The default after the 429 must satisfy the publish lane's
+            // receipt contract (200 plus the echoed registry); get and kick
+            // accept the same 200 body.
             let mock = MockRest::start_with_body_delay(
                 vec![response],
-                ScriptedResponse::status(204),
+                ScriptedResponse::json(200, serde_json::json!([])),
                 Duration::from_millis(650),
             )
             .await;
@@ -712,7 +715,7 @@ async fn publish_waits_out_long_global_retries_but_keeps_its_wire_deadline() {
             429,
             serde_json::json!({"retry_after": 10, "global": true}),
         )],
-        ScriptedResponse::status(204),
+        ScriptedResponse::json(200, serde_json::json!([])),
     )
     .await;
     let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());

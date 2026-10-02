@@ -63,11 +63,18 @@ def http_response(url):
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
     metadata = json.loads(docker("image", "inspect", image).stdout)[0]
-    # Sum of uncompressed layer sizes. With the containerd image store (the
-    # self-hosted runners) `inspect .Size` also counts the compressed content
-    # blobs; the layer sum equals the classic overlay2 Size on both stores.
+    # Resolve the tag once; measurement and every image probe use this ID.
+    image = metadata["Id"]
+    report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")
+    # Sum Docker's uncompressed history layer sizes. Containerd inspect Size
+    # also counts compressed content blobs, so it is not the budget metric.
     history = docker("history", "--no-trunc", "--human=false", "--format", "{{.Size}}", image).stdout
-    image_bytes = sum(int(line) for line in history.split())
+    records = [line.strip() for line in history.splitlines()]
+    require(records, "Docker history returned no layer sizes")
+    require(all(record.isascii() and record.isdecimal() for record in records),
+            "Docker history layer sizes must be nonempty nonnegative integers")
+    measured_image_bytes = sum(int(record) for record in records)
+    require(measured_image_bytes > 0, "Docker history returned only zero-size layers")
     # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
     # orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex
@@ -80,11 +87,11 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     finally:
         docker("rm", "--force", measure, check=False)
     for label, size, limit in (
-        ("image (uncompressed Docker Size)", image_bytes, image_max_bytes),
+        ("image (summed uncompressed Docker history layer bytes)", measured_image_bytes, image_max_bytes),
         ("release binary", binary_bytes, binary_max_bytes),
     ):
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")
-    require(image_bytes <= image_max_bytes, "image exceeds size budget")
+    require(measured_image_bytes <= image_max_bytes, "image exceeds size budget")
     require(binary_bytes <= binary_max_bytes, "release binary exceeds size budget")
     config = metadata["Config"]
     require(config.get("User") not in (None, "", "root", "0", "0:0"), "image must specify a non-root user")

@@ -187,13 +187,14 @@ pub enum ChannelCall {
     },
 }
 
-/// One observed HTTP exchange: status plus parsed bodies the retry policy
-/// needs. The executor owns this transport so 429/5xx accounting is exact.
-#[derive(Clone)]
+/// One observed HTTP exchange. Successful mutations retain their consuming
+/// permit until the mutation boundary validates the receipt. Dropping an
+/// uncertain response intentionally leaves admission occupied.
 pub struct RawResponse {
     pub status: u16,
     pub retry_after_header: Option<String>,
     pub body: Vec<u8>,
+    pub(crate) completion: Option<two_bot_core::send_admission::AdmissionPermit>,
 }
 
 impl std::fmt::Debug for RawResponse {
@@ -207,6 +208,24 @@ impl std::fmt::Debug for RawResponse {
 }
 
 impl RawResponse {
+    /// Call only for a definite effect/no-effect, after validating any required
+    /// mutation receipt. A storage fault must not authorize effect replay.
+    pub(crate) async fn complete(&mut self) {
+        if let Some(permit) = self.completion.take() {
+            let cooldown = (self.status == 429).then(|| {
+                two_bot_core::send_admission::cooldown_from_delays(
+                    self.retry_after_header
+                        .as_deref()
+                        .and_then(|value| value.parse().ok()),
+                    self.body_retry_after_secs(),
+                )
+            });
+            if let Err(error) = permit.complete(cooldown).await {
+                tracing::warn!(%error, "Discord send admission completion failed; lane held");
+            }
+        }
+    }
+
     /// Body `retry_after` (seconds) when present and finite — wins over the
     /// header per legacy `kick.ts`.
     #[must_use]
@@ -255,6 +274,7 @@ pub struct HyperTransport {
     scheme_http: bool,
     host: two_bot_core::Secret<String>,
     token: two_bot_core::Secret<String>,
+    admission: Option<Arc<dyn two_bot_core::send_admission::SendAdmission>>,
     guard: Arc<RateLimitGuard>,
 }
 
@@ -264,6 +284,7 @@ impl std::fmt::Debug for HyperTransport {
             .field("scheme_http", &self.scheme_http)
             .field("host", &self.host)
             .field("token", &self.token)
+            .field("admission", &self.admission)
             .finish_non_exhaustive()
     }
 }
@@ -279,6 +300,32 @@ impl HyperTransport {
     /// bare `host:port`; the scheme prefix is stripped (twilight's `proxy`
     /// takes the host only) and selects plain-HTTP transport.
     pub fn with_proxy(token: String, proxy_url: Option<String>) -> Result<Self, String> {
+        Self::build(token, proxy_url, None)
+    }
+
+    pub fn with_admission(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Arc<dyn two_bot_core::send_admission::SendAdmission>,
+    ) -> Result<Self, String> {
+        Self::build(token, proxy_url, Some(admission))
+    }
+
+    fn build(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Option<Arc<dyn two_bot_core::send_admission::SendAdmission>>,
+    ) -> Result<Self, String> {
+        use two_bot_core::send_admission::{is_loopback_http, TokenKey};
+        if let Some(admission) = &admission {
+            if admission.token_key()
+                != &TokenKey::for_bot_token(&token).map_err(|e| e.to_string())?
+            {
+                return Err("Discord send admission token mismatch".to_owned());
+            }
+        } else if !proxy_url.as_deref().is_some_and(is_loopback_http) {
+            return Err("shared durable Discord send admission required".to_owned());
+        }
         use hyper_rustls::ConfigBuilderExt as _;
         let (scheme_http, host) = match proxy_url {
             None => (false, "discord.com".to_owned()),
@@ -324,12 +371,15 @@ impl HyperTransport {
         let inner: HyperClient<
             hyper_rustls::HttpsConnector<HttpConnector>,
             http_body_util::Full<bytes::Bytes>,
-        > = HyperClient::builder(TokioExecutor::new()).build(connector);
+        > = HyperClient::builder(TokioExecutor::new())
+            .retry_canceled_requests(false)
+            .build(connector);
         Ok(Self {
             inner,
             scheme_http,
             host: two_bot_core::Secret::new(host),
             token: two_bot_core::Secret::new(token),
+            admission,
             guard: process_guard(),
         })
     }
@@ -343,8 +393,16 @@ impl HyperTransport {
         )
     }
 
-    async fn send_request(&self, request: &Request) -> Result<(RawResponse, bool), String> {
+    /// One governed wire attempt; no Twilight or pooled-connection resends.
+    /// Returns the response and whether a process-global pause was recorded.
+    pub async fn send_request(&self, request: &Request) -> Result<(RawResponse, bool), String> {
         use http_body_util::BodyExt as _;
+        if request
+            .headers()
+            .is_some_and(|headers| headers.contains_key(hyper::header::AUTHORIZATION))
+        {
+            return Err("caller-supplied authorization is forbidden".to_owned());
+        }
         let method: http::Method = request
             .method()
             .name()
@@ -353,11 +411,10 @@ impl HyperTransport {
         let url = self.url(request.path());
         let mut builder = hyper::Request::builder().method(method).uri(url);
         if let Some(headers) = builder.headers_mut() {
-            headers.insert(
-                hyper::header::AUTHORIZATION,
-                hyper::header::HeaderValue::from_str(self.token.expose())
-                    .map_err(|e| format!("bad token header: {e}"))?,
-            );
+            let mut authorization = hyper::header::HeaderValue::from_str(self.token.expose())
+                .map_err(|_| "bad token header".to_owned())?;
+            authorization.set_sensitive(true);
+            headers.insert(hyper::header::AUTHORIZATION, authorization);
             if let Some(bytes) = request.body() {
                 headers.insert(
                     hyper::header::CONTENT_LENGTH,
@@ -391,6 +448,10 @@ impl HyperTransport {
         let hyper_req = builder
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
+        let permit = match &self.admission {
+            Some(admission) => Some(admission.admit().await.map_err(|e| e.to_string())?),
+            None => None, // Constructor restricts ungoverned transport to loopback fixtures.
+        };
         let mut attempt = crate::executor_metrics::Attempt::new(request);
         let response = self
             .inner
@@ -414,18 +475,32 @@ impl HyperTransport {
         // its header-anchored timing/fallback without opening admission early.
         let collected = tokio::time::timeout(
             Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS),
-            response.into_body().collect(),
+            http_body_util::Limited::new(response.into_body(), 8 * 1024 * 1024).collect(),
         )
-        .await
-        .map_err(|_| "read body timed out".to_owned())?
-        .map_err(|e| format!("read body: {e}"))?;
-        let response = RawResponse {
+        .await;
+        let body = match collected {
+            Ok(Ok(body)) => body.to_bytes().to_vec(),
+            // 429 is definitive no-effect even with a broken, oversized or
+            // timed-out body. Missing timing installs an indefinite hold
+            // instead of a default.
+            Err(_) | Ok(Err(_)) if status == 429 => Vec::new(),
+            Err(_) => return Err("read body timed out".to_owned()),
+            Ok(Err(_)) => return Err("Discord response body unavailable".to_owned()),
+        };
+        let mut res = RawResponse {
             status,
             retry_after_header,
-            body: collected.to_bytes().to_vec(),
+            body,
+            completion: permit,
         };
-        let global = accounting.finish(&response);
-        Ok((response, global))
+        let global = accounting.finish(&res);
+        // Reads cannot mutate; a complete failure may be retried independently.
+        // Mutation success needs its caller's validated receipt. 5xx, redirects
+        // and request-timeout responses remain uncertain even with a full body.
+        if request.method() == Method::Get || matches!(status, 400 | 401 | 403 | 404 | 405 | 429) {
+            res.complete().await;
+        }
+        Ok((res, global))
     }
 }
 
@@ -545,11 +620,21 @@ impl ActionExecutor {
     /// Build with an optional API-host override (legacy `DISCORD_API_BASE`;
     /// tests point this at the mock double).
     pub fn with_proxy(token: String, proxy_url: Option<String>) -> Result<Self, String> {
-        Self::with_proxy_and_guard(token, proxy_url, process_guard())
+        Self::build(token, proxy_url, None)
+    }
+
+    /// Mandatory for non-loopback sends; every retry uses this same lane.
+    pub fn with_admission(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Arc<dyn two_bot_core::send_admission::SendAdmission>,
+    ) -> Result<Self, String> {
+        Self::build(token, proxy_url, Some(admission))
     }
 
     /// Explicit shared guard injection for isolated mock tests or embedding.
-    /// Production callers must reuse one guard for every executor in a process.
+    /// Production callers must reuse one guard for every executor in a process
+    /// and reach the wire through [`Self::with_admission`] instead.
     pub fn with_proxy_and_guard(
         token: String,
         proxy_url: Option<String>,
@@ -557,6 +642,23 @@ impl ActionExecutor {
     ) -> Result<Self, String> {
         let mut transport = HyperTransport::with_proxy(token.clone(), proxy_url.clone())?;
         transport.guard = guard;
+        Self::assemble(token, proxy_url, transport)
+    }
+
+    fn build(
+        token: String,
+        proxy_url: Option<String>,
+        admission: Option<Arc<dyn two_bot_core::send_admission::SendAdmission>>,
+    ) -> Result<Self, String> {
+        let transport = HyperTransport::build(token.clone(), proxy_url.clone(), admission)?;
+        Self::assemble(token, proxy_url, transport)
+    }
+
+    fn assemble(
+        token: String,
+        proxy_url: Option<String>,
+        transport: HyperTransport,
+    ) -> Result<Self, String> {
         let mut builder = TwilightClient::builder()
             .token(token)
             .ratelimiter(None)
@@ -620,16 +722,6 @@ impl ActionExecutor {
         }
         // A global response/breaker may arrive during the lane sleep.
         guard.admit(essential).await?;
-        *last = std::time::Instant::now();
-        Ok(())
-    }
-
-    /// Pace one lane request: reserve the lane, wait out the floor and stamp
-    /// the dispatch. A guard refusal (cooldown/breaker) surfaces instead of
-    /// sending unpaced; every caller returns `Result<_, DiscordError>`, which
-    /// converts `GuardError` via `#[from]`.
-    async fn pace(&self, kick_lane: bool) -> Result<(), GuardError> {
-        let mut last = self.paced_lane(kick_lane).await?;
         *last = std::time::Instant::now();
         Ok(())
     }
@@ -727,8 +819,26 @@ impl ActionExecutor {
         request: Request,
         accepted: &[u16],
     ) -> Result<Option<serde_json::Value>, DiscordError> {
-        let res = self.call_once_raw(request, accepted).await?;
-        Ok(serde_json::from_slice(&res.body).ok())
+        let needs_object = request.method() == Method::Patch;
+        let mut res = self.call_once_raw(request, accepted).await?;
+        let body: Option<serde_json::Value> = serde_json::from_slice(&res.body).ok();
+        if needs_object
+            && !body.as_ref().is_some_and(|body| {
+                body.get("id")
+                    .or_else(|| body.pointer("/user/id"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .is_some_and(|id| id != 0)
+            })
+        {
+            return Err(DiscordError::Unavailable(
+                "invalid mutation receipt".to_owned(),
+            ));
+        }
+        // These verbs use their accepted status as the effect receipt; message
+        // creation instead validates its required id before consuming completion.
+        res.complete().await;
+        Ok(body)
     }
 
     /// Same single-attempt send as [`Self::call_once`], but returns the raw
@@ -770,8 +880,7 @@ impl ActionExecutor {
         &self,
         request: Request,
     ) -> Result<T, DiscordError> {
-        self.pace(false).await?;
-        let response = self.call_once_raw(request, &[200]).await?;
+        let response = self.call_once_raw_paced(request, &[200]).await?;
         serde_json::from_slice(&response.body)
             .map_err(|_| DiscordError::Unavailable("invalid role readback".into()))
     }
@@ -833,24 +942,22 @@ impl ActionExecutor {
                 .await?;
         }
         for role in grants {
-            self.pace(false).await?;
             let request = Self::request_of(
                 self.inner
                     .factory
                     .add_guild_member_role(guild, member, role)
                     .reason(&grant_reason),
             )?;
-            self.call_once_raw(request, &[200, 204]).await?;
+            self.call_once_raw_paced(request, &[200, 204]).await?;
         }
         for role in revokes {
-            self.pace(false).await?;
             let request = Self::request_of(
                 self.inner
                     .factory
                     .remove_guild_member_role(guild, member, role)
                     .reason(revoke_reason.as_deref().expect("validated revoke reason")),
             )?;
-            self.call_once_raw(request, &[200, 204]).await?;
+            self.call_once_raw_paced(request, &[200, 204]).await?;
         }
         Ok(())
     }
@@ -1114,7 +1221,7 @@ impl ActionExecutor {
                     });
             // Backoff belongs to this caller, not the shared kick reservation.
             drop(lane);
-            let (res, global) = match exchange {
+            let (mut res, global) = match exchange {
                 Ok(r) => r,
                 Err(detail) => {
                     mutation_uncertain = true;
@@ -1132,12 +1239,13 @@ impl ActionExecutor {
             };
             match classify_kick_status(res.status) {
                 KickStatus::Removed => {
+                    res.complete().await;
                     return Ok(KickResult {
                         outcome: KickOutcome::Kicked,
                         status: Some(res.status),
                         detail: "removed".to_owned(),
                         attempts,
-                    })
+                    });
                 }
                 KickStatus::AlreadyGone => {
                     return Ok(KickResult {
@@ -1698,8 +1806,9 @@ impl ActionExecutor {
 
     /// Post a message with mention suppression (legacy
     /// `allowed_mentions: { parse: [] }`). Asserts the legacy 2000 UTF-16-unit
-    /// ceiling before sending; returns the message id (`""` when Discord
-    /// omits it). A numeric nonce is sent with `enforce_nonce: true` for
+    /// ceiling before sending; requires a valid message id receipt. An
+    /// unreadable receipt is uncertain, not an empty successful id. A numeric
+    /// nonce is sent with `enforce_nonce: true` for
     /// duplicate suppression.
     pub async fn post_message(
         &self,
@@ -1782,24 +1891,28 @@ impl ActionExecutor {
         .body(body_bytes)
         .build()
         .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
-        let answered = if after_authorization {
+        let message_id = if after_authorization {
             self.inner.transport.guard.check_now(false)?;
-            let (res, _) =
+            let (mut res, _) =
                 tokio::time::timeout(self.inner.moderation_timeout, self.send_admitted(&req))
                     .await
                     .map_err(|_| DiscordError::Timeout)??;
             if ![200, 201].contains(&res.status) {
                 return Err(throw_for_status(&res));
             }
-            serde_json::from_slice(&res.body).unwrap_or_default()
+            // An accepted mutation still needs its validated id receipt
+            // before the durable lane reopens; an unreadable receipt is
+            // uncertain, never an empty successful id.
+            let id = mutation_receipt_id(&res.body)?;
+            res.complete().await;
+            id
         } else {
-            self.call_once(req, &[200, 201]).await?.unwrap_or_default()
+            let mut res = self.call_once_raw(req, &[200, 201]).await?;
+            let id = mutation_receipt_id(&res.body)?;
+            res.complete().await;
+            id
         };
-        Ok(answered
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned())
+        Ok(message_id)
     }
 
     /// Carry out one [`ChannelCall`].
@@ -1935,12 +2048,24 @@ impl ActionExecutor {
             // Idempotent sync may wait out any global pause; the five-second
             // wire budget starts after paced admission, unlike moderation.
             self.admit(&req, Some(false)).await?;
-            let (res, global) =
+            let (mut res, global) =
                 tokio::time::timeout(self.inner.moderation_timeout, self.send_admitted(&req))
                     .await
                     .map_err(|_| DiscordError::Timeout)??;
             match res.status {
-                200..=299 => return Ok(()),
+                200 => {
+                    let published: Vec<twilight_model::application::command::Command> =
+                        serde_json::from_slice(&res.body).map_err(|_| {
+                            DiscordError::Unavailable("invalid command registry receipt".to_owned())
+                        })?;
+                    if published.len() != commands.len() {
+                        return Err(DiscordError::Unavailable(
+                            "incomplete command registry receipt".to_owned(),
+                        ));
+                    }
+                    res.complete().await;
+                    return Ok(());
+                }
                 429 => {
                     if attempts >= MAX_HTTP_TRIES - 1 {
                         return Err(DiscordError::RateLimited);
@@ -1981,9 +2106,17 @@ impl ActionExecutor {
                 .create_response(interaction_id, interaction_token, &response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        let (res, _) = self.send_with_timeout(&req, None).await?;
+        let (mut res, _) = self.send_with_timeout(&req, None).await?;
         match res.status {
-            200..=299 => Ok(()),
+            200 => {
+                mutation_receipt_id(&res.body)?;
+                res.complete().await;
+                Ok(())
+            }
+            204 => {
+                res.complete().await;
+                Ok(())
+            }
             _ => Err(throw_for_status(&res)),
         }
     }
@@ -2097,7 +2230,10 @@ impl ActionExecutor {
                 .content(Some(&content))
                 .allowed_mentions(Some(&mentions)),
         )?;
-        self.call_once_raw(req, &[200]).await.map(|_| ())
+        let mut res = self.call_once_raw(req, &[200]).await?;
+        mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(())
     }
 
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
@@ -2238,6 +2374,18 @@ pub fn unlock_masks(current: Option<&EveryoneOverwrite>) -> (String, String) {
         (allow & !SEND_MESSAGES_BIT).to_string(),
         (deny & !SEND_MESSAGES_BIT).to_string(),
     )
+}
+
+fn mutation_receipt_id(body: &[u8]) -> Result<String, DiscordError> {
+    let body: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| DiscordError::Unavailable("invalid mutation receipt".to_owned()))?;
+    let id = body.get("id").and_then(serde_json::Value::as_str);
+    match id {
+        Some(id) if id.parse::<u64>().is_ok_and(|id| id != 0) => Ok(id.to_owned()),
+        _ => Err(DiscordError::Unavailable(
+            "invalid mutation receipt id".to_owned(),
+        )),
+    }
 }
 
 /// Only documented no-effect rejections are retry-safe. An unexpected success,
@@ -2486,13 +2634,35 @@ pub fn pace_delay_ms(last_at_ms: u64, interval_ms: u64, now_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use two_bot_core::send_admission::{
+        AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, TokenKey,
+    };
+
+    #[derive(Debug)]
+    struct NeverSendAdmission(TokenKey);
+
+    impl SendAdmission for NeverSendAdmission {
+        fn token_key(&self) -> &TokenKey {
+            &self.0
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            Box::pin(async { Err(AdmissionError::Blocked) })
+        }
+    }
+
+    fn never_send_admission(token: &str) -> Arc<dyn SendAdmission> {
+        Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
+    }
 
     #[tokio::test]
     async fn debug_redacts_transport_and_nested_executor_token() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let marker = "fixture-rest-executor-bot-token";
-        let transport = HyperTransport::new(marker.to_owned()).unwrap();
-        let executor = ActionExecutor::new(marker.to_owned()).unwrap();
+        let admission = never_send_admission(marker);
+        let transport =
+            HyperTransport::with_admission(marker.to_owned(), None, admission.clone()).unwrap();
+        let executor = ActionExecutor::with_admission(marker.to_owned(), None, admission).unwrap();
         for output in [
             format!("{transport:?}"),
             format!("{transport:#?}"),
@@ -2515,10 +2685,18 @@ mod tests {
             "https://proxy.invalid?key=fixture-query-secret",
         ] {
             for error in [
-                HyperTransport::with_proxy("fixture-token".to_owned(), Some(proxy.to_owned()))
-                    .unwrap_err(),
-                ActionExecutor::with_proxy("fixture-token".to_owned(), Some(proxy.to_owned()))
-                    .unwrap_err(),
+                HyperTransport::with_admission(
+                    "fixture-token".to_owned(),
+                    Some(proxy.to_owned()),
+                    never_send_admission("fixture-token"),
+                )
+                .unwrap_err(),
+                ActionExecutor::with_admission(
+                    "fixture-token".to_owned(),
+                    Some(proxy.to_owned()),
+                    never_send_admission("fixture-token"),
+                )
+                .unwrap_err(),
             ] {
                 assert!(!error.contains("fixture"));
                 assert!(!error.contains(proxy));
@@ -2530,10 +2708,19 @@ mod tests {
     async fn accepted_proxy_is_redacted_in_transport_and_twilight_factory_debug() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let proxy = "https://fixture-proxy-origin.invalid";
-        let transport =
-            HyperTransport::with_proxy("fixture-token".to_owned(), Some(proxy.to_owned())).unwrap();
-        let executor =
-            ActionExecutor::with_proxy("fixture-token".to_owned(), Some(proxy.to_owned())).unwrap();
+        let admission = never_send_admission("fixture-token");
+        let transport = HyperTransport::with_admission(
+            "fixture-token".to_owned(),
+            Some(proxy.to_owned()),
+            admission.clone(),
+        )
+        .unwrap();
+        let executor = ActionExecutor::with_admission(
+            "fixture-token".to_owned(),
+            Some(proxy.to_owned()),
+            admission,
+        )
+        .unwrap();
         for shown in [
             format!("{transport:?}"),
             format!("{transport:#?}"),
@@ -2554,6 +2741,7 @@ mod tests {
             status: 403,
             retry_after_header: Some("fixture-echoed-header-secret".to_owned()),
             body: b"fixture-echoed-body-secret".to_vec(),
+            completion: None,
         };
         for shown in [format!("{response:?}"), format!("{response:#?}")] {
             assert!(!shown.contains("fixture"));
@@ -2583,6 +2771,7 @@ mod tests {
             status: 429,
             retry_after_header: Some("5".to_owned()),
             body: br#"{"retry_after": 1.5, "global": false}"#.to_vec(),
+            completion: None,
         };
         assert_eq!(res.body_retry_after_secs(), Some(1.5));
         assert_eq!(res.retry_after_wait_ms(), 1750);
@@ -2594,24 +2783,28 @@ mod tests {
             status: 429,
             retry_after_header: Some("2".to_owned()),
             body: Vec::new(),
+            completion: None,
         };
         assert_eq!(header_only.retry_after_wait_ms(), 2250);
         let missing = RawResponse {
             status: 429,
             retry_after_header: None,
             body: Vec::new(),
+            completion: None,
         };
         assert_eq!(missing.retry_after_wait_ms(), 1250);
         let garbage = RawResponse {
             status: 429,
             retry_after_header: Some("soon".to_owned()),
             body: b"not json".to_vec(),
+            completion: None,
         };
         assert_eq!(garbage.retry_after_wait_ms(), 1250);
         let clamped = RawResponse {
             status: 429,
             retry_after_header: Some("86400".to_owned()),
             body: Vec::new(),
+            completion: None,
         };
         assert_eq!(clamped.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
     }
@@ -2649,12 +2842,14 @@ mod tests {
             status: 429,
             retry_after_header: None,
             body: Vec::new(),
+            completion: None,
         };
         assert_eq!(throw_for_status(&rl), DiscordError::RateLimited);
         let down = RawResponse {
             status: 503,
             retry_after_header: None,
             body: Vec::new(),
+            completion: None,
         };
         assert!(matches!(
             throw_for_status(&down),
@@ -2665,6 +2860,7 @@ mod tests {
                 status,
                 retry_after_header: None,
                 body: Vec::new(),
+                completion: None,
             };
             assert!(throw_for_status(&no).is_safe_pre_mutation(), "{status}");
         }
@@ -2673,6 +2869,7 @@ mod tests {
                 status,
                 retry_after_header: None,
                 body: Vec::new(),
+                completion: None,
             };
             assert!(matches!(
                 throw_for_status(&uncertain),

@@ -29,9 +29,11 @@ releases it. Scheduled events remain independent. Publication timestamps reuse
 core `now_iso`, the fixed `YYYY-MM-DDTHH:mm:ss.sssZ` website contract.
 
 The jobs park when `DISCORD_TOKEN`, `DATABASE_URL` or nonzero `GUILD_ID` is
-missing. They share a paced REST executor and a lazily initialized pool; the
-existing cutover migrations and `web_v1` contract are applied before the first
-publication. Initialization errors are retried on the next attempt, never
+missing. They share a paced, durably governed REST executor and lazily initialized
+pools using the gateway's `DATABASE_URL` authority. The operator must provision
+cutover migrations, `web_v1` and the reviewed role plan before runtime starts;
+jobs never execute migration/view DDL using the DML-only runtime credential.
+Admission refusal sends no HTTP. Initialization errors are retried on the next attempt, never
 logged with a database URL. Guild members are fully paginated; rank-role names
 come from the guild object's `roles` array. Domain/store semantics are unchanged:
 
@@ -137,8 +139,8 @@ the env gates below.
   `bot::website_jobs::serve`) resolves the env gates once at boot. A gated-off
   or misconfigured job logs `job_disabled` (warn on `invalid_config`), produces
   no supervised job, and is marked parked in the `/readyz` status map alongside
-  the website jobs. The supervisor's status map therefore always lists all
-  seven job names (three website, three community, `audit_retry`).
+  the website jobs. The supervisor's status map therefore always lists all six
+  job names.
 
 ## Verification
 

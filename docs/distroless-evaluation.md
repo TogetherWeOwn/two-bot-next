@@ -29,7 +29,7 @@ variant; do not deploy a `debug-nonroot` variant.
 - **Healthcheck:** exec-form `CMD ["/home/nonroot/two-bot", "--healthcheck"]`
   needs no shell. The probe is std+tokio only (`GET /health`, exit 0/1).
   CI: Docker HEALTHCHECK healthy, `/health` 200 `{"status":"ok"}`,
-  `/readyz` 503 parked (gateway/database down, all seven jobs parked,
+  `/readyz` 503 parked (gateway/database down, all six jobs parked,
   non-running, never started).
 - **Boot/shutdown:** binary booted with no secrets or DB; SIGTERM exited 0
   in 0.236 s (10 s budget). The exec form keeps PID 1 semantics; the shutdown
