@@ -25,7 +25,7 @@ Record a verified human attendee for a Discord event occurrence.
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | — | — | Scheduled event id or stable occurrence id. |
+| `event-occurrence` | string | true | — | — | 128 | — | Scheduled event id or stable occurrence id. |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`

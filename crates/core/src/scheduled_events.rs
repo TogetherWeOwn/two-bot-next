@@ -145,7 +145,7 @@ pub fn normalize_events(raw: &[RawScheduledEvent]) -> Option<Vec<ScheduledEvent>
 /// Parse the complete RFC 3339 instant fallibly, then reuse the UTC millis
 /// renderer (legacy `new Date(s).toISOString()`). Malformed timestamps must
 /// reject the whole response, not panic or silently ignore trailing input.
-/// Source: https://docs.rs/time/0.3.55/time/format_description/well_known/struct.Rfc3339.html
+/// Source: <https://docs.rs/time/0.3.55/time/format_description/well_known/struct.Rfc3339.html>
 fn normalize_timestamp(s: &str) -> Option<String> {
     let instant =
         time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;

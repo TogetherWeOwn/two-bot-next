@@ -13,6 +13,8 @@ mod executor_metrics;
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
+#[cfg(feature = "db")]
+pub mod internal_channel_moderation;
 pub mod internal_events;
 mod message_safety;
 pub mod pipeline;

@@ -1,5 +1,5 @@
 //! Fixed-cardinality, process-local metrics; no background task or retained payloads.
-//! Text format: https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details
+//! Text format: <https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details>
 
 use std::{
     fmt::Write,
@@ -55,7 +55,18 @@ pub const REST_ROUTES: &[&str] = &[
     "other",
 ];
 const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
-pub const JOBS: &[&str] = &["invite_snapshot", "session_checkpoint", "other"];
+pub const JOBS: &[&str] = &[
+    "invite_snapshot",
+    "session_checkpoint",
+    "counter",
+    "rank",
+    "scheduled_events",
+    "presence_probe",
+    "community_scorecard",
+    "inactivity",
+    "other",
+];
+const JOB_OUTCOMES: &[&str] = &["success", "failure"];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -103,10 +114,17 @@ impl Histogram {
 }
 
 #[derive(Default)]
+struct JobMetrics {
+    runs: [u64; JOB_OUTCOMES.len()],
+    last_success: u64,
+    consecutive_failures: u64,
+}
+
+#[derive(Default)]
 struct Values {
     events: [u64; EVENTS.len()],
     rest: [[u64; RESULTS.len()]; REST_ROUTES.len()],
-    jobs: [u64; JOBS.len()],
+    jobs: [JobMetrics; JOBS.len()],
     reconnects: u64,
     resumes: u64,
     latency_micros: Option<u64>,
@@ -180,10 +198,25 @@ impl Metrics {
 
     /// Call only after successful completion, not when a job starts or is merely scheduled.
     pub fn job_success(&self, job: &str, unix_seconds: u64) {
-        self.0
+        let mut values = self
+            .0
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .jobs[bounded_index(job, JOBS)] = unix_seconds;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = &mut values.jobs[bounded_index(job, JOBS)];
+        current.runs[0] = current.runs[0].saturating_add(1);
+        current.last_success = unix_seconds;
+        current.consecutive_failures = 0;
+    }
+
+    /// A completed failed attempt, including a timeout or isolated panic.
+    pub fn job_failure(&self, job: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = &mut values.jobs[bounded_index(job, JOBS)];
+        current.runs[1] = current.runs[1].saturating_add(1);
+        current.consecutive_failures = current.consecutive_failures.saturating_add(1);
     }
 
     /// Pool samples are supplied at scrape time; this function never opens a DB connection.
@@ -253,14 +286,44 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_job_runs_total",
+            "counter",
+            "Completed job attempts by bounded job name and outcome.",
+        );
+        for (job, current) in JOBS.iter().zip(&values.jobs) {
+            for (outcome, count) in JOB_OUTCOMES.iter().zip(current.runs) {
+                writeln!(
+                    out,
+                    "two_bot_job_runs_total{{job=\"{job}\",outcome=\"{outcome}\"}} {count}"
+                )
+                .unwrap();
+            }
+        }
+        header(
+            &mut out,
             "two_bot_job_last_success_timestamp_seconds",
             "gauge",
             "Unix time of last successful job completion; zero means never.",
         );
-        for (job, timestamp) in JOBS.iter().zip(values.jobs) {
+        for (job, current) in JOBS.iter().zip(&values.jobs) {
             writeln!(
                 out,
-                "two_bot_job_last_success_timestamp_seconds{{job=\"{job}\"}} {timestamp}"
+                "two_bot_job_last_success_timestamp_seconds{{job=\"{job}\"}} {}",
+                current.last_success
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_job_consecutive_failures",
+            "gauge",
+            "Completed failures since the last success; resets on success.",
+        );
+        for (job, current) in JOBS.iter().zip(&values.jobs) {
+            writeln!(
+                out,
+                "two_bot_job_consecutive_failures{{job=\"{job}\"}} {}",
+                current.consecutive_failures
             )
             .unwrap();
         }
@@ -342,6 +405,7 @@ mod tests {
             metrics.gateway_event(&hostile);
             metrics.rest_response(&hostile, Some(429));
             metrics.job_success(&hostile, 123);
+            metrics.job_failure(&hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -351,6 +415,39 @@ mod tests {
             text.contains("two_bot_rest_requests_total{route=\"other\",result=\"429\"} 10000\n")
         );
         assert!(text.contains("two_bot_db_pool_configured 0\n"));
+        for outcome in JOB_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_job_runs_total{{job=\"other\",outcome=\"{outcome}\"}} 10000\n"
+            )));
+        }
+        assert!(text.contains("two_bot_job_last_success_timestamp_seconds{job=\"other\"} 123\n"));
+        assert!(text.contains("two_bot_job_consecutive_failures{job=\"other\"} 1\n"));
+    }
+
+    #[test]
+    fn job_counters_saturate_and_success_resets_failures() {
+        let metrics = Metrics::default();
+        {
+            let mut values = metrics.0.lock().unwrap();
+            let current = &mut values.jobs[bounded_index("rank", JOBS)];
+            current.runs = [u64::MAX; JOB_OUTCOMES.len()];
+            current.consecutive_failures = u64::MAX;
+        }
+        metrics.job_failure("rank");
+        assert!(metrics.render(None).contains(&format!(
+            "two_bot_job_consecutive_failures{{job=\"rank\"}} {}\n",
+            u64::MAX
+        )));
+        metrics.job_success("rank", 456);
+        let text = metrics.render(None);
+        for outcome in JOB_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_job_runs_total{{job=\"rank\",outcome=\"{outcome}\"}} {}\n",
+                u64::MAX
+            )));
+        }
+        assert!(text.contains("two_bot_job_last_success_timestamp_seconds{job=\"rank\"} 456\n"));
+        assert!(text.contains("two_bot_job_consecutive_failures{job=\"rank\"} 0\n"));
     }
 
     #[test]
