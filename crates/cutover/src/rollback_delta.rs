@@ -156,6 +156,18 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "scheduled_events", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "scheduled_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "self_role_audit", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec {
+        table: "self_role_exchange_baselines",
+        measure: TableMeasure::Unmeasurable(
+            "no timestamp column; the baseline row is written with its event's exchange lifecycle (measured via self_role_exchanges.created_at)",
+        ),
+    },
+    // Ticket creation, settlement and retirement each rewrite a different
+    // column without touching the others, so the maximum is the row's last write.
+    TableSpec {
+        table: "self_role_exchanges",
+        measure: TableMeasure::Columns(&["created_at", "completed_at", "retired_at"]),
+    },
     TableSpec { table: "self_role_panel_claims", measure: TableMeasure::Columns(&["processing_expires_at"]) },
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "ticket_transcripts", measure: TableMeasure::Columns(&["created_at"]) },
