@@ -6,6 +6,7 @@
 //! or by future transports. Slices S3+ build on these seams.
 
 pub mod action_outcomes;
+pub mod anchor_event;
 pub mod audit;
 pub mod audit_mirror;
 #[cfg(feature = "db")]
@@ -91,8 +92,10 @@ pub mod tickets;
 pub mod voice;
 pub mod voice_alias;
 pub mod voice_assistant_cap;
+pub mod voice_assistant_request;
 pub mod voice_config;
 pub mod voice_config_diff;
+pub mod voice_custom_id;
 pub mod voice_naming;
 pub mod voice_ownership;
 pub mod voice_permission_health;
