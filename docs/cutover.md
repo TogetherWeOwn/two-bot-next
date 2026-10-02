@@ -152,7 +152,7 @@ Do **not** run `two-bot backup --help` or
 `two-bot guild-config-snapshot --help`: dispatch ignores their trailing arguments
 and executes the backup/prune/upload or Discord snapshot/upload instead. The
 usage comment claiming help after any subcommand is not the dispatch behavior:
-[argument dispatch](../crates/bot/src/backup_cli.rs#L129). Other binaries or future
+[argument dispatch](../crates/bot/src/backup_cli.rs#L162). Other binaries or future
 subcommand help paths require source/fixture verification before approval; a
 `--help` suffix is not a read-only safety boundary.
 
@@ -165,8 +165,8 @@ subcommand help paths require source/fixture verification before approval; a
 | `two-bot backup-upload <dump.ndjson.gz>` | Uploads one dump using approved S3 bindings; an upload is not proof of completeness or restore compatibility |
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
-Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L82),
-[restore implementation](../crates/bot/src/backup_cli.rs#L354) and
+Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L99),
+[restore implementation](../crates/bot/src/backup_cli.rs#L380) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -180,12 +180,15 @@ env -u TWO_RESTORE_URL two-bot restore fixture.ndjson.gz --dry-run
 
 Use a disposable fixture for a test. Missing/tampered file or nonzero exit means
 FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
-verify canonical content and required table coverage. The generic allowlist
-omits leveling, gateway checkpoints, guild settings, internal actions and other
-Next tables, and requires some legacy tables absent from embedded migrations.
-It can fail against a fresh Next schema. See
-[`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44). Do not treat its
-per-table count checks as complete final-copy verification.
+verify canonical content and required table coverage. A v4 dump covers every
+table that `crates/cutover/migrations` creates, except `xp_cooldowns` and the
+migration ledgers ([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L117)),
+plus retired legacy tables when the source still has them
+([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
+target migrated to the dump's schema, and refuses before any write when a
+current table is missing. Coverage and the trigger and sequence handling are in
+[backup.md](backup.md#coverage-and-recovery-semantics-v4-tog-11142). Do not
+treat its per-table count checks as complete final-copy verification.
 
 MEE6 XP/backfill/capture/reward utilities are **separate binaries**, not a
 legacy-table copier or rollback journal. Some default to writes, and even some
@@ -334,10 +337,9 @@ alongside an unconfirmed Next gateway.
   [session policy](../crates/core/src/gateway_session.rs#L4),
   [boot resume](../crates/bot/src/gateway.rs#L315). A reviewed force-fresh path is
   required for first production boot; do not assume a restart gives IDENTIFY.
-- SIGTERM drains HTTP only, then main aborts the gateway task. No final
-  gateway/job checkpoint-drain acknowledgment exists here:
-  [shutdown](../crates/bot/src/server.rs#L50),
-  [gateway abort](../crates/bot/src/main.rs#L156).
+- SIGTERM drains accepted gateway dispatches, jobs and HTTP within
+  `SHUTDOWN_TIMEOUT_SECONDS` (default 35 s), then exits; a second signal exits
+  immediately. See [Shutdown](configuration.md#shutdown).
 - The baseline has no wired scheduled-unban handoff/sweeper. Moderator sign-off
   must identify a verified executor for every pending deadline before GO:
   [moderation port boundary](../crates/core/src/moderation.rs#L7).
@@ -495,8 +497,17 @@ receipt is **NO-GO**. The same allocator gate applies to a rollback recovery tar
 Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L13)
 is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L98)
 that handle only idempotency-key conflicts, not primary-key collisions. The
-[limited restore's events sequence adjustment](../crates/core/src/backup/dump.rs#L371)
+[restore's sequence restart](../crates/core/src/backup/dump.rs#L215)
 illustrates the hazard; it does not prove the planned copier covers every table.
+
+A backup restore (the drill, or a rollback recovery target) meets this gate for
+the archived tables only when the archive carries `sequenceMarks`: each
+allocator resumes past the archived high-water (deleted IDs included), the
+restored rows and the target's own position, and the CAS allocator moves past
+every source token before rows are inserted. Record the receipt from the
+manifest marks and the target's post-restore positions. An archive without
+marks (frozen v3, or v4 written before marks existed) does **not** meet the
+gate. Details: [backup runbook](backup.md).
 
 Do not start either gateway while verification is unresolved. Record the baseline
 watermark from which all subsequent Next/web writes will be reconciled.
