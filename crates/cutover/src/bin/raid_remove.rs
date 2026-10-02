@@ -1,3 +1,6 @@
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use std::{collections::HashSet, io::Read, path::Path};
 use two_bot_core::{
     moderation::require_moderation_reason,

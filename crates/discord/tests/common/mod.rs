@@ -384,6 +384,9 @@ pub struct ScriptedResponse {
     pub body: Vec<u8>,
     /// Delay before answering (drives the 5 s abort test).
     pub delay: Duration,
+    /// Fault injection after headers have already been received.
+    pub body_delay: Duration,
+    pub declared_body_len: Option<usize>,
 }
 
 impl ScriptedResponse {
@@ -394,6 +397,8 @@ impl ScriptedResponse {
             headers: Vec::new(),
             body: Vec::new(),
             delay: Duration::ZERO,
+            body_delay: Duration::ZERO,
+            declared_body_len: None,
         }
     }
 
@@ -404,6 +409,8 @@ impl ScriptedResponse {
             headers: Vec::new(),
             body: body.to_string().into_bytes(),
             delay: Duration::ZERO,
+            body_delay: Duration::ZERO,
+            declared_body_len: None,
         }
     }
 
@@ -417,7 +424,21 @@ impl ScriptedResponse {
                 .to_string()
                 .into_bytes(),
             delay: Duration::ZERO,
+            body_delay: Duration::ZERO,
+            declared_body_len: None,
         }
+    }
+
+    /// Advertise more body bytes than are sent, then close the connection.
+    pub fn truncated_body(mut self) -> Self {
+        self.declared_body_len = Some(self.body.len() + 1);
+        self
+    }
+
+    /// Send headers immediately, withholding the body for `delay`.
+    pub fn delayed_body(mut self, delay: Duration) -> Self {
+        self.body_delay = delay;
+        self
     }
 
     /// Answer only after `delay` (the abort test uses a delay past 5 s).
@@ -646,7 +667,9 @@ async fn handle_rest(
         "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
         next.status,
         reason_phrase(next.status),
-        body.len(),
+        // Fault injection: a scripted response may advertise more bytes than
+        // are ever sent, so the client sees a truncated body on close.
+        next.declared_body_len.unwrap_or(body.len()),
     );
     for (name, value) in &next.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -664,8 +687,14 @@ async fn handle_rest(
             tokio::time::sleep(body_delay).await;
         }
     }
+    // Per-response fault injection after headers: a stalled/delayed body the
+    // receipt contract must treat as ambiguous, never as a verdict.
+    if !next.body_delay.is_zero() {
+        tokio::time::sleep(next.body_delay).await;
+    }
     // The echo self-heal above may replace an empty scripted body; deliver
-    // whichever body the receipt contract chose.
+    // whichever body the receipt contract chose. A declared length beyond the
+    // delivered bytes truncates on connection close.
     let _ = stream.write_all(&body).await;
     if let Some(gate) = gate {
         gate.completed.notify_one();

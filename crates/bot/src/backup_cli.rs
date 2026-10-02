@@ -14,6 +14,9 @@
 //! last line is the only success for restores), 1 failure, 2 usage/guard
 //! refusal, 3 tampered guild-config snapshot.
 
+// Operator commands intentionally emit human-readable/JSON output to stdout.
+#![allow(clippy::print_stdout)]
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +24,11 @@ use two_bot_core::backup::{
     dump, dump_file, guild_config, guild_config_api::GuildConfigDiscordApi, guild_config_restore,
     http, retention, s3,
 };
+
+pub fn print_server_usage() {
+    println!("{}", crate::preflight::USAGE);
+    print!("{}", crate::erasure_cli::USAGE);
+}
 
 fn env_var(name: &str) -> Option<String> {
     env::var(name)

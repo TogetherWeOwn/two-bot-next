@@ -18,9 +18,12 @@
 //! Metadata only: member IDs plus pending-since timestamps. Never writes,
 //! DMs, or pings.
 //!
-//! Usage: gate_stuck_report --guild <snowflake> [--threshold-days <n>]
+//! Usage: gate_stuck_report --guild `<snowflake>` [--threshold-days `<n>`]
 //!   Env: TWO_DATABASE_URL. Exit 0 on a report (including clean), 1 on
 //!   database failure, 2 on usage errors.
+
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
 
 use two_bot_cutover::cli::{open_db, require_guild_read, Args};
 

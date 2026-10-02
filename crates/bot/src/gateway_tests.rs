@@ -33,6 +33,7 @@ mod force_identify;
 mod member_journey;
 mod persistent;
 mod recovery;
+mod voice;
 
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";
@@ -365,6 +366,38 @@ async fn wait_sequence(store: &GatewaySessionStore, sequence: u64) {
     .expect("checkpoint deadline");
 }
 
+// A visible checkpoint precedes the runner's in-memory readiness update.
+async fn wait_connected(state: &RwLock<GatewayState>) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while *state.read().await != GatewayState::Connected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("gateway connected deadline");
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_wait_requires_connected_state() {
+    let state = Arc::new(RwLock::new(GatewayState::Armed));
+    let waiting_state = state.clone();
+    let waiting = tokio::spawn(async move { wait_connected(&waiting_state).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished(), "Armed is not ready");
+    *state.write().await = GatewayState::Connected;
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("connected state observed")
+        .expect("readiness waiter");
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "gateway connected deadline")]
+async fn readiness_wait_has_a_bounded_deadline() {
+    wait_connected(&RwLock::new(GatewayState::Armed)).await;
+}
+
 async fn spawn_runner(
     db: &TestDb,
     url: &str,
@@ -415,6 +448,7 @@ async fn spawn_runner_until_shutdown(
         state.clone(),
         db.store.clone(),
         commands,
+        None,
         shutdown,
     ));
     (task, state)
@@ -517,7 +551,7 @@ async fn gateway_resume_after_restart_has_no_duplicate_funnel_rows_and_is_ready(
     assert_eq!(auth["d"]["session_id"], "fresh-session");
     wait_sequence(&db.store, 3).await;
     assert_eq!(db.count().await, 1);
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     runner.abort();
     let _ = runner.await;
     second.task.abort();
@@ -552,7 +586,7 @@ async fn gateway_invalid_session_falls_back_to_identify_and_replaces_checkpoint(
             .session_id,
         "fresh-session"
     );
-    assert_eq!(*state.read().await, GatewayState::Connected);
+    wait_connected(&state).await;
     runner.abort();
     let _ = runner.await;
     mock.task.abort();

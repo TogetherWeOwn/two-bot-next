@@ -1,4 +1,7 @@
 //! Offline cutover only. Never migrates schemas or calls Discord.
+// Operator commands intentionally emit human-readable/JSON output to stdout.
+#![allow(clippy::print_stdout)]
+
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 use two_bot_cutover::legacy_copy::{copy, mapping::GROUPS, options::Options};

@@ -70,6 +70,7 @@ pub fn cache_resource_types() -> ResourceType {
         | ResourceType::MEMBER
         | ResourceType::MESSAGE
         | ResourceType::ROLE
+        | ResourceType::USER_CURRENT
         | ResourceType::VOICE_STATE
 }
 
