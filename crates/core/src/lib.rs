@@ -13,6 +13,9 @@ pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
 pub mod automod;
+pub mod automod_runtime;
+#[cfg(feature = "db")]
+pub mod automod_store;
 pub mod backup;
 pub mod channel_moderation;
 #[cfg(feature = "db")]
