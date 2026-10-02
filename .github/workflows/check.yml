@@ -217,6 +217,9 @@ jobs:
           cargo build -p two-bot --locked
           export TWO_BOT_TEST_BACKUP_BIN="$PWD/target/debug/two-bot"
           cargo test -p two-bot-core --features db --test backup_roundtrip --test backup_dump_publication --locked -- --nocapture --test-threads=1
+          # The shipped monthly drill on the complete migrated schema (TOG-11804).
+          export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          cargo test -p two-bot-core --features db --test backup_schema_roundtrip --locked shipped_backup_and_restore_drill -- --nocapture --test-threads=1
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).

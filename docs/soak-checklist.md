@@ -568,7 +568,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
-### s5-02: `internal_nonces`, `internal_idempotency`, `internal_action_log`, `internal_discord_events` — website-callback replay guard, idempotency, audit, dedupe
+### s5-02: `internal_nonces`, `internal_clock_high_water`, `internal_idempotency`, `internal_action_log`, `internal_discord_events` — website-callback replay guard (plus its F8 clock high-water mark), idempotency, audit, dedupe
 
 - **Method:** `waived` (not an execution verdict).
 - **Action:** Send signed synthetic actions, replay nonce/idempotency key, and repeat Discord callback in CI store fixtures.
