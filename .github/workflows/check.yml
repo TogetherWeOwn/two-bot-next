@@ -22,7 +22,7 @@ concurrency:
 jobs:
   check:
     name: check
-    needs: self-role-store
+    needs: [self-role-store, parity-docs]
     # A skipped dependency must not make the required check appear green.
     if: ${{ always() }}
     # Overflow switch (TOG ops, 2026-10-01): stays on self-hosted unless repo vars
@@ -73,6 +73,10 @@ jobs:
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
+
+      - name: require parity docs to pass
+        if: needs.parity-docs.result != 'success'
+        run: exit 1
 
       - name: require self-role store tests to pass
         if: needs.self-role-store.result != 'success'
@@ -304,6 +308,23 @@ jobs:
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test SQL ledger on ephemeral Postgres
         run: cargo test -p two-bot-core --features db --locked --test member_moderation_db -- --ignored
+  parity-docs:
+    name: parity docs
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Offline parity guard regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_parity_baseline.py' -v
+      - name: Fetch public legacy history (no credentials)
+        run: |
+          git -c credential.helper= clone --bare https://github.com/TogetherWeOwn/two-bot.git "$RUNNER_TEMP/legacy.git"
+          start=$(python3 -c 'import json; print(json.load(open("docs/parity-baseline.json"))["historyStart"])')
+          git -C "$RUNNER_TEMP/legacy.git" -c credential.helper= fetch origin "$start"
+      - name: Check baseline ancestry, complete ledger and permalink targets
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_parity_baseline.py --legacy-repo "$RUNNER_TEMP/legacy.git"
 
   self-role-store:
     name: self-role store leases
