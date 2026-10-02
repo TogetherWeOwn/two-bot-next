@@ -685,6 +685,15 @@ class DeploymentWiringTests(unittest.TestCase):
         deploy = [step for step in steps if "command: deploy --config" in step]
         verify = [step for step in steps if "python3 ../scripts/staging_rollout.py verify" in step]
         self.assertEqual((len(prepare), len(deploy), len(verify)), (1, 1, 1))
+        # GitHub rejects the whole workflow if job-level env uses the runner context.
+        job_header = source.split("    steps:\n", 1)[0]
+        self.assertNotIn("runner.", job_header)
+        paths = [step for step in steps if 'echo "ROLLOUT_DIR=' in step]
+        self.assertEqual(len(paths), 1)
+        self.assertIn('$RUNNER_TEMP/', paths[0])
+        self.assertIn('>> "$GITHUB_ENV"', paths[0])
+        self.assertIn('echo "WRANGLER_OUTPUT_FILE_PATH=$rollout_dir/', paths[0])
+        self.assertLess(steps.index(paths[0]), steps.index(prepare[0]))
         self.assertLess(steps.index(prepare[0]), steps.index(deploy[0]))
         self.assertLess(steps.index(deploy[0]), steps.index(verify[0]))
         for step in [prepare[0], deploy[0], verify[0]]:

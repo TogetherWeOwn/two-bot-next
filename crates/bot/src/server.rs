@@ -73,7 +73,15 @@ async fn readyz(
         }
     })
     .await;
-    (code, Json(ReadinessReport { health, jobs }))
+    (
+        code,
+        Json(ReadinessReport {
+            health,
+            jobs,
+            build_revision: option_env!("BOT_BUILD_REVISION").unwrap_or("unknown"),
+            build_id: option_env!("BOT_BUILD_ID").unwrap_or("unknown"),
+        }),
+    )
 }
 
 async fn readiness_after_ping(
@@ -89,15 +97,22 @@ async fn readiness_after_ping(
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (
-        code,
-        Json(ReadinessReport {
-            health: report,
-            jobs: jobs.read().await.clone(),
-            build_revision: option_env!("BOT_BUILD_REVISION").unwrap_or("unknown"),
-            build_id: option_env!("BOT_BUILD_ID").unwrap_or("unknown"),
-        }),
-    )
+    (code, Json(report))
+}
+
+fn readiness_report(gateway: GatewayState, database_ready: bool) -> HealthReport {
+    HealthReport::new(vec![
+        ("process".to_owned(), ComponentStatus::Ready),
+        ("gateway".to_owned(), gateway.status()),
+        (
+            "database".to_owned(),
+            if database_ready {
+                ComponentStatus::Ready
+            } else {
+                ComponentStatus::Down
+            },
+        ),
+    ])
 }
 
 /// Bind before starting the gateway so liveness never waits for Discord.

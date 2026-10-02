@@ -22,13 +22,18 @@ jobs:
     defaults:
       run:
         working-directory: wrangler
-    env:
-      ROLLOUT_DIR: ${{ runner.temp }}/two-bot-staging-${{ github.run_id }}-${{ github.run_attempt }}
-      WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/two-bot-staging-${{ github.run_id }}-${{ github.run_attempt }}/wrangler-output.ndjson
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+      # The runner context is not available in job-level env, so derive the
+      # per-attempt paths here and export them to every later step.
+      - name: Set per-attempt rollout paths
+        run: |
+          set -euo pipefail
+          rollout_dir="$RUNNER_TEMP/two-bot-staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "ROLLOUT_DIR=$rollout_dir" >> "$GITHUB_ENV"
+          echo "WRANGLER_OUTPUT_FILE_PATH=$rollout_dir/wrangler-output.ndjson" >> "$GITHUB_ENV"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
