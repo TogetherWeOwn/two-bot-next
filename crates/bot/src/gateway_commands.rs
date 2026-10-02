@@ -1,12 +1,20 @@
 //! Gateway composition of the shared custom-command router/runtime.
 //! Bootstrap reads finish before constructing the shard, including cold RESUME.
+//! Event work is detached at reception by [`crate::command_runtime::CommandRuntime::dispatch`].
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, PoisonError, RwLock},
+};
 
 use sqlx::PgPool;
-use twilight_cache_inmemory::InMemoryCache;
 use twilight_gateway::Event;
-use twilight_model::id::{marker::GuildMarker, Id};
+use twilight_model::{
+    application::interaction::Interaction,
+    channel::Message,
+    gateway::payload::incoming::GuildCreate,
+    id::{marker::GuildMarker, Id},
+};
 use two_bot_core::{
     custom_commands::AutomationMessageAcceptance,
     feature_commands::FeatureGates,
@@ -14,7 +22,10 @@ use two_bot_core::{
     router::{RouterGates, SurfaceFlags},
     InteractionRouter,
 };
-use two_bot_discord::{custom_commands::CustomCommandRuntime, ActionExecutor};
+use two_bot_discord::{
+    custom_commands::{CustomCommandError, CustomCommandRuntime},
+    ActionExecutor,
+};
 
 pub struct GatewayCommandConfig {
     gates: RouterGates,
@@ -68,7 +79,8 @@ pub struct GatewayCommands {
     runtime: CustomCommandRuntime,
     application_id: u64,
     guild_id: Id<GuildMarker>,
-    bootstrap_guild_name: String,
+    /// Seeded by bootstrap REST, refreshed from GUILD_CREATE/GUILD_UPDATE.
+    guild_name: RwLock<String>,
     text_commands: bool,
     acceptance: AutomationMessageAcceptance,
 }
@@ -113,68 +125,83 @@ impl GatewayCommands {
             runtime,
             application_id,
             guild_id,
-            bootstrap_guild_name,
+            guild_name: RwLock::new(bootstrap_guild_name),
             text_commands: config.text_commands,
             acceptance: config.acceptance,
         })
     }
 
-    /// Called after the ordinary pipeline and awaited before its checkpoint.
-    /// Per-command failures are terminal for this dispatch, not a reason to
-    /// retry an acknowledged/uncertain external operation. Deadline cancellation
-    /// stops the shard; immutable prefix attempts fence any subsequent replay.
-    pub async fn handle_event(
-        &self,
-        event: &Event,
-        cache: &InMemoryCache,
-    ) -> Result<bool, sqlx::Error> {
-        if let Event::Ready(ready) = event {
-            if ready.application.id.get() != self.application_id {
-                return Err(sqlx::Error::InvalidArgument(
-                    "gateway application context mismatch".into(),
-                ));
-            }
-        }
-        if matches!(event, Event::Ready(_) | Event::Resumed) {
-            // One complete registry, also after a cold RESUME where READY is
-            // absent. Do not report readiness after a failed synchronization.
-            self.runtime.sync_registry().await.map_err(|_| {
-                sqlx::Error::InvalidArgument("gateway registry synchronization failed".into())
-            })?;
-            return Ok(true);
-        }
-        // Own the name before awaiting: never hold a cache shard lock over I/O.
-        // https://docs.rs/twilight-cache-inmemory/0.17.1/twilight_cache_inmemory/struct.InMemoryCache.html#method.guild
-        let guild_name = cache
-            .guild(self.guild_id)
-            .map(|guild| guild.name().to_owned());
-        let guild_name = guild_name.as_deref().unwrap_or(&self.bootstrap_guild_name);
-        let result = match event {
-            Event::InteractionCreate(interaction) => {
-                self.runtime
-                    .handle_interaction(interaction, Some(guild_name))
-                    .await
-            }
-            Event::MessageCreate(message) => self
-                .runtime
-                .handle_message(
-                    message,
-                    self.acceptance,
-                    self.text_commands,
-                    Some(guild_name),
-                )
-                .await
-                .map(|_| true),
-            _ => return Ok(false),
+    /// Reception-order observation, before later events spawn their work:
+    /// keeps the template `{server}` name current without a cache lookup.
+    pub fn observe(&self, event: &Event) {
+        let name = match event {
+            Event::GuildCreate(guild) => match guild.as_ref() {
+                GuildCreate::Available(guild) if guild.id == self.guild_id => &guild.name,
+                _ => return,
+            },
+            Event::GuildUpdate(update) if update.0.id == self.guild_id => &update.0.name,
+            _ => return,
         };
-        match result {
-            Ok(handled) => Ok(handled),
+        name.clone_into(
+            &mut self
+                .guild_name
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
+
+    fn guild_name(&self) -> String {
+        self.guild_name
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// One complete registry for READY and for a cold RESUME where READY is
+    /// absent. The session must name the bootstrapped application; a mismatch
+    /// publishes nothing.
+    pub async fn sync_registry(&self, application_id: u64) -> Result<(), CustomCommandError> {
+        if application_id != self.application_id {
+            return Err(CustomCommandError::Context);
+        }
+        self.runtime.sync_registry().await
+    }
+
+    /// Detached interaction dispatch. True means this runtime owns the
+    /// interaction, including a failed or uncertain attempt: acknowledged
+    /// operations never fall through to another handler or replay.
+    pub async fn handle_interaction(&self, interaction: &Interaction) -> bool {
+        let guild_name = self.guild_name();
+        match self
+            .runtime
+            .handle_interaction(interaction, Some(&guild_name))
+            .await
+        {
+            Ok(handled) => handled,
             Err(error) => {
-                // Acknowledged/uncertain operations must never fall through to
-                // another handler or replay. Errors contain fixed codes only.
-                tracing::warn!(error = %error, "custom-command dispatch finished without confirmed success");
-                Ok(true)
+                // Errors contain fixed codes only.
+                tracing::warn!(error = %error, "custom-command interaction finished without confirmed success");
+                true
             }
+        }
+    }
+
+    /// Detached prefix-trigger dispatch with the configured acceptance, which
+    /// stays fail-closed until an automod verdict producer exists. The
+    /// immutable pre-send attempt claim fences reordered or replayed events.
+    pub async fn handle_message(&self, message: &Message) {
+        let guild_name = self.guild_name();
+        if let Err(error) = self
+            .runtime
+            .handle_message(
+                message,
+                self.acceptance,
+                self.text_commands,
+                Some(&guild_name),
+            )
+            .await
+        {
+            tracing::warn!(error = %error, "custom-command trigger finished without confirmed success");
         }
     }
 }

@@ -1,10 +1,12 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use two_bot_core::commands::OCCURRENCE_ID_MAX_CHARS;
 use two_bot_core::router::{InteractionRouter, RouterGates};
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
     ("rota-acknowledge", "docs/parity.md §1 #13 / §9 drop 1"),
+    ("attendance", "docs/parity.md §1 #12 bound"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -51,6 +53,13 @@ pub fn expected_registry() -> Value {
         .expect(INTENTIONAL_DIFFERENCES[0].1);
     // The exception changes ONLY this name, never its options or permissions.
     rsvp["name"] = json!(INTENTIONAL_DIFFERENCES[0].0);
+    // The bound exception advertises ONLY this max_length on the scorecard
+    // `event-occurrence` option; every other field stays legacy-identical.
+    let scorecard = commands
+        .iter_mut()
+        .find(|c| c["name"] == "attendance" && c["options"][0]["name"] == "event-occurrence")
+        .expect(INTENTIONAL_DIFFERENCES[2].1);
+    scorecard["options"][0]["max_length"] = json!(OCCURRENCE_ID_MAX_CHARS);
     let rota = commands
         .iter()
         .position(|c| c["name"] == INTENTIONAL_DIFFERENCES[1].0)

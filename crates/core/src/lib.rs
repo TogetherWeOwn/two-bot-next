@@ -53,6 +53,7 @@ pub mod inactivity_store;
 #[cfg(feature = "db")]
 pub mod internal_action_store;
 pub mod internal_actions;
+pub mod internal_settings;
 pub mod invites;
 pub mod leveling;
 #[cfg(feature = "db")]
@@ -75,11 +76,16 @@ pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
+pub mod scheduled;
 pub mod scheduled_events;
+#[cfg(feature = "db")]
+pub mod scheduled_store;
 pub mod secret;
 pub use secret::Secret;
+pub mod self_roles;
 pub mod settings;
 pub mod sticky;
+pub mod tickets;
 pub mod voice;
 pub mod voice_config;
 pub mod voice_ownership;
@@ -127,9 +133,11 @@ pub use community_snapshots::{
 pub use config::Config;
 pub use containment::{
     plan_quarantine, quarantine_outcome, role_removal_status, ClaimedContainmentEvent,
-    ContainmentDisposition, ContainmentEventState, ContainmentIncident, ContainmentIncidentState,
-    ContainmentPolicy, ContainmentPolicyError, ContainmentReason, ContainmentRole,
-    DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan, QuarantineRefusal,
+    ContainmentAlert, ContainmentDisposition, ContainmentEventState, ContainmentIncident,
+    ContainmentIncidentState, ContainmentPolicy, ContainmentPolicyError, ContainmentReason,
+    ContainmentRole, ContainmentSignal, DestructiveAction, DestructiveAuditEvent,
+    QuarantineFailure, QuarantinePlan, QuarantineRefusal, CONTAINMENT_ALERT_EVENT,
+    CONTAINMENT_ALERT_MAX_IDS, CONTAINMENT_SUPPRESSED_EVENT,
 };
 #[cfg(feature = "db")]
 pub use custom_command_store::{
@@ -188,9 +196,9 @@ pub use internal_actions::{
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
-    summarize_attribution_split, AttributionCategory, AttributionSplit, DowntimeWindow,
-    DowntimeWindowCount, InviteSnapshotStore, InviteState, InviteTracker, JoinAttribution,
-    MemSnapshots,
+    is_snapshot_stale, summarize_attribution_split, AttributionCategory, AttributionSplit,
+    DowntimeWindow, DowntimeWindowCount, InviteSnapshotStore, InviteState, InviteTracker,
+    JoinAttribution, MemSnapshots, INVITE_SNAPSHOT_STALENESS_BOUND_MS,
 };
 #[cfg(feature = "db")]
 pub use leveling_store::{
@@ -239,9 +247,9 @@ pub use onboarding_store::{
 };
 pub use presence::{
     bot_floor_due, daily_peaks, decide_probe_cycle, evaluate_trigger, latest_bot_floor,
-    sanitize_presence_count, DailyPeak, PresenceReading, ProbeDecision, TriggerOptions,
-    TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS, PRESENCE_PROBE_INTERVAL_MS,
-    REOPEN_PEAK_THRESHOLD,
+    sanitize_presence_count, BotFloorScan, DailyPeak, PresenceReading, ProbeDecision,
+    TriggerOptions, TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS,
+    PRESENCE_PROBE_INTERVAL_MS, REOPEN_PEAK_THRESHOLD,
 };
 pub use raid::{
     count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,
@@ -268,9 +276,36 @@ pub use rsvp::{
 pub use rsvp_store::{
     list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
 };
+pub use scheduled::{
+    advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
+    next_run_at_ms, no_such_schedule_text, no_unique_match_text, parse_iso_ms,
+    post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text, schedule_confirm_text,
+    schedule_list_line, schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome,
+    ScheduleError, ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX,
+    EVERY_MINUTES_MIN, INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
+    MAX_BODY_CHARS as SCHEDULED_MAX_BODY_CHARS, RETRY_DEFAULT_MS, RETRY_MAX_MS, RETRY_MIN_MS,
+    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+};
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
     ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+};
+#[cfg(feature = "db")]
+pub use scheduled_store::{
+    audit_scheduled, claim_due, complete_run, delete_scheduled, get_scheduled, list_scheduled,
+    put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store, retry_scheduled,
+    ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError, ScheduledWrite,
+};
+pub use self_roles::{
+    emoji_identity, event_order_for_event_id, event_order_from_snowflake,
+    find_disallowed_permission, find_unsafe_channel_grant, parse_self_role_custom_id,
+    parse_self_role_panels, plan_select_delta, plan_self_role_change, reaction_endpoint_emoji,
+    reaction_option_key, self_role_claim_owned, self_role_custom_id, self_role_renew_after_ms,
+    self_role_reply, validate_panel_roles, validate_self_role_dispatch, ChannelOverwrite,
+    ChannelSnapshot, DispatchCheck, DispatchFailure, DispatchRole, PanelMode, ParsedCustomId,
+    PlanRejection, ResolvedRole, RoleOperation, SelfRoleConfigError, SelfRoleGates, SelfRoleOption,
+    SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
+    SELF_ROLE_ALLOWED_MASK, SELF_ROLE_ALLOWED_PERMISSIONS, SELF_ROLE_CLAIM_LEASE_MS,
 };
 pub use settings::{
     assert_storable_key, classify_key, is_declared_env_only, is_env_only_key, is_storable_key,

@@ -35,8 +35,8 @@
 use std::collections::HashMap;
 
 use super::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_EVENTS,
-    PERM_MANAGE_GUILD,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, OCCURRENCE_ID_MAX_CHARS,
+    PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
 
 /// Scorecard check-in command (parity #12). Keeps the `attendance` name; the
@@ -54,7 +54,8 @@ pub fn scorecard_attendance_command() -> CommandDefinition {
             "Scheduled event id or stable occurrence id.",
             CommandOptionType::String,
         )
-        .required(),
+        .required()
+        .max_length(OCCURRENCE_ID_MAX_CHARS as u32),
         CommandOption::new(
             "member",
             "Human member who attended.",
@@ -443,6 +444,13 @@ mod tests {
         let score = scorecard_attendance_command();
         assert!(score.options.iter().all(|o| o.required == Some(true)));
         assert_eq!(score.options[1].kind, CommandOptionType::User.as_u8());
+        // event-occurrence advertises the shared occurrence-ID bound (pinned
+        // literal: a const change must update docs/parity.md and commands.md).
+        assert_eq!(score.options[0].max_length, Some(128));
+        assert_eq!(
+            score.options[0].max_length,
+            Some(OCCURRENCE_ID_MAX_CHARS as u32)
+        );
     }
 
     #[test]
@@ -452,6 +460,8 @@ mod tests {
         // RSVP-totals carries the namespaced name.
         assert_eq!(json[0]["name"], "attendance");
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
+        assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
+        assert_eq!(json[0]["options"][0]["max_length"], 128);
         assert_eq!(json[10]["name"], "rsvp-attendance");
         assert!(json[10].get("default_member_permissions").is_none());
         assert_eq!(json[10]["options"][0]["name"], "event-id");

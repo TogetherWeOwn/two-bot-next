@@ -252,10 +252,10 @@ impl CustomCommandRuntime {
         }
     }
 
-    /// Called only after the ordinary message path has completed, with its
-    /// explicit moderation result. Never derive acceptance from MessageCreate,
-    /// funnel capture, or whether deletion succeeded. Unknown errors fail closed
-    /// (unlike the legacy emitter's fail-open null result).
+    /// Called with an explicit moderation acceptance, never a default. Never
+    /// derive acceptance from MessageCreate, funnel capture, or whether
+    /// deletion succeeded. Unknown errors fail closed (unlike the legacy
+    /// emitter's fail-open null result).
     pub async fn handle_message(
         &self,
         message: &Message,
