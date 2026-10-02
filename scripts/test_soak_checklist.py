@@ -1,12 +1,16 @@
 """Coverage guard regressions: local fixtures only, no Discord or databases."""
 
+from collections import Counter
 import copy
 import json
 from pathlib import Path
 import subprocess
+import tempfile
+import textwrap
 import unittest
 
-from check_soak_checklist import parity_rows, render, validate
+from check_soak_checklist import (check_verification, delta_rows, parity_rows, render,
+                                  libtest_names, validate)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,7 +23,7 @@ class SoakChecklistTests(unittest.TestCase):
 
     def test_repository_coverage_and_render(self):
         counts = validate(self.parity, self.checklist)
-        self.assertEqual(set(counts), set(range(1, 9)))
+        self.assertEqual(set(counts), set(range(1, 9)) | {12, 13})
         self.assertEqual((ROOT / "docs/soak-checklist.md").read_text(), render(self.checklist))
 
     def test_unnumbered_section_ends_parity_table_scope(self):
@@ -188,6 +192,331 @@ class SoakChecklistTests(unittest.TestCase):
     def test_escaped_pipe_stays_in_cell(self):
         changed = self.parity.replace("## 9. Drops", "| Behaviour | Detail | Map |\n|---|---|---|\n|new observable | one \\| two | **S5** |\n\n## 9. Drops")
         self.assertIn((8, ("new observable", "one | two")), parity_rows(changed))
+
+
+WRAPPED = "python3 scripts/cargo_cache.py run -- test "
+FIXTURE = {
+    "Cargo.toml": """
+        [workspace]
+        members = ["crates/demo"]
+    """,
+    "crates/demo/Cargo.toml": """
+        [package]
+        name = "demo"
+    """,
+    "crates/demo/src/lib.rs": """
+        //! #[test] fn doc_ghost() {}
+        /* outer /* nested #[test] fn block_ghost() {} */ still a comment } */
+        pub mod outer;
+        #[path = "elsewhere/renamed.rs"]
+        mod moved;
+        const RAW: &str = r##"{ "#[test] fn raw_ghost() {}" "##;
+        const OPEN: char = '{';
+        fn helper<'a>(x: &'a str) -> &'a str { let _ = "} #[test] fn string_ghost"; x }
+        #[cfg(test)]
+        mod tests {
+            #[test]
+            fn unit() {}
+            fn not_a_test() {
+                #[test]
+                fn nested_hidden() {}
+            }
+            proptest::proptest! {
+                #[test]
+                fn property(x in 0..1u8) { let _ = x; }
+            }
+        }
+    """,
+    "crates/demo/src/outer.rs": """
+        mod inner;
+        #[tokio::test(flavor = "current_thread")]
+        async fn outer_async() {}
+    """,
+    "crates/demo/src/outer/inner.rs": "#[test] fn deep() {}",
+    "crates/demo/src/elsewhere/renamed.rs": """
+        mod sibling;
+        #[test] fn moved_test() {}
+    """,
+    "crates/demo/src/elsewhere/sibling.rs": "#[test] fn sib() {}",
+    "crates/demo/tests/smoke.rs": """
+        mod support;
+        #[test] fn smoke_case() {}
+    """,
+    "crates/demo/tests/support/mod.rs": """
+        pub mod nested;
+        #[test] fn support_case() {}
+    """,
+    "crates/demo/tests/support/nested.rs": "#[test] fn nested_case() {}",
+    "crates/demo/tests/multi/main.rs": "#[test] fn multi_case() {}",
+}
+
+
+class AutomatedVerificationTests(unittest.TestCase):
+    """Automated rows must name a real package, test target and test (offline)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parity = (ROOT / "docs/parity.md").read_text()
+        cls.checklist = json.loads((ROOT / "docs/soak-checklist.json").read_text())
+        cls.fixture = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.fixture.name)
+        for name, source in FIXTURE.items():
+            (cls.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (cls.root / name).write_text(textwrap.dedent(source))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture.cleanup()
+
+    def rewritten(self, entry_id, old, new):
+        data = copy.deepcopy(self.checklist)
+        entry = next(e for e in data["entries"] if e["id"] == entry_id)
+        self.assertIn(old, entry["verification"])
+        entry["verification"] = entry["verification"].replace(old, new)
+        return data
+
+    def test_every_automated_row_resolves(self):
+        automated = [e for e in self.checklist["entries"] if e["status"] == "automated"]
+        self.assertGreater(len(automated), 0)
+        for entry in automated:
+            with self.subTest(entry=entry["id"]):
+                check_verification(entry["id"], entry["verification"])
+
+    def test_unknown_package_fails_with_row_id(self):
+        data = self.rewritten("s6-07", "-p two-bot-core", "-p two-bot-kore")
+        with self.assertRaisesRegex(ValueError, r"^s6-07: unknown package -p two-bot-kore"):
+            validate(self.parity, data)
+
+    def test_missing_test_target_fails_with_row_id(self):
+        data = self.rewritten("s6-07", "--test backup_transport", "--test backup_transports")
+        with self.assertRaisesRegex(
+                ValueError, r"^s6-07: missing test target --test backup_transports "
+                            r"\(crates/core/tests/backup_transports\.rs\)"):
+            validate(self.parity, data)
+
+    def test_renamed_test_fn_fails_with_row_id(self):
+        name = "guild_config_capture_plan_apply_round_trip"
+        data = self.rewritten("s6-03", name, name + "_v2")
+        with self.assertRaisesRegex(ValueError, rf"^s6-03: no test named '{name}_v2'"):
+            validate(self.parity, data)
+        # Without --exact a prefix still selects the test; with it, only the full name.
+        data = self.rewritten("s6-03", name, "guild_config_capture")
+        validate(self.parity, self.rewritten("s6-03", name + " -- --exact", "guild_config_capture"))
+        with self.assertRaisesRegex(ValueError, r"^s6-03: no test named 'guild_config_capture'"):
+            validate(self.parity, data)
+
+    def test_renamed_lib_module_filter_fails_with_row_id(self):
+        data = self.rewritten("s13-90ab4b7", "backup::dump_file", "backup::dump_files")
+        with self.assertRaisesRegex(ValueError, r"^s13-90ab4b7: no test matching 'backup::dump_files'"):
+            validate(self.parity, data)
+
+    def test_every_chained_invocation_is_checked(self):
+        data = self.rewritten("s6-01", "--test executor_regressions", "--test executor_regression")
+        with self.assertRaisesRegex(ValueError, r"^s6-01: missing test target --test executor_regression "):
+            validate(self.parity, data)
+
+    def test_unsupported_command_shapes_fail_closed(self):
+        for command, error in (
+            ("cargo test -p two-bot-core --test backup_transport", "run Cargo as"),
+            ("python3 scripts/cargo_cache.py run -- check -p two-bot-core", "automated verification must be `cargo test`"),
+            (WRAPPED + "--test backup_transport", "name exactly one -p"),
+            (WRAPPED + "-p two-bot-core -p two-bot-discord --lib", "name exactly one -p"),
+            (WRAPPED + "-p two-bot-core --doc", "unsupported target selector --doc"),
+            (WRAPPED + "-p two-bot-next --lib", "no tests in the selected targets"),
+            ("python3 scripts/check_soak_checklist.py", "no cargo test invocation"),
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ValueError, f"^row: {error}"):
+                    check_verification("row", command)
+
+    def test_test_names_follow_modules_and_ignore_comments_and_literals(self):
+        demo = self.root / "crates/demo"
+        self.assertEqual(sorted(libtest_names(demo / "src/lib.rs")), [
+            "moved::moved_test", "moved::sibling::sib", "outer::inner::deep",
+            "outer::outer_async", "tests::property", "tests::unit"])
+        self.assertEqual(sorted(libtest_names(demo / "tests/smoke.rs")), [
+            "smoke_case", "support::nested::nested_case", "support::support_case"])
+
+    def test_fixture_commands_resolve_by_target_and_filter(self):
+        for command in (
+            WRAPPED + "-p demo --lib outer::inner",
+            WRAPPED + "-p demo --test smoke support::nested::nested_case -- --exact",
+            WRAPPED + "-p demo --test multi && " + WRAPPED + "-p demo --tests sib",
+            WRAPPED + "-p demo -- --skip unit --test-threads 1 moved_test",
+        ):
+            with self.subTest(command=command):
+                check_verification("row", command, self.root)
+        for ghost in ("doc_ghost", "block_ghost", "raw_ghost", "string_ghost", "nested_hidden"):
+            with self.subTest(ghost=ghost):
+                with self.assertRaisesRegex(ValueError, f"^row: no test matching '{ghost}'"):
+                    check_verification("row", WRAPPED + "-p demo " + ghost, self.root)
+
+
+class DeltaChecklistTests(unittest.TestCase):
+    """Parity §12 additions and §13 non-dropped ledger rows (B4 gate)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parity = (ROOT / "docs/parity.md").read_text()
+        cls.checklist = json.loads((ROOT / "docs/soak-checklist.json").read_text())
+
+    def line(self, needle):
+        return next(line for line in self.parity.splitlines() if needle in line)
+
+    def entry(self, data, entry_id):
+        return next(e for e in data["entries"] if e["id"] == entry_id)
+
+    def without_entry(self, entry_id):
+        data = copy.deepcopy(self.checklist)
+        data["entries"] = [e for e in data["entries"] if e["id"] != entry_id]
+        return data
+
+    def test_ledger_coverage_is_every_non_dropped_row(self):
+        # Independent of the table scanner: split the delimited ledger by hand.
+        ledger = self.parity.split("<!-- post-freeze-ledger:start -->")[1].split("<!-- post-freeze-ledger:end -->")[0]
+        statuses = {}
+        for line in ledger.splitlines():
+            if line.startswith("| ["):
+                cells = [c.strip() for c in line.strip("|").split("|")]
+                statuses[cells[0][1:cells[0].index("]")]] = cells[3]
+        covered = {row[0][1:row[0].index("]")] for section, row in delta_rows(self.parity) if section == 13}
+        self.assertEqual(covered, {sha for sha, status in statuses.items() if status != "dropped"})
+        replays = [line for line in ledger.splitlines() if "| dropped | drop: history-rewrite replay" in line]
+        self.assertGreater(len(replays), 100)
+        for line in replays:
+            self.assertFalse(line[3:line.index("]")] in covered)
+        counts = Counter(section for section, _ in delta_rows(self.parity))
+        self.assertEqual(counts[12], len([e for e in self.checklist["entries"] if e["parity"]["section"] == 12]))
+
+    def test_removing_delta_entry_fails(self):
+        for entry_id in ("s12-01", "s12-14", "s13-f114c44", "s13-90ab4b7"):
+            with self.subTest(entry=entry_id):
+                with self.assertRaisesRegex(ValueError, "missing=\\[\\(1[23],"):
+                    validate(self.parity, self.without_entry(entry_id))
+
+    def test_removing_delta_source_row_leaves_stale_entry(self):
+        for needle in ("| Temporary voice creator channels", "| [Lookup failure", "| [f114c44]", "| [bffccf3]"):
+            with self.subTest(row=needle):
+                changed = self.parity.replace(self.line(needle) + "\n", "", 1)
+                with self.assertRaisesRegex(ValueError, "missing=\\[\\]; stale=\\[\\(1[23],"):
+                    validate(changed, self.checklist)
+
+    def test_new_delta_rows_need_entries(self):
+        for needle, row in (
+            ("| [Lookup failure", "| New surface | evidence | [TOG-1](/TOG/issues/TOG-1) |"),
+            ("| [bffccf3]", "| [abc1234](https://example.invalid) | `src/x/` | fix(x): new | gap | [TOG-1](/TOG/issues/TOG-1) — obligation |"),
+        ):
+            with self.subTest(row=row):
+                line = self.line(needle)
+                changed = self.parity.replace(line, line + "\n" + row, 1)
+                with self.assertRaisesRegex(ValueError, "missing="):
+                    validate(changed, self.checklist)
+
+    def test_ledger_status_changes_are_stale(self):
+        line = self.line("| [bffccf3]")
+        dropped = line.replace("| carded | ", "| dropped | drop: superseded; ", 1)
+        with self.assertRaisesRegex(ValueError, "missing=\\[\\]; stale="):
+            validate(self.parity.replace(line, dropped, 1), self.checklist)
+        with self.assertRaisesRegex(ValueError, "missing=\\[\\(13,.*stale=\\[\\(13,"):
+            validate(self.parity.replace(line, line.replace("| carded |", "| gap |", 1), 1), self.checklist)
+
+    def test_drop_and_replay_rows_are_excluded(self):
+        rows = delta_rows(self.parity)
+        for needle, row in (
+            ("| [Lookup failure", "| Retired surface | evidence | **DROP** — intentionally absent |"),
+            ("| [bffccf3]", "| [abc1234](https://example.invalid) | `src/x/` | replayed | dropped | drop: history-rewrite replay |"),
+        ):
+            with self.subTest(row=row):
+                line = self.line(needle)
+                changed = self.parity.replace(line, line + "\n" + row, 1)
+                self.assertEqual(delta_rows(changed), rows)
+                self.assertEqual(validate(changed, self.checklist), validate(self.parity, self.checklist))
+        # A DROP prefix naming an owner card keeps the §12 row in scope.
+        line = self.line("| [Lookup failure")
+        mixed = line + "\n| Mixed surface | evidence | **DROP** the Node hop; [TOG-1](/TOG/issues/TOG-1) keeps the contract |"
+        self.assertIn((12, ("Mixed surface", "evidence")), delta_rows(self.parity.replace(line, mixed, 1)))
+
+    def test_retained_delta_rows_need_owner_cards(self):
+        line = self.line("| [Lookup failure")
+        with self.assertRaisesRegex(ValueError, "§12: row needs an owner card"):
+            delta_rows(self.parity.replace(line, line + "\n| Orphan surface | evidence | to be decided |", 1))
+        line = self.line("| [bffccf3]")
+        for status in ("carded", "gap"):
+            with self.subTest(status=status):
+                row = f"| [abc1234](https://example.invalid) | `src/x/` | fix(x): new | {status} | no card yet |"
+                with self.assertRaisesRegex(ValueError, f"§13: {status} row needs an owner card"):
+                    delta_rows(self.parity.replace(line, line + "\n" + row, 1))
+        # Ported rows cite source evidence instead, yet still need an entry.
+        row = "| [abc1234](https://example.invalid) | `src/x/` | fix(x): new | ported | implemented in `x.rs:1` |"
+        with self.assertRaisesRegex(ValueError, "missing="):
+            validate(self.parity.replace(line, line + "\n" + row, 1), self.checklist)
+
+    def test_owner_cards_must_match_disposition(self):
+        data = copy.deepcopy(self.checklist)
+        self.entry(data, "s13-1d64196")["owner"] = ["TOG-11146"]
+        with self.assertRaisesRegex(ValueError, "s13-1d64196: stale owner"):
+            validate(self.parity, data)
+        self.entry(data, "s13-1d64196")["owner"] = ["TOG-11145"]
+        line = self.line("| [1d64196]")
+        moved = self.parity.replace(line, line.replace("TOG-11145", "TOG-99999"), 1)
+        with self.assertRaisesRegex(ValueError, "s13-1d64196: stale owner"):
+            validate(moved, data)
+        for owner in (None, [], ["owner"], "TOG-11145"):
+            with self.subTest(owner=owner):
+                self.entry(data, "s13-1d64196")["owner"] = owner
+                with self.assertRaisesRegex(ValueError, "requires owner cards"):
+                    validate(self.parity, data)
+        # A ported row with no cited card still names its owning slice.
+        data = copy.deepcopy(self.checklist)
+        self.entry(data, "s13-3dc9720").pop("owner")
+        with self.assertRaisesRegex(ValueError, "s13-3dc9720: §13 entry requires owner cards"):
+            validate(self.parity, data)
+
+    def test_delta_tables_fail_closed(self):
+        header = "| Legacy commit | Area | Change | Status | Disposition |"
+        with self.assertRaisesRegex(ValueError, "ledger columns"):
+            delta_rows(self.parity.replace(header, "| Legacy commit | Area | Change | State | Disposition |", 1))
+        with self.assertRaisesRegex(ValueError, "must end in Disposition"):
+            delta_rows(self.parity.replace(header, "| Legacy commit | Area | Change | Status | Outcome |", 1))
+        line = self.line("| [bffccf3]")
+        with self.assertRaisesRegex(ValueError, "unknown ledger status 'pending'"):
+            delta_rows(self.parity.replace(line, line.replace("| carded |", "| pending |", 1), 1))
+        with self.assertRaisesRegex(ValueError, "malformed table row"):
+            delta_rows(self.parity.replace(line, line.replace("| carded |", "|", 1), 1))
+        with self.assertRaisesRegex(ValueError, "sections 12 and 13"):
+            delta_rows(self.parity.replace("## 13. Exact-range", "## 31. Exact-range", 1))
+        line = self.line("| [Lookup failure")
+        with self.assertRaisesRegex(ValueError, "without leading border"):
+            delta_rows(self.parity.replace(line, line + "\nNew surface | evidence | [TOG-1](/TOG/issues/TOG-1) |", 1))
+
+    def test_delta_waivers_and_voice_rows_keep_their_rules(self):
+        waived = [e for e in self.checklist["entries"] if e["parity"]["section"] in (12, 13) and e["status"] == "waived"]
+        self.assertGreater(len(waived), 0)
+        for field in ("reason", "approver"):
+            with self.subTest(field=field):
+                data = copy.deepcopy(self.checklist)
+                self.entry(data, waived[0]["id"]).pop(field)
+                with self.assertRaisesRegex(ValueError, f"waiver requires {field}"):
+                    validate(self.parity, data)
+        for entry_id in ("s12-01", "s13-59965d0", "s13-f114c44"):
+            with self.subTest(entry=entry_id):
+                data = copy.deepcopy(self.checklist)
+                self.entry(data, entry_id).pop("reference")
+                with self.assertRaisesRegex(ValueError, "TOG-10119"):
+                    validate(self.parity, data)
+
+    def test_ported_rows_verify_through_the_cache_wrapper(self):
+        automated = [e for e in self.checklist["entries"] if e["parity"]["section"] == 13 and e["status"] == "automated"]
+        self.assertEqual({e["parity"]["row"][3] for e in automated}, {"ported"})
+        for entry in automated:
+            self.assertTrue(entry["verification"].startswith("python3 scripts/cargo_cache.py run -- test -p two-bot-core "))
+
+    def test_render_lists_delta_sections_and_owners(self):
+        output = render(self.checklist)
+        self.assertIn("\n## 12. ", output)
+        self.assertIn("\n## 13. ", output)
+        self.assertIn("\n### s13-f114c44: f114c44 — TOG-3052: temp-voice generator", output)
+        self.assertIn("- **Owner:** [TOG-11145](/TOG/issues/TOG-11145)\n", output)
 
 
 if __name__ == "__main__":

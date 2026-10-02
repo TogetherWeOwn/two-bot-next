@@ -5,16 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 # Cutover data path (TOG-9882): one-shot MEE6 XP / reward / history
 # import-backfill operator tools. Library modules port the pure legacy logic
 # (parse, plan, reconcile); `src/db.rs` + `src/rest.rs` hold the sqlx and
-# twilight seams; `src/bin/` holds the seven operator CLIs.
+# twilight seams; `src/bin/` holds the operator CLIs.
 #
 # Intra-workspace path deps carry an explicit version (still resolved via
 # path): cargo-deny `wildcards = "deny"` rejects version-less deps.
 
 [dependencies]
-# `db` for the shared redacting `database_url::connect_options` parse helper.
+# `db` for shared durable admission and the redacting database URL helper.
 # sqlx is already a direct dependency, so no new driver burden.
 two-bot-core = { version = "0.2.0", path = "../core", features = ["db"] }
 two-bot-discord = { version = "0.2.0", path = "../discord" }
@@ -34,6 +37,10 @@ url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
+
+[dev-dependencies]
+rustls = { workspace = true }
+two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
 
 [[bin]]
 name = "legacy_verify"
@@ -78,3 +85,15 @@ path = "src/bin/raid_list.rs"
 [[bin]]
 name = "raid-remove"
 path = "src/bin/raid_remove.rs"
+
+[[bin]]
+name = "gateway-force-identify"
+path = "src/bin/gateway_force_identify.rs"
+
+[[bin]]
+name = "reengagement-list"
+path = "src/bin/reengagement_list.rs"
+
+[[bin]]
+name = "rollback-delta"
+path = "src/bin/rollback_delta.rs"
