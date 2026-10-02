@@ -203,14 +203,21 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0170_lfg.sql"),
         include_str!("../../cutover/migrations/0190_onboarding.sql"),
         include_str!("../../cutover/migrations/0200_self_roles.sql"),
+        include_str!("../../cutover/migrations/0203_self_role_pending_exchange.sql"),
+        include_str!("../../cutover/migrations/0205_self_role_exchange_receipts.sql"),
+        include_str!("../../cutover/migrations/0206_self_role_exchange_baselines.sql"),
         include_str!("../../cutover/migrations/0210_tickets.sql"),
         include_str!("../../cutover/migrations/0220_automod.sql"),
         include_str!("../../cutover/migrations/0221_automod_delivery_claims.sql"),
         include_str!("../../cutover/migrations/0222_automod_counted_claim.sql"),
         include_str!("../../cutover/migrations/0223_automod_preserved_match.sql"),
+        include_str!("../../cutover/migrations/0224_voice_rooms.sql"),
+        include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
+        include_str!("../../cutover/migrations/0226_voice_text_channels.sql"),
         include_str!("../../cutover/migrations/0300_website_contract.sql"),
         include_str!("../../cutover/migrations/0310_presence_probe.sql"),
         include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
+        include_str!("../../cutover/migrations/0312_community_scorecard_attempts.sql"),
         include_str!("../../cutover/migrations/0320_gateway_sessions.sql"),
         include_str!("../../cutover/migrations/0321_gateway_boot_directives.sql"),
         include_str!("../../cutover/migrations/0330_guild_settings.sql"),
@@ -281,6 +288,15 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "CREATE TABLE public.migrator_probe (id int)",
     )
     .await?;
+    as_role(pool, &roles[1], "INSERT INTO public.voice_creators (guild_id, channel_id) VALUES ('100', '200'); SELECT * FROM public.voice_creators; UPDATE public.voice_creators SET default_limit = 5 WHERE guild_id = '100'; INSERT INTO public.voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at) VALUES ('100', '500', '200', '300', '300', '7', now()); SELECT * FROM public.voice_rooms; UPDATE public.voice_rooms SET owner_id = '301' WHERE guild_id = '100'; INSERT INTO public.voice_text_companions (guild_id, room_channel_id, text_channel_id, text_channels, created_at) VALUES ('100', '500', '600', TRUE, now()); SELECT * FROM public.voice_text_companions; DELETE FROM public.voice_text_companions WHERE guild_id = '100'; DELETE FROM public.voice_rooms WHERE guild_id = '100'; DELETE FROM public.voice_creators WHERE guild_id = '100'").await?;
+    denied(pool, &roles[2], "SELECT * FROM public.voice_creators").await?;
+    denied(pool, &roles[2], "SELECT * FROM public.voice_rooms").await?;
+    denied(
+        pool,
+        &roles[2],
+        "SELECT * FROM public.voice_text_companions",
+    )
+    .await?;
     // Invoker trigger DML must work without runtime direct function EXECUTE.
     as_role(
         pool,
@@ -312,6 +328,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // lane leases must work under the least-privilege login.
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_audit; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); UPDATE public.self_role_audit SET reason = 'probe' WHERE event_id = 'roles-probe'; DELETE FROM public.self_role_audit WHERE event_id = 'roles-probe'").await?;
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_panel_claims; INSERT INTO public.self_role_panel_claims (guild_id, member_id, panel_id, claim_token, claim_generation, processing_expires_at) VALUES ('g', 'm', 'p', 'tok', 1, now() + interval '1 minute'); UPDATE public.self_role_panel_claims SET latest_option_key = 'probe' WHERE guild_id = 'g' AND member_id = 'm' AND panel_id = 'p'; DELETE FROM public.self_role_panel_claims WHERE guild_id = 'g' AND member_id = 'm' AND panel_id = 'p'").await?;
+    as_role(pool, &roles[1], "SELECT * FROM public.self_role_exchanges; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('exchange-roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); INSERT INTO public.self_role_exchanges (exchange_id,event_id,origin_generation,role_id,adding,compensating) VALUES ('exchange-roles-probe','exchange-roles-probe',1,'101',true,false); UPDATE public.self_role_exchanges SET disposition='no_send',completed_at=clock_timestamp() WHERE exchange_id='exchange-roles-probe'; DELETE FROM public.self_role_exchanges WHERE exchange_id='exchange-roles-probe'; DELETE FROM public.self_role_audit WHERE event_id='exchange-roles-probe'").await?;
+    as_role(pool, &roles[1], "INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('baseline-roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); INSERT INTO public.self_role_exchange_baselines (event_id) VALUES ('baseline-roles-probe'); SELECT * FROM public.self_role_exchange_baselines; UPDATE public.self_role_exchange_baselines SET legacy_pending=true WHERE event_id='baseline-roles-probe'; DELETE FROM public.self_role_exchange_baselines WHERE event_id='baseline-roles-probe'; DELETE FROM public.self_role_audit WHERE event_id='baseline-roles-probe'").await?;
     scheduled_runtime_probe(pool, &roles[1]).await?;
     // Migration 0210 relations require runtime CRUD, including the transcript's
     // ticket foreign key. Delete the transcript before its parent ticket.
@@ -358,6 +376,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "INSERT INTO public.members (member_id) VALUES ('test')",
         "SELECT * FROM public.self_role_audit",
         "SELECT * FROM public.self_role_panel_claims",
+        "SELECT * FROM public.self_role_exchanges",
+        "SELECT * FROM public.self_role_exchange_baselines",
         "SELECT * FROM public.scheduled_messages",
         SCHEDULED_INSERT,
         "UPDATE public.scheduled_messages SET body = 'reader' WHERE id = 'scheduled-role-probe'",

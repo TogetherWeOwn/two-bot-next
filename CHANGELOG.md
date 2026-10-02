@@ -4,6 +4,88 @@
 
 ### Added
 
+- Add self-role reads and singular role operations to the shared REST executor:
+  authoritative member/bot/role/channel policy snapshots, fetched reaction-message
+  identity, paced single-attempt operations with pre/post ownership checks and
+  retained ambiguous or accepted-but-stale exchanges. Add event-first/lane-first
+  runtime admission, concurrent cancellation-safe renewal of both leases, and
+  one-time fenced intent initialization (migration 0201). Recovery preserves
+  intentionally empty snapshots and computes remaining work from freshly fetched
+  member state. Add durable paced send journaling, fresh-policy singular execution,
+  effect checkpoints, and a monotonic compensation phase (migration 0202) that
+  survives restart without retrying rejected intent. Add newly leased stale-worker
+  repair to the committed target, live atomic runtime settlement, and durable
+  pending-exchange recovery (migration 0203) that refuses false success after an
+  interrupted remote send. Add isolated Postgres/mock REST regressions for
+  partial/ambiguous failures, compensation recovery, stale in-flight repair,
+  selected/empty targets, expiry rollback and unresolved settlement refusal.
+  Add injectable shared component/reaction dispatch with source and input-type
+  validation, ephemeral defer-before-admission and final-settlement-only success
+  replies. Add fenced dry-run audits without role mutations or simulated target
+  publication, plus input and orchestration regressions. Add bounded configured-
+  source discovery and generation-fenced recovery of expired processing audits
+  without gateway redelivery, preserving initialized empty targets and unresolved
+  evidence. Gate reaction dispatch through the shared router and add actual
+  partial/duplicate add/remove fixtures. Add optional shared-supervisor recovery
+  registration with bounded cadence/timeout and discovery I/O, per-name parked
+  status, and cancellation/evidence-preservation fixtures. Add separate terminal
+  supersession discovery, fresh typed evidence leases, dual-fenced repair
+  journaling/completion receipts and inherited-unknown preservation (migration
+  0204), with isolated source regressions. Add cancellation-owned terminal restart
+  repair through the shared journaled executor to a freshly leased committed
+  selected/empty target, atomic paired ownership checks and bounded fair mixed
+  discovery. Preserve inherited uncertainty and terminal rejection; dry-run skips
+  terminal claims. Add source fixtures for restart convergence, missing/unknown
+  targets, pending evidence, cancelled renewals and mixed sweeps. Extend terminal
+  fault-injection source coverage for partial repair rejection/rate-limit/received
+  ambiguity/timeout, independent evidence/lane transfer during REST, and expiry
+  after pacing or journal waits without false sends or uncertainty retirement.
+  Route older processing audits inserted after the winning lane's bulk
+  supersession into terminal discovery before prepared ownership, using a fresh
+  post-lock event fence and stored scope/chronology checks. Preserve all intent,
+  pending and compensation evidence without REST or winner publication; add
+  early-supersession runtime/store and lock-wait source fixtures. Preserve singular
+  role-response status before unused provider-body reads can fail or stall, while
+  requiring complete snapshot bodies. Resolve definite new role/direction evidence
+  without erasing older unknown sends or mislabeling unrelated acknowledged work;
+  add partial-body, ownership-loss and inherited-evidence source regressions.
+  Add distinct per-send journal tickets and idempotent response/no-send receipts
+  (migration 0205) that survive generation transfer without former-worker audit
+  or target authority. Pending tickets gate settlement and cannot be erased by
+  aggregate checkpoint clearing. Read ticket evidence only after audit lock waits
+  and preserve unresolved role/direction IDs from pending tickets. Add processing/
+  terminal provenance, lock-wait and role-matrix source fixtures. Wire tickets
+  into normal processing and typed terminal paced runtime steps, persisting raw
+  response/no-send receipts before stale aggregate writes; retain timeout and
+  cancellation uncertainty without retry. Extend runtime/executor source fixtures
+  for status provenance, generation transfer, post-journal no-send and pending
+  tickets. Add live-fenced current-owner receipt evidence incorporation to processing
+  recovery and typed terminal repair, restoring cumulative attempts and acknowledged
+  204 compensation while preserving pending/legacy uncertainty, snapshot effects,
+  terminal outcome and committed target. Distinguish received ambiguous effects
+  from unknown in-flight sends. Add replay, stale-fence, lock-wait and recovery
+  source coverage. Add explicit legacy uncertainty baselines and current-owner
+  receipt-specific retirement (migration 0206), preserving overlapping pending
+  tickets and legacy work. Require live fences after receipt lock waits; received
+  ambiguous effects are not no-effect verdicts or unknown sends. Protect unretired
+  completed tickets and legacy floors from aggregate clearing/settlement. Wire
+  processing/typed terminal retirement and post-commit claim refresh; atomically
+  pin untracked stale-path journals instead of borrowing a ticket's provenance.
+  Add classifier, overlap/replay, stale-fence, lock-wait and recovery source
+  fixtures plus baseline role-matrix coverage. Replace lane-only stale-maintenance
+  journaling with immutable-metadata handoff to the shared fresh typed terminal
+  owner and newly leased committed target. Remove the maintenance alternative from
+  normal processing steps; every new repair send has a distinct ticket. Preserve
+  inherited pending/legacy work and former-worker refusal, without publishing a
+  target or claiming success for obsolete input. Add active-owner/mismatched-hint,
+  stale-cache, overlap/no-send and selected/empty convergence source fixtures.
+  Document bounded unknown-work continuation and add a shared-service restart
+  regression for repeated pending sweeps, durable lease backoff, other-row progress,
+  one acknowledged repair, genuine sender completion and preserved legacy floors.
+  Compose one boot-time self-role service, shared by gateway dispatch and the
+  supervised recovery job, only for a nonempty catalogue in the pinned TWO Staging
+  guild with a verified bot identity; any other guild, an empty or invalid
+  catalogue or a failed identity read parks the surface and the job.
 - Pure `scan_joins_for_bursts` raid replay over recorded joins (fresh watch per
   call, instant-ordered, strict RFC 3339) with the legacy historical-raid
   scenarios as integration tests. No runtime or database wiring. (TOG-12378)
@@ -32,8 +114,15 @@
 - Add the audit mirror delivery service over the shared REST executor: record-before-deliver, private guild-fenced destinations, enforced nonce/mention suppression, kill-switch enforcement, crash-safe marker reconciliation and quarantine. Revalidate prepared ownership after shared transport pacing, preserve interrupted dedup adoption evidence, treat malformed history as uncertain, and run service fault-injection regressions in CI. Runtime wiring and activation remain deferred.
 - Add the pinned-address HTTPS feed connector (`feeds_connector`). `fetch_feed` validates the source through `feeds_http`, resolves all A/AAAA answers once, pins them into a `PublicRequest`, and dials only those addresses through a per-request hyper/rustls client whose resolver answers only the pinned host. TLS SNI, certificate verification and the Host header keep the URL hostname; every redirect hop re-validates and re-pins under a three-hop, same-host, HTTPS-only budget, one 15 s total deadline, `Owen/1.0 (+https://two.gg)` identity, and compressed-then-decompressed `MAX_FEED_BYTES` bounds before XML parsing. Injected resolver/connector seams keep every test hermetic; the private-fixture constructor exists only under `#[cfg(test)]`.
 
+### Security
+
+- Require authenticated TLS for `two_bot_cutover::connect` (threat-model F6). `TWO_DATABASE_TLS` defaults to `required`, which refuses local hosts and missing, `disable`, `allow` or `prefer` sslmode, and always connects as `verify-full`. `local-only` (tests and CI only) allows loopback, CI service and socket hosts and refuses remote ones. Refusals are fixed strings that never echo the URL. See `docs/database-tls.md`.
+
 ### Fixed
 
+- Fold the self-role runtime CI command so its Rust module selector is literal
+  text, not an invalid YAML mapping; retain the isolated mocked acceptance opt-in.
+- Accept and strip Neon's `channel_binding` URL option before SQLx without changing TLS mode; retain fatal startup exits with fixed, credential-safe diagnostics and sanitized Worker HTTP 500 responses. Gate staging deployments on the intended new container rollout, immutable image/build identity and serving Worker version; parked readiness 503 no longer passes deployment acceptance.
 - Keep parallel settings DB fixture schemas distinct when wall-clock readings
   repeat, without sharing schemas or serializing the CAS regressions. (TOG-10089)
 - Grant runtime-only CRUD on the automod relations and cover migrations 0220–0223

@@ -16,7 +16,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/check.yml"
 def validation_script():
     workflow = WORKFLOW.read_text()
     marker = "      - name: Pin native tests to one CPU (loaded-runner validation)\n"
-    step = workflow.split(marker, 1)[1].split("      # Restore on every run;", 1)[0]
+    step = workflow.split(marker, 1)[1].split("      # Fail-fast (TOG-12055)", 1)[0]
     assert "if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests" in step
     return textwrap.dedent(step.split("python3 - <<'PY'\n", 1)[1].rsplit("          PY", 1)[0])
 

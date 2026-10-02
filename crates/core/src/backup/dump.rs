@@ -211,7 +211,7 @@ async fn sequence_state(
 /// reissues a value the source or the target already handed out, including
 /// one whose row was deleted (the cutover allocator gate).
 /// Catalog identifiers are quoted by Postgres; restart values are checked i64s.
-/// https://www.postgresql.org/docs/16/sql-altersequence.html
+/// <https://www.postgresql.org/docs/16/sql-altersequence.html>
 async fn restart_sequence(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table: &str,
