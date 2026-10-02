@@ -18,7 +18,8 @@ It requires no `db` feature, Discord wire types, clock, or external I/O.
   @everyone), the viewer role allowed, and every current occupant and admin
   allowed. The plan also carries `settings`, the snapshot taken at creation.
 - `sanitise_channel_name`: lowercase, whitespace runs collapse to one `-` with
-  edges trimmed, at most 100 characters; blank or empty results fall back to
+  edges trimmed, at most 100 characters; codepoints with no lowercase mapping
+  (e.g. U+1D400) are dropped; blank or empty results fall back to
   `voice-chat`. Sanitising is fixed-point.
 - `occupancy_diff(before, after, protected)`: grants on join, revokes on leave,
   except `protected` IDs are never revoked. Both lists are deduplicated and

@@ -112,6 +112,9 @@ fn name_sanitisation_table() {
         (Some("-trailing-"), "trailing"),
         (Some("tab\tseparated"), "tab-separated"),
         (Some("Ünïcodé Room"), "ünïcodé-room"),
+        // U+1D400 has no lowercase mapping: dropped, not passed through.
+        (Some("Room\u{1d400}"), "room"),
+        (Some("\u{1d400}"), "voice-chat"),
     ];
     for (configured, expected) in cases {
         assert_eq!(

@@ -129,12 +129,15 @@ pub fn text_channel_plan(
 
 /// Sanitise a configured name to Discord text-channel rules: lowercase, no
 /// whitespace (runs collapse to one `-`, edges trimmed), at most 100
-/// characters. Blank or empty results fall back to the default name.
+/// characters. Codepoints with no lowercase mapping (e.g. U+1D400) survive
+/// `to_lowercase` unchanged and still uppercase, so those leftovers are
+/// dropped. Blank or empty results fall back to the default name.
 pub fn sanitise_channel_name(configured: Option<&str>) -> String {
     let raw = configured.unwrap_or(DEFAULT_TEXT_CHANNEL_NAME);
     let mapped: String = raw
         .chars()
         .flat_map(char::to_lowercase)
+        .filter(|c| !c.is_uppercase())
         .map(|c| if c.is_whitespace() { '-' } else { c })
         .take(MAX_TEXT_CHANNEL_NAME_CHARS)
         .collect();
