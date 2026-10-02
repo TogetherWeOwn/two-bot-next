@@ -98,3 +98,35 @@ test("spoofed X-Forwarded-For cannot change the edge IP bucket or stored click",
   assert.deepEqual(callerKeys.slice(3), ["unknown", "unknown", "unknown"],
     "no edge header must not fall back to client-supplied forwarding headers");
 });
+
+test("Worker forwards the bucket's real hold on a redirect 429", async (t) => {
+  let now = 0;
+  const buckets = new TokenBuckets({ capacity: 1, refillPerSecond: 1 }, () => now, {
+    maxConsecutiveDenials: 2, terminalCooldownMs: 60_000,
+  });
+  const take = TokenBuckets.prototype.take;
+  t.mock.method(TokenBuckets.prototype, "take", (key: string) => take.call(buckets, key));
+  let lookups = 0;
+  t.mock.method(RedirectStore.prototype, "lookup", async (slug: string) => {
+    lookups += 1;
+    return { slug, inviteCode: "freshCode" };
+  });
+  t.mock.method(RedirectStore.prototype, "recordClick", async () => {});
+  const edge = "203.0.113.45";
+  const caller = { "CF-Connecting-IP": edge };
+  assert.equal((await fetch("/worker-held", caller)).status, 302);
+  const refill = await fetch("/worker-held", caller);
+  assert.equal(refill.status, 429);
+  assert.equal(refill.headers.get("retry-after"), "1", "refill denial stays short");
+  const held = await fetch("/worker-held", caller);
+  assert.equal(held.status, 429);
+  assert.equal(held.headers.get("retry-after"), "60");
+  now += 20_000;
+  const later = await fetch("/worker-held", caller);
+  assert.equal(later.status, 429);
+  assert.equal(later.headers.get("retry-after"), "40");
+  assert.equal(lookups, 1, "held retries never reach the store");
+  // Only the wait leaves the handler, never the caller key.
+  for (const [, value] of later.headers) assert.ok(!value.includes(edge));
+  assert.ok(!(await later.text()).includes(edge));
+});

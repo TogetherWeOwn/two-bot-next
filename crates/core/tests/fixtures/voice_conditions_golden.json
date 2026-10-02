@@ -1,0 +1,2742 @@
+{
+ "version": 1,
+ "spec": {
+  "path": "docs/voice-rooms.md",
+  "sha256": "11d8af8076659c221279cbbbadb477d6c0898c4ef284eef9857b93635fdb44fb"
+ },
+ "description": "V6b independent golden corpus over the voice_conditions evaluator (TOG-12468). Rows authored from docs/voice-rooms.md V6 plus the legacy two-bot tempVoice runtime state each head reads; basis=spec is determinate from the spec alone, basis=choice pins a choice TOG-12189 documents (line cited) where V6 alone does not decide the outcome.",
+ "contexts": {
+  "day-Monday": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Monday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "day-Saturday": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Saturday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "day-Sunday": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Sunday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "full-full": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 3,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m1",
+     "display_name": "Member 1",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m2",
+     "display_name": "Member 2",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "full-space": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 4,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m1",
+     "display_name": "Member 1",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m2",
+     "display_name": "Member 2",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "full-unlimited": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m1",
+     "display_name": "Member 1",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m2",
+     "display_name": "Member 2",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "game-alias": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": "Long Game Title",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {
+     "Long Game Title": "Apex"
+    },
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "game-apex": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": "Apex",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m1",
+     "display_name": "Bea",
+     "nick": null,
+     "roles": [],
+     "game": "Apex",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m2",
+     "display_name": "Cai",
+     "nick": null,
+     "roles": [],
+     "game": "Chess",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "hour-0": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 0,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "hour-23": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 23,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "humans-1-2": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 2,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "humans-3-4": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 4,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m1",
+     "display_name": "Member 1",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m2",
+     "display_name": "Member 2",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "live-both": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": true,
+     "live_external": true,
+     "stream_title": "Evening games",
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "live-discord": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": true,
+     "live_external": false,
+     "stream_title": "Evening games",
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "live-external": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": true,
+     "stream_title": "Evening games",
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "live-offline": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "month-September": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "party-4": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 8,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": "Apex",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": {
+      "id": "p1",
+      "size": 4,
+      "maximum": 12,
+      "state": "Ranked",
+      "details": "Trios"
+     }
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "party-no-maximum": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 8,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": "Apex",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": {
+      "id": "p1",
+      "size": 2,
+      "maximum": null,
+      "state": "Ready",
+      "details": "Duo"
+     }
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "playing-no-party-3": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 8,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "m0",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "m0",
+     "display_name": "Player 0",
+     "nick": null,
+     "roles": [],
+     "game": "Apex",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m1",
+     "display_name": "Player 1",
+     "nick": null,
+     "roles": [],
+     "game": "Apex",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m2",
+     "display_name": "Player 2",
+     "nick": null,
+     "roles": [],
+     "game": "Apex",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "private-standalone-True": {
+   "channel_kind": "standalone",
+   "number": 3,
+   "limit": 0,
+   "private": true,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "private-temporary-False": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "private-temporary-True": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": true,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "role-other": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    },
+    {
+     "id": "m1",
+     "display_name": "Bea",
+     "nick": null,
+     "roles": [
+      "raid"
+     ],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "role-owner": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [
+      "raid"
+     ],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "solo": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 0,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": null,
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": null
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  },
+  "v6b-party-capped": {
+   "channel_kind": "temporary",
+   "number": 3,
+   "limit": 8,
+   "private": false,
+   "seed": "room-seed-17",
+   "owner_id": "owner",
+   "original_creator_name": "Rowan",
+   "members": [
+    {
+     "id": "owner",
+     "display_name": "Alex",
+     "nick": null,
+     "roles": [],
+     "game": "Apex",
+     "live_discord": false,
+     "live_external": false,
+     "stream_title": null,
+     "party": {
+      "id": "p1",
+      "size": 4,
+      "maximum": 4,
+      "state": "Ranked",
+      "details": "Full squad"
+     }
+    }
+   ],
+   "clock": {
+    "weekday": "Wednesday",
+    "month": "September",
+    "hour": 12,
+    "timezone": "UTC"
+   },
+   "settings": {
+    "no_game": "General",
+    "aliases": {},
+    "named_lists": {},
+    "force_single_game": false,
+    "include_inactive": false
+   }
+  }
+ },
+ "cases": [
+  {
+   "id": "v6b-game-contains",
+   "input": "{{GAME:Ape ??yes//no}}",
+   "context": "game-alias",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:GAME"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   },
+   "shared_case": "game-condition-GAME:Ape"
+  },
+  {
+   "id": "v6b-game-equals",
+   "input": "{{GAME=Apex ??yes//no}}",
+   "context": "game-alias",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:GAME"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   },
+   "shared_case": "game-condition-GAME=Apex"
+  },
+  {
+   "id": "v6b-game-not-equals-false",
+   "input": "{{GAME!=Apex ??yes//no}}",
+   "context": "game-alias",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:GAME"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   },
+   "shared_case": "game-condition-GAME!=Apex"
+  },
+  {
+   "id": "v6b-game-equals-minority-miss",
+   "input": "{{GAME=Chess ??yes//no}}",
+   "context": "game-alias",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:GAME"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   },
+   "shared_case": "game-condition-GAME=Chess"
+  },
+  {
+   "id": "v6b-game-title-case-insensitive",
+   "input": "{{GAME=apex ??yes//no}}",
+   "context": "game-apex",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:GAME",
+    "rule:case"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-game-bare-shown",
+   "input": "{{GAME ??yes//no}}",
+   "context": "game-apex",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:GAME"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-game-bare-empty",
+   "input": "{{GAME ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:GAME"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-role-hit",
+   "input": "{{ROLE:raid ??yes//no}}",
+   "context": "role-owner",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:ROLE:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts permit/reject role overwrites; role membership from Discord guild state"
+   },
+   "shared_case": "role-role-owner"
+  },
+  {
+   "id": "v6b-role-miss",
+   "input": "{{ROLE:raid ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:ROLE:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts permit/reject role overwrites; role membership from Discord guild state"
+   },
+   "shared_case": "role-solo"
+  },
+  {
+   "id": "v6b-role-scope-case-insensitive",
+   "input": "{{role:raid ??yes//no}}",
+   "context": "role-owner",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:ROLE:id",
+    "rule:case"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
+    "legacy": "two-bot src/tempVoice/service.ts permit/reject role overwrites; role membership from Discord guild state"
+   }
+  },
+  {
+   "id": "v6b-role-id-exact",
+   "input": "{{ROLE:Raid ??yes//no}}",
+   "context": "role-owner",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:ROLE:id",
+    "rule:case"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
+    "legacy": "two-bot src/tempVoice/service.ts permit/reject role overwrites; role membership from Discord guild state"
+   }
+  },
+  {
+   "id": "v6b-any-role-member",
+   "input": "{{ANY_ROLE:raid ??yes//no}}",
+   "context": "role-other",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:ANY_ROLE:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts permit/reject role overwrites; role membership from Discord guild state"
+   },
+   "shared_case": "any-role-role-other"
+  },
+  {
+   "id": "v6b-any-role-absent",
+   "input": "{{ANY_ROLE:raid ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:ANY_ROLE:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts permit/reject role overwrites; role membership from Discord guild state"
+   },
+   "shared_case": "any-role-solo"
+  },
+  {
+   "id": "v6b-member-hit",
+   "input": "{{MEMBER:owner ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:MEMBER:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts claim/transfer, persisted row.ownerId"
+   },
+   "shared_case": "person-condition-MEMBER:owner"
+  },
+  {
+   "id": "v6b-member-miss",
+   "input": "{{MEMBER:absent ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:MEMBER:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts claim/transfer, persisted row.ownerId"
+   },
+   "shared_case": "person-condition-MEMBER:absent"
+  },
+  {
+   "id": "v6b-owner-id-hit",
+   "input": "{{OWNER:owner ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:OWNER:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts claim/transfer, persisted row.ownerId"
+   },
+   "shared_case": "person-condition-OWNER:owner"
+  },
+  {
+   "id": "v6b-owner-id-miss",
+   "input": "{{OWNER:absent ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:OWNER:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts claim/transfer, persisted row.ownerId"
+   },
+   "shared_case": "person-condition-OWNER:absent"
+  },
+  {
+   "id": "v6b-owner-bare-present",
+   "input": "{{OWNER ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:OWNER"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "two-bot src/tempVoice/service.ts claim/transfer, persisted row.ownerId"
+   }
+  },
+  {
+   "id": "v6b-full-at-limit",
+   "input": "{{FULL ??full//open}}",
+   "context": "full-full",
+   "expected": {
+    "kind": "exact",
+    "output": "full"
+   },
+   "covers": [
+    "condition:FULL"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts setLimit 0-99, 0 = unlimited (\"User limit removed\")"
+   },
+   "shared_case": "full-full"
+  },
+  {
+   "id": "v6b-full-with-space",
+   "input": "{{FULL ??full//open}}",
+   "context": "full-space",
+   "expected": {
+    "kind": "exact",
+    "output": "open"
+   },
+   "covers": [
+    "condition:FULL"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts setLimit 0-99, 0 = unlimited (\"User limit removed\")"
+   },
+   "shared_case": "full-space"
+  },
+  {
+   "id": "v6b-full-unlimited",
+   "input": "{{FULL ??full//open}}",
+   "context": "full-unlimited",
+   "expected": {
+    "kind": "exact",
+    "output": "open"
+   },
+   "covers": [
+    "condition:FULL"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts setLimit 0-99, 0 = unlimited (\"User limit removed\")"
+   },
+   "shared_case": "full-unlimited"
+  },
+  {
+   "id": "v6b-full-keyword-case-insensitive",
+   "input": "{{full ??full//open}}",
+   "context": "full-full",
+   "expected": {
+    "kind": "exact",
+    "output": "full"
+   },
+   "covers": [
+    "condition:FULL",
+    "rule:case"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
+    "legacy": "two-bot src/tempVoice/service.ts setLimit 0-99, 0 = unlimited (\"User limit removed\")"
+   }
+  },
+  {
+   "id": "v6b-private-temp-locked",
+   "input": "{{PRIVATE ??private//public}}",
+   "context": "private-temporary-True",
+   "expected": {
+    "kind": "exact",
+    "output": "private"
+   },
+   "covers": [
+    "condition:PRIVATE"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts lock/hide @everyone overwrite edits (Connect / ViewChannel)"
+   },
+   "shared_case": "private-temporary-True"
+  },
+  {
+   "id": "v6b-private-temp-open",
+   "input": "{{PRIVATE ??private//public}}",
+   "context": "private-temporary-False",
+   "expected": {
+    "kind": "exact",
+    "output": "public"
+   },
+   "covers": [
+    "condition:PRIVATE"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts lock/hide @everyone overwrite edits (Connect / ViewChannel)"
+   },
+   "shared_case": "private-temporary-False"
+  },
+  {
+   "id": "v6b-private-standalone-never",
+   "input": "{{PRIVATE ??private//public}}",
+   "context": "private-standalone-True",
+   "expected": {
+    "kind": "exact",
+    "output": "public"
+   },
+   "covers": [
+    "condition:PRIVATE"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/service.ts lock/hide @everyone overwrite edits (Connect / ViewChannel)"
+   },
+   "shared_case": "private-standalone-True"
+  },
+  {
+   "id": "v6b-playing-idle",
+   "input": "{{PLAYING ??yes//no}}",
+   "context": "live-offline",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:PLAYING"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-playing-active",
+   "input": "{{PLAYING ??yes//no}}",
+   "context": "game-apex",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:PLAYING"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-live-offline",
+   "input": "{{LIVE ??yes//no}}",
+   "context": "live-offline",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:LIVE"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-live-discord",
+   "input": "{{LIVE ??yes//no}}",
+   "context": "live-discord",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:LIVE"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-live-external",
+   "input": "{{LIVE ??yes//no}}",
+   "context": "live-external",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:LIVE"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-live-discord-miss-external",
+   "input": "{{LIVE_DISCORD ??yes//no}}",
+   "context": "live-external",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:LIVE_DISCORD"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-live-external-miss-discord",
+   "input": "{{LIVE_EXTERNAL ??yes//no}}",
+   "context": "live-discord",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:LIVE_EXTERNAL"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-any-live",
+   "input": "{{ANY_LIVE ??yes//no}}",
+   "context": "live-both",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:ANY_LIVE"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-any-live-offline",
+   "input": "{{ANY_LIVE ??yes//no}}",
+   "context": "live-offline",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:ANY_LIVE"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-live-keyword-case-insensitive",
+   "input": "{{live ??yes//no}}",
+   "context": "live-discord",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:LIVE",
+    "rule:case"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-players-three",
+   "input": "{{PLAYERS ??yes//no}}",
+   "context": "playing-no-party-3",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:PLAYERS"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-players-none",
+   "input": "{{PLAYERS ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:PLAYERS"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-max-capped",
+   "input": "{{MAX ??yes//no}}",
+   "context": "v6b-party-capped",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:MAX"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-max-uncapped",
+   "input": "{{MAX ??yes//no}}",
+   "context": "party-4",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:MAX"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-max-no-advertised-max",
+   "input": "{{MAX ??yes//no}}",
+   "context": "party-no-maximum",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:MAX"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-rich-party",
+   "input": "{{RICH ??yes//no}}",
+   "context": "party-4",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:RICH"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-rich-none",
+   "input": "{{RICH ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:RICH"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-weekend-saturday",
+   "input": "{{WEEKEND ??weekend//weekday}}",
+   "context": "day-Saturday",
+   "expected": {
+    "kind": "exact",
+    "output": "weekend"
+   },
+   "covers": [
+    "condition:WEEKEND"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   },
+   "shared_case": "weekend-Saturday"
+  },
+  {
+   "id": "v6b-weekend-sunday",
+   "input": "{{WEEKEND ??weekend//weekday}}",
+   "context": "day-Sunday",
+   "expected": {
+    "kind": "exact",
+    "output": "weekend"
+   },
+   "covers": [
+    "condition:WEEKEND"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   },
+   "shared_case": "weekend-Sunday"
+  },
+  {
+   "id": "v6b-weekend-monday",
+   "input": "{{WEEKEND ??weekend//weekday}}",
+   "context": "day-Monday",
+   "expected": {
+    "kind": "exact",
+    "output": "weekday"
+   },
+   "covers": [
+    "condition:WEEKEND"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   },
+   "shared_case": "weekend-Monday"
+  },
+  {
+   "id": "v6b-weekday-bare-monday",
+   "input": "{{WEEKDAY ??weekday//weekend}}",
+   "context": "day-Monday",
+   "expected": {
+    "kind": "exact",
+    "output": "weekday"
+   },
+   "covers": [
+    "condition:WEEKDAY"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-weekday-name-equals",
+   "input": "{{WEEKDAY:Monday ??yes//no}}",
+   "context": "day-Monday",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:WEEKDAY"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-weekday-name-miss",
+   "input": "{{WEEKDAY:Friday ??yes//no}}",
+   "context": "day-Monday",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:WEEKDAY"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-month-number",
+   "input": "{{MONTH = 9 ??yes//no}}",
+   "context": "month-September",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:MONTH",
+    "compare:="
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-month-name",
+   "input": "{{MONTH:September ??yes//no}}",
+   "context": "month-September",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:MONTH"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-month-name-miss",
+   "input": "{{MONTH:April ??yes//no}}",
+   "context": "month-September",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "condition:MONTH"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-month-case-insensitive",
+   "input": "{{month:september ??yes//no}}",
+   "context": "month-September",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "condition:MONTH",
+    "rule:case"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
+    "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
+   }
+  },
+  {
+   "id": "v6b-hour-early",
+   "input": "{{@@hour@@ < 12 ??early//late}}",
+   "context": "hour-0",
+   "expected": {
+    "kind": "exact",
+    "output": "early"
+   },
+   "covers": [
+    "token:@@hour@@",
+    "compare:<"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   }
+  },
+  {
+   "id": "v6b-hour-late",
+   "input": "{{@@hour@@ < 12 ??early//late}}",
+   "context": "hour-23",
+   "expected": {
+    "kind": "exact",
+    "output": "late"
+   },
+   "covers": [
+    "token:@@hour@@",
+    "compare:<"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   }
+  },
+  {
+   "id": "v6b-cmp-lt-false",
+   "input": "{{@@num@@ < 1 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "compare:<",
+    "token:@@num@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-equal-lt"
+  },
+  {
+   "id": "v6b-cmp-gt-false",
+   "input": "{{@@num@@ > 1 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "compare:>",
+    "token:@@num@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-equal-gt"
+  },
+  {
+   "id": "v6b-cmp-le-true",
+   "input": "{{@@num@@ <= 1 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:<=",
+    "token:@@num@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-equal-le"
+  },
+  {
+   "id": "v6b-cmp-ge-true",
+   "input": "{{@@num@@ >= 1 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:>=",
+    "token:@@num@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-equal-ge"
+  },
+  {
+   "id": "v6b-cmp-eq-true",
+   "input": "{{@@num@@ = 1 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:=",
+    "token:@@num@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-equal-eq"
+  },
+  {
+   "id": "v6b-cmp-ne-false",
+   "input": "{{@@num@@ != 1 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "compare:!=",
+    "token:@@num@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-equal-ne"
+  },
+  {
+   "id": "v6b-cmp-token-vs-token",
+   "input": "{{@@num@@ < @@limit@@ ??yes//no}}",
+   "context": "humans-3-4",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:<",
+    "token:@@num@@",
+    "token:@@limit@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-num-limit"
+  },
+  {
+   "id": "v6b-cmp-slots-vs-limit",
+   "input": "{{@@slots@@ != @@limit@@ ??yes//no}}",
+   "context": "humans-1-2",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:!=",
+    "token:@@slots@@",
+    "token:@@limit@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-slots-limit"
+  },
+  {
+   "id": "v6b-cmp-hour-ge",
+   "input": "{{@@hour@@ >= 12 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:>=",
+    "token:@@hour@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-hour"
+  },
+  {
+   "id": "v6b-cmp-room-number",
+   "input": "{{$# = 3 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:="
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-room-number"
+  },
+  {
+   "id": "v6b-cmp-room-number-padded",
+   "input": "{{$00# = 3 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:="
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   }
+  },
+  {
+   "id": "v6b-cmp-num-others",
+   "input": "{{@@num_others@@ = 2 ??yes//no}}",
+   "context": "humans-3-4",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:=",
+    "token:@@num_others@@"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   }
+  },
+  {
+   "id": "v6b-cmp-num-live",
+   "input": "{{@@num_live@@ = 1 ??yes//no}}",
+   "context": "live-both",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:=",
+    "token:@@num_live@@"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   }
+  },
+  {
+   "id": "v6b-cmp-num-playing",
+   "input": "{{@@num_playing@@ = 3 ??yes//no}}",
+   "context": "playing-no-party-3",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:=",
+    "token:@@num_playing@@"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   }
+  },
+  {
+   "id": "v6b-cmp-party-size-max",
+   "input": "{{@@party_size@@ = 12 ??yes//no}}",
+   "context": "party-4",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:=",
+    "token:@@party_size@@"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   }
+  },
+  {
+   "id": "v6b-cmp-counter-case-insensitive",
+   "input": "{{@@NUM@@ = 1 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:=",
+    "token:@@num@@",
+    "rule:case"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   }
+  },
+  {
+   "id": "v6b-cmp-blank-slots-always-false",
+   "input": "{{@@slots@@ = 0 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "compare:=",
+    "token:@@slots@@"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   }
+  },
+  {
+   "id": "v6b-cmp-literals",
+   "input": "{{7 > 2 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "compare:>"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
+   },
+   "shared_case": "compare-literal"
+  },
+  {
+   "id": "v6b-unknown-word",
+   "input": "{{NOT_DEFINED ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "rule:unknown-condition"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   },
+   "shared_case": "condition-unknown"
+  },
+  {
+   "id": "v6b-unknown-name-token-not-expanded",
+   "input": "{{@@owner@@ = Alex ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "rule:unknown-condition",
+    "rule:name-in-condition",
+    "token:@@owner@@"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   },
+   "shared_case": "condition-name-not-expanded"
+  },
+  {
+   "id": "v6b-unknown-hash-not-numeric",
+   "input": "{{## = 3 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "rule:unknown-condition",
+    "token:##"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L23-26 untyped conditions are false; L34 ##, +# and name tokens are not numeric; tests/voice_templates/coverage.json ambiguity numeric-##",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-unknown-roman-not-numeric",
+   "input": "{{+# = 3 ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "rule:unknown-condition",
+    "token:+#"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L23-26 untyped conditions are false; L34 ##, +# and name tokens are not numeric; tests/voice_templates/coverage.json ambiguity numeric-+#",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-unknown-person-with-compare",
+   "input": "{{ROLE=raid ??yes//no}}",
+   "context": "role-owner",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "rule:unknown-condition",
+    "condition:ROLE:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-unknown-empty-condition",
+   "input": "{{ ??yes//no}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "rule:unknown-condition"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-unknown-game-operator",
+   "input": "{{GAME > Apex ??yes//no}}",
+   "context": "game-apex",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "rule:unknown-condition",
+    "condition:GAME"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-nested-else-hit",
+   "input": "{{ROLE:raid ??role//{{PRIVATE ??private//default}}}}",
+   "context": "role-owner",
+   "expected": {
+    "kind": "exact",
+    "output": "role"
+   },
+   "covers": [
+    "rule:nested",
+    "condition:ROLE:id",
+    "condition:PRIVATE"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   },
+   "shared_case": "nested-role-owner"
+  },
+  {
+   "id": "v6b-nested-else-inner",
+   "input": "{{ROLE:raid ??role//{{PRIVATE ??private//default}}}}",
+   "context": "private-temporary-True",
+   "expected": {
+    "kind": "exact",
+    "output": "private"
+   },
+   "covers": [
+    "rule:nested",
+    "condition:ROLE:id",
+    "condition:PRIVATE"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   },
+   "shared_case": "nested-private-temporary-True"
+  },
+  {
+   "id": "v6b-nested-else-default",
+   "input": "{{ROLE:raid ??role//{{PRIVATE ??private//default}}}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "default"
+   },
+   "covers": [
+    "rule:nested",
+    "condition:ROLE:id",
+    "condition:PRIVATE"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   },
+   "shared_case": "nested-solo"
+  },
+  {
+   "id": "v6b-nested-in-condition-true",
+   "input": "{{{{FULL ??FULL//PRIVATE}} ??yes//no}}",
+   "context": "full-full",
+   "expected": {
+    "kind": "exact",
+    "output": "yes"
+   },
+   "covers": [
+    "rule:nested",
+    "condition:FULL",
+    "condition:PRIVATE"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-nested-in-condition-false",
+   "input": "{{{{FULL ??FULL//PRIVATE}} ??yes//no}}",
+   "context": "full-unlimited",
+   "expected": {
+    "kind": "exact",
+    "output": "no"
+   },
+   "covers": [
+    "rule:nested",
+    "condition:FULL",
+    "condition:PRIVATE"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-optional-else-false-renders-nothing",
+   "input": "prefix{{PRIVATE ??secret}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "prefix"
+   },
+   "covers": [
+    "rule:optional-else",
+    "condition:PRIVATE"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   },
+   "shared_case": "optional-else-false"
+  },
+  {
+   "id": "v6b-optional-else-true",
+   "input": "prefix{{ROLE:raid ??role}}",
+   "context": "role-owner",
+   "expected": {
+    "kind": "exact",
+    "output": "prefixrole"
+   },
+   "covers": [
+    "rule:optional-else",
+    "condition:ROLE:id"
+   ],
+   "basis": "spec",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   },
+   "shared_case": "optional-else-true"
+  },
+  {
+   "id": "v6b-verbatim-extra-separators-true",
+   "input": "{{FULL ??a??b//c//d}}",
+   "context": "full-full",
+   "expected": {
+    "kind": "exact",
+    "output": "a??b"
+   },
+   "covers": [
+    "rule:verbatim",
+    "condition:FULL"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L10-11 split at first top-level ?? then first //",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-verbatim-extra-separators-false",
+   "input": "{{FULL ??a??b//c//d}}",
+   "context": "full-space",
+   "expected": {
+    "kind": "exact",
+    "output": "c//d"
+   },
+   "covers": [
+    "rule:verbatim",
+    "condition:FULL"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L10-11 split at first top-level ?? then first //",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-verbatim-spaces-kept",
+   "input": "[{{ FULL ?? yes // no }}]",
+   "context": "full-full",
+   "expected": {
+    "kind": "exact",
+    "output": "[ yes ]"
+   },
+   "covers": [
+    "rule:verbatim",
+    "condition:FULL"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L83 branch text keeps spacing around ?? and //",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  },
+  {
+   "id": "v6b-verbatim-no-node-stays-literal",
+   "input": "{{FULL}}",
+   "context": "solo",
+   "expected": {
+    "kind": "exact",
+    "output": "{{FULL}}"
+   },
+   "covers": [
+    "rule:verbatim",
+    "condition:FULL"
+   ],
+   "basis": "choice",
+   "source": {
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L13 a node without ?? stays literal",
+    "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
+   }
+  }
+ ]
+}
