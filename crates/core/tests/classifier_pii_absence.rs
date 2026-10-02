@@ -47,8 +47,18 @@ const HOSTILE_USER: &str = concat!(
     "@everyone https://example.invalid/u?next=https://example.invalid/"
 );
 
-/// Test-only marker secret (low entropy, never a real credential).
-const TEST_SECRET: &str = "pii-absence-test-secret";
+/// Marker MAC key from the public, non-production vector fixture shared with
+/// the in-crate MAC/classifier tests (`mac::moderation_test_vectors`).
+fn fixture_mac_key() -> String {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/moderation-mac.json");
+    let json = std::fs::read_to_string(path).expect("public MAC vector fixture");
+    let vectors: serde_json::Value = serde_json::from_str(&json).expect("valid MAC vectors");
+    vectors[0]["secret"]
+        .as_str()
+        .expect("fixture vector key")
+        .to_owned()
+}
 
 fn surfaces(event: &AuditEvent) -> String {
     format!(
@@ -61,9 +71,10 @@ fn surfaces(event: &AuditEvent) -> String {
 
 fn assert_absent(event: &AuditEvent, hostile: &str, ctx: &str) {
     let haystack = surfaces(event);
+    // The failure message names the case only; it never echoes row contents.
     assert!(
         !haystack.contains(hostile),
-        "{ctx}: hostile input surfaces verbatim in row\n hostile={hostile:?}\n row={haystack:?}"
+        "{ctx}: hostile input surfaces verbatim in row"
     );
 }
 
@@ -178,8 +189,9 @@ fn uncorrelated_entry(reason: Option<String>) -> RawAuditLogEntry {
 #[test]
 fn moderation_audit_never_carries_freeform_reasons() {
     // Correlated row: the marker verifies, but the human suffix must not leak.
+    let mac_key = fixture_mac_key();
     let reason = moderation_audit_reason(
-        Some(TEST_SECRET),
+        Some(&mac_key),
         GUILD_STR,
         "idem-pii-1",
         "moderation.ban",
@@ -197,7 +209,7 @@ fn moderation_audit_never_carries_freeform_reasons() {
         extra_count: None,
         extra_removed: None,
     };
-    let event = classify_moderation_audit(&entry, GUILD_STR, Some(ACTOR_STR), Some(TEST_SECRET))
+    let event = classify_moderation_audit(&entry, GUILD_STR, Some(ACTOR_STR), Some(&mac_key))
         .expect("correlated row");
     assert_absent(&event, HOSTILE_REASON, "correlated reason suffix");
     assert_absent_all(&event, "correlated row");
@@ -326,8 +338,9 @@ fn empty_inputs_yield_no_rows() {
         action_id: 1,
         ..uncorrelated_entry(None)
     };
+    let mac_key = fixture_mac_key();
     assert_eq!(
-        classify_moderation_audit(&unknown, GUILD_STR, Some(ACTOR_STR), Some(TEST_SECRET)),
+        classify_moderation_audit(&unknown, GUILD_STR, Some(ACTOR_STR), Some(&mac_key)),
         None
     );
 }
