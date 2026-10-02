@@ -162,7 +162,7 @@ fn send_bit_helpers_preserve_unrelated_bits() {
     assert_eq!(set_send_bit(2048), 2048);
     assert_eq!(clear_send_bit(2048 | 8), 8);
     assert_eq!(clear_send_bit(8), 8);
-    assert_eq!(clear_send_bit(u64::MAX), u64::MAX & !2048);
+    assert_eq!(clear_send_bit(u64::MAX), !2048);
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn lockdown_overwrite_denies_send_and_preserves_other_bits() {
     assert_eq!(lockdown_overwrite(0, 0), (0, 2048));
     assert_eq!(lockdown_overwrite(2048 | 1024, 64), (1024, 64 | 2048));
     let (allow, deny) = lockdown_overwrite(u64::MAX, 0x00FF);
-    assert_eq!(allow, u64::MAX & !SEND_MESSAGES_BIT);
+    assert_eq!(allow, !SEND_MESSAGES_BIT);
     assert_eq!(deny, 0x00FF | SEND_MESSAGES_BIT);
 }
 
@@ -178,10 +178,7 @@ fn lockdown_overwrite_denies_send_and_preserves_other_bits() {
 fn unlock_overwrite_clears_only_the_send_bit() {
     assert_eq!(unlock_overwrite(2048 | 1024, 2048 | 64), (1024, 64));
     assert_eq!(unlock_overwrite(1024, 64), (1024, 64));
-    assert_eq!(
-        unlock_overwrite(u64::MAX, u64::MAX),
-        (u64::MAX & !2048, u64::MAX & !2048)
-    );
+    assert_eq!(unlock_overwrite(u64::MAX, u64::MAX), (!2048, !2048));
 }
 
 #[test]
