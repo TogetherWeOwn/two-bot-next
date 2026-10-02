@@ -72,6 +72,12 @@ pub const MODERATION_TIMEOUT_MS: u64 = 5_000;
 /// Bound response-body collection, including the otherwise untimed GET/kick
 /// lanes, so a stalled global response cannot retain pending admission forever.
 pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
+/// Wire marker for a stalled response body: headers arrived but the body never
+/// completed within [`RESPONSE_BODY_TIMEOUT_MS`]. The executor seam maps this
+/// to [`DiscordError::Timeout`] (never `Unavailable`) so the publish wire
+/// deadline stays deterministic when the inner body budget and the outer wire
+/// budget expire in the same timer tick ([TOG-12562](/TOG/issues/TOG-12562)).
+pub(crate) const BODY_TIMEOUT_MESSAGE: &str = "read body timed out";
 /// Legacy audit-log-reason header bound (`X-Audit-Log-Reason`, latin-1,
 /// percent-encoded; twilight validates ≤512 chars).
 pub const MAX_AUDIT_REASON_CHARS: usize = 512;
@@ -484,7 +490,7 @@ impl HyperTransport {
             // timed-out body. Missing timing installs an indefinite hold
             // instead of a default.
             Err(_) | Ok(Err(_)) if status == 429 => Vec::new(),
-            Err(_) => return Err("read body timed out".to_owned()),
+            Err(_) => return Err(BODY_TIMEOUT_MESSAGE.to_owned()),
             Ok(Err(_)) => return Err("Discord response body unavailable".to_owned()),
         };
         let mut res = RawResponse {
@@ -760,7 +766,20 @@ impl ActionExecutor {
             .transport
             .send_request(request)
             .await
-            .map_err(DiscordError::Unavailable)
+            .map_err(|detail| {
+                // The body budget equals the wire budget and both start within
+                // milliseconds of each other, so on a loaded runner they expire in
+                // the same timer tick. Normalize the stalled-body marker to the
+                // wire-deadline error: a body that never completed inside the wire
+                // budget is "Discord did not answer in time" (legacy
+                // `upstream_timeout`), whichever timer wins
+                // ([TOG-12562](/TOG/issues/TOG-12562)).
+                if detail == BODY_TIMEOUT_MESSAGE {
+                    DiscordError::Timeout
+                } else {
+                    DiscordError::Unavailable(detail)
+                }
+            })
     }
 
     async fn send_paced(
