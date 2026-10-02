@@ -39,6 +39,19 @@ jobs:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
+      # Disk hygiene for hosted overflow runners (TOG-12134): the integration
+      # link step (`cargo test --workspace --test '*'`) links ~70 test
+      # binaries and exhausted the job-container overlay (98 MB left, rust-lld
+      # bus error on two consecutive main heads). Line tables keep failure
+      # backtraces useful while cutting binary size; codegen, debug
+      # assertions and test semantics are unchanged. `cargo test` compiles
+      # under the `test` profile, so both profiles are pinned.
+      CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
+      # Incremental artifacts multiply with ~70 linked test binaries; a cold
+      # CI link does not reuse them, so skip writing them (TOG-12134).
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
       TWO_LFG_TESTDB_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
     services:
@@ -68,6 +81,9 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          # Disk hygiene for hosted overflow runners (TOG-12134): the package
+          # lists stay on the job-container overlay otherwise.
+          rm -rf /var/lib/apt/lists/*
           # Tests that pin 127.0.0.1/localhost:5432 reach the service through
           # this job-private forward.
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
@@ -130,6 +146,9 @@ jobs:
         run: |
           python3 scripts/check-secret-debug.py --test
           python3 scripts/check-secret-debug.py
+
+      - name: Verify check job disk hygiene
+        run: python3 scripts/test-check-disk-hygiene.py
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
