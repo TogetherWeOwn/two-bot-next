@@ -760,8 +760,7 @@ impl ActionExecutor {
         &self,
         request: Request,
     ) -> Result<T, DiscordError> {
-        self.pace(false).await;
-        let response = self.call_once_raw(request, &[200]).await?;
+        let response = self.call_once_raw_paced(request, &[200]).await?;
         serde_json::from_slice(&response.body)
             .map_err(|_| DiscordError::Unavailable("invalid role readback".into()))
     }
@@ -823,24 +822,22 @@ impl ActionExecutor {
                 .await?;
         }
         for role in grants {
-            self.pace(false).await;
             let request = Self::request_of(
                 self.inner
                     .factory
                     .add_guild_member_role(guild, member, role)
                     .reason(&grant_reason),
             )?;
-            self.call_once_raw(request, &[200, 204]).await?;
+            self.call_once_raw_paced(request, &[200, 204]).await?;
         }
         for role in revokes {
-            self.pace(false).await;
             let request = Self::request_of(
                 self.inner
                     .factory
                     .remove_guild_member_role(guild, member, role)
                     .reason(revoke_reason.as_deref().expect("validated revoke reason")),
             )?;
-            self.call_once_raw(request, &[200, 204]).await?;
+            self.call_once_raw_paced(request, &[200, 204]).await?;
         }
         Ok(())
     }
@@ -1284,10 +1281,10 @@ impl ActionExecutor {
             scheduled_event_id: event.get(),
             with_user_count: false,
         });
-        self.pace(false).await;
-        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&request))
+        // Guard admission and pacing run inside the one bounded attempt.
+        let (res, _) = self
+            .send_with_timeout(&request, Some(false))
             .await
-            .map_err(|_| "Unable to validate scheduled event.")?
             .map_err(|_| "Unable to validate scheduled event.")?;
         match res.status {
             404 => Ok(None),
