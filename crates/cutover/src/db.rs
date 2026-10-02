@@ -13,17 +13,37 @@
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
+use two_bot_core::database_tls::{self, TlsPolicy};
 
 /// Legacy pool default (`TWO_DB_POOL_MAX ?? 5`).
 pub const DB_POOL_MAX_DEFAULT: u32 = 5;
 /// Legacy statement timeout (`statementTimeoutMillis ?? 15_000`).
 pub const STATEMENT_TIMEOUT_MS: u64 = 15_000;
 
-/// Open the Postgres pool and apply pending migrations (unless skipped).
+/// Open the Postgres pool and apply pending migrations (unless skipped),
+/// under the `TWO_DATABASE_TLS` policy: unset means `required`.
 pub async fn connect(
     url: &str,
     pool_max: u32,
     skip_migrations: bool,
+) -> Result<CutoverDb, sqlx::Error> {
+    connect_with_tls(url, pool_max, skip_migrations, tls_policy_from_env()?).await
+}
+
+/// Read the one TLS policy setting; an unset value is `Required`.
+fn tls_policy_from_env() -> Result<TlsPolicy, sqlx::Error> {
+    let value = std::env::var_os(database_tls::POLICY_SETTING);
+    // A non-UTF-8 value parses as "" and is refused like any unknown value.
+    TlsPolicy::from_setting(value.as_ref().map(|v| v.to_str().unwrap_or("")))
+        .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))
+}
+
+/// [`connect`] with an explicit TLS policy (tests pass `LocalOnly`).
+pub async fn connect_with_tls(
+    url: &str,
+    pool_max: u32,
+    skip_migrations: bool,
+    tls: TlsPolicy,
 ) -> Result<CutoverDb, sqlx::Error> {
     if url.trim().is_empty() {
         return Err(sqlx::Error::InvalidArgument(
@@ -38,9 +58,13 @@ pub async fn connect(
     }
     two_bot_core::database_url::validate(url)
         .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
+    // Threat-model F6: refuse plaintext/unverified modes and the wrong host
+    // class before SQLx parses the URL (see `docs/database-tls.md`).
+    database_tls::enforce(url, tls)
+        .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
     // Passfile diagnostics stay suppressed during the synchronous parse, but a
     // well-formed entry still supplies the password (see `database_url`).
-    let mut options = two_bot_core::database_url::connect_options(url)?;
+    let mut options = database_tls::apply(two_bot_core::database_url::connect_options(url)?, tls);
     // Statement timeout rides the connection options (server-side setting
     // per connection), so no per-connection SET is needed.
     options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);

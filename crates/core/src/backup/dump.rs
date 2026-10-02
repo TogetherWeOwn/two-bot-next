@@ -214,7 +214,7 @@ async fn sequence_state(
 /// `sources` are every restored (table, column) allocated from `sequence`; the
 /// first names it in refusals and supplies the archive mark. It resumes past
 /// the edge across all of them.
-/// https://www.postgresql.org/docs/16/sql-altersequence.html
+/// <https://www.postgresql.org/docs/16/sql-altersequence.html>
 async fn restart_sequence(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sources: &[(&str, &str)],
