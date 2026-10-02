@@ -150,7 +150,12 @@ pub const GROUPS: &[Group] = &[
     Group { name: "automod", status: "pending", reason: "automod/anti-nuke/containment target migrations are not shipped", tables: &[] },
     Group { name: "self_roles", status: "pending", reason: "self-role panel/audit/recovery target migrations are not shipped", tables: &[] },
     Group { name: "feeds", status: "pending", reason: "feed relay/delivery target migrations are not shipped", tables: &[] },
-    Group { name: "invite_campaigns", status: "pending", reason: "invite_campaigns target migration is not shipped", tables: &[] },
+    Group { name: "invite_campaigns", status: "ready", reason: "legacy 0006 invite campaigns → next 0407/0411", tables: &[
+        table!("invite_campaigns", "invite_campaigns", ["slug"], {
+            slug: "text", invite_code: "text", label: "text",
+            disabled_at: "timestamptz", created_at: "timestamptz"
+        }, Upsert, None, None),
+    ]},
     Group { name: "lfg_rsvp_temp_voice", status: "pending", reason: "LFG/RSVP need authoritative legacy runtime DDL; temp-voice target migration is not shipped", tables: &[] },
     Group { name: "onboarding_rota", status: "retired", reason: "rota is explicitly retired; no row-copy target", tables: &[] },
 ];
@@ -197,7 +202,7 @@ mod tests {
         }
         assert!(select(&["all".to_owned()]).is_err());
         assert!(select(&["funnel".to_owned(), "unknown".to_owned()]).is_err());
-        assert_eq!(select(&["ready".to_owned()]).unwrap().len(), 25);
+        assert_eq!(select(&["ready".to_owned()]).unwrap().len(), 26);
     }
 
     #[test]

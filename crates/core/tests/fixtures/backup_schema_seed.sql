@@ -328,3 +328,9 @@ VALUES ('100000000000000001', 0, '2026-08-01T10:00:00Z', 'backup directive');
 INSERT INTO member_erasure_audit (actor, erased_at)
 VALUES ('backup-operator', '2026-08-01T10:00:00.123456Z'),
        ('backup-operator', '2026-08-02T10:00:00Z');
+
+-- Tracked short links behind go.two.gg; disabled rows still redirect.
+INSERT INTO invite_campaigns (slug, invite_code, label, disabled_at, created_at)
+VALUES ('backup-link', 'backup-code', 'backup sidebar', NULL, '2026-08-01T10:00:00.123456Z'),
+       ('backup-retired', 'backup-retired-code', 'retired placement',
+        '2026-08-02T10:00:00Z', '2026-08-01T10:00:00Z');
