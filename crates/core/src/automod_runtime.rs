@@ -16,8 +16,9 @@ use crate::moderation::{
     moderation_target_protection, ModerationPolicy, ModerationTarget, TargetProtection,
 };
 
-pub const STAGING_GUILD_ID: &str = "1545644954272137297";
-pub const LIVE_GUILD_ID: &str = "326474832151838730";
+// One source for the guild pins: the backup identity guards already hold the
+// reviewed literals (scripts/ci/snowflakes-allowlist.json).
+pub use crate::backup::guild_config::{LIVE_GUILD_ID, TWO_STAGING_GUILD_ID as STAGING_GUILD_ID};
 
 /// Approval is supplied by the activation fence, never inferred from ENFORCE.
 #[derive(Debug, Clone, PartialEq, Eq)]

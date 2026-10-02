@@ -14,6 +14,8 @@
 //!    `TWO_GATEWAY_TEST_DATABASE_URL` (same approved service as the gateway
 //!    suite — never the runtime DATABASE_URL).
 
+#![cfg(test)]
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};

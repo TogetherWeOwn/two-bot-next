@@ -191,7 +191,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         saved.as_ref(),
         Some(&mock.url),
     );
-    let pipeline = Arc::new(build_pipeline(db.store.milestones().await.unwrap()));
+    let pipeline = Arc::new(build_pipeline(db.store.milestones().await.unwrap(), None));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
     let runner = tokio::spawn(run_shard(
         shard,
