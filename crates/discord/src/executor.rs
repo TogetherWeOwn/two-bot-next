@@ -395,7 +395,7 @@ impl HyperTransport {
 
     /// One governed wire attempt; no Twilight or pooled-connection resends.
     /// Returns the response and whether a process-global pause was recorded.
-    async fn send_request(&self, request: &Request) -> Result<(RawResponse, bool), String> {
+    pub async fn send_request(&self, request: &Request) -> Result<(RawResponse, bool), String> {
         use http_body_util::BodyExt as _;
         if request
             .headers()

@@ -178,7 +178,7 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let res =
+            let (res, _) =
                 tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
                     .await
                     .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
@@ -213,7 +213,7 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let res =
+            let (res, _) =
                 tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
                     .await
                     .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
