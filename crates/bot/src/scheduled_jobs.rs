@@ -328,7 +328,9 @@ fn failure_status(error: &DiscordError) -> Option<u16> {
     match error {
         DiscordError::Rejected(_) => Some(400),
         DiscordError::RateLimited => Some(429),
-        DiscordError::Timeout | DiscordError::Unavailable(_) => None,
+        // A local guard refusal never reached the wire and clears with time
+        // (breaker closes, global pause ends), so it re-queues like a timeout.
+        DiscordError::Timeout | DiscordError::Unavailable(_) | DiscordError::Guard(_) => None,
     }
 }
 
@@ -339,6 +341,7 @@ fn discord_error_name(error: &DiscordError) -> &'static str {
         DiscordError::RateLimited => "discord_rate_limited",
         DiscordError::Timeout => "discord_timeout",
         DiscordError::Unavailable(_) => "discord_unavailable",
+        DiscordError::Guard(_) => "discord_guard_refused",
     }
 }
 
