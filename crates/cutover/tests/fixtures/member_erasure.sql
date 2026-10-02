@@ -27,6 +27,17 @@ BEGIN
       INSERT INTO moderation_idempotency
         (guild_id, idempotency_key, action, request_hash, state, claimed_at, completed_at, result_json)
         VALUES (g, k, 'warn', 'fixture', 'done', '2026-10-01T00:00:00Z', '2026-10-01T00:00:01Z', '{}');
+      INSERT INTO automod_violations
+        (guild_id, user_id, violation_count, last_filter, last_message_id, updated_at)
+        VALUES (g, u, 1, 'fixture', 'm-' || k, '2026-10-01T00:00:00Z');
+      INSERT INTO automod_processed_messages (guild_id, message_id, user_id, processed_at)
+        VALUES (g, 'm-' || k, u, '2026-10-01T00:00:00Z');
+      INSERT INTO automod_delivery_claims
+        (guild_id, message_id, delivery_kind, dry_run, request_hash, mutation_started,
+         result_json, claimed_at, completed_at, counted, matched_filter, matched_guild_id,
+         matched_channel_id, matched_message_id, matched_author_id)
+        VALUES (g, 'm-' || k, 'create', FALSE, 'fixture', TRUE, '{}'::jsonb,
+         '2026-10-01T00:00:00Z', '2026-10-01T00:00:01Z', TRUE, 'fixture', g, u, 'm-' || k, u);
       INSERT INTO sticky_messages
         (guild_id, channel_id, body, created_by, created_at, updated_by, updated_at)
         VALUES (g, u, 'fixture', u, now(), u, now());

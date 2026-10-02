@@ -61,6 +61,21 @@
       "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR metadata_json ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
     },
     {
+      "table": "automod_violations",
+      "columns": ["user_id"],
+      "predicate": "guild_id = $1 AND user_id = $2"
+    },
+    {
+      "table": "automod_processed_messages",
+      "columns": ["user_id"],
+      "predicate": "guild_id = $1 AND user_id = $2"
+    },
+    {
+      "table": "automod_delivery_claims",
+      "columns": ["matched_author_id"],
+      "predicate": "guild_id = $1 AND matched_author_id = $2"
+    },
+    {
       "table": "sticky_messages",
       "columns": ["created_by", "updated_by"],
       "predicate": "guild_id = $1 AND (created_by = $2 OR updated_by = $2)"
