@@ -63,6 +63,9 @@ Limits: default user limit `0..=99`, positive first number, nonblank timezone,
 labels, aliases, list names/choices and command names. Literal text-channel names
 and no-game labels have a 100-Unicode-scalar ceiling. Template **source** is not
 limited to 100 characters: V5 truncates rendered output, not source expressions.
+Import accepts JSON only (YAML payloads fail as malformed) and refuses documents
+over `MAX_IMPORT_BYTES` (256 KiB) on the document before parsing, so an
+oversized upload can never partially apply.
 Empty templates are retained because V5 defines fallback for empty rendered
 names. Malformed JSON/type errors expose only line/column, not uploaded text.
 
