@@ -22,7 +22,7 @@ REQUIRED_DO_BINDING = "TWO_BOT"
 EXTRA_REQUIRED_VARS = {"TWO_GUILD_NAME"}
 # Worker secrets live outside wrangler.toml and are optional per environment.
 # Never require this binding (absence is log-only), or accept a plaintext URL.
-OPTIONAL_SECRET_BINDINGS = {"OPS_ALERT_WEBHOOK_URL"}
+OPTIONAL_SECRET_BINDINGS = {"OPS_ALERT_WEBHOOK_URL", "METRICS_SCRAPE_TOKEN"}
 # Absent tuning uses the code default; a named env may opt in independently.
 OPTIONAL_VARS = {"UNREADY_ALERT_FAILURES"}
 

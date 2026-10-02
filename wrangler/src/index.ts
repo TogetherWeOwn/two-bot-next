@@ -37,6 +37,13 @@ import {
   type RedirectClick,
 } from "./redirect.ts";
 import { RedirectStore, parseMappingsSnapshot } from "./redirect-store.ts";
+import {
+  EMPTY_STATE,
+  evaluateMetrics,
+  parseExposition,
+  transitionMessages,
+  type MetricsAlertState,
+} from "./alert-rules.ts";
 
 export interface Env {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
@@ -53,6 +60,8 @@ export interface Env {
   UNREADY_ALERT_FAILURES?: string;
   /** Optional Worker secret; never forwarded to the container or logged. */
   OPS_ALERT_WEBHOOK_URL?: string;
+  /** Optional Worker secret: bearer token for GET /ops/metrics. Unset → route 404s. */
+  METRICS_SCRAPE_TOKEN?: string;
   /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -94,6 +103,22 @@ const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
 const DEFAULT_UNREADY_SECONDS = 600;
 const READINESS_KEY = "two-bot:readiness";
+const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
+const OPS_METRICS_PATH = "/ops/metrics";
+
+/** Compare via digests so length/prefix timing does not leak the token. */
+async function tokenMatches(provided: string, expected: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(provided)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  const x = new Uint8Array(a);
+  const y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i]! ^ y[i]!;
+  return diff === 0;
+}
 
 function containerPort(raw: string | undefined): number {
   if (raw === undefined) return 8080;
@@ -180,12 +205,21 @@ export class TwoBotContainer extends Container<Env> {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === CONTROL_PATH) return this.control(request);
-    if (url.pathname !== "/health" && url.pathname !== "/readyz") {
+    if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH) {
       return new Response("not found", { status: 404 });
     }
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
+        // Reached only through the Worker's bearer-token gate (see default export).
+        if (url.pathname === OPS_METRICS_PATH) {
+          await this.armKeepalive();
+          const upstream = await this.containerFetch("http://c/metrics");
+          return new Response(await upstream.text(), {
+            status: upstream.status,
+            headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
+          });
+        }
         // Bound the entire probe, including auto-start, below the 30s DO gate.
         const probe = new Request(request, { signal: AbortSignal.timeout(6000) });
         const response = await this.containerFetch(probe);
@@ -300,6 +334,7 @@ export class TwoBotContainer extends Container<Env> {
             console.warn("two-bot keepalive probe failed");
           }
           await this.recordReadiness(status);
+          await this.evaluateMetricsAlerts();
         } finally {
           // Collapse duplicate chains, preserving unrelated SDK schedules.
           // No takeover can interleave with this owned callback's I/O.
@@ -365,6 +400,48 @@ export class TwoBotContainer extends Container<Env> {
       observed_at: now,
     }));
     await this.postReadinessWebhook(event);
+  }
+
+  /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
+  private async evaluateMetricsAlerts(): Promise<void> {
+    try {
+      const res = await this.containerFetch("http://c/metrics", { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) {
+        await res.arrayBuffer();
+        return;
+      }
+      const samples = parseExposition(await res.text());
+      const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
+      const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
+      // Persist before notifying: at most one attempt per transition.
+      await this.ctx.storage.put(METRICS_ALERT_KEY, state);
+      for (const content of transitionMessages(previous.firing, firing)) {
+        console.warn(JSON.stringify({ event: "metrics_alert", service: "two-bot-next", content }));
+        await this.postWebhookText(content);
+      }
+    } catch {
+      console.warn("two-bot metrics scrape failed");
+    }
+  }
+
+  private async postWebhookText(content: string): Promise<void> {
+    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
+    if (!binding) return;
+    try {
+      const url = new URL(binding);
+      if (url.protocol !== "https:" || url.username || url.password) throw new Error("invalid webhook binding");
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(6000),
+        body: JSON.stringify({ content, allowed_mentions: { parse: [], replied_user: false } }),
+      });
+      await response.body?.cancel();
+      if (!response.ok) console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: response.status }));
+    } catch {
+      console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: null }));
+    }
   }
 
   private async postReadinessWebhook(event: ReadinessEvent): Promise<void> {
@@ -441,6 +518,23 @@ export default {
         // DO version; always overwrite untrusted ingress identity.
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
         if (url.pathname !== CONTROL_PATH) forwarded.headers.delete("authorization");
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch (error) { return refused(error); }
+    }
+
+    // Authenticated off-container scrape path. No configured token → 404 (the
+    // route does not exist); missing/wrong bearer → 401. Exact path only.
+    if (url.pathname === OPS_METRICS_PATH) {
+      if (!env.METRICS_SCRAPE_TOKEN || request.method !== "GET") return new Response("not found", { status: 404 });
+      const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
+      if (!m || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
+        return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
+      }
+      try {
+        // The fenced DO route requires the deployment header (see fetch);
+        // stamp it here like the health/readyz forward above.
+        const forwarded = new Request(request);
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
         return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
       } catch (error) { return refused(error); }
     }
