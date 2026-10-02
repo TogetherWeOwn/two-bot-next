@@ -6,7 +6,11 @@ mod test_database;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use two_bot_core::database_roles;
+
+// Parallel tests share one pid and can read the same clock tick.
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
 const TEST_URL: &str = "postgres://agent_test:@agent-testdb:5432/agent_test";
 const SCHEDULED_INSERT: &str = "INSERT INTO public.scheduled_messages
@@ -30,7 +34,8 @@ fn names() -> (String, Vec<String>) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let name = format!("dbroles10892_{}_{stamp}", std::process::id());
+    let sequence = NEXT_DB.fetch_add(1, Ordering::Relaxed);
+    let name = format!("dbroles10892_{}_{stamp}_{sequence}", std::process::id());
     let roles = ["m", "b", "w"].map(|suffix| format!("{name}_{suffix}"));
     (name, roles.to_vec())
 }
