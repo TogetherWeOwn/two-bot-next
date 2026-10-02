@@ -45,17 +45,8 @@ export interface Env extends ForwardedFlagEnv {
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
   GUILD_ID?: string;
+  // Explicit: not a TWO_* flag, so outside the container-env allowlist.
   DISCORD_APPLICATION_ID?: string;
-  TWO_COMMANDS_PUBLISH_ON_BOOT?: string;
-  TWO_COMMANDS_ALLOW_LIVE_GUILD?: string;
-  TWO_AUTOMATIONS?: string;
-  TWO_TEXT_COMMANDS?: string;
-  TWO_ANNOUNCEMENTS?: string;
-  TWO_FEED_POLL_SECONDS?: string;
-  TWO_MODERATION?: string;
-  TWO_OWEN_USER_ID?: string;
-  TWO_MODERATION_PROTECTED_ROLE_IDS?: string;
-  TWO_COMMUNITY_SCORECARD?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
   /** Consecutive failed probes; default covers ~10 minutes of keepalive ticks. */
@@ -129,20 +120,9 @@ function containerPort(raw: string | undefined): number {
   return port;
 }
 
-// Keep publication and registry configuration explicit; never forward all bindings.
-const COMMAND_ENV_KEYS = [
-  "DISCORD_APPLICATION_ID",
-  "TWO_COMMANDS_PUBLISH_ON_BOOT",
-  "TWO_COMMANDS_ALLOW_LIVE_GUILD",
-  "TWO_AUTOMATIONS",
-  "TWO_TEXT_COMMANDS",
-  "TWO_ANNOUNCEMENTS",
-  "TWO_FEED_POLL_SECONDS",
-  "TWO_MODERATION",
-  "TWO_OWEN_USER_ID",
-  "TWO_MODERATION_PROTECTED_ROLE_IDS",
-  "TWO_COMMUNITY_SCORECARD",
-] as const;
+// Non-TWO_* container input: application ID for command registry sync.
+// The TWO_* publication flags ride the reviewed container-env allowlist.
+const APPLICATION_ID_KEY = "DISCORD_APPLICATION_ID" as const;
 
 /** Readonly view of the secrets/vars the DO forwards into the container. */
 function containerEnvVars(env: Env, port: number): Record<string, string> {
@@ -150,10 +130,8 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;
-  for (const key of COMMAND_ENV_KEYS) {
-    const value = env[key];
-    if (value !== undefined) vars[key] = value;
-  }
+  const applicationId = env[APPLICATION_ID_KEY];
+  if (applicationId !== undefined) vars[APPLICATION_ID_KEY] = applicationId;
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   return vars;
 }
