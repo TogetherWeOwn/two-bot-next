@@ -128,14 +128,14 @@ fn never_matching_condition_refusal_names_nothing_else() {
 fn never_matching_condition_accept_when_true_somewhere() {
     // FULL fires only in the locked scenario; GAME and WEEKEND fire elsewhere.
     assert_eq!(
-        accept_names("{{FULL ?? full // open}} @@owner@@"),
+        accept_names("@@owner@@{{FULL ?? · full // · open}}"),
         [
-            "open Avery",
-            "open Blake",
-            "open Casey",
-            "open Devon",
-            "open Emery",
-            "full Finley",
+            "Avery · open",
+            "Blake · open",
+            "Casey · open",
+            "Devon · open",
+            "Emery · open",
+            "Finley · full",
         ]
     );
     assert_eq!(
