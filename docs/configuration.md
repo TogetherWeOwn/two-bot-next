@@ -44,6 +44,27 @@ resolved from legacy `TWO_DATABASE_URL` / `DISCORD_GUILD_ID`. Token, database UR
 and guild ID have no embedded deployment value; the listen address defaults to
 `0.0.0.0:8080`. Missing configuration is not proof of readiness.
 
+### Shutdown
+
+SIGTERM/SIGINT flips `/readyz` to 503, stops gateway intake, drains accepted
+dispatches and jobs, commits the gateway checkpoint and closes the pool. The
+whole drain is bounded by `SHUTDOWN_TIMEOUT_SECONDS` (whole seconds, 1–900;
+default 35 = the 30 s dispatch drain plus 5 s margin). Past the bound the process
+logs `shutdown_deadline_exceeded` and exits 1, so the supervisor restarts from the
+last committed checkpoint; a blocking checkpoint writer cannot be abandoned
+safely. A second SIGTERM/SIGINT exits 1 immediately. The Container stop
+grace period (SIGTERM, 15 minutes, SIGKILL) is a wrangler setting and is not
+configured here.
+
+Under the Worker, the Container also receives the reviewed `TWO_*` runtime
+flags in `wrangler/src/container-env.ts` (`FORWARDED_FLAGS`), forwarded
+verbatim when the Worker env defines them as strings. Secrets never pass
+through that allowlist: a Container secret needs its own explicit line in
+`containerEnvVars` (`wrangler/src/index.ts`), like `DISCORD_TOKEN` and
+`DATABASE_URL`. Every other `TWO_*` name the Rust sources mention sits in
+`NOT_FORWARDED` with a reason, and `wrangler/test/container-env.test.ts`
+fails when a name is in neither list.
+
 ## Settings catalog
 
 Default sources (parsed defaults only, not boot wiring): feature/announcement
@@ -115,7 +136,7 @@ Catalog entries: 117.
 | `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored unwired | Staging guilds excluded from human community activity. |
 | `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored unwired | Test actors excluded from human community activity. |
 | `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Welcome-channel classification for community analytics. |
-| `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Legacy database connection secret; distinct from Container DATABASE_URL. |
+| `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
 | `TWO_FEED_POLL_SECONDS` | cold | `300` | env at boot; stored unwired | Feed polling interval (validated from 60 to 86400 seconds). |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |

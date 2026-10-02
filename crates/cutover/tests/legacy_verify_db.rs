@@ -2,6 +2,7 @@
 //! Controller: python3 scripts/cargo_cache.py run -- test -p two-bot-cutover
 //! --test legacy_verify_db -- --ignored
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -15,6 +16,9 @@ use two_bot_cutover::{
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+// Parallel tests share one pid and can read the same clock tick.
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
 fn test_database_url_allowed(url: &str, github_actions: bool) -> bool {
     url == "postgres://agent_test@agent-testdb:5432/agent_test"
@@ -60,11 +64,16 @@ impl ScratchDatabases {
         // No fallback on authentication/ownership failure.
         let mut admin = PgConnection::connect_with(&options).await?;
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let prefix = format!("verify_{}_{}", std::process::id(), nonce);
+        let prefix = format!(
+            "verify_{}_{}_{}",
+            std::process::id(),
+            nonce,
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
+        );
         let source = format!("{prefix}_source");
         let target = format!("{prefix}_target");
         for database in [&source, &target] {
-            // Names contain only our constant prefix and decimal process/time IDs.
+            // Names contain only our constant prefix and process/time/sequence IDs.
             sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
                 .execute(&mut admin)
                 .await?;
