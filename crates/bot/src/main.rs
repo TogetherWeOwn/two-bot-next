@@ -29,6 +29,9 @@ mod metrics_http;
 mod preflight;
 mod server;
 mod ticket_runtime;
+#[cfg(test)]
+#[path = "../../core/tests/support/tracing_capture.rs"]
+mod tracing_capture;
 mod website_jobs;
 
 use std::sync::Arc;

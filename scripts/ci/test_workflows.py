@@ -57,6 +57,32 @@ def runner_allowed(job_id, runs_on):
     return runs_on == ROUTED_RUNNER.format(job=job_id)
 
 
+def staging_dispatch_errors(workflow):
+    """The suspended staging workflow keeps exactly one fenced dispatch input.
+
+    `release_fence` exists on main (TOG-11143) so post-handoff re-activation
+    is explicit and auditable; it defaults to false and the job-level
+    `if: ${{ false }}` stays authoritative while suspension holds. Anything
+    else in the dispatch block (an arming switch, a deploy flag, a default of
+    true) is an activation route around the static suspension.
+    """
+    name = "deploy-staging.yml"
+    errors = []
+    on = workflow.get("on") or {}
+    if set(on) != {"push", "workflow_dispatch"}:
+        errors.append(f"{name}: triggers changed")
+    if on.get("push") != {"branches": ["main"]}:
+        errors.append(f"{name}: push trigger changed")
+    dispatch = on.get("workflow_dispatch") or {}
+    if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != {"release_fence"}:
+        errors.append(f"{name}: workflow_dispatch must carry only the release_fence input")
+    else:
+        fence = dispatch["inputs"]["release_fence"] or {}
+        if fence.get("type") != "boolean" or fence.get("default") not in (False, "false"):
+            errors.append(f"{name}: release_fence must be an opt-in boolean defaulting to false")
+    return errors
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch-only, human-gated, chained to staging."""
     name = "deploy-production.yml"
@@ -98,10 +124,14 @@ def suspension_errors(workflows):
         if name == "deploy-production.yml":
             errors.extend(production_errors(workflow))
             continue
+        if name == "deploy-staging.yml":
+            errors.extend(staging_dispatch_errors(workflow))
         for job_id, job in jobs.items():
             if name == "deploy-staging.yml":
                 if job.get("if") != STATIC_FALSE:
                     errors.append(f"{name}:{job_id}: deployment/probes are not statically disabled")
+                if job_id == "deploy":
+                    continue  # the dispatch shape is pinned by staging_dispatch_errors above
             else:
                 # Retargeting a known CI job must not create an activation bypass.
                 text = str(job).lower()
@@ -119,7 +149,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_staging_is_suspended_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
-        self.assertEqual(staging["on"], {"push": {"branches": ["main"]}, "workflow_dispatch": ""})
+        self.assertEqual(staging_dispatch_errors(staging), [])
         self.assertEqual(suspension_errors(self.workflows), [])
         self.assertEqual(staging["jobs"]["deploy"]["environment"], "staging")
 
@@ -133,6 +163,22 @@ class WorkflowTests(unittest.TestCase):
                     job.pop("if", None)
                 else:
                     job["if"] = guard
+                self.assertTrue(suspension_errors(workflows))
+
+    def test_dispatch_inputs_cannot_arm_the_release_fence(self):
+        # The workflow_dispatch inputs block must not gain an arming switch:
+        # an attacker-readable input that the (suspended) steps could consult
+        # would be an activation route around the static `if: false`. Each
+        # mutation below must trip staging_dispatch_errors (surfaced through
+        # suspension_errors on the real inventory).
+        for dispatch in ({"inputs": {"deploy": {"description": "deploy now", "type": "boolean", "default": False}}},
+                         {"inputs": {"release_fence": {"description": "x", "type": "boolean", "default": True}}},
+                         {"inputs": {"enable": {"description": "x", "type": "boolean", "default": False}}},
+                         {"inputs": {}},
+                         "just-a-string"):
+            with self.subTest(dispatch=dispatch):
+                workflows = deepcopy(self.workflows)
+                workflows["deploy-staging.yml"]["on"]["workflow_dispatch"] = dispatch
                 self.assertTrue(suspension_errors(workflows))
 
     def test_step_level_guard_is_not_sufficient(self):
@@ -240,6 +286,12 @@ class WorkflowTests(unittest.TestCase):
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
+                    if (name, job_id) == ("deploy-staging.yml", "deploy"):
+                        # The suspended staging job carries no per-job grant:
+                        # top-level `permissions: {}` is the default-deny and
+                        # nothing on a statically-disabled job needs a token.
+                        self.assertNotIn("permissions", job)
+                        continue
                     if (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
