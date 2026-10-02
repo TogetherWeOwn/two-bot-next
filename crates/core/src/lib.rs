@@ -22,6 +22,7 @@ pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;
+pub mod clock_guard;
 pub mod command_permissions;
 pub mod commands;
 pub mod community;
@@ -139,6 +140,7 @@ pub use channel_moderation_store::{
     ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore, DB_POOL_MAX_DEFAULT,
     STATEMENT_TIMEOUT_MS,
 };
+pub use clock_guard::{ClockGuard, ClockRollback, CLOCK_SKEW_TOLERANCE_MS};
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,

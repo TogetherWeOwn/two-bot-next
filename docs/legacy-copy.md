@@ -198,3 +198,17 @@ collision refusal, target-only defaults and preserved audit halt evidence.
 Scenario assertion panics still run owned-database cleanup. The CI `check` job
 runs this suite explicitly. Scratch databases and run-owned build scratch are
 cleaned after tests; no real database, deployment or Discord journey is involved.
+
+### Rehearsal test
+
+`crates/cutover/tests/cutover_rehearsal.rs` chains the runbook order in one
+test on two disposable `two_bot_test_rehearsal_*` databases: migrate the Next
+schema, `legacy_copy` dry-run plan then apply, `legacy_verify`, a MEE6 import
+from `fixtures/mee6_rehearsal_export.json`, then a full rerun. It asserts
+planned, applied and verified counts agree per group, the rerun changes zero
+rows, a one-row drift fails verification naming `events`, and pending groups
+refuse loudly in both copy and verify instead of being omitted. Unlike the
+ignored suites above it is **not** ignored: the CI `check` job's
+`cargo test --workspace --test '*'` step runs it against the disposable
+Postgres service, and missing/refused database access fails rather than
+skipping. No network, no staging, no workflow change.
