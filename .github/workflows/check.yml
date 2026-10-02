@@ -315,8 +315,51 @@ jobs:
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
 
+  # Dependency-aware selector for the container job (TOG-12056): PRs that
+  # touch only docs, worker UI or unrelated CI tooling skip the ~15-minute
+  # amd64 release build. No `paths:` filter on the workflow: that would
+  # skip the whole workflow including required checks. Needs nothing so it
+  # starts immediately and never blocks on the test jobs. Fail-closed end
+  # to end: the shell step defaults to build=true, so an undecidable diff,
+  # missing SHAs, a classifier error or any non-PR event selects a full
+  # build. Skipped PR runs deliberately write no image cache: the GHA
+  # cache is PR-safe by platform ref-scoping (PR restores base/main, PR
+  # writes stay on the merge ref), so no scope-string change is needed.
+  container-inputs:
+    name: container inputs changed
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.select.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The base/head SHAs must resolve locally for the diff below.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Offline container-inputs regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_inputs.py' -v
+      - name: Select image build or skip
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          build=true
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+            && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
+            && result=$(python3 scripts/container-inputs.py \
+              --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA"); then
+            build="$result"
+          fi
+          printf 'container-inputs: build=%s (event=%s)\n' \
+            "$build" "${{ github.event_name }}"
+          printf 'build=%s\n' "$build" >>"$GITHUB_OUTPUT"
+
   container:
     name: container smoke
+    needs: container-inputs
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     steps:
@@ -326,9 +369,20 @@ jobs:
           persist-credentials: false
       - name: Offline smoke-test regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
+      # A skipped build still reports success: the offline tests above ran,
+      # and container smoke is not a required check, so the check stays
+      # green without hiding anything the branch protection demands.
+      - name: Skip note (no image inputs changed)
+        if: needs.container-inputs.outputs.build != 'true'
+        run: |
+          printf 'Skipping the runtime image build: no image inputs changed.\n'
+          printf 'Selector output: build=%s\n' \
+            "${{ needs.container-inputs.outputs.build }}"
       - name: Set up BuildKit
+        if: needs.container-inputs.outputs.build == 'true'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Build runtime image (local only)
+        if: needs.container-inputs.outputs.build == 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -340,8 +394,10 @@ jobs:
           cache-from: type=gha,scope=two-bot-runtime-amd64
           cache-to: type=gha,mode=max,scope=two-bot-runtime-amd64
       - name: Runtime contract and size budgets
+        if: needs.container-inputs.outputs.build == 'true'
         run: python3 scripts/container-smoke.py two-bot:ci
       - name: Prove deliberate budget breakage fails
+        if: needs.container-inputs.outputs.build == 'true'
         run: |
           set -euo pipefail
           for budget in image binary; do
