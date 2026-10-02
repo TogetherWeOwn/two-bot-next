@@ -100,6 +100,7 @@ pub mod tickets;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
+pub mod voice_alias_core;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_assistant_validate;
