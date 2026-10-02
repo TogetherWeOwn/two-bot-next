@@ -399,10 +399,11 @@ impl HyperTransport {
         )
     }
 
-    /// One governed wire attempt; no Twilight or pooled-connection resends.
-    /// Returns the response and whether a process-global pause was recorded.
-    pub async fn send_request(&self, request: &Request) -> Result<(RawResponse, bool), String> {
-        use http_body_util::BodyExt as _;
+    /// Send one governed attempt through headers receipt. The caller either
+    /// collects the bounded body ([`PendingHeaders::collect`]) or settles a
+    /// status-only verdict without waiting on the body; dropping the pending
+    /// headers commits only header-anchored global timing.
+    async fn send_request_headers(&self, request: &Request) -> Result<PendingHeaders<'_>, String> {
         if request
             .headers()
             .is_some_and(|headers| headers.contains_key(hyper::header::AUTHORIZATION))
@@ -465,7 +466,7 @@ impl HyperTransport {
             .await
             .map_err(|e| format!("transport: {e}"))?;
         let status = response.status().as_u16();
-        let mut accounting = crate::ratelimit_guard::ResponseAccounting::new(
+        let accounting = crate::ratelimit_guard::ResponseAccounting::new(
             &self.guard,
             status,
             response.headers(),
@@ -477,6 +478,55 @@ impl HyperTransport {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
+        // Reads cannot mutate; a complete failure may be retried independently.
+        // Mutation success needs its caller's validated receipt. 5xx, redirects
+        // and request-timeout responses remain uncertain even with a full body.
+        let complete_on_receipt =
+            request.method() == Method::Get || matches!(status, 400 | 401 | 403 | 404 | 405 | 429);
+        Ok(PendingHeaders {
+            response: Some(response),
+            accounting: Some(accounting),
+            complete_on_receipt,
+            status,
+            retry_after_header,
+            permit,
+        })
+    }
+
+    /// One governed wire attempt; no Twilight or pooled-connection resends.
+    /// Returns the response and whether a process-global pause was recorded.
+    pub async fn send_request(&self, request: &Request) -> Result<(RawResponse, bool), String> {
+        self.send_request_headers(request).await?.collect().await
+    }
+}
+
+/// Headers-received half of one governed wire attempt. The status is known;
+/// the body is not yet collected. The caller either collects the bounded body
+/// ([`PendingHeaders::collect`]) or settles a status-only verdict
+/// ([`PendingHeaders::settle_status`]) and drops the rest unread. Dropping
+/// without settling commits only the header-anchored global timing, never
+/// body timing.
+///
+/// [`crate::ratelimit_guard::ResponseAccounting`] settles exactly once:
+/// either in `collect`/`settle_status` (with whatever evidence is available)
+/// or in `Drop` (header-anchored fallback). Either way a pending header
+/// restriction resolves to its header timing without opening admission early.
+struct PendingHeaders<'a> {
+    response: Option<hyper::Response<hyper::body::Incoming>>,
+    accounting: Option<crate::ratelimit_guard::ResponseAccounting<'a>>,
+    complete_on_receipt: bool,
+    status: u16,
+    retry_after_header: Option<String>,
+    permit: Option<two_bot_core::send_admission::AdmissionPermit>,
+}
+
+impl PendingHeaders<'_> {
+    /// Collect the bounded body and settle guard/admission accounting exactly
+    /// as the pre-split `send_request` always has.
+    async fn collect(mut self) -> Result<(RawResponse, bool), String> {
+        use http_body_util::BodyExt as _;
+        let response = self.response.take().expect("pending headers");
+        let status = self.status;
         // Expiry drops accounting, resolving the pending header restriction to
         // its header-anchored timing/fallback without opening admission early.
         let collected = tokio::time::timeout(
@@ -495,18 +545,55 @@ impl HyperTransport {
         };
         let mut res = RawResponse {
             status,
-            retry_after_header,
+            retry_after_header: self.retry_after_header.clone(),
             body,
-            completion: permit,
+            completion: self.permit.take(),
         };
-        let global = accounting.finish(&res);
-        // Reads cannot mutate; a complete failure may be retried independently.
-        // Mutation success needs its caller's validated receipt. 5xx, redirects
-        // and request-timeout responses remain uncertain even with a full body.
-        if request.method() == Method::Get || matches!(status, 400 | 401 | 403 | 404 | 405 | 429) {
+        let global = self
+            .accounting
+            .take()
+            .map(|mut settled| settled.finish(&res))
+            .unwrap_or(false);
+        if self.complete_on_receipt {
             res.complete().await;
         }
         Ok((res, global))
+    }
+
+    /// Settle a status-only verdict without waiting on the body: run the same
+    /// receipt-time settlement `collect` would, but with no body evidence,
+    /// then drop the unread body. Definite verdicts release the lane;
+    /// uncertain ones keep the permit held by dropping it uncompleted.
+    /// 204 is the singular role-mutation success: it releases admission here
+    /// because `complete_on_receipt` (GET + rejection/rate-limit statuses)
+    /// never fires for a PUT/DELETE success, and no caller completes it later.
+    async fn settle_status(mut self) -> u16 {
+        let status = self.status;
+        let mut res = RawResponse {
+            status,
+            retry_after_header: self.retry_after_header.clone(),
+            body: Vec::new(),
+            completion: self.permit.take(),
+        };
+        let _ = self
+            .accounting
+            .take()
+            .map(|mut settled| settled.finish(&res));
+        if self.complete_on_receipt || status == 204 {
+            res.complete().await;
+        }
+        status
+    }
+}
+
+impl Drop for PendingHeaders<'_> {
+    fn drop(&mut self) {
+        // Resolve the pending header restriction to its header-anchored
+        // timing/fallback without opening admission early. Body timing is
+        // unknown: the body was never collected. An uncompleted admission
+        // permit intentionally holds the lane: an uncertain response must not
+        // release durable send admission.
+        drop(self.accounting.take());
     }
 }
 
@@ -539,6 +626,8 @@ pub struct KickAttemptState {
 
 #[path = "internal_exec/member.rs"]
 pub mod member;
+#[path = "self_roles_rest.rs"]
+pub mod self_roles;
 
 /// A separately authorized staging revoke operation. It is never constructed
 /// by the level-up path. Both deployment identities must match the existing
@@ -813,6 +902,16 @@ impl ActionExecutor {
         tokio::time::timeout_at(deadline, self.send_admitted(request))
             .await
             .map_err(|_| DiscordError::Timeout)?
+    }
+
+    /// Singular role mutations use status only. A truncated/stalled provider
+    /// body must not erase headers already received or invent an unknown send:
+    /// any body-read failure is `Ambiguous` with no status, so the caller
+    /// compensates instead of trusting a partial exchange.
+    async fn send_status(&self, request: &Request) -> Result<u16, String> {
+        self.count();
+        let pending = self.inner.transport.send_request_headers(request).await?;
+        Ok(pending.settle_status().await)
     }
 
     /// Build a twilight [`Request`] from a builder without sending (keeps

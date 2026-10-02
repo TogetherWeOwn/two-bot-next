@@ -71,11 +71,11 @@ chain. Branches then style through the parent policy.
 
 ## Residual parent integration (not parity evidence)
 
-- The parent V6 slice fills `ConditionFacts` from Discord state: owner and
-  member IDs, role IDs, presence activities, both live sources, the shown
-  titles after alias and majority rules, and the room's privacy setting.
-- It wires the V6a style functions into `styled` and checks the combined
-  policy against the styling corpus cases.
+- The composed policy is `voice_template::TemplateExtensions`
+  ([voice-template-core](voice-template-core.md)); it passes the shared corpus,
+  styling cases included. `voice_naming::majority_games` gives the shown titles.
+- The runtime fills `ConditionFacts` from Discord state: owner and member IDs,
+  role IDs, presence activities, both live sources and the room's privacy.
 - On malformed input the node split can differ from the V5 reservation split:
   an unpaired style quote, or an unclosed construct wrapping a nested
   conditional. Random stability still holds, because the renderer reserves

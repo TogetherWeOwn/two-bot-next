@@ -26,6 +26,7 @@ pub mod lfg_interactions;
 mod message_safety;
 pub mod pipeline;
 pub mod ratelimit_guard;
+pub mod voice_rooms;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};

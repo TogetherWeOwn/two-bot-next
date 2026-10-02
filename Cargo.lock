@@ -2356,6 +2356,7 @@ name = "two-bot-discord"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bytes",
  "futures-util",
  "hex",
