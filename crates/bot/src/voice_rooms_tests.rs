@@ -9,7 +9,7 @@ const GUILD: u64 = 100;
 const CREATOR: u64 = 200;
 const CATEGORY: u64 = 400;
 const MEMBER: u64 = 300;
-const NOW: &str = "2026-09-30T00:00:00.000Z";
+const NOW: &str = "2026-09-30T00:00:00.000000+00:00";
 type Trace = Arc<Mutex<Vec<String>>>;
 type Hook = Arc<dyn Fn() + Send + Sync>;
 
