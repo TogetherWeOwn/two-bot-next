@@ -44,6 +44,26 @@ const EXPECTED_ENV = {
   LISTEN_ADDR: "0.0.0.0:8080",
 };
 
+const PUBLICATION_ENV = {
+  DISCORD_APPLICATION_ID: "2222",
+  TWO_COMMANDS_PUBLISH_ON_BOOT: "1",
+  TWO_COMMANDS_ALLOW_LIVE_GUILD: "1",
+  TWO_AUTOMATIONS: "1",
+  TWO_TEXT_COMMANDS: "0",
+  TWO_ANNOUNCEMENTS: "1",
+  TWO_FEED_POLL_SECONDS: "300",
+  TWO_MODERATION: "1",
+  TWO_OWEN_USER_ID: "333444555666777888",
+  TWO_MODERATION_PROTECTED_ROLE_IDS: "444555666777888999, 555666777888999000",
+  TWO_COMMUNITY_SCORECARD: "1",
+};
+const PUBLICATION_WORKER_ENV = {
+  ...WORKER_ENV,
+  ...PUBLICATION_ENV,
+  DISCORD_API_BASE: "https://not-forwarded.invalid",
+  UNRELATED_SETTING: "not-a-container-var",
+};
+
 type StartConfig = {
   env?: Record<string, string>;
   enableInternet?: boolean;
@@ -417,6 +437,50 @@ test("cold keepalive passes env through the SDK's string-URL fetch path", async 
   assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
 });
 
+for (const path of ["/health", "/readyz", "keepalive", "start", "startAndWaitForPorts"]) {
+  test(`${path} startup forwards only allowlisted publication settings`, async (t) => {
+    const h = await harness(t, PUBLICATION_WORKER_ENV);
+    if (path === "keepalive") {
+      await tickKeepalive(h.bot);
+    } else if (path === "start") {
+      await h.bot.start();
+    } else if (path === "startAndWaitForPorts") {
+      await h.bot.startAndWaitForPorts();
+    } else {
+      await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
+    }
+    assert.equal(h.starts.length, 1);
+    assert.deepEqual(h.starts[0]?.env, { ...EXPECTED_ENV, ...PUBLICATION_ENV });
+    assert.ok(h.logs.every((line) =>
+      !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
+  });
+}
+
+test("registry feature bindings do not opt in to publication or acknowledge live writes", async (t) => {
+  const { TWO_COMMANDS_PUBLISH_ON_BOOT, TWO_COMMANDS_ALLOW_LIVE_GUILD, ...features } = PUBLICATION_ENV;
+  const h = await harness(t, { ...WORKER_ENV, ...features });
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  assert.deepEqual(h.starts[0]?.env, { ...EXPECTED_ENV, ...features });
+  assert.equal(h.starts[0]?.env?.["TWO_COMMANDS_PUBLISH_ON_BOOT"], undefined);
+  assert.equal(h.starts[0]?.env?.["TWO_COMMANDS_ALLOW_LIVE_GUILD"], undefined);
+});
+
+for (const value of ["0", "true", ""]) {
+  test(`publication flags preserve exact binding value ${JSON.stringify(value)}`, async (t) => {
+    const h = await harness(t, {
+      ...WORKER_ENV,
+      TWO_COMMANDS_PUBLISH_ON_BOOT: value,
+      TWO_COMMANDS_ALLOW_LIVE_GUILD: value,
+    });
+    await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+    assert.deepEqual(h.starts[0]?.env, {
+      ...EXPECTED_ENV,
+      TWO_COMMANDS_PUBLISH_ON_BOOT: value,
+      TWO_COMMANDS_ALLOW_LIVE_GUILD: value,
+    });
+  });
+}
+
 for (const port of ["9090", "1", "65535", "09090"]) {
   for (const path of ["/health", "/readyz", "keepalive"]) {
     test(`cold ${path} uses BOT_PORT=${port} for both listener and SDK target`, async (t) => {
@@ -489,7 +553,7 @@ test("explicit startAndWaitForPorts also uses the class env defaults", async (t)
 
 for (const method of ["start", "startAndWaitForPorts"] as const) {
   test(`${method} preserves SDK envVars replacement precedence`, async (t) => {
-    const h = await harness(t);
+    const h = await harness(t, PUBLICATION_WORKER_ENV);
     const envVars = { ONLY_EXPLICIT: "synthetic-override" };
     if (method === "start") {
       await h.bot.start({ envVars });
@@ -497,7 +561,8 @@ for (const method of ["start", "startAndWaitForPorts"] as const) {
       await h.bot.startAndWaitForPorts({ startOptions: { envVars } });
     }
     assert.deepEqual(h.starts[0]?.env, envVars);
-    assert.deepEqual(h.bot.envVars, EXPECTED_ENV, "per-start override must not mutate defaults");
+    assert.deepEqual(h.bot.envVars, { ...EXPECTED_ENV, ...PUBLICATION_ENV },
+      "per-start override must not mutate defaults");
   });
 }
 

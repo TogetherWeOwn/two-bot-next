@@ -209,8 +209,8 @@ fn ready_groups() -> Vec<String> {
 fn pending_groups_fail_loudly_in_copy_and_verify() {
     let ready = ready_groups();
     let spec = MappingSpec::parse(&rehearsal_spec_json()).unwrap();
-    assert_eq!(spec.select(&ready).unwrap().len(), 25);
-    assert_eq!(mapping::select(&ready).unwrap().len(), 25);
+    assert_eq!(spec.select(&ready).unwrap().len(), 26);
+    assert_eq!(mapping::select(&ready).unwrap().len(), 26);
     for group in mapping::GROUPS.iter().filter(|g| g.status != "ready") {
         let copy_error = mapping::select(&[group.name.to_owned()]).unwrap_err();
         assert!(
@@ -303,7 +303,7 @@ async fn scenario(
     let (host, source_name, target_name) = (&host, &source_name, &target_name);
     initialize(source, target).await?;
     let tables = mapping::select(&["ready".to_owned()])?;
-    assert_eq!(tables.len(), 25);
+    assert_eq!(tables.len(), 26);
     let groups = ready_groups();
     let spec = MappingSpec::parse(&rehearsal_spec_json())?;
 
