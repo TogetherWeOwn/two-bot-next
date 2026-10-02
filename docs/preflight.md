@@ -2,9 +2,13 @@
 
 `two-bot preflight` answers whether the **supplied deployment configuration** has
 working Discord credentials, privileged intents, role hierarchy and channel
-access, without connecting to the gateway. It uses the same Twilight 0.17 HTTP
-client as the other Discord adapters, issuing **GET requests only**. It does not
-open Postgres/Redis, migrate, send messages, grant roles, or repair permissions.
+access, without connecting to the gateway. It uses Twilight 0.17 request builders
+and the shared raw governed transport, issuing **GET requests only**. Live requests
+open the runtime `TWO_DATABASE_URL` admission authority and update only the
+credential's durable admission lane. It does not query configuration tables, open
+Redis, migrate, send messages, grant roles, or repair permissions. A held or
+unavailable lane stops checks; 429 is recorded by the shared gate and never
+retried by this command. See [durable send admission](discord-send-admission.md).
 Running it against the production guild is an operator step in the cutover
 runbook, not an agent test or part of this implementation's verification.
 
@@ -26,6 +30,9 @@ Required environment:
   A present-but-empty primary is a configuration error, not permission to try
   the alias. A rejected credential stops the check; there is no retry with the
   alias.
+- `TWO_DATABASE_URL`: the same durable admission authority used by the runtime,
+  with migration 0361 already installed. It is not an alternative data target;
+  no live request is permitted without this authority.
 - `GUILD_ID`: one nonzero guild snowflake, pinned to the deployment under test.
   `DISCORD_GUILD_ID` is a legacy fallback when `GUILD_ID` is absent/empty.
 - The same feature/channel configuration supplied to the bot at startup.
@@ -37,7 +44,7 @@ Twilight debug/error dump. No secret is a CLI argument.
 ### Database-backed level rewards
 
 Level rewards are configured in `level_role_rewards`, not an environment list.
-To keep this command strictly REST-only, the operator supplies the guild's
+To avoid reading configuration tables, the operator supplies the guild's
 **current exported role IDs**:
 
 ```sh
@@ -170,7 +177,10 @@ double, with a cleared environment and fake token. It covers PASS/WARN/FAIL,
 intent gates, role hierarchy/managed/deleted roles, channel denials, JSON/table
 output, credential rejection, invalid config and zero API writes. The fake REST
 names and error bodies intentionally contain the fake token to detect accidental
-logging. An unusable database URL proves that no database is needed.
+logging. With only the explicit loopback fixture and no `TWO_DATABASE_URL`, no
+admission database is needed. A present but failed authority is never replaced
+or bypassed. Negative coverage proves live requests without the authority are
+refused before HTTP, and preflight 429 cannot trigger a hidden resend.
 
 `DISCORD_PREFLIGHT_API_BASE=http://127.0.0.1:<port>` (or another literal loopback IP)
 is the test-only HTTP seam. It rejects non-loopback hosts, URL paths, credentials

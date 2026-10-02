@@ -61,6 +61,22 @@
       "sha256": "950da1329b8943173ef0472681fd104049a622d2bacaf88d7afd31d242ca1a08",
       "justification": "Correct unmerged TOG-10088 ticket migration to clamp populated legacy expiry to 2160 elapsed UTC hours without extending shorter deadlines; transcript bodies remain unchanged."
     },
+    "crates/cutover/migrations/0220_automod.sql": {
+      "sha256": "c06f98968464e589f937436cf208830efeee2685fcc76a312a70935d1730d2cb",
+      "justification": "Add reserved automod legacy-compatible ledger migration for TOG-10089; no change to historical SQL."
+    },
+    "crates/cutover/migrations/0221_automod_delivery_claims.sql": {
+      "sha256": "cab3cfec413c911112932cfec4f1dacfda3faaea7b37e55bf50799e470ae0f64",
+      "justification": "Add durable token-fenced automod delivery claims for TOG-10089."
+    },
+    "crates/cutover/migrations/0222_automod_counted_claim.sql": {
+      "sha256": "25fd9cab8e7bbd5341e59c2f9add524a9353ccdc875879d999a5ce79ceab9af5",
+      "justification": "Fence counted automod claims against unsafe pre-mutation release for TOG-10089."
+    },
+    "crates/cutover/migrations/0223_automod_preserved_match.sql": {
+      "sha256": "c5f2bc418224a3c684c5d50bbdaf78ab082590477147f81279c276327314f1e8",
+      "justification": "Preserve pre-count automod decisions across safely released retries for TOG-10089."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
@@ -76,6 +92,10 @@
     "crates/cutover/migrations/0320_gateway_sessions.sql": {
       "sha256": "f6f39298deee84821f408c7b851b507debef7a22ef02ef3781528cd2b5111c83",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
+    },
+    "crates/cutover/migrations/0321_gateway_boot_directives.sql": {
+      "sha256": "1c89d934b24f53ac0db6224a55d92080f24a17914ab68139308b5b4dc00c56a5",
+      "justification": "Add the one-shot force-fresh IDENTIFY directive for first production boot in TOG-12014; gateway_sessions stays unchanged."
     },
     "crates/cutover/migrations/0330_guild_settings.sql": {
       "sha256": "9addc4962a1a69062bb8886e7c6f33596c0a1cc7583a965c360376819b546ed0",
@@ -109,13 +129,25 @@
       "sha256": "889864e3d2768c5b95455b6b1e2071e20921cd65d5f8a017aad8668093b8f489",
       "justification": "Pin the validated resolved role in internal-action intents and audits before REST for TOG-10861."
     },
+    "crates/cutover/migrations/0352_internal_action_not_sent.sql": {
+      "sha256": "eee55973b4e8cfd1bf5c0014d0ec80599f48c0954c373c86597d183af08acb16",
+      "justification": "Allow audited, owning-executor proof of no dispatch to retry a guarded member action under the original key for TOG-10857; unknown and stale intents remain fenced."
+    },
     "crates/cutover/migrations/0360_join_risk_flags.sql": {
       "sha256": "e3215b7b6b878e710a75acf33ecdc61ce3c2955b60ce4e523509bdc1fa92aea2",
       "justification": "Add legacy join-risk evidence schema for manually approved raid-list and raid-remove tooling (TOG-10867); no containment activation or automatic removal."
     },
+    "crates/cutover/migrations/0361_discord_send_admission.sql": {
+      "sha256": "5f5986ae81173571aaea237bff45f09d6e23256f5023ed7a3570697796da791d",
+      "justification": "TOG-11045: add durable token-wide Discord send admission; no existing migration SQL changed."
+    },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."
+    },
+    "crates/cutover/migrations/0410_member_erasure_audit.sql": {
+      "sha256": "712f85817c15262f42907114e35dbaeccdada1044833d8bac6b5bd661ca62fe5",
+      "justification": "TOG-11141: minimal actor/time erasure receipt with no subject or content."
     },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
@@ -140,6 +172,10 @@
     "crates/store/migrations/0405_timestamptz_and_boolean.sql": {
       "sha256": "5c00a07ac5565bd668e5804aa9e681c5bc8ebe1728d6f700fa5b956a8b0bb987",
       "justification": "Add unpublished S6 dependency-preserving normalization gate for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
+    },
+    "crates/store/migrations/0406_rollback_journal.sql": {
+      "sha256": "13a396ea63ea19cf64e5b9abee940f845189ace2ec5c950f29db7baf22e42c57",
+      "justification": "Add durable cutover rollback journal and per-table watermarks for TOG-12137; additive tables only."
     }
   }
 }

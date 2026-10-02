@@ -1,4 +1,4 @@
-//! The v3 backup envelope: manifest / rows / end marker, gzipped NDJSON.
+//! The v4 backup envelope (also reads v3): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -36,11 +36,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-/// Everything the bot owns. The website's own tables are not ours to back up.
-///
-/// The moderation tables are here because losing them is not cosmetic: a lost
-/// scheduled unban is a tempban that became permanent, and a lost warn ledger
-/// is a moderation history the staff cannot see (TOG-1659 High 5).
+/// Durable bot-owned tables, parents before children. The first 22 names are
+/// frozen v3 coverage; append new tables after that prefix. Tables retired from
+/// the Rust migration set remain supported when present on a legacy target.
+/// The bot-owned website-contract backing tables ARE included; derived views
+/// and the website service's own database are not application data here.
 pub const DUMP_TABLES: &[&str] = &[
     "events",
     "members",
@@ -64,10 +64,93 @@ pub const DUMP_TABLES: &[&str] = &[
     "automod_processed_messages",
     "self_role_audit",
     "self_role_panel_claims",
+    "member_levels",
+    "xp_awards",
+    "level_role_rewards",
+    "level_import_runs",
+    "event_rsvps",
+    "announcements_audit_log",
+    "community_facts",
+    "lfg_posts",
+    "lfg_roles",
+    "lfg_signups",
+    "feed_relays",
+    "feed_deliveries",
+    "web_contract_meta",
+    "guild_counters",
+    "rank_ladder",
+    "rank_snapshots",
+    "member_ranks",
+    "scheduled_events",
+    "counter_snapshots",
+    "member_exclusions",
+    "presence_probe",
+    "community_stream_heartbeats",
+    "community_scorecard_runs",
+    "community_scorecard_alerts",
+    "gateway_sessions",
+    "guild_settings_revision",
+    "guild_settings",
+    "guild_settings_audit",
+    "audit_kill_switch",
+    "internal_nonces",
+    "internal_idempotency",
+    "internal_action_log",
+    "internal_discord_events",
+    "moderation_channel_executions",
+    "automod_delivery_claims",
+    "gateway_boot_directives",
+    "member_erasure_audit",
 ];
 
-/// The backup format version. Must stay 3: the envelope is frozen.
-pub const DUMP_VERSION: u32 = 3;
+/// Frozen v3 tables no longer created by cutover migrations. Keep their data
+/// when they exist, but do not require nonexistent legacy subsystems on Rust.
+pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
+    "moderation_warnings",
+    "moderation_scheduled_unbans",
+    "containment_events",
+    "containment_incidents",
+    "automation_commands",
+];
+
+/// Explicit migrated-schema exclusions, checked by the schema coverage test.
+pub const EXCLUDED_TABLES: &[&str] = &[
+    // Short-lived XP award throttles, not XP totals/history. Never replay a
+    // pre-restore cooldown into a recovered process.
+    "xp_cooldowns",
+    // Durable send admission is per-credential runtime lane state: occupancy
+    // generations and Discord cooldown timing, not application data. Never
+    // replay a pre-restore lane hold into a recovered process; a restored
+    // database re-admits from generation zero and re-learns cooldowns.
+    "discord_send_admission",
+    // Migration ledgers describe target DDL; replacing them would falsely mark
+    // unapplied migrations as applied. Legacy schema_migrations is diagnostic
+    // manifest metadata only, never restored application data.
+    "_sqlx_migrations",
+    "schema_migrations",
+];
+
+/// Columns the destination allocates itself: never archived, never restored.
+pub const DESTINATION_OWNED_COLUMNS: &[(&str, &str)] = &[
+    // CAS tokens come from the never-reseeded guild_settings_cas_seq, and
+    // trg_guild_settings_version replaces supplied tokens on every write. A
+    // restore therefore allocates fresh tokens that invalidate every token
+    // issued before it, as legacy copy does; archiving them would only record
+    // values that restore cannot and must not reproduce.
+    ("guild_settings", "cas_version"),
+];
+
+/// True when `table.column` is allocated by the destination, see
+/// [`DESTINATION_OWNED_COLUMNS`].
+#[must_use]
+pub fn is_destination_owned(table: &str, column: &str) -> bool {
+    DESTINATION_OWNED_COLUMNS
+        .iter()
+        .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
+}
+
+/// Write the complete-schema envelope; the reader also accepts frozen v3.
+pub const DUMP_VERSION: u32 = 4;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -100,6 +183,63 @@ pub struct DumpManifest {
     /// Which migrations the source had applied, for diagnosing an old backup.
     #[serde(rename = "schemaMigrations")]
     pub schema_migrations: Vec<String>,
+    /// Source allocator positions. Absent from v3 and from v4 archives written
+    /// before marks existed; restore then knows only the restored rows and the
+    /// target's own allocators, which cannot see deleted top rows.
+    #[serde(
+        rename = "sequenceMarks",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub sequence_marks: Vec<SequenceMark>,
+}
+
+/// A sequence's position when the dump was taken, keyed by the column it
+/// feeds. Sequences are not MVCC, so the dump reads the live position: it is
+/// at or beyond every value in the archived snapshot, never behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceMark {
+    pub table: String,
+    pub column: String,
+    #[serde(rename = "lastValue")]
+    pub last_value: i64,
+    #[serde(rename = "isCalled")]
+    pub is_called: bool,
+    pub increment: i64,
+}
+
+impl SequenceMark {
+    /// The value the source would have allocated next; `None` past `i64`.
+    #[must_use]
+    pub fn next(&self) -> Option<i64> {
+        if self.is_called {
+            self.last_value.checked_add(self.increment)
+        } else {
+            Some(self.last_value)
+        }
+    }
+}
+
+impl DumpManifest {
+    /// The archived position of the allocator feeding `table.column`, if any.
+    #[must_use]
+    pub fn sequence_mark(&self, table: &str, column: &str) -> Option<&SequenceMark> {
+        self.sequence_marks
+            .iter()
+            .find(|mark| mark.table == table && mark.column == column)
+    }
+
+    /// Old v3 archives predate complete table coverage. Restore clears these
+    /// tables too, rather than silently retaining unrelated target contents.
+    #[must_use]
+    pub fn missing_tables(&self) -> Vec<&'static str> {
+        DUMP_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !OPTIONAL_LEGACY_TABLES.contains(name))
+            .filter(|name| !self.tables.iter().any(|t| t.name == *name))
+            .collect()
+    }
 }
 
 /// Maximum compressed AND decoded bytes. Files are streamed rather than
@@ -528,9 +668,9 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     .get("version")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| refuse("manifest has an invalid version"))?;
-                if version != u64::from(DUMP_VERSION) {
+                if version != 3 && version != u64::from(DUMP_VERSION) {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -691,6 +831,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             }
         }
     }
+    if let Some(marks) = obj.get("sequenceMarks") {
+        validate_sequence_marks(marks)?;
+    }
     let tables = obj
         .get("tables")
         .and_then(Value::as_array)
@@ -729,8 +872,17 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
+    // The first 22 entries are frozen v3 coverage, pinned by the checked-in
+    // legacy fixture. V3 may omit later additions; v4 must declare them all.
+    let required = if obj.get("version").and_then(Value::as_u64) == Some(3) {
+        22
+    } else {
+        DUMP_TABLES.len()
+    };
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
+        .take(required)
+        .filter(|name| required == 22 || !OPTIONAL_LEGACY_TABLES.contains(name))
         .filter(|name| !names.contains(**name))
         .copied()
         .collect();
@@ -741,6 +893,47 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         )));
     }
     serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
+}
+
+/// Restore raises allocators to these marks, so a malformed one must refuse
+/// rather than silently restore without the high-water it was meant to carry.
+fn validate_sequence_marks(marks: &Value) -> Result<(), DumpError> {
+    let marks = marks
+        .as_array()
+        .ok_or_else(|| refuse("manifest has invalid sequenceMarks"))?;
+    let mut keys = std::collections::BTreeSet::new();
+    for mark in marks {
+        let mark = mark
+            .as_object()
+            .ok_or_else(|| refuse("manifest sequence mark is not an object"))?;
+        let table = mark
+            .get("table")
+            .and_then(Value::as_str)
+            .filter(|table| is_dump_table(table))
+            .ok_or_else(|| refuse("manifest sequence mark names no backup table"))?;
+        let column = mark
+            .get("column")
+            .and_then(Value::as_str)
+            .filter(|column| !column.is_empty())
+            .ok_or_else(|| refuse(format!("manifest sequence mark on {table} has no column")))?;
+        if mark.get("lastValue").and_then(Value::as_i64).is_none()
+            || mark.get("isCalled").and_then(Value::as_bool).is_none()
+            || mark
+                .get("increment")
+                .and_then(Value::as_i64)
+                .is_none_or(|increment| increment == 0)
+        {
+            return Err(refuse(format!(
+                "manifest sequence mark {table}.{column} has an invalid position"
+            )));
+        }
+        if !keys.insert((table, column)) {
+            return Err(refuse(format!(
+                "manifest sequence mark {table}.{column} is duplicated"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Convert a validated cell to bound PostgreSQL input, never coercing an
@@ -1009,6 +1202,66 @@ mod tests {
             objs[0]["sequences"] = sequences.clone();
             let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
             assert!(err.to_string().contains("sequence"), "{sequences}: {err}");
+        }
+    }
+
+    #[test]
+    fn sequence_marks_parse_and_report_the_next_allocation() {
+        let mut objs = empty_dump();
+        objs[0]["sequenceMarks"] = serde_json::json!([
+            {"table": "events", "column": "id", "lastValue": 41, "isCalled": true, "increment": 1},
+            {"table": "members", "column": "backup_identity", "lastValue": 17, "isCalled": false, "increment": 3},
+            {"table": "guild_settings", "column": "cas_version", "lastValue": -9, "isCalled": true, "increment": -1},
+            {"table": "xp_awards", "column": "id", "lastValue": i64::MAX, "isCalled": true, "increment": 1},
+        ]);
+        let marks = inspect_bytes(&gzip_lines(&objs))
+            .unwrap()
+            .manifest
+            .sequence_marks;
+        let next: Vec<_> = marks.iter().map(SequenceMark::next).collect();
+        assert_eq!(next, vec![Some(42), Some(17), Some(-10), None]);
+        // Absent marks (v3, older v4) default to none and are not re-emitted.
+        let manifest = inspect_bytes(&gzip_lines(&empty_dump())).unwrap().manifest;
+        assert!(manifest.sequence_marks.is_empty());
+        assert!(serde_json::to_value(&manifest)
+            .unwrap()
+            .get("sequenceMarks")
+            .is_none());
+    }
+
+    #[test]
+    fn refuses_malformed_sequence_marks() {
+        let good = serde_json::json!({"table": "events", "column": "id", "lastValue": 1, "isCalled": true, "increment": 1});
+        let with = |field: &str, value: Value| {
+            let mut mark = good.clone();
+            mark[field] = value;
+            serde_json::json!([mark])
+        };
+        let mut cases = vec![
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("events"),
+            serde_json::json!([1]),
+            serde_json::json!([good.clone(), good.clone()]),
+            with("table", serde_json::json!("website_users")),
+            with("table", Value::Null),
+            with("column", serde_json::json!("")),
+            with("column", serde_json::json!(1)),
+            with("lastValue", serde_json::json!("1")),
+            with("lastValue", serde_json::json!(0.5)),
+            with("lastValue", serde_json::json!(i64::MAX as u64 + 1)),
+            with("isCalled", serde_json::json!("true")),
+            with("increment", serde_json::json!(0)),
+            with("increment", Value::Null),
+        ];
+        let mut missing = good.clone();
+        missing.as_object_mut().unwrap().shift_remove("isCalled");
+        cases.push(serde_json::json!([missing]));
+        for marks in cases {
+            let mut objs = empty_dump();
+            objs[0]["sequenceMarks"] = marks.clone();
+            let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+            assert!(err.to_string().contains("sequence"), "{marks}: {err}");
         }
     }
 
@@ -1333,6 +1586,18 @@ mod tests {
         .unwrap();
         let contents = inspect_bytes(&finish_gzip(enc).unwrap()).unwrap();
         assert_eq!(contents.rows, 2);
+        assert_eq!(contents.manifest.version, 3);
+        let legacy_names: std::collections::BTreeSet<_> = contents
+            .manifest
+            .tables
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(legacy_names, DUMP_TABLES.iter().take(22).copied().collect());
+        assert_eq!(
+            contents.manifest.missing_tables().len(),
+            DUMP_TABLES.len() - 22
+        );
         assert!(contents
             .manifest
             .tables
@@ -1347,6 +1612,29 @@ mod tests {
             contents.buffers["join_risk_flags"][0]["flagged"],
             serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn v3_requires_its_original_tables_but_v4_requires_complete_coverage() {
+        let legacy: Value = serde_json::from_str(
+            include_str!("../../tests/fixtures/legacy-v3-native.ndjson")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut missing_v3 = legacy.clone();
+        missing_v3["tables"].as_array_mut().unwrap().remove(0);
+        assert!(validate_manifest(&missing_v3)
+            .unwrap_err()
+            .to_string()
+            .contains("missing tables"));
+        let mut incomplete_v4 = legacy;
+        incomplete_v4["version"] = serde_json::json!(4);
+        assert!(validate_manifest(&incomplete_v4)
+            .unwrap_err()
+            .to_string()
+            .contains("missing tables"));
     }
 
     #[test]

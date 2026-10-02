@@ -11,7 +11,7 @@ use two_bot_core::audit_mirror::{
     AuditMirror, MirrorChannel, MirrorError, MirrorMessage, MirrorOverwrite,
 };
 
-use crate::executor::{ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordError};
+use crate::executor::{ActionExecutor, DiscordError};
 
 /// `DiscordError` → `MirrorError`: `Rejected` stays provably-unsent/refused,
 /// `RateLimited` keeps its own verdict, and both `Timeout` and `Unavailable`
@@ -20,9 +20,20 @@ use crate::executor::{ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordEr
 fn mirror_error(error: DiscordError) -> MirrorError {
     match error {
         DiscordError::Rejected(detail) => MirrorError::Rejected(detail),
+        DiscordError::Guard(error) => MirrorError::Rejected(error.to_string()),
         DiscordError::RateLimited => MirrorError::RateLimited,
         DiscordError::Timeout => MirrorError::Uncertain("timeout".to_owned()),
         DiscordError::Unavailable(detail) => MirrorError::Uncertain(detail),
+    }
+}
+
+/// A local guard refusal is no channel permission or history evidence. Reads
+/// must defer/hold recovery, not quarantine the delivery as a permission loss.
+/// Posts retain the provably-unsent classification in `mirror_error`.
+fn mirror_read_error(error: DiscordError) -> MirrorError {
+    match error {
+        DiscordError::Guard(error) => MirrorError::Uncertain(error.to_string()),
+        error => mirror_error(error),
     }
 }
 
@@ -35,7 +46,7 @@ impl AuditMirror for ActionExecutor {
     /// `POST /channels/{c}/messages` through the executor's paced lane. The
     /// wire shape (deterministic nonce + `enforce_nonce`, empty
     /// `allowed_mentions`, the 2000-utf16 bound) is owned by
-    /// `execute_channel` — there is no private HTTP client here.
+    /// the executor's shared message builder — there is no private HTTP client here.
     async fn post_mirror_checked<Fut, E>(
         &self,
         channel_id: &str,
@@ -47,21 +58,16 @@ impl AuditMirror for ActionExecutor {
         Fut: std::future::Future<Output = Result<(), E>> + Send,
         E: Send,
     {
-        let call = ChannelCall::PostMessage {
-            channel_id: channel_id.to_owned(),
-            content: content.to_owned(),
-            nonce: Some(nonce.to_owned()),
+        let mut lane = match self.paced_lane(false).await {
+            Ok(lane) => lane,
+            Err(error) => return Ok(Err(MirrorError::Rejected(error.to_string()))),
         };
-        let mut lane = self.paced_lane(false).await;
         authorize.await?;
         *lane = std::time::Instant::now();
-        Ok(match self.execute_channel(&call).await {
-            Ok(ChannelCallOutcome::Posted { message_id }) => Ok(message_id),
-            // The executor's PostMessage arm only constructs `Posted`; other
-            // variants are unreachable but must still map safely.
-            Ok(_) => Ok(String::new()),
-            Err(error) => Err(mirror_error(error)),
-        })
+        Ok(self
+            .post_message_after_authorization(channel_id, content, nonce)
+            .await
+            .map_err(mirror_error))
     }
 
     /// `GET /channels/{c}` reduced to `guild_id` + the `@everyone` overwrite
@@ -72,7 +78,7 @@ impl AuditMirror for ActionExecutor {
         let doc = self
             .fetch_channel_document(channel_id)
             .await
-            .map_err(mirror_error)?;
+            .map_err(mirror_read_error)?;
         let guild_id = doc
             .get("guild_id")
             .and_then(|v| v.as_str())
@@ -143,7 +149,7 @@ impl AuditMirror for ActionExecutor {
         let rows = self
             .fetch_channel_messages(channel_id, before, limit)
             .await
-            .map_err(mirror_error)?;
+            .map_err(mirror_read_error)?;
         rows.iter()
             .map(|row| {
                 let parse = || {

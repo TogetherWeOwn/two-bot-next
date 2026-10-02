@@ -2,6 +2,7 @@
 """Offline regressions: no Cargo, network, services, or large fixtures."""
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -129,6 +130,75 @@ class CacheTests(unittest.TestCase):
             (slot / 'lease.json').write_text('{"wrapper_pid": 99999999}')
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
             cache.acquire(self.pool, self.policy)
+
+    def dead_pgid(self):
+        terminated = subprocess.Popen(['true'])
+        terminated.wait()
+        self.assertFalse(cache.group_alive(terminated.pid))
+        return terminated.pid
+
+    def test_stale_lease_with_free_lock_is_recovered(self):
+        slot = self.pool / 'slot-0'
+        lease = {'workspace': str(self.root), 'wrapper_pid': 99999999,
+                 'started_at': 0, 'cargo_pgid': self.dead_pgid()}
+        (slot / 'lease.json').write_text(json.dumps(lease))
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            got, _, fd = cache.acquire(self.pool, self.policy)
+        os.close(fd)
+        self.assertEqual(got.name, 'slot-0')
+        self.assertFalse((slot / 'lease.json').exists())
+        line = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(line['finding'], 'stale_lease_recovered')
+        self.assertEqual(line['cargo_pgid'], lease['cargo_pgid'])
+        print(f"stale recovery receipt: slot-0 lease with dead pgid "
+              f"{lease['cargo_pgid']} admitted, sentinel unlinked")
+
+    def test_held_lock_is_skipped_not_recovered(self):
+        slot = self.pool / 'slot-0'
+        (slot / 'lease.json').write_text(json.dumps(
+            {'workspace': str(self.root), 'wrapper_pid': 99999999,
+             'started_at': 0, 'cargo_pgid': self.dead_pgid()}))
+        held = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        got, _, fd = cache.acquire(self.pool, self.policy)
+        os.close(fd)
+        self.assertEqual(got.name, 'slot-1')
+        self.assertTrue((slot / 'lease.json').exists())
+
+    def test_over_budget_stale_lease_is_still_refused(self):
+        dead = self.dead_pgid()
+        for slot in self.pool.glob('slot-*'):
+            (slot / 'scratch' / 'retained').write_bytes(
+                b'x' * self.policy['slot_budget_bytes'])
+            (slot / 'lease.json').write_text(json.dumps(
+                {'workspace': str(self.root), 'wrapper_pid': 99999999,
+                 'started_at': 0, 'cargo_pgid': dead}))
+        with self.assertRaisesRegex(cache.Refusal, 'no idle'):
+            cache.acquire(self.pool, self.policy)
+        self.assertEqual(len(list(self.pool.glob('slot-*/lease.json'))), 2)
+
+    def test_live_recorded_group_is_still_refused(self):
+        live = subprocess.Popen(['sleep', '30'], start_new_session=True)
+
+        def finish_live():
+            live.terminate()
+            try:
+                live.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                live.kill()
+                live.wait(timeout=5)
+
+        self.addCleanup(finish_live)
+        self.assertTrue(cache.group_alive(live.pid))
+        for slot in self.pool.glob('slot-*'):
+            (slot / 'lease.json').write_text(json.dumps(
+                {'workspace': str(self.root), 'wrapper_pid': 99999999,
+                 'started_at': 0, 'cargo_pgid': live.pid}))
+        with self.assertRaisesRegex(cache.Refusal, 'no idle'):
+            cache.acquire(self.pool, self.policy)
+        self.assertEqual(len(list(self.pool.glob('slot-*/lease.json'))), 2)
 
     def test_over_budget_idle_slots_are_not_reused(self):
         self.policy['slot_budget_bytes'] = 1
@@ -308,6 +378,76 @@ class CacheTests(unittest.TestCase):
             with self.assertRaisesRegex(cache.Refusal, 'insufficient'):
                 cache.run_cargo(self.pool, ['check'], cargo=str(self.fake))
         self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
+
+    def no_cargo_environment(self):
+        # PATH, CARGO_HOME and HOME all point at empty directories.
+        empty = self.root / 'no-cargo'
+        empty.mkdir(exist_ok=True)
+        return patch.dict(os.environ, PATH=str(empty), CARGO_HOME=str(empty), HOME=str(empty))
+
+    def assert_slots_reusable(self):
+        self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
+        slot, _, fd = cache.acquire(self.pool, self.policy)
+        os.close(fd)
+        self.assertEqual(slot.name, 'slot-0')
+
+    def test_missing_cargo_is_refused_before_leasing(self):
+        # TOG-11995: agent PATH had no cargo, so every run wedged a slot.
+        with self.no_cargo_environment():
+            with patch.object(cache, 'acquire', side_effect=AssertionError('pool touched')):
+                with self.assertRaisesRegex(cache.Refusal, 'not found on PATH'):
+                    cache.run_cargo(self.pool, ['check'])
+            err = io.StringIO()
+            with patch.object(sys, 'argv', ['cargo_cache.py', 'run', '--pool', str(self.pool),
+                                           '--', 'check']):
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(cache.main(), 75)
+            self.assertIn('not found on PATH', err.getvalue())
+        self.assert_slots_reusable()
+
+    def test_cargo_resolves_from_cargo_home_then_home(self):
+        self.fake.write_text('#!' + sys.executable + '\n'
+                             'import os,sys\n'
+                             'path=os.environ["PATH"].split(os.pathsep)\n'
+                             'sys.exit(0 if path[0]==os.path.dirname(sys.argv[0]) else 3)\n')
+        with self.no_cargo_environment():
+            for variable in ('CARGO_HOME', 'HOME'):
+                home = self.root / f'from-{variable}'
+                bindir = home / 'bin' if variable == 'CARGO_HOME' else home / '.cargo' / 'bin'
+                bindir.mkdir(parents=True)
+                shutil.copy2(self.fake, bindir / 'cargo')
+                with self.subTest(variable=variable), patch.dict(os.environ, {variable: str(home)}):
+                    self.assertEqual(cache.resolve_cargo('cargo'), str(bindir / 'cargo'))
+                    # The child PATH gains the proxy directory; the parent's does not.
+                    self.assertEqual(cache.run_cargo(self.pool, ['check']), 0)
+                    self.assertNotIn(str(bindir), os.environ['PATH'])
+                    self.assert_slots_reusable()
+            self.assertEqual(cache.resolve_cargo(str(self.fake)), str(self.fake))
+            with self.assertRaises(cache.Refusal):
+                cache.resolve_cargo(str(self.root / 'missing' / 'cargo'))
+
+    def test_failed_spawn_releases_its_own_lease(self):
+        # Popen raising OSError means exec/fork failed and no writer ever
+        # existed, while this process still holds the slot flock: the
+        # wrapper removes its own sentinel. Covers a mocked FileNotFoundError
+        # and a real exec failure (executable with a missing interpreter).
+        import signal as sigmod
+        lease = self.pool / 'slot-0' / 'lease.json'
+
+        def failing_popen(*args, **kwargs):
+            self.assertTrue(lease.exists(), 'lease must exist before spawn')
+            raise FileNotFoundError(2, 'No such file or directory', args[0][0])
+
+        broken = self.root / 'broken-cargo'
+        broken.write_text('#!' + str(self.root / 'missing-interpreter') + '\n')
+        broken.chmod(0o700)
+        before = sigmod.getsignal(sigmod.SIGTERM)
+        for name, popen in (('mocked', failing_popen), ('real', subprocess.Popen)):
+            with self.subTest(name), patch.object(subprocess, 'Popen', popen):
+                with self.assertRaises(FileNotFoundError):
+                    cache.run_cargo(self.pool, ['check'], cargo=str(broken))
+                self.assertIs(sigmod.getsignal(sigmod.SIGTERM), before)
+                self.assert_slots_reusable()
 
     def test_budget_escape_arguments_refused(self):
         for args in (['clean'], ['run'], ['check', '--target-dir=/tmp/other'],
