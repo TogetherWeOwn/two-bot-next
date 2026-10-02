@@ -104,7 +104,7 @@ async fn write(
         .push((method.to_string(), path.to_owned(), body.clone()));
     if method == Method::POST {
         state.next_id += 1;
-        let id = format!("created-{}", state.next_id);
+        let id = (9_000_000_000_000_000_000u64 + state.next_id as u64).to_string();
         let field = match path {
             "/guilds/g/roles" => "roles",
             "/guilds/g/channels" => "channels",
@@ -161,7 +161,8 @@ async fn write(
             .unwrap();
         merge(target, &body);
     }
-    response(json!({}))
+    // Minimal synthetic resource receipt; target/delta assertions inspect writes.
+    response(json!({"id": "1"}))
 }
 
 async fn fake(live: Map<String, Value>) -> FakeDiscord {

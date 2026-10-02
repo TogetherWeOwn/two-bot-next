@@ -36,7 +36,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
-`community_scorecard` and `inactivity` (the last two may be parked by configuration).
+`community_scorecard`, `inactivity` and `audit_retry` (the last three may be
+parked by configuration).
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -111,9 +112,14 @@ as dynamic labels.
   `POST /guilds/:guild/scheduled-events`,
   `PATCH /guilds/:guild/scheduled-events/:event`,
   `DELETE /guilds/:guild/scheduled-events/:event`, `other`).
-- `two_bot_job_last_success_timestamp_seconds{job}` — `job` is one of
-  `invite_snapshot`, `session_checkpoint`, `other`. `session_checkpoint`
-  records successful durable gateway commits; zero means never run.
+- `two_bot_job_runs_total{job,outcome}`,
+  `two_bot_job_last_success_timestamp_seconds{job}` and
+  `two_bot_job_consecutive_failures{job}` — `job` is one of
+  `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
+  `scheduled_events`, `presence_probe`, `community_scorecard`, `inactivity`,
+  `audit_retry`, `other`; `outcome` is `success` or `failure`.
+  `session_checkpoint` records successful durable gateway commits; zero means
+  never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
   `_sum` and `_count`.
@@ -197,6 +203,11 @@ server, no new infrastructure.
 | `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
+
+`job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
+Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
+have no cadence and are exempt. `wrangler/test/alert-job-catalog.test.ts` fails
+when a `JOBS` label has neither a matching cadence nor a reasoned exemption.
 
 Packet identity (TOG-12100): rule ids above are the single shared spelling
 used on both sides of the B2 soak evidence seam. The Rust canonical list is

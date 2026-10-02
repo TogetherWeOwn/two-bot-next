@@ -5,8 +5,9 @@
 delivery engine for [TOG-9810](/TOG/issues/TOG-9810): events are recorded
 before anything is sent, every send is fenced by the persistent kill switch,
 and an ambiguous post is reconciled against mirror history instead of
-resent. **No runtime wiring is included** — gateway classification and
-moderation recording are [TOG-10346](/TOG/issues/TOG-10346). Nothing here touches a production or
+resent. [TOG-12240](/TOG/issues/TOG-12240) runs it in the bot (see
+[Runtime](#runtime)); gateway classification and moderation recording are
+[TOG-10346](/TOG/issues/TOG-10346). Nothing here touches a production or
 staging guild, token or database.
 
 ## Pieces
@@ -95,6 +96,40 @@ This does not bypass required durable writes or the final transactional
 send authorization: their failures stop delivery. Engage/disengage edges
 are logged once each.
 
+## Runtime
+
+`crates/bot/src/audit_runtime.rs` builds one `AuditMirrorService` per
+process over the jobs pool and the shared `ActionExecutor`, so mirror posts
+use the same pacing lanes as every other REST call. The pool and the bot's
+own user id (`GET /users/@me`, the reconciliation author) are resolved on
+the first sweep or record call, never at boot; a failed connect caches
+nothing and the next sweep retries.
+
+| Variable | Effect |
+|---|---|
+| `DISCORD_AUDIT_LOG_CHANNEL_ID` | Audit destination; voice and moderation fall back to it |
+| `DISCORD_VOICE_LOG_CHANNEL_ID` | Voice destination |
+| `DISCORD_MODERATION_LOG_CHANNEL_ID` | Moderation destination |
+
+With none set (blank counts as unset) the runtime is inert: no job, no
+handle, and `audit_retry` reports parked with reason `disabled`. A value
+that is not a canonical nonzero snowflake parks it as `invalid_config`;
+the raw value is never logged.
+
+- `audit_retry` (legacy `audit.retryPending()` + 30 s sweep): every 30 s,
+  first run within 5 s of start, timeout 25 s. One `drain_pending` call
+  claims at most 25 rows. An engaged halt skips the sweep before any claim;
+  a halt that lands mid-sweep is honored per row and held claims are
+  released unattempted. Rows whose store write failed fail the run
+  (`database`); every per-row Discord outcome counts as success. Outcomes
+  reach `/metrics` through the supervisor's `two_bot_job_*{job="audit_retry"}`
+  series.
+- `audit_runtime::handle()` exposes the same runtime to recorders;
+  `AuditRuntime::record` routes and stores one event for the next sweep.
+- Logs carry counts and entry IDs only: `audit_retry_swept` (per-outcome
+  counts), `audit_entry_quarantined` (entry ID + reason),
+  `audit_entry_store_failed` (entry ID, no error text), halt edges.
+
 ## Testing
 
 - `crates/discord/tests/audit_mirror.rs`: enforced nonce/mention wire shape,
@@ -105,6 +140,11 @@ are logged once each.
   accepted-post ack loss, adoption ack loss + restart, definite rejection,
   ambiguous history + healthy recovery, privacy/guild/refusal, expired
   prepared senders (including replacement quarantine), and halt/recovery.
+- `crates/bot/src/audit_runtime_tests.rs`: env gating, once-only delivery,
+  halt skip + held-claim release, ambiguous-post reconciliation, the 25-row
+  cap, one loopback-REST pass through `ActionExecutor`, job metrics and log
+  hygiene (agent-testdb/CI service plus a mirror double; runs in the
+  unit/binary `cargo test` step).
 - `.github/workflows/check.yml` explicitly runs the ignored `audit_service`
   and `audit_store` tests against the ephemeral CI Postgres service.
 
