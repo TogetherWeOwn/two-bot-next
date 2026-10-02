@@ -68,7 +68,7 @@ pub fn enforce(raw: &str, policy: TlsPolicy) -> Result<(), &'static str> {
     let url = url::Url::parse(raw).map_err(|_| INVALID_URL)?;
     let mut hosts = Vec::new();
     match url.host() {
-        Some(url::Host::Domain(host)) if host.is_empty() => {}
+        Some(url::Host::Domain("")) => {}
         Some(url::Host::Domain(host)) => hosts.push(classify_authority(host)),
         Some(url::Host::Ipv4(ip)) => hosts.push(classify_ip(ip.into())),
         Some(url::Host::Ipv6(ip)) => hosts.push(classify_ip(ip.into())),
