@@ -15,10 +15,12 @@
     "containers": "wrangler containers"
   },
   "dependencies": {
-    "@cloudflare/containers": "0.3.7"
+    "@cloudflare/containers": "0.3.7",
+    "pg": "8.23.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260929.1",
+    "@types/pg": "8.23.1",
     "typescript": "7.0.2",
     "wrangler": "4.143.1"
   }

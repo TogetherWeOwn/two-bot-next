@@ -16,8 +16,8 @@
  * B3 (TOG-9696): the same Worker also serves the go.two.gg redirect — every
  * path except /health and /readyz is a tracked invite link (see redirect.ts,
  * a behavioral port of two-bot's src/redirect/server.ts). The mapping source
- * is Hyperdrive → shared Neon Postgres once S1 lands; until then
- * REDIRECT_MAPPINGS_JSON carries a snapshot of the same rows.
+ * is Hyperdrive → shared Neon Postgres when the optional REDIRECT_DB binding
+ * exists; otherwise REDIRECT_MAPPINGS_JSON carries a snapshot of the same rows.
  */
 
 import { Container } from "@cloudflare/containers";
@@ -30,6 +30,7 @@ import {
   type RedirectClick,
 } from "./redirect.ts";
 import { RedirectStore, parseMappingsSnapshot } from "./redirect-store.ts";
+import { connectPostgres } from "./redirect-db.ts";
 import {
   EMPTY_STATE,
   evaluateMetrics,
@@ -51,11 +52,11 @@ export interface Env {
   OPS_ALERT_WEBHOOK_URL?: string;
   /** Optional Worker secret: bearer token for GET /ops/metrics. Unset → route 404s. */
   METRICS_SCRAPE_TOKEN?: string;
-  /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
+  /** Optional Hyperdrive binding to shared Postgres; absent → snapshot, clicks dropped. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
   REDIRECT_FALLBACK_CODE?: string;
-  /** JSON snapshot of invite_campaigns rows (pre-S1 mapping source). */
+  /** JSON snapshot of invite_campaigns rows (mapping source without REDIRECT_DB). */
   REDIRECT_MAPPINGS_JSON?: string;
 }
 
@@ -66,10 +67,10 @@ const clickBuckets = new TokenBuckets();
 function redirectStore(env: Env): RedirectStore {
   const raw = env.REDIRECT_MAPPINGS_JSON;
   const snapshot = raw === undefined || raw === "" ? [] : parseMappingsSnapshot(raw);
-  // node-postgres ships inside the Worker via the `nodejs_compat` flag only
-  // when S1 wires Hyperdrive; until then connect stays undefined and the
-  // store serves the snapshot with clicks dropped (logged, never faked).
-  return new RedirectStore(env.REDIRECT_DB, undefined, snapshot);
+  // Without the binding there is no connector: the store serves the snapshot
+  // and drops clicks (logged, never faked) exactly as before TOG-12194.
+  const connect = env.REDIRECT_DB === undefined ? undefined : connectPostgres;
+  return new RedirectStore(env.REDIRECT_DB, connect, snapshot);
 }
 
 interface KeepalivePayload {
