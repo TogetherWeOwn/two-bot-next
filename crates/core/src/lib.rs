@@ -94,6 +94,7 @@ pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_config;
 pub mod voice_config_diff;
+pub mod voice_custom_id;
 pub mod voice_naming;
 pub mod voice_ownership;
 pub mod voice_permission_health;
