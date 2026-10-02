@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
 use twilight_model::gateway::event::Event;
 use twilight_model::util::Timestamp;
+use two_bot_core::automod_runtime::FunnelDisposition;
 use two_bot_core::{
     ChannelClass, ExpectedJoins, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput,
     InviteSnapshotStore, InviteState, InviteTracker, JoinInput, LevelingHook, MessageInput,
@@ -380,6 +381,15 @@ impl<
         self.handle_at(event, &two_bot_core::now_iso());
     }
 
+    /// Shared async orchestration supplies the result after durable claim and
+    /// inspection. `None` keeps cache handling but skips duplicate/pending
+    /// creates; `CaptureOnly` records facts without XP/activity/milestones.
+    /// Updates never award the funnel, regardless of this disposition. Call
+    /// this instead of `handle`, not in addition to it.
+    pub fn handle_with_message_disposition(&self, event: &Event, disposition: FunnelDisposition) {
+        self.handle_at_with_message_disposition(event, &two_bot_core::now_iso(), disposition);
+    }
+
     /// Drive a received event after queueing without changing its occurrence
     /// time. Payload timestamps win; timestamp-less transitions use receipt time.
     pub fn handle_at(&self, event: &Event, observed_at: &str) {
@@ -393,6 +403,36 @@ impl<
         event: &Event,
         observed_at: &str,
         eligibility: MessageEligibility,
+    ) {
+        self.handle_inner(event, observed_at, eligibility, true);
+    }
+
+    /// Combine the replay clock with the automod decision without handling twice.
+    pub fn handle_at_with_message_disposition(
+        &self,
+        event: &Event,
+        observed_at: &str,
+        disposition: FunnelDisposition,
+    ) {
+        self.handle_inner(
+            event,
+            observed_at,
+            MessageEligibility {
+                is_staff_automation: false,
+                capture_only: disposition == FunnelDisposition::CaptureOnly,
+            },
+            disposition != FunnelDisposition::None,
+        );
+    }
+
+    /// Shared funnel core. `deliver` is false only for the automod `None`
+    /// disposition: cache handling still runs, message handlers are skipped.
+    fn handle_inner(
+        &self,
+        event: &Event,
+        observed_at: &str,
+        eligibility: MessageEligibility,
+        deliver: bool,
     ) {
         match event {
             // Fresh session after (re-)identify: first connect starts empty
@@ -522,7 +562,9 @@ impl<
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
                 };
                 self.cache.update(event);
-                self.handlers.on_message(input);
+                if deliver {
+                    self.handlers.on_message(input);
+                }
             }
             Event::VoiceStateUpdate(update) => {
                 let Some(guild_id) = update.guild_id.map(|g| g.get()) else {
