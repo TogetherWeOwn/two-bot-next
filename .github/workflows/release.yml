@@ -227,7 +227,7 @@ jobs:
     if: ${{ !cancelled() && needs.sbom-target.result == 'success' }}
     permissions:
       contents: read
-    uses: ./.github/workflows/sbom.yml
+    uses: ./.github/workflows/sbom.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
       ref: ${{ needs.sbom-target.outputs.ref }}
 
