@@ -65,10 +65,10 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod member_leave_gap;
 pub mod member_moderation;
 #[cfg(feature = "db")]
 pub mod member_moderation_store;
-pub mod member_leave_gap;
 pub mod membership;
 pub mod message_safety;
 pub mod metrics;
