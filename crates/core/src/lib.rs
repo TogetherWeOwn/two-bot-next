@@ -90,6 +90,7 @@ pub mod settings;
 pub mod sticky;
 pub mod tickets;
 pub mod voice;
+pub mod voice_access;
 pub mod voice_alias;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
@@ -332,6 +333,10 @@ pub use voice::{
     known_voice_durations, parse_voice_end_metadata, resolve_voice_end, summarize_voice_durations,
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
+};
+pub use voice_access::{
+    is_voice_command, may_create_room, may_use_command, validate_access_controls, AccessControls,
+    AccessDecision, AccessDenyReason, AccessError, AccessMember, RoleId, VOICE_COMMANDS,
 };
 pub use voice_permission_health::{
     evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
