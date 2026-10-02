@@ -14,6 +14,11 @@ use thiserror::Error;
 
 pub const VOICE_CONFIG_VERSION: u32 = 1;
 
+/// Largest accepted import payload in bytes. Oversized uploads fail before
+/// parsing, so a huge document can never partially apply. Real configurations
+/// are a few kilobytes; the cap is headroom, not a target.
+pub const MAX_IMPORT_BYTES: usize = 256 * 1024;
+
 /// Snowflakes are decimal strings on the wire to preserve all 64 bits in JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -194,6 +199,9 @@ pub fn import_configuration(
     json: &[u8],
     inventory: &GuildInventory,
 ) -> Result<VoiceConfiguration, VoiceConfigError> {
+    if json.len() > MAX_IMPORT_BYTES {
+        return Err(invalid("document", "exceeds the import size limit"));
+    }
     let mut deserializer = serde_json::Deserializer::from_slice(json);
     let config = object(&mut deserializer)?;
     deserializer.end()?;

@@ -106,7 +106,7 @@ two-bot operator commands
       Read-only privilege drift inspection. Env: TWO_DATABASE_URL (required).
 
   two-bot backup
-      Dump all bot-owned tables (v3 format) to TWO_BACKUP_DIR
+      Dump all bot-owned tables (v4 format) to TWO_BACKUP_DIR
       (default ./backups) as two-funnel-<stamp>.ndjson.gz, prune to
       TWO_BACKUP_KEEP newest (default 14), then run TWO_BACKUP_UPLOAD_CMD
       with the file path as its last argument.
@@ -148,6 +148,47 @@ two-bot operator commands
       --confirm-staging-guild.
 ";
 
+/// The subcommands whose help is `USAGE`; `db` and `erase-member` parse
+/// their own.
+const SUBCOMMANDS: [&str; 5] = [
+    "backup",
+    "restore",
+    "backup-upload",
+    "guild-config-snapshot",
+    "guild-config-restore",
+];
+
+/// What `dispatch` does with a subcommand, decided from its arguments alone.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    Help,
+    Usage(String),
+    Run,
+}
+
+/// Help and usage errors are settled here, before any env, DB or network
+/// read: `two-bot backup --help` must never dump, prune or upload, and
+/// `backup-upload --help` must never be taken for a path. A `--` ends
+/// options (restore's grammar), so `restore -- -h` still names a file.
+fn route(subcommand: &str, rest: &[String]) -> Route {
+    if !SUBCOMMANDS.contains(&subcommand) {
+        return Route::Run;
+    }
+    if rest
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        return Route::Help;
+    }
+    match (subcommand, rest.first()) {
+        ("backup" | "guild-config-snapshot", Some(extra)) => Route::Usage(format!(
+            "{subcommand}: unexpected argument {extra:?}.\n{USAGE}"
+        )),
+        _ => Route::Run,
+    }
+}
+
 /// Dispatch `args` (without the program name). Returns the exit code.
 /// `serve` is handled by the caller: this returns 100 when no backup
 /// subcommand was given so `main` falls through to the gateway path.
@@ -158,6 +199,17 @@ pub async fn dispatch(args: &[String]) -> i32 {
         }
         print!("{USAGE}");
         return 0;
+    }
+    match route(&args[0], &args[1..]) {
+        Route::Help => {
+            print!("{USAGE}");
+            return 0;
+        }
+        Route::Usage(message) => {
+            eprintln!("{message}");
+            return 2;
+        }
+        Route::Run => {}
     }
     match args[0].as_str() {
         "db" => crate::database_roles_cli::dispatch(&args[1..]).await,
@@ -705,6 +757,49 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+async fn governed_guild_config_api(
+    token: String,
+    guild_id: String,
+) -> Result<GuildConfigDiscordApi, String> {
+    // Offline CLI fixtures must explicitly opt in and supply both loopback
+    // endpoints. A supplied authority (even empty/invalid) is never bypassed.
+    if env::var_os("TWO_DATABASE_URL").is_none()
+        && env_var("TWO_GUILD_CONFIG_OFFLINE_TEST").as_deref() == Some("1")
+    {
+        let api_base =
+            env_var("GUILD_CONFIG_API_BASE").ok_or("offline fixture API base required")?;
+        let cdn_base =
+            env_var("GUILD_CONFIG_CDN_BASE").ok_or("offline fixture CDN base required")?;
+        return GuildConfigDiscordApi::new(
+            Some(&api_base),
+            Some(&cdn_base),
+            token,
+            guild_config::STAGING_BOT_APPLICATION_ID.to_owned(),
+            guild_id,
+        )
+        .map_err(|error| error.to_string());
+    }
+    let url = env_var("TWO_DATABASE_URL").ok_or("TWO_DATABASE_URL admission authority required")?;
+    let options = two_bot_core::database_url::connect_options(&url)
+        .map_err(|_| "Discord admission authority unavailable")?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await
+        .map_err(|_| "Discord admission authority unavailable")?;
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(pool, &token)
+        .map_err(|error| error.to_string())?;
+    GuildConfigDiscordApi::with_admission(
+        env_var("GUILD_CONFIG_API_BASE").as_deref(),
+        env_var("GUILD_CONFIG_CDN_BASE").as_deref(),
+        token,
+        guild_config::STAGING_BOT_APPLICATION_ID.to_owned(),
+        guild_id,
+        std::sync::Arc::new(admission),
+    )
+    .map_err(|error| error.to_string())
+}
+
 async fn cmd_guild_config_snapshot() -> i32 {
     let token = match staging_token() {
         Ok(token) => token,
@@ -726,13 +821,7 @@ async fn cmd_guild_config_snapshot() -> i32 {
         }
     };
 
-    let api = match GuildConfigDiscordApi::new(
-        env_var("GUILD_CONFIG_API_BASE").as_deref(),
-        env_var("GUILD_CONFIG_CDN_BASE").as_deref(),
-        token,
-        guild_config::STAGING_BOT_APPLICATION_ID.to_owned(),
-        guild_id.clone(),
-    ) {
+    let api = match governed_guild_config_api(token, guild_id.clone()).await {
         Ok(api) => api,
         Err(err) => {
             eprintln!("guild-config-snapshot: {err}");
@@ -973,13 +1062,7 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
         return 2;
     }
 
-    let mut api = match GuildConfigDiscordApi::new(
-        env_var("GUILD_CONFIG_API_BASE").as_deref(),
-        env_var("GUILD_CONFIG_CDN_BASE").as_deref(),
-        token,
-        guild_config::STAGING_BOT_APPLICATION_ID.to_owned(),
-        guild_id.clone(),
-    ) {
+    let mut api = match governed_guild_config_api(token, guild_id.clone()).await {
         Ok(api) => api,
         Err(err) => {
             eprintln!("guild-config-restore: {err}");
@@ -1135,7 +1218,28 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_staging_token, prune_backups};
+    use super::{load_staging_token, prune_backups, route, Route};
+
+    #[test]
+    fn admission_query_guard_child() {
+        if std::env::var_os("ADMISSION_BOOTSTRAP_PROBE").is_none() {
+            return;
+        }
+        crate::admission_test_support::capture_probe(async {
+            let error = super::governed_guild_config_api(
+                "fixture-token".to_owned(),
+                "fixture-guild".to_owned(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, "Discord admission authority unavailable");
+        });
+    }
+
+    #[test]
+    fn admission_query_guard_redacts_dependency_logs() {
+        crate::admission_test_support::run_probe("backup_cli::tests::admission_query_guard_child");
+    }
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1242,6 +1346,78 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn help_after_any_subcommand_routes_to_usage() {
+        for subcommand in super::SUBCOMMANDS {
+            for rest in [
+                &["--help"][..],
+                &["-h"],
+                &["extra", "--help"],
+                &["--snapshot", "-h"],
+                &["--force", "--dry-run", "--help"],
+            ] {
+                assert_eq!(
+                    route(subcommand, &strings(rest)),
+                    Route::Help,
+                    "{subcommand} {rest:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_after_option_terminator_is_an_operand() {
+        // restore reads `-- -h` as a file named `-h`; backup-upload refuses
+        // two arguments itself, so `--help` is still never its path.
+        for subcommand in ["restore", "backup-upload", "guild-config-restore"] {
+            assert_eq!(
+                route(subcommand, &strings(&["--", "-h"])),
+                Route::Run,
+                "{subcommand}"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_argument_to_argumentless_subcommand_is_a_usage_error() {
+        for subcommand in ["backup", "guild-config-snapshot"] {
+            for extra in ["now", "--force", "--"] {
+                let Route::Usage(message) = route(subcommand, &strings(&[extra])) else {
+                    panic!("{subcommand} {extra} must refuse");
+                };
+                assert!(message.starts_with(&format!("{subcommand}: unexpected argument")));
+                assert!(message.contains(&format!("{extra:?}")));
+                assert!(message.ends_with(super::USAGE));
+            }
+            assert_eq!(route(subcommand, &[]), Route::Run);
+        }
+    }
+
+    #[test]
+    fn operand_subcommands_and_foreign_help_run_unchanged() {
+        assert_eq!(
+            route("restore", &strings(&["dump.ndjson.gz", "--dry-run"])),
+            Route::Run
+        );
+        assert_eq!(
+            route("backup-upload", &strings(&["dump.ndjson.gz"])),
+            Route::Run
+        );
+        assert_eq!(
+            route("guild-config-restore", &strings(&["--snapshot", "s.json"])),
+            Route::Run
+        );
+        // `db` and `erase-member` own their help; unknown names reach the
+        // unknown-subcommand refusal.
+        for subcommand in ["db", "erase-member", "serve"] {
+            assert_eq!(route(subcommand, &strings(&["--help"])), Route::Run);
+        }
     }
 
     #[test]

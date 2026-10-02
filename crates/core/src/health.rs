@@ -8,7 +8,7 @@
 use serde::Serialize;
 
 /// Readiness of one component (database pool, gateway shard, …).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ComponentStatus {
     Ready,
@@ -40,7 +40,7 @@ impl HealthReport {
 }
 
 /// Fixed component identities for the offline voice-readiness contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceComponent {
     Gateway,
@@ -107,7 +107,7 @@ impl VoiceHealthReport {
 }
 
 /// Permissions named by docs/voice-rooms.md §V10, not raw Discord error text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoicePermission {
     ManageChannels,
@@ -117,7 +117,7 @@ pub enum VoicePermission {
 }
 
 /// Preserves the level causing a refusal; category names/IDs stay with the adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoicePermissionScope {
     Guild,
@@ -141,7 +141,7 @@ pub enum VoiceFailureKind {
 
 /// Closed diagnostic vocabulary: no source messages, URLs, names or credentials
 /// can be embedded. Safe to serialize or format for a V10 error notice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, thiserror::Error)]
 #[serde(tag = "category", rename_all = "snake_case")]
 pub enum VoiceDiagnostic {
     #[error("{component:?} is not ready ({status:?}).")]

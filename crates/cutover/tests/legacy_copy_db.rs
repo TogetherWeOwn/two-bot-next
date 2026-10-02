@@ -3,10 +3,14 @@
 use serde_json::Value;
 use sqlx::postgres::{PgPoolOptions, PgSslMode};
 use sqlx::{PgPool, Row};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use two_bot_cutover::legacy_copy::{copy, mapping, options::guarded_target, CopyError, Table};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+// Parallel tests share one pid and can read the same clock tick.
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
 struct Pair {
     admin: PgPool,
@@ -18,9 +22,10 @@ struct Pair {
 impl Pair {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let suffix = format!(
-            "{}_{}",
+            "{}_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
         );
         let names = [
             format!("two_bot_test_copy_s_{suffix}"),
