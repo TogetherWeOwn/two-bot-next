@@ -47,7 +47,8 @@ KEEPALIVE_SECONDS = "60"
 # bindings are non-inheritable, so an [env.*] with only `vars` deploys a
 # Worker whose env.TWO_BOT is undefined (staging HTTP 1101, TOG-9907).
 # Staging deploys automatically via deploy-staging.yml; production deploys are
-# manual and owned by B4 (TOG-9699) — no workflow targets it.
+# manual and owned by B4 (TOG-9699): only the dispatch-only deploy-production.yml,
+# behind the `production` GitHub Environment (docs/production-deploy.md).
 # Secrets per environment (never here):
 #   wrangler secret put --env staging DISCORD_TOKEN      # staging bot token
 #   wrangler secret put --env staging GUILD_ID           # TWO Staging guild
