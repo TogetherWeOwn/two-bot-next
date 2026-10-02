@@ -20,6 +20,7 @@ static ISOLATED_PROGRESS: AtomicU64 = AtomicU64::new(0);
 
 const CHANNEL: &str = "333333333333333333";
 const MESSAGE: &str = "444444444444444444";
+const OTHER: &str = "555555555555555555";
 
 #[derive(Clone)]
 struct Reply {
@@ -78,13 +79,27 @@ impl MockDiscord {
             .expect("mock setup must finish without advancing Tokio time")
     }
 
+    /// The nth request gets the nth reply; the last one repeats.
+    async fn start_sequence(replies: Vec<Reply>) -> Self {
+        stall_watchdog(STALL_GRACE, Self::start_inner_sequence(replies))
+            .await
+            .expect("mock setup must finish without advancing Tokio time")
+    }
+
     async fn start_inner(reply: Reply) -> Self {
+        Self::start_inner_sequence(vec![reply]).await
+    }
+
+    async fn start_inner_sequence(replies: Vec<Reply>) -> Self {
         let clock_hold = ClockHold::start().await;
         let clock_released = clock_hold.released.clone();
         let request_received = Arc::new(tokio::sync::Notify::new());
         let response_received = Arc::new(tokio::sync::Notify::new());
         let received = request_received.clone();
-        let stall_response = reply.stall_response;
+        let stall_response = replies
+            .first()
+            .map(|reply| reply.stall_response)
+            .unwrap_or(false);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -136,6 +151,10 @@ impl MockDiscord {
                 });
                 received.notify_one();
                 mark_progress();
+                let reply = {
+                    let seen = seen.lock().unwrap();
+                    replies[(seen.len() - 1).min(replies.len() - 1)].clone()
+                };
                 if reply.disconnect {
                     continue;
                 }
@@ -177,7 +196,8 @@ impl MockDiscord {
         let client = TwilightClient::builder()
             .token(format!("local-fixture-{}", std::process::id()))
             .build();
-        let mut executor = AnnouncementExecutor::new(Arc::new(client), keys);
+        let mut executor =
+            AnnouncementExecutor::new(Arc::new(client), keys, CooldownGovernor::new());
         executor.api_origin = self.origin.clone();
         executor.timeout = Duration::from_millis(100);
         executor.response_received = Some(self.response_received.clone());
@@ -702,5 +722,118 @@ async fn outcomes_debug_serialization_and_logs_never_echo_sensitive_values() {
             !output.contains(forbidden),
             "sensitive value escaped safe contract"
         );
+    }
+}
+
+const COOLING: ExecutionOutcome = ExecutionOutcome::NoEffect(Refusal::CoolingDown);
+
+fn two_channel_keys() -> HashMap<String, String> {
+    two_bot_core::internal_actions::build_channel_keys(&format!("ann:{CHANNEL},other:{OTHER}"))
+        .unwrap()
+}
+
+fn other_channel() -> Map<String, Value> {
+    payload(json!({"channel_key": "other", "body": "elsewhere"}))
+}
+
+fn rate_limited(headers: &str) -> Reply {
+    let mut reply = Reply::new(429, "{}");
+    reply.headers = headers.to_owned();
+    reply
+}
+
+fn posted_in(channel: &str) -> Reply {
+    Reply::new(
+        200,
+        json!({"id": MESSAGE, "channel_id": channel}).to_string(),
+    )
+}
+
+// Cooldown sends run on a frozen clock: the fixture's clock hold inhibits idle
+// auto-advance while loopback I/O is pending, so `run_once` observes zero
+// elapsed time and every expiry is driven by `advance`, never by sleeping.
+#[tokio::test(start_paused = true)]
+async fn channel_cooldown_refuses_that_channel_without_http_while_others_proceed() {
+    let mock = MockDiscord::start_sequence(vec![
+        rate_limited("Retry-After: 60\r\nX-RateLimit-Scope: user\r\n"),
+        posted_in(OTHER),
+        posted_in(CHANNEL),
+    ])
+    .await;
+    let executor = mock.executor(two_channel_keys());
+    let clone = executor.clone();
+    assert_eq!(
+        run_once(&executor, &announcement("first")).await,
+        ExecutionOutcome::RateLimited(RateLimitCooldown {
+            scope: CooldownScope::Channel(Id::new(CHANNEL.parse().unwrap())),
+            retry_after_ms: Some(60_000),
+        })
+    );
+    for shared in [&executor, &clone] {
+        assert_eq!(run_once(shared, &announcement("second")).await, COOLING);
+    }
+    assert_eq!(mock.count(), 1);
+    assert!(matches!(
+        run_once(&clone, &other_channel()).await,
+        ExecutionOutcome::Posted(_)
+    ));
+    assert_eq!(mock.count(), 2);
+
+    advance(Duration::from_secs(59)).await;
+    assert_eq!(run_once(&executor, &announcement("held")).await, COOLING);
+    advance(Duration::from_secs(1)).await;
+    assert!(matches!(
+        run_once(&executor, &announcement("after expiry")).await,
+        ExecutionOutcome::Posted(_)
+    ));
+    assert_eq!(mock.count(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn global_cooldown_refuses_every_channel_without_http_until_expiry() {
+    let mock = MockDiscord::start_sequence(vec![
+        rate_limited("Retry-After: 30\r\nX-RateLimit-Global: true\r\n"),
+        posted_in(OTHER),
+    ])
+    .await;
+    let executor = mock.executor(two_channel_keys());
+    assert_eq!(
+        run_once(&executor, &announcement("first")).await,
+        ExecutionOutcome::RateLimited(RateLimitCooldown {
+            scope: CooldownScope::Global,
+            retry_after_ms: Some(30_000),
+        })
+    );
+    for elapsed in [0, 29] {
+        advance(Duration::from_secs(elapsed)).await;
+        for body in [announcement("again"), other_channel()] {
+            assert_eq!(run_once(&executor.clone(), &body).await, COOLING);
+        }
+    }
+    assert_eq!(mock.count(), 1);
+    advance(Duration::from_secs(1)).await;
+    assert!(matches!(
+        run_once(&executor, &other_channel()).await,
+        ExecutionOutcome::Posted(_)
+    ));
+    assert_eq!(mock.count(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_rate_limits_end_each_intent_and_feed_every_cooldown() {
+    let mock = MockDiscord::start(rate_limited(
+        "Retry-After: 1\r\nX-RateLimit-Scope: user\r\n",
+    ))
+    .await;
+    let executor = mock.executor(keys());
+    for round in 1..=3 {
+        // One send, then a terminal result: nothing waits out or retries a 429.
+        assert!(matches!(
+            run_once(&executor, &announcement("again")).await,
+            ExecutionOutcome::RateLimited(_)
+        ));
+        assert_eq!(run_once(&executor, &announcement("again")).await, COOLING);
+        assert_eq!(mock.count(), round);
+        advance(Duration::from_secs(1)).await;
     }
 }
