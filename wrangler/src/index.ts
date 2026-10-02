@@ -37,7 +37,12 @@ import {
   redirectErrorClass,
   type RedirectClick,
 } from "./redirect.ts";
-import { RedirectStore, parseMappingsSnapshot } from "./redirect-store.ts";
+import {
+  CampaignLookupCache,
+  DB_TIMEOUT_MS,
+  RedirectStore,
+  parseMappingsSnapshot,
+} from "./redirect-store.ts";
 import { connectPostgres } from "./redirect-db.ts";
 import { forwardedFlagVars, type ForwardedFlagEnv } from "./container-env.ts";
 import {
@@ -101,13 +106,29 @@ function missCacheFor(env: Env): RedirectMissCache {
 // the Worker and is unaffected.
 const healthBuckets = new TokenBuckets();
 
+// Store instances are request-scoped, but the lookup cache must survive
+// across requests to blunt repeated lookups — so it lives here beside the
+// miss cache, keyed (and reset) on the same configuration identity. A changed
+// snapshot or mapping source must not inherit another config's entries.
+let redirectLookupKey = "";
+let redirectLookupCache = new CampaignLookupCache();
+function lookupCacheFor(env: Env): CampaignLookupCache {
+  const raw = env.REDIRECT_MAPPINGS_JSON;
+  const key = `${env.REDIRECT_DB === undefined ? "snapshot" : "live"}:${typeof raw === "string" ? raw : typeof raw}`;
+  if (key !== redirectLookupKey) {
+    redirectLookupKey = key;
+    redirectLookupCache = new CampaignLookupCache();
+  }
+  return redirectLookupCache;
+}
+
 function redirectStore(env: Env): RedirectStore {
   const raw = env.REDIRECT_MAPPINGS_JSON;
   const snapshot = raw === undefined || raw === "" ? [] : parseMappingsSnapshot(raw);
   // Without the binding there is no connector: the store serves the snapshot
   // and drops clicks (logged, never faked) exactly as before TOG-12194.
   const connect = env.REDIRECT_DB === undefined ? undefined : connectPostgres;
-  return new RedirectStore(env.REDIRECT_DB, connect, snapshot);
+  return new RedirectStore(env.REDIRECT_DB, connect, snapshot, DB_TIMEOUT_MS, lookupCacheFor(env));
 }
 
 interface KeepalivePayload {
@@ -145,6 +166,23 @@ async function tokenMatches(provided: string, expected: string): Promise<boolean
   let diff = 0;
   for (let i = 0; i < x.length; i++) diff |= x[i]! ^ y[i]!;
   return diff === 0;
+}
+
+// SDK failures do not carry a trustworthy Rust startup class. Never serialize
+// arbitrary exception text (or claim stderr crossed the Container boundary).
+function containerUnavailable(): Response {
+  console.error(JSON.stringify({ event: "container_probe_failed", error_class: "container_unavailable" }));
+  return Response.json({ ready: false, error_class: "container_unavailable" }, { status: 500 });
+}
+
+// Allowlist, not denylist: only the bot's own answers may reach the public
+// probe, i.e. 200 or its parked readiness as JSON 503. SDK 0.3.7 synthesizes
+// text 429 (raw e.message), 500 and 503 bodies from startup failures.
+// Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
+function isBotProbeResponse(response: Response): boolean {
+  if (response.status === 200) return true;
+  const mediaType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+  return response.status === 503 && mediaType === "application/json";
 }
 
 function containerPort(raw: string | undefined): number {
@@ -255,9 +293,19 @@ export class TwoBotContainer extends Container<Env> {
         }
         // Bound the entire probe, including auto-start, below the 30s DO gate.
         const probe = new Request(request, { signal: AbortSignal.timeout(6000) });
-        const response = await this.containerFetch(probe);
-        await this.armKeepalive();
-        return response;
+        try {
+          const response = await this.containerFetch(probe);
+          // SDK startup failures arrive as responses rather than rejections.
+          // Drop any other body without exposing its error message.
+          if (!isBotProbeResponse(response)) {
+            await response.arrayBuffer();
+            return containerUnavailable();
+          }
+          await this.armKeepalive();
+          return response;
+        } catch {
+          return containerUnavailable();
+        }
       });
     } catch (error) { return refused(error); }
   }
@@ -527,9 +575,11 @@ export class TwoBotContainer extends Container<Env> {
     console.log("two-bot container stopped");
   }
 
-  override onError(error: unknown): void {
-    console.error(`two-bot container error: ${String(error)}`);
-    throw error;
+  override onError(_error: unknown): void {
+    console.error(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" }));
+    // The SDK logs errors thrown by hooks too; replace rather than rethrow the
+    // original exception, and do not retain a credential-bearing cause.
+    throw new Error("container_lifecycle_failed");
   }
 }
 
@@ -584,13 +634,40 @@ export default {
       const clean = new URL(request.url);
       clean.search = "";
       clean.hash = "";
+      // A missing version identity cannot address a deployment: refuse like
+      // the control and metrics paths instead of blaming the container.
+      let deployment: string;
+      try {
+        deployment = deploymentId(env.CF_VERSION_METADATA?.id);
+      } catch (error) { return refused(error); }
+      let response: Response;
       try {
         const sanitized = new Request(clean.toString(), {
           method: request.method,
-          headers: { [DEPLOYMENT_HEADER]: deploymentId(env.CF_VERSION_METADATA?.id) },
+          headers: { [DEPLOYMENT_HEADER]: deployment },
         });
-        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
-      } catch (error) { return refused(error); }
+        const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
+        // SDK startup failures arrive as responses rather than rejections.
+        // Drop any other body without exposing its error message.
+        if (!isBotProbeResponse(upstream)) {
+          await upstream.arrayBuffer();
+          response = containerUnavailable();
+        } else {
+          response = upstream;
+        }
+      } catch {
+        // Includes DO construction/binding failures before its fetch handler.
+        response = containerUnavailable();
+      }
+      // The outer Worker owns provenance, not the container or DO version.
+      // Copy the response to get mutable headers without changing status/body.
+      const result = new Response(response.body, response);
+      if (env.CF_VERSION_METADATA) {
+        result.headers.set("x-two-worker-version", env.CF_VERSION_METADATA.id);
+      } else {
+        result.headers.delete("x-two-worker-version");
+      }
+      return result;
     }
 
     // Authenticated off-container scrape path. No configured token → 404 (the

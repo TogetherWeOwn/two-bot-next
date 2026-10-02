@@ -33,7 +33,8 @@
  * - Bare `/` → fallback code redirect (uncounted), else 404.
  * - Lookup outage (throw) → fallback redirect when configured, else 503 +
  *   `retry-after: 30`. Unknown slug (null) → 404 with no Location (no open
- *   redirect). Confirmed misses are cached per isolate for 5s (1,024 slots);
+ *   redirect). Confirmed misses are cached per isolate for 2s (1,024 slots), the
+ *   legacy negative-TTL bound (TOG-11153);
  *   cache hits still consume caller budget. Outages and live rows are uncached.
  *   Invalid stored code → 500, nothing recorded.
  * - Slugs: lowercase alnum + internal hyphens, 2–40 chars; lookup is
@@ -371,7 +372,18 @@ export class TokenBuckets {
   }
 }
 
-/** Short, bounded negative cache: a new campaign becomes visible within 5s. */
+/**
+ * Short, bounded negative cache: the default keeps a new campaign visible
+ * within 2s (legacy campaigns.ts negative-TTL bound, TOG-11153), so neither
+ * this layer nor the store's short negative cache below can hold a miss
+ * long-lived on the production path (which always uses the default).
+ *
+ * Kept module-private: the Miniflare acceptance embeds this file as a Worker
+ * script, and a named const export becomes a workerd map entry and fails the
+ * runtime (`Incorrect type for map entry`). Callers use the default TTL.
+ */
+const MAX_MISS_TTL_MS = 2_000;
+
 export class RedirectMissCache {
   private misses = new Map<string, number>();
   private ttlMs: number;
@@ -380,7 +392,7 @@ export class RedirectMissCache {
 
   constructor(
     spec: { ttlMs: number; maxEntries: number } = {
-      ttlMs: 5_000,
+      ttlMs: MAX_MISS_TTL_MS,
       maxEntries: 1_024,
     },
     now: () => number = Date.now,

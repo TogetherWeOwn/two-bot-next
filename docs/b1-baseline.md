@@ -110,13 +110,19 @@ headroom below are historical, not measurements of the current PR head:
 | Artifact | Historical definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|
 | Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 11 MiB / 11,534,336 bytes | 3.99 MiB / 56.9% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 10.30 MiB / 10,805,344 bytes | 15 MiB / 15,728,640 bytes | 4.70 MiB / 45.6% |
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
 25% image growth rounded up to the next 8 MiB, and roughly 40% binary growth
 rounded up to the next MiB. Base-image/toolchain changes must remeasure and
-justify any future budget increase. Docker is not available in the controller
+justify any future budget increase. Recalibrated 2026-10-01 for the S4 self-role
+runtime (TOG-10292): PR head measured 10,805,344 bytes (10.30 MiB) on the
+ephemeral runner vs main baseline 10,377,112 bytes (9.90 MiB) at `ec49663`;
+growth is linked runtime/handlers/REST plus previously-dead domain/store code
+with no new dependencies, release profile already minimal (opt-level=z, lto,
+strip). Per calibration (measured * 1.4 rounded up to the next MiB):
+10.30 * 1.4 = 14.42 -> 15 MiB. Docker is not available in the controller
 workspace; offline fixture sizes are not measurements.
 
 ### Docker history image measurement and immutable-ID pinning
