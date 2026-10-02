@@ -1,0 +1,21 @@
+{
+  "create_external": {
+    "name": "Launch Night",
+    "scheduled_start_time": "2026-09-01T19:00:00.000Z",
+    "scheduled_end_time": "2026-09-01T22:00:00.000Z",
+    "privacy_level": 2,
+    "entity_type": 3,
+    "channel_id": null,
+    "entity_metadata": { "location": "The Together We Own server" }
+  },
+  "update_voice": {
+    "name": "Launch Night",
+    "description": "Meet in voice",
+    "scheduled_start_time": "2026-09-01T19:00:00.000Z",
+    "scheduled_end_time": "2026-09-01T22:00:00.000Z",
+    "privacy_level": 2,
+    "entity_type": 2,
+    "channel_id": "100000000000000003"
+  },
+  "cancel": { "status": 4 }
+}

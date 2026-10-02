@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const exporter = fileURLToPath(new URL('./export-legacy-registry.mjs', import.meta.url));
-const frozenRevision = 'd5d1179348feb9157bcac8c875de9399d4f5c76a';
+const frozenRevision = 'dbee695b95aabf9234cad28a6b24692e2d07314d';
 const source = 'src/leveling/discord.ts';
 const lockfile = 'package-lock.json';
 const sentinel = 'existing golden must not be overwritten\n';
