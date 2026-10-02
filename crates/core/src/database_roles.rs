@@ -66,6 +66,7 @@ mod tests {
             include_str!("../../cutover/migrations/0223_automod_preserved_match.sql"),
             include_str!("../../cutover/migrations/0224_voice_rooms.sql"),
             include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
+            include_str!("../../cutover/migrations/0226_voice_text_channels.sql"),
             include_str!("../../cutover/migrations/0300_website_contract.sql"),
             include_str!("../../cutover/migrations/0310_presence_probe.sql"),
             include_str!("../../cutover/migrations/0311_community_scorecard.sql"),

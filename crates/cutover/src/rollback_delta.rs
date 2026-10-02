@@ -177,6 +177,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Insert-once rows (PgRoomStore::add_room never overwrites). An ownership
     // transfer that updates owner_id must add its own timestamp column.
     TableSpec { table: "voice_rooms", measure: TableMeasure::Columns(&["created_at"]) },
+    // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
+    // overwrites the creation snapshot).
+    TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec {
         table: "web_contract_meta",
         measure: TableMeasure::Unmeasurable("singleton contract row with no timestamp column"),
