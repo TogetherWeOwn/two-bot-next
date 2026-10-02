@@ -35,7 +35,13 @@ use twilight_model::{
         Channel, ChannelType, VideoQualityMode,
     },
     guild::{Permissions, Role},
-    http::interaction::InteractionResponse,
+    http::{
+        interaction::InteractionResponse,
+        permission_overwrite::{
+            PermissionOverwrite as HttpPermissionOverwrite,
+            PermissionOverwriteType as HttpPermissionOverwriteType,
+        },
+    },
     id::{
         marker::{ApplicationMarker, InteractionMarker, RoleMarker},
         Id,
@@ -424,6 +430,64 @@ impl RoomHttp {
             .try_into_request()
             .map_err(classify_http_error)?;
         self.send(request, still_in_creator).await?;
+        Ok(())
+    }
+
+    /// V4 vote-kick enforcement, first half: move the member out of voice by
+    /// clearing their voice channel (`channel_id: null`). Source:
+    /// https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/member/struct.UpdateGuildMember.html
+    /// A 404 means the member already left: the spec cancels the vote when the
+    /// target leaves, so treat it as success.
+    pub async fn disconnect_member(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        if guild_id == 0 || member_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = self
+            .http
+            .update_guild_member(Id::new(guild_id), Id::new(member_id))
+            .channel_id(None)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        match self.send(request, still_valid).await {
+            Ok(()) | Err(RoomHttpError::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// V4 vote-kick enforcement, second half: deny Connect to the target on
+    /// this room channel only (member-scoped overwrite, not a guild kick or
+    /// ban). CONNECT is denied while every other bit is left alone:
+    /// allow carries empty so the write neither grants nor (via `allow`)
+    /// preserves anything outside the deny bit.
+    ///
+    /// Named `deny_member_connect` (not `deny_connect`) so the `RoomWrites`
+    /// trait impl can call it without resolving to itself.
+    pub async fn deny_member_connect(
+        &self,
+        channel_id: Snowflake,
+        member_id: Snowflake,
+        still_valid: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 || member_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let overwrite = HttpPermissionOverwrite {
+            allow: Some(Permissions::empty()),
+            deny: Some(Permissions::CONNECT),
+            id: Id::new(member_id),
+            kind: HttpPermissionOverwriteType::Member,
+        };
+        let request = self
+            .http
+            .update_channel_permission(Id::new(channel_id), &overwrite)
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, still_valid).await?;
         Ok(())
     }
 

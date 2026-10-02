@@ -225,6 +225,36 @@ impl RoomWrites for Http {
             None => Ok(()),
         }
     }
+    async fn disconnect(
+        &self,
+        guild: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("disconnect:{guild}:{member}"));
+        Ok(())
+    }
+    async fn deny_connect(
+        &self,
+        channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("deny:{channel}:{member}"));
+        Ok(())
+    }
     async fn delete(&self, channel: u64, guard: WriteGuard) -> Result<(), RoomHttpError> {
         if let Some(hook) = &self.before_delete {
             hook();

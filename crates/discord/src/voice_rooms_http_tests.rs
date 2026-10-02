@@ -403,3 +403,63 @@ async fn refused_credential_stops_all_clones_without_more_network_requests() {
     );
     assert_eq!(mock.state.recorded.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn vote_kick_disconnect_clears_voice_channel_and_missing_member_is_success() {
+    let mock = Mock::start(vec![
+        response(200, json!({})),
+        response(404, json!({"code": 10007})),
+        response(403, json!({"code": 50001})),
+    ])
+    .await;
+    mock.api.disconnect_member(100, 300, || true).await.unwrap();
+    // The target already left: the vote is cancelled, not failed.
+    mock.api.disconnect_member(100, 301, || true).await.unwrap();
+    assert_eq!(
+        mock.api.disconnect_member(100, 302, || true).await,
+        Err(RoomHttpError::AccessDenied)
+    );
+    assert_eq!(
+        mock.api.disconnect_member(0, 300, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert_eq!(
+        mock.api.disconnect_member(100, 0, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, Method::PATCH);
+    assert_eq!(requests[0].path, "/api/v10/guilds/100/members/300");
+    assert_eq!(requests[0].body, json!({"channel_id": null}));
+    assert!(requests.iter().all(|request| request.bot_authenticated));
+}
+
+#[tokio::test]
+async fn vote_kick_deny_is_member_scoped_connect_only_on_that_room() {
+    let mock = Mock::start(vec![response(204, Value::Null)]).await;
+    mock.api
+        .deny_member_connect(600, 300, || true)
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.api.deny_member_connect(0, 300, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    assert_eq!(
+        mock.api.deny_member_connect(600, 0, || true).await,
+        Err(RoomHttpError::InvalidRequest)
+    );
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::PUT);
+    assert_eq!(requests[0].path, "/api/v10/channels/600/permissions/300");
+    assert_eq!(
+        requests[0].body,
+        json!({
+            "id": "300", "type": 1,
+            "allow": "0", "deny": Permissions::CONNECT.bits().to_string(),
+        })
+    );
+    assert!(requests[0].bot_authenticated);
+}
