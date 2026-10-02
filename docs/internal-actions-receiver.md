@@ -26,14 +26,15 @@ An enabled receiver requires all of these settings, without defaults:
 | Setting | Meaning |
 | --- | --- |
 | `TWO_INTERNAL_BIND` | Literal private IP plus explicit nonzero port. IPv6 uses brackets. No hostname, URL, wildcard, public address or ephemeral port. |
-| `TWO_INTERNAL_KEYS` | Existing comma-separated `key-id:secret` signing specification; each secret is at least 32 bytes. At most 64 keys, with unique IDs. |
+| `TWO_INTERNAL_KEYS` | Existing comma-separated `key-id:secret` signing specification; each secret is at least 32 bytes. At most 64 keys, with unique IDs and distinct secrets. |
 | `TWO_INTERNAL_CALLERS` | Comma-separated `key-id:caller` mappings. Exactly one entry for each signing key, no unknown entries. The caller is a stable logical identity, not a key-rotation version. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Explicit nonempty comma-separated channel-key/Discord-ID map. Names are unique; IDs are canonical, nonzero, u64-representable snowflakes. |
 
 Key IDs, caller names and channel-key names are 1–128 ASCII alphanumeric,
 period, underscore or hyphen characters. Multiple rotating keys may identify the
-same logical caller. A signing secret cannot be shared by different callers:
-the key ID itself is not authenticated by the legacy signature format.
+same logical caller, but every key ID must have a distinct signing secret, even
+for that same caller. The shared parser refuses secret aliases: the key ID
+itself is not authenticated by the legacy signature format.
 
 Runtime integration must load this separately from the gateway's health-only
 configuration fallback. Invalid enabled configuration is a fatal startup error,
@@ -64,10 +65,11 @@ before execution is enabled. See
 
 ## Tests
 
-The configuration unit tests use only the existing public signing vector. They
+The configuration unit tests use only the existing public signing vectors. They
 exercise dark defaults, strict enable values, missing/non-Unicode settings,
-private literal binds, key-rotation caller continuity, duplicate/ambiguous
-mappings, same-secret principal confusion, canonical channels and redaction.
+private literal binds, distinct-key rotation with caller continuity,
+duplicate/ambiguous mappings, same-secret aliases for the same or different
+callers, canonical channels and redaction.
 They do not read runtime credentials, open sockets, access databases or send to
 Discord.
 
