@@ -28,9 +28,9 @@ mod voice_corpus_context;
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use two_bot_core::voice_conditions::{ConditionFacts, Conditions};
+use two_bot_core::voice_conditions::Conditions;
 use two_bot_core::voice_naming::{parse, render, Extension, Segment};
-use voice_corpus_context::{room_context, CorpusContext};
+use voice_corpus_context::{condition_facts, room_context, CorpusContext};
 
 const GOLDEN: &str = include_str!("fixtures/voice_conditions_golden.json");
 const SHARED: &str = include_str!("../../../tests/voice_templates/corpus.json");
@@ -351,61 +351,6 @@ fn contexts_are_shared_verbatim_except_the_derived_allowlist() {
         copied += 1;
     }
     assert_eq!(copied, 26, "26 contexts are copied verbatim");
-}
-
-/// Facts the parent runtime resolves from guild state, read from the same
-/// snapshot as [`room_context`]: the owner and members by ID, their roles,
-/// the owner's game and streams, and the lock flag.
-fn condition_facts(context: &CorpusContext) -> ConditionFacts {
-    let owner = context.members.iter().find(|m| m.id == context.owner_id);
-    let count = |live: usize| u32::try_from(live).expect("member count fits u32");
-    ConditionFacts {
-        owner_id: Some(context.owner_id.clone()),
-        owner_role_ids: owner.map(|m| m.roles.clone()).unwrap_or_default(),
-        member_ids: context.members.iter().map(|m| m.id.clone()).collect(),
-        member_role_ids: context
-            .members
-            .iter()
-            .flat_map(|m| m.roles.iter().cloned())
-            .collect(),
-        owner_playing: owner.is_some_and(|m| m.game.is_some()),
-        owner_live_discord: owner.is_some_and(|m| m.live_discord),
-        owner_live_external: owner.is_some_and(|m| m.live_external),
-        live_discord_count: count(context.members.iter().filter(|m| m.live_discord).count()),
-        live_external_count: count(context.members.iter().filter(|m| m.live_external).count()),
-        games: shown_games(context),
-        private: context.private,
-    }
-}
-
-/// V5 shown titles: the alias-resolved majority, both titles on a two-way
-/// tie, none on a wider tie or when nobody plays. Only the default majority
-/// settings are modelled; every corpus context uses them.
-fn shown_games(context: &CorpusContext) -> Vec<String> {
-    assert!(
-        !context.settings.force_single_game && !context.settings.include_inactive,
-        "shown_games models only the default majority settings"
-    );
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for title in context.members.iter().filter_map(|m| m.game.as_deref()) {
-        let title = context
-            .settings
-            .aliases
-            .get(title)
-            .map_or(title, String::as_str);
-        *counts.entry(title.to_string()).or_default() += 1;
-    }
-    let top = counts.values().copied().max().unwrap_or(0);
-    let leaders: Vec<String> = counts
-        .into_iter()
-        .filter(|(_, count)| *count == top)
-        .map(|(title, _)| title)
-        .collect();
-    if leaders.len() > 2 {
-        Vec::new()
-    } else {
-        leaders
-    }
 }
 
 #[test]

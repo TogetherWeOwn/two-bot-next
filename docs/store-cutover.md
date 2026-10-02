@@ -96,7 +96,7 @@ own uniquely named schemas. There is no credential fallback.
 
 ```sh
 TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/postgres \
-  cargo test -p two-bot-store --locked --test postgres -- --ignored
+  cargo test -p two-bot-store --locked --test postgres --test membership_pg -- --ignored
 cargo test -p two-bot -p two-bot-discord --locked
 cargo clippy -p two-bot-store -p two-bot -p two-bot-discord --all-targets --locked -- -D warnings
 cargo fmt --all -- --check

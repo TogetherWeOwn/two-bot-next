@@ -226,6 +226,11 @@ VALUES (71, '100000000000000001', '2026-07-27T00:00:00.000Z', '2026-08-03T00:00:
         'maintain', '2026-08-03T00:00:01.000Z');
 INSERT INTO community_scorecard_alerts (guild_id, week_start, alert_key, created_at)
 VALUES ('100000000000000001', '2026-07-27T00:00:00.000Z', 'backup:alert:dedupe', '2026-08-03T00:00:02.000Z');
+-- Preserve both a spent-but-pending retry budget and terminal completion.
+INSERT INTO community_scorecard_attempts
+    (guild_id, week_key, attempts, next_attempt_at, completed)
+VALUES ('100000000000000001', '2026-08-10', 2, 1786343100000, FALSE),
+       ('100000000000000001', '2026-08-03', 1, 1785738000000, TRUE);
 INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at)
 VALUES ('100000000000000001', 2, 'backup-resume-session', 9007199254740993,
         'wss://gateway.example.invalid', '2026-08-01T10:00:00.123456Z');
@@ -316,3 +321,19 @@ INSERT INTO invite_campaigns (slug, invite_code, label, disabled_at, created_at)
 VALUES ('backup-link', 'backup-code', 'backup sidebar', NULL, '2026-08-01T10:00:00.123456Z'),
        ('backup-retired', 'backup-retired-code', 'retired placement',
         '2026-08-02T10:00:00Z', '2026-08-01T10:00:00Z');
+
+-- Temporary voice rooms: one inheriting and one channel-sourced creator; rooms
+-- outlive their creator config, so one room points at an unmarked creator.
+INSERT INTO voice_creators (guild_id, channel_id, name_template, permission_source,
+  permission_channel_id, default_limit, private_default, text_channels, position, first_room_number)
+VALUES ('100000000000000001', '100000000000000030', '{user}''s room', 'creator',
+        NULL, NULL, FALSE, FALSE, 'above', 1),
+       ('100000000000000001', '100000000000000031', 'Squad #{n}', 'channel',
+        '100000000000000032', 5, TRUE, TRUE, 'below', 3);
+INSERT INTO voice_rooms (guild_id, channel_id, creator_channel_id, owner_id,
+  original_creator_id, name_seed, created_at)
+VALUES ('100000000000000001', '100000000000000033', '100000000000000030',
+        '100000000000000002', '100000000000000002', '18446744073709551615',
+        '2026-08-01T10:00:00.123456Z'),
+       ('100000000000000001', '100000000000000034', '100000000000000035',
+        '100000000000000003', '100000000000000002', '7', '2026-08-02T10:00:00Z');

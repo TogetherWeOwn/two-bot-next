@@ -24,6 +24,7 @@ fn cli(database_url: &str, guild_id: Option<&str>, args: &[&str]) -> Output {
     command
         .env_clear()
         .env("TWO_DATABASE_URL", database_url)
+        .env("TWO_DATABASE_TLS", "local-only")
         .env("TWO_DB_POOL_MAX", "1")
         .args(args);
     if let Some(guild_id) = guild_id {

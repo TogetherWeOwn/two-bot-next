@@ -33,6 +33,7 @@ pub mod config;
 pub mod containment;
 #[cfg(feature = "db")]
 pub mod database_roles;
+pub mod database_tls;
 pub mod database_url;
 pub mod events;
 pub mod evidence;
@@ -97,9 +98,11 @@ pub mod voice_alias;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_assistant_validate;
+pub mod voice_channelinfo;
 pub mod voice_conditions;
 pub mod voice_config;
 pub mod voice_config_diff;
+pub mod voice_create_admission;
 pub mod voice_custom_id;
 pub mod voice_logging;
 pub mod voice_name_filter;
@@ -111,7 +114,9 @@ pub mod voice_placement;
 pub mod voice_private;
 pub mod voice_rename_coalescer;
 pub mod voice_room_controls;
+pub mod voice_rooms;
 pub mod voice_style;
+pub mod voice_template;
 pub mod voice_template_lint;
 pub mod voice_text_channel;
 pub mod voice_utilities;
@@ -356,6 +361,15 @@ pub use voice_permission_health::{
     NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,
     PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS, PERM_ADMINISTRATOR,
     PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS, PERM_VIEW_CHANNEL,
+};
+pub use voice_rooms::{
+    category_full_message, decide_room_join, decide_room_leave, fail_backoff_ms,
+    parse_retry_after_ms, reconcile, voice_commands, ActionQueue, CreatorChannel,
+    CreatorSettingsError, FailedAction, MemRoomStore, NewRoomSpec, PermissionSource,
+    ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction, RoomJoinDecision,
+    RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore, SeenChannel,
+    VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT,
+    QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,

@@ -1,13 +1,15 @@
 //! The shared voice-template corpus context (`tests/voice_templates/corpus.json`)
-//! and its adaptation to the V5 engine's [`RoomContext`]. One mapping serves
-//! every corpus that inlines these contexts, so their renders agree.
+//! and its adaptation to the engine: the V5 name tokens ([`RoomContext`]) and
+//! the V6 condition facts ([`ConditionFacts`]). One mapping serves every
+//! corpus that inlines these contexts, so their renders agree.
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
 use time::{Date, Month};
+use two_bot_core::voice_conditions::ConditionFacts;
 use two_bot_core::voice_naming::{
-    resolve_majority_game, ChannelKind, GameOptions, PartyInfo, RoomContext,
+    majority_games, resolve_majority_game, ChannelKind, GameOptions, PartyInfo, RoomContext,
 };
 
 #[derive(Deserialize)]
@@ -16,8 +18,6 @@ pub struct CorpusContext {
     pub channel_kind: String,
     pub number: u32,
     pub limit: u32,
-    /// Read by condition facts, not by the room context.
-    #[allow(dead_code)]
     pub private: bool,
     pub seed: String,
     pub owner_id: String,
@@ -33,8 +33,6 @@ pub struct Member {
     pub id: String,
     pub display_name: String,
     pub nick: Option<String>,
-    /// Read by condition facts, not by the room context.
-    #[allow(dead_code)]
     pub roles: Vec<String>,
     pub game: Option<String>,
     pub live_discord: bool,
@@ -72,6 +70,20 @@ pub struct Settings {
     pub include_inactive: bool,
 }
 
+/// The majority inputs every mapping derives from one snapshot: one activity
+/// entry per member (`None` = no visible activity) plus the corpus majority
+/// settings.
+fn game_inputs(context: &CorpusContext) -> (Vec<Option<String>>, GameOptions) {
+    let activities = context.members.iter().map(|m| m.game.clone()).collect();
+    let options = GameOptions {
+        aliases: context.settings.aliases.clone(),
+        force_single: context.settings.force_single_game,
+        count_idle_toward_majority: context.settings.include_inactive,
+        no_game_label: context.settings.no_game.clone(),
+    };
+    (activities, options)
+}
+
 /// Adapt the implementation-independent snapshot to the engine's context,
 /// following V5 and V7: owner name prefers `/nick`, the game is the
 /// alias-resolved majority, and parties are deduplicated by ID in first-seen
@@ -92,13 +104,7 @@ pub fn room_context(context: &CorpusContext) -> RoomContext {
             ));
         }
     }
-    let activities: Vec<Option<String>> = context.members.iter().map(|m| m.game.clone()).collect();
-    let game_options = GameOptions {
-        aliases: context.settings.aliases.clone(),
-        force_single: context.settings.force_single_game,
-        count_idle_toward_majority: context.settings.include_inactive,
-        no_game_label: context.settings.no_game.clone(),
-    };
+    let (activities, game_options) = game_inputs(context);
     RoomContext {
         channel_kind: match context.channel_kind.as_str() {
             "temporary" => ChannelKind::Temporary,
@@ -130,6 +136,35 @@ pub fn room_context(context: &CorpusContext) -> RoomContext {
         seed: seed(&context.seed),
         named_lists: context.settings.named_lists.clone(),
         fallback_name: String::new(),
+    }
+}
+
+/// Facts the parent runtime resolves from guild state, read from the same
+/// snapshot as [`room_context`]: the owner and members by ID, their roles,
+/// the owner's game and streams, and the lock flag. `games` comes from
+/// [`majority_games`] over the same inputs as `game_name`, so the `GAME`
+/// condition always agrees with `@@game_name@@`.
+pub fn condition_facts(context: &CorpusContext) -> ConditionFacts {
+    let owner = context.members.iter().find(|m| m.id == context.owner_id);
+    let (activities, game_options) = game_inputs(context);
+    let owner_game = owner.and_then(|m| m.game.as_deref());
+    let count = |is: fn(&Member) -> bool| context.members.iter().filter(|m| is(m)).count() as u32;
+    ConditionFacts {
+        owner_id: Some(context.owner_id.clone()),
+        owner_role_ids: owner.map(|m| m.roles.clone()).unwrap_or_default(),
+        member_ids: context.members.iter().map(|m| m.id.clone()).collect(),
+        member_role_ids: context
+            .members
+            .iter()
+            .flat_map(|m| m.roles.iter().cloned())
+            .collect(),
+        owner_playing: owner_game.is_some(),
+        owner_live_discord: owner.is_some_and(|m| m.live_discord),
+        owner_live_external: owner.is_some_and(|m| m.live_external),
+        live_discord_count: count(|m| m.live_discord),
+        live_external_count: count(|m| m.live_external),
+        games: majority_games(&activities, owner_game, &game_options),
+        private: context.private,
     }
 }
 

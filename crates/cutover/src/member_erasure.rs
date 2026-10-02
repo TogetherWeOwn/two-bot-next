@@ -56,6 +56,7 @@ pub fn is_identity_column(column: &str) -> bool {
         || column.ends_with("_member_id")
         || column.ends_with("_by")
         || column.ends_with("_author_id")
+        || column.ends_with("_creator_id")
         || matches!(
             column,
             "actor"
@@ -300,6 +301,7 @@ mod tests {
             "member_id",
             "inviter_id",
             "matched_author_id",
+            "original_creator_id",
             "created_by",
             "actor",
         ] {

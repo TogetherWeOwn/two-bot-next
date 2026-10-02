@@ -75,6 +75,7 @@ export const FORWARDED_FLAGS = [
   "TWO_ANTI_NUKE_PROTECTED_USER_IDS",
   "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
   // Temporary voice rooms.
+  "TWO_VOICE",
   "TWO_TEMP_VOICE",
   "TWO_TEMP_VOICE_CATEGORY_ID",
   "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
@@ -107,12 +108,14 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
+  TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
   TWO_BACKUP_S3_ACCESS_KEY_ID: SECRET,
   TWO_BACKUP_S3_SECRET_ACCESS_KEY: SECRET,
   TWO_DB_POOL_MAX: "cutover CLI pool size, not read by the Container runtime",
+  TWO_DATABASE_TLS: "cutover/operator CLI TLS policy for database_tls::enforce (default required); not read by the Container runtime",
   TWO_ERASURE_ACTOR: "erase-member operator CLI audit actor, set per invocation; not read by the Container runtime",
   TWO_GUILD_CONFIG_OFFLINE_TEST: "guild-config backup CLI offline-fixture gate, set only by CLI tests; not read by the Container runtime",
   TWO_BACKUP_DIR: BACKUP,
