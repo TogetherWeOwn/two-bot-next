@@ -13,6 +13,9 @@
 //!   Exit codes: 0 ok (already-engaged and already-clear count as ok),
 //!   1 database failure, 2 usage or refused target.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use time::format_description::well_known::Rfc3339;
 use two_bot_core::audit_store::AuditStore;
 use two_bot_cutover::cli::{open_db, Args};

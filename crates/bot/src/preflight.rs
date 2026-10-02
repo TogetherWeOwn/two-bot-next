@@ -82,6 +82,8 @@ impl Report {
         self.add(if ok { Status::Pass } else { Status::Fail }, check, detail);
     }
 
+    // CLI report output only; checks themselves do not write stdout.
+    #[allow(clippy::print_stdout)]
     fn render(&self, json: bool, code: i32) {
         let failures = self
             .checks
@@ -564,6 +566,11 @@ async fn check_discord(
     Ok(())
 }
 
+#[allow(clippy::print_stdout)] // CLI help only; preserve exact output bytes.
+fn print_usage() {
+    print!("{USAGE}");
+}
+
 async fn admission_transport(
     token: String,
     proxy: Option<String>,
@@ -600,7 +607,7 @@ async fn admission_transport(
 
 pub async fn dispatch(args: &[String]) -> i32 {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print!("{USAGE}");
+        print_usage();
         return 0;
     }
     let json = args.iter().any(|arg| arg == "--json");

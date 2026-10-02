@@ -497,8 +497,17 @@ receipt is **NO-GO**. The same allocator gate applies to a rollback recovery tar
 Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L13)
 is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L98)
 that handle only idempotency-key conflicts, not primary-key collisions. The
-[restore's sequence restart](../crates/core/src/backup/dump.rs#L523)
+[restore's sequence restart](../crates/core/src/backup/dump.rs#L215)
 illustrates the hazard; it does not prove the planned copier covers every table.
+
+A backup restore (the drill, or a rollback recovery target) meets this gate for
+the archived tables only when the archive carries `sequenceMarks`: each
+allocator resumes past the archived high-water (deleted IDs included), the
+restored rows and the target's own position, and the CAS allocator moves past
+every source token before rows are inserted. Record the receipt from the
+manifest marks and the target's post-restore positions. An archive without
+marks (frozen v3, or v4 written before marks existed) does **not** meet the
+gate. Details: [backup runbook](backup.md).
 
 Do not start either gateway while verification is unresolved. Record the baseline
 watermark from which all subsequent Next/web writes will be reconciled.
