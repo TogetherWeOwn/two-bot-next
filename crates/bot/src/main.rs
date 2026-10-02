@@ -25,6 +25,8 @@ mod gateway;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+#[cfg(test)]
+mod interaction_composition_tests;
 mod jobs;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -203,45 +205,24 @@ async fn main() {
                     .map_err(|error| gateway_failure("checkpoint_load_failed", error))?;
                 let onboarding = two_bot_core::OnboardingGates::from_env()
                     .map_err(|_| sqlx::Error::InvalidArgument("invalid onboarding mode".into()))?;
-                let features = two_bot_core::FeatureGates::from_env().map_err(|_| {
-                    sqlx::Error::InvalidArgument("invalid interaction feature gates".into())
-                })?;
-                let moderation = two_bot_core::ModerationGates::from_env()
-                    .map_err(|_| sqlx::Error::InvalidArgument("invalid moderation gates".into()))?;
-                let router =
-                    two_bot_core::InteractionRouter::new(two_bot_core::RouterGates::from_slices(
-                        Some(guild_id),
-                        &features,
-                        &moderation,
-                        two_bot_core::SurfaceFlags {
-                            session_picker: onboarding.mode
-                                == two_bot_core::OnboardingMode::Session,
-                            tickets: ticket_runtime::TicketConfig::from_env(guild_id).is_some(),
-                            scorecard: std::env::var("TWO_COMMUNITY_SCORECARD")
-                                .is_ok_and(|v| v == "1"),
-                            ..Default::default()
-                        },
-                    ));
-                let executor = two_bot_discord::ActionExecutor::with_proxy(
-                    token.clone(),
-                    std::env::var("DISCORD_API_BASE").ok(),
-                )
-                .map_err(|_| {
-                    sqlx::Error::InvalidArgument("invalid Discord executor configuration".into())
-                })?;
-                let interactions = Arc::new(two_bot_discord::interactions::InteractionRuntime {
-                    router,
-                    pool: pool.clone(),
-                    executor,
-                    classifier: two_bot_core::ClassifierConfig::from_env(),
-                });
                 // Shared command slices reuse the pool; RSVP completion is ordered.
-                // ONE router + REST executor + sqlx stores over the same pool.
-                // Bad command env gates still park only the command surface.
-                // The ordered leveling path shares this runtime's
-                // executor/pacing for XP awards and role rewards.
-                let runtime =
-                    command_runtime::CommandRuntime::from_env(pool, &token, guild_id, onboarding);
+                // ONE router + one governed REST executor + sqlx stores over the
+                // same pool. Bad command env gates still park only the command
+                // surfaces. The ordered leveling path shares this runtime's
+                // executor/pacing for XP awards and role rewards, and the
+                // ordered RSVP surface below shares the same executor.
+                let runtime = command_runtime::CommandRuntime::from_env(
+                    pool.clone(),
+                    &token,
+                    guild_id,
+                    onboarding,
+                );
+                // Ordered RSVP surface over the runtime's governed executor.
+                // `None` whenever the command runtime is parked; the gateway
+                // and funnel still boot.
+                let interactions = runtime.as_ref().and_then(|runtime| {
+                    build_interaction_runtime(&pool, guild_id, &onboarding, runtime.executor())
+                });
                 let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
                 let pipeline = Arc::new(
                     build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
@@ -263,7 +244,7 @@ async fn main() {
                     pipeline,
                     Arc::clone(&state),
                     store,
-                    Some(interactions),
+                    interactions,
                     runtime,
                     voice,
                     async move {
@@ -311,6 +292,54 @@ async fn main() {
         );
         std::process::exit(1);
     }
+}
+
+/// Ordered RSVP surface over the command runtime's governed REST executor:
+/// one shared executor (one token key, one pacing lane) serves both the
+/// detached command dispatch and the ordered interaction completion. Returns
+/// `None` — gateway and funnel still boot — when command-gate parsing fails,
+/// so bad env parks only this surface. Mirrors
+/// [`command_runtime::CommandRuntime::from_env`]: no permissive defaults,
+/// no loopback broadening, no live probe.
+fn build_interaction_runtime(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    guild_id: u64,
+    onboarding: &two_bot_core::OnboardingGates,
+    executor: two_bot_discord::ActionExecutor,
+) -> Option<Arc<two_bot_discord::interactions::InteractionRuntime>> {
+    let features = match two_bot_core::FeatureGates::from_env() {
+        Ok(features) => features,
+        Err(err) => {
+            tracing::warn!(error = %err, "feature gates invalid; ordered interaction surface parked");
+            return None;
+        }
+    };
+    let moderation = match two_bot_core::ModerationGates::from_env() {
+        Ok(moderation) => moderation,
+        Err(err) => {
+            tracing::warn!(error = %err, "moderation gates invalid; ordered interaction surface parked");
+            return None;
+        }
+    };
+    let router = two_bot_core::InteractionRouter::new(two_bot_core::RouterGates::from_slices(
+        Some(guild_id),
+        &features,
+        &moderation,
+        two_bot_core::SurfaceFlags {
+            session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
+            tickets: ticket_runtime::TicketConfig::from_env(guild_id).is_some(),
+            scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1"),
+            ..Default::default()
+        },
+    ));
+    Some(Arc::new(
+        two_bot_discord::interactions::InteractionRuntime {
+            router,
+            pool: pool.clone(),
+            executor,
+            classifier: two_bot_core::ClassifierConfig::from_env(),
+        },
+    ))
 }
 
 /// Fixed operation classes only: neither SQLx errors nor their sources are logged.

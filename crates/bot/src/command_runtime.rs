@@ -288,6 +288,13 @@ impl CommandRuntime {
         self.leveling.clone()
     }
 
+    /// Shares this runtime's governed REST executor (one token key, one
+    /// pacing lane) with the ordered interaction surface, so both surfaces
+    /// send through the same governed admission.
+    pub fn executor(&self) -> ActionExecutor {
+        self.executor.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn with_tickets(
         pool: Pool<Postgres>,
