@@ -47,8 +47,8 @@
 //! Conditionals (`{{cond ?? yes // no}}`) and styling (`""mode:text""`) are
 //! parsed into [`Segment::Extension`] nodes but evaluated through the
 //! [`ExtensionPolicy`] trait. V5 ships [`PassthroughExtensions`], which
-//! leaves them as literal text; the V6 slice implements the trait with real
-//! conditional and styling passes without touching the parser or pipeline.
+//! leaves them as literal text; [`crate::voice_template::TemplateExtensions`]
+//! implements the trait with the real V6 conditional and styling passes.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1313,11 +1313,27 @@ pub fn resolve_majority_game(
     owner_game: Option<&str>,
     options: &GameOptions,
 ) -> String {
-    let no_game = if options.no_game_label.is_empty() {
+    let games = majority_games(activities, owner_game, options);
+    if !games.is_empty() {
+        return games.join(" & ");
+    }
+    if options.no_game_label.is_empty() {
         "General".to_string()
     } else {
         options.no_game_label.clone()
-    };
+    }
+}
+
+/// The aliased titles [`resolve_majority_game`] shows, under the same rules:
+/// one title, both titles of a two-way tie (alphabetical), or none when no
+/// member shows a game or three or more tie. Feed this to the V6 `GAME`
+/// condition so a condition always agrees with `@@game_name@@`.
+#[must_use]
+pub fn majority_games(
+    activities: &[Option<String>],
+    owner_game: Option<&str>,
+    options: &GameOptions,
+) -> Vec<String> {
     let canonical = |title: &str| -> String {
         options
             .aliases
@@ -1337,18 +1353,18 @@ pub fn resolve_majority_game(
         }
     }
     if counts.is_empty() {
-        return no_game;
+        return Vec::new();
     }
     if options.force_single {
         if let Some(owner) = owner_game {
             let owned = canonical(owner);
             if counts.contains_key(&owned) {
-                return owned;
+                return vec![owned];
             }
         }
         let mut ranked: Vec<&String> = counts.keys().collect();
         ranked.sort_by(|a, b| counts[*a].cmp(&counts[*b]).reverse().then_with(|| a.cmp(b)));
-        return ranked[0].clone();
+        return vec![ranked[0].clone()];
     }
 
     let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
@@ -1357,15 +1373,75 @@ pub fn resolve_majority_game(
         ranked[0].1 += idle;
     }
     let top = ranked[0].1;
-    let leaders: Vec<&String> = ranked
-        .iter()
+    let leaders: Vec<String> = ranked
+        .into_iter()
         .filter(|(_, count)| *count == top)
         .map(|(name, _)| name)
         .collect();
-    match leaders.len() {
-        1 => leaders[0].clone(),
-        2 => format!("{} & {}", leaders[0], leaders[1]),
-        _ => no_game,
+    if leaders.len() > 2 {
+        Vec::new()
+    } else {
+        leaders
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Room create/rename wiring (V5b)
+// ---------------------------------------------------------------------------
+
+/// Default name template for new rooms (spec V5).
+pub const DEFAULT_NAME_TEMPLATE: &str =
+    "@@random_emoji@@ @@owner@@'s [[den/crew/lair/hangout/base/club]]";
+
+/// Resolve the channel name for a room create or rename.
+///
+/// `template` is the creator channel's (or standalone channel's) configured
+/// name template, `ctx` carries the current room state, and `raw_name` is the
+/// caller-supplied name (custom `/name` value, or the previous channel name
+/// on rename).
+///
+/// Intended call sites (no room-lifecycle runtime exists yet; V1 owns it):
+/// create renders once after the room number is allocated, rename re-renders
+/// on join/leave, activity, limit or privacy changes (spec V5).
+///
+/// Template errors never propagate: a blank or oversized template falls back
+/// to `raw_name` without touching the engine, and an empty render falls back
+/// through [`RoomContext::fallback_name`] (wired to `raw_name` here).
+/// Output is never empty and never over [`MAX_NAME_LEN`] characters.
+///
+/// This renders conditionals and styling as literal text; runtime callers
+/// use [`crate::voice_template::resolve_room_name`] for full V6 behaviour.
+#[must_use]
+pub fn resolve_room_name(template: &str, ctx: &RoomContext, raw_name: &str) -> String {
+    resolve_room_name_with(template, ctx, raw_name, &PassthroughExtensions)
+}
+
+/// [`resolve_room_name`] with a caller-chosen [`ExtensionPolicy`], under the
+/// same fallback contract.
+#[must_use]
+pub fn resolve_room_name_with<E: ExtensionPolicy>(
+    template: &str,
+    ctx: &RoomContext,
+    raw_name: &str,
+    extensions: &E,
+) -> String {
+    let fallback = finalize_raw(raw_name);
+    if template.trim().is_empty() || template.len() > MAX_TEMPLATE_BYTES {
+        return fallback;
+    }
+    let mut ctx = ctx.clone();
+    ctx.fallback_name = fallback;
+    render(&parse(template), &ctx, extensions)
+}
+
+/// Trim → truncate → built-in default, mirroring the engine's pipeline tail.
+fn finalize_raw(raw_name: &str) -> String {
+    let mut out = truncate_chars(raw_name.trim(), MAX_NAME_LEN);
+    out = out.trim_end().to_string();
+    if out.is_empty() {
+        DEFAULT_FALLBACK_NAME.to_string()
+    } else {
+        out
     }
 }
 
@@ -2496,5 +2572,71 @@ mod tests {
             }
             assert_eq!(render_str(&input, &ctx()), expected, "input {input:?}");
         }
+    }
+
+    // -- create/rename wiring (V5b) ------------------------------------------
+
+    #[test]
+    fn wiring_create_renders_template() {
+        let c = ctx();
+        assert_eq!(resolve_room_name("@@owner@@ ##", &c, "Hangout"), "Ava #3");
+        let name = resolve_room_name(DEFAULT_NAME_TEMPLATE, &c, "Hangout");
+        assert!(name.contains("Ava's "), "unexpected {name:?}");
+    }
+
+    #[test]
+    fn wiring_rename_rerenders_and_random_stays_stable() {
+        let template = "@@random_emoji@@ @@num@@ <<person/people>>";
+        let mut c = ctx();
+        c.member_count = 1;
+        let solo = resolve_room_name(template, &c, "old");
+        assert!(solo.ends_with("1 person"), "unexpected {solo:?}");
+        c.member_count = 4;
+        let busy = resolve_room_name(template, &c, "old");
+        assert!(busy.ends_with("4 people"), "unexpected {busy:?}");
+        // Same seed: the emoji pick never re-rolls across renames.
+        assert_eq!(
+            solo.split(' ').next(),
+            busy.split(' ').next(),
+            "random pick re-rolled"
+        );
+    }
+
+    #[test]
+    fn wiring_blank_or_oversized_template_falls_back_raw() {
+        let c = ctx();
+        assert_eq!(resolve_room_name("", &c, "  Hangout  "), "Hangout");
+        assert_eq!(resolve_room_name("   ", &c, "Hangout"), "Hangout");
+        let big = "x".repeat(MAX_TEMPLATE_BYTES + 1);
+        assert_eq!(resolve_room_name(&big, &c, "Hangout"), "Hangout");
+        // At exactly the limit the engine still runs.
+        let edge = format!(
+            "@@owner@@{}",
+            "x".repeat(MAX_TEMPLATE_BYTES - "@@owner@@".len())
+        );
+        let out = resolve_room_name(&edge, &c, "Hangout");
+        assert!(out.starts_with("Ava"), "unexpected {out:?}");
+        assert_eq!(out.chars().count(), MAX_NAME_LEN);
+    }
+
+    #[test]
+    fn wiring_empty_render_falls_back_raw_then_builtin() {
+        let c = ctx();
+        // Unknown token renders empty; the live raw name wins over the
+        // context fallback ("Lounge").
+        assert_eq!(resolve_room_name("@@bogus@@", &c, "Custom"), "Custom");
+        // Blank raw degrades to the built-in default, never empty.
+        assert_eq!(resolve_room_name("@@bogus@@", &c, "   "), "Voice Room");
+        assert_eq!(resolve_room_name("", &c, ""), "Voice Room");
+    }
+
+    #[test]
+    fn wiring_raw_fallback_is_trimmed_and_truncated() {
+        let c = ctx();
+        assert_eq!(resolve_room_name("", &c, "  Hangout  "), "Hangout");
+        let long = "🎮".repeat(500);
+        let out = resolve_room_name("@@bogus@@", &c, &long);
+        assert_eq!(out.chars().count(), MAX_NAME_LEN);
+        assert!(out.is_char_boundary(out.len()));
     }
 }

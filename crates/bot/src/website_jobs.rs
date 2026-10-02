@@ -6,16 +6,17 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
-    apply_web_contract, build_community_snapshot, build_counter_reading, match_rank_roles,
-    normalize_events, now_iso, read_raid_windows, replace_events, write_counter,
-    write_rank_snapshot, Config, RawScheduledEvent, RosterMember, WebsiteStoreError,
-    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    build_community_snapshot, build_counter_reading, match_rank_roles, normalize_events, now_iso,
+    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config,
+    RawScheduledEvent, RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
+    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
-    community_jobs,
+    audit_runtime, community_jobs,
     jobs::{self, ErrorClass, Job},
+    self_role_handlers::{SelfRoleService, RECOVERY_JOB_NAME},
     server,
 };
 
@@ -77,15 +78,11 @@ impl Context {
                 let db = two_bot_cutover::connect(
                     &self.url,
                     two_bot_cutover::DB_POOL_MAX_DEFAULT,
-                    false,
+                    true, // Operator provisions migrations/views; runtime is DML-only.
                 )
                 .await
                 .map_err(|_| ErrorClass::Database)?;
-                let pool = db.pool().clone();
-                apply_web_contract(&pool)
-                    .await
-                    .map_err(|_| ErrorClass::Database)?;
-                Ok(pool)
+                Ok(db.pool().clone())
             })
             .await
     }
@@ -99,16 +96,42 @@ impl Drop for Shutdown {
     }
 }
 
+/// `self_roles` is the ONE boot-composed service Arc also injected into gateway
+/// dispatch; recovery joins the existing supervisor, never another feature service.
+fn governed_executor(
+    token: &str,
+    proxy: Option<String>,
+    pool: PgPool,
+) -> Result<ActionExecutor, String> {
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(pool, token)
+        .map_err(|error| error.to_string())?;
+    ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
+}
+
+fn admission_pool(url: &str) -> Result<PgPool, String> {
+    let options = two_bot_core::database_url::connect_options(url)
+        .map_err(|_| "invalid admission authority".to_owned())?;
+    Ok(sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(options))
+}
+
 pub async fn serve(
     config: &Config,
     listener: tokio::net::TcpListener,
     gateway: server::SharedState,
     shutdown: watch::Sender<bool>,
+    self_roles: Option<Arc<SelfRoleService>>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
-        match ActionExecutor::with_proxy(token.to_owned(), std::env::var("DISCORD_API_BASE").ok()) {
+        // Lazy connection preserves parked/startup behavior; every wire attempt
+        // still fails closed on this same runtime database authority.
+        let rest = admission_pool(url).and_then(|pool| {
+            governed_executor(token, std::env::var("DISCORD_API_BASE").ok(), pool)
+        });
+        match rest {
             Ok(rest) => {
                 let context = Arc::new(Context {
                     url: url.to_owned(),
@@ -155,29 +178,53 @@ pub async fn serve(
                         }),
                     });
                 }
-                let registration = community_jobs::register(context);
+                let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
+                match audit_runtime::register(context, shutdown.subscribe()) {
+                    Some(job) => registered.push(job),
+                    None => parked.extend(audit_runtime::NAMES),
+                }
             }
             Err(_) => tracing::warn!("website jobs parked: invalid REST configuration"),
         }
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
-    // All six names park together when nothing registered; otherwise only the
-    // env-gated community names are parked and the rest report live status.
-    let status = jobs::statuses(&names, registered.is_empty());
+    if let Some(service) = self_roles {
+        registered.push(service.recovery_job());
+    }
+    let status = registered_statuses(&registered, &parked).await;
+    let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
+    serve_jobs(registered, status, shutdown, http).await
+}
+
+async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::SharedStatus {
+    let names: Vec<&'static str> = NAMES
+        .into_iter()
+        .chain(community_jobs::NAMES)
+        .chain(audit_runtime::NAMES)
+        .chain([RECOVERY_JOB_NAME])
+        .collect();
+    // Start everything parked; the loop below unparks exactly the registered
+    // jobs. Recovery alone must not make unavailable website/community jobs
+    // look active, and an absent recovery job must not report live.
+    let status = jobs::statuses(&names, true);
     {
         let mut entries = status.write().await;
+        for job in registered {
+            entries
+                .get_mut(job.name)
+                .expect("known registered job")
+                .parked = false;
+        }
         for name in parked {
-            if let Some(entry) = entries.get_mut(name) {
+            if let Some(entry) = entries.get_mut(*name) {
                 entry.parked = true;
             }
         }
     }
-    let http = server::serve(listener, gateway, status.clone(), shutdown.clone());
-    serve_jobs(registered, status, shutdown, http).await
+    status
 }
 
 pub(crate) const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);

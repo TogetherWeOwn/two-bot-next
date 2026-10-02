@@ -2,11 +2,12 @@
 
 The Rust process exposes `GET /metrics` on its existing `LISTEN_ADDR` listener.
 This is **internal-only**, unauthenticated operational data: scrape only from the
-container/private network. Do not expose the container port publicly, add a Worker
-proxy route, or route this through a public ingress. Both the Worker entrypoint
+container/private network. Do not expose the container port publicly or route it through a
+public ingress; the only off-container path is the authenticated
+`/ops/metrics` route below. Both the Worker entrypoint
 and the Container DO refuse `/metrics`; the Worker also reserves `/metrics`,
 `/metrics/*` and canonical case/encoding/slash aliases before
-invite-campaign lookup. No Prometheus server is added by this change.
+invite-campaign lookup. No Prometheus server exists; see the off-container path below.
 
 Format: Prometheus text 0.0.4, `text/plain; version=0.0.4; charset=utf-8`, `no-store`.
 Counters reset when the process restarts; timestamps use Unix seconds. Missing
@@ -35,7 +36,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
-`community_scorecard` and `inactivity` (the last two may be parked by configuration).
+`community_scorecard`, `inactivity`, `audit_retry` and `self_role_recovery`
+(the last four may be parked by configuration).
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -110,9 +112,14 @@ as dynamic labels.
   `POST /guilds/:guild/scheduled-events`,
   `PATCH /guilds/:guild/scheduled-events/:event`,
   `DELETE /guilds/:guild/scheduled-events/:event`, `other`).
-- `two_bot_job_last_success_timestamp_seconds{job}` — `job` is one of
-  `invite_snapshot`, `session_checkpoint`, `other`. `session_checkpoint`
-  records successful durable gateway commits; zero means never run.
+- `two_bot_job_runs_total{job,outcome}`,
+  `two_bot_job_last_success_timestamp_seconds{job}` and
+  `two_bot_job_consecutive_failures{job}` — `job` is one of
+  `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
+  `scheduled_events`, `presence_probe`, `community_scorecard`, `inactivity`,
+  `audit_retry`, `other`; `outcome` is `success` or `failure`.
+  `session_checkpoint` records successful durable gateway commits; zero means
+  never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
   `_sum` and `_count`.
@@ -173,3 +180,47 @@ controller's bounded cache pool was missing at implementation time.
   <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Latency.html#method.recent>
 - Axum router composition follows the existing router/state pattern (0.8.9 in
   `Cargo.lock`); no middleware or additional dependency is introduced.
+
+## Off-container scrape and alert rules
+
+Chosen path: the Container Durable Object (the only caller that can reach the
+container-internal listener) pulls `/metrics` via `containerFetch` on every
+keepalive tick, evaluates the checked-in rules and posts transitions to the
+optional `OPS_ALERT_WEBHOOK_URL` Discord-compatible webhook. No Prometheus
+server, no new infrastructure.
+
+- Authenticated pull: `GET /ops/metrics` on the Worker with
+  `Authorization: Bearer <METRICS_SCRAPE_TOKEN>`. The token is an optional
+  Worker secret (never a plain var). Unset → `404`; missing or wrong bearer →
+  `401` (compared via SHA-256 digests); non-GET → `404`. Unauthenticated
+  requests never reach the container. `/metrics` itself stays `404`.
+- Rules live in `wrangler/src/alert-rules.ts`; each links to a
+  [runbook](runbook.md#metrics-alerts) section (a test enforces the anchors):
+
+| Rule | Fires when | Runbook |
+| --- | --- | --- |
+| `job_stale:<job>` | last success older than 2 x the job cadence (never-succeeded is ignored) | [job stale](runbook.md#alert-job-stale) |
+| `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
+| `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
+| `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
+
+`job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
+Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
+have no cadence and are exempt. `wrangler/test/alert-job-catalog.test.ts` fails
+when a `JOBS` label has neither a matching cadence nor a reasoned exemption.
+
+Packet identity (TOG-12100): rule ids above are the single shared spelling
+used on both sides of the B2 soak evidence seam. The Rust canonical list is
+`ALERT_RULE_IDS` in `crates/core/src/evidence.rs`; the Worker mirrors it in
+`packetFilename` (`wrangler/src/alert-rules.ts`). Every evidence/alert packet
+is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
+`soak_expected_committed` ledger identity), so the QA evidence table can
+attribute packets when several rules fire in one window. Both sides pin all
+four spellings with tests; the payload shape is unchanged.
+
+Known gaps: there is no DB error counter (the pool rule is a proxy) and no
+send-admission series, so neither is alerted. Add the series first, then a rule.
+A forced job failure on staging (three failures) raises
+`job_consecutive_failures:<job>` within about one keepalive tick. Counter resets
+(process restart) skip the 429 window. Alert state is persisted in DO storage
+before notifying, so delivery is at most once per transition.

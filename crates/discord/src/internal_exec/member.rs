@@ -5,6 +5,7 @@
 //! of them may contain the member's OAuth token.
 
 use super::{ActionExecutor, RawResponse};
+use crate::ratelimit_guard::GuardError;
 use serde::Deserialize;
 use std::time::Duration;
 use twilight_http::request::TryIntoRequest;
@@ -19,6 +20,38 @@ pub mod store;
 
 pub const ADD_MEMBER_TIMEOUT_MS: u64 = 1500;
 pub const ROLE_TIMEOUT_MS: u64 = 2000;
+
+/// Keep proof of an unsent mutation until the durable caller disposes its claim.
+/// Public callers still receive the legacy scalar-only `ActionError` envelope.
+enum MemberError {
+    Guard(GuardError),
+    Action(ActionError),
+}
+
+impl From<ActionError> for MemberError {
+    fn from(error: ActionError) -> Self {
+        Self::Action(error)
+    }
+}
+
+impl MemberError {
+    fn into_action_error(self) -> ActionError {
+        match self {
+            Self::Guard(GuardError::TokenInvalid) => ActionError::new(
+                ErrorCode::DiscordUnavailable,
+                "Discord bot authentication is unavailable",
+                "discord_guard_refused",
+            ),
+            Self::Guard(_) => ActionError::new(
+                ErrorCode::RateLimited,
+                "Discord request paused locally before dispatch",
+                "discord_guard_refused",
+            )
+            .with_retry_after(1),
+            Self::Action(error) => error,
+        }
+    }
+}
 
 /// Exactly the legacy result object, without a provider response or secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -126,7 +159,7 @@ impl ActionExecutor {
         &self,
         build: T,
         timeout_ms: u64,
-    ) -> Result<RawResponse, ActionError> {
+    ) -> Result<RawResponse, MemberError> {
         let request = build.try_into_request().map_err(|_| {
             ActionError::new(
                 ErrorCode::Malformed,
@@ -134,26 +167,26 @@ impl ActionExecutor {
                 "discord_request_invalid",
             )
         })?;
-        let response = tokio::time::timeout(Duration::from_millis(timeout_ms), self.send(&request))
+        let (response, _) = self
+            .send_with_timeout_for(&request, None, Duration::from_millis(timeout_ms))
             .await
-            .map_err(|_| {
-                ActionError::new(
+            .map_err(|error| match error {
+                super::DiscordError::Guard(error) => MemberError::Guard(error),
+                super::DiscordError::Timeout => MemberError::Action(ActionError::new(
                     ErrorCode::UpstreamTimeout,
                     format!("Discord did not answer in {timeout_ms}ms"),
                     "discord_timeout",
-                )
-            })?
-            .map_err(|_| {
-                ActionError::new(
+                )),
+                _ => MemberError::Action(ActionError::new(
                     ErrorCode::DiscordUnavailable,
                     "Discord was unreachable",
                     "discord_unreachable",
-                )
+                )),
             })?;
         if let Some(error) = member_status_error(&response) {
             tracing::warn!(code = error.code.as_str(), reason = %error.log_reason,
                 "internal member action refused");
-            return Err(error);
+            return Err(error.into());
         }
         Ok(response)
     }
@@ -162,7 +195,7 @@ impl ActionExecutor {
         &self,
         guild_id: &str,
         user_id: &str,
-    ) -> Result<Option<Vec<String>>, ActionError> {
+    ) -> Result<Option<Vec<String>>, MemberError> {
         let response = self
             .member_request(
                 self.inner
@@ -181,21 +214,33 @@ impl ActionExecutor {
     }
 
     /// PUT /guilds/{g}/members/{u}. The token is a function argument and wire
-    /// body only. Source: https://docs.discord.com/developers/resources/guild#add-guild-member
+    /// body only. Source: <https://docs.discord.com/developers/resources/guild#add-guild-member>
     pub async fn add_internal_member(
         &self,
         guild_id: &str,
         request: &GuildAddMemberRequest<'_>,
         access_token: &str,
     ) -> Result<MemberOutcome, ActionError> {
+        self.add_internal_member_once(guild_id, request, access_token)
+            .await
+            .map_err(MemberError::into_action_error)
+    }
+
+    async fn add_internal_member_once(
+        &self,
+        guild_id: &str,
+        request: &GuildAddMemberRequest<'_>,
+        access_token: &str,
+    ) -> Result<MemberOutcome, MemberError> {
         if access_token.is_empty() {
             return Err(ActionError::new(
                 ErrorCode::Malformed,
                 "\"access_token\" must be a non-empty string",
                 "missing_access_token",
-            ));
+            )
+            .into());
         }
-        let response = self
+        let mut response = self
             .member_request(
                 self.inner.factory.add_guild_member(
                     numeric_id(guild_id)?.cast(),
@@ -205,21 +250,36 @@ impl ActionExecutor {
                 ADD_MEMBER_TIMEOUT_MS,
             )
             .await?;
-        Ok(if response.status == 201 {
-            MemberOutcome::Added
-        } else {
-            MemberOutcome::AlreadyMember
-        })
+        let outcome = match response.status {
+            201 => MemberOutcome::Added,
+            200 | 204 => MemberOutcome::AlreadyMember,
+            _ => return Err(unreadable().into()),
+        };
+        // This endpoint's accepted status distinguishes added/already present;
+        // no message/resource id is consumed by the caller.
+        response.complete().await;
+        Ok(outcome)
     }
 
     /// A resolved allowlisted role, with an authoritative hierarchy read before
-    /// mutation. Source: https://docs.discord.com/developers/topics/permissions#permission-hierarchy
+    /// mutation. Source: <https://docs.discord.com/developers/topics/permissions#permission-hierarchy>
     pub async fn assign_internal_role(
         &self,
         guild_id: &str,
         bot_user_id: &str,
         request: &RoleAssignRequest<'_>,
     ) -> Result<MemberOutcome, ActionError> {
+        self.assign_internal_role_once(guild_id, bot_user_id, request)
+            .await
+            .map_err(MemberError::into_action_error)
+    }
+
+    async fn assign_internal_role_once(
+        &self,
+        guild_id: &str,
+        bot_user_id: &str,
+        request: &RoleAssignRequest<'_>,
+    ) -> Result<MemberOutcome, MemberError> {
         let guild = numeric_id(guild_id)?.cast();
         let user = numeric_id(request.discord_id())?.cast();
         let role = numeric_id(request.role_id())?.cast();
@@ -234,7 +294,10 @@ impl ActionExecutor {
             Ok(Some(held)) if held.iter().any(|id| id == request.role_id()) => {
                 return Ok(MemberOutcome::AlreadyHeld);
             }
-            Err(error) if error.code == ErrorCode::RateLimited => return Err(error),
+            Err(error @ MemberError::Guard(_)) => return Err(error),
+            Err(MemberError::Action(error)) if error.code == ErrorCode::RateLimited => {
+                return Err(error.into());
+            }
             _ => {}
         }
         let bot_roles = self
@@ -251,11 +314,11 @@ impl ActionExecutor {
         for snapshot in &roles {
             numeric_id(&snapshot.id).map_err(|_| unreadable())?;
             if !ids.insert(snapshot.id.as_str()) {
-                return Err(unreadable());
+                return Err(unreadable().into());
             }
         }
         if !ids.contains(guild_id) || bot_roles.iter().any(|id| !ids.contains(id.as_str())) {
-            return Err(unreadable());
+            return Err(unreadable().into());
         }
         let target = roles
             .iter()
@@ -272,14 +335,21 @@ impl ActionExecutor {
                 status: 403,
                 retry_after_header: None,
                 body: vec![],
+                completion: None,
             })
-            .expect("403 is a refusal"));
+            .expect("403 is a refusal")
+            .into());
         }
-        self.member_request(
-            self.inner.factory.add_guild_member_role(guild, user, role),
-            ROLE_TIMEOUT_MS,
-        )
-        .await?;
+        let mut response = self
+            .member_request(
+                self.inner.factory.add_guild_member_role(guild, user, role),
+                ROLE_TIMEOUT_MS,
+            )
+            .await?;
+        if response.status != 204 {
+            return Err(unreadable().into());
+        }
+        response.complete().await;
         Ok(MemberOutcome::Assigned)
     }
 }

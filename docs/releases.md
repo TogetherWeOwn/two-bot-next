@@ -57,9 +57,10 @@ snapshot, including every manifest/dependency/lock update and the migrated
 changelog, then feeds a second native release to verify the post-release state.
 `security` entries appear under Fixed and advance the patch.
 Before dispatching checks, `scripts/migrate-release-notes.cjs` consumes the
-native updater's first-release bootstrap tail: it merges the existing RSVP
-Added/Fixed notes (plus the hand-written Notes tail the live changelog carries)
-into the generated version section and the release PR body,
+native updater's first-release bootstrap tail: it merges the existing
+Added/Fixed/Changed notes (plus the hand-written Notes tail and Security
+section the live changelog carries) into the generated version section and
+the release PR body,
 removing the duplicate title and Unreleased section. The PR body matters because
 release-please uses it, not the changelog file, for GitHub Release notes. The
 changelog and body are reconciled independently, so retries recover if only one
@@ -143,7 +144,7 @@ uses a token, contacts GitHub or accesses a database, and runs in Worker CI.
 ## Required-check dispatch
 
 `GITHUB_TOKEN`-created PRs do not trigger ordinary PR workflows. The release
-workflow dispatches `check.yml`, `secret-scan.yml`, and `pr-lint.yml` on the
+workflow dispatches `check.yml` and `supply-chain.yml` (the folded `pr-lint` + `gitleaks` gate) on the
 release PR branch. `GH_REPO` explicitly names the repository because that job
 has no checkout. PR lint reads the open release PR's title and body via the
 API, verifies that its open same-repository head SHA and branch match the

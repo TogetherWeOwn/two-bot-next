@@ -1,6 +1,6 @@
 //! Runtime Postgres store for two-bot-next (S6, TOG-9811).
 //!
-//! sqlx [`Pool<Postgres>`] persistence behind the framework-free core seams:
+//! sqlx `Pool<Postgres>` persistence behind the framework-free core seams:
 //! [`FunnelStore`] (append-only funnel log + members projection) and
 //! [`InviteSnapshotStore`]. Plus the checksum migration runner
 //! ([`migrations`]) and the read-only `web_v1` contract views
@@ -16,6 +16,7 @@
 //! The runtime pipeline calls from one ordered blocking dispatch worker;
 //! the shard is polled independently on the multi-thread Tokio runtime.
 
+pub mod journal;
 pub mod migrations;
 pub mod pool;
 pub mod snapshots;

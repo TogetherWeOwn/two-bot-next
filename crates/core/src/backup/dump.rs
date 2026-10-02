@@ -29,8 +29,9 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 
 use super::dump_file::{
-    cell_input, inspect, is_dump_table, DumpContents, DumpError, DumpManifest, DumpTableInfo,
-    DumpWriter, DUMP_TABLES, DUMP_VERSION,
+    cell_input, inspect, is_destination_owned, is_dump_table, DumpContents, DumpError,
+    DumpManifest, DumpTableInfo, DumpWriter, SequenceMark, DUMP_TABLES, DUMP_VERSION,
+    OPTIONAL_LEGACY_TABLES,
 };
 use super::guild_config::unix_now_iso;
 
@@ -45,39 +46,15 @@ pub enum DbDumpError {
     Refused(String),
 }
 
-/// Stable read order, so two dumps of an unchanged database are comparable.
-/// (Port of legacy `orderFor`.)
-fn order_for(table: &str, columns: &[String]) -> String {
-    let order = match table {
-        "events" => "id",
-        "members" => "guild_id, member_id",
-        "invite_snapshots" => "guild_id, code",
-        "operational_audit_log" => "entry_id",
-        "moderation_warnings" => "created_at, id",
-        "moderation_scheduled_unbans" => "execute_at, request_id",
-        "moderation_audit" => "created_at, request_id",
-        "moderation_lockdowns" => "guild_id, channel_id",
-        "moderation_idempotency" => "guild_id, idempotency_key",
-        "containment_events" => "occurred_at, audit_entry_id",
-        "containment_incidents" => "started_at, id",
-        "join_risk_flags" => "joined_at, event_id",
-        "automation_commands" => "guild_id, name",
-        "scheduled_messages" => "guild_id, id",
-        "sticky_messages" => "guild_id, channel_id",
-        "automation_audit_log" => "created_at, id",
-        "tickets" => "created_at, id",
-        "ticket_transcripts" => "created_at, ticket_id",
-        "automod_violations" => "guild_id, user_id",
-        "automod_processed_messages" => "guild_id, message_id",
-        "self_role_audit" => "created_at, event_id",
-        "self_role_panel_claims" => "guild_id, member_id, panel_id",
-        _ => "",
-    };
-    if order.is_empty() {
-        columns.first().cloned().unwrap_or_else(|| "1".to_owned())
-    } else {
-        order.to_owned()
-    }
+/// Total, locale-independent order even for composite keys or tables without
+/// a primary key. Text output is the archive's representation; equal sort keys
+/// therefore mean identical archived rows (including JSON and binary columns).
+fn order_for(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("\"{}\"::text COLLATE \"C\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Postgres caps a statement at 65535 bound parameters. Stay well under.
@@ -142,6 +119,152 @@ async fn count_of(
     Ok(row.0)
 }
 
+/// Allocators not OWNED BY a column, keyed by the column they feed.
+const STANDALONE_SEQUENCES: &[(&str, &str, &str)] = &[
+    ("guild_settings", "version", "guild_settings_version_seq"),
+    ("guild_settings", "cas_version", "guild_settings_cas_seq"),
+];
+
+/// `(column, sequence)` for every serial AND identity sequence owned by a
+/// column of `table`, including columns not named `id`, from the catalog
+/// rather than a hardcoded list or archive-supplied names. Standalone
+/// allocators that exist follow.
+/// https://www.postgresql.org/docs/16/functions-info.html
+async fn table_sequences(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+) -> Result<Vec<(String, String)>, DbDumpError> {
+    let mut sequences: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name::text, pg_get_serial_sequence(\
+         quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) \
+         FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1 \
+         AND pg_get_serial_sequence(\
+         quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) IS NOT NULL \
+         ORDER BY ordinal_position",
+    )
+    .bind(table)
+    .fetch_all(&mut **tx)
+    .await?;
+    for (owner, column, sequence) in STANDALONE_SEQUENCES {
+        if *owner != table {
+            continue;
+        }
+        let (exists,): (bool,) = sqlx::query_as("SELECT to_regclass($1) IS NOT NULL")
+            .bind(*sequence)
+            .fetch_one(&mut **tx)
+            .await?;
+        if exists {
+            sequences.push(((*column).to_owned(), (*sequence).to_owned()));
+        }
+    }
+    Ok(sequences)
+}
+
+/// A sequence's definition and live position. Sequences are not MVCC: inside
+/// the dump's snapshot this reads the current position, which is at or beyond
+/// every value the snapshot can contain.
+struct SequenceState {
+    quoted: String,
+    start: i64,
+    increment: i64,
+    min: i64,
+    max: i64,
+    last_value: i64,
+    is_called: bool,
+}
+
+async fn sequence_state(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sequence: &str,
+) -> Result<SequenceState, DbDumpError> {
+    let (quoted, start, increment, min, max): (String, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
+         s.seqstart, s.seqincrement, s.seqmin, s.seqmax \
+         FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE s.seqrelid = $1::regclass",
+    )
+    .bind(sequence)
+    .fetch_one(&mut **tx)
+    .await?;
+    // `quoted` is the catalog's own quote_ident spelling.
+    let (last_value, is_called): (i64, bool) = sqlx::query_as(audited(format!(
+        "SELECT last_value, is_called FROM {quoted}"
+    )))
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(SequenceState {
+        quoted,
+        start,
+        increment,
+        min,
+        max,
+        last_value,
+        is_called,
+    })
+}
+
+/// Restart transactionally rather than using setval (which survives rollback),
+/// at the furthest of: the configured start, one step past the restored rows,
+/// the archive's mark and the target's own position. A restore therefore never
+/// reissues a value the source or the target already handed out, including
+/// one whose row was deleted (the cutover allocator gate).
+/// Catalog identifiers are quoted by Postgres; restart values are checked i64s.
+/// <https://www.postgresql.org/docs/16/sql-altersequence.html>
+async fn restart_sequence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+    column: &str,
+    sequence: &str,
+    mark: Option<&SequenceMark>,
+) -> Result<(), DbDumpError> {
+    let state = sequence_state(tx, sequence).await?;
+    let exhausted =
+        || DbDumpError::Refused(format!("{table}.{column}: restored sequence exhausted"));
+    let quoted_column = format!("\"{}\"", column.replace('"', "\"\""));
+    let ascending = state.increment > 0;
+    let aggregate = if ascending { "MAX" } else { "MIN" };
+    let (edge,): (Option<i64>,) = sqlx::query_as(audited(format!(
+        "SELECT {aggregate}({quoted_column})::bigint FROM {table}"
+    )))
+    .fetch_one(&mut **tx)
+    .await?;
+    let own = if state.is_called {
+        state.last_value.checked_add(state.increment)
+    } else {
+        Some(state.last_value)
+    };
+    let mut candidates = vec![state.start, own.ok_or_else(exhausted)?];
+    if let Some(edge) = edge {
+        candidates.push(edge.checked_add(state.increment).ok_or_else(exhausted)?);
+    }
+    if let Some(mark) = mark {
+        if mark.increment.signum() != state.increment.signum() {
+            return Err(DbDumpError::Refused(format!(
+                "{table}.{column}: archived sequence mark runs the other way from the target"
+            )));
+        }
+        candidates.push(mark.next().ok_or_else(exhausted)?);
+    }
+    let next = if ascending {
+        candidates.into_iter().max()
+    } else {
+        candidates.into_iter().min()
+    }
+    .ok_or_else(exhausted)?;
+    if !(state.min..=state.max).contains(&next) {
+        return Err(exhausted());
+    }
+    sqlx::query(audited(format!(
+        "ALTER SEQUENCE {} RESTART WITH {next}",
+        state.quoted
+    )))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Write every bot-owned table to `out_path` as one consistent snapshot.
 pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDumpError> {
     let mut tx = pool.begin().await?;
@@ -157,11 +280,18 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         }
         let cols = columns_of(&mut tx, name).await?;
         if cols.is_empty() {
+            if OPTIONAL_LEGACY_TABLES.contains(name) {
+                continue;
+            }
             return Err(DbDumpError::Refused(format!(
                 "table {name} does not exist in the target — run migrations first (S6 owns the schema)"
             )));
         }
         let count = count_of(&mut tx, name).await? as u64;
+        let cols: Vec<_> = cols
+            .into_iter()
+            .filter(|(c, _)| !is_destination_owned(name, c))
+            .collect();
         tables.push(DumpTableInfo {
             name: (*name).to_owned(),
             columns: cols.iter().map(|(c, _)| c.clone()).collect(),
@@ -189,6 +319,22 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         Vec::new()
     };
 
+    // Rows alone cannot show values handed out and then deleted; the marks
+    // let restore resume past them (the cutover allocator gate).
+    let mut sequence_marks = Vec::new();
+    for table in &tables {
+        for (column, sequence) in table_sequences(&mut tx, &table.name).await? {
+            let state = sequence_state(&mut tx, &sequence).await?;
+            sequence_marks.push(SequenceMark {
+                table: table.name.clone(),
+                column,
+                last_value: state.last_value,
+                is_called: state.is_called,
+                increment: state.increment,
+            });
+        }
+    }
+
     let manifest = DumpManifest {
         kind: "manifest".to_owned(),
         version: DUMP_VERSION,
@@ -196,6 +342,7 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         tables,
         events_sequence: seq.0,
         schema_migrations: migrations.into_iter().map(|(id,)| id).collect(),
+        sequence_marks,
     };
 
     let mut writer = DumpWriter::new(out_path)?;
@@ -209,7 +356,7 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
             .map(|c| format!("\"{}\"::text", c.replace('"', "\"\"")))
             .collect();
         let select_list = quoted.join(", ");
-        let order = order_for(&table.name, &table.columns);
+        let order = order_for(&table.columns);
         // Stream row-by-row: each row passes through the bounded writer
         // (8 MiB decoded-line cap, cumulative budgets) BEFORE the next row
         // is materialised. An early oversized row refuses before later rows
@@ -250,6 +397,8 @@ pub struct RestoreReport {
     pub manifest: DumpManifest,
     pub restored: BTreeMap<String, u64>,
     pub dropped_columns: BTreeMap<String, Vec<String>>,
+    /// Schema-required baseline rows initialized when absent from an old dump.
+    pub initialized_tables: BTreeMap<String, u64>,
     pub ok: bool,
 }
 
@@ -262,19 +411,105 @@ pub struct RestoreReport {
 pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbDumpError> {
     let contents: DumpContents = inspect(in_path)?;
     let manifest = contents.manifest;
+    let missing = manifest.missing_tables();
+    if !missing.is_empty() {
+        tracing::warn!(version = manifest.version, tables = ?missing, "old dump lacks tables; restore clears them (settings revision singleton resets to zero)");
+    }
     let mut dropped_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     let mut tx = pool.begin().await?;
-    // RESTART IDENTITY so the sequence does not carry over from whatever was
-    // in the target before; it is set explicitly below.
+    let mut target_tables = Vec::new();
+    for name in DUMP_TABLES {
+        if columns_of(&mut tx, name).await?.is_empty() {
+            let count = manifest
+                .tables
+                .iter()
+                .find(|t| t.name == *name)
+                .map_or(0, |t| t.count);
+            if !OPTIONAL_LEGACY_TABLES.contains(name) || count != 0 {
+                return Err(DbDumpError::Refused(format!(
+                    "table {name} is absent from target; refusing to lose {count} archived rows — provision the matching schema first"
+                )));
+            }
+        } else {
+            target_tables.push(*name);
+        }
+    }
+    // Lock before changing guards. Only two named application triggers are
+    // suspended, never FK/check constraints or session_replication_role. ALTER
+    // TABLE is transactional: error/cancellation rolls back data AND guards.
+    // trg_guild_settings_version stays enabled: it allocates fresh CAS tokens.
+    // https://www.postgresql.org/docs/16/sql-altertable.html
     sqlx::query(audited(format!(
-        "TRUNCATE {} RESTART IDENTITY",
-        DUMP_TABLES.join(", ")
+        "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+        target_tables.join(", ")
     )))
     .execute(&mut *tx)
     .await?;
+    let mut suspended = Vec::new();
+    for (table, trigger) in [
+        ("guild_settings", "trg_guild_settings_revision"),
+        (
+            "guild_settings_audit",
+            "trg_guild_settings_audit_append_only",
+        ),
+    ] {
+        let enabled: Option<(String,)> = sqlx::query_as(
+            "SELECT tgenabled::text FROM pg_trigger \
+             WHERE tgrelid = to_regclass($1) AND tgname = $2 AND NOT tgisinternal",
+        )
+        .bind(table)
+        .bind(trigger)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((state,)) = enabled {
+            sqlx::query(audited(format!(
+                "ALTER TABLE {table} DISABLE TRIGGER {trigger}"
+            )))
+            .execute(&mut *tx)
+            .await?;
+            suspended.push((table, trigger, state));
+        }
+    }
+    // A single explicit truncate covers all FK dependencies, without CASCADE
+    // touching foreign/website tables. No RESTART IDENTITY: that would discard
+    // the target's own high-water mark, which the restarts below preserve.
+    sqlx::query(audited(format!("TRUNCATE {}", target_tables.join(", "))))
+        .execute(&mut *tx)
+        .await?;
+    // Cooldowns are intentionally not archived; discard stale target throttles.
+    if !columns_of(&mut tx, "xp_cooldowns").await?.is_empty() {
+        sqlx::query("TRUNCATE xp_cooldowns")
+            .execute(&mut *tx)
+            .await?;
+    }
+    if manifest.sequence_marks.is_empty() {
+        tracing::warn!(version = manifest.version, "archive carries no sequence marks; allocators resume past the restored rows and the target's own position only");
+    }
+    // Destination-owned columns (CAS tokens) are allocated by the inserts
+    // below. Move their allocator past the archive's mark first, so no restored
+    // row receives a token a client of the source may still hold.
+    for &table in &target_tables {
+        for (column, sequence) in table_sequences(&mut tx, table).await? {
+            if is_destination_owned(table, &column) {
+                restart_sequence(
+                    &mut tx,
+                    table,
+                    &column,
+                    &sequence,
+                    manifest.sequence_mark(table, &column),
+                )
+                .await?;
+            }
+        }
+    }
 
-    for table in &manifest.tables {
+    // Never trust manifest order: a legacy or reordered file can put children
+    // before parents. The same allowlist controls dump and restore FK order.
+    for name in DUMP_TABLES {
+        let Some(table) = manifest.tables.iter().find(|t| t.name == *name) else {
+            continue;
+        };
         // Re-checked at the point of interpolation, not just at parse time:
         // this is the line that builds SQL from file-supplied text.
         if !is_dump_table(&table.name) {
@@ -296,6 +531,8 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             .collect();
         // Dumps written by legacy two-bot carry no column types; the
         // target's own type is the safe fallback (text parses everywhere).
+        // Destination-owned columns are allocated by the target, so an archived
+        // value is skipped rather than restored or reported as dropped.
         let kept: Vec<(&String, &str)> = table
             .columns
             .iter()
@@ -310,12 +547,16 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
                         .unwrap_or("text"),
                 )
             })
-            .filter(|(c, _)| target_names.contains(&c.as_str()))
+            .filter(|(c, _)| {
+                target_names.contains(&c.as_str()) && !is_destination_owned(&table.name, c)
+            })
             .collect();
         let dropped: Vec<String> = table
             .columns
             .iter()
-            .filter(|c| !target_names.contains(&c.as_str()))
+            .filter(|c| {
+                !target_names.contains(&c.as_str()) && !is_destination_owned(&table.name, c)
+            })
             .cloned()
             .collect();
         if !dropped.is_empty() {
@@ -336,7 +577,12 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         let batch = batch_size_for(kept.len());
         for page in rows.chunks(batch) {
             // One multi-row INSERT per page: VALUES ($1::t1, $2::t2), ...
-            let mut sql = format!("INSERT INTO {} ({quoted}) VALUES ", table.name);
+            // Identity GENERATED ALWAYS columns need explicit-value restore too.
+            // https://www.postgresql.org/docs/16/sql-insert.html
+            let mut sql = format!(
+                "INSERT INTO {} ({quoted}) OVERRIDING SYSTEM VALUE VALUES ",
+                table.name
+            );
             let mut params: Vec<Option<String>> = Vec::with_capacity(page.len() * kept.len());
             let mut placeholders: Vec<String> = Vec::with_capacity(page.len());
             let mut index = 1;
@@ -368,40 +614,86 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         }
     }
 
-    // Put the id sequence back past the restored high-water mark, or the
-    // first write after the restore collides with a row we just put back.
-    sqlx::query(
-        "SELECT setval(pg_get_serial_sequence('events', 'id'), \
-         GREATEST((SELECT COALESCE(MAX(id), 0) FROM events), 1), \
-         (SELECT COUNT(*) FROM events) > 0)",
-    )
-    .execute(&mut *tx)
-    .await?;
+    // v3 predates the required singleton. Clearing stale target data is not
+    // enough: settings writes would subsequently fail without this baseline.
+    // Never synthesize application settings/history or replace an archived row.
+    let mut initialized_tables = BTreeMap::new();
+    if missing.contains(&"guild_settings_revision") {
+        let columns = columns_of(&mut tx, "guild_settings_revision").await?;
+        if columns.iter().any(|(name, _)| name == "singleton")
+            && columns.iter().any(|(name, _)| name == "revision")
+        {
+            sqlx::query(
+                "INSERT INTO guild_settings_revision (singleton, revision) VALUES (TRUE, 0)",
+            )
+            .execute(&mut *tx)
+            .await?;
+            initialized_tables.insert("guild_settings_revision".to_owned(), 1);
+        }
+    }
+
+    // Preserve origin/always/replica/disabled modes, not just enabled vs disabled.
+    // https://www.postgresql.org/docs/16/catalog-pg-trigger.html
+    for (table, trigger, state) in suspended {
+        let action = match state.as_str() {
+            "O" => "ENABLE",
+            "A" => "ENABLE ALWAYS",
+            "R" => "ENABLE REPLICA",
+            "D" => "DISABLE",
+            _ => return Err(DbDumpError::Refused("unknown trigger state".to_owned())),
+        };
+        sqlx::query(audited(format!(
+            "ALTER TABLE {table} {action} TRIGGER {trigger}"
+        )))
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Every other allocator (owned serial/identity and the standalone
+    // settings-version sequence) resumes past the restored rows, the
+    // archive's mark and the target's own position.
+    for &table in &target_tables {
+        for (column, sequence) in table_sequences(&mut tx, table).await? {
+            if !is_destination_owned(table, &column) {
+                restart_sequence(
+                    &mut tx,
+                    table,
+                    &column,
+                    &sequence,
+                    manifest.sequence_mark(table, &column),
+                )
+                .await?;
+            }
+        }
+    }
     tx.commit().await?;
 
     let mut restored = BTreeMap::new();
     let mut ok = true;
-    for table in &manifest.tables {
-        if !is_dump_table(&table.name) {
-            return Err(DbDumpError::Refused(format!(
-                "manifest table {:?} is not a dump table",
-                table.name
-            )));
-        }
-        let row: (i64,) = sqlx::query_as(audited(format!("SELECT COUNT(*) FROM {}", table.name)))
+    for table in &target_tables {
+        let row: (i64,) = sqlx::query_as(audited(format!("SELECT COUNT(*) FROM {table}")))
             .fetch_one(pool)
             .await?;
         let count = row.0 as u64;
-        if count != table.count {
+        let expected = manifest
+            .tables
+            .iter()
+            .find(|t| t.name == *table)
+            .map_or_else(
+                || initialized_tables.get(*table).copied().unwrap_or(0),
+                |t| t.count,
+            );
+        if count != expected {
             ok = false;
         }
-        restored.insert(table.name.clone(), count);
+        restored.insert((*table).to_owned(), count);
     }
 
     Ok(RestoreReport {
         manifest,
         restored,
         dropped_columns,
+        initialized_tables,
         ok,
     })
 }

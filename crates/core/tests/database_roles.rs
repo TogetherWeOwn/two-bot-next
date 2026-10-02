@@ -6,7 +6,11 @@ mod test_database;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use two_bot_core::database_roles;
+
+// Parallel tests share one pid and can read the same clock tick.
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
 const TEST_URL: &str = "postgres://agent_test:@agent-testdb:5432/agent_test";
 const SCHEDULED_INSERT: &str = "INSERT INTO public.scheduled_messages
@@ -30,7 +34,8 @@ fn names() -> (String, Vec<String>) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let name = format!("dbroles10892_{}_{stamp}", std::process::id());
+    let sequence = NEXT_DB.fetch_add(1, Ordering::Relaxed);
+    let name = format!("dbroles10892_{}_{stamp}_{sequence}", std::process::id());
     let roles = ["m", "b", "w"].map(|suffix| format!("{name}_{suffix}"));
     (name, roles.to_vec())
 }
@@ -88,6 +93,54 @@ async fn denied(pool: &PgPool, role: &str, sql: &str) -> Result<(), sqlx::Error>
             "expected permission denial for {sql}"
         ))),
     }
+}
+
+async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    use two_bot_core::send_admission::{
+        AdmissionError, PgSendAdmission, SendAdmission, SendCooldown,
+    };
+
+    let role = role.to_owned();
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _| {
+            let role = role.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await?;
+    let result = async {
+        let error = |error: AdmissionError| sqlx::Error::InvalidArgument(error.to_string());
+        let gate = PgSendAdmission::new(runtime.clone(), "offline-database-role-admission")
+            .map_err(error)?;
+        gate.admit()
+            .await
+            .map_err(error)?
+            .complete(None)
+            .await
+            .map_err(error)?;
+        gate.admit()
+            .await
+            .map_err(error)?
+            .complete(Some(SendCooldown::Indefinite))
+            .await
+            .map_err(error)?;
+        gate.extend(SendCooldown::FiniteMs(1))
+            .await
+            .map_err(error)?;
+        require(
+            matches!(gate.admit().await, Err(AdmissionError::Blocked)),
+            "runtime lost indefinite admission hold",
+        )
+    }
+    .await;
+    runtime.close().await;
+    result
 }
 
 async fn scheduled_runtime_probe(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
@@ -150,11 +203,22 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0170_lfg.sql"),
         include_str!("../../cutover/migrations/0190_onboarding.sql"),
         include_str!("../../cutover/migrations/0200_self_roles.sql"),
+        include_str!("../../cutover/migrations/0203_self_role_pending_exchange.sql"),
+        include_str!("../../cutover/migrations/0205_self_role_exchange_receipts.sql"),
+        include_str!("../../cutover/migrations/0206_self_role_exchange_baselines.sql"),
         include_str!("../../cutover/migrations/0210_tickets.sql"),
+        include_str!("../../cutover/migrations/0220_automod.sql"),
+        include_str!("../../cutover/migrations/0221_automod_delivery_claims.sql"),
+        include_str!("../../cutover/migrations/0222_automod_counted_claim.sql"),
+        include_str!("../../cutover/migrations/0223_automod_preserved_match.sql"),
+        include_str!("../../cutover/migrations/0224_voice_rooms.sql"),
+        include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
         include_str!("../../cutover/migrations/0300_website_contract.sql"),
         include_str!("../../cutover/migrations/0310_presence_probe.sql"),
         include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
+        include_str!("../../cutover/migrations/0312_community_scorecard_attempts.sql"),
         include_str!("../../cutover/migrations/0320_gateway_sessions.sql"),
+        include_str!("../../cutover/migrations/0321_gateway_boot_directives.sql"),
         include_str!("../../cutover/migrations/0330_guild_settings.sql"),
         include_str!("../../cutover/migrations/0331_guild_settings_versions.sql"),
         include_str!("../../cutover/migrations/0332_guild_settings_allocator.sql"),
@@ -162,6 +226,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
         include_str!("../../cutover/migrations/0340_operational_audit.sql"),
         include_str!("../../cutover/migrations/0350_internal_actions.sql"),
+        include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
+        include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
     ] {
         sqlx::raw_sql(migration).execute(pool).await?;
     }
@@ -221,6 +287,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "CREATE TABLE public.migrator_probe (id int)",
     )
     .await?;
+    as_role(pool, &roles[1], "INSERT INTO public.voice_creators (guild_id, channel_id) VALUES ('100', '200'); SELECT * FROM public.voice_creators; UPDATE public.voice_creators SET default_limit = 5 WHERE guild_id = '100'; INSERT INTO public.voice_rooms (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at) VALUES ('100', '500', '200', '300', '300', '7', now()); SELECT * FROM public.voice_rooms; UPDATE public.voice_rooms SET owner_id = '301' WHERE guild_id = '100'; DELETE FROM public.voice_rooms WHERE guild_id = '100'; DELETE FROM public.voice_creators WHERE guild_id = '100'").await?;
+    denied(pool, &roles[2], "SELECT * FROM public.voice_creators").await?;
+    denied(pool, &roles[2], "SELECT * FROM public.voice_rooms").await?;
     // Invoker trigger DML must work without runtime direct function EXECUTE.
     as_role(
         pool,
@@ -252,10 +321,13 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // lane leases must work under the least-privilege login.
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_audit; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); UPDATE public.self_role_audit SET reason = 'probe' WHERE event_id = 'roles-probe'; DELETE FROM public.self_role_audit WHERE event_id = 'roles-probe'").await?;
     as_role(pool, &roles[1], "SELECT * FROM public.self_role_panel_claims; INSERT INTO public.self_role_panel_claims (guild_id, member_id, panel_id, claim_token, claim_generation, processing_expires_at) VALUES ('g', 'm', 'p', 'tok', 1, now() + interval '1 minute'); UPDATE public.self_role_panel_claims SET latest_option_key = 'probe' WHERE guild_id = 'g' AND member_id = 'm' AND panel_id = 'p'; DELETE FROM public.self_role_panel_claims WHERE guild_id = 'g' AND member_id = 'm' AND panel_id = 'p'").await?;
+    as_role(pool, &roles[1], "SELECT * FROM public.self_role_exchanges; INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('exchange-roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); INSERT INTO public.self_role_exchanges (exchange_id,event_id,origin_generation,role_id,adding,compensating) VALUES ('exchange-roles-probe','exchange-roles-probe',1,'101',true,false); UPDATE public.self_role_exchanges SET disposition='no_send',completed_at=clock_timestamp() WHERE exchange_id='exchange-roles-probe'; DELETE FROM public.self_role_exchanges WHERE exchange_id='exchange-roles-probe'; DELETE FROM public.self_role_audit WHERE event_id='exchange-roles-probe'").await?;
+    as_role(pool, &roles[1], "INSERT INTO public.self_role_audit (event_id, guild_id, panel_id, member_id, source_id, source, operation, outcome, added_role_ids, removed_role_ids, created_at) VALUES ('baseline-roles-probe', 'g', 'p', 'm', 's', 'button', 'add', 'processing', '[]', '[]', '2026-01-01T00:00:00Z'); INSERT INTO public.self_role_exchange_baselines (event_id) VALUES ('baseline-roles-probe'); SELECT * FROM public.self_role_exchange_baselines; UPDATE public.self_role_exchange_baselines SET legacy_pending=true WHERE event_id='baseline-roles-probe'; DELETE FROM public.self_role_exchange_baselines WHERE event_id='baseline-roles-probe'; DELETE FROM public.self_role_audit WHERE event_id='baseline-roles-probe'").await?;
     scheduled_runtime_probe(pool, &roles[1]).await?;
     // Migration 0210 relations require runtime CRUD, including the transcript's
     // ticket foreign key. Delete the transcript before its parent ticket.
     as_role(pool, &roles[1], "INSERT INTO public.tickets (id, guild_id, channel_id, opener_id, status, created_at) VALUES ('ticket-probe', 'g', 'c', 'm', 'open', '2026-01-01T00:00:00Z'); SELECT * FROM public.tickets; UPDATE public.tickets SET claimed_by = 'staff' WHERE id = 'ticket-probe'; INSERT INTO public.ticket_transcripts (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at, purge_after) VALUES ('ticket-probe', 'g', 'c', 'm', 'staff', 'probe', 1, '2026-01-01T00:00:00Z', '2026-04-01T00:00:00Z'); SELECT * FROM public.ticket_transcripts; UPDATE public.ticket_transcripts SET content = 'updated probe' WHERE ticket_id = 'ticket-probe'; DELETE FROM public.ticket_transcripts WHERE ticket_id = 'ticket-probe'; DELETE FROM public.tickets WHERE id = 'ticket-probe'").await?;
+    automod_runtime_role_regression(pool, roles).await?;
     for view in [
         "contract_meta",
         "live_counts",
@@ -269,7 +341,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     ] {
         as_role(pool, &roles[2], &format!("SELECT * FROM web_v1.{view}")).await?;
     }
+    admission_as_runtime(pool, &roles[1]).await?;
     for sql in [
+        "DELETE FROM public.discord_send_admission",
+        "TRUNCATE public.discord_send_admission",
         "CREATE TABLE public.runtime_probe (id int)",
         "CREATE SCHEMA runtime_probe",
         "CREATE TEMP TABLE runtime_probe (id int)",
@@ -286,10 +361,16 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         denied(pool, &roles[1], sql).await?;
     }
     for sql in [
+        "SELECT * FROM public.discord_send_admission",
+        "INSERT INTO public.discord_send_admission (token_key) VALUES ('offline')",
+        "UPDATE public.discord_send_admission SET in_flight = FALSE",
+        "DELETE FROM public.discord_send_admission",
         "SELECT * FROM public.members",
         "INSERT INTO public.members (member_id) VALUES ('test')",
         "SELECT * FROM public.self_role_audit",
         "SELECT * FROM public.self_role_panel_claims",
+        "SELECT * FROM public.self_role_exchanges",
+        "SELECT * FROM public.self_role_exchange_baselines",
         "SELECT * FROM public.scheduled_messages",
         SCHEDULED_INSERT,
         "UPDATE public.scheduled_messages SET body = 'reader' WHERE id = 'scheduled-role-probe'",
@@ -313,6 +394,18 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // PUBLIC/column access, attributes, inheritance and future grants all count.
     let (migrator, runtime, reader) = (&roles[0], &roles[1], &roles[2]);
     for (change, restore) in [
+        (format!("REVOKE SELECT ON public.discord_send_admission FROM {runtime}"),
+         format!("GRANT SELECT ON public.discord_send_admission TO {runtime}")),
+        (format!("REVOKE INSERT ON public.discord_send_admission FROM {runtime}"),
+         format!("GRANT INSERT ON public.discord_send_admission TO {runtime}")),
+        (format!("REVOKE UPDATE ON public.discord_send_admission FROM {runtime}"),
+         format!("GRANT UPDATE ON public.discord_send_admission TO {runtime}")),
+        (format!("GRANT DELETE ON public.discord_send_admission TO {runtime}"),
+         format!("REVOKE DELETE ON public.discord_send_admission FROM {runtime}")),
+        (format!("GRANT TRUNCATE ON public.discord_send_admission TO {runtime}"),
+         format!("REVOKE TRUNCATE ON public.discord_send_admission FROM {runtime}")),
+        ("GRANT SELECT ON public.discord_send_admission TO PUBLIC".to_owned(),
+         "REVOKE SELECT ON public.discord_send_admission FROM PUBLIC".to_owned()),
         ("GRANT SELECT (member_id) ON public.members TO PUBLIC".to_owned(),
          "REVOKE SELECT (member_id) ON public.members FROM PUBLIC".to_owned()),
         (format!("GRANT CREATE ON SCHEMA public TO {runtime}"),
@@ -350,6 +443,107 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         findings(pool, roles).await?.is_empty(),
         "restored matrix drifted",
     )?;
+    Ok(())
+}
+
+async fn automod_runtime_role_regression(
+    pool: &PgPool,
+    roles: &[String],
+) -> Result<(), sqlx::Error> {
+    // The canonical plan is the only source of grants. Exercise claim fencing,
+    // ledger upserts and retention under the non-owner runtime, not the admin.
+    as_role(
+        pool,
+        &roles[1],
+        r#"INSERT INTO public.automod_delivery_claims
+            (guild_id, message_id, delivery_kind, dry_run, request_hash)
+            VALUES ('g', 'automod-probe', 'create', false, 'hash')
+            ON CONFLICT DO NOTHING RETURNING claim_token;
+        SELECT claim_token, mutation_started, counted, released
+            FROM public.automod_delivery_claims
+            WHERE guild_id = 'g' AND message_id = 'automod-probe' FOR UPDATE;
+        INSERT INTO public.automod_processed_messages (guild_id, message_id, user_id, processed_at)
+            VALUES ('g', 'automod-probe', 'm', '2026-01-01T00:00:00Z')
+            ON CONFLICT (guild_id, message_id) DO NOTHING;
+        INSERT INTO public.automod_processed_messages (guild_id, message_id, user_id, processed_at)
+            VALUES ('g', 'automod-probe', 'm', '2026-01-01T00:00:00Z')
+            ON CONFLICT (guild_id, message_id) DO NOTHING;
+        INSERT INTO public.automod_violations
+            (guild_id, user_id, violation_count, last_filter, last_message_id, updated_at)
+            VALUES ('g', 'm', 1, 'links', 'automod-probe', '2026-01-01T00:00:00Z');
+        INSERT INTO public.automod_violations
+            (guild_id, user_id, violation_count, last_filter, last_message_id, updated_at)
+            VALUES ('g', 'm', 1, 'links', 'automod-probe', '2026-01-01T00:00:00Z')
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+                SET violation_count = automod_violations.violation_count + 1
+            RETURNING violation_count;
+        UPDATE public.automod_processed_messages SET processed_at = '2026-01-01T00:00:01Z'
+            WHERE guild_id = 'g' AND message_id = 'automod-probe';
+        UPDATE public.automod_delivery_claims
+            SET counted = true, matched_filter = 'links', matched_guild_id = 'g',
+                matched_channel_id = 'c', matched_message_id = 'automod-probe',
+                matched_author_id = 'm', released = false, mutation_started = true,
+                result_json = '{"outcome":"probe"}', completed_at = CURRENT_TIMESTAMP
+            WHERE guild_id = 'g' AND message_id = 'automod-probe';
+        DO $automod$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT FROM public.automod_processed_messages p
+                JOIN public.automod_violations v ON v.guild_id = p.guild_id AND v.user_id = p.user_id
+                JOIN public.automod_delivery_claims c ON c.guild_id = p.guild_id AND c.message_id = p.message_id
+                WHERE p.guild_id = 'g' AND p.message_id = 'automod-probe'
+                    AND v.violation_count = 2 AND c.counted AND c.mutation_started
+                    AND c.matched_author_id = 'm' AND c.result_json IS NOT NULL
+            ) THEN
+                RAISE EXCEPTION 'runtime claim/ledger DML did not persist';
+            END IF;
+        END;
+        $automod$;
+        DELETE FROM public.automod_delivery_claims WHERE guild_id = 'g' AND message_id = 'automod-probe';
+        DELETE FROM public.automod_processed_messages WHERE guild_id = 'g' AND message_id = 'automod-probe';
+        DELETE FROM public.automod_violations WHERE guild_id = 'g' AND user_id = 'm';"#,
+    )
+    .await?;
+    for table in [
+        "automod_violations",
+        "automod_processed_messages",
+        "automod_delivery_claims",
+    ] {
+        let relation = format!("public.{table}");
+        // Schema denial alone could hide accidental reader grants. Check the
+        // effective relation ACL too, including inherited/PUBLIC privileges.
+        require(
+            sqlx::query_scalar::<_, bool>(
+                r#"SELECT has_table_privilege($1::text, $3::text, 'SELECT')
+                    AND has_table_privilege($1::text, $3::text, 'INSERT')
+                    AND has_table_privilege($1::text, $3::text, 'UPDATE')
+                    AND has_table_privilege($1::text, $3::text, 'DELETE')
+                    AND NOT has_table_privilege($1::text, $3::text, 'TRUNCATE, REFERENCES, TRIGGER')
+                    AND NOT has_table_privilege($2::text, $3::text, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')"#,
+            )
+            .bind(&roles[1])
+            .bind(&roles[2])
+            .bind(&relation)
+            .fetch_one(pool)
+            .await?,
+            &format!("automod least-privilege ACL differs: {relation}"),
+        )?;
+        denied(
+            pool,
+            &roles[1],
+            &format!("ALTER TABLE {relation} ADD COLUMN forbidden int"),
+        )
+        .await?;
+        denied(pool, &roles[1], &format!("TRUNCATE {relation}")).await?;
+        for sql in [
+            format!("SELECT * FROM {relation}"),
+            format!("INSERT INTO {relation} DEFAULT VALUES"),
+            format!("UPDATE {relation} SET guild_id = 'forbidden'"),
+            format!("DELETE FROM {relation}"),
+        ] {
+            denied(pool, &roles[2], &sql).await?;
+        }
+    }
     Ok(())
 }
 

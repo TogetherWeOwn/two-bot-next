@@ -17,6 +17,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import {
   TokenBuckets,
+  canonicalCallerKey,
   clickIdempotencyKey,
   handleRedirect,
   inviteUrl,
@@ -64,6 +65,7 @@ function harness(opts: {
   recorderThrows?: boolean;
   fallback?: string | null;
   bucket?: { capacity: number; refillPerSecond: number };
+  limits?: ConstructorParameters<typeof TokenBuckets>[2];
   now?: () => number;
 } = {}): Harness {
   const clicks: RedirectClick[] = [];
@@ -71,6 +73,7 @@ function harness(opts: {
   const buckets = new TokenBuckets(
     opts.bucket ?? { capacity: 60, refillPerSecond: 1 },
     opts.now ?? Date.now,
+    opts.limits,
   );
   let token = 0;
   const deps: RedirectDeps = {
@@ -87,7 +90,7 @@ function harness(opts: {
     onError: (msg, detail) => errors.push(`${msg} ${JSON.stringify(detail)}`),
     now: () => new Date("2026-09-03T12:00:00.000Z").getTime(),
     uuid: () => `token-${++token}`,
-    isThrottled: (key) => !buckets.take(key).allowed,
+    throttle: (key) => buckets.take(key),
   };
   return {
     deps,
@@ -446,7 +449,7 @@ describe("configuration and campaign ingress fail closed", () => {
       for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
         const h = harness({ fallback: "has space" });
         h.deps.lookup = async () => { assert.fail("reserved paths must skip lookup"); };
-        h.deps.isThrottled = () => { assert.fail("reserved paths must skip rate limiting"); };
+        h.deps.throttle = () => { assert.fail("reserved paths must skip rate limiting"); };
         const res = await h.call(method, path);
         assert.equal(res.status, 404, `${method} ${path}`);
         assert.equal(res.headers.location, undefined);
@@ -473,7 +476,7 @@ describe("configuration and campaign ingress fail closed", () => {
         for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
           const h = harness({ fallback });
           h.deps.lookup = async () => { assert.fail("reserved prefixes must skip lookup"); };
-          h.deps.isThrottled = () => { assert.fail("reserved prefixes must skip throttling"); };
+          h.deps.throttle = () => { assert.fail("reserved prefixes must skip throttling"); };
           const res = await h.call(method, path);
           assert.equal(res.status, 404, `${method} ${path}`);
           assert.equal(res.headers.location, undefined);
@@ -495,7 +498,7 @@ describe("configuration and campaign ingress fail closed", () => {
         const h = harness();
         h.deps.fallbackInviteCode = value as string;
         h.deps.lookup = async () => { assert.fail("invalid fallback must skip lookup"); };
-        h.deps.isThrottled = () => { assert.fail("invalid fallback must skip throttling"); };
+        h.deps.throttle = () => { assert.fail("invalid fallback must skip throttling"); };
         const res = await h.call("GET", path);
         assert.equal(res.status, 503);
         assert.equal(res.headers.location, undefined);
@@ -667,6 +670,75 @@ describe("idle buckets expire but throttles never reset", () => {
     assert.ok(buckets.take("a").allowed);
   });
 
+  test("a full map of idle keys drains on new-key traffic alone", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 60, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 100 },
+    );
+    for (let i = 0; i < 100; i++) {
+      assert.ok(buckets.take(`filler-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 100);
+    // No tracked key ever returns. Every new caller must still be admitted
+    // once the fillers have sat idle past the full-refill window.
+    now += 24 * 60 * 60 * 1000;
+    for (let i = 0; i < 50; i++) {
+      assert.ok(buckets.take(`newcomer-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 50);
+  });
+
+  test("the reap before an at-cap refusal stays within the sweep budget", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 1, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 10, sweepBudget: 2 },
+    );
+    for (let i = 0; i < 10; i++) {
+      assert.ok(buckets.take(`filler-${i}`).allowed);
+    }
+    now += 2_000;
+    // Reap 2 to make room, write the newcomer, reap 2 more: 10 - 2 + 1 - 2.
+    assert.ok(buckets.take("newcomer").allowed);
+    assert.equal(buckets.size, 7);
+  });
+
+  test("at the cap a live map still refuses and a depleted key keeps its debt", async () => {
+    const t0 = 1_000_000;
+    let now = t0;
+    const buckets = new TokenBuckets(
+      { capacity: 4, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 3 },
+    );
+    assert.ok(buckets.take("old").allowed);
+    now = t0 + 3_500;
+    for (let i = 0; i < 4; i++) assert.ok(buckets.take("hot").allowed);
+    assert.ok(!buckets.take("hot").allowed);
+    assert.ok(buckets.take("a").allowed);
+    assert.equal(buckets.size, 3);
+    // "old" has sat idle for the 4s full-refill window; "hot" owes tokens.
+    // The newcomer may take only the idle slot.
+    now = t0 + 4_000;
+    assert.ok(buckets.take("new").allowed);
+    assert.equal(buckets.size, 3);
+    const hot = buckets.take("hot");
+    assert.ok(!hot.allowed);
+    assert.equal(hot.retryAfter, 1);
+    // Every remaining entry is live: fail closed.
+    const shed = buckets.take("late");
+    assert.ok(!shed.allowed);
+    assert.ok(shed.retryAfter >= 1);
+    assert.equal(buckets.size, 3);
+    // 0.5 + 1 refilled tokens: one take, not the four a reset would grant.
+    now = t0 + 5_000;
+    assert.ok(buckets.take("hot").allowed);
+    assert.ok(!buckets.take("hot").allowed);
+  });
+
   test("sweep work per call is bounded regardless of map size", async () => {
     let now = 1_000_000;
     const buckets = new TokenBuckets(
@@ -690,6 +762,226 @@ describe("idle buckets expire but throttles never reset", () => {
       assert.ok(buckets.take(`fresh-${i}`).allowed);
     }
     assert.equal(buckets.size, 25);
+  });
+});
+
+describe("F7 residual: canonical quota, unknown budget, terminal 429s (TOG-12469)", () => {
+  test("canonicalCallerKey folds aliases and unknowns", () => {
+    assert.equal(canonicalCallerKey("203.0.113.44"), "203.0.113.44");
+    assert.equal(canonicalCallerKey("  203.0.113.44  "), "203.0.113.44");
+    assert.equal(canonicalCallerKey("FE80::1"), "fe80::1");
+    assert.equal(canonicalCallerKey("fe80::1%eth0"), "fe80::1");
+    assert.equal(canonicalCallerKey("::ffff:192.0.2.1"), "192.0.2.1");
+    assert.equal(canonicalCallerKey("::FFFF:192.0.2.1"), "192.0.2.1");
+    for (const u of ["unknown", "UNKNOWN", " Unknown ", "", "   "]) {
+      assert.equal(canonicalCallerKey(u), "unknown", JSON.stringify(u));
+    }
+    assert.equal(canonicalCallerKey(undefined), "unknown");
+    assert.equal(canonicalCallerKey(null), "unknown");
+    assert.equal(canonicalCallerKey(42), "unknown");
+    // Long keys merge into a shared 256-char bucket instead of minting more.
+    const long = `k-${"x".repeat(300)}`;
+    assert.equal(canonicalCallerKey(long), canonicalCallerKey(`${long}-suffix`));
+    assert.equal(canonicalCallerKey(long).length, 256);
+  });
+
+  test("caller aliases share one quota bucket", () => {
+    const now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 2, refillPerSecond: 1 },
+      () => now,
+      { maxConsecutiveDenials: 100 },
+    );
+    assert.ok(buckets.take("10.0.0.1").allowed);
+    assert.ok(buckets.take("  10.0.0.1 ").allowed);
+    // Same caller under another spelling: the budget is shared, not doubled.
+    assert.ok(!buckets.take("10.0.0.1").allowed);
+    assert.equal(buckets.size, 1);
+  });
+
+  test("unknown-key flood cannot fill the map or starve valid callers", () => {
+    const now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 1, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 3, maxConsecutiveDenials: 1000 },
+    );
+    // Distinct raw spellings that all mean "no edge signal".
+    const spellings = ["unknown", "UNKNOWN", " Unknown ", "", "   "];
+    for (let i = 0; i < 20; i++) buckets.take(spellings[i % spellings.length]!);
+    assert.equal(buckets.size, 1, "no-signal traffic mints exactly one entry");
+    assert.ok(buckets.take("203.0.113.7").allowed, "valid caller admitted");
+    assert.ok(buckets.take("203.0.113.8").allowed, "second valid caller admitted");
+    assert.equal(buckets.size, 3);
+  });
+
+  test("sustained denials earn a terminal hold that retries cannot extend", () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 1, refillPerSecond: 1 },
+      () => now,
+      { maxConsecutiveDenials: 3, terminalCooldownMs: 60_000 },
+    );
+    assert.ok(buckets.take("hammer").allowed);
+    assert.ok(!buckets.take("hammer").allowed);
+    assert.ok(!buckets.take("hammer").allowed);
+    const terminal = buckets.take("hammer");
+    assert.ok(!terminal.allowed);
+    assert.equal(terminal.retryAfter, 60);
+    // Retries during the hold stay refused and the hold end never moves.
+    now += 10_000;
+    const retry = buckets.take("hammer");
+    assert.ok(!retry.allowed);
+    assert.equal(retry.retryAfter, 50);
+    now += 10_000;
+    const retry2 = buckets.take("hammer");
+    assert.ok(!retry2.allowed);
+    assert.equal(retry2.retryAfter, 40);
+    // Other callers are unaffected by one key's hold.
+    assert.ok(buckets.take("innocent").allowed);
+    // Past the hold the streak is cleared: normal quota resumes, and a single
+    // fresh denial does not instantly re-hold.
+    now += 41_000;
+    assert.ok(buckets.take("hammer").allowed);
+    const fresh = buckets.take("hammer");
+    assert.ok(!fresh.allowed);
+    assert.equal(fresh.retryAfter, 1);
+  });
+
+  test("an elapsed hold resumes normal quota without idle expiry", () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 1, refillPerSecond: 1 },
+      () => now,
+      { idleTtlMs: 3_600_000, maxConsecutiveDenials: 2, terminalCooldownMs: 5_000 },
+    );
+    assert.ok(buckets.take("k").allowed);
+    assert.ok(!buckets.take("k").allowed);
+    const terminal = buckets.take("k");
+    assert.ok(!terminal.allowed);
+    assert.equal(terminal.retryAfter, 5);
+    now += 6_000;
+    // Hold elapsed but the bucket is far from idle: quota resumes and the
+    // next over-budget streak must re-earn a hold, not inherit one.
+    assert.ok(buckets.take("k").allowed);
+    const r1 = buckets.take("k");
+    assert.ok(!r1.allowed);
+    assert.equal(r1.retryAfter, 1);
+    const r2 = buckets.take("k");
+    assert.ok(!r2.allowed);
+    assert.equal(r2.retryAfter, 5);
+    assert.equal(buckets.size, 1);
+  });
+
+  test("a live hold survives idle expiry and the sweep", () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 60, refillPerSecond: 1 },
+      () => now,
+      { idleTtlMs: 60_000, sweepBudget: 64, maxConsecutiveDenials: 2, terminalCooldownMs: 120_000 },
+    );
+    for (let i = 0; i < 60; i++) assert.ok(buckets.take("held").allowed);
+    assert.ok(!buckets.take("held").allowed);
+    const terminal = buckets.take("held");
+    assert.ok(!terminal.allowed);
+    assert.equal(terminal.retryAfter, 120);
+    // Past the idle window with only unrelated traffic: the hold is
+    // enforcement state, not idle, so it is neither reaped nor reset.
+    now += 61_000;
+    for (let i = 0; i < 10; i++) assert.ok(buckets.take(`other-${i}`).allowed);
+    assert.equal(buckets.size, 11);
+    const still = buckets.take("held");
+    assert.ok(!still.allowed);
+    assert.equal(still.retryAfter, 59);
+  });
+
+  test("redirect quota follows caller aliases, not spellings", async () => {
+    const h = harness({
+      bucket: { capacity: 2, refillPerSecond: 1 },
+      now: () => 1_000_000,
+    });
+    assert.equal((await h.call("GET", "/reddit", "203.0.113.44")).status, 302);
+    assert.equal((await h.call("GET", "/reddit", "  203.0.113.44 ")).status, 302);
+    // Same caller under another spelling: the budget is shared, not doubled.
+    const throttled = await h.call("GET", "/reddit", "203.0.113.44");
+    assert.equal(throttled.status, 429);
+    assert.equal(h.clicks.length, 2);
+  });
+
+  test("refill accrues across a hold, capped at capacity (deliberate, TOG-12533)", () => {
+    let now = 1_000_000;
+    // Long idle TTL: the post-hold quota below comes from refill, not expiry.
+    const limits = { idleTtlMs: 3_600_000, maxConsecutiveDenials: 2 };
+    const short = new TokenBuckets(
+      { capacity: 60, refillPerSecond: 1 },
+      () => now,
+      { ...limits, terminalCooldownMs: 3_000 },
+    );
+    for (let i = 0; i < 60; i++) assert.ok(short.take("k").allowed);
+    assert.ok(!short.take("k").allowed);
+    assert.equal(short.take("k").retryAfter, 3);
+    now += 1_000;
+    assert.equal(short.take("k").retryAfter, 2, "mid-hold takes spend nothing");
+    now += 2_000;
+    // The 3-second hold refilled exactly 3 tokens: obeying the advertised
+    // wait earns what any idle caller would, never more.
+    for (let i = 0; i < 3; i++) assert.ok(short.take("k").allowed, `admit ${i}`);
+    const after = short.take("k");
+    assert.ok(!after.allowed);
+    assert.equal(after.retryAfter, 1);
+
+    const long = new TokenBuckets(
+      { capacity: 5, refillPerSecond: 1 },
+      () => now,
+      { ...limits, terminalCooldownMs: 30_000 },
+    );
+    for (let i = 0; i < 5; i++) assert.ok(long.take("k").allowed);
+    assert.ok(!long.take("k").allowed);
+    assert.equal(long.take("k").retryAfter, 30);
+    now += 30_000;
+    // A hold longer than the refill window still banks only one bucket.
+    for (let i = 0; i < 5; i++) assert.ok(long.take("k").allowed, `admit ${i}`);
+    assert.ok(!long.take("k").allowed);
+  });
+
+  test("a held caller's redirect 429 carries the remaining hold, counting down", async () => {
+    let now = 1_000_000;
+    const h = harness({
+      bucket: { capacity: 2, refillPerSecond: 1 },
+      limits: { maxConsecutiveDenials: 3, terminalCooldownMs: 60_000 },
+      now: () => now,
+    });
+    const lookup = h.deps.lookup;
+    let lookups = 0;
+    h.deps.lookup = (slug) => { lookups += 1; return lookup(slug); };
+    assert.equal((await h.call("GET", "/reddit")).status, 302);
+    assert.equal((await h.call("GET", "/reddit")).status, 302);
+    // Plain refill denials before the streak earns a hold: a short wait.
+    for (let i = 0; i < 2; i++) {
+      const refill = await h.call("GET", "/reddit");
+      assert.equal(refill.status, 429);
+      assert.equal(refill.headers["retry-after"], "1");
+    }
+    // The denial that earns the hold advertises it, not a one-second retry.
+    const held = await h.call("GET", "/reddit");
+    assert.equal(held.status, 429);
+    assert.equal(held.headers["retry-after"], "60");
+    // Retries during the hold, on any path or caller alias, see the same hold
+    // end counting down and never reach the store.
+    now += 15_000;
+    const later = await h.call("GET", "/no-such-campaign", " CALLER-1 ");
+    assert.equal(later.status, 429);
+    assert.equal(later.headers["retry-after"], "45");
+    now += 44_500;
+    const last = await h.call("HEAD", "/reddit");
+    assert.equal(last.status, 429);
+    assert.equal(last.headers["retry-after"], "1", "a partial second rounds up");
+    assert.equal(lookups, 2);
+    assert.equal(h.clicks.length, 2);
+    // Hold over: the caller is served again.
+    now += 500;
+    assert.equal((await h.call("GET", "/reddit")).status, 302);
+    assert.equal(h.clicks.length, 3);
   });
 });
 

@@ -4,6 +4,7 @@
 //! TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres
 //! python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test audit_switch_cli
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::postgres::{PgPoolOptions, PgSslMode};
@@ -15,6 +16,9 @@ const OTHER_ACTOR: &str = "100000000000000002";
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+// Parallel tests share one pid and can read the same clock tick.
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
+
 struct TestDb {
     admin: PgPool,
     pool: PgPool,
@@ -25,9 +29,10 @@ struct TestDb {
 impl TestDb {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let name = format!(
-            "two_bot_test_switch_{}_{}",
+            "two_bot_test_switch_{}_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
         );
         let url = format!("postgres://agent_test:@agent-testdb:5432/{name}");
         // Never read an application URL or substitute its credentials.
@@ -82,6 +87,7 @@ impl TestDb {
         command
             .env_clear()
             .env("TWO_DATABASE_URL", &self.url)
+            .env("TWO_DATABASE_TLS", "local-only")
             .env("TWO_DB_POOL_MAX", "1")
             .args(args);
         command.output().unwrap()
@@ -286,6 +292,7 @@ fn fenced_target() -> TestResult {
             "TWO_DATABASE_URL",
             "postgres://agent_test:@agent-testdb:5432/postgres",
         )
+        .env("TWO_DATABASE_TLS", "local-only")
         .env("TWO_DB_POOL_MAX", "1")
         .arg("--status");
     let out = command.output().unwrap();
