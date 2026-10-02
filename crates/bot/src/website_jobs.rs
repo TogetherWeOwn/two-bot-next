@@ -25,6 +25,10 @@ pub const NAMES: [&str; 3] = ["counter", "rank", "scheduled_events"];
 #[path = "website_jobs_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "website_snapshot_tests.rs"]
+mod snapshot_tests;
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,
@@ -118,6 +122,7 @@ pub async fn serve(
                     .zip([Kind::Counter, Kind::Rank, Kind::Events])
                 {
                     let context = context.clone();
+                    let shutdown = shutdown.subscribe();
                     let cadence = cadence(kind);
                     registered.push(Job {
                         name,
@@ -130,15 +135,22 @@ pub async fn serve(
                         }),
                         action: Arc::new(move || {
                             let context = context.clone();
+                            let shutdown = shutdown.clone();
                             Box::pin(async move {
-                                run_once(
-                                    kind,
-                                    context.pool().await?,
-                                    &context.rest,
-                                    &context.guild,
-                                    &context.observation,
-                                )
-                                .await
+                                tokio::select! {
+                                    biased;
+                                    _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
+                                    result = async {
+                                        run_once(
+                                            kind,
+                                            context.pool().await?,
+                                            &context.rest,
+                                            &context.guild,
+                                            &context.observation,
+                                            &shutdown,
+                                        ).await
+                                    } => result,
+                                }
                             })
                         }),
                     });
@@ -220,8 +232,40 @@ fn snowflake(value: &Value) -> Result<u64, ErrorClass> {
         .ok_or(ErrorClass::Rest)
 }
 
+fn roster_page(page: &Value, after: &mut u64) -> Result<Vec<RosterMember>, ErrorClass> {
+    let page = page.as_array().ok_or(ErrorClass::Rest)?;
+    if page.len() > 1000 {
+        return Err(ErrorClass::Rest);
+    }
+    let mut members = Vec::with_capacity(page.len());
+    for member in page {
+        let user = &member["user"];
+        let id = snowflake(&user["id"])?;
+        if id <= *after {
+            return Err(ErrorClass::Rest);
+        }
+        *after = id;
+        let is_bot = match user.get("bot") {
+            None => false,
+            Some(v) => v.as_bool().ok_or(ErrorClass::Rest)?,
+        };
+        let roles = member["roles"]
+            .as_array()
+            .ok_or(ErrorClass::Rest)?
+            .iter()
+            .map(|role| snowflake(role).map(|id| id.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        members.push(RosterMember {
+            user_id: id.to_string(),
+            is_bot,
+            roles,
+        });
+    }
+    Ok(members)
+}
+
 /// Discord's paginated roster is the denominator, never approximate counts.
-/// The presence probe reuses it for the daily bot-floor re-list.
+/// Website publication still requires the entire roster.
 pub(crate) async fn roster(
     rest: &ActionExecutor,
     guild: &str,
@@ -234,37 +278,41 @@ pub(crate) async fn roster(
             &format!("/guilds/{guild}/members?limit=1000&after={after}"),
         )
         .await?;
-        let page = page.as_array().ok_or(ErrorClass::Rest)?;
-        if page.len() > 1000 {
-            return Err(ErrorClass::Rest);
-        }
-        for member in page {
-            let user = &member["user"];
-            let id = snowflake(&user["id"])?;
-            if id <= after {
-                return Err(ErrorClass::Rest);
-            }
-            after = id;
-            let is_bot = match user.get("bot") {
-                None => false,
-                Some(v) => v.as_bool().ok_or(ErrorClass::Rest)?,
-            };
-            let roles = member["roles"]
-                .as_array()
-                .ok_or(ErrorClass::Rest)?
-                .iter()
-                .map(|role| snowflake(role).map(|id| id.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
-            members.push(RosterMember {
-                user_id: id.to_string(),
-                is_bot,
-                roles,
-            });
-        }
-        if page.len() < 1000 {
+        let page = roster_page(&page, &mut after)?;
+        let complete = page.len() < 1000;
+        members.extend(page);
+        if complete {
             return Ok(members);
         }
     }
+}
+
+/// Legacy BOT_FLOOR_MAX_PAGES: ten full pages plus one termination probe.
+pub(crate) const BOT_FLOOR_MAX_PAGES: usize = 11;
+
+/// A daily floor scan is bounded independently of the website roster. A full
+/// final page cannot prove completion, so discard the partial count. Exactly
+/// 10,000 members completes via an empty eleventh page.
+pub(crate) async fn bot_floor_scan(
+    rest: &ActionExecutor,
+    guild: &str,
+) -> Result<two_bot_core::BotFloorScan, ErrorClass> {
+    let mut after = 0;
+    let mut bots = 0;
+    for _ in 0..BOT_FLOOR_MAX_PAGES {
+        // No hidden retries: the page ceiling also bounds wire requests.
+        let page = rest
+            .get_json_once(&format!("/guilds/{guild}/members?limit=1000&after={after}"))
+            .await
+            .map_err(|_| ErrorClass::Rest)?
+            .ok_or(ErrorClass::Rest)?;
+        let page = roster_page(&page, &mut after)?;
+        bots += page.iter().filter(|member| member.is_bot).count() as i64;
+        if page.len() < 1000 {
+            return Ok(two_bot_core::BotFloorScan::Complete(bots));
+        }
+    }
+    Ok(two_bot_core::BotFloorScan::Truncated)
 }
 
 fn raw_event(value: &Value) -> Result<RawScheduledEvent, ErrorClass> {
@@ -287,12 +335,36 @@ fn raw_event(value: &Value) -> Result<RawScheduledEvent, ErrorClass> {
     })
 }
 
+/// Cancel queued/in-flight observations directly, without waiting for the job
+/// supervisor to abort us. Biased selection discards a simultaneously-ready REST
+/// result; publication fences also cover shutdown arriving during that poll.
+/// This cannot undo a database commit already submitted before shutdown.
 pub async fn run_once(
     kind: Kind,
     pool: &PgPool,
     rest: &ActionExecutor,
     guild: &str,
     observation: &Mutex<()>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<(), ErrorClass> {
+    tokio::select! {
+        biased;
+        _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
+        result = snapshot_once(kind, pool, rest, guild, observation, shutdown) => result,
+    }
+}
+
+fn publication_stopped(shutdown: &watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+async fn snapshot_once(
+    kind: Kind,
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    observation: &Mutex<()>,
+    shutdown: &watch::Receiver<bool>,
 ) -> Result<(), ErrorClass> {
     if matches!(kind, Kind::Events) {
         let response = get(
@@ -307,6 +379,9 @@ pub async fn run_once(
             .map(raw_event)
             .collect::<Result<Vec<_>, _>>()?;
         let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
+        if publication_stopped(shutdown) {
+            return Ok(());
+        }
         return replace_events(pool, guild, &now_iso(), &events)
             .await
             .map_err(|_| ErrorClass::Database);
@@ -315,6 +390,9 @@ pub async fn run_once(
     // observation through commit so a slow rank tick cannot overwrite a newer
     // counter roster. Events use independent tables and do not take this lock.
     let _observation = observation.lock().await;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     let Some(windows) = read_raid_windows(pool, guild)
         .await
         .map_err(|_| ErrorClass::Database)?
@@ -329,11 +407,20 @@ pub async fn run_once(
         );
         return Ok(());
     };
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     let members = roster(rest, guild).await?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     if matches!(kind, Kind::Counter) {
         let reading = build_counter_reading(&members, &windows).ok_or(ErrorClass::Rest)?;
         let count =
             i32::try_from(reading.human_member_count).map_err(|_| ErrorClass::Configuration)?;
+        if publication_stopped(shutdown) {
+            return Ok(());
+        }
         return write_counter(pool, guild, &now_iso(), count)
             .await
             .map_err(|_| ErrorClass::Database);
@@ -351,6 +438,9 @@ pub async fn run_once(
         .collect::<Result<Vec<_>, ErrorClass>>()?;
     let ladder = match_rank_roles(&roles).ok_or(ErrorClass::Configuration)?;
     let snapshot = build_community_snapshot(&members, &ladder, &windows).ok_or(ErrorClass::Rest)?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     write_rank_snapshot(pool, guild, &now_iso(), &snapshot)
         .await
         .map_err(|error| match error {

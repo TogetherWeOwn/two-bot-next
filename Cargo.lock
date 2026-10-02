@@ -2288,6 +2288,7 @@ dependencies = [
  "two-bot-core",
  "two-bot-cutover",
  "two-bot-discord",
+ "two-bot-store",
  "two-bot-testsupport",
 ]
 
@@ -2331,6 +2332,7 @@ name = "two-bot-cutover"
 version = "0.2.0"
 dependencies = [
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2342,6 +2344,7 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "two-bot-core",
+ "two-bot-discord",
  "url",
 ]
 
@@ -2385,6 +2388,21 @@ dependencies = [
  "sqlx",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "two-bot-store"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "twilight-model",
+ "two-bot-core",
+ "two-bot-discord",
 ]
 
 [[package]]
