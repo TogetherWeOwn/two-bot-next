@@ -89,6 +89,7 @@ pub mod settings;
 pub mod sticky;
 pub mod tickets;
 pub mod voice;
+pub mod voice_alias;
 pub mod voice_assistant_cap;
 pub mod voice_config;
 pub mod voice_config_diff;
@@ -160,8 +161,8 @@ pub use evidence::{
 };
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
-    announcement_commands, automation_commands, feature_commands, scorecard_attendance_command,
-    FeatureGates, GateError,
+    announcement_commands, automation_commands, feature_commands, parse_prefix_trigger,
+    scorecard_attendance_command, FeatureGates, GateError,
 };
 pub use funnel::{
     format_iso_millis, idempotency_key, is_measurable_gate_clearing, now_iso, parse_iso_millis,
