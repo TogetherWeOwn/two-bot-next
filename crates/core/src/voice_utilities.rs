@@ -77,8 +77,7 @@ pub fn is_valid_invite_code(code: &str) -> bool {
 #[must_use]
 pub fn invite_render(guild_invite_code: Option<&str>) -> String {
     match guild_invite_code {
-        None => NO_INVITE_CONFIGURED.to_owned(),
-        Some(code) if code.is_empty() => NO_INVITE_CONFIGURED.to_owned(),
+        None | Some("") => NO_INVITE_CONFIGURED.to_owned(),
         Some(code) if is_valid_invite_code(code) => {
             format!("Join the server: https://discord.gg/{code}")
         }
