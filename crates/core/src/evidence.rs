@@ -43,6 +43,49 @@ pub const MAX_RECEIPTS: usize = 60;
 /// idempotency-key hint was supplied (live timestamps differ from planned ones).
 pub const MATCH_WINDOW_MS: i64 = 60_000;
 
+/// Rule identity the soak evidence ledger stamps on its QA packet.
+///
+/// The B2 soak correlates evidence and metrics-alert packets by producer, not
+/// by timestamp alone: when several conditions fire in one window the QA
+/// evidence table ([TOG-10955](/TOG/issues/TOG-10955)) must attribute each
+/// packet unambiguously. This spelling is canonical here and mirrored by the
+/// Worker alert rules (`wrangler/src/alert-rules.ts`) and `docs/metrics.md`;
+/// both sides pin it with tests.
+pub const SOAK_LEDGER_RULE_ID: &str = "soak_expected_committed";
+
+/// Rule ids the Worker alert rules can fire, in rule-table order. The Worker
+/// derives its fired-packet names from the same spellings via `ruleFor`, so
+/// this list must stay identical to `RULES` in `wrangler/src/alert-rules.ts`;
+/// the table test below and the Worker test both pin all four.
+pub const ALERT_RULE_IDS: [&str; 4] = [
+    "job_stale",
+    "job_consecutive_failures",
+    "rest_429_rate",
+    "db_pool_saturated",
+];
+
+/// Stamped packet filename carrying the producer identity:
+/// `evidence-{rule_id}-{window}.json` (e.g.
+/// `evidence-soak_expected_committed-2026-10-09T20-11-06Z.json`). The payload
+/// shape is unchanged — only the name attributes the packet. `window` labels
+/// the collection window (window start); characters outside
+/// `[A-Za-z0-9._-]` are replaced so the name is always a safe filename.
+#[must_use]
+pub fn evidence_packet_filename(rule_id: &str, window: &str) -> String {
+    fn safe(part: &str) -> String {
+        part.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+    format!("evidence-{}-{}.json", safe(rule_id), safe(window))
+}
+
 /// Event families the soak reconciles. Everything else (invite clicks,
 /// onboarding prompts, inactivity sweeps, …) is out of scope: receipts for
 /// those still count as collateral observations, never as matches.
@@ -640,6 +683,44 @@ mod tests {
         assert_eq!(packet["truncated"]["expected_overflow"], true);
         assert_eq!(packet["truncated"]["receipts_overflow"], true);
         assert_eq!(packet["counts"]["expected"], MAX_EXPECTED_ACTIONS);
+    }
+
+    #[test]
+    fn packet_filenames_carry_the_shared_rule_spelling() {
+        // Single shared spelling: the canonical core list must name all four
+        // Worker rules exactly (mirrored by `wrangler/test/alert-rules.test.ts`
+        // and documented in `docs/metrics.md`).
+        assert_eq!(
+            ALERT_RULE_IDS,
+            [
+                "job_stale",
+                "job_consecutive_failures",
+                "rest_429_rate",
+                "db_pool_saturated",
+            ]
+        );
+        // The soak ledger stamps its own ledger identity, not an alert rule.
+        assert_eq!(SOAK_LEDGER_RULE_ID, "soak_expected_committed");
+        let window = "2026-10-09T20-11-06Z";
+        assert_eq!(
+            evidence_packet_filename(SOAK_LEDGER_RULE_ID, window),
+            "evidence-soak_expected_committed-2026-10-09T20-11-06Z.json"
+        );
+        for rule in ALERT_RULE_IDS {
+            let name = evidence_packet_filename(rule, window);
+            assert_eq!(name, format!("evidence-{rule}-{window}.json"));
+        }
+        // Subject suffixes (`job_stale:rank`) keep the bare rule up front so
+        // the filename still attributes the producer; hostile window stamps
+        // stay filename-safe.
+        assert_eq!(
+            evidence_packet_filename("job_stale", "2026-10-09T20:11:06Z"),
+            "evidence-job_stale-2026-10-09T20-11-06Z.json"
+        );
+        assert_eq!(
+            evidence_packet_filename("rest_429_rate", "../../x"),
+            "evidence-rest_429_rate-..-..-x.json"
+        );
     }
 
     #[test]

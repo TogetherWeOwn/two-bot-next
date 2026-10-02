@@ -30,6 +30,7 @@ import {
   type RedirectClick,
 } from "./redirect.ts";
 import { RedirectStore, parseMappingsSnapshot } from "./redirect-store.ts";
+import { forwardedFlagVars, type ForwardedFlagEnv } from "./container-env.ts";
 import {
   EMPTY_STATE,
   evaluateMetrics,
@@ -38,7 +39,8 @@ import {
   type MetricsAlertState,
 } from "./alert-rules.ts";
 
-export interface Env {
+/** Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020). */
+export interface Env extends ForwardedFlagEnv {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
@@ -144,7 +146,7 @@ const COMMAND_ENV_KEYS = [
 
 /** Readonly view of the secrets/vars the DO forwards into the container. */
 function containerEnvVars(env: Env, port: number): Record<string, string> {
-  const vars: Record<string, string> = {};
+  const vars: Record<string, string> = forwardedFlagVars(env);
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;

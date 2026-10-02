@@ -17,6 +17,7 @@ mod database_roles_cli;
 #[path = "../../discord/tests/common/mod.rs"]
 mod discord_test_common;
 mod dispatch;
+mod erasure_cli;
 mod gateway;
 mod gateway_metrics;
 #[cfg(test)]
@@ -236,6 +237,7 @@ async fn main() {
 async fn print_backup_help_and_exit() -> ! {
     print!("{}", commands_cli::USAGE);
     println!("{}", preflight::USAGE);
+    print!("{}", erasure_cli::USAGE);
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
 }
