@@ -60,7 +60,7 @@ proptest! {
     #[test]
     fn sanitize_is_a_fixed_point(raw in ".*") {
         let once = sanitize_channel_name(&raw);
-        prop_assert_eq!(sanitize_channel_name(&once), once);
+        prop_assert_eq!(sanitize_channel_name(&once), once.clone());
         prop_assert!(!once.contains(['@', '`']));
         // Legacy strips only C0 + DEL (C1 controls survive, as in legacy).
         // Hoisted: `matches!` with `\u{...}` char literals inside
