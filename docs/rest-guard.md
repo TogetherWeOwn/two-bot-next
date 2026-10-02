@@ -71,6 +71,10 @@ sync instead waits for paced admission **outside** its 5-second wire deadline, s
 long global pauses do not abort a retry. Fatal/breaker refusals still interrupt
 that wait promptly. Kick results count only dispatched HTTP attempts: pre-wire
 build/guard refusals report zero, and a refusal after one exchange reports one.
+Guarded kicks (`kick_paced_guarded`, used by raid removal) follow the audit-mirror
+pattern below: admission precedes the caller's safety authorization, and a guard
+closed during authorization fails the kick before dispatch instead of sleeping.
+Strict safety reads (`get_json_strict`) admit inside their one bounded attempt.
 
 Audit mirror posts retain their paced lane through late DB authorization and the
 bounded send. All admission waits precede authorization. If a global restriction
