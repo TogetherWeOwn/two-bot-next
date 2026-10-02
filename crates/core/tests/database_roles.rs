@@ -220,6 +220,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
         include_str!("../../cutover/migrations/0340_operational_audit.sql"),
         include_str!("../../cutover/migrations/0350_internal_actions.sql"),
+        include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
         include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
         include_str!("../../cutover/migrations/0362_gateway_onboarding_jobs.sql"),
     ] {
