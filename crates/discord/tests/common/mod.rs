@@ -615,8 +615,8 @@ async fn handle_rest(
         return;
     };
     recorded.lock().expect("recorded").push(RestRequest {
-        method,
-        path,
+        method: method.clone(),
+        path: path.clone(),
         headers,
         body: body.clone(),
         received_at: std::time::Instant::now(),
@@ -636,15 +636,12 @@ async fn handle_rest(
     // A guild-command replace echoes the stored command list back (Discord's
     // PUT contract) and the executor validates that receipt; a scripted bare
     // 200 self-heals into the echo, while an explicit body wins.
-    let body = if next.status == 200
+    let scripted_body = std::mem::take(&mut next.body);
+    let echo_self_heal = next.status == 200
         && method == "PUT"
         && path.ends_with("/commands")
-        && next.body.is_empty()
-    {
-        body
-    } else {
-        next.body
-    };
+        && scripted_body.is_empty();
+    let body = if echo_self_heal { body } else { scripted_body };
     let mut head = format!(
         "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
         next.status,
@@ -656,7 +653,7 @@ async fn handle_rest(
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
-    if !next.body.is_empty() {
+    if !body.is_empty() && !echo_self_heal {
         let Some(body_delay) = body_delay else {
             // Retain the socket without delivering bytes until the client
             // disconnects. No timer/server-side completion can rescue the test.
