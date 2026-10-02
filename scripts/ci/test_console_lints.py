@@ -28,6 +28,7 @@ CLI_MODULES = {
     "crates/cutover/src/bin/raid_list.rs",
     "crates/cutover/src/bin/raid_remove.rs",
     "crates/cutover/src/bin/reengagement_list.rs",
+    "crates/cutover/src/bin/rollback_delta.rs",
 }
 
 

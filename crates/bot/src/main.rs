@@ -30,6 +30,7 @@ mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
 mod restore_drill;
+mod schedule_runtime;
 mod server;
 mod shutdown;
 mod ticket_runtime;
