@@ -19,8 +19,13 @@ require `--force`. This confirmation is not authorization to target production.
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
 write **v4**; the reader also accepts frozen **v3**. Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
-inside one `REPEATABLE READ` transaction, the `events` high-water mark, and
-the source's applied migrations. Values are stored in Postgres text-output
+inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
+source's applied migrations and `sequenceMarks`: for every serial, identity and
+standalone settings allocator, `{table, column, lastValue, isCalled, increment}`
+read from the sequence itself. Rows cannot show values that were handed out
+and then deleted; the marks can. Sequences are not MVCC, so a mark is the
+position when the dump read it, at or beyond every value in the snapshot. The
+dump role needs `SELECT` on those sequences. Values are stored in Postgres text-output
 form with a `$n::type` cast on restore — faithful for every owned type
 without per-type decoding. `column_types` is additive to the legacy envelope.
 Port-written row cells are strings/nulls. Frozen legacy v3 dumps have no
@@ -88,12 +93,30 @@ with application writers stopped and rehearse into an isolated test target.
 Serial and identity sequences are discovered from the **target catalog**, not a
 hardcoded list of `id` columns or untrusted archive sequence names. This includes
 `internal_idempotency.intent_id` and `internal_action_log.audit_id`. The standalone
-`guild_settings_version_seq` is also restarted. Next allocation is beyond restored
-values (or the target's configured start for an empty table), respecting sequence
-increment/bounds; exhaustion refuses and rolls back. `ALTER SEQUENCE RESTART` is
-transactional, unlike `setval`, so a failed restore cannot advance the standalone
-settings sequence outside the rolled-back transaction. Identity `GENERATED ALWAYS`
-columns use `OVERRIDING SYSTEM VALUE` during inserts.
+`guild_settings_version_seq` and `guild_settings_cas_seq` are also restarted.
+Archive marks are matched to target sequences by `(table, column)`; a mark never
+names a sequence. The truncate does **not** `RESTART IDENTITY`. Each allocator
+resumes at the furthest of its configured start, one step past the restored
+rows, the archive's mark and the target's own position, in the sequence's
+direction and within its bounds. A restore therefore never reissues a value the
+source or the target handed out, including one whose row was deleted (the
+[cutover allocator gate](cutover.md#data-copy-and-verification)). That
+matters beyond the database: `community_scorecard_runs.watermark` is a
+`community_facts.id`. Exhaustion, or a mark running the other way from the
+target, refuses and rolls back.
+
+The CAS allocator (`guild_settings.cas_version`, descending) moves past the
+archive's mark **before** the inserts assign fresh tokens, so no restored row
+receives a token a client of the source may still hold. `ALTER SEQUENCE RESTART`
+is transactional, unlike `setval`: a failed restore leaves every allocator where
+it was. Identity `GENERATED ALWAYS` columns use `OVERRIDING SYSTEM VALUE` during
+inserts.
+
+An archive without `sequenceMarks` (frozen v3, or v4 written before marks
+existed) carries no deleted-top high-water. Restore logs a warning and
+resumes past the restored rows and the target's own position only, so it does
+**not** meet the allocator gate on a fresh target. A mark covers allocations up
+to the dump: take a cutover or recovery dump with writers stopped.
 
 PostgreSQL behavior references:
 - [Serial/identity ownership discovery](https://www.postgresql.org/docs/16/functions-info.html)

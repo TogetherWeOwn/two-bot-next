@@ -193,8 +193,22 @@ async fn inventory(
     let mut keys = BTreeSet::new();
     let mut rows = 0;
     let mut hashes: Vec<Sha256> = table.columns.iter().map(|_| Sha256::new()).collect();
+    // FETCH text is the per-connection statement-cache key, but its result
+    // shape follows whichever cursor is open: reusing one cached descriptor
+    // across tables decodes a wider table with a narrower table's column
+    // count (e.g. 9-column events metadata reused for 12-column members
+    // fails as ColumnIndexOutOfBounds { index: 9, len: 9 } at the ordinal
+    // decode below). Qualify the text per table so each shape prepares and
+    // caches its own descriptor. The fragment is a comment carrying only the
+    // validated mapping name and a count, never SQL. Same-table reuse on a
+    // later verify call keeps the correct cached shape.
+    let fetch_sql = format!(
+        "FETCH FORWARD 1024 FROM legacy_verify_rows /* {}.{} */",
+        table.source,
+        table.columns.len()
+    );
     loop {
-        let page = sqlx::query("FETCH FORWARD 1024 FROM legacy_verify_rows")
+        let page = sqlx::query(sqlx::AssertSqlSafe(fetch_sql.clone()))
             .fetch_all(&mut **tx)
             .await?;
         if page.is_empty() {

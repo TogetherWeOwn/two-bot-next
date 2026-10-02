@@ -57,6 +57,8 @@ export interface Env extends ForwardedFlagEnv {
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
   GUILD_ID?: string;
+  // Explicit: not a TWO_* flag, so outside the container-env allowlist.
+  DISCORD_APPLICATION_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
   /** Consecutive failed probes; default covers ~10 minutes of keepalive ticks. */
@@ -153,12 +155,18 @@ function containerPort(raw: string | undefined): number {
   return port;
 }
 
+// Non-TWO_* container input: application ID for command registry sync.
+// The TWO_* publication flags ride the reviewed container-env allowlist.
+const APPLICATION_ID_KEY = "DISCORD_APPLICATION_ID" as const;
+
 /** Readonly view of the secrets/vars the DO forwards into the container. */
 function containerEnvVars(env: Env, port: number): Record<string, string> {
   const vars: Record<string, string> = forwardedFlagVars(env);
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;
+  const applicationId = env[APPLICATION_ID_KEY];
+  if (applicationId !== undefined) vars[APPLICATION_ID_KEY] = applicationId;
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   return vars;
 }
@@ -640,7 +648,7 @@ export default {
         recordClick: (click: RedirectClick) => store.recordClick(click),
         onError: (msg, detail) =>
           console.error(`${msg} ${JSON.stringify(detail)}`),
-        isThrottled: (key) => !clickBuckets.take(key).allowed,
+        throttle: (key) => clickBuckets.take(key),
         missCache: missCacheFor(env),
       },
     );

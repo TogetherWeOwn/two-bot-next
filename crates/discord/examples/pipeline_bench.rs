@@ -1,6 +1,9 @@
 //! Bounded synthetic pipeline + dispatch-store measurement; disposable DB only.
 //! See docs/b1-baseline.md for boundaries and reproduction, not a full-bot soak.
 
+// Local benchmark CLI intentionally reports its JSON result to stdout.
+#![allow(clippy::print_stdout)]
+
 #[allow(dead_code)]
 #[path = "../tests/common/mod.rs"]
 mod common;
