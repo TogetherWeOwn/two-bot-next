@@ -591,6 +591,34 @@ impl std::io::Write for LogWriter {
     }
 }
 
+/// Process-wide sweep-log capture. The two-bot test binary drives sweeps on
+/// many threads, and a per-test thread-local subscriber loses events to the
+/// global callsite-interest cache poisoned by sibling sweeps that ran with
+/// no subscriber installed: the `audit_retry_swept` callsite caches
+/// "never" and the scoped subscriber is never consulted. Only a global
+/// install rebuilds the cache (same hazard as
+/// `crates/core/tests/reply_lifecycle.rs`). One install per process; the
+/// buffer is cleared before each captured sweep.
+fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
+    static CAPTURE: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    CAPTURE
+        .get_or_init(|| {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let writer = LogWriter(buffer.clone());
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            )
+            .expect("install global sweep-log capture");
+            buffer
+        })
+        .clone()
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn sweep_logs_carry_ids_and_counts_only() {
     let Some(db) = database("sweep_logs_carry_ids_and_counts_only").await else {
@@ -613,18 +641,9 @@ async fn sweep_logs_carry_ids_and_counts_only() {
         "transport detail 7f3a".to_owned(),
     )));
 
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogWriter(buffer.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .without_time()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    let deliveries = {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        drained(&runtime).await
-    };
+    let buffer = capture_logs();
+    buffer.lock().unwrap().clear();
+    let deliveries = drained(&runtime).await;
     assert_eq!(
         deliveries,
         [
