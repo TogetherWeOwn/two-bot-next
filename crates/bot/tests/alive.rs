@@ -333,15 +333,9 @@ async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<String>>>) {
                 .unwrap_or("")
                 .to_owned();
             recorded.lock().await.push(path.clone());
-            // Boot identity agrees with READY, including RESUME without READY.
-            // The fixture grounds no raid windows; only the events mirror reads.
-            let (status, body): (&str, &[u8]) = if path == "/api/v10/users/@me" {
-                ("200 OK", b"{\"id\":\"999\",\"bot\":true}")
-            } else if path == "/api/v10/oauth2/applications/@me" {
-                ("200 OK", b"{\"id\":\"1111\"}")
-            } else if path == format!("/api/v10/applications/1111/guilds/{GUILD}/commands")
-                || path.contains("scheduled-events")
-            {
+            // The fixture grounds no raid windows, so only the events mirror
+            // reads; anything else fails closed without touching the gateway.
+            let (status, body): (&str, &[u8]) = if path.contains("scheduled-events") {
                 ("200 OK", b"[]")
             } else {
                 (

@@ -22,11 +22,11 @@ Nonce recovery reads at most three 100-message history pages and matches the sta
 
 Legacy create/signup/leave/close outcomes use the available shared `rsvp_store::write_audit` announcements seam. Its pool-only insert is not atomic with the domain mutation; an audit failure surfaces as failure rather than a false success. Refresh failure explicitly says the saved mutation remains.
 
-The container entrypoint now loads guild-scoped boot settings (cold announcement gates, environment fallback), resolves bot/application identity through the shared executor before IDENTIFY **or RESUME**, and wires gateway interactions into the shared runtime. READY must agree with that identity; foreign-application interactions are ignored. Worker SDK auto-start, keepalive and explicit-start paths forward the optional `TWO_ANNOUNCEMENTS` string without enabling it by default. No deployed configuration is changed by this PR.
+READY supplies the bot user and application ids. A resumed session carries neither, so LFG reuses the lookups the runtime already makes: the ticket runtime's bot-user read and the registry's application read. No extra identity request is issued. With tickets disabled, the first LFG interaction resolves the bot user once through the shared executor. Until it is known, nonce recovery reports acceptance as uncertain and keeps durable state instead of matching a guessed author. Once the application id is known, foreign-application interactions are ignored. Worker SDK auto-start, keepalive and explicit-start paths forward the optional `TWO_ANNOUNCEMENTS` string without enabling it by default. No deployed configuration is changed by this PR. Source: [current bot identity](https://docs.rs/twilight-http/0.17.1/twilight_http/client/struct.Client.html#method.current_user).
 
-SQL/REST interaction work runs in a bounded `JoinSet` (32 in flight) rather than awaiting on Twilight's polling/checkpoint path. Saturation or a task panic fails closed; shard teardown aborts tasks and retains any already-persisted LFG state for nonce recovery. Gateway checkpoints persist funnel dispatches; this slice does **not** add a durable interaction inbox or guarantee replay of an interaction aborted during restart. Sources: [Twilight shard polling requirement](https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Shard.html), [Tokio JoinSet ownership](https://docs.rs/tokio/1/tokio/task/struct.JoinSet.html), and [current bot identity](https://docs.rs/twilight-http/0.17.1/twilight_http/client/struct.Client.html#method.current_user).
+`CommandRuntime::dispatch` spawns interaction work off the shard loop, so SQL and paced REST never block Twilight's polling. This slice does **not** add a durable interaction inbox or guarantee replay of an interaction aborted during restart; already-persisted LFG state stays available for nonce recovery.
 
-Publication uses the router's **whole** gate-filtered registry, never an LFG-only replacement. With automations disabled, custom rows are intentionally excluded by the router. With automations enabled, publication is deferred until TOG-10080 supplies an authoritative custom-command store/load: unavailable storage is not an empty custom set. Existing remote registrations are left untouched in that case. Missing/failed settings, identity or attempted registry publication stops startup rather than pretending success. Staging/production deployment and enabling announcements remain separately gated.
+Publication uses the router's **whole** gate-filtered registry, never an LFG-only replacement. With automations disabled, custom rows are intentionally excluded by the router. With automations enabled, publication is deferred until TOG-10080 supplies an authoritative custom-command store/load: unavailable storage is not an empty custom set. Existing remote registrations are left untouched in that case. A failed lookup or publish is logged and stays eligible to retry on a later gateway connection event. Staging/production deployment and enabling announcements remain separately gated.
 
 No private dispatcher, Discord client, or temporary voice channel feature is included here.
 
@@ -35,10 +35,9 @@ No private dispatcher, Discord client, or temporary voice channel feature is inc
 ```sh
 cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- check -p two-bot
-python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot interactions::
+python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot command_runtime
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db lfg_store:: -- --ignored --test-threads=1
 python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_interactions -- --ignored --test-threads=1
-python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test executor_identity
 ```
 
 The actual-router tests additionally cover lifecycle/audit outcomes, ordinary-member signup/leave, refusals, persist-before-POST ordering, ambiguous acceptance, failed-post cleanup, uncertain history preservation, recovery without role/signup/closure replacement and cross-guild targeting. They apply real migrations in a unique test schema and use only the fixed agent-testdb endpoint or CI service above. Discord REST is a scripted loopback double.

@@ -317,10 +317,6 @@ impl CommandRuntime {
                 }));
             }
             Event::Resumed => {
-                let identity = Arc::clone(self);
-                drop(tokio::spawn(async move {
-                    identity.resolve_identity().await;
-                }));
                 if let Some(tickets) = &self.tickets {
                     let runtime = Arc::clone(self);
                     // Saved sessions emit RESUMED without READY. Resolve the
@@ -341,21 +337,16 @@ impl CommandRuntime {
         }
     }
 
-    /// Resume boots receive no READY user: resolve both ids through the shared
-    /// executor so LFG nonce recovery and the application fence are armed.
-    async fn resolve_identity(&self) {
-        match self.executor.current_identity().await {
-            Ok((bot_user_id, application_id)) => self.set_identity(bot_user_id, application_id),
-            Err(_) => warn!("bot identity lookup failed; LFG identity unset"),
-        }
-    }
-
     async fn ready_tickets_after_resume(&self) {
         let Some(tickets) = &self.tickets else {
             return;
         };
         match self.executor.current_bot_user_id().await {
-            Ok(bot_id) => tickets.on_ready(bot_id),
+            Ok(bot_id) => {
+                // Reuse this lookup for LFG nonce recovery; no extra REST read.
+                self.interactions.set_bot_user_id(bot_id);
+                tickets.on_ready(bot_id);
+            }
             Err(_) => {
                 warn!("bot user lookup failed; ticket readiness skipped");
             }
@@ -394,9 +385,16 @@ impl CommandRuntime {
         };
         let application_id = match application_id {
             Some(id) => id,
-            None => self.executor.current_application_id().await.map_err(|_| {
-                sqlx::Error::InvalidArgument("command application lookup failed".into())
-            })?,
+            None => {
+                let id = self.executor.current_application_id().await.map_err(|_| {
+                    sqlx::Error::InvalidArgument("command application lookup failed".into())
+                })?;
+                // RESUMED carries no application: arm the interaction fence from
+                // this registry lookup instead of a separate identity read.
+                self.interactions.set_application_id(id);
+                self.application_id.store(id, Ordering::Relaxed);
+                id
+            }
         };
         let commands = publish_commands(&defs);
         self.executor

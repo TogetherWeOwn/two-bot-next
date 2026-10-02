@@ -1394,6 +1394,10 @@ impl ActionExecutor {
         nonce: &str,
         bot_user_id: u64,
     ) -> Result<Option<String>, DiscordError> {
+        // Without the bot's identity no author check can prove acceptance.
+        if bot_user_id == 0 {
+            return Err(DiscordError::Unavailable("bot identity unknown".into()));
+        }
         let mut before = None;
         for _ in 0..3 {
             let path = match &before {
@@ -1644,41 +1648,6 @@ impl ActionExecutor {
             }
             _ => Err(throw_for_status(&res)),
         }
-    }
-
-    /// Resolve bot + application identity before connecting, including RESUME
-    /// boots (RESUMED carries no user). Uses the shared transport; no token decoding.
-    /// https://docs.rs/twilight-http/0.17.1/twilight_http/client/struct.Client.html#method.current_user
-    pub async fn current_identity(&self) -> Result<(u64, u64), DiscordError> {
-        let user = Self::request_of(self.inner.factory.current_user())?;
-        let application = Self::request_of(self.inner.factory.current_user_application())?;
-        let read = async |request: &Request| -> Result<serde_json::Value, DiscordError> {
-            let response = tokio::time::timeout(self.inner.moderation_timeout, self.send(request))
-                .await
-                .map_err(|_| DiscordError::Timeout)?
-                .map_err(DiscordError::Unavailable)?;
-            if !(200..300).contains(&response.status) {
-                return Err(throw_for_status(&response));
-            }
-            serde_json::from_slice(&response.body)
-                .map_err(|_| DiscordError::Unavailable("invalid identity response".into()))
-        };
-        let user = read(&user).await?;
-        if user["bot"].as_bool() != Some(true) {
-            return Err(DiscordError::Rejected(
-                "current identity is not a bot".into(),
-            ));
-        }
-        let id = |value: &serde_json::Value| {
-            value["id"]
-                .as_str()
-                .and_then(|id| id.parse::<u64>().ok())
-                .filter(|id| *id != 0)
-                .ok_or_else(|| DiscordError::Unavailable("identity missing id".into()))
-        };
-        let user_id = id(&user)?;
-        let application = read(&application).await?;
-        Ok((user_id, id(&application)?))
     }
 
     /// Publish the router's full guild command set in one send

@@ -83,6 +83,21 @@ fn runtime(pool: sqlx::PgPool, mock: &MockRest, enabled: bool) -> InteractionRun
 }
 
 #[tokio::test]
+async fn unknown_bot_identity_never_proves_acceptance() {
+    // A resumed boot without tickets may not know the bot user yet: recovery
+    // must stay uncertain rather than read history against a guessed author.
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!([]))).await;
+    let executor =
+        ActionExecutor::with_proxy("lfg-test-token".into(), Some(mock.origin())).expect("executor");
+    assert!(executor
+        .recover_message_by_nonce(CHANNEL, &lfg::lfg_nonce("lfg-1"), 0)
+        .await
+        .is_err());
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn foreign_application_is_ignored_before_callback_or_store() {
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let pool = sqlx::postgres::PgPoolOptions::new()
