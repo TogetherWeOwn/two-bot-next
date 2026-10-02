@@ -161,6 +161,7 @@ pub async fn dispatch(args: &[String]) -> i32 {
     }
     match args[0].as_str() {
         "db" => crate::database_roles_cli::dispatch(&args[1..]).await,
+        "erase-member" => crate::erasure_cli::dispatch(&args[1..]).await,
         "backup" => cmd_backup().await,
         "restore" => cmd_restore(&args[1..]).await,
         "backup-upload" => cmd_backup_upload(&args[1..]).await,

@@ -143,7 +143,7 @@ uses a token, contacts GitHub or accesses a database, and runs in Worker CI.
 ## Required-check dispatch
 
 `GITHUB_TOKEN`-created PRs do not trigger ordinary PR workflows. The release
-workflow dispatches `check.yml`, `secret-scan.yml`, and `pr-lint.yml` on the
+workflow dispatches `check.yml` and `supply-chain.yml` (the folded `pr-lint` + `gitleaks` gate) on the
 release PR branch. `GH_REPO` explicitly names the repository because that job
 has no checkout. PR lint reads the open release PR's title and body via the
 API, verifies that its open same-repository head SHA and branch match the

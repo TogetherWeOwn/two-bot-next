@@ -166,7 +166,7 @@ subcommand help paths require source/fixture verification before approval; a
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
 Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L99),
-[restore implementation](../crates/bot/src/backup_cli.rs#L379) and
+[restore implementation](../crates/bot/src/backup_cli.rs#L380) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -182,7 +182,7 @@ Use a disposable fixture for a test. Missing/tampered file or nonzero exit means
 FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
 verify canonical content and required table coverage. A v4 dump covers every
 table that `crates/cutover/migrations` creates, except `xp_cooldowns` and the
-migration ledgers ([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L116)),
+migration ledgers ([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L117)),
 plus retired legacy tables when the source still has them
 ([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
 target migrated to the dump's schema, and refuses before any write when a
