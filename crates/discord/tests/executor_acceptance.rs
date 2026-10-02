@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use common::{MockRest, RestRequest, ScriptedResponse};
 use two_bot_core::{ActionOutcome, KickOutcome, ModerationAction, ModerationExecution};
+use two_bot_discord::executor::KickAttemptState;
 use two_bot_discord::{ActionExecutor, DiscordError};
 
 const GUILD: &str = "2222";
@@ -75,21 +76,184 @@ async fn kick_terminal_paths_hit_expected_route_with_audit_reason() {
 #[tokio::test]
 async fn kick_paces_removals_at_350ms_floor() {
     let mock = MockRest::start(
-        vec![ScriptedResponse::status(204), ScriptedResponse::status(204)],
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+        ],
         ScriptedResponse::status(500),
     )
     .await;
     let exec = executor_for(&mock);
-    let first = exec.kick_paced(GUILD, USER, REASON).await;
-    let second = exec.kick_paced(GUILD, USER, REASON).await;
-    assert_eq!(first.outcome, KickOutcome::Kicked);
-    assert_eq!(second.outcome, KickOutcome::Kicked);
+    for _ in 0..3 {
+        let result = exec.kick_paced(GUILD, USER, REASON).await;
+        assert_eq!(result.outcome, KickOutcome::Kicked);
+    }
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 3);
+    // The third call catches timestamps captured before the second call's wait.
+    for pair in reqs.windows(2) {
+        let gap = gap_ms(pair);
+        assert!(
+            (300..=3000).contains(&gap),
+            "kick lane holds the legacy 350 ms floor, got {gap} ms"
+        );
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn guarded_kick_clones_hold_350ms_wire_floor_despite_different_guard_delays() {
+    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let first = executor_for(&mock);
+    let second = first.clone();
+    let (guard_entered, entered) = tokio::sync::oneshot::channel();
+    let first = tokio::spawn(async move {
+        let mut guard_entered = Some(guard_entered);
+        first
+            .kick_paced_guarded(GUILD, USER, REASON, |state| {
+                assert_eq!(state, KickAttemptState::default());
+                let guard_entered = guard_entered.take().expect("one authorization");
+                async move {
+                    guard_entered.send(()).expect("guard entry observed");
+                    tokio::time::sleep(Duration::from_millis(750)).await;
+                    Ok::<(), ()>(())
+                }
+            })
+            .await
+    });
+    entered.await.expect("first guard holds the reservation");
+    let second = tokio::spawn(async move {
+        second
+            .kick_paced_guarded(GUILD, "3334", REASON, |state| async move {
+                assert_eq!(state, KickAttemptState::default());
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok::<(), ()>(())
+            })
+            .await
+    });
+    let joined = async { tokio::join!(first, second) };
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), joined)
+        .await
+        .expect("both guarded kicks finish");
+    assert_eq!(first.unwrap().unwrap().outcome, KickOutcome::Kicked);
+    assert_eq!(second.unwrap().unwrap().outcome, KickOutcome::Kicked);
     let reqs = mock.requests();
     assert_eq!(reqs.len(), 2);
-    let gap = gap_ms(&reqs);
+    assert!(reqs.iter().all(|r| r.method == "DELETE"));
+    assert_eq!(
+        reqs[0].path,
+        kick_path(),
+        "the slow guard cannot be overtaken"
+    );
+    assert_eq!(reqs[1].path, "/api/v10/guilds/2222/members/3334");
+    let gap = reqs[1].received_at.duration_since(reqs[0].received_at);
     assert!(
-        (300..=3000).contains(&gap),
-        "kick lane holds the legacy 350 ms floor, got {gap} ms"
+        gap >= Duration::from_millis(350),
+        "clones must maintain 350 ms between actual DELETE arrivals, got {gap:?}"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn guarded_kick_definitive_429_and_5xx_do_not_mark_mutation_uncertain() {
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::rate_limited(0.0, "0"),
+            ScriptedResponse::status(503),
+        ],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let exec = executor_for(&mock);
+    let mut states = Vec::new();
+    let stopped = exec
+        .kick_paced_guarded(GUILD, USER, REASON, |state| {
+            states.push(state);
+            async move {
+                if state.attempts == 2 {
+                    Err(state)
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .expect_err("fresh protection refuses the third DELETE");
+    assert_eq!(
+        stopped,
+        KickAttemptState {
+            attempts: 2,
+            mutation_uncertain: false
+        }
+    );
+    assert_eq!(
+        states,
+        (0..=2)
+            .map(|attempts| KickAttemptState {
+                attempts,
+                mutation_uncertain: false
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "guard refusal sends no third DELETE"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn guarded_kick_timeout_uncertainty_survives_a_later_429() {
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204).delayed(Duration::from_secs(6)),
+            ScriptedResponse::rate_limited(0.0, "0"),
+        ],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let exec = executor_for(&mock);
+    let mut states = Vec::new();
+    let stopped = exec
+        .kick_paced_guarded(GUILD, USER, REASON, |state| {
+            states.push(state);
+            async move {
+                if state.attempts == 2 {
+                    Err(state)
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .expect_err("fresh protection refuses a retry with a pending uncertain mutation");
+    assert_eq!(
+        stopped,
+        KickAttemptState {
+            attempts: 2,
+            mutation_uncertain: true
+        }
+    );
+    assert_eq!(
+        states,
+        vec![
+            KickAttemptState::default(),
+            KickAttemptState {
+                attempts: 1,
+                mutation_uncertain: true
+            },
+            KickAttemptState {
+                attempts: 2,
+                mutation_uncertain: true
+            },
+        ]
+    );
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "guard refusal sends no third DELETE"
     );
     mock.shutdown().await;
 }
@@ -250,7 +414,7 @@ async fn post_message_suppresses_mentions() {
         format!("/api/v10/channels/{CHANNEL}/messages")
     );
     let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("post body is JSON");
-    assert_eq!(body["content"], "hello @everyone");
+    assert_eq!(body["content"], "hello @\u{200b}everyone");
     assert_eq!(
         body["allowed_mentions"]["parse"],
         serde_json::json!([]),
@@ -265,29 +429,31 @@ async fn paced_gets_hold_110ms_floor() {
     let mock = MockRest::start(
         vec![
             ScriptedResponse::json(200, channel_body.clone()),
+            ScriptedResponse::json(200, channel_body.clone()),
             ScriptedResponse::json(200, channel_body),
         ],
         ScriptedResponse::status(500),
     )
     .await;
     let exec = executor_for(&mock);
-    let first = exec
-        .get_json(&format!("/channels/{CHANNEL}"))
-        .await
-        .expect("first read succeeds");
-    let second = exec
-        .get_json(&format!("/channels/{CHANNEL}"))
-        .await
-        .expect("second read succeeds");
-    assert!(first.is_some() && second.is_some());
+    for _ in 0..3 {
+        let result = exec
+            .get_json(&format!("/channels/{CHANNEL}"))
+            .await
+            .expect("read succeeds");
+        assert!(result.is_some());
+    }
     let reqs = mock.requests();
-    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs.len(), 3);
     assert!(reqs.iter().all(|r| r.method == "GET"));
-    let gap = gap_ms(&reqs);
-    assert!(
-        (80..=2000).contains(&gap),
-        "paced lane holds the legacy 110 ms floor, got {gap} ms"
-    );
+    // Check both gaps: two calls alone miss a stale post-wait timestamp.
+    for pair in reqs.windows(2) {
+        let gap = gap_ms(pair);
+        assert!(
+            (80..=2000).contains(&gap),
+            "paced lane holds the legacy 110 ms floor, got {gap} ms"
+        );
+    }
     mock.shutdown().await;
 }
 

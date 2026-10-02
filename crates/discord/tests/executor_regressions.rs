@@ -41,7 +41,11 @@ fn context(action: ModerationAction, count: Option<u64>) -> ModerationExecution 
 // pinned Twilight parser accepts (the `Z` form never survived `Timestamp`).
 #[tokio::test]
 async fn timeout_outcome_sends_a_valid_timestamp() {
-    let mock = MockRest::start(vec![], ScriptedResponse::json(200, serde_json::json!({}))).await;
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!({"user": {"id": USER}})),
+    )
+    .await;
     let result = executor_for(&mock)
         .execute_outcome(
             &context(ModerationAction::Timeout, None),
@@ -540,6 +544,58 @@ async fn purge_outcome_uses_actual_affected_count() {
             affected: 3,
         }
     );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn purge_rejects_unreadable_history_without_deleting_valid_subset() {
+    let mut bodies = vec![Vec::new(), b"[{".to_vec()];
+    bodies.extend(
+        [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!([{}]),
+            serde_json::json!([{"id":11}]),
+            serde_json::json!([{"id":"0"}]),
+            serde_json::json!([{"id":"invalid"}]),
+            serde_json::json!([{"id":"18446744073709551616"}]),
+            serde_json::json!([{"id":"011"}]),
+            serde_json::json!([{"id":"11"}, {"id":"invalid"}]),
+        ]
+        .iter()
+        .map(|body| body.to_string().into_bytes()),
+    );
+    for body in bodies {
+        let mock = MockRest::start(
+            vec![ScriptedResponse {
+                body,
+                ..ScriptedResponse::status(200)
+            }],
+            ScriptedResponse::status(204),
+        )
+        .await;
+        let result = executor_for(&mock).purge(CHANNEL, 2, REASON).await;
+        assert!(matches!(result, Err(DiscordError::Unavailable(_))));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "only the read-only list was sent");
+        assert_eq!(requests[0].method, "GET");
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn purge_accepts_a_valid_empty_history_without_deletion() {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, serde_json::json!([]))],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    assert_eq!(
+        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
+        0
+    );
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(mock.requests()[0].method, "GET");
     mock.shutdown().await;
 }
 

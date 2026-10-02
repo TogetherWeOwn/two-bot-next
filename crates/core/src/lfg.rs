@@ -67,6 +67,11 @@ pub enum RoleSpecError {
     /// Key fails `^[a-z0-9_-]{{1,32}}$` after trim+lowercase; carries the raw field.
     #[error("Invalid LFG role key \"{0}\".")]
     BadKey(String),
+    /// Normalized key equals the reserved leave-action value (`__leave__`);
+    /// carries the normalized key. Legacy `normalizeRoles` throws
+    /// `LFG role key "__leave__" is reserved for leaving the group.`
+    #[error("LFG role key \"{0}\" is reserved for leaving the group.")]
+    ReservedKey(String),
     /// Label empty or longer than 80 chars.
     #[error("LFG role labels must be 1-80 characters.")]
     BadLabel,
@@ -120,6 +125,9 @@ pub fn parse_role_spec(spec: &str) -> Result<Vec<LfgRoleSpec>, RoleSpecError> {
         let key = trim_ecmascript(raw_key).to_lowercase();
         if !valid_role_key(&key) {
             return Err(RoleSpecError::BadKey(raw_key.to_owned()));
+        }
+        if key == LFG_LEAVE_VALUE {
+            return Err(RoleSpecError::ReservedKey(key));
         }
         let label = trim_ecmascript(fields[1]);
         if label.is_empty() || label.encode_utf16().count() > 80 {
@@ -405,14 +413,7 @@ pub fn role_fill(signups: &[LfgSignup], role_key: &str) -> usize {
 
 /// Cap UTF-16 length like legacy without splitting a Unicode scalar.
 fn truncate_utf16(value: &str, limit: usize) -> String {
-    let mut used = 0;
-    value
-        .chars()
-        .take_while(|ch| {
-            used += ch.len_utf16();
-            used <= limit
-        })
-        .collect()
+    crate::message_safety::truncate(value, limit)
 }
 
 /// Post body (legacy `renderLfg` content): title, state, Discord timestamp,
@@ -441,7 +442,7 @@ pub fn lfg_content(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> 
         lines.push(line);
     }
     let content = lines.join("\n");
-    truncate_utf16(&content, MAX_MESSAGE_CHARS)
+    crate::message_safety::content(&content)
 }
 
 /// One signup-select option (plain data; the adapter maps this to the
@@ -591,6 +592,83 @@ pub fn lfg_nonce(post_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn property_lfg_parsers_accept_arbitrary_unicode_without_panicking(
+            text in proptest::collection::vec(any::<char>(), 0..256)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            now in any::<i64>(),
+        ) {
+            if let Ok(roles) = parse_role_spec(&text) {
+                let wire = roles.iter().map(|r| format!("{}:{}:{}", r.key, r.label, r.slots))
+                    .collect::<Vec<_>>().join(",");
+                prop_assert_eq!(parse_role_spec(&wire), Ok(roles));
+            }
+            if let Ok(title) = validate_title(&text) {
+                prop_assert_eq!(validate_title(&title), Ok(title));
+            }
+            if let Ok(instant) = normalize_starts_at(&text, now) {
+                prop_assert_eq!(normalize_starts_at(&instant, now), Ok(instant));
+            }
+            let _ = parse_lfg_select(&text, &text);
+        }
+
+        #[test]
+        fn property_role_specs_round_trip_normalized_values(
+            entries in proptest::collection::vec(("[A-Za-z][A-Za-z0-9 _-]{0,79}", 1u8..=99), 1..=20),
+        ) {
+            let wire = entries.iter().enumerate()
+                .map(|(i, (label, slots))| format!(" ROLE{i} : {label} : {slots} "))
+                .collect::<Vec<_>>().join(",");
+            let parsed = parse_role_spec(&wire).unwrap();
+            let expected = entries.iter().enumerate().map(|(i, (label, slots))| LfgRoleSpec {
+                key: format!("role{i}"), label: label.trim().to_owned(), slots: *slots,
+            }).collect::<Vec<_>>();
+            prop_assert_eq!(&parsed, &expected);
+            let canonical = parsed.iter().map(|r| format!("{}:{}:{}", r.key, r.label, r.slots))
+                .collect::<Vec<_>>().join(",");
+            prop_assert_eq!(parse_role_spec(&canonical), Ok(parsed));
+        }
+
+        #[test]
+        fn property_lfg_bounds_match_legacy_utf16_and_slot_limits(
+            count in 0usize..=22,
+            slots in -2i32..=102,
+            chars in proptest::collection::vec(prop::sample::select(vec!['a', 'é', '😀', '\u{0085}']), 0..=110),
+        ) {
+            let spec = (0..count).map(|i| format!("r{i}:Role:{slots}"))
+                .collect::<Vec<_>>().join(",");
+            prop_assert_eq!(parse_role_spec(&spec).is_ok(), (1..=20).contains(&count) && (1..=99).contains(&slots));
+            let title: String = chars.into_iter().collect();
+            let expected = (1..=100).contains(&title.encode_utf16().count());
+            prop_assert_eq!(validate_title(&format!("\u{feff}{title}\u{feff}")).is_ok(), expected);
+            let label_spec = format!("role:{title}:1");
+            prop_assert_eq!(parse_role_spec(&label_spec).is_ok(), (1..=80).contains(&title.encode_utf16().count()));
+        }
+
+        #[test]
+        fn property_starts_at_normalizes_offsets_and_enforces_future_boundary(
+            seconds in 946_684_800i64..4_102_444_800,
+            millis in 0u16..1000,
+            offset_minutes in -720i32..=840,
+        ) {
+            use time::format_description::well_known::Rfc3339;
+            let instant = time::OffsetDateTime::from_unix_timestamp(seconds).unwrap()
+                + time::Duration::milliseconds(i64::from(millis));
+            let local = instant.to_offset(time::UtcOffset::from_whole_seconds(offset_minutes * 60).unwrap());
+            let input = local.format(&Rfc3339).unwrap();
+            let now = seconds * 1000 + i64::from(millis);
+            let normalized = normalize_starts_at(&input, now - 1).unwrap();
+            prop_assert_eq!(&normalized, &iso_millis_utc(instant));
+            prop_assert_eq!(normalize_starts_at(&normalized, now - 1), Ok(normalized));
+            prop_assert_eq!(normalize_starts_at(&input, now), Err(StartsAtError::NotFuture));
+            prop_assert_eq!(normalize_starts_at(&input, now + 1), Err(StartsAtError::NotFuture));
+        }
+    }
 
     #[test]
     fn role_spec_parses_legacy_example() {
@@ -759,6 +837,64 @@ mod tests {
     }
 
     #[test]
+    fn role_spec_refuses_reserved_leave_key() {
+        let reserved = RoleSpecError::ReservedKey(LFG_LEAVE_VALUE.to_owned());
+        // Refused in every position.
+        assert_eq!(parse_role_spec("__leave__:Leave:1"), Err(reserved.clone()));
+        assert_eq!(
+            parse_role_spec("tank:Tank:1,__leave__:Leave:1"),
+            Err(reserved.clone())
+        );
+        assert_eq!(
+            parse_role_spec("tank:Tank:1,__leave__:Leave:1,dps:DPS:1"),
+            Err(reserved.clone())
+        );
+        assert_eq!(
+            parse_role_spec("tank:Tank:1,dps:DPS:1,__leave__:Leave:1"),
+            Err(reserved.clone())
+        );
+        // Case and surrounding-whitespace variants normalize to the sentinel.
+        for raw in [
+            "__LEAVE__",
+            "__Leave__",
+            "__lEaVe__",
+            " __leave__ ",
+            "\t__LEAVE__\n",
+            "\u{feff}__leave__\u{feff}",
+        ] {
+            assert_eq!(
+                parse_role_spec(&format!("{raw}:Leave:1")),
+                Err(reserved.clone()),
+                "{raw:?}"
+            );
+            assert_eq!(
+                parse_role_spec(&format!("tank:Tank:1,{raw}:Leave:1")),
+                Err(reserved.clone()),
+                "{raw:?}"
+            );
+        }
+        // Near-sentinel keys stay valid, keeping the leave action distinct.
+        let roles = parse_role_spec("tank:Tank:1,leave:Leave:1,__leave___:Near:1").expect("parses");
+        assert_eq!(
+            roles
+                .iter()
+                .map(|role| role.key.as_str())
+                .collect::<Vec<_>>(),
+            ["tank", "leave", "__leave___"]
+        );
+        // Duplicate detection is unchanged: plain duplicates still report the
+        // normalized key, and the reserved key refuses before dedup can fire.
+        assert_eq!(
+            parse_role_spec("tank:Tank:1,TANK:Other:1"),
+            Err(RoleSpecError::DuplicateKey("tank".to_owned()))
+        );
+        assert_eq!(
+            parse_role_spec("__leave__:Leave:1,__leave__:Leave:1"),
+            Err(reserved.clone())
+        );
+    }
+
+    #[test]
     fn role_spec_numbers_and_unicode_match_javascript() {
         for number in ["2", "2.0", "2e0", "+2", "0x2", "0X2", "0b10", "0o2"] {
             assert_eq!(
@@ -803,6 +939,10 @@ mod tests {
         assert_eq!(
             RoleSpecError::DuplicateKey("tank".to_owned()).to_string(),
             "Duplicate LFG role key \"tank\"."
+        );
+        assert_eq!(
+            RoleSpecError::ReservedKey(LFG_LEAVE_VALUE.to_owned()).to_string(),
+            "LFG role key \"__leave__\" is reserved for leaving the group."
         );
     }
 

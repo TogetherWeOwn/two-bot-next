@@ -87,7 +87,12 @@ fn guard_environment(mut is_set: impl FnMut(&str) -> bool) -> Result<()> {
     Ok(())
 }
 
-fn connect_options(raw: &str) -> Result<PgConnectOptions> {
+// Fixture pools keep a tight timeout; the admin connection only runs
+// CREATE/DROP DATABASE, which can legitimately exceed it on a loaded runner.
+const FIXTURE_STATEMENT_TIMEOUT: &str = "5000ms";
+const ADMIN_DDL_STATEMENT_TIMEOUT: &str = "120s";
+
+fn connect_options(raw: &str, statement_timeout: &str) -> Result<PgConnectOptions> {
     guard_database_url(raw)?;
     let url = Url::parse(raw).expect("guard already parsed URL");
     Ok(PgConnectOptions::new_without_pgpass()
@@ -97,7 +102,7 @@ fn connect_options(raw: &str) -> Result<PgConnectOptions> {
         .password("")
         .database(url.path().trim_start_matches('/'))
         .ssl_mode(PgSslMode::Disable)
-        .options([("statement_timeout", "5000ms")]))
+        .options([("statement_timeout", statement_timeout)]))
 }
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -120,15 +125,30 @@ struct Cleanup {
     name: String,
 }
 
+async fn prepare_cleanup_connection(conn: &mut sqlx::PgConnection) -> Result<()> {
+    // DROP DATABASE waits for a checkpoint; ordinary fixture queries keep 5s.
+    sqlx::query("SET statement_timeout = '30s'")
+        .execute(conn)
+        .await
+        .context("set disposable database teardown timeout")?;
+    Ok(())
+}
+
 impl Cleanup {
     async fn close(self) -> Result<()> {
         self.pool.close().await;
-        // The name is generated internally, not supplied by a caller.
-        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE \"{}\" WITH (FORCE)",
-            self.name
-        )))
-        .execute(&self.admin)
+        let result: Result<()> = async {
+            let mut conn = self.admin.acquire().await?;
+            prepare_cleanup_connection(&mut conn).await?;
+            // The name is generated internally, not supplied by a caller.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE \"{}\" WITH (FORCE)",
+                self.name
+            )))
+            .execute(&mut *conn)
+            .await?;
+            Ok(())
+        }
         .await;
         self.admin.close().await;
         result.context("drop disposable test database")?;
@@ -147,11 +167,11 @@ pub struct TestDatabase {
 
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
-        let options = connect_options(raw)?;
+        let options = connect_options(raw, FIXTURE_STATEMENT_TIMEOUT)?;
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_with(options.clone())
+            .connect_with(connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?)
             .await
             .context("connect to test bootstrap database")?;
         let name = database_name();
@@ -167,7 +187,12 @@ impl TestDatabase {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_lazy_with(options.database(&name).application_name(&name));
+            .connect_lazy_with(
+                options
+                    .database(&name)
+                    .application_name(&name)
+                    .options([("statement_timeout", "5000ms")]),
+            );
         let fixture = Self {
             cleanup: Some(Cleanup { admin, pool, name }),
         };
@@ -246,6 +271,34 @@ mod tests {
     use super::*;
 
     const SAFE: &str = "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard";
+
+    #[tokio::test]
+    async fn administrative_timeout_does_not_relax_fixture_queries() {
+        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return,
+            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+        };
+        let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
+            .await
+            .unwrap();
+        let admin = &fixture.cleanup.as_ref().unwrap().admin;
+        let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(admin)
+            .await
+            .unwrap();
+        assert_eq!(timeout, "2min");
+        let peer = fixture.independent_pool().await.unwrap();
+        for pool in [fixture.pool(), &peer] {
+            let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(timeout, "5s");
+        }
+        peer.close().await;
+        fixture.close().await.unwrap();
+    }
 
     #[test]
     fn accepts_only_explicit_test_connections() {
@@ -334,6 +387,45 @@ mod tests {
             .to_string();
         assert!(!error.contains("private_password"));
         assert!(!error.contains("postgres://"));
+    }
+
+    #[tokio::test]
+    async fn teardown_budget_is_finite_and_separate_from_fixture_queries() {
+        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(std::env::VarError::NotPresent) => return,
+            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+        };
+        let db = TestDatabase::create(&url, &sqlx::migrate!("./tests/migrations"))
+            .await
+            .unwrap();
+        let mut conn = db.cleanup.as_ref().unwrap().admin.acquire().await.unwrap();
+        sqlx::query("SET statement_timeout = '100ms'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        prepare_cleanup_connection(&mut conn).await.unwrap();
+        let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(timeout, "30s");
+        sqlx::query("SELECT pg_sleep(0.2)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let peer = db.independent_pool().await.unwrap();
+        for pool in [db.pool(), &peer] {
+            let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(timeout, "5s");
+        }
+        peer.close().await;
+        db.close().await.unwrap();
     }
 
     #[test]

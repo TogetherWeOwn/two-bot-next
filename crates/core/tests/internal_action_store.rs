@@ -349,6 +349,7 @@ fn subject() -> AuditSubject {
         guild_id: Some(DiscordId::new("123456789012345678").unwrap()),
         actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
         target_id: None,
+        resolved_role_id: None,
     }
 }
 
@@ -357,6 +358,129 @@ fn claimed(result: InternalClaim) -> ExecutionClaim {
         InternalClaim::Claimed(claim) => claim,
         other => panic!("expected committed execution claim, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn proven_unsent_release_retains_binding_and_allows_one_new_owner() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let id = identity("unsent-key:123", "role.assign", b"payload");
+    let subject = subject();
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let timestamp = db_now_secs(&db.pool).await.to_string();
+    assert!(store.burn_nonce(nonce, &timestamp).await.unwrap());
+    let first = claimed(store.claim(&id, &subject).await.unwrap());
+    let intent_id = first.intent_id();
+    store.release_proven_not_sent(first).await.unwrap();
+    assert!(!store.burn_nonce(nonce, &timestamp).await.unwrap());
+    for changed in [
+        identity("unsent-key:123", "role.assign", b"changed"),
+        identity("unsent-key:123", "guild.add_member", b"payload"),
+    ] {
+        assert!(matches!(
+            store.claim(&changed, &subject).await.unwrap(),
+            InternalClaim::Mismatch
+        ));
+    }
+    let mut remapped = subject.clone();
+    remapped.resolved_role_id = Some(DiscordId::new("345678901234567890").unwrap());
+    assert!(matches!(
+        store.claim(&id, &remapped).await.unwrap(),
+        InternalClaim::Mismatch
+    ));
+    sqlx::query(
+        "UPDATE internal_idempotency SET created_at = clock_timestamp() - interval '1 hour'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .reconcile(
+                &id,
+                &TerminalResponse::Failure(TerminalFailure::NoEffect),
+                ReconciliationEvidence::ProvenNotSent
+            )
+            .await
+            .unwrap_err(),
+        InternalStoreError::TransitionRefused
+    );
+    let (a, b) = tokio::join!(store.claim(&id, &subject), store.claim(&id, &subject));
+    let winner = match (a.unwrap(), b.unwrap()) {
+        (InternalClaim::Claimed(claim), InternalClaim::InFlight)
+        | (InternalClaim::InFlight, InternalClaim::Claimed(claim)) => claim,
+        other => panic!("expected exactly one new owner: {other:?}"),
+    };
+    assert_eq!(winner.intent_id(), intent_id);
+    // A second no-dispatch release still keeps one audit per intent/phase.
+    store.release_proven_not_sent(winner).await.unwrap();
+    let final_claim = claimed(store.claim(&id, &subject).await.unwrap());
+    store.finish(&final_claim, &success()).await.unwrap();
+    assert!(matches!(
+        store.claim(&id, &subject).await.unwrap(),
+        InternalClaim::Replay(_)
+    ));
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT phase, evidence_code FROM internal_action_log ORDER BY audit_id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("intent".into(), None),
+            ("released".into(), Some("proven_not_sent".into())),
+            ("terminal".into(), Some("executor".into())),
+        ]
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn unsent_release_refuses_uncertainty_and_rolls_back_with_its_audit() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let subject = subject();
+    for state in ["unknown", "completed", "stale"] {
+        let id = identity(&format!("unsent-{state}:123"), "role.assign", b"payload");
+        let claim = claimed(store.claim(&id, &subject).await.unwrap());
+        match state {
+            "unknown" => store.mark_unknown(&claim).await.unwrap(),
+            "completed" => store.finish(&claim, &success()).await.unwrap(),
+            "stale" => {
+                sqlx::query("UPDATE internal_idempotency SET created_at = clock_timestamp() - interval '1 hour' WHERE intent_id = $1")
+                    .bind(claim.intent_id()).execute(&db.pool).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            store.release_proven_not_sent(claim).await.unwrap_err(),
+            InternalStoreError::TransitionRefused
+        );
+        assert!(!matches!(
+            store.claim(&id, &subject).await.unwrap(),
+            InternalClaim::Claimed(_)
+        ));
+    }
+    let id = identity("unsent-rollback:123", "role.assign", b"payload");
+    let claim = claimed(store.claim(&id, &subject).await.unwrap());
+    sqlx::query("ALTER TABLE internal_action_log ADD CONSTRAINT injected_release_failure CHECK (phase <> 'released')")
+        .execute(&db.pool).await.unwrap();
+    assert_eq!(
+        store.release_proven_not_sent(claim).await.unwrap_err(),
+        InternalStoreError::Unavailable
+    );
+    assert!(matches!(
+        store.claim(&id, &subject).await.unwrap(),
+        InternalClaim::InFlight
+    ));
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM internal_action_log WHERE phase = 'released'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    db.cleanup().await;
 }
 
 fn success() -> TerminalResponse {

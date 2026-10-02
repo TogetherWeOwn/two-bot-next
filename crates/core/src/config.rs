@@ -8,6 +8,8 @@ use std::env;
 
 use thiserror::Error;
 
+use crate::Secret;
+
 /// Configuration errors: messages never include secret values.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -22,9 +24,9 @@ pub enum ConfigError {
 pub struct Config {
     /// Discord bot token. Required unless running health-only (S1 skeleton
     /// boots without it but reports the gateway as down on /readyz).
-    pub discord_token: Option<String>,
+    pub discord_token: Option<Secret<String>>,
     /// Postgres connection URL (Neon, pooled via sqlx, max 5 — ADR 0001).
-    pub database_url: Option<String>,
+    pub database_url: Option<Secret<String>>,
     /// HTTP listen address for /health and /readyz. Defaults to 0.0.0.0:8080.
     pub listen_addr: String,
     /// Guild under management. Single-guild deployment (ADR 0001).
@@ -59,8 +61,8 @@ impl Config {
         };
 
         Ok(Self {
-            discord_token: lookup("DISCORD_TOKEN").ok(),
-            database_url: lookup("DATABASE_URL").ok(),
+            discord_token: lookup("DISCORD_TOKEN").ok().map(Secret::new),
+            database_url: lookup("DATABASE_URL").ok().map(Secret::new),
             listen_addr: lookup("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
             guild_id,
         })
@@ -70,7 +72,9 @@ impl Config {
     /// Later slices add the database and gateway-session requirements.
     #[must_use]
     pub fn gateway_configured(&self) -> bool {
-        self.discord_token.as_ref().is_some_and(|t| !t.is_empty())
+        self.discord_token
+            .as_ref()
+            .is_some_and(|t| !t.expose().is_empty())
     }
 }
 
@@ -85,6 +89,34 @@ mod tests {
                 .map(|(_, value)| (*value).to_owned())
                 .ok_or(env::VarError::NotPresent)
         })
+    }
+
+    #[test]
+    fn debug_redacts_token_and_entire_database_url() {
+        let cfg = from_vars(&[
+            ("DISCORD_TOKEN", "fixture-discord-token"),
+            (
+                "DATABASE_URL",
+                "postgres://fixture-user:fixture-password@localhost/db?key=fixture-query",
+            ),
+        ])
+        .unwrap();
+        for output in [
+            format!("{cfg:?}"),
+            format!("{cfg:#?}"),
+            format!("{:?}", cfg.clone()),
+        ] {
+            for secret in [
+                "fixture-discord-token",
+                "fixture-user",
+                "fixture-password",
+                "fixture-query",
+                "postgres://",
+            ] {
+                assert!(!output.contains(secret));
+            }
+            assert!(output.contains("[REDACTED]"));
+        }
     }
 
     #[test]
@@ -120,8 +152,18 @@ mod tests {
             ("GUILD_ID", "18446744073709551615"),
         ])
         .expect("configured values must parse");
-        assert_eq!(cfg.discord_token.as_deref(), Some("test-token"));
-        assert_eq!(cfg.database_url.as_deref(), Some("test-database-url"));
+        assert_eq!(
+            cfg.discord_token
+                .as_ref()
+                .map(|secret| secret.expose().as_str()),
+            Some("test-token")
+        );
+        assert_eq!(
+            cfg.database_url
+                .as_ref()
+                .map(|secret| secret.expose().as_str()),
+            Some("test-database-url")
+        );
         assert_eq!(cfg.listen_addr, "127.0.0.1:9090");
         assert_eq!(cfg.guild_id, Some(u64::MAX));
         assert!(cfg.gateway_configured());
@@ -130,7 +172,12 @@ mod tests {
     #[test]
     fn empty_token_does_not_configure_gateway() {
         let cfg = from_vars(&[("DISCORD_TOKEN", "")]).expect("empty token must parse");
-        assert_eq!(cfg.discord_token.as_deref(), Some(""));
+        assert_eq!(
+            cfg.discord_token
+                .as_ref()
+                .map(|secret| secret.expose().as_str()),
+            Some("")
+        );
         assert!(!cfg.gateway_configured());
     }
 

@@ -11,9 +11,13 @@
 //! for the same reason legacy honoured it — a staging run against a mock is
 //! how the restore path is rehearsed without touching Discord.
 
+use crate::send_admission::{cooldown_from_delays, AdmissionError, SendAdmission, TokenKey};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use thiserror::Error;
+
+use crate::Secret;
 
 use super::guild_config_restore::RestorePlan;
 use super::http::{self, HttpError, HttpMethod};
@@ -22,13 +26,15 @@ use super::http::{self, HttpError, HttpMethod};
 #[derive(Debug, Error)]
 pub enum GuildConfigApiError {
     #[error("not a URL: {0:?}")]
-    BadBase(String),
+    BadBase(Secret<String>),
     #[error("{0} is a test seam and only accepts loopback. Got host {1:?}.")]
-    NonLoopbackBase(String, String),
+    NonLoopbackBase(String, Secret<String>),
     #[error("http: {0}")]
     Http(#[from] HttpError),
     #[error("{0}")]
     Discord(String),
+    #[error("{0}")]
+    Admission(#[from] AdmissionError),
 }
 
 /// Checked test-seam base: loopback only. Production default otherwise.
@@ -41,40 +47,44 @@ pub fn checked_base(
         return Ok(production.to_owned());
     };
     let raw = raw.trim_end_matches('/');
-    let host = raw
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-        // Strip brackets for IPv6 display.
-        let shown = host.trim_start_matches('[').trim_end_matches(']');
-        let _ = shown;
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| GuildConfigApiError::BadBase(Secret::new(name.to_owned())))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(GuildConfigApiError::BadBase(Secret::new(name.to_owned())));
+    }
+    let host = parsed.host_str().unwrap_or("");
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
         return Err(GuildConfigApiError::NonLoopbackBase(
             name.to_owned(),
-            host.to_owned(),
+            Secret::new(host.to_owned()),
         ));
     }
-    if !raw.starts_with("https://") && !raw.starts_with("http://") {
-        return Err(GuildConfigApiError::BadBase(raw.to_owned()));
-    }
-    Ok(raw.to_owned())
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 /// Discord REST/CDN client for one guild. Counts writes for restore evidence.
-#[derive(Debug)]
 pub struct GuildConfigDiscordApi {
-    pub api_base: String,
-    pub cdn_base: String,
-    pub token: String,
+    pub api_base: Secret<String>,
+    pub cdn_base: Secret<String>,
+    token: Secret<String>,
+    admission: Option<Arc<dyn SendAdmission>>,
     pub application_id: String,
     pub guild_id: String,
     pub writes: u64,
     pub timeout_secs: u64,
+}
+
+impl std::fmt::Debug for GuildConfigDiscordApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuildConfigDiscordApi")
+            .field("writes", &self.writes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GuildConfigDiscordApi {
@@ -86,17 +96,18 @@ impl GuildConfigDiscordApi {
         guild_id: String,
     ) -> Result<Self, GuildConfigApiError> {
         Ok(Self {
-            api_base: checked_base(
+            api_base: Secret::new(checked_base(
                 api_base,
                 "GUILD_CONFIG_API_BASE",
                 "https://discord.com/api/v10",
-            )?,
-            cdn_base: checked_base(
+            )?),
+            cdn_base: Secret::new(checked_base(
                 cdn_base,
                 "GUILD_CONFIG_CDN_BASE",
                 "https://cdn.discordapp.com",
-            )?,
-            token,
+            )?),
+            token: Secret::new(token.strip_prefix("Bot ").unwrap_or(&token).to_owned()),
+            admission: None,
             application_id,
             guild_id,
             writes: 0,
@@ -104,8 +115,27 @@ impl GuildConfigDiscordApi {
         })
     }
 
+    pub fn with_admission(
+        api_base: Option<&str>,
+        cdn_base: Option<&str>,
+        token: String,
+        application_id: String,
+        guild_id: String,
+        admission: Arc<dyn SendAdmission>,
+    ) -> Result<Self, GuildConfigApiError> {
+        if admission.token_key() != &TokenKey::for_bot_token(&token)? {
+            return Err(AdmissionError::Configuration.into());
+        }
+        let mut api = Self::new(api_base, cdn_base, token, application_id, guild_id)?;
+        api.admission = Some(admission);
+        Ok(api)
+    }
+
     fn auth_header(&self) -> (String, String) {
-        ("authorization".to_owned(), format!("Bot {}", self.token))
+        (
+            "authorization".to_owned(),
+            format!("Bot {}", self.token.expose()),
+        )
     }
 
     /// GET with Discord 429 handling: honour `retry_after` (capped at 30 s),
@@ -116,7 +146,7 @@ impl GuildConfigDiscordApi {
         path: &str,
         body: Option<Value>,
     ) -> Result<(u16, Option<Value>), GuildConfigApiError> {
-        let url = format!("{}{}", self.api_base, path);
+        let url = format!("{}{}", self.api_base.expose(), path);
         let method = method
             .parse::<HttpMethod>()
             .map_err(|_| GuildConfigApiError::Discord(format!("bad method {method:?}")))?;
@@ -129,11 +159,50 @@ impl GuildConfigDiscordApi {
                 headers.pop();
             }
             let payload = body.clone().map(|b| b.to_string().into_bytes());
+            let permit = match &self.admission {
+                Some(admission) => Some(admission.admit().await?),
+                // `checked_base` enforces loopback on explicit test seams.
+                None if checked_base(Some(self.api_base.expose()), "GUILD_CONFIG_API_BASE", "")
+                    .is_ok() =>
+                {
+                    None
+                }
+                None => return Err(AdmissionError::Configuration.into()),
+            };
             let res =
                 http::request(method.clone(), &url, headers, payload, self.timeout_secs).await?;
             let status = res.status.as_u16();
+            let response = res.json();
+            // A full mutation 5xx/redirect or unusable success receipt is still
+            // uncertain. Dropping its permit retains durable occupancy.
+            let definite = method == HttpMethod::GET
+                || matches!(status, 400 | 401 | 403 | 404 | 405 | 429)
+                || mutation_receipt_is_definite(&method, path, status, response.as_ref());
+            if let Some(permit) = permit.filter(|_| definite) {
+                let cooldown = (status == 429).then(|| {
+                    cooldown_from_delays(
+                        res.header("retry-after")
+                            .and_then(|value| value.parse().ok()),
+                        res.json()
+                            .as_ref()
+                            .and_then(|body| body.get("retry_after"))
+                            .and_then(Value::as_f64),
+                    )
+                });
+                if let Err(error) = permit.complete(cooldown).await {
+                    if status == 429 {
+                        return Ok((status, res.json()));
+                    }
+                    return Err(error.into());
+                }
+            }
+            if method != HttpMethod::GET && (200..300).contains(&status) && !definite {
+                return Err(GuildConfigApiError::Discord(
+                    "Discord mutation receipt unavailable.".to_owned(),
+                ));
+            }
             if status != 429 {
-                return Ok((status, res.json()));
+                return Ok((status, response));
             }
             let retry_after = res
                 .json()
@@ -546,7 +615,7 @@ impl GuildConfigDiscordApi {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let extension = if animated { "gif" } else { "png" };
-        let url = format!("{}/emojis/{id}.{extension}", self.cdn_base);
+        let url = format!("{}/emojis/{id}.{extension}", self.cdn_base.expose());
         let res = http::get(&url, vec![], 30).await?;
         if res.status.as_u16() != 200 {
             return Err(GuildConfigApiError::Discord(format!(
@@ -561,8 +630,10 @@ impl GuildConfigDiscordApi {
             .unwrap_or(if animated { "image/gif" } else { "image/png" })
             .to_owned();
         if !content_type.starts_with("image/") {
+            // The header value is remote-controlled (a URL echo can carry a
+            // credential), so the error keeps only the constant classification.
             return Err(GuildConfigApiError::Discord(format!(
-                "Emoji {} returned non-image content type {content_type}.",
+                "Emoji {} returned a non-image response.",
                 name.unwrap_or("?")
             )));
         }
@@ -578,12 +649,11 @@ impl GuildConfigDiscordApi {
         let roles_path = format!("{guild_path}/roles");
         let channels_path = format!("{guild_path}/channels");
         let emojis_path = format!("{guild_path}/emojis");
-        let (guild, roles, channels, emojis) = tokio::join!(
-            self.request_json("GET", &guild_path, None),
-            self.request_json("GET", &roles_path, None),
-            self.request_json("GET", &channels_path, None),
-            self.request_json("GET", &emojis_path, None),
-        );
+        // One token lane: do not compete with ourselves for admission.
+        let guild = self.request_json("GET", &guild_path, None).await;
+        let roles = self.request_json("GET", &roles_path, None).await;
+        let channels = self.request_json("GET", &channels_path, None).await;
+        let emojis = self.request_json("GET", &emojis_path, None).await;
         let (status, guild) = guild?;
         if status != 200 || guild.is_none() {
             return Err(GuildConfigApiError::Discord(format!(
@@ -651,14 +721,50 @@ impl GuildConfigDiscordApi {
     ) -> Result<Option<Value>, GuildConfigApiError> {
         let (status, response) = self.request_json(method, path, Some(body)).await?;
         if !(200..300).contains(&status) {
+            // Remote JSON can echo Authorization, even on a normal refusal.
             return Err(GuildConfigApiError::Discord(format!(
-                "Discord write {method} {path} failed: HTTP {status} {}",
-                response.map(|b| b.to_string()).unwrap_or_default()
+                "Discord write failed: HTTP {status}."
             )));
         }
         self.writes += 1;
         Ok(response)
     }
+}
+
+fn mutation_receipt_is_definite(
+    method: &HttpMethod,
+    path: &str,
+    status: u16,
+    body: Option<&Value>,
+) -> bool {
+    // Guild channel-position updates have a documented no-content receipt;
+    // role-position updates instead return the resource array.
+    let channel_positions = matches!(
+        path.split('/').collect::<Vec<_>>().as_slice(),
+        ["", "guilds", guild, "channels"] if !guild.is_empty()
+    );
+    if status == 204
+        && (*method == HttpMethod::DELETE || *method == HttpMethod::PATCH && channel_positions)
+    {
+        return true;
+    }
+    if !matches!(status, 200 | 201) {
+        return false;
+    }
+    let has_id = |value: &Value| {
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<u64>().ok())
+            .is_some_and(|id| id != 0)
+    };
+    body.is_some_and(|body| {
+        has_id(body)
+            || *method == HttpMethod::PATCH
+                && body
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty() && rows.iter().all(has_id))
+    })
 }
 
 /// Permission masks arrive as strings in sealed snapshots but the planned
@@ -736,12 +842,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mutation_receipts_keep_uncertainty_and_explicit_no_content_contracts_separate() {
+        let resource = serde_json::json!({"id": "123"});
+        let roles = serde_json::json!([{"id": "123"}]);
+        assert!(mutation_receipt_is_definite(
+            &HttpMethod::POST,
+            "/guilds/1/roles",
+            201,
+            Some(&resource)
+        ));
+        assert!(mutation_receipt_is_definite(
+            &HttpMethod::PATCH,
+            "/guilds/1/roles",
+            200,
+            Some(&roles)
+        ));
+        assert!(mutation_receipt_is_definite(
+            &HttpMethod::PATCH,
+            "/guilds/1/channels",
+            204,
+            None
+        ));
+        assert!(mutation_receipt_is_definite(
+            &HttpMethod::DELETE,
+            "/channels/1",
+            204,
+            None
+        ));
+        assert!(!mutation_receipt_is_definite(
+            &HttpMethod::PATCH,
+            "/guilds/1/roles",
+            204,
+            None
+        ));
+        assert!(!mutation_receipt_is_definite(
+            &HttpMethod::POST,
+            "/guilds/1/channels",
+            204,
+            None
+        ));
+        assert!(!mutation_receipt_is_definite(
+            &HttpMethod::POST,
+            "/guilds/1/roles",
+            500,
+            Some(&resource)
+        ));
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"id": "0"}),
+            serde_json::json!({"id": "not-an-id"}),
+        ] {
+            assert!(!mutation_receipt_is_definite(
+                &HttpMethod::POST,
+                "/guilds/1/roles",
+                201,
+                Some(&body)
+            ));
+        }
+    }
+
+    #[test]
     fn bases_default_to_discord_and_pin_tests_to_loopback() {
         let api =
             GuildConfigDiscordApi::new(None, None, "t".to_owned(), "a".to_owned(), "g".to_owned())
                 .unwrap();
-        assert_eq!(api.api_base, "https://discord.com/api/v10");
-        assert_eq!(api.cdn_base, "https://cdn.discordapp.com");
+        assert_eq!(api.api_base.expose(), "https://discord.com/api/v10");
+        assert_eq!(api.cdn_base.expose(), "https://cdn.discordapp.com");
         GuildConfigDiscordApi::new(
             Some("http://127.0.0.1:9"),
             Some("http://localhost:9"),
@@ -761,6 +927,18 @@ mod tests {
         assert!(
             matches!(err, GuildConfigApiError::NonLoopbackBase(_, _)),
             "{err}"
+        );
+        for raw in [
+            "http://127.0.0.1:9@evil.example.com",
+            "https://localhost:9@evil.example.com",
+            "http://127.0.0.1:9?redirect=elsewhere",
+            "http://127.0.0.1:9#fragment",
+        ] {
+            assert!(checked_base(Some(raw), "test", "").is_err(), "{raw}");
+        }
+        assert_eq!(
+            checked_base(Some("http://[::1]:9"), "test", "").unwrap(),
+            "http://[::1]:9"
         );
     }
 }

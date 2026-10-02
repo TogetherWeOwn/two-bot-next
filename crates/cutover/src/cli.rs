@@ -5,7 +5,47 @@
 //! `test/e2e.leveling-scripts.test.ts`: exit 2, "Refusing live guild", no
 //! connection attempt). Dry run is the default everywhere that writes.
 
-use crate::{is_snowflake, CutoverDb, DB_POOL_MAX_DEFAULT, LIVE_GUILD_ID};
+use crate::{is_snowflake, CutoverDb, ScanCompletion, DB_POOL_MAX_DEFAULT, LIVE_GUILD_ID};
+
+/// Shared completion accounting for both history CLIs. Probes are recorded only
+/// when interrupted; their intentional one-page cap is not a backfill outcome.
+#[derive(Debug, Default)]
+pub struct ScanReport {
+    counts: std::collections::BTreeMap<ScanCompletion, usize>,
+    interrupted: Vec<(String, ScanCompletion)>,
+}
+
+impl ScanReport {
+    pub fn record(&mut self, channel: &str, completion: ScanCompletion) {
+        *self.counts.entry(completion).or_default() += 1;
+        if completion.interrupted() {
+            self.interrupted.push((channel.to_owned(), completion));
+        }
+    }
+
+    #[must_use]
+    pub fn has_incomplete_history(&self) -> bool {
+        self.counts
+            .keys()
+            .any(|reason| *reason != ScanCompletion::EndOfHistory)
+    }
+
+    #[must_use]
+    pub fn render(&self) -> String {
+        let counts: Vec<_> = self
+            .counts
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect();
+        let mut report = format!("  scan completion       {}\n", counts.join("   "));
+        for (channel, reason) in &self.interrupted {
+            report.push_str(&format!(
+                "  INCOMPLETE: {reason} on {channel}. Partial history retained; this is not a page cap. Check access/service health before re-running.\n"
+            ));
+        }
+        report
+    }
+}
 
 /// Parsed `--name value` / `--name=value` / bare `--flag` arguments.
 #[derive(Debug, Default)]
@@ -114,8 +154,8 @@ pub async fn open_db(_args: &Args, migrations_off: bool) -> CutoverDb {
         .unwrap_or(DB_POOL_MAX_DEFAULT);
     match crate::connect(&url, pool_max, migrations_off).await {
         Ok(db) => db,
-        Err(e) => {
-            eprintln!("cannot open database: {e}");
+        Err(_) => {
+            eprintln!("cannot open database; connection details redacted");
             std::process::exit(1);
         }
     }

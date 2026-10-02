@@ -207,11 +207,11 @@ async fn s3_put_round_trip_with_verified_signature() {
     let secret = secret();
     let (endpoint, state) = start_fake_s3(&secret).await;
     let target = s3::S3Target {
-        endpoint,
+        endpoint: endpoint.into(),
         region: "auto".to_owned(),
         bucket: "paperclip-backups".to_owned(),
-        access_key_id: KEY_ID.to_owned(),
-        secret_access_key: secret,
+        access_key_id: KEY_ID.to_owned().into(),
+        secret_access_key: secret.into(),
         prefix: Some("two-bot".to_owned()),
     };
     let body = b"test dump bytes".to_vec();
@@ -221,9 +221,14 @@ async fn s3_put_round_trip_with_verified_signature() {
     let signed = s3::sign_put(&target, &key, &body, &amz_date, &date_stamp);
 
     // The real transport path: hyper PUT with the signed headers.
-    let res = two_bot_core::backup::http::put(&signed.url, signed.headers, body.clone(), 30)
-        .await
-        .expect("PUT to fake S3");
+    let res = two_bot_core::backup::http::put(
+        signed.url.expose(),
+        signed.headers.expose().clone(),
+        body.clone(),
+        30,
+    )
+    .await
+    .expect("PUT to fake S3");
     assert_eq!(
         res.status.as_u16(),
         200,
@@ -246,19 +251,24 @@ async fn s3_put_round_trip_with_verified_signature() {
 async fn s3_put_with_wrong_secret_is_403_not_success() {
     let (endpoint, _state) = start_fake_s3(&secret()).await;
     let target = s3::S3Target {
-        endpoint,
+        endpoint: endpoint.into(),
         region: "auto".to_owned(),
         bucket: "paperclip-backups".to_owned(),
-        access_key_id: KEY_ID.to_owned(),
-        secret_access_key: "wrong-secret".to_owned(),
+        access_key_id: KEY_ID.to_owned().into(),
+        secret_access_key: "wrong-secret".to_owned().into(),
         prefix: None,
     };
     let body = b"test dump bytes".to_vec();
     let (amz_date, date_stamp) = s3::amz_stamps(1_787_735_020);
     let signed = s3::sign_put(&target, "f.gz", &body, &amz_date, &date_stamp);
-    let res = two_bot_core::backup::http::put(&signed.url, signed.headers, body, 30)
-        .await
-        .expect("transport works; signature does not");
+    let res = two_bot_core::backup::http::put(
+        signed.url.expose(),
+        signed.headers.expose().clone(),
+        body,
+        30,
+    )
+    .await
+    .expect("transport works; signature does not");
     assert_eq!(res.status.as_u16(), 403, "bad signature must fail loudly");
 }
 
@@ -274,6 +284,7 @@ struct DiscordState {
     emojis: serde_json::Value,
     writes: Vec<(String, String)>,
     next_id: u64,
+    write_response_override: Option<serde_json::Value>,
 }
 
 async fn discord_get(
@@ -297,7 +308,7 @@ async fn discord_get(
                 guild_config::STAGING_BOT_APPLICATION_ID
             ) =>
         {
-            serde_json::json!({"roles": ["r-admin"]})
+            serde_json::json!({"roles": ["1001"]})
         }
         p if p == format!("guilds/{}", guild_config::TWO_STAGING_GUILD_ID) => state.guild.clone(),
         p if p == format!("guilds/{}/roles", guild_config::TWO_STAGING_GUILD_ID) => {
@@ -331,12 +342,27 @@ async fn discord_write(
     let path = uri.path().to_owned();
     let mut state = state.lock().unwrap();
     state.next_id += 1;
-    let id = format!("new-{}", state.next_id);
-    state.writes.push((method.to_string(), path));
+    let id = (10_000 + state.next_id).to_string();
+    state.writes.push((method.to_string(), path.clone()));
+    let guild_path = format!("/api/guilds/{}", guild_config::TWO_STAGING_GUILD_ID);
+    // Match Discord's bulk-position receipts, not a generic resource object.
+    if method == axum::http::Method::PATCH && path == format!("{guild_path}/channels") {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap();
+    }
+    let body = state.write_response_override.clone().unwrap_or_else(|| {
+        if method == axum::http::Method::PATCH && path == format!("{guild_path}/roles") {
+            state.roles.clone()
+        } else {
+            serde_json::json!({"id": id})
+        }
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({"id": id}).to_string()))
+        .body(Body::from(body.to_string()))
         .unwrap()
 }
 
@@ -378,14 +404,14 @@ fn discord_fixture() -> DiscordState {
         guild: serde_json::json!({"id": guild_config::TWO_STAGING_GUILD_ID, "name": "TWO Staging", "description": "d", "owner_id": guild_config::STAGING_BOT_APPLICATION_ID}),
         roles: serde_json::json!([
             {"id": guild_config::TWO_STAGING_GUILD_ID, "name": "@everyone", "managed": false, "color": 0, "hoist": false, "permissions": "0", "mentionable": false, "position": 0},
-            {"id": "r-admin", "name": "Admin", "managed": false, "color": 0, "hoist": true, "permissions": "8", "mentionable": false, "position": 3}
+            {"id": "1001", "name": "Admin", "managed": false, "color": 0, "hoist": true, "permissions": "8", "mentionable": false, "position": 3}
         ]),
         channels: serde_json::json!([
-            {"id": "cat1", "name": "COMMUNITY", "type": 4, "parent_id": null, "position": 0, "permission_overwrites": []},
-            {"id": "ch1", "name": "general", "type": 0, "parent_id": "cat1", "position": 0, "permission_overwrites": []}
+            {"id": "2001", "name": "COMMUNITY", "type": 4, "parent_id": null, "position": 0, "permission_overwrites": []},
+            {"id": "2002", "name": "general", "type": 0, "parent_id": "2001", "position": 0, "permission_overwrites": []}
         ]),
         emojis: serde_json::json!([
-            {"id": "e1", "name": "wave", "roles": [], "require_colons": true, "managed": false, "animated": false, "available": true}
+            {"id": "3001", "name": "wave", "roles": [], "require_colons": true, "managed": false, "animated": false, "available": true}
         ]),
         ..DiscordState::default()
     }
@@ -490,6 +516,48 @@ async fn guild_config_capture_plan_apply_round_trip() {
         }
     }
     assert_eq!(api2.writes as usize, plan.operations.len());
+    assert_eq!(mutated.lock().unwrap().writes.len(), plan.operations.len());
+}
+
+#[tokio::test]
+async fn guild_config_malformed_success_receipts_are_refused_without_retry() {
+    for receipt in [
+        serde_json::json!({}),
+        serde_json::json!({"id": "0"}),
+        serde_json::json!({"id": "not-an-id"}),
+    ] {
+        let state = Arc::new(Mutex::new(DiscordState {
+            write_response_override: Some(receipt),
+            ..discord_fixture()
+        }));
+        let (api_base, cdn_base) = start_fake_discord(state.clone()).await;
+        let mut api = GuildConfigDiscordApi::new(
+            Some(&api_base),
+            Some(&cdn_base),
+            "token".to_owned(),
+            guild_config::STAGING_BOT_APPLICATION_ID.to_owned(),
+            guild_config::TWO_STAGING_GUILD_ID.to_owned(),
+        )
+        .unwrap();
+        let error = api
+            .write(
+                "PATCH",
+                "/channels/2002",
+                serde_json::json!({"name": "general"}),
+            )
+            .await
+            .expect_err("malformed mutation receipt must remain uncertain");
+        assert!(matches!(
+            error,
+            two_bot_core::backup::guild_config_api::GuildConfigApiError::Discord(message)
+                if message == "Discord mutation receipt unavailable."
+        ));
+        assert_eq!(
+            state.lock().unwrap().writes,
+            vec![("PATCH".to_owned(), "/api/channels/2002".to_owned())],
+            "uncertain mutation must not be retried"
+        );
+    }
 }
 
 #[tokio::test]

@@ -89,7 +89,35 @@ pub fn moderation_audit_reason(
     };
     let token = moderation_audit_token(guild_id, idempotency_key);
     let mac = marker_mac(secret, guild_id, &token, action, actor_id);
-    format!("[two-audit:v1:{token}:{action}:{actor_id}:{mac}] {reason}")
+    let marker = format!("[two-audit:v1:{token}:{action}:{actor_id}:{mac}] ");
+    let budget = AUDIT_REASON_MAX_UTF16.saturating_sub(marker.encode_utf16().count());
+    format!("{marker}{}", truncate_utf16(reason, budget))
+}
+
+/// Discord's `X-Audit-Log-Reason` limit. Unit: UTF-16 code units, the same
+/// unit `require_moderation_reason` validates in (non-BMP chars count 2).
+pub const AUDIT_REASON_MAX_UTF16: usize = 512;
+
+/// Shorten only the human suffix to `budget` UTF-16 units, never splitting a
+/// scalar value; a shortened suffix ends in `…`. Fits unchanged otherwise.
+fn truncate_utf16(text: &str, budget: usize) -> String {
+    if text.encode_utf16().count() <= budget {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.len_utf16();
+        if used + w + 1 > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    if budget > 0 {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// A verified marker: the correlated service action and the acting moderator.
@@ -218,13 +246,13 @@ pub fn outcome_for(action: &str) -> &'static str {
 pub fn moderation_audit_secret(
     vars: &std::collections::HashMap<String, String>,
     credential_dir: Option<&std::path::Path>,
-) -> Result<Option<String>, SecretError> {
+) -> Result<Option<crate::Secret<String>>, SecretError> {
     if let Some(dir) = credential_dir {
         match std::fs::read_to_string(dir.join("moderation_audit_secret")) {
             Ok(raw) => {
                 let trimmed = raw.trim_matches(is_ecmascript_trim_space);
                 if !trimmed.is_empty() {
-                    return Ok(Some(trimmed.to_owned()));
+                    return Ok(Some(crate::Secret::new(trimmed.to_owned())));
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -234,7 +262,8 @@ pub fn moderation_audit_secret(
     Ok(vars
         .get("TWO_MODERATION_AUDIT_SECRET")
         .filter(|s| !s.is_empty())
-        .cloned())
+        .cloned()
+        .map(crate::Secret::new))
 }
 
 // ECMAScript TrimString uses WhiteSpace + LineTerminator, not Unicode
@@ -285,6 +314,54 @@ pub(crate) fn moderation_test_vectors() -> Vec<ModerationTestVector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn property_mac_parse_mint_round_trip_and_reject_tampering(
+            guild in "[0-9]{17,20}",
+            actor in "[0-9]{17,20}",
+            secret in "[a-zA-Z0-9]{1,64}",
+            key in proptest::collection::vec(any::<char>(), 0..64)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            reason in proptest::collection::vec(any::<char>(), 0..128)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            action_index in 0usize..10,
+        ) {
+            let action = ModerationAction::ALL.get(action_index)
+                .map_or(UNBAN_SCHEDULED_ACTION, |a| a.action_name());
+            let wire = moderation_audit_reason(Some(&secret), &guild, &key, action, &actor, &reason);
+            let marker = parse_moderation_audit_reason(Some(&secret), &guild, Some(&wire)).unwrap();
+            prop_assert_eq!(&marker, &ModerationMarker {
+                token: moderation_audit_token(&guild, &key), action: action.to_owned(), actor_id: actor.clone(),
+            });
+            // Reason prose is not MAC-authenticated; only the marker fields are.
+            let marker_only = wire.split("] ").next().unwrap().to_owned() + "]";
+            prop_assert_eq!(parse_moderation_audit_reason(Some(&secret), &guild, Some(&marker_only)), Some(marker));
+            let mut altered = wire.clone();
+            let last_mac_byte = marker_only.len() - 2;
+            let replacement = if altered.as_bytes()[last_mac_byte] == b'0' { "1" } else { "0" };
+            altered.replace_range(last_mac_byte..last_mac_byte + 1, replacement);
+            prop_assert!(parse_moderation_audit_reason(Some(&secret), &guild, Some(&altered)).is_none());
+            let changed_guild = format!("{guild}0");
+            prop_assert!(parse_moderation_audit_reason(Some(&secret), &changed_guild, Some(&wire)).is_none());
+        }
+
+        #[test]
+        fn property_mac_parser_never_panics_on_arbitrary_marker_text(
+            text in proptest::collection::vec(any::<char>(), 0..256)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            let secret = moderation_test_vectors().remove(0).secret;
+            let _ = parse_moderation_audit_reason(Some(&secret), GUILD, Some(&text));
+            let prefixed = format!("{MARKER_PREFIX}{text}] ");
+            let _ = parse_moderation_audit_reason(Some(&secret), GUILD, Some(&prefixed));
+            prop_assert_eq!(moderation_audit_reason(None, GUILD, &text, "moderation.ban", ACTOR, &text), text.clone());
+            prop_assert!(parse_moderation_audit_reason(None, GUILD, Some(&text)).is_none());
+        }
+    }
 
     const GUILD: &str = "123456789012345678";
     const ACTOR: &str = "987654321098765432";
@@ -371,6 +448,54 @@ mod tests {
         let marker = parse_moderation_audit_reason(Some(&secret), GUILD, Some(&reason))
             .expect("unban_scheduled must verify");
         assert_eq!(marker.action, UNBAN_SCHEDULED_ACTION);
+    }
+
+    #[test]
+    fn signed_reason_fits_outbound_limit_and_still_verifies() {
+        let secret = moderation_test_vectors().remove(0).secret;
+        let units = |s: &str| s.encode_utf16().count();
+        let marker_len = units(&moderation_audit_reason(
+            Some(&secret),
+            GUILD,
+            "k",
+            "moderation.ban",
+            ACTOR,
+            "",
+        ));
+        let budget = AUDIT_REASON_MAX_UTF16 - marker_len;
+        let cases = [
+            "x".repeat(512),
+            "\u{1F600}".repeat(256),
+            "x".repeat(budget),     // exact boundary: unchanged
+            "x".repeat(budget + 1), // one over: shortened
+            "é".repeat(512),
+            String::new(),
+            "spam".to_owned(),
+        ];
+        for human in cases {
+            let out =
+                moderation_audit_reason(Some(&secret), GUILD, "k", "moderation.ban", ACTOR, &human);
+            assert!(units(&out) <= AUDIT_REASON_MAX_UTF16, "{}", units(&out));
+            let m = parse_moderation_audit_reason(Some(&secret), GUILD, Some(&out))
+                .expect("marker intact");
+            assert_eq!(m.token, moderation_audit_token(GUILD, "k"));
+            let suffix = out.split_once("] ").unwrap().1;
+            if units(&human) <= budget {
+                assert_eq!(suffix, human);
+            } else {
+                assert!(suffix.ends_with('\u{2026}'));
+                assert!(human.starts_with(suffix.trim_end_matches('\u{2026}')));
+            }
+        }
+        let long = moderation_audit_reason(
+            Some(&secret),
+            GUILD,
+            "k",
+            "moderation.ban",
+            ACTOR,
+            &"x".repeat(budget + 1),
+        );
+        assert_eq!(units(&long), AUDIT_REASON_MAX_UTF16);
     }
 
     #[test]
@@ -465,10 +590,13 @@ mod tests {
             )]
             .into();
             let loaded = moderation_audit_secret(&vars, None).expect("reads");
-            assert_eq!(loaded.as_deref(), Some(vector.secret.as_str()));
+            assert_eq!(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                Some(vector.secret.as_str())
+            );
             assert_eq!(
                 moderation_audit_reason(
-                    loaded.as_deref(),
+                    loaded.as_ref().map(|secret| secret.expose().as_str()),
                     GUILD,
                     "idem-1",
                     "moderation.ban",
@@ -477,10 +605,12 @@ mod tests {
                 ),
                 vector.reason
             );
-            assert!(
-                parse_moderation_audit_reason(loaded.as_deref(), GUILD, Some(&vector.reason))
-                    .is_some()
-            );
+            assert!(parse_moderation_audit_reason(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                GUILD,
+                Some(&vector.reason)
+            )
+            .is_some());
         }
         let vars = [("TWO_MODERATION_AUDIT_SECRET".to_owned(), String::new())].into();
         assert_eq!(moderation_audit_secret(&vars, None).expect("reads"), None);
@@ -537,10 +667,13 @@ mod tests {
         for vector in fixture.vectors {
             std::fs::write(&path, &vector.raw).expect("write public fixture");
             let loaded = moderation_audit_secret(&vars, Some(&dir)).expect("reads");
-            assert_eq!(loaded.as_deref(), Some(vector.secret.as_str()));
+            assert_eq!(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                Some(vector.secret.as_str())
+            );
             assert_eq!(
                 moderation_audit_reason(
-                    loaded.as_deref(),
+                    loaded.as_ref().map(|secret| secret.expose().as_str()),
                     GUILD,
                     "idem-1",
                     "moderation.ban",
@@ -549,15 +682,17 @@ mod tests {
                 ),
                 vector.reason
             );
-            assert!(
-                parse_moderation_audit_reason(loaded.as_deref(), GUILD, Some(&vector.reason))
-                    .is_some()
-            );
+            assert!(parse_moderation_audit_reason(
+                loaded.as_ref().map(|secret| secret.expose().as_str()),
+                GUILD,
+                Some(&vector.reason)
+            )
+            .is_some());
             // File trimming must never leak into environment-key semantics.
             let env = [("TWO_MODERATION_AUDIT_SECRET".to_owned(), vector.raw.clone())].into();
             assert_eq!(
                 moderation_audit_secret(&env, None).expect("reads"),
-                Some(vector.raw)
+                Some(crate::Secret::new(vector.raw))
             );
         }
         std::fs::remove_dir_all(&dir).expect("remove fixtures");
@@ -581,18 +716,18 @@ mod tests {
         // Credential file wins over env, trimmed.
         assert_eq!(
             moderation_audit_secret(&vars, Some(&dir)).expect("reads"),
-            Some(vectors[0].secret.clone())
+            Some(crate::Secret::new(vectors[0].secret.clone()))
         );
         // Missing and blank credential files retain the raw environment value.
         std::fs::write(&path, &vectors[2].secret).expect("blank fixture");
         assert_eq!(
             moderation_audit_secret(&vars, Some(&dir)).expect("reads"),
-            Some(vectors[2].secret.clone())
+            Some(crate::Secret::new(vectors[2].secret.clone()))
         );
         std::fs::remove_file(&path).expect("remove fixture");
         assert_eq!(
             moderation_audit_secret(&vars, Some(&dir)).expect("reads"),
-            Some(vectors[2].secret.clone())
+            Some(crate::Secret::new(vectors[2].secret.clone()))
         );
         // A credential path that exists but is not readable as a file must
         // fail; never substitute the otherwise usable environment value.

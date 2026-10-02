@@ -11,9 +11,8 @@
 //! `record_earliest`, forward-only `touch_activity`, and the members
 //! projection guards.
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
-use std::str::FromStr;
 
 /// Legacy pool default (`TWO_DB_POOL_MAX ?? 5`).
 pub const DB_POOL_MAX_DEFAULT: u32 = 5;
@@ -37,15 +36,19 @@ pub async fn connect(
                 .to_owned(),
         ));
     }
-    let mut options = PgConnectOptions::from_str(url)
-        .map_err(|e| sqlx::Error::InvalidArgument(format!("invalid database URL: {e}")))?;
+    two_bot_core::database_url::validate(url)
+        .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
+    // Passfile diagnostics stay suppressed during the synchronous parse, but a
+    // well-formed entry still supplies the password (see `database_url`).
+    let mut options = two_bot_core::database_url::connect_options(url)?;
     // Statement timeout rides the connection options (server-side setting
     // per connection), so no per-connection SET is needed.
     options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);
     let pool = PgPoolOptions::new()
         .max_connections(pool_max)
         .connect_with(options)
-        .await?;
+        .await
+        .map_err(|_| sqlx::Error::InvalidArgument("database connection failed".to_owned()))?;
     let db = CutoverDb { pool };
     if !skip_migrations {
         if let Err(e) = db.migrate().await {
@@ -73,7 +76,7 @@ impl CutoverDb {
         sqlx::migrate!("./migrations")
             .run(&self.pool)
             .await
-            .map_err(|e| sqlx::Error::InvalidArgument(format!("migration failed: {e}")))
+            .map_err(|_| sqlx::Error::InvalidArgument("database migration failed".to_owned()))
     }
 
     /// Close idle connections (drains the pool).
@@ -401,22 +404,7 @@ pub async fn replace_role_rewards(
     guild_id: &str,
     rewards: &[crate::LevelRoleReward],
 ) -> Result<(), ReplaceRewardsError> {
-    use std::collections::BTreeMap;
-    let mut normalized: BTreeMap<u64, &str> = BTreeMap::new();
-    for r in rewards {
-        if r.level == 0 {
-            return Err(ReplaceRewardsError::Invalid(
-                "reward level must be a positive integer".to_owned(),
-            ));
-        }
-        if !crate::is_snowflake(&r.role_id) {
-            return Err(ReplaceRewardsError::Invalid(format!(
-                "invalid Discord role id: {}",
-                r.role_id
-            )));
-        }
-        normalized.insert(r.level, r.role_id.as_str());
-    }
+    let normalized = normalize_role_rewards(rewards)?;
     let mut tx = db.pool.begin().await.map_err(ReplaceRewardsError::Db)?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("{guild_id}:level_role_rewards"))
@@ -433,7 +421,7 @@ pub async fn replace_role_rewards(
             "INSERT INTO level_role_rewards (guild_id, level, role_id) VALUES ($1, $2, $3)",
         )
         .bind(guild_id)
-        .bind(level as i64)
+        .bind(level)
         .bind(role_id)
         .execute(&mut *tx)
         .await
@@ -443,6 +431,43 @@ pub async fn replace_role_rewards(
     Ok(())
 }
 
+/// Validate every input row against the INT4 storage domain, then keep the
+/// last role per level and require unique roles in that final ladder. Pure:
+/// callers can reject invalid replacements before opening a database.
+pub fn normalize_role_rewards(
+    rewards: &[crate::LevelRoleReward],
+) -> Result<std::collections::BTreeMap<i32, &str>, ReplaceRewardsError> {
+    use std::collections::{BTreeMap, HashSet};
+    let mut normalized = BTreeMap::new();
+    for r in rewards {
+        let level = i32::try_from(r.level)
+            .ok()
+            .filter(|level| *level > 0)
+            .ok_or_else(|| {
+                ReplaceRewardsError::Invalid(format!(
+                    "reward level must be between 1 and {}",
+                    i32::MAX
+                ))
+            })?;
+        if !crate::is_snowflake(&r.role_id) {
+            return Err(ReplaceRewardsError::Invalid(format!(
+                "invalid Discord role id: {}",
+                r.role_id
+            )));
+        }
+        normalized.insert(level, r.role_id.as_str());
+    }
+    let mut roles = HashSet::new();
+    for role_id in normalized.values() {
+        if !roles.insert(role_id.trim_start_matches('0')) {
+            return Err(ReplaceRewardsError::Invalid(format!(
+                "duplicate Discord role id in reward ladder: {role_id}"
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
 /// Reward-replacement failure: invalid input vs database error.
 #[derive(Debug, thiserror::Error)]
 pub enum ReplaceRewardsError {
@@ -450,4 +475,185 @@ pub enum ReplaceRewardsError {
     Invalid(String),
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
+}
+
+#[cfg(test)]
+mod reward_tests {
+    use super::*;
+    use crate::LevelRoleReward;
+    use sqlx::postgres::{PgConnectOptions, PgSslMode};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const ROLE_A: &str = "90000000000000002";
+    const ROLE_B: &str = "90000000000000003";
+
+    fn reward(level: u64, role_id: &str) -> LevelRoleReward {
+        LevelRoleReward {
+            level,
+            role_id: role_id.to_owned(),
+        }
+    }
+
+    fn invalid(rewards: &[LevelRoleReward]) {
+        assert!(matches!(
+            normalize_role_rewards(rewards),
+            Err(ReplaceRewardsError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn reward_levels_match_positive_int4_storage() {
+        let rewards = [reward(1, ROLE_A), reward(i32::MAX as u64, ROLE_B)];
+        assert_eq!(
+            normalize_role_rewards(&rewards)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![(1, ROLE_A), (i32::MAX, ROLE_B)]
+        );
+        for level in [0, i32::MAX as u64 + 1, i64::MAX as u64, u64::MAX] {
+            invalid(&[reward(level, ROLE_A)]);
+        }
+        invalid(&[reward(1, "bad"), reward(1, ROLE_A)]);
+        invalid(&[reward(u64::MAX, ROLE_A), reward(1, ROLE_B)]);
+    }
+
+    #[test]
+    fn reward_role_uniqueness_ignores_leading_zero_aliases() {
+        invalid(&[reward(1, ROLE_A), reward(2, "090000000000000002")]);
+    }
+
+    #[test]
+    fn reward_role_uniqueness_is_checked_after_last_level_wins() {
+        let rewards = [reward(2, ROLE_A), reward(1, ROLE_A), reward(1, ROLE_B)];
+        assert_eq!(
+            normalize_role_rewards(&rewards)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![(1, ROLE_B), (2, ROLE_A)]
+        );
+        assert!(normalize_role_rewards(&[]).unwrap().is_empty());
+        assert_eq!(
+            normalize_role_rewards(&[reward(1, ROLE_A), reward(1, ROLE_A)])
+                .unwrap()
+                .len(),
+            1
+        );
+        invalid(&[reward(1, ROLE_A), reward(2, ROLE_B), reward(2, ROLE_A)]);
+    }
+
+    #[tokio::test]
+    async fn invalid_rewards_do_not_acquire_a_connection() {
+        let pool = PgPoolOptions::new().connect_lazy_with(
+            PgConnectOptions::new()
+                .host("agent-testdb")
+                .username("agent_test")
+                .password(""),
+        );
+        pool.close().await;
+        let db = CutoverDb { pool };
+        for rewards in [
+            vec![reward(u64::MAX, ROLE_A)],
+            vec![reward(1, ROLE_A), reward(2, ROLE_A)],
+        ] {
+            assert!(matches!(
+                replace_role_rewards(&db, "g1", &rewards).await,
+                Err(ReplaceRewardsError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            replace_role_rewards(&db, "g1", &[]).await,
+            Err(ReplaceRewardsError::Db(sqlx::Error::PoolClosed))
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires agent-testdb or the CI Postgres service"]
+    async fn reward_replacement_preserves_ladder_on_invalid_input(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // No inherited app URL or credentials; only the disposable test service.
+        let host = if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+            "127.0.0.1"
+        } else {
+            "agent-testdb"
+        };
+        let options = PgConnectOptions::new()
+            .host(host)
+            .port(5432)
+            .username("agent_test")
+            .password("")
+            .database("postgres")
+            .ssl_mode(PgSslMode::Disable);
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(options.clone())
+            .await?;
+        let schema = format!(
+            "reward_test_{}_{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await?;
+        let path = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(5))
+            .after_connect(move |conn, _| {
+                let path = path.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                        .bind(path)
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await?;
+        let db = CutoverDb { pool };
+        let result = async {
+            sqlx::raw_sql(include_str!("../migrations/0002_leveling.sql"))
+                .execute(db.pool())
+                .await?;
+            let original = vec![reward(5, ROLE_A)];
+            replace_role_rewards(&db, "g1", &original).await?;
+            replace_role_rewards(&db, "g2", &original).await?;
+            for rewards in [
+                vec![reward(i32::MAX as u64 + 1, ROLE_B)],
+                vec![reward(1, ROLE_A), reward(2, ROLE_A)],
+            ] {
+                assert!(matches!(
+                    replace_role_rewards(&db, "g1", &rewards).await,
+                    Err(ReplaceRewardsError::Invalid(_))
+                ));
+                assert_eq!(role_rewards(&db, "g1").await?, original);
+            }
+            let replacement = vec![
+                reward(1, ROLE_A),
+                reward(i32::MAX as u64, ROLE_A),
+                reward(1, ROLE_B),
+            ];
+            replace_role_rewards(&db, "g1", &replacement).await?;
+            assert_eq!(
+                role_rewards(&db, "g1").await?,
+                vec![reward(1, ROLE_B), reward(i32::MAX as u64, ROLE_A)]
+            );
+            assert_eq!(role_rewards(&db, "g2").await?, original);
+            replace_role_rewards(&db, "g1", &[]).await?;
+            assert!(role_rewards(&db, "g1").await?.is_empty());
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        db.close().await;
+        // Only this generated schema is disposable; preserve all shared data.
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
 }

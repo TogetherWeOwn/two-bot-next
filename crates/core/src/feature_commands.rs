@@ -32,11 +32,11 @@
 //! only the S6 staging shape-check ports it, matrix §9 drop 6),
 //! `/rota-acknowledge` #13 (dropped with the rota stack).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_EVENTS,
-    PERM_MANAGE_GUILD,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, OCCURRENCE_ID_MAX_CHARS,
+    PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
 
 /// Scorecard check-in command (parity #12). Keeps the `attendance` name; the
@@ -54,7 +54,8 @@ pub fn scorecard_attendance_command() -> CommandDefinition {
             "Scheduled event id or stable occurrence id.",
             CommandOptionType::String,
         )
-        .required(),
+        .required()
+        .max_length(OCCURRENCE_ID_MAX_CHARS as u32),
         CommandOption::new(
             "member",
             "Human member who attended.",
@@ -260,6 +261,51 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
     ]
 }
 
+/// Parse a `!<trigger>` prefix from message text (parity §1 #23).
+///
+/// Ports legacy `triggerWord` (`src/automations/gateway.ts`): `text` must
+/// start with `!` (no leading whitespace), the word is everything up to the
+/// first JS-`\s` character, and it is lowercased (`str::to_lowercase`, the
+/// same Unicode fold as JS `toLowerCase`, so `!\u{212A}ick` folds to `kick`).
+/// The folded word must match legacy `TRIGGER_PATTERN =
+/// /^![a-z0-9_-]{1,32}$/` ([`crate::leveling::valid_command_name`]); stored
+/// triggers always do, so a miss here is a miss in the store. The returned
+/// name excludes the leading `!`.
+///
+/// - `text_commands_enabled` is the `FeatureGates::text_commands` flag
+///   (`TWO_AUTOMATIONS=1` AND `TWO_TEXT_COMMANDS=1`). Off rejects everything.
+/// - `builtin_names` holds bare builtin slash names (no `!` prefix: `rank`,
+///   `ban`, `rsvp-attendance`, …). A folded trigger colliding with a builtin
+///   is rejected so prefix traffic can never shadow a slash command.
+/// - First token only: `"!faq extra"` yields `faq`; `"hi !faq"` and
+///   `"  !faq"` yield nothing.
+///
+/// Gateway wiring and custom-command storage are out of scope (follow-ups
+/// under TOG-10080); the caller resolves the returned name against its store.
+#[must_use]
+pub fn parse_prefix_trigger(
+    text: &str,
+    text_commands_enabled: bool,
+    builtin_names: &HashSet<String>,
+) -> Option<String> {
+    if !text_commands_enabled {
+        return None;
+    }
+    let rest = text.strip_prefix('!')?;
+    let word = rest.split(is_js_whitespace).next()?;
+    let name = word.to_lowercase();
+    if !crate::leveling::valid_command_name(&name) || builtin_names.contains(&name) {
+        return None;
+    }
+    Some(name)
+}
+
+/// JS regex `\s`: Unicode `White_Space` minus U+0085 (NEL), plus U+FEFF
+/// (BOM). `char::is_whitespace` alone differs on exactly those two.
+fn is_js_whitespace(c: char) -> bool {
+    c == '\u{feff}' || (c != '\u{85}' && c.is_whitespace())
+}
+
 /// Slice-2 definitions in legacy publish order (community, automation,
 /// announcement — mirrors `BUILTIN_COMMAND_NAMES` in
 /// `src/discord/commandNames.ts`). The registry caller merges this via
@@ -443,6 +489,13 @@ mod tests {
         let score = scorecard_attendance_command();
         assert!(score.options.iter().all(|o| o.required == Some(true)));
         assert_eq!(score.options[1].kind, CommandOptionType::User.as_u8());
+        // event-occurrence advertises the shared occurrence-ID bound (pinned
+        // literal: a const change must update docs/parity.md and commands.md).
+        assert_eq!(score.options[0].max_length, Some(128));
+        assert_eq!(
+            score.options[0].max_length,
+            Some(OCCURRENCE_ID_MAX_CHARS as u32)
+        );
     }
 
     #[test]
@@ -452,6 +505,8 @@ mod tests {
         // RSVP-totals carries the namespaced name.
         assert_eq!(json[0]["name"], "attendance");
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
+        assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
+        assert_eq!(json[0]["options"][0]["max_length"], 128);
         assert_eq!(json[10]["name"], "rsvp-attendance");
         assert!(json[10].get("default_member_permissions").is_none());
         assert_eq!(json[10]["options"][0]["name"], "event-id");

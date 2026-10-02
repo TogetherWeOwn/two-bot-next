@@ -92,9 +92,18 @@ async fn persistence_failure_stops_service_and_restart_recovers_committed_sequen
     .expect("failure trigger");
     let mut first = MockGateway::new(false, false).await;
     let (runner, state) = spawn_runner(&db, &first.url).await;
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        crate::supervise_gateway(runner, std::future::pending()),
+        crate::supervise_gateway(
+            runner,
+            async move {
+                crate::server::shutdown_requested(receiver).await;
+                Ok(())
+            },
+            state.clone(),
+            shutdown,
+        ),
     )
     .await
     .expect("service must stop")
@@ -104,7 +113,7 @@ async fn persistence_failure_stops_service_and_restart_recovers_committed_sequen
         "gateway task stopped; container restart required"
     );
     assert_eq!(first.authentication().await["op"], 2);
-    assert_eq!(*state.read().await, GatewayState::Armed);
+    assert_eq!(*state.read().await, GatewayState::Draining);
     let saved = db.store.load().await.unwrap().unwrap();
     assert_eq!(
         saved.sequence, 1,

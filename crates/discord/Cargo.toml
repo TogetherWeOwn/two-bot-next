@@ -21,16 +21,28 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+sqlx = { workspace = true, optional = true }
 twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
 twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
+[features]
+default = []
+db = ["two-bot-core/db", "dep:sqlx"]
+# Explicit service-DB acceptance lane; no credentialed Discord traffic.
+db-tests = ["db"]
+
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
+anyhow = { workspace = true }
+two-bot-cutover = { version = "0.2.0", path = "../cutover" }
+sqlx = { workspace = true }
+two-bot-testsupport = { path = "../testsupport", version = "0.2.0" }
 futures-util = { workspace = true, features = ["sink"] }
 rustls = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }
 tracing-subscriber = { workspace = true }
 twilight-gateway = { workspace = true }

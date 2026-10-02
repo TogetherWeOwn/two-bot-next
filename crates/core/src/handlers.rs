@@ -64,6 +64,9 @@ impl From<&FunnelEvent> for StoredRow {
 /// S6 implements this over Postgres (`ON CONFLICT DO NOTHING` arbitrates the
 /// idempotency key atomically); [`MemStore`] is the test double.
 pub trait FunnelStore: Send + Sync {
+    /// Persist an observed bot before any unconditional funnel projection.
+    /// Classification is monotonic: missing user data never demotes a bot.
+    fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake);
     /// Insert-or-ignore by idempotency key.
     fn record(&self, event: FunnelEvent) -> RecordOutcome;
     /// Monotonic recency bump (never moves backwards).
@@ -78,6 +81,8 @@ pub trait FunnelStore: Send + Sync {
         at: &str,
     ) -> Option<EventType>;
     fn has_event(&self, guild_id: Snowflake, member_id: Snowflake, event_type: EventType) -> bool;
+    /// Optional durable invite seam; in-memory replay already owns its tracker.
+    fn stage_invite_snapshot(&self, _snapshot: crate::gateway_funnel::InviteSnapshotWrite) {}
 }
 
 /// In-memory [`FunnelStore`] for tests and the replay harness.
@@ -91,6 +96,7 @@ struct MemInner {
     rows: Vec<StoredRow>,
     keys: std::collections::HashSet<String>,
     activity: std::collections::HashMap<(Snowflake, Snowflake), String>,
+    bots: std::collections::HashSet<(Snowflake, Snowflake)>,
 }
 
 impl MemStore {
@@ -116,15 +122,16 @@ impl MemStore {
 }
 
 impl FunnelStore for MemStore {
+    fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake) {
+        self.inner
+            .lock()
+            .expect("store lock")
+            .bots
+            .insert((guild_id, member_id));
+    }
+
     fn record(&self, event: FunnelEvent) -> RecordOutcome {
-        let row = StoredRow::from(&event);
-        let mut inner = self.inner.lock().expect("store lock");
-        if inner.keys.contains(&row.idempotency_key) {
-            return RecordOutcome { inserted: false };
-        }
-        inner.keys.insert(row.idempotency_key.clone());
-        inner.rows.push(row);
-        RecordOutcome { inserted: true }
+        crate::membership::MembershipStore::record_observed(self, event, None)
     }
 
     fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
@@ -182,6 +189,51 @@ impl FunnelStore for MemStore {
                     && row.member_id == Some(member_id)
                     && row.event_type == event_type
             })
+    }
+}
+
+impl crate::membership::MembershipStore for MemStore {
+    fn membership(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+    ) -> Option<crate::membership::Membership> {
+        let inner = self.inner.lock().expect("store lock");
+        crate::membership::project(
+            inner
+                .rows
+                .iter()
+                .filter(|r| r.guild_id == guild_id && r.member_id == Some(member_id)),
+        )
+    }
+
+    fn membership_rows(&self, guild_id: Snowflake, member_id: Snowflake) -> Vec<StoredRow> {
+        self.rows()
+            .into_iter()
+            .filter(|r| r.guild_id == guild_id && r.member_id == Some(member_id))
+            .collect()
+    }
+
+    fn record_observed(&self, event: FunnelEvent, observed_at: Option<&str>) -> RecordOutcome {
+        let mut row = StoredRow::from(&event);
+        let mut inner = self.inner.lock().expect("store lock");
+        if inner.keys.contains(&row.idempotency_key) {
+            if let Some(hint) = observed_at {
+                let existing = inner
+                    .rows
+                    .iter_mut()
+                    .find(|r| r.idempotency_key == row.idempotency_key)
+                    .expect("key has a row");
+                crate::membership::advance_observation(existing, hint);
+            }
+            return RecordOutcome { inserted: false };
+        }
+        if let Some(hint) = observed_at {
+            crate::membership::set_observation(&mut row, hint);
+        }
+        inner.keys.insert(row.idempotency_key.clone());
+        inner.rows.push(row);
+        RecordOutcome { inserted: true }
     }
 }
 
@@ -492,6 +544,9 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
 
     /// Member arrival. Bots are captured in facts but never write funnel rows.
     pub fn on_join(&self, i: JoinInput) -> HandlerOutcome {
+        if i.is_bot {
+            self.store.mark_bot(i.guild_id, i.member_id);
+        }
         let at = i.occurred_at.clone().unwrap_or_else(now_iso);
         if let Some(facts) = &self.facts {
             let source_event_id = i
@@ -767,6 +822,9 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
         occurred_at: Option<String>,
         is_bot: Option<bool>,
     ) -> HandlerOutcome {
+        if is_bot == Some(true) {
+            self.store.mark_bot(guild_id, member_id);
+        }
         let at = occurred_at.unwrap_or_else(now_iso);
         if self
             .voice_sessions

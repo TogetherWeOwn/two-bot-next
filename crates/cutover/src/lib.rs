@@ -19,15 +19,23 @@ pub mod cli;
 pub mod db;
 pub mod dedupe;
 pub mod gateway_session;
+pub mod internal_settings;
 pub mod invite;
+pub mod invite_store;
 pub mod legacy_copy;
+pub mod legacy_mapping;
+pub mod legacy_verify;
 pub mod mee6_names;
 pub mod mee6_rewards;
 pub mod mee6_xp;
+pub mod member_erasure;
 pub mod message_scan;
 pub mod parse;
+pub mod raid_tools;
 pub mod rest;
+pub mod self_role_store;
 pub mod settings;
+pub mod tickets;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
 pub use db::{
@@ -61,7 +69,10 @@ pub use parse::{
     parse_voice_message, snowflake_to_date_ms, EmbedView, LeaveAttributionRecord, MemberLogKind,
     MemberLogRecord, MessageView, VoiceKind, VoiceRecord,
 };
-pub use rest::{iso_to_millis, timestamp_ms, RestClient, RestError, ScanPage};
+pub use rest::{
+    iso_to_millis, timestamp_ms, ArchiveIncompleteReason, ArchivedThreadsOutcome, RestClient,
+    RestError, ScanCompletion, ScanPage, DEFAULT_ARCHIVED_THREAD_PAGES,
+};
 pub use settings::{log_refresh_report, SettingsStore, SettingsWriteError};
 
 /// Live TWO guild: every CLI refuses it without `--allow-live-guild`
@@ -71,9 +82,12 @@ pub const LIVE_GUILD_ID: &str = "326474832151838730";
 /// Staging guild for soak runs (legacy `TWO_STAGING_GUILD_ID`).
 pub const STAGING_GUILD_ID: &str = "1545644954272137297";
 
-/// True when `s` is a Discord snowflake (legacy `/^\d{17,20}$/`).
+/// True when `s` is a canonical Discord snowflake, safe for identity comparisons.
 #[must_use]
 pub fn is_snowflake(s: &str) -> bool {
     let len = s.len();
-    (17..=20).contains(&len) && s.bytes().all(|b| b.is_ascii_digit())
+    (17..=20).contains(&len)
+        && !s.starts_with('0')
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && s.parse::<u64>().is_ok()
 }

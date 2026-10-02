@@ -20,12 +20,16 @@ import {
   clickIdempotencyKey,
   handleRedirect,
   inviteUrl,
+  isReservedInternal,
   isValidInviteCode,
+  isValidFallback,
   isValidSlug,
   type Campaign,
   type RedirectClick,
   type RedirectDeps,
 } from "../src/redirect.ts";
+
+import { parseMappingsSnapshot, RedirectStore } from "../src/redirect-store.ts";
 
 const GUILD = "111222333444555666";
 const CODE = "aB3xY9";
@@ -272,6 +276,68 @@ describe("things that are not people", () => {
   });
 });
 
+describe("reserved internal slugs never become campaigns", () => {
+  const METRICS_CAMPAIGN: Campaign = {
+    slug: "metrics",
+    inviteCode: "synthetic",
+  };
+  function metricsHarness() {
+    const h = harness();
+    const lookupCalls: string[] = [];
+    h.deps.lookup = async (slug) => {
+      lookupCalls.push(slug);
+      return MAPPINGS.find((c) => c.slug === slug) ?? METRICS_CAMPAIGN;
+    };
+    h.deps.recordClick = async () => {
+      throw new Error("reserved slug must not record clicks");
+    };
+    return { h, lookupCalls };
+  }
+
+  test("canonical aliases are reserved for every method", async () => {
+    for (const path of [
+      "/metrics",
+      "/METRICS",
+      "/%6detrics",
+      "//metrics",
+      "/metrics/",
+      "/metrics/extra",
+      "/metrics//extra",
+      "/metrics?token=synthetic",
+    ]) {
+      assert.ok(isReservedInternal(path), `${path} must be reserved`);
+      for (const method of ["GET", "HEAD", "POST"]) {
+        const { h, lookupCalls } = metricsHarness();
+        const res = await h.call(method, path);
+        assert.equal(res.status, 404, `${method} ${path} must 404, got ${res.status}`);
+        assert.equal(res.headers["location"], undefined);
+        assert.ok(!("click" in res) || res.click === undefined);
+        assert.equal(lookupCalls.length, 0, `${method} ${path} must skip lookup`);
+        assert.equal(h.clicks.length, 0);
+      }
+    }
+  });
+
+  test("near-miss slugs still resolve as campaigns", async () => {
+    // `metricsfoo` is not reserved: GET redirects and records, POST is 405.
+    assert.ok(!isReservedInternal("/metricsfoo"));
+    const { h } = metricsHarness();
+    const lookup = h.deps.lookup;
+    h.deps.lookup = async (slug) =>
+      slug === "metricsfoo"
+        ? { slug: "metricsfoo", inviteCode: CODE }
+        : lookup(slug);
+    const clicks: RedirectClick[] = [];
+    h.deps.recordClick = async (click) => { clicks.push(click); };
+    const res = await h.call("GET", "/metricsfoo");
+    assert.equal(res.status, 302);
+    assert.equal(res.headers["location"], `https://discord.gg/${CODE}`);
+    assert.equal(clicks.length, 1);
+    const post = await h.call("POST", "/metricsfoo");
+    assert.equal(post.status, 405);
+  });
+});
+
 describe("abuse and malformed input fail closed", () => {
   test("one caller's burst throttles at 429 before the store, then refills", async () => {
     let now = 1_000_000;
@@ -349,6 +415,350 @@ describe("abuse and malformed input fail closed", () => {
       );
     }
     assert.equal(h.clicks.length, 0);
+  });
+});
+
+describe("configuration and campaign ingress fail closed", () => {
+  test("invalid fallback prevents serving even a healthy campaign or probe", async () => {
+    for (const fallback of ["has space", "https://discord.gg/code", "x".repeat(65), "code\n"]) {
+      for (const path of ["/", "/reddit", "/healthz"]) {
+        const h = harness({ fallback });
+        let lookups = 0;
+        h.deps.lookup = async () => { lookups++; return MAPPINGS[0]!; };
+        const res = await h.call("GET", path);
+        assert.equal(res.status, 503);
+        assert.equal(res.headers.location, undefined);
+        assert.equal(lookups, 0);
+        assert.equal(h.clicks.length, 0);
+        assert.deepEqual(h.errors, ['invite_redirect_invalid_config {"errorClass":"invalid_fallback"}']);
+      }
+    }
+    assert.equal((await harness({ fallback: "" }).call("GET", "/")).status, 404);
+    assert.equal((await harness({ fallback: null }).call("GET", "/healthz")).status, 200);
+  });
+
+  test("reserved paths reject every method before invalid fallback configuration", async () => {
+    for (const path of [
+      "/metrics", "/METRICS", "/%6detrics", "//metrics", "/metrics/", "/metrics/extra",
+      "/HEALTHZ", "/%68ealthz", "//healthz", "/healthz/", "/%2fhealthz", "/healthz/extra",
+      "/healthz/?visitor=synthetic",
+    ]) {
+      for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
+        const h = harness({ fallback: "has space" });
+        h.deps.lookup = async () => { assert.fail("reserved paths must skip lookup"); };
+        h.deps.isThrottled = () => { assert.fail("reserved paths must skip rate limiting"); };
+        const res = await h.call(method, path);
+        assert.equal(res.status, 404, `${method} ${path}`);
+        assert.equal(res.headers.location, undefined);
+        assert.equal(res.click, undefined);
+        assert.equal(h.clicks.length, 0);
+        assert.deepEqual(h.errors, []);
+      }
+    }
+    for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
+      const h = harness({ fallback: "has space" });
+      assert.equal((await h.call(method, "/healthz?visitor=synthetic")).status, 503);
+      assert.deepEqual(h.errors, ['invite_redirect_invalid_config {"errorClass":"invalid_fallback"}']);
+    }
+  });
+
+  test("reserved prefixes reject malformed suffixes without configuration or throttle effects", async () => {
+    for (const path of [
+      "/healthz/%", "/metrics/%FF", "/%68ealthz/%", "/%6detrics/%FF",
+      "/HEALTHZ/%E0%A4", "//METRICS//%", "/%2fhealthz/%FF", "/%2F%6detrics%2F%",
+      "/healthz%2f%", "/metrics%2F%FF", "/healthz/%?visitor=synthetic",
+    ]) {
+      assert.ok(isReservedInternal(path), path);
+      for (const fallback of [FALLBACK, "has space"]) {
+        for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
+          const h = harness({ fallback });
+          h.deps.lookup = async () => { assert.fail("reserved prefixes must skip lookup"); };
+          h.deps.isThrottled = () => { assert.fail("reserved prefixes must skip throttling"); };
+          const res = await h.call(method, path);
+          assert.equal(res.status, 404, `${method} ${path}`);
+          assert.equal(res.headers.location, undefined);
+          assert.equal(res.click, undefined);
+          assert.equal(h.clicks.length, 0);
+          assert.deepEqual(h.errors, []);
+        }
+      }
+    }
+    for (const path of ["/healthz-campaign/%", "/metricsfoo/%FF", "/%252fhealthz/%", "/hea%FFlthz/%"]) {
+      assert.ok(!isReservedInternal(path), path);
+    }
+  });
+
+  test("fallback bindings reject non-string values without coercion", async () => {
+    for (const value of [123, 0, false, true, [], [FALLBACK], {}, { toString() { assert.fail("must not coerce fallback"); } }, Symbol("fixture")]) {
+      assert.equal(isValidFallback(value), false);
+      for (const path of ["/", "/reddit", "/healthz"]) {
+        const h = harness();
+        h.deps.fallbackInviteCode = value as string;
+        h.deps.lookup = async () => { assert.fail("invalid fallback must skip lookup"); };
+        h.deps.isThrottled = () => { assert.fail("invalid fallback must skip throttling"); };
+        const res = await h.call("GET", path);
+        assert.equal(res.status, 503);
+        assert.equal(res.headers.location, undefined);
+        assert.equal(res.click, undefined);
+        assert.equal(h.clicks.length, 0);
+        assert.deepEqual(h.errors, ['invite_redirect_invalid_config {"errorClass":"invalid_fallback"}']);
+      }
+    }
+    for (const value of [undefined, null, "", FALLBACK]) assert.ok(isValidFallback(value));
+  });
+
+  test("snapshot parser rejects non-string input without coercion", () => {
+    let coercions = 0;
+    const object = { toString() { coercions++; return "[]"; } };
+    for (const value of [undefined, null, false, 0, [], ["[]"], {}, object]) {
+      assert.throws(() => parseMappingsSnapshot(value), { message: "Invalid redirect mappings snapshot" });
+    }
+    assert.equal(coercions, 0);
+  });
+
+  test("healthz aliases cannot become a campaign, even with a polluted lookup", async () => {
+    for (const path of ["/healthz", "/HEALTHZ", "/%68ealthz", "//healthz", "/healthz/", "/%2fhealthz", "/healthz/extra"]) {
+      for (const method of ["GET", "HEAD", "POST"]) {
+        const h = harness();
+        let lookups = 0;
+        h.deps.lookup = async () => { lookups++; return { slug: "healthz", inviteCode: CODE }; };
+        const res = await h.call(method, path);
+        assert.equal(res.status, path === "/healthz" ? (method === "POST" ? 405 : 200) : 404);
+        assert.equal(res.headers.location, undefined);
+        assert.equal(lookups, 0);
+        assert.equal(h.clicks.length, 0);
+      }
+    }
+    assert.ok(isValidSlug("healthz-campaign"));
+    assert.ok(!isValidSlug("healthz"));
+  });
+
+  test("snapshot rejects malformed, reserved and duplicate campaigns without echoing values", () => {
+    const row = { slug: "reddit", invite_code: CODE, label: "sidebar", disabled_at: null };
+    for (const input of [
+      "null", "{}", "[null]", "[1]", '"secret-value"', "not json secret-value",
+      JSON.stringify([{ ...row, slug: "healthz" }]),
+      ...["HEALTHZ", "%68ealthz", "/healthz/", "metrics", "a", "a".repeat(41), "reddit\n"].map(slug => JSON.stringify([{ ...row, slug }])),
+      ...[undefined, null, 123, "has space", "x".repeat(65), "secret-value\n"].map(invite_code => JSON.stringify([{ ...row, invite_code }])),
+      JSON.stringify([{ ...row, label: 123 }]),
+      JSON.stringify([{ ...row, disabled_at: {} }]),
+      JSON.stringify([row, row]),
+    ]) {
+      assert.throws(() => parseMappingsSnapshot(input), { message: "Invalid redirect mappings snapshot" });
+    }
+    assert.deepEqual(parseMappingsSnapshot("[]"), []);
+    assert.deepEqual(parseMappingsSnapshot(JSON.stringify([row])), [{ slug: "reddit", inviteCode: CODE, label: "sidebar", disabledAt: null }]);
+  });
+
+  test("reserved and malformed slugs never reach the database", async () => {
+    let connections = 0;
+    const store = new RedirectStore({ connectionString: "fixture" }, async () => {
+      connections++;
+      throw new Error("must not connect");
+    });
+    for (const slug of ["healthz", "HEALTHZ", "%68ealthz", "metrics", "invalid/slug"]) {
+      assert.equal(await store.lookup(slug), null);
+    }
+    assert.equal(connections, 0);
+  });
+
+  test("lookup error logs only a validated slug and a fixed error class", async () => {
+    const secret = "postgres://fixture:secret-value@fixture/db?visitor=203.0.113.44";
+    for (const [thrown, errorClass] of [
+      [new Error(secret), "Error"], [new TypeError(secret), "TypeError"],
+      [new RangeError(secret), "RangeError"], [secret, "Unknown"],
+      [{ name: secret, message: secret }, "Unknown"],
+      [Object.assign(new Error(secret), { name: secret }), "Error"],
+    ] as const) {
+      const h = harness({ fallback: null });
+      h.deps.lookup = async () => { throw thrown; };
+      assert.equal((await h.call("GET", "/reddit?visitor=203.0.113.44", secret)).status, 503);
+      assert.deepEqual(h.errors, [`invite_redirect_lookup_failed ${JSON.stringify({ slug: "reddit", errorClass })}`]);
+    }
+    const h = harness({ outage: true });
+    for (const path of ["/postgres:secret-value", "/reddit%0a", "/" + "x".repeat(100)]) {
+      assert.equal((await h.call("GET", path)).status, 404);
+    }
+    assert.deepEqual(h.errors, []);
+  });
+});
+
+describe("idle buckets expire but throttles never reset", () => {
+  test("many one-time keys expire after the fully-refilled idle window", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 5, refillPerSecond: 1 },
+      () => now,
+    );
+    for (let i = 0; i < 200; i++) {
+      assert.ok(buckets.take(`synthetic-key-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 200);
+    // Below the 5-second full-refill window: nothing may expire yet.
+    now += 4_000;
+    assert.ok(buckets.take("synthetic-key-200").allowed);
+    assert.equal(buckets.size, 201);
+    // Past the window: four live takes reap 64+64+64+8 = 200 stale entries;
+    // only the five live keys (200–204) remain.
+    now += 2_000;
+    assert.ok(buckets.take("synthetic-key-201").allowed);
+    assert.ok(buckets.take("synthetic-key-202").allowed);
+    assert.ok(buckets.take("synthetic-key-203").allowed);
+    assert.ok(buckets.take("synthetic-key-204").allowed);
+    assert.equal(buckets.size, 5);
+  });
+
+  test("an exhausted key stays throttled until refill, never via eviction", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 2, refillPerSecond: 1 },
+      () => now,
+    );
+    assert.ok(buckets.take("hot").allowed);
+    assert.ok(buckets.take("hot").allowed);
+    assert.ok(!buckets.take("hot").allowed);
+    // New keys churn around it; the hot bucket must keep its debt.
+    for (let i = 0; i < 10; i++) {
+      assert.ok(buckets.take(`churn-${i}`).allowed);
+      assert.ok(!buckets.take("hot").allowed);
+    }
+    now += 1_100;
+    assert.ok(buckets.take("hot").allowed);
+    now += 1_100;
+    assert.ok(buckets.take("hot").allowed);
+  });
+
+  test("a sub-refill idle TTL is clamped to the full-refill window", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 4, refillPerSecond: 1 },
+      () => now,
+      { idleTtlMs: 500 },
+    );
+    assert.ok(buckets.take("drained").allowed);
+    for (let i = 0; i < 4; i++) buckets.take("drained");
+    assert.ok(!buckets.take("drained").allowed);
+    // 500ms would have expired the TTL; clamped to 4s, it must not.
+    now += 600;
+    assert.ok(!buckets.take("drained").allowed);
+    now += 3_500;
+    assert.ok(buckets.take("drained").allowed);
+  });
+
+  test("past the cardinality cap new keys shed load, tracked keys keep theirs", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 1, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 3 },
+    );
+    assert.ok(buckets.take("a").allowed);
+    assert.ok(buckets.take("b").allowed);
+    assert.ok(buckets.take("c").allowed);
+    assert.equal(buckets.size, 3);
+    const shed = buckets.take("overflow");
+    assert.ok(!shed.allowed);
+    assert.ok(shed.retryAfter >= 1);
+    assert.equal(buckets.size, 3);
+    // Tracked keys still spend and throttle exactly as before.
+    assert.ok(!buckets.take("a").allowed);
+    assert.ok(!buckets.take("b").allowed);
+    now += 1_100;
+    assert.ok(buckets.take("a").allowed);
+  });
+
+  test("a full map of idle keys drains on new-key traffic alone", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 60, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 100 },
+    );
+    for (let i = 0; i < 100; i++) {
+      assert.ok(buckets.take(`filler-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 100);
+    // No tracked key ever returns. Every new caller must still be admitted
+    // once the fillers have sat idle past the full-refill window.
+    now += 24 * 60 * 60 * 1000;
+    for (let i = 0; i < 50; i++) {
+      assert.ok(buckets.take(`newcomer-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 50);
+  });
+
+  test("the reap before an at-cap refusal stays within the sweep budget", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 1, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 10, sweepBudget: 2 },
+    );
+    for (let i = 0; i < 10; i++) {
+      assert.ok(buckets.take(`filler-${i}`).allowed);
+    }
+    now += 2_000;
+    // Reap 2 to make room, write the newcomer, reap 2 more: 10 - 2 + 1 - 2.
+    assert.ok(buckets.take("newcomer").allowed);
+    assert.equal(buckets.size, 7);
+  });
+
+  test("at the cap a live map still refuses and a depleted key keeps its debt", async () => {
+    const t0 = 1_000_000;
+    let now = t0;
+    const buckets = new TokenBuckets(
+      { capacity: 4, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 3 },
+    );
+    assert.ok(buckets.take("old").allowed);
+    now = t0 + 3_500;
+    for (let i = 0; i < 4; i++) assert.ok(buckets.take("hot").allowed);
+    assert.ok(!buckets.take("hot").allowed);
+    assert.ok(buckets.take("a").allowed);
+    assert.equal(buckets.size, 3);
+    // "old" has sat idle for the 4s full-refill window; "hot" owes tokens.
+    // The newcomer may take only the idle slot.
+    now = t0 + 4_000;
+    assert.ok(buckets.take("new").allowed);
+    assert.equal(buckets.size, 3);
+    const hot = buckets.take("hot");
+    assert.ok(!hot.allowed);
+    assert.equal(hot.retryAfter, 1);
+    // Every remaining entry is live: fail closed.
+    const shed = buckets.take("late");
+    assert.ok(!shed.allowed);
+    assert.ok(shed.retryAfter >= 1);
+    assert.equal(buckets.size, 3);
+    // 0.5 + 1 refilled tokens: one take, not the four a reset would grant.
+    now = t0 + 5_000;
+    assert.ok(buckets.take("hot").allowed);
+    assert.ok(!buckets.take("hot").allowed);
+  });
+
+  test("sweep work per call is bounded regardless of map size", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 60, refillPerSecond: 1 },
+      () => now,
+      { idleTtlMs: 60_000, sweepBudget: 4 },
+    );
+    for (let i = 0; i < 100; i++) {
+      assert.ok(buckets.take(`idle-${i}`).allowed);
+    }
+    now += 61_000;
+    // One call reaps at most 4 of the 100 idle entries, then writes its own.
+    assert.ok(buckets.take("fresh").allowed);
+    assert.equal(buckets.size, 97);
+    // Repeat live calls a bounded number of times: each reaps at most 4
+    // stale entries (stale front stays front while idle), and every new key
+    // written 60s+ after the burst is itself live — so after 24 more writes
+    // all 100 stale entries are gone with the 25 live keys remaining.
+    for (let i = 0; i < 24; i++) {
+      now += 1_000;
+      assert.ok(buckets.take(`fresh-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 25);
   });
 });
 

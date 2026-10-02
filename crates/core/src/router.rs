@@ -32,10 +32,11 @@
 //! 3. Permission bits — the handler-level check legacy performs even though
 //!    `default_member_permissions` hides the command from non-admin pickers.
 //!
-//! Unknown slash names (no builtin, no custom row) and unknown `custom_id`s
-//! are `Ignore`: some other application's command, not ours to answer —
-//! exactly the legacy fall-through. Legacy has no modal submits; modals route
-//! through the same component-id table so future slices have a place to land.
+//! Unknown slash names and `custom_id`s in the configured guild get a uniform
+//! ephemeral reply (a deliberate improvement on legacy's silent fall-through).
+//! Foreign/missing guilds remain fenced. Legacy has no modal submits; modals
+//! route through the component-id table. [`replies`] owns async reply timing,
+//! error redaction and panic isolation; the adapter supplies the transport.
 //!
 //! Publish: [`InteractionRouter::publish_set`] assembles the ONE complete
 //! guild set (core + enabled features in legacy order + custom) via
@@ -49,11 +50,13 @@
 //! grant/revoke (`MessageReactionAdd/Remove`), and `/rota-acknowledge`
 //! (dropped with the rota stack, matrix §9).
 
+pub mod replies;
+
 use std::collections::{HashMap, HashSet};
 
+use super::command_permissions::command_permission;
 use super::commands::{
     core_commands, merge_commands, CommandDefinition, CustomCommand, RegistryError,
-    PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
 use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
@@ -263,6 +266,7 @@ impl RouterRefusal {
 pub enum SlashOutcome {
     Handled { handler: HandlerId },
     Refuse { refusal: RouterRefusal },
+    Unknown,
     Ignore,
 }
 
@@ -270,6 +274,7 @@ pub enum SlashOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentOutcome {
     Handled { handler: ComponentHandler },
+    Unknown,
     Ignore,
 }
 
@@ -326,8 +331,26 @@ impl InteractionRouter {
         guild_id.is_some_and(|g| Some(g) == self.gates.configured_guild)
     }
 
-    fn has_perm(actor_permissions: Option<u64>, required: u64) -> bool {
-        actor_permissions.is_some_and(|bits| bits & required == required)
+    fn permission_allowed(
+        name: &str,
+        guild_id: Option<u64>,
+        actor_permissions: Option<u64>,
+    ) -> bool {
+        let row = command_permission(name).expect("builtin command has a permission row");
+        if row.allows(actor_permissions) {
+            return true;
+        }
+        // Metadata-only security audit: never include interaction tokens,
+        // options, message bodies, or target/member display names.
+        tracing::warn!(
+            target: "two_bot_core::command_permissions",
+            command = row.command,
+            guild_id = ?guild_id,
+            required_permissions = row.required_permissions,
+            actor_permissions = ?actor_permissions,
+            "command_permission_denied"
+        );
+        false
     }
 
     /// Route one slash command through fence → gate → permission checks.
@@ -339,8 +362,8 @@ impl InteractionRouter {
             return outcome;
         }
         // Dynamic DB-backed custom commands (#22): everyone while automations
-        // are on; explicit refusal while off; silence otherwise (legacy
-        // `registerAutomationCommands`: unknown names are another app's).
+        // are on; explicit refusal while off. Missing/disabled rows in the
+        // configured guild get the same reply as other stale interactions.
         match ctx.custom_row {
             Some(true) => {
                 if !self.guild_ok(ctx.guild_id) {
@@ -355,6 +378,7 @@ impl InteractionRouter {
                     handler: HandlerId::AutomationCustom,
                 }
             }
+            Some(false) | None if self.guild_ok(ctx.guild_id) => SlashOutcome::Unknown,
             Some(false) | None => SlashOutcome::Ignore,
         }
     }
@@ -382,7 +406,7 @@ impl InteractionRouter {
                     refusal: RouterRefusal::ModerationDisabled,
                 });
             }
-            if !Self::has_perm(actor_permissions, action.required_permission()) {
+            if !Self::permission_allowed(name, guild_id, actor_permissions) {
                 return Some(SlashOutcome::Refuse {
                     refusal: RouterRefusal::ModerationPermission(*action),
                 });
@@ -424,19 +448,19 @@ impl InteractionRouter {
         struct Row {
             handler: HandlerId,
             gate: RowGate,
-            perm: Option<(u64, RouterRefusal)>,
+            permission_refusal: Option<RouterRefusal>,
         }
 
         let row = match name {
             "rank" => Row {
                 handler: HandlerId::Rank,
                 gate: RowGate::Always,
-                perm: None,
+                permission_refusal: None,
             },
             "leaderboard" => Row {
                 handler: HandlerId::Leaderboard,
                 gate: RowGate::Always,
-                perm: None,
+                permission_refusal: None,
             },
             // Scorecard check-in gates `ManageEvents` both in the published
             // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`
@@ -445,18 +469,18 @@ impl InteractionRouter {
             "attendance" => Row {
                 handler: HandlerId::ScorecardAttendance,
                 gate: RowGate::Scorecard,
-                perm: Some((PERM_MANAGE_EVENTS, RouterRefusal::ManageEventsRequired)),
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
             "command" | "command-remove" | "command-list" | "schedule" | "schedule-remove"
             | "schedule-list" | "sticky" | "sticky-remove" => Row {
                 handler: HandlerId::AutomationAdmin,
                 gate: RowGate::Automations,
-                perm: Some((PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)),
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             "rsvp" => Row {
                 handler: HandlerId::Rsvp,
                 gate: RowGate::Announcements,
-                perm: None,
+                permission_refusal: None,
             },
             // Namespaced: legacy RSVP-totals `attendance` collides with the
             // scorecard `attendance` on `guild.commands.set` — see
@@ -464,32 +488,32 @@ impl InteractionRouter {
             "rsvp-attendance" => Row {
                 handler: HandlerId::RsvpAttendance,
                 gate: RowGate::Announcements,
-                perm: None,
+                permission_refusal: None,
             },
             "lfg" => Row {
                 handler: HandlerId::Lfg,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_EVENTS, RouterRefusal::ManageEventsRequired)),
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
             "lfg-close" => Row {
                 handler: HandlerId::LfgClose,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_EVENTS, RouterRefusal::ManageEventsRequired)),
+                permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
             "feed-add" => Row {
                 handler: HandlerId::FeedAdd,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)),
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             "feed-remove" => Row {
                 handler: HandlerId::FeedRemove,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)),
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             "feed-list" => Row {
                 handler: HandlerId::FeedList,
                 gate: RowGate::Announcements,
-                perm: Some((PERM_MANAGE_GUILD, RouterRefusal::ManageServerRequired)),
+                permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
             _ => return None,
         };
@@ -502,10 +526,12 @@ impl InteractionRouter {
                 refusal: row.gate.refusal().expect("gated row has a refusal"),
             });
         }
-        if let Some((bits, refusal)) = row.perm {
-            if !Self::has_perm(actor_permissions, bits) {
-                return Some(SlashOutcome::Refuse { refusal });
-            }
+        if !Self::permission_allowed(name, guild_id, actor_permissions) {
+            return Some(SlashOutcome::Refuse {
+                refusal: row
+                    .permission_refusal
+                    .expect("restricted command has a permission refusal"),
+            });
         }
         Some(SlashOutcome::Handled {
             handler: row.handler,
@@ -544,13 +570,17 @@ impl InteractionRouter {
             }
             ComponentHandler::SelfRole
         } else {
-            return ComponentOutcome::Ignore;
+            return if self.guild_ok(guild_id) {
+                ComponentOutcome::Unknown
+            } else {
+                ComponentOutcome::Ignore
+            };
         };
         ComponentOutcome::Handled { handler }
     }
 
     /// Route one modal submit by `custom_id` through the same table as
-    /// components. Legacy has no modals; unknown ids are `Ignore`.
+    /// components. Unknown ids reply only inside the configured guild.
     #[must_use]
     pub fn route_modal(&self, custom_id: &str, guild_id: Option<u64>) -> ComponentOutcome {
         self.route_component(custom_id, guild_id)
@@ -986,10 +1016,9 @@ mod tests {
                 handler: HandlerId::AutomationCustom
             }
         );
-        // Disabled row: silence (legacy `if (!custom.enabled) return`).
-        assert_eq!(r.route_slash(&custom(Some(false))), SlashOutcome::Ignore);
-        // No row: another app's command, not ours.
-        assert_eq!(r.route_slash(&custom(None)), SlashOutcome::Ignore);
+        // Disabled/missing rows now get the uniform stale-interaction reply.
+        assert_eq!(r.route_slash(&custom(Some(false))), SlashOutcome::Unknown);
+        assert_eq!(r.route_slash(&custom(None)), SlashOutcome::Unknown);
         // Builtin names shadow custom rows (publish merge does the same).
         let shadow = SlashContext {
             name: "rank",
@@ -1016,21 +1045,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_slash_names_are_ignored() {
+    fn unknown_slash_names_reply_only_inside_the_guild_fence() {
         let r = router();
-        assert_eq!(
-            r.route_slash(&ctx("rota-acknowledge", Some(GUILD), Some(u64::MAX))),
-            SlashOutcome::Ignore,
-            "dropped rota command is not ours"
-        );
-        assert_eq!(
-            r.route_slash(&ctx(
-                "definitely-not-a-command",
-                Some(GUILD),
-                Some(u64::MAX)
-            )),
-            SlashOutcome::Ignore
-        );
+        for name in ["rota-acknowledge", "definitely-not-a-command"] {
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
+                SlashOutcome::Unknown
+            );
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(9999), Some(u64::MAX))),
+                SlashOutcome::Ignore
+            );
+            assert_eq!(r.route_slash(&ctx(name, None, None)), SlashOutcome::Ignore);
+        }
     }
 
     #[test]
@@ -1075,15 +1102,15 @@ mod tests {
                 handler: ComponentHandler::SelfRole
             }
         );
-        // Unknown ids are not ours.
-        assert_eq!(
-            r.route_component("two:unknown:thing", Some(GUILD)),
-            ComponentOutcome::Ignore
-        );
-        assert_eq!(
-            r.route_component("other", Some(GUILD)),
-            ComponentOutcome::Ignore
-        );
+        // Unknown ids reply consistently without escaping the guild fence.
+        for id in ["two:unknown:thing", "other"] {
+            assert_eq!(
+                r.route_component(id, Some(GUILD)),
+                ComponentOutcome::Unknown
+            );
+            assert_eq!(r.route_component(id, Some(9999)), ComponentOutcome::Ignore);
+            assert_eq!(r.route_component(id, None), ComponentOutcome::Ignore);
+        }
         // Modal submits share the table.
         assert_eq!(
             r.route_modal("two:lfg:abc123", Some(GUILD)),
@@ -1093,7 +1120,7 @@ mod tests {
         );
         assert_eq!(
             r.route_modal("two:unknown:thing", Some(GUILD)),
-            ComponentOutcome::Ignore
+            ComponentOutcome::Unknown
         );
     }
 

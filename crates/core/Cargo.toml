@@ -24,6 +24,7 @@ subtle = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+tower-service = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = { workspace = true }
 regex = { workspace = true }
@@ -42,9 +43,12 @@ default = []
 db = ["dep:sqlx"]
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 two-bot-testsupport = { path = "../testsupport", version = "0.2.0" }
+# Pure, bounded properties: no fork/timeout helpers or temporary-file dependency.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 rand = { workspace = true }
-tokio = { workspace = true }
 axum = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
