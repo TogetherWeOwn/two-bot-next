@@ -624,6 +624,16 @@ impl ActionExecutor {
         Ok(())
     }
 
+    /// Pace one lane request: reserve the lane, wait out the floor and stamp
+    /// the dispatch. A guard refusal (cooldown/breaker) surfaces instead of
+    /// sending unpaced; every caller returns `Result<_, DiscordError>`, which
+    /// converts `GuardError` via `#[from]`.
+    async fn pace(&self, kick_lane: bool) -> Result<(), GuardError> {
+        let mut last = self.paced_lane(kick_lane).await?;
+        *last = std::time::Instant::now();
+        Ok(())
+    }
+
     /// Keep pacing/global waits before the audit service's late DB fence, and
     /// retain the lane reservation through authorization and its bounded send.
     pub(crate) async fn paced_lane(
@@ -760,7 +770,7 @@ impl ActionExecutor {
         &self,
         request: Request,
     ) -> Result<T, DiscordError> {
-        self.pace(false).await;
+        self.pace(false).await?;
         let response = self.call_once_raw(request, &[200]).await?;
         serde_json::from_slice(&response.body)
             .map_err(|_| DiscordError::Unavailable("invalid role readback".into()))
@@ -823,7 +833,7 @@ impl ActionExecutor {
                 .await?;
         }
         for role in grants {
-            self.pace(false).await;
+            self.pace(false).await?;
             let request = Self::request_of(
                 self.inner
                     .factory
@@ -833,7 +843,7 @@ impl ActionExecutor {
             self.call_once_raw(request, &[200, 204]).await?;
         }
         for role in revokes {
-            self.pace(false).await;
+            self.pace(false).await?;
             let request = Self::request_of(
                 self.inner
                     .factory
