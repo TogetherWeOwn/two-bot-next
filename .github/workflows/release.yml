@@ -18,10 +18,7 @@ on:
         type: string
         default: ''
 
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
+permissions: {}
 
 concurrency:
   group: release
@@ -30,6 +27,12 @@ concurrency:
 jobs:
   release-please:
     name: release-please
+    permissions:
+      contents: write # Publish releases and reconcile the release/notes branches.
+      pull-requests: write # Create and reconcile the release PR.
+    # The dry_run/release_tag inputs keep the SBOM repair path live: those
+    # downstream jobs consume inputs.dry_run, inputs.release_tag and this
+    # job's release_created/tag_name outputs.
     if: github.ref == 'refs/heads/main' && inputs.dry_run != true && (inputs.release_tag == '' || github.event_name != 'workflow_dispatch')
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'release-please') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
@@ -41,6 +44,8 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Inspect existing release PR
         id: plan
         env:
@@ -69,6 +74,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.select.outputs.pr_available == 'true'
         with:
+          persist-credentials: false
           ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
       # Env expressions are evaluated even on a skipped step. Selection emits
       # valid {} JSON when publication leaves no open PR; the guard stays false.
@@ -112,7 +118,12 @@ jobs:
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add CHANGELOG.md
             git commit -m 'chore(release): preserve bootstrap release notes' -m 'Co-Authored-By: Paperclip <noreply@paperclip.ing>'
-            git push origin HEAD
+            # Authenticate only this push via GH_TOKEN; write no credential config.
+            GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
+              GIT_CONFIG_KEY_1=credential.https://github.com.helper \
+              GIT_CONFIG_VALUE_1='!gh auth git-credential' \
+              git push origin HEAD
           fi
           # Body reconciliation is independent of the file diff: a retry after
           # a successful push but failed PATCH must still repair Release notes.
@@ -162,6 +173,8 @@ jobs:
 
   dispatch-checks:
     name: dispatch-checks
+    permissions:
+      actions: write # Dispatch required checks for GITHUB_TOKEN-created release PRs.
     needs: release-please
     if: needs.release-please.outputs.pr_available == 'true'
     # Runner routing: see the note on `check` in check.yml.

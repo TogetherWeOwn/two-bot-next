@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Shared Postgres lane plus both real transports pointed at mock Discord.
 use super::*;
 use crate::{ActionExecutor, DiscordError};
