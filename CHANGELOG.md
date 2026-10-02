@@ -4,6 +4,8 @@
 
 ### Added
 
+- Scheduled-message domain logic, PostgreSQL store and migration, with validation, prefix-resolved removal, recurring timing and retry outcomes. Discord router/executor wiring follows separately.
+- Scheduled-store integration tests run against the isolated PostgreSQL service container in CI.
 - Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.
 - **Self-role domain and storage:** framework-free button/select/reaction plans,
   configuration and live-role safety validation, hierarchy refusals, and
@@ -23,6 +25,13 @@
 
 ### Fixed
 
+- Grant the least-privilege runtime role scheduled-message CRUD and claim access, with web-reader denial coverage.
+- Isolate scheduled-store fixtures in per-test schema-only pools with awaited teardown on success or panic, so concurrent suites cannot replace each other's claims. Use literal legacy CHECK probes compatible with SQLx 0.9.
+- Upgrade legacy scheduled-message queues to BIGINT intervals and add missing claim/nonce columns without losing definitions or run facts (additive migration 0141).
+- Validate scheduled bodies in UTF-16 units and refuse whitespace/invisible-only effective messages before saving.
+- Scheduled claims lease one occurrence per call, preventing distinct messages from sharing a batch nonce while preserving the nonce across retries and restarts.
+- Scheduled-message ID prefixes treat `%`, `_` and backslashes literally, matching the domain resolver.
+- Configured scheduled-store tests fail on connection, migration or cleanup errors instead of silently skipping; test URLs are restricted to test databases.
 - Answer published but unwired commands ephemerally instead of timing out, preserving the existing router refusals and complete registry. Synchronize the registry on resumed process startup as well as Ready, without blocking gateway polling.
 - Capture the REST pacing timestamp after the lane wait completes, preserving adjacent-request spacing across three or more reads and kicks.
 - Grant the least-privilege runtime role CRUD on the self-role audit and panel-claim relations (migration 0200), cover 0200 in the role-matrix tests, and prove runtime claim access with continued web-reader denial.

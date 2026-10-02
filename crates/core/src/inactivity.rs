@@ -197,6 +197,70 @@ mod tests {
     }
 
     #[test]
+    fn cutoff_before_epoch_goes_negative_without_panic() {
+        // `now_ms = 0` is before any real activity: the cutoff is just
+        // `-days` in millis, negative without any saturation or panic.
+        assert_eq!(inactivity_cutoff_ms(0, 14), -14 * DAY);
+        assert_eq!(inactivity_cutoff_ms(0, 14), -1_209_600_000);
+        // Zero days is the identity: cutoff == now, even at the epoch.
+        assert_eq!(inactivity_cutoff_ms(0, 0), 0);
+    }
+
+    #[test]
+    fn cutoff_saturates_instead_of_wrapping_at_extreme_days() {
+        // `i64::MAX / 86_400_000 = 106_751_991_167`: the largest whole-day
+        // span that still fits in an `i64` of millis. One more day overflows
+        // the span, so `saturating_mul` pins it to `i64::MAX` instead of
+        // wrapping (a wrapping refactor would flip the sweep to flag the
+        // active or flag nobody at all).
+        const MAX_EXACT_DAYS: u64 = 106_751_991_167;
+        let now = ms("2026-09-07T00:00:00.000Z");
+        let exact_span = (MAX_EXACT_DAYS as i64) * DAY;
+        assert_eq!(exact_span, 9_223_372_036_828_800_000);
+        assert_eq!(inactivity_cutoff_ms(now, MAX_EXACT_DAYS), now - exact_span);
+        // One day past the boundary saturates the span to `i64::MAX` ...
+        assert_eq!(
+            inactivity_cutoff_ms(now, MAX_EXACT_DAYS + 1),
+            now.saturating_sub(i64::MAX)
+        );
+        // ... and so does any larger value, including `u64::MAX` (which never
+        // fits in an `i64` at all). The cutoff stays deeply negative — below
+        // any real activity — instead of wrapping positive.
+        let saturated = inactivity_cutoff_ms(now, u64::MAX);
+        assert_eq!(saturated, now.saturating_sub(i64::MAX));
+        assert!(
+            saturated < 0,
+            "saturated cutoff {saturated} stays below real activity"
+        );
+        // The floor is `i64::MIN`-bounded: a saturating subtraction can never
+        // go below `i64::MIN`, wherever `now` sits.
+        assert_eq!(inactivity_cutoff_ms(0, u64::MAX), i64::MIN + 1);
+        assert_eq!(inactivity_cutoff_ms(i64::MIN, u64::MAX), i64::MIN);
+    }
+
+    #[test]
+    fn sweep_inclusion_stays_strict_at_saturated_boundary() {
+        // At `days = u64::MAX` the cutoff saturates to `i64::MIN + 1`: the
+        // only representable older instant is `i64::MIN` itself. Inclusion
+        // stays strict-`<` there exactly as on the happy path — a refactor
+        // that flips the comparison (or the saturation) flags the wrong set.
+        let cutoff = inactivity_cutoff_ms(0, u64::MAX);
+        assert_eq!(cutoff, i64::MIN + 1);
+        assert!(
+            !should_flag(&candidate("edge", Some(cutoff), None), cutoff),
+            "seen exactly at the saturated cutoff is not flagged"
+        );
+        assert!(
+            should_flag(&candidate("older", Some(i64::MIN), None), cutoff),
+            "the one instant below the saturated cutoff still flags"
+        );
+        assert!(
+            !should_flag(&candidate("new", Some(0), None), cutoff),
+            "anything newer than the saturated cutoff never flags"
+        );
+    }
+
+    #[test]
     fn quiet_members_flagged_active_ones_not() {
         let now = ms("2026-09-07T00:00:00.000Z");
         let cutoff = inactivity_cutoff_ms(now, 14);
