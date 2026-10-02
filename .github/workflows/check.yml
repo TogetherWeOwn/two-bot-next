@@ -118,6 +118,16 @@ jobs:
           python3 tests/voice_templates/validate.py
           python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
 
+      # `check all` reads Cargo.lock by default (no --locked flag exists).
+      # deny.toml's allow-list is verified tight: no unmatched allowances.
+      # Runs before the toolchain install and every compile/link step
+      # (TOG-12134): the deny image ships its own toolchain and rustup-syncs
+      # the pinned one, so it must run while the disk is at its freest.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check all
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -267,13 +277,6 @@ jobs:
 
       - name: Real binary lifecycle acceptance (CI service only, under 60 s)
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
-
-      # `check all` reads Cargo.lock by default (no --locked flag exists).
-      # deny.toml's allow-list is verified tight: no unmatched allowances.
-      - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check all
 
   parity-docs:
     name: parity docs

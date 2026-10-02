@@ -12,6 +12,10 @@ Guards (TOG-12134):
   never reuses incremental artifacts, so don't write them.
 - the job-container prerequisites step removes `/var/lib/apt/lists`: the
   package lists stay on the overlay otherwise.
+- the `cargo-deny` step runs before the toolchain install and every
+  compile/link step: the deny image ships its own toolchain and
+  rustup-syncs the pinned one (a second ~1 GB toolchain download), so it
+  must run while the disk is at its freest (CHANGES on PR #232, 07:31Z).
 - the integration step still runs the full `--workspace --test '*'` graph:
   coverage must not be narrowed as a substitute for freeing disk.
 """
@@ -102,6 +106,27 @@ class CheckDiskHygieneTests(unittest.TestCase):
             self.check, "cargo test (integration, including website acceptance)"
         )
         self.assertIn(FULL_INTEGRATION_RUN, integration)
+
+    def test_deny_runs_before_toolchain_and_compiles(self):
+        names = [
+            line.strip()[len("- name: "):]
+            for line in self.check
+            if line.strip().startswith("- name: ")
+        ]
+        self.assertIn("cargo-deny", names)
+        deny_at = names.index("cargo-deny")
+        for heavy in (
+            "Install Rust toolchain",
+            "cargo fmt --check",
+            "cargo clippy -D warnings",
+            "cargo test (unit and binary, including RSVP store)",
+            "cargo test (integration, including website acceptance)",
+        ):
+            self.assertIn(heavy, names, f"expected step {heavy!r} in check job")
+            self.assertLess(
+                deny_at, names.index(heavy),
+                f"cargo-deny must run before {heavy!r} (disk is freest early)",
+            )
 
 
 if __name__ == "__main__":
