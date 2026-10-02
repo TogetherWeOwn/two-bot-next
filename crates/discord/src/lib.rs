@@ -7,6 +7,7 @@
 
 pub mod adapter;
 pub mod audit_mirror;
+pub mod automod;
 pub mod channel_access;
 pub mod executor;
 mod executor_metrics;
