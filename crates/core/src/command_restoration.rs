@@ -1395,7 +1395,7 @@ mod tests {
                 resource_id: "99".to_owned(),
             }],
         );
-        let mock = MockDiscord::from_baseline(&[baseline.clone()]);
+        let mock = MockDiscord::from_baseline(std::slice::from_ref(&baseline));
         let report = reconcile_watch_window(
             &baseline,
             &staged,
@@ -1429,7 +1429,7 @@ mod tests {
                 },
             ],
         );
-        let mock = MockDiscord::from_baseline(&[baseline.clone()]);
+        let mock = MockDiscord::from_baseline(std::slice::from_ref(&baseline));
         let report = reconcile_watch_window(
             &baseline,
             &staged,
@@ -1447,7 +1447,7 @@ mod tests {
     #[test]
     fn recreated_names_get_fresh_ids_on_the_mock() {
         let baseline = scoped(vec![def("rank")]);
-        let mut mock = MockDiscord::from_baseline(&[baseline.clone()]);
+        let mut mock = MockDiscord::from_baseline(std::slice::from_ref(&baseline));
         let before = mock.live_ids_for_scope(&baseline.scope);
         mock.put_definitions(&baseline.scope, &[]);
         mock.put_definitions(&baseline.scope, &[def("rank")]);
