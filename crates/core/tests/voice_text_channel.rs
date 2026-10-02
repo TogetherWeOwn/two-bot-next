@@ -241,6 +241,7 @@ proptest! {
         prop_assert!(clean.chars().count() <= MAX_TEXT_CHANNEL_NAME_CHARS);
         prop_assert!(!clean.chars().any(|c| c.is_whitespace() || c.is_uppercase()));
         prop_assert!(!clean.is_empty());
-        prop_assert_eq!(clean, sanitise_channel_name(Some(&clean)), "sanitising is fixed-point");
+        let again = sanitise_channel_name(Some(&clean));
+        prop_assert_eq!(clean, again, "sanitising is fixed-point");
     }
 }
