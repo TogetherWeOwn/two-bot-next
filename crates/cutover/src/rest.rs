@@ -946,8 +946,11 @@ mod tests {
     async fn unreadable_forum_reports_no_listing_like_before() {
         // `exec_one` maps 403/404 to `None`; the legacy consumer sees exactly
         // what the old one-page call returned for an unreadable forum.
-        let (mock, origin) =
-            ArchiveMock::start_script(vec![Scripted::Status(403, "{}".to_owned())]).await;
+        let (mock, origin) = ArchiveMock::start_script(vec![
+            Scripted::Status(403, "{}".to_owned()),
+            Scripted::Status(403, "{}".to_owned()),
+        ])
+        .await;
         let rest = client_for(&origin);
 
         let outcome = rest
