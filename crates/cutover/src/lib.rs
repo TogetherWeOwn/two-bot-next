@@ -21,6 +21,7 @@ pub mod dedupe;
 pub mod gateway_session;
 pub mod internal_settings;
 pub mod invite;
+pub mod invite_store;
 pub mod legacy_copy;
 pub mod legacy_mapping;
 pub mod legacy_verify;
@@ -68,7 +69,7 @@ pub use parse::{
 };
 pub use rest::{
     iso_to_millis, timestamp_ms, ArchiveIncompleteReason, ArchivedThreadsOutcome, RestClient,
-    RestError, ScanPage, DEFAULT_ARCHIVED_THREAD_PAGES,
+    RestError, ScanCompletion, ScanPage, DEFAULT_ARCHIVED_THREAD_PAGES,
 };
 pub use settings::{log_refresh_report, SettingsStore, SettingsWriteError};
 
