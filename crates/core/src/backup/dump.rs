@@ -120,7 +120,7 @@ async fn count_of(
 
 /// Restart transactionally rather than using setval (which survives rollback).
 /// Catalog identifiers are quoted by Postgres; restart values are checked i64s.
-/// https://www.postgresql.org/docs/16/sql-altersequence.html
+/// <https://www.postgresql.org/docs/16/sql-altersequence.html>
 async fn restart_sequence(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table: &str,
