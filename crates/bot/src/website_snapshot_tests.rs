@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use two_bot_core::apply_web_contract;
 use two_bot_testsupport::{guard_database_url, TestDatabase};
 
 use crate::discord_test_common::{MockRest, ScriptedResponse};

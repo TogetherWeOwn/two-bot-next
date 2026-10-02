@@ -5,8 +5,8 @@
 //! release a slot or silently retry a mutation (docs/internal-action-store.md).
 
 use super::{
-    numeric_id, ActionError, ActionExecutor, ErrorCode, GuildAddMemberRequest, MemberOutcome,
-    RoleAssignRequest,
+    numeric_id, ActionError, ActionExecutor, ErrorCode, GuildAddMemberRequest, MemberError,
+    MemberOutcome, RoleAssignRequest,
 };
 use std::collections::HashMap;
 use two_bot_core::internal_action_store::{
@@ -162,12 +162,12 @@ impl ActionExecutor {
             }
         };
         let result = if let Some(request) = role_request {
-            self.assign_internal_role(config.guild_id, config.bot_user_id, &request)
+            self.assign_internal_role_once(config.guild_id, config.bot_user_id, &request)
                 .await
         } else {
             // Already validated; never format the parsed body or this local.
             let token = require_field_str(body, "access_token")?;
-            self.add_internal_member(
+            self.add_internal_member_once(
                 config.guild_id,
                 &member_request.expect("validated member action"),
                 token,
@@ -195,7 +195,18 @@ impl ActionExecutor {
                     replayed: false,
                 })
             }
-            Err(error) => {
+            Err(error @ MemberError::Guard(_)) => {
+                // Member actions have one mutation, last. A typed admission
+                // refusal therefore proves it was never dispatched, even if
+                // preceding hierarchy GETs succeeded. Do not release on a wire
+                // 429, timeout or transport failure.
+                store
+                    .release_proven_not_sent(claim)
+                    .await
+                    .map_err(storage_error)?;
+                Err(error.into_action_error())
+            }
+            Err(MemberError::Action(error)) => {
                 if error.code == ErrorCode::DiscordRejected {
                     store
                         .finish(
