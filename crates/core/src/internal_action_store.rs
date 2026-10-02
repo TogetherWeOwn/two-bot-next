@@ -436,6 +436,21 @@ impl InternalActionStore {
                 match row.try_get::<&str, _>("state")? {
                     "completed" => InternalClaim::Replay(TerminalResponse::from_row(&row)?),
                     "unknown" => InternalClaim::NeedsReconciliation,
+                    "not_sent" if !Self::matches_subject(&row, subject)? => InternalClaim::Mismatch,
+                    "not_sent" => {
+                        sqlx::query(
+                            "WITH fresh AS MATERIALIZED (SELECT clock_timestamp() AS now) \
+                             UPDATE internal_idempotency SET state = 'in_flight', \
+                             created_at = now, updated_at = now FROM fresh WHERE intent_id = $1",
+                        )
+                        .bind(row.try_get::<i64, _>("intent_id")?)
+                        .execute(&mut *tx)
+                        .await?;
+                        InternalClaim::Claimed(ExecutionClaim {
+                            intent_id: row.try_get("intent_id")?,
+                            identity: identity.clone(),
+                        })
+                    }
                     "in_flight" if row.try_get::<bool, _>("stale")? => {
                         InternalClaim::NeedsReconciliation
                     }
@@ -446,6 +461,49 @@ impl InternalActionStore {
         };
         tx.commit().await?;
         Ok(result)
+    }
+
+    /// Release only when the caller proves the mutation was never dispatched.
+    /// Consumes the opaque, non-Clone claim even on failure: no old owner can
+    /// finish or mark unknown after a new claimant acquires this same intent.
+    /// Nonces, payload/subject binding and per-intent audit evidence are retained.
+    ///
+    /// ```compile_fail
+    /// use two_bot_core::internal_action_store::{ExecutionClaim, InternalActionStore};
+    /// async fn old_owner(store: &InternalActionStore, claim: ExecutionClaim) {
+    ///     store.release_proven_not_sent(claim).await.unwrap();
+    ///     store.mark_unknown(&claim).await.unwrap(); // claim was consumed
+    /// }
+    /// ```
+    pub async fn release_proven_not_sent(
+        &self,
+        claim: ExecutionClaim,
+    ) -> Result<(), InternalStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let row = Self::lock_identity(&mut tx, &claim.identity).await?;
+        if !Self::matches(&row, &claim.identity)?
+            || row.try_get::<i64, _>("intent_id")? != claim.intent_id
+            || row.try_get::<&str, _>("state")? != "in_flight"
+            || row.try_get::<bool, _>("stale")?
+        {
+            return Err(InternalStoreError::TransitionRefused);
+        }
+        sqlx::query(
+            "UPDATE internal_idempotency SET state = 'not_sent', updated_at = clock_timestamp() \
+             WHERE intent_id = $1",
+        )
+        .bind(claim.intent_id)
+        .execute(&mut *tx)
+        .await?;
+        Self::audit(
+            &mut tx,
+            claim.intent_id,
+            "released",
+            Some("proven_not_sent"),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Record a definitive outcome. Late completion cannot overwrite reconciliation.
@@ -464,7 +522,7 @@ impl InternalActionStore {
         let row = Self::lock_identity(&mut tx, &claim.identity).await?;
         if !Self::matches(&row, &claim.identity)?
             || row.try_get::<i64, _>("intent_id")? != claim.intent_id
-            || row.try_get::<&str, _>("state")? == "completed"
+            || !matches!(row.try_get::<&str, _>("state")?, "in_flight" | "unknown")
         {
             return Err(InternalStoreError::TransitionRefused);
         }
@@ -507,7 +565,7 @@ impl InternalActionStore {
         let intent_id: i64 = row.try_get("intent_id")?;
         let state: &str = row.try_get("state")?;
         if !Self::matches(&row, identity)?
-            || state == "completed"
+            || !matches!(state, "in_flight" | "unknown")
             || owner_id.is_some_and(|id| id != intent_id)
             || (owner_id.is_none() && state != "unknown" && !row.try_get::<bool, _>("stale")?)
         {
@@ -557,6 +615,20 @@ impl InternalActionStore {
     ) -> Result<bool, InternalStoreError> {
         Ok(row.try_get::<&str, _>("action")? == identity.action
             && row.try_get::<&str, _>("payload_hash")? == identity.payload_hash)
+    }
+
+    fn matches_subject(
+        row: &sqlx::postgres::PgRow,
+        subject: &AuditSubject,
+    ) -> Result<bool, InternalStoreError> {
+        Ok(row.try_get::<Option<&str>, _>("guild_id")?
+            == subject.guild_id.as_ref().map(DiscordId::as_str)
+            && row.try_get::<Option<&str>, _>("actor_id")?
+                == subject.actor_id.as_ref().map(DiscordId::as_str)
+            && row.try_get::<Option<&str>, _>("target_id")?
+                == subject.target_id.as_ref().map(DiscordId::as_str)
+            && row.try_get::<Option<&str>, _>("resolved_role_id")?
+                == subject.resolved_role_id.as_ref().map(DiscordId::as_str))
     }
 
     async fn audit(

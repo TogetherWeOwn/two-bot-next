@@ -27,10 +27,12 @@ room-lifecycle runtime are introduced.
   enforcement belongs to `validate_bitrate_preference`; the average tolerates
   stored out-of-range values through the final clamp.
 - `name_conflicts(candidate, existing_voice_names, unique_names_enabled)`:
-  literal names only, with case-sensitive byte equality (`"Room" != "room"`).
-  No trimming or normalization is applied. Returns `false` whenever the guild
-  "unique names" setting is off. Whether the candidate's own channel is in the
-  supplied list is the parent's routing decision (exclude it for renames).
+  literal names only (no template expansion), compared after folding NFKC +
+  Unicode lowercase and trimming (legacy `rename.ts` rule), so `"Room"`,
+  `"room"` and full-width `"Ｒｏｏｍ"` all conflict. Returns `false`
+  whenever the guild "unique names" setting is off. Whether the candidate's
+  own channel is in the supplied list is the parent's routing decision
+  (exclude it for renames).
 
 ## Residual parent integration (not parity evidence)
 
@@ -51,6 +53,6 @@ cargo test -p two-bot-core --test voice_room_controls --locked
 
 The acceptance fixture covers the full edge table (0, 1, 99, 100, None, 8000,
 8001, tier max, tier max + 1), floor rounding, fallback clamping,
-case-sensitive literal matching, the off-switch, and property tests pinning
+folded (NFKC + lowercase + trim) collision matching, the off-switch, and property tests pinning
 the bitrate bounds and the lock `<= 99` invariant. No network, Discord,
 database, credentials or sleep is needed.
