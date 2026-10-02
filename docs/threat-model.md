@@ -2,7 +2,10 @@
 
 Reviewed 2026-10-01 against baseline `5ddab2dfec52853a0c87cc6e555baf6575eae77e`
 (delta `44338b28..5ddab2d` assessed; prior review 2026-09-30 against
-`44338b28a7feac0093cbd72dc9cecc45ab33a15d`).
+`44338b28a7feac0093cbd72dc9cecc45ab33a15d`). The F7 redirect caller-map and
+public-probe text (Denial of service row, redirect rate-limit notes, F7 row)
+was refreshed 2026-10-02 against `c122126d678c98e171bdf92cb20d731a9529c93e`;
+its `wrangler/` line citations refer to that commit.
 This is a source-based STRIDE assessment, **not deployment approval**. No live
 credentials, Discord mutations, database probes or key rotation were performed.
 The private durable HTTP receiver (PR #114,
@@ -168,7 +171,7 @@ gates for that integration. Current-public-surface findings are marked explicitl
 | Tampering | Bypass role/channel maps, foreign-guild fence or protected-target policy | Symbolic role/channel keys, catalog-only settings, moderation adjudication and guild-fenced persistence exist in libraries. Moderation permission/targets now resolve from one `command_permissions` source (`crates/core/src/moderation.rs:103-112`); website moderation channels are guild/type-checked (`crates/discord/src/executor.rs:887`); role assignment pins `resolved_role_id` at claim time (`crates/core/src/internal_action_store.rs:92`) | Receiver must call every relevant validator and obtain trusted live permission/hierarchy facts; `authorize` alone does not validate action fields. Settings CAS conflicts (`VersionConflict`/409 at `crates/core/src/internal_actions.rs:507`) must refresh, never blind-retry. P1 F2. |
 | Repudiation | Retry a destructive action after an ambiguous outcome, or lose audit linkage | Store commits scalar intent and audit atomically; only `Claimed` allows execution; stale/unknown claims require reconciliation. Ticket close commits transcript atomically under row-lock fences (`crates/cutover/src/tickets.rs:180-199`); later audits copy the original role pin, never a re-evaluated map | Async store seam is not wired. Request/actor IDs need trusted derivation; no arbitrary provider JSON in terminal records. Transcript purge and CAS-token retention are new deletion/conflict surfaces; cleanup must not reopen duplication. P1 F2, F5. |
 | Information disclosure | Leak OAuth/bot/signing/DB credentials via errors, tracing or settings | Redacted key/decision Debug, catalog denies environment-only/unknown settings, typed store errors/results. Since the prior review: `Secret`-wrapped signing keys/decoy, redacted transport/Debug (`crates/discord/src/executor.rs`), `RawResponse` shape-only Debug, `database_url` query allowlist plus passfile-target silencing, and generic DB connection/migration errors | HTTP rejection logger is not implemented. Logging full headers/body/error chains would undo minimization. Staging and production log head sampling 1 (`wrangler/wrangler.toml:84-86`, `:118-120`) raises log stakes in both. Source does not prove runtime TLS/custody. F4/F6. |
-| Denial of service | Public probes wake/pin singleton Container or consume pool/crypto/memory | DO path allowlist, six-second readiness probe, redirect bucket, pool/timeouts. Reserved-internal `/metrics*` 404s land before DB lookup (`wrangler/src/index.ts:321`); readiness webhook failures stay generic and never log the secret URL (`wrangler/src/index.ts:260`) | Probes have no application auth/rate gate; redirects' isolate bucket is not a global edge limit and its caller map has no cap or expiry, even for 404s (`wrangler/src/redirect.ts:111-117`, `:229`; reserved paths skip lookup but still take a caller bucket). Action body cap runs after HMAC and nonce burn; authenticated nonce flood precedes key bucket. Gateway fan-out is detached per event, so a hostile event burst spawns bounded runtime work (ticket lane 10 s, cumulative 120 s) rather than stalling heartbeats — bound it anyway. F1/F7. |
+| Denial of service | Public probes wake/pin singleton Container or consume pool/crypto/memory | DO path allowlist, six-second readiness probe, pool/timeouts. Public `/health` and `/readyz` return 405 for non-GET/HEAD, then spend a per-caller **60 burst, 1/second** `healthBuckets` budget (429 with `Retry-After`) before the Container is touched, and forward a sanitized probe (`wrangler/src/index.ts:84-88`, `:410-444`; TOG-12245, #259). Redirects spend a separate `clickBuckets` map (`:65-67`, `:496`). Both are `TokenBuckets` with idle expiry no shorter than full refill, a 10,000-key fail-closed cap and a 64-entry sweep budget (`wrangler/src/redirect.ts:126-254`). Reserved-internal `/metrics*` 404s land before the bucket and DB lookup (`wrangler/src/index.ts:459`, `wrangler/src/redirect.ts:344-346`); readiness webhook failures stay generic and never log the secret URL (`wrangler/src/index.ts:382`) | Probe and redirect buckets are per isolate, not a global edge limit: a recycled or different isolate starts every caller full. The cap bounds memory but refuses every new caller while 10,000 keys are live; a new key at the cap first reaps idle entries, so a map of one-time callers drains on new-key traffic alone (fixed, TOG-12387). Probes have no application auth. Action body cap runs after HMAC and nonce burn; authenticated nonce flood precedes key bucket. Gateway fan-out is detached per event, so a hostile event burst spawns bounded runtime work (ticket lane 10 s, cumulative 120 s) rather than stalling heartbeats — bound it anyway. F1/F7. |
 | Denial of service | Spend the same clock interval twice in an action bucket | This change keeps a last-seen clock high-water mark | New regression covers both bucket specs; restart/multi-instance buckets are still local. Future receiver needs bounded ingress/concurrency. F7. |
 | Elevation of privilege | Compromised signer invokes all enabled verbs or changes its own gates | Environment-only approval flags; settings catalog denies `TWO_INTERNAL_*`, `TWO_MODERATION`, secrets and unknown keys; overwrite requires a second flag. Phase-1 defaults remain exactly `role.assign`, `announcement.post`, `event.upsert` (`crates/core/src/internal_actions.rs:778`); settings CAS rejects stale writes instead of silently reverting (`VersionConflict`) | Keys have no per-caller capabilities. Mapped roles/configured channels and allowed hot/cold settings still carry privilege; validate policy before enabling. P1 F2. |
 | Elevation of privilege | Treat public wildcard health bind as an approved actions bind | `assert_private_bind` rejects wildcard/public/hostname addresses with no override (`crates/core/src/internal_actions.rs:1430`) | Current health listener is deliberately `0.0.0.0`; never reuse it for an unguarded receiver or weaken the bind guard to fit the Worker. Internal `/metrics` shares that listener but is never proxied; treat it as non-public by routing, not by the bind. P1 F1. |
@@ -309,18 +312,46 @@ change the legacy canonical format.
   precedes the bucket: TTL bounds entry lifetime, not flood-driven entry count
   or the cost of the in-memory full-map sweep. Bound ingress separately (F1/F7).
 - Redirects use a separate per-isolate/per-caller **60 burst, 1/second** bucket
-  (`wrangler/src/redirect.ts:117`) and validated invite codes with a fixed Discord
-  destination host (`:92`). Reserved-internal paths 404 before the DB lookup for
-  every method (`:211`), but **the caller map still has no size cap, idle expiry
-  or eviction** (`:111-117`, `:229`): every distinct caller reaching the throttle
-  allocates retained state before slug validation/lookup, including unknown-path
-  404s. A many-caller client population can grow isolate memory indefinitely
-  until recycle; spoof resistance of caller identification does not cap
-  cardinality. Local handler fixtures retained 4096 synthetic callers after 404s,
-  then 4097 after another caller at 30 simulated idle days; no live load was sent.
-  F7 requires bounded caller state and safe eviction/overflow behavior. Neither
-  this bucket nor `max_instances=1` proves global rate enforcement. Source shows
-  no application gate on public health/readiness.
+  (`clickBuckets`, `wrangler/src/index.ts:65-67`, `:496`; default spec
+  `wrangler/src/redirect.ts:153-156`) and validated invite codes with a fixed
+  Discord destination host (`:91-93`, `:110-112`). Reserved-internal paths 404
+  for every method before the caller bucket and DB lookup
+  (`wrangler/src/index.ts:459`, `wrangler/src/redirect.ts:344-346`). Other
+  GET/HEAD paths, including invalid-slug and unknown-campaign 404s, take a
+  caller bucket before slug validation/lookup (`wrangler/src/redirect.ts:368-371`).
+- **Landed (TOG-12245, #259): the caller map is bounded.** `TokenBuckets`
+  (`wrangler/src/redirect.ts:126-254`) idle-expires a bucket only after a full
+  refill window (TTL clamped to at least `capacity / refillPerSecond`,
+  `:166-173`, `:196-202`), so expiry never resets a depleted caller. It caps the
+  map at **10,000** keys; a new key at the cap first runs the bounded reap and
+  is refused fail-closed only if every slot is still live, while tracked keys
+  keep their state (`:174-179`, `:203-216`), and each `take` reaps
+  at most **64** idle entries from the least-recent end (`:180-185`,
+  `:243-253`). Public `/health` and `/readyz` now pass a 405 method gate and a
+  separate per-caller `healthBuckets` budget before the Container is touched
+  (`wrangler/src/index.ts:84-88`, `:410-433`). Local fixtures:
+  `wrangler/test/redirect.test.ts:586-763` (200 one-time keys reclaimed after
+  the idle window, a depleted key keeps its debt through churn, TTL clamp, cap
+  shedding, bounded sweep, idle map drains on new keys alone, reap before
+  refusal within budget, live full map still refuses and a depleted key keeps
+  its debt), `:342-360` (burst 429 before the store) and
+  `wrangler/test/health-probes.test.ts:114-139` (probe burst 429, other callers
+  and 405s unaffected, throttled probes never reach the Container). No live
+  load was sent.
+- Residual risk: the buckets are **per isolate, not global**. Each Worker
+  isolate holds its own maps, and a recycled or different isolate starts every
+  caller full, so effective quota grows with isolate count; `max_instances = 1`
+  bounds the Container, not Worker isolates. The cap trades memory for
+  availability: once 10,000 keys are live in one isolate, every new caller gets
+  429, and keying on the full client IP lets one IPv6 prefix mint distinct
+  keys. **Fixed (TOG-12387):** overflow refusals used to skip the sweep, so a
+  full map drained only when an already-tracked key returned (a 100-key fixture
+  still refused 50 of 50 new keys after 24 idle hours). A new key at the cap now
+  runs the same bounded 64-entry reap before its verdict
+  (`wrangler/src/redirect.ts:203-216`); the fixture admits 50 of 50
+  (`wrangler/test/redirect.test.ts:670-688`). The redirect 429 always sends
+  `Retry-After: 1` (`:370-371`), including cap refusals. Global quota and
+  starvation resistance stay open under F7.
 - The moderation `ActionExecutor` (`crates/discord/src/executor.rs`) paces its
   own clones at 110 ms general / 350 ms kick with 5-second-timeout
   moderation mutations (`:63-68`, paced-lane reservation held through the fence
@@ -474,7 +505,7 @@ Remaining proposals are intentionally **not implemented** here:
 | F4 / P2 rejection telemetry | Receiver implementer: scalar structured logger with bounded labels/suppression | Capture every rejection class with token/body/SQL marker fixtures; no marker or full input escapes and rejection flood stays bounded. `Secret`/redaction and `database_url` allowlist work has landed; staging and production log head-sampling 1 make log proof load-bearing in both. |
 | F5 / P2 action-specific safety | Action owners: mapped event ownership, automation import schema/cardinality/overwrite transaction, key-specific setting validation, tempban recovery and lockdown/unlock overwrite serialization | Unmapped events, excessive imports, protected roles, invalid setting types, conflicting channel intents and unknown outcomes fail closed; legitimate operation/reconciliation has scalar evidence. Moderation duration caps and settings CAS have landed as narrowing, not closure. |
 | F6 / P1 deployment gate | Deployment owner with CISO: verify secret custody, per-environment guild/DB/key bindings, least-privilege DB role and mandatory authenticated TLS for Neon | Record non-secret binding/TLS/role receipts on the deployment card; test only fixtures/CI or explicitly authorized staging. Least-privilege roles/verifier/DML-only gateway/operator-migrates-first (via #102) and the `database_url` allowlist are procedure progress, not isolation proof; staging observability is telemetry, not a fence. Source URL-prefix validation is not TLS or isolation proof. |
-| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: edge probe limits, global guild/caller quotas, bounded redirect caller-map/nonce/intent growth, the shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429 (landed; receiver must share one per token), and total REST deadlines; preserve gateway resources | Local many-caller fixtures, including invalid-slug/unknown-campaign 404s and long simulated idle intervals, prove a fixed caller-state ceiling and idle reclamation (reserved-internal 404s and ticket/dispatch budgets have landed; the uncapped caller map has not). Define eviction/overflow behavior so churn cannot reset a depleted caller's quota or create unbounded work. Also prove bounded collection/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. The executor-level 429 governor is proven locally: the first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent before that cooldown elapses is refused as `NoEffect(CoolingDown)` without a Discord send while other channels proceed, and a new intent proceeds only after the cooldown closes; the original key stays terminal throughout. Receiver wiring of one governor per token remains open. No destructive live load tests. |
+| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: global edge/guild/caller quotas, bounded nonce/intent growth (redirect caller map and per-isolate probe limits landed), the shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429 (landed; receiver must share one per token), and total REST deadlines; preserve gateway resources | Landed for the Worker: bounded redirect caller map and public probe gate (TOG-12245, #259). `TokenBuckets` (`wrangler/src/redirect.ts:126-254`) idle-expires only fully refilled buckets, caps at 10,000 keys fail-closed and sweeps at most 64 per call; `/health`/`/readyz` take a separate `healthBuckets` budget before the Container (`wrangler/src/index.ts:84-88`, `:410-433`). Fixtures `wrangler/test/redirect.test.ts:586-763` prove idle reclamation, a fixed ceiling, churn that cannot reset a depleted caller, bounded sweep work and reap-before-refuse at the cap; `wrangler/test/health-probes.test.ts:114-139` proves the probe 429. Reserved-internal 404s and ticket/dispatch budgets have also landed. Residual: buckets are per isolate, not global, and 10,000 live keys in one isolate refuse new callers there; a map of idle keys now drains on new-key traffic alone (fixed, TOG-12387). Still open: prove bounded collection/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. The executor-level 429 governor is proven locally: the first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent before that cooldown elapses is refused as `NoEffect(CoolingDown)` without a Discord send while other channels proceed, and a new intent proceeds only after the cooldown closes; the original key stays terminal throughout. Receiver wiring of one governor per token remains open. No destructive live load tests. |
 | F8 / P1 receiver clock-policy gate | Receiver/store owners with Security review: define fail-closed behavior for backwards freshness/expiry clocks (including DB time), bounded retention and safe recovery across restart/failover; TTL coverage is conditional | Accept a capture, expire/sweep/replace its nonce, then roll time back into its signed window: memory and durable paths must refuse, including across instance restart/failover and lock waits. Record the trusted clock/high-water or equivalent policy and recovery criteria; cleanup (including transcript/intent retention) must not erase replay protection. Legitimate traffic resumes only under that verified policy. |
 
 F1/F2/F8 are requirements for the existing receiver slice, not new route work in
