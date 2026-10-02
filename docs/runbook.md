@@ -84,6 +84,9 @@ npm --prefix wrangler run containers -- info "${CONTAINER_APPLICATION_ID}" --env
 npm --prefix wrangler run containers -- instances "${CONTAINER_APPLICATION_ID}" --env staging
 ```
 
+Workers Logs (dashboard, 7-day retention) keep every staging and production
+invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
+
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
 logs in the Cloudflare dashboard. Wrangler 4.143.1 has no `containers logs`
