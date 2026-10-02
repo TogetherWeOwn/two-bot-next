@@ -1,6 +1,9 @@
 //! Linux local-fixture measurement: no Discord, database, or deployment calls.
 //! Run on an admitted controller or ephemeral CI: cargo run -p two-bot-core --example metrics_rss
 
+// Local measurement CLI intentionally reports its fixture result to stdout.
+#![allow(clippy::print_stdout)]
+
 use std::{hint::black_box, time::Duration};
 use two_bot_core::metrics::{Metrics, EVENTS, JOBS, REST_ROUTES};
 
