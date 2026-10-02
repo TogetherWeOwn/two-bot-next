@@ -93,6 +93,10 @@
       "sha256": "f6f39298deee84821f408c7b851b507debef7a22ef02ef3781528cd2b5111c83",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
     },
+    "crates/cutover/migrations/0321_gateway_boot_directives.sql": {
+      "sha256": "1c89d934b24f53ac0db6224a55d92080f24a17914ab68139308b5b4dc00c56a5",
+      "justification": "Add the one-shot force-fresh IDENTIFY directive for first production boot in TOG-12014; gateway_sessions stays unchanged."
+    },
     "crates/cutover/migrations/0330_guild_settings.sql": {
       "sha256": "9addc4962a1a69062bb8886e7c6f33596c0a1cc7583a965c360376819b546ed0",
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes."
@@ -164,6 +168,10 @@
     "crates/store/migrations/0405_timestamptz_and_boolean.sql": {
       "sha256": "5c00a07ac5565bd668e5804aa9e681c5bc8ebe1728d6f700fa5b956a8b0bb987",
       "justification": "Add unpublished S6 dependency-preserving normalization gate for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
+    },
+    "crates/store/migrations/0406_rollback_journal.sql": {
+      "sha256": "13a396ea63ea19cf64e5b9abee940f845189ace2ec5c950f29db7baf22e42c57",
+      "justification": "Add durable cutover rollback journal and per-table watermarks for TOG-12137; additive tables only."
     }
   }
 }
