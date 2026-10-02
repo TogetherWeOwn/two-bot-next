@@ -9,6 +9,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[cfg(feature = "db-tests")]
+mod admission;
+
 const CHANNEL: &str = "333333333333333333";
 const MESSAGE: &str = "444444444444444444";
 const OTHER: &str = "555555555555555555";
@@ -49,6 +52,8 @@ struct Recorded {
     method: String,
     path: String,
     user_agent: Option<String>,
+    #[cfg(feature = "db-tests")]
+    authorization: Option<String>,
     body: Value,
 }
 
@@ -90,7 +95,7 @@ impl MockDiscord {
                                 name.eq_ignore_ascii_case("content-length")
                                     .then(|| value.trim().parse::<usize>().unwrap())
                             })
-                            .unwrap();
+                            .unwrap_or(0);
                         break (end + 4, length);
                     }
                 };
@@ -111,8 +116,17 @@ impl MockDiscord {
                         name.eq_ignore_ascii_case("user-agent")
                             .then(|| value.trim().to_owned())
                     }),
-                    body: serde_json::from_slice(&bytes[head_end..head_end + content_length])
-                        .unwrap(),
+                    #[cfg(feature = "db-tests")]
+                    authorization: head.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_owned())
+                    }),
+                    body: if content_length == 0 {
+                        Value::Null
+                    } else {
+                        serde_json::from_slice(&bytes[head_end..head_end + content_length]).unwrap()
+                    },
                 });
                 let reply = {
                     let seen = seen.lock().unwrap();

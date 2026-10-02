@@ -86,6 +86,7 @@ pub mod scheduled_store;
 pub mod secret;
 pub use secret::Secret;
 pub mod self_roles;
+pub mod send_admission;
 pub mod settings;
 pub mod sticky;
 pub mod tickets;

@@ -27,13 +27,19 @@ fn executor_for(mock: &MockRest) -> ActionExecutor {
 
 #[tokio::test]
 async fn mirror_posts_share_the_executor_read_pacing_lane() {
-    let mock = MockRest::start(vec![], ScriptedResponse::json(200, serde_json::json!([]))).await;
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, serde_json::json!([]))],
+        ScriptedResponse::json(200, serde_json::json!({"id": "640"})),
+    )
+    .await;
     let exec = executor_for(&mock);
     exec.channel_history(CHANNEL, None, 100).await.unwrap();
     for _ in 0..10 {
-        exec.post_mirror(CHANNEL, "x", &delivery_nonce(&mock.origin()))
-            .await
-            .unwrap();
+        assert_eq!(
+            exec.post_mirror(CHANNEL, "x", &delivery_nonce(&mock.origin()))
+                .await,
+            Ok("640".to_owned())
+        );
     }
     let requests = mock.requests();
     assert_eq!(requests.len(), 11);
@@ -186,6 +192,32 @@ async fn post_mirror_classifies_each_discord_failure() {
             | ("uncertain", Err(MirrorError::Uncertain(_))) => {}
             (_, other) => panic!("status {status} produced {other:?}"),
         }
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn post_mirror_malformed_success_receipt_is_uncertain_without_retry() {
+    for receipt in [
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!({"id": "0"}),
+        serde_json::json!({"id": "not-an-id"}),
+    ] {
+        let mock = MockRest::start(
+            vec![ScriptedResponse::json(200, receipt)],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let exec = executor_for(&mock);
+        let outcome = exec
+            .post_mirror(CHANNEL, "x", &delivery_nonce(&mock.origin()))
+            .await;
+        assert!(
+            matches!(outcome, Err(MirrorError::Uncertain(_))),
+            "malformed mutation receipt remains uncertain, got {outcome:?}"
+        );
+        assert_eq!(mock.requests().len(), 1, "uncertain post is not retried");
         mock.shutdown().await;
     }
 }
