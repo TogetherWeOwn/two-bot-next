@@ -1,3 +1,4 @@
+#![cfg(test)]
 use super::*;
 use two_bot_core::backup::guild_config_api::GuildConfigDiscordApi;
 
