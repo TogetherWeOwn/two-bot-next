@@ -91,8 +91,10 @@ pub mod tickets;
 pub mod voice;
 pub mod voice_alias;
 pub mod voice_assistant_cap;
+pub mod voice_assistant_request;
 pub mod voice_config;
 pub mod voice_config_diff;
+pub mod voice_custom_id;
 pub mod voice_name_filter;
 pub mod voice_naming;
 pub mod voice_ownership;
@@ -101,6 +103,7 @@ pub mod voice_permissions;
 pub mod voice_placement;
 pub mod voice_private;
 pub mod voice_room_controls;
+pub mod voice_template_lint;
 pub mod voice_text_channel;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
