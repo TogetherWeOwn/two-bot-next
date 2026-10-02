@@ -33,6 +33,8 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'community_scorecard_runs', 'table'),
     ('public', 'community_scorecard_alerts', 'table'),
     ('public', 'gateway_sessions', 'table'),
+    ('public', 'voice_creators', 'table'),
+    ('public', 'voice_rooms', 'table'),
     ('public', 'gateway_boot_directives', 'table'),
     ('public', 'guild_settings', 'table'),
     ('public', 'guild_settings_revision', 'table'),

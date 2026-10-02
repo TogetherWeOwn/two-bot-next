@@ -43,11 +43,11 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tracing::info;
-use two_bot_core::{ComponentStatus, Config};
+use two_bot_core::{ComponentStatus, Config, VoiceGates};
 
 use gateway::{
-    build_persistent_pipeline, build_shard, ensure_crypto_provider, intents_from_env, run_shard,
-    GatewayState,
+    build_persistent_pipeline, build_shard, build_voice_runtime, ensure_crypto_provider,
+    intents_from_env, run_shard, GatewayState,
 };
 use server::SharedState;
 use website_jobs::serve;
@@ -160,6 +160,11 @@ async fn main() {
         database: store.as_ref().map(|s| s.pool().clone()),
     };
 
+    // V1 voice rooms: per-guild lifecycle actors fed by the gateway sink.
+    // Inert unless TWO_VOICE=1 with token + database present; any failure
+    // degrades to voice-off with a warn, never a boot failure.
+    let voice = build_voice_runtime(&config, VoiceGates::from_env().enabled).await;
+
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
     let gateway_task = if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
         let token = token.to_owned();
@@ -208,6 +213,7 @@ async fn main() {
                     Arc::clone(&state),
                     store,
                     runtime,
+                    voice,
                     async move {
                         server::shutdown_requested(stopping).await;
                     },

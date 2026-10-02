@@ -15,6 +15,10 @@ are outside this implementation's scope.
   age, join time, score and reasons (`join_risk_flags`). Erased by member ID; the
   legacy TEXT `event_id` and `reasons_json` are also checked for the snowflake.
 - Tickets: `tickets` and `ticket_transcripts` (opener or claimer; 90-day transcript purge applies independently).
+- Temporary voice rooms: each tracked room stores its current owner and original
+  creator IDs (`voice_rooms`), erased by either. Erasure removes the tracking row
+  only, never the Discord channel. Creator-channel configuration
+  (`voice_creators`) stores no member IDs.
 - Event RSVPs and attendance/community facts, including attribution and compound
   voice-session/event keys (`event_rsvps`, `community_facts`). Scorecards normally
   store aggregates; the erasure plan also checks their serialized payloads.
