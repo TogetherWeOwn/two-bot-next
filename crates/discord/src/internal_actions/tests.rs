@@ -211,7 +211,11 @@ async fn run_once(executor: &AnnouncementExecutor, body: &Map<String, Value>) ->
 async fn classification_fixture_keeps_default_deadline_and_timeout_fixture_is_explicit() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
-    let production = AnnouncementExecutor::new(Arc::clone(&executor.twilight), keys());
+    let production = AnnouncementExecutor::new(
+        Arc::clone(&executor.twilight),
+        keys(),
+        CooldownGovernor::new(),
+    );
     assert_eq!(executor.timeout, production.timeout);
     assert_eq!(
         mock.deadline_executor(keys()).timeout,
