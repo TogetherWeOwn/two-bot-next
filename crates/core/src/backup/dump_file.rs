@@ -88,6 +88,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "community_stream_heartbeats",
     "community_scorecard_runs",
     "community_scorecard_alerts",
+    "community_scorecard_attempts",
     "gateway_sessions",
     "guild_settings_revision",
     "guild_settings",
