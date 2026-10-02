@@ -98,14 +98,34 @@ def acquire(pool, policy):
             os.close(fd)
             continue
         try:
-            usable = not (slot / 'lease.json').exists() and usage(slot) < policy['slot_budget_bytes']
+            if (slot / 'lease.json').exists():
+                # The slot flock is the liveness proof: it is passed to Cargo
+                # through pass_fds, so holding it means no wrapper, Cargo, or
+                # fd-inheriting descendant is alive. A stale under-budget
+                # lease whose recorded Cargo process group is also dead is
+                # recovered here; anything else still needs the Operator.
+                try:
+                    lease = json.loads((slot / 'lease.json').read_text())
+                except (OSError, ValueError):
+                    lease = None
+                pgid = lease.get('cargo_pgid') if isinstance(lease, dict) else None
+                if (isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 0
+                        and usage(slot) < policy['slot_budget_bytes']
+                        and not group_alive(pgid)):
+                    print(json.dumps({'finding': 'stale_lease_recovered',
+                                      'slot': slot.name, **lease}, sort_keys=True),
+                          file=sys.stderr)
+                    (slot / 'lease.json').unlink()
+                    return slot, target, fd
+                os.close(fd)
+                continue  # Interrupted/oversized/live run: Operator must inspect it.
+            if usage(slot) >= policy['slot_budget_bytes']:
+                os.close(fd)
+                continue  # Oversized retained output: Operator must inspect it.
+            return slot, target, fd
         except Exception:
             os.close(fd)
             raise
-        if not usable:
-            os.close(fd)
-            continue  # Interrupted/oversized run: Operator must inspect it.
-        return slot, target, fd
     raise Refusal('no idle, below-budget slot; no per-worktree fallback')
 
 
@@ -205,6 +225,15 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
         # Pass the lease FD to Cargo as well: wrapper SIGKILL must not free it.
         child = subprocess.Popen([cargo] + args, env=env, start_new_session=True,
                                  pass_fds=(fd,))
+        # Record Cargo's process group (start_new_session: pgid == child pid)
+        # so a later acquire can tell a dead group from an escaped descendant
+        # that closed the fd. Atomic rewrite; the temp file lives in scratch
+        # so a crash can never leave an unexpected top-level slot entry.
+        tmp_path = slot / 'scratch' / 'lease.json.tmp'
+        with tmp_path.open('w') as output:
+            json.dump({**json.loads((slot / 'lease.json').read_text()),
+                       'cargo_pgid': child.pid}, output)
+        os.replace(tmp_path, slot / 'lease.json')
         spawning = False
         if pending_signal is not None:
             raise Refusal(f'build interrupted by signal {pending_signal}; lease retained')
