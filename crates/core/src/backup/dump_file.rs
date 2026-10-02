@@ -99,6 +99,9 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_discord_events",
     "moderation_channel_executions",
     "moderation_member_bans",
+    "automod_delivery_claims",
+    "gateway_boot_directives",
+    "member_erasure_audit",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data
@@ -107,8 +110,6 @@ pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
     "containment_events",
     "containment_incidents",
     "automation_commands",
-    "automod_violations",
-    "automod_processed_messages",
 ];
 
 /// Explicit migrated-schema exclusions, checked by the schema coverage test.

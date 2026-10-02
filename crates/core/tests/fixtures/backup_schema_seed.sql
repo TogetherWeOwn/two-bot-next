@@ -129,6 +129,29 @@ VALUES ('backup:ticket:closed', '100000000000000001', '100000000000000007',
         '100000000000000002', '100000000000000004', E'[09:00] opener: help | NULL\n雪 "quote"',
         2, '2026-08-01T09:31:00.000Z', '2026-10-30T09:31:00.000Z');
 
+INSERT INTO automod_violations
+    (guild_id, user_id, violation_count, last_filter, last_message_id, updated_at)
+VALUES ('100000000000000001', '100000000000000002', 2, 'invite_links',
+        '100000000000000020', '2026-08-01T10:02:00.000Z');
+INSERT INTO automod_processed_messages (guild_id, message_id, user_id, processed_at)
+VALUES ('100000000000000001', '100000000000000019', '100000000000000002',
+        '2026-08-01T10:01:00.000Z'),
+       ('100000000000000001', '100000000000000020', '100000000000000002',
+        '2026-08-01T10:02:00.000Z');
+-- A started, uncompleted mutation is a replay guard: restore must keep it.
+INSERT INTO automod_delivery_claims
+    (guild_id, message_id, delivery_kind, dry_run, request_hash, claim_token,
+     mutation_started, result_json, claimed_at, completed_at, counted, matched_filter,
+     matched_guild_id, matched_channel_id, matched_message_id, matched_author_id, released)
+VALUES ('100000000000000001', '100000000000000020', 'create', FALSE, repeat('7', 64),
+        'backup-automod-claim', TRUE, NULL, '2026-08-01T10:02:00.123456Z', NULL, TRUE,
+        'invite_links', '100000000000000001', '100000000000000003', '100000000000000020',
+        '100000000000000002', FALSE),
+       ('100000000000000001', '100000000000000021', 'update', TRUE, repeat('8', 64),
+        'backup-automod-dry-run', FALSE, '{"outcome":"clean","note":"雪 | NULL"}',
+        '2026-08-01T10:03:00Z', '2026-08-01T10:03:01Z', FALSE, NULL, NULL, NULL, NULL,
+        NULL, FALSE);
+
 INSERT INTO member_levels (guild_id, member_id, xp, message_xp, voice_xp, imported_xp, updated_at)
 VALUES ('100000000000000001', '100000000000000002', 9007199254740991,
         31, 60, 9007199254740900, '2026-08-01T10:00:00Z');
@@ -224,6 +247,12 @@ VALUES ('100000000000000001', '2026-07-27T00:00:00.000Z', 'backup:alert:dedupe',
 INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at)
 VALUES ('100000000000000001', 2, 'backup-resume-session', 9007199254740993,
         'wss://gateway.example.invalid', '2026-08-01T10:00:00.123456Z');
+-- One consumed and one armed one-shot IDENTIFY directive, restored with the
+-- gateway checkpoints they govern.
+INSERT INTO gateway_boot_directives (guild_id, shard_id, armed_at, reason, consumed_at)
+VALUES ('100000000000000001', 0, '2026-08-01T09:00:00Z', 'backup consumed | NULL',
+        '2026-08-01T09:05:00.123456Z'),
+       ('100000000000000001', 1, '2026-08-01T10:00:00Z', E'backup armed\n雪', NULL);
 
 INSERT INTO guild_settings (guild_id, key, value, version, updated_at, updated_by)
 VALUES ('100000000000000001', 'TWO_STICKY_ENABLED',
@@ -292,3 +321,8 @@ INSERT INTO self_role_panel_claims
 VALUES ('100000000000000001', '100000000000000002', 'backup:panel', 'backup-self-role-claim',
         23, '2026-08-01T10:01:00.123456Z', 'backup:self-role:event', 'backup-option',
         'backup-event-order', TRUE);
+
+-- Operator erasure receipts carry no subject; accountability survives restore.
+INSERT INTO member_erasure_audit (actor, erased_at)
+VALUES ('backup-operator', '2026-08-01T10:00:00.123456Z'),
+       ('backup-operator', '2026-08-02T10:00:00Z');
