@@ -840,3 +840,41 @@ async fn callback_401_is_not_bot_token_failure_and_ack_is_essential() {
     assert_eq!(mock.requests().len(), 2);
     mock.shutdown().await;
 }
+
+#[tokio::test]
+async fn followup_401_is_an_expired_interaction_token_not_a_bot_token_failure() {
+    use two_bot_core::router::replies::{InteractionReply, ReplyOperation};
+
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(401), ScriptedResponse::status(401)],
+        ScriptedResponse::status(204),
+    )
+    .await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    assert!(exec
+        .execute_reply_operation(
+            1111,
+            7,
+            "expired-fixture-token",
+            ReplyOperation::Followup(InteractionReply::new("late", true)),
+        )
+        .await
+        .is_err());
+    assert!(exec
+        .execute_reply_operation(
+            1111,
+            7,
+            "expired-fixture-token",
+            ReplyOperation::EditFollowup {
+                message_id: 424_242,
+                content: "late".to_owned(),
+            },
+        )
+        .await
+        .is_err());
+    assert!(!guard.snapshot().token_invalid);
+    ban(&exec).await.unwrap();
+    assert_eq!(mock.requests().len(), 3);
+    mock.shutdown().await;
+}

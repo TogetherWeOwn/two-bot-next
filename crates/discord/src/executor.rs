@@ -433,9 +433,16 @@ fn is_interaction_callback(request: &Request) -> bool {
 }
 
 fn is_interaction_token_request(request: &Request) -> bool {
+    // Webhook-token routes (`webhooks/{app}/{token}…`: interaction originals
+    // and followups) authenticate with the URL token, not the bot token.
     is_interaction_callback(request)
-        || (request.path().starts_with("webhooks/")
-            && request.path().ends_with("/messages/@original"))
+        || request
+            .path()
+            .split('?')
+            .next()
+            .and_then(|path| path.strip_prefix("webhooks/"))
+            .and_then(|rest| rest.split('/').nth(1))
+            .is_some_and(|token| !token.is_empty())
 }
 
 /// Prior DELETE attempts supplied to a paced kick's safety guard.
@@ -1859,10 +1866,8 @@ impl ActionExecutor {
                 Self::request_of(client.delete_response(interaction_token))?
             }
         };
-        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
-            .await
-            .map_err(|_| DiscordError::Timeout)?
-            .map_err(DiscordError::Unavailable)?;
+        // Unpaced lane; guard admission runs inside the one bounded attempt.
+        let (res, _) = self.send_with_timeout(&req, None).await?;
         match res.status {
             200..=299 if creates_followup => {
                 // Discord returns the created message; retain its identity so
