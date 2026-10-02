@@ -317,16 +317,32 @@ const text = (status: number, body: string, extra?: Record<string, string>): Red
  * first segment, stripping literal/encoded leading slashes and decoding once.
  * A malformed suffix cannot unreserve a recognized `metrics`/`healthz` prefix;
  * near-miss campaign slugs like `metricsfoo` still do not match.
+ * The ownership-fence control plane (`internal/ownership`, plus subpaths) is
+ * likewise reserved: it is served by the Worker (TOG-11143), never a campaign.
  */
 export function isReservedInternal(path: string): boolean {
   const bare = path.split("?")[0] ?? "/";
   const prefix = bare.replace(/^(?:\/|%2f)+/i, "").split(/\/|%2f/i, 1)[0] ?? "";
   try {
-    return RESERVED_SLUGS.includes(decodeURIComponent(prefix).toLowerCase());
+    if (RESERVED_SLUGS.includes(decodeURIComponent(prefix).toLowerCase())) {
+      return true;
+    }
   } catch {
     // An undecodable prefix is not provably reserved; callers fail closed.
     return false;
   }
+  let canonical: string;
+  try {
+    canonical = decodeURIComponent(
+      bare.replace(/^\/+/, "").replace(/\/+$/, ""),
+    ).toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    canonical === "internal/ownership" ||
+    canonical.startsWith("internal/ownership/")
+  );
 }
 
 export async function handleRedirect(

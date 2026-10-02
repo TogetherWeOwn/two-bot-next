@@ -23,6 +23,8 @@ function harness() {
   const env = {
     REDIRECT_MAPPINGS_JSON: "[]",
     REDIRECT_FALLBACK_CODE: "fallbackCode",
+    // The ownership fence refuses forwards without a deployment id.
+    CF_VERSION_METADATA: { id: "synthetic-probe-deployment" },
     TWO_BOT: {
       getByName: (name: string) => {
         names.push(name);
@@ -94,6 +96,12 @@ for (const path of ["/health", "/readyz"]) {
     for (const leaked of ["authorization", "cookie", "x-custom", "cf-connecting-ip"]) {
       assert.equal(fwd!.headers[leaked], undefined, `${leaked} must not be forwarded`);
     }
+    assert.deepEqual(
+      Object.keys(fwd!.headers),
+      ["x-two-bot-deployment-id"],
+      "only the Worker-stamped deployment id reaches the fenced DO",
+    );
+    assert.equal(fwd!.headers["x-two-bot-deployment-id"], "synthetic-probe-deployment");
     assert.equal(fwd!.body, "", "no caller body may be forwarded");
   });
 
