@@ -383,9 +383,11 @@ fn legacy_without_ownership(source: &Path, target: &Path) {
         .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
         .collect();
     // `dump` writes v4, which must declare every table; only v3 may omit
-    // post-v3 tables. V3 also predates the additive sequence metadata.
+    // post-v3 tables. V3 also predates the additive sequence metadata
+    // (`sequenceMarks`; the retired `sequences` key is removed if present).
     lines[0]["version"] = serde_json::json!(3);
     lines[0].as_object_mut().unwrap().remove("sequences");
+    lines[0].as_object_mut().unwrap().remove("sequenceMarks");
     lines[0]["tables"]
         .as_array_mut()
         .unwrap()

@@ -2,6 +2,9 @@
 //! database, applies the shipped migrations, and uses the normal safety guard.
 //! This is not a general-purpose database provisioner or production recovery.
 
+// Operator commands intentionally emit human-readable output to stdout.
+#![allow(clippy::print_stdout)]
+
 use std::env;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{Read, Write};
