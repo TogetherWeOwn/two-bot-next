@@ -18,6 +18,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::commands::{CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_CHANNELS};
+use super::voice_text_channel::{
+    TextChannelPlan, TextChannelSettings, MAX_TEXT_CHANNEL_NAME_CHARS,
+};
 use crate::funnel::Snowflake;
 
 /// Longest Discord channel name (spec "Discord API notes": 100 characters).
@@ -74,6 +77,12 @@ pub struct CreatorChannel {
     pub default_limit: Option<i64>,
     pub private_default: bool,
     pub text_channels: bool,
+    /// Configured companion text-channel name (V9 `/textchannels`). `None`
+    /// means the default companion name at plan time.
+    pub text_channel_name: Option<String>,
+    /// The one extra role allowed to view the companion (V9). `None` means
+    /// occupants and admins only; `Some(guild_id)` is @everyone.
+    pub text_viewer_role_id: Option<Snowflake>,
     pub position: RoomPosition,
     /// First room number; the numbering engine (V5) assigns the lowest free
     /// number at or above this.
@@ -94,6 +103,8 @@ impl CreatorChannel {
             default_limit: None,
             private_default: false,
             text_channels: false,
+            text_channel_name: None,
+            text_viewer_role_id: None,
             position: RoomPosition::Above,
             first_room_number: 1,
         }
@@ -121,8 +132,40 @@ impl CreatorChannel {
                 Some(_) => {}
             }
         }
+        if self
+            .text_channel_name
+            .as_ref()
+            .is_some_and(|name| !is_usable_channel_name(name))
+        {
+            return Err(CreatorSettingsError::TextChannelNameOutOfRange);
+        }
+        if self.text_viewer_role_id == Some(0) {
+            return Err(CreatorSettingsError::TextViewerRoleInvalid(0));
+        }
         Ok(())
     }
+
+    /// The V9 per-creator `/textchannels` settings snapshot this creator
+    /// carries. Off by default; the name/viewer role ride along only when
+    /// the toggle is on.
+    #[must_use]
+    pub fn text_channel_settings(&self) -> TextChannelSettings {
+        TextChannelSettings {
+            enabled: self.text_channels,
+            configured_name: self.text_channel_name.clone(),
+            viewer_role_id: self.text_viewer_role_id,
+        }
+    }
+}
+
+/// Whether a configured companion text-channel name is storable: non-blank
+/// once trimmed, at most [`MAX_TEXT_CHANNEL_NAME_CHARS`] characters (mirrors
+/// the `voice_creators.text_channel_name` CHECK; blank falls back to the
+/// default name at plan time instead of being stored).
+#[must_use]
+pub fn is_usable_channel_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty() && trimmed.chars().count() <= MAX_TEXT_CHANNEL_NAME_CHARS
 }
 
 /// Invalid creator settings.
@@ -136,6 +179,10 @@ pub enum CreatorSettingsError {
     MissingPermissionChannel,
     #[error("permission source channel does not match permission_channel_id")]
     PermissionChannelMismatch,
+    #[error("text channel name must be 1–100 non-blank characters")]
+    TextChannelNameOutOfRange,
+    #[error("text viewer role must be a nonzero snowflake, got {0}")]
+    TextViewerRoleInvalid(Snowflake),
 }
 
 // --- tracked rooms ----------------------------------------------------------
@@ -169,6 +216,35 @@ pub struct NewRoomSpec {
     pub created_at: String,
 }
 
+/// One per-room companion text channel record (V9b): the Discord text
+/// channel created alongside a room, plus the settings snapshot taken at
+/// creation so later `/textchannels` changes do not retroactively alter it.
+/// The `text_channels` snapshot is the creator toggle at creation time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextCompanion {
+    pub guild_id: Snowflake,
+    pub room_channel_id: Snowflake,
+    pub text_channel_id: Snowflake,
+    pub settings: TextChannelSettings,
+    /// ISO-millis creation stamp (funnel `now_iso` shape).
+    pub created_at: String,
+}
+
+impl TextCompanion {
+    /// Complete a creation plan once Discord returns the text channel id.
+    /// `now` is the creation stamp (ISO millis, caller clock).
+    #[must_use]
+    pub fn from_plan(plan: &TextChannelPlan, text_channel_id: Snowflake, now: String) -> Self {
+        Self {
+            guild_id: plan.guild_id,
+            room_channel_id: plan.room_id,
+            text_channel_id,
+            settings: plan.settings.clone(),
+            created_at: now,
+        }
+    }
+}
+
 impl VoiceRoom {
     /// Complete a [`NewRoomSpec`] once Discord returns the channel id. The
     /// joiner is both owner and original creator.
@@ -198,12 +274,24 @@ pub trait RoomStore: Send + Sync {
     fn room_for(&self, guild_id: Snowflake, channel_id: Snowflake) -> Option<VoiceRoom>;
     fn rooms_in_guild(&self, guild_id: Snowflake) -> Vec<VoiceRoom>;
     fn rooms_for_owner(&self, guild_id: Snowflake, owner_id: Snowflake) -> Vec<VoiceRoom>;
+    fn add_companion(&self, companion: TextCompanion);
+    fn remove_companion(
+        &self,
+        guild_id: Snowflake,
+        room_channel_id: Snowflake,
+    ) -> Option<TextCompanion>;
+    fn companion_for(
+        &self,
+        guild_id: Snowflake,
+        room_channel_id: Snowflake,
+    ) -> Option<TextCompanion>;
 }
 
 #[derive(Debug, Default)]
 struct MemRooms {
     creators: HashMap<(Snowflake, Snowflake), CreatorChannel>,
     rooms: HashMap<(Snowflake, Snowflake), VoiceRoom>,
+    companions: HashMap<(Snowflake, Snowflake), TextCompanion>,
 }
 
 /// In-memory [`RoomStore`] for tests and the replay harness.
@@ -311,6 +399,39 @@ impl RoomStore for MemRoomStore {
             .collect();
         out.sort_by_key(|r| r.channel_id);
         out
+    }
+
+    fn add_companion(&self, companion: TextCompanion) {
+        self.inner
+            .lock()
+            .expect("room store lock")
+            .companions
+            .insert((companion.guild_id, companion.room_channel_id), companion);
+    }
+
+    fn remove_companion(
+        &self,
+        guild_id: Snowflake,
+        room_channel_id: Snowflake,
+    ) -> Option<TextCompanion> {
+        self.inner
+            .lock()
+            .expect("room store lock")
+            .companions
+            .remove(&(guild_id, room_channel_id))
+    }
+
+    fn companion_for(
+        &self,
+        guild_id: Snowflake,
+        room_channel_id: Snowflake,
+    ) -> Option<TextCompanion> {
+        self.inner
+            .lock()
+            .expect("room store lock")
+            .companions
+            .get(&(guild_id, room_channel_id))
+            .cloned()
     }
 }
 
@@ -1391,6 +1512,90 @@ mod tests {
         assert!(c.validate().is_err());
         c.permission_channel_id = Some(999);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn text_channel_name_bounds_match_the_sql_check() {
+        // `None` (default) is always fine, and a normal name passes.
+        assert!(creator().validate().is_ok());
+        let mut named = creator();
+        named.text_channel_name = Some("Lounge".to_owned());
+        assert!(named.validate().is_ok());
+        // Blank (only whitespace) and over-100-character names are refused
+        // here, never reaching the database CHECK.
+        for bad in ["", "   ", &"a".repeat(101)] {
+            let mut c = creator();
+            c.text_channel_name = Some(bad.to_owned());
+            assert_eq!(
+                c.validate(),
+                Err(CreatorSettingsError::TextChannelNameOutOfRange)
+            );
+        }
+        // Exactly 100 characters is the SQL boundary: accepted.
+        let mut edge = creator();
+        edge.text_channel_name = Some("a".repeat(100));
+        assert!(edge.validate().is_ok());
+        assert!(is_usable_channel_name("Lounge"));
+        assert!(!is_usable_channel_name("   "));
+        assert!(!is_usable_channel_name(&"a".repeat(101)));
+    }
+
+    #[test]
+    fn text_viewer_role_must_be_nonzero() {
+        let mut everyone = creator();
+        everyone.text_viewer_role_id = Some(GUILD);
+        assert!(everyone.validate().is_ok());
+        let mut zero = creator();
+        zero.text_viewer_role_id = Some(0);
+        assert_eq!(
+            zero.validate(),
+            Err(CreatorSettingsError::TextViewerRoleInvalid(0))
+        );
+    }
+
+    #[test]
+    fn text_channel_settings_default_off_and_snapshot_shape() {
+        use crate::voice_text_channel::TextChannelSettings;
+        assert_eq!(
+            creator().text_channel_settings(),
+            TextChannelSettings::default()
+        );
+        assert!(!creator().text_channel_settings().enabled);
+        let mut on = creator();
+        on.text_channels = true;
+        on.text_channel_name = Some("Lounge".to_owned());
+        on.text_viewer_role_id = Some(42);
+        assert_eq!(
+            on.text_channel_settings(),
+            TextChannelSettings {
+                enabled: true,
+                configured_name: Some("Lounge".to_owned()),
+                viewer_role_id: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn mem_store_round_trips_companion_records() {
+        use crate::voice_text_channel::TextChannelSettings;
+        let store = MemRoomStore::new();
+        let companion = TextCompanion {
+            guild_id: GUILD,
+            room_channel_id: 500,
+            text_channel_id: 600,
+            settings: TextChannelSettings {
+                enabled: true,
+                configured_name: Some("Lounge".to_owned()),
+                viewer_role_id: Some(GUILD),
+            },
+            created_at: crate::funnel::now_iso(),
+        };
+        assert_eq!(store.companion_for(GUILD, 500), None);
+        store.add_companion(companion.clone());
+        assert_eq!(store.companion_for(GUILD, 500), Some(companion.clone()));
+        assert_eq!(store.companion_for(GUILD + 1, 500), None);
+        assert_eq!(store.remove_companion(GUILD, 500), Some(companion));
+        assert_eq!(store.remove_companion(GUILD, 500), None);
     }
 
     #[test]

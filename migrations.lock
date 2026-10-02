@@ -109,6 +109,10 @@
       "sha256": "d1a9abe893e8b030db21452f29506a924d60bd7b880d7cef9debc53deb0dd4b4",
       "justification": "Renumber unmerged TOG-10093 voice inherit 0221 to 0225 to follow 0224 voice schema, SQL unchanged."
     },
+    "crates/cutover/migrations/0226_voice_text_channels.sql": {
+      "sha256": "eb73644e24d46df87e828728e1b0572ac35f7dc1fdbf4d40dce8181f52dbf867",
+      "justification": "Add V9b text-channel settings columns and companion table for TOG-12802 (0226 follows 0225 voice inherit)."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43"

@@ -9,7 +9,9 @@
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
-use two_bot_core::voice_rooms::{CreatorChannel, PermissionSource, RoomPosition, VoiceRoom};
+use two_bot_core::voice_rooms::{
+    CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
+};
 use two_bot_core::{format_iso_millis, parse_iso_millis, Snowflake};
 
 #[derive(Debug, Clone)]
@@ -38,8 +40,9 @@ impl PgRoomStore {
             "INSERT INTO voice_creators
              (guild_id, channel_id, name_template, permission_source,
               permission_channel_id, default_limit, private_default,
-              text_channels, position, first_room_number)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+              text_channels, text_channel_name, text_viewer_role_id,
+              position, first_room_number)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              ON CONFLICT (guild_id, channel_id) DO UPDATE SET
               name_template = EXCLUDED.name_template,
               permission_source = EXCLUDED.permission_source,
@@ -47,6 +50,8 @@ impl PgRoomStore {
               default_limit = EXCLUDED.default_limit,
               private_default = EXCLUDED.private_default,
               text_channels = EXCLUDED.text_channels,
+              text_channel_name = EXCLUDED.text_channel_name,
+              text_viewer_role_id = EXCLUDED.text_viewer_role_id,
               position = EXCLUDED.position,
               first_room_number = EXCLUDED.first_room_number",
         )
@@ -58,6 +63,8 @@ impl PgRoomStore {
         .bind(creator.default_limit.map(|limit| limit as i32))
         .bind(creator.private_default)
         .bind(creator.text_channels)
+        .bind(creator.text_channel_name.clone())
+        .bind(creator.text_viewer_role_id.map(|id| id.to_string()))
         .bind(position)
         .bind(creator.first_room_number)
         .execute(&self.pool)
@@ -189,6 +196,71 @@ impl PgRoomStore {
             .map(decode_room)
             .transpose()
     }
+
+    /// Record a companion created alongside its room, with the settings
+    /// snapshot taken at creation. Insert-once like [`Self::add_room`]: later
+    /// settings changes never update the snapshot in place.
+    /// Returns false when a companion for this room is already tracked.
+    pub async fn add_companion(&self, companion: &TextCompanion) -> Result<bool, sqlx::Error> {
+        let millis = parse_iso_millis(&companion.created_at)
+            .ok_or_else(|| invalid_argument("invalid companion creation timestamp"))?;
+        let timestamp = OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
+            .map_err(invalid_argument)?;
+        Ok(sqlx::query(
+            "INSERT INTO voice_text_companions
+             (guild_id, room_channel_id, text_channel_id, text_channels,
+              text_channel_name, text_viewer_role_id, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT (guild_id, room_channel_id) DO NOTHING",
+        )
+        .bind(companion.guild_id.to_string())
+        .bind(companion.room_channel_id.to_string())
+        .bind(companion.text_channel_id.to_string())
+        .bind(companion.settings.enabled)
+        .bind(companion.settings.configured_name.clone())
+        .bind(companion.settings.viewer_role_id.map(|id| id.to_string()))
+        .bind(timestamp)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            != 0)
+    }
+
+    pub async fn companion_for(
+        &self,
+        guild_id: Snowflake,
+        room_channel_id: Snowflake,
+    ) -> Result<Option<TextCompanion>, sqlx::Error> {
+        sqlx::query(
+            "SELECT * FROM voice_text_companions WHERE guild_id = $1 AND room_channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(room_channel_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(decode_companion)
+        .transpose()
+    }
+
+    /// Delete the companion tracked for a room (the runtime deletes the
+    /// Discord text channel through the separate Discord call).
+    pub async fn remove_companion(
+        &self,
+        guild_id: Snowflake,
+        room_channel_id: Snowflake,
+    ) -> Result<Option<TextCompanion>, sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM voice_text_companions WHERE guild_id = $1 AND room_channel_id = $2 RETURNING *",
+        )
+        .bind(guild_id.to_string())
+        .bind(room_channel_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(decode_companion)
+        .transpose()
+    }
 }
 
 fn invalid_argument(error: impl std::fmt::Display) -> sqlx::Error {
@@ -223,6 +295,14 @@ fn decode_creator(row: &PgRow) -> Result<CreatorChannel, sqlx::Error> {
         "below" => RoomPosition::Below,
         _ => return Err(invalid_argument("unknown room position")),
     };
+    let text_viewer_role_id = row
+        .try_get::<Option<String>, _>("text_viewer_role_id")?
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+        })
+        .transpose()?;
     let creator = CreatorChannel {
         guild_id: decode_id(row, "guild_id")?,
         channel_id: decode_id(row, "channel_id")?,
@@ -234,11 +314,36 @@ fn decode_creator(row: &PgRow) -> Result<CreatorChannel, sqlx::Error> {
             .map(i64::from),
         private_default: row.try_get("private_default")?,
         text_channels: row.try_get("text_channels")?,
+        text_channel_name: row.try_get("text_channel_name")?,
+        text_viewer_role_id,
         position,
         first_room_number: row.try_get("first_room_number")?,
     };
     creator.validate().map_err(invalid_argument)?;
     Ok(creator)
+}
+
+fn decode_companion(row: &PgRow) -> Result<TextCompanion, sqlx::Error> {
+    let timestamp: OffsetDateTime = row.try_get("created_at")?;
+    let viewer_role_id = row
+        .try_get::<Option<String>, _>("text_viewer_role_id")?
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+        })
+        .transpose()?;
+    Ok(TextCompanion {
+        guild_id: decode_id(row, "guild_id")?,
+        room_channel_id: decode_id(row, "room_channel_id")?,
+        text_channel_id: decode_id(row, "text_channel_id")?,
+        settings: two_bot_core::voice_text_channel::TextChannelSettings {
+            enabled: row.try_get("text_channels")?,
+            configured_name: row.try_get("text_channel_name")?,
+            viewer_role_id,
+        },
+        created_at: format_iso_millis((timestamp.unix_timestamp_nanos() / 1_000_000) as i64),
+    })
 }
 
 fn decode_room(row: &PgRow) -> Result<VoiceRoom, sqlx::Error> {

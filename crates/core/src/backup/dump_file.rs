@@ -112,6 +112,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "invite_campaigns",
     "voice_creators",
     "voice_rooms",
+    "voice_text_companions",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data

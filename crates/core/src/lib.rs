@@ -52,6 +52,7 @@ pub mod health;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
+pub mod internal_action_config;
 #[cfg(feature = "db")]
 pub mod internal_action_store;
 pub mod internal_actions;
@@ -96,6 +97,7 @@ pub mod tickets;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
+pub mod voice_alias_core;
 pub mod voice_assistant;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
@@ -376,12 +378,12 @@ pub use voice_reconcile::{
 };
 pub use voice_rooms::{
     category_full_message, decide_room_join, decide_room_leave, fail_backoff_ms,
-    parse_retry_after_ms, reconcile, voice_commands, ActionQueue, CreatorChannel,
-    CreatorSettingsError, FailedAction, MemRoomStore, NewRoomSpec, PermissionSource,
-    ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction, RoomJoinDecision,
-    RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore, SeenChannel,
-    VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT,
-    QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
+    is_usable_channel_name, parse_retry_after_ms, reconcile, voice_commands, ActionQueue,
+    CreatorChannel, CreatorSettingsError, FailedAction, MemRoomStore, NewRoomSpec,
+    PermissionSource, ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction,
+    RoomJoinDecision, RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore,
+    SeenChannel, TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY,
+    MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT, QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
