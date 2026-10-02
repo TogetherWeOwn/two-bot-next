@@ -5,7 +5,7 @@
 //! `src/backfill/` + `src/core/inviteTracker.ts`). The library holds the pure
 //! logic — parsing, planning, reconciliation — so it unit-tests without a
 //! database or Discord; `db` and `rest` hold the sqlx/twilight seams and the
-//! seven `src/bin/` CLIs are thin arg-parsing shells around them.
+//! `src/bin/` CLIs are thin arg-parsing shells around them.
 //!
 //! Conventions inherited from legacy: dry run is the default everywhere that
 //! writes (`--apply` is the only thing that writes); every CLI refuses the
@@ -28,10 +28,13 @@ pub mod legacy_verify;
 pub mod mee6_names;
 pub mod mee6_rewards;
 pub mod mee6_xp;
+pub mod member_erasure;
 pub mod message_scan;
 pub mod parse;
 pub mod raid_tools;
+pub mod reengagement;
 pub mod rest;
+pub mod rollback_delta;
 pub mod self_role_store;
 pub mod settings;
 pub mod tickets;
