@@ -837,6 +837,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')",
         "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'",
         "INSERT INTO self_role_panel_claims SELECT * FROM self_role_panel_claims",
+        "INSERT INTO automod_delivery_claims SELECT * FROM automod_delivery_claims",
     ] {
         assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
     }
