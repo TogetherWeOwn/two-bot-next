@@ -112,6 +112,7 @@ pub mod voice_private;
 pub mod voice_rename_coalescer;
 pub mod voice_room_controls;
 pub mod voice_style;
+pub mod voice_template;
 pub mod voice_template_lint;
 pub mod voice_text_channel;
 pub mod voice_utilities;
