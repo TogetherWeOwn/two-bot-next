@@ -93,6 +93,7 @@ pub mod voice_alias;
 pub mod voice_assistant_cap;
 pub mod voice_config;
 pub mod voice_config_diff;
+pub mod voice_create_admission;
 pub mod voice_naming;
 pub mod voice_ownership;
 pub mod voice_permission_health;
