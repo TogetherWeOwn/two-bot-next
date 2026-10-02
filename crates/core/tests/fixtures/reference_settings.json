@@ -29,6 +29,8 @@
   "TWO_ANTI_NUKE_SNAPSHOT_PATH": "Filesystem snapshot destination; never dashboard-selectable.",
   "TWO_ANTI_NUKE_TRUSTED_USER_IDS": "Trusted accounts ignored by anti-nuke; environment-only reach boundary.",
   "TWO_ANTI_NUKE_WINDOW_SECONDS": "Aggregation window for anti-nuke heat.",
+  "TWO_ASSISTANT_ENDPOINT": "Template-assistant OpenAI-compatible endpoint; environment-only destination boundary.",
+  "TWO_ASSISTANT_MODEL": "Template-assistant model name; environment-only so a web form cannot redirect it.",
   "TWO_AUTOMATIONS": "Enable automation administration and custom command publication/routing.",
   "TWO_AUTOMOD": "Enable automod message inspection.",
   "TWO_AUTOMOD_ALLOWED_DOMAINS": "Domains permitted by the external-link matcher.",
