@@ -93,9 +93,12 @@ impl TestDb {
     }
 
     async fn snapshot(&self) -> Result<serde_json::Value, sqlx::Error> {
+        // Tables only: sequences (relkind 'S') have no composite row type,
+        // so to_jsonb(t) on them fails with 42809. The snapshot asserts the
+        // report wrote no rows; sequences carry none.
         let names: Vec<String> = sqlx::query_scalar(
             "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'S') ORDER BY c.relname",
+             WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') ORDER BY c.relname",
         )
         .fetch_all(&self.pool)
         .await?;
