@@ -139,9 +139,11 @@ pub async fn load_boot_session(
     .map_err(|_| sqlx::Error::InvalidArgument("gateway boot deadline exceeded".into()))?
 }
 
-// Partition the existing five-connection gateway subsystem budget. These must
-// be distinct pools: feature transactions retain connections across Discord I/O.
+// The ordered checkpoint writer gets its own pool, distinct from the shared
+// store pool feature work runs on: feature transactions retain connections
+// across Discord I/O. Saturation tests model a tighter feature budget.
 pub const GATEWAY_POOL_MAX: u32 = 1;
+#[cfg(test)]
 pub const FEATURE_POOL_MAX: u32 = two_bot_cutover::DB_POOL_MAX_DEFAULT - GATEWAY_POOL_MAX;
 // Admission is independent of the 32-row durable queue. Leave feature capacity
 // for settings and shared commands; do not claim more jobs while these workers run.
