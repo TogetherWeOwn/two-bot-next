@@ -392,7 +392,7 @@ pub async fn export_delta(
         };
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(spec.table)
-            .fetch_one(&mut **tx)
+            .fetch_one(&mut *tx)
             .await?;
         if !exists {
             continue;
@@ -402,7 +402,7 @@ pub async fn export_delta(
         let count_sql = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
             .bind(since)
-            .fetch_one(&mut **tx)
+            .fetch_one(&mut *tx)
             .await?;
         if count as u64 > MAX_EXPORT_ROWS_PER_TABLE {
             return Err(DeltaError::ExportCap(spec.table.to_owned()));
@@ -413,7 +413,7 @@ pub async fn export_delta(
         let row_sql = format!("SELECT to_jsonb(t.*)::text FROM {table} t WHERE {predicate}");
         let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(row_sql))
             .bind(since)
-            .fetch_all(&mut **tx)
+            .fetch_all(&mut *tx)
             .await?;
         for row in rows {
             let line = serde_json::json!({"table": spec.table, "row": serde_json::from_str::<serde_json::Value>(&row).unwrap_or(serde_json::Value::Null)}).to_string();
