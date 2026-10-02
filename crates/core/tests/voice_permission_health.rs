@@ -4,9 +4,8 @@ use two_bot_core::health::{VoiceDiagnostic, VoicePermission, VoicePermissionScop
 use two_bot_core::voice_permission_health::{
     evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
     NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,
-    PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS,
-    PERM_ADMINISTRATOR, PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS,
-    PERM_VIEW_CHANNEL,
+    PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS, PERM_ADMINISTRATOR,
+    PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS, PERM_VIEW_CHANNEL,
 };
 
 const CATEGORY: u64 = 10;
@@ -19,7 +18,11 @@ fn masks(allow: u64, deny: u64) -> OverwriteMasks {
 }
 
 fn overwrite(target: OverwriteTarget, allow: u64, deny: u64) -> PermissionOverwrite {
-    PermissionOverwrite { target, allow, deny }
+    PermissionOverwrite {
+        target,
+        allow,
+        deny,
+    }
 }
 
 fn evaluate(
@@ -162,12 +165,20 @@ fn resolution_table_covers_discord_order_and_administrator() {
             expect: u64::MAX,
         },
         Case {
-            name: "administrator from overwrite grants everything",
+            name: "administrator bit in an overwrite allow is ignored",
             base: 0,
             everyone: None,
-            roles: vec![masks(PERM_ADMINISTRATOR, 0)],
+            roles: vec![masks(PERM_ADMINISTRATOR | view, 0)],
             member: None,
-            expect: u64::MAX,
+            expect: view,
+        },
+        Case {
+            name: "administrator bit in an overwrite deny is ignored",
+            base: view,
+            everyone: Some(masks(0, PERM_ADMINISTRATOR)),
+            roles: vec![],
+            member: None,
+            expect: view,
         },
     ];
     assert!(cases.len() >= 12, "table must cover at least 12 cases");
@@ -223,7 +234,11 @@ fn channel_override_cause_names_the_channel() {
     let findings = evaluate(
         all_required(),
         &[],
-        &[overwrite(OverwriteTarget::Member(BOT), 0, PERM_MANAGE_ROLES)],
+        &[overwrite(
+            OverwriteTarget::Member(BOT),
+            0,
+            PERM_MANAGE_ROLES,
+        )],
     );
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].permission, VoicePermission::ManageRoles);
@@ -246,19 +261,56 @@ fn guild_shortage_is_attributed_to_guild_not_overwrites() {
 }
 
 #[test]
-fn overwrite_allow_rescues_missing_guild_base() {
-    let findings = evaluate(
-        all_required() & !PERM_MANAGE_CHANNELS,
-        &[overwrite(OverwriteTarget::Role(ROLE), PERM_MANAGE_CHANNELS, 0)],
-        &[],
-    );
+fn overwrite_allow_rescues_missing_guild_base_where_it_applies() {
+    let rescue = [overwrite(
+        OverwriteTarget::Role(ROLE),
+        PERM_MANAGE_CHANNELS,
+        0,
+    )];
+    let findings = evaluate(all_required() & !PERM_MANAGE_CHANNELS, &rescue, &rescue);
     assert!(findings.is_empty());
 }
 
 #[test]
-fn channel_overwrite_only_applies_after_category_level() {
-    // Category already removed Move Members: the finding stays category
-    // scope even though the channel overwrite also denies it.
+fn category_allow_does_not_carry_into_the_channel() {
+    // Channels resolve from the guild base with their own rows, so a
+    // category-only rescue leaves the channel short at guild scope.
+    let findings = evaluate(
+        all_required() & !PERM_MOVE_MEMBERS,
+        &[overwrite(OverwriteTarget::Role(ROLE), PERM_MOVE_MEMBERS, 0)],
+        &[],
+    );
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].permission, VoicePermission::MoveMembers);
+    assert_eq!(findings[0].scope, VoicePermissionScope::Guild);
+}
+
+#[test]
+fn channel_allow_does_not_hide_a_category_denial() {
+    // The bot still cannot manage channels in the category itself.
+    let findings = evaluate(
+        all_required(),
+        &[overwrite(
+            OverwriteTarget::Everyone,
+            0,
+            PERM_MANAGE_CHANNELS,
+        )],
+        &[overwrite(
+            OverwriteTarget::Member(BOT),
+            PERM_MANAGE_CHANNELS,
+            0,
+        )],
+    );
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].permission, VoicePermission::ManageChannels);
+    assert_eq!(findings[0].scope, VoicePermissionScope::Category);
+    assert_eq!(findings[0].category_id, Some(CATEGORY));
+}
+
+#[test]
+fn category_cause_wins_when_a_synced_channel_also_denies() {
+    // A synced channel carries a copy of the category deny: one finding,
+    // naming the category override as the cause.
     let findings = evaluate(
         all_required(),
         &[overwrite(OverwriteTarget::Everyone, 0, PERM_MOVE_MEMBERS)],
@@ -273,7 +325,11 @@ fn foreign_role_and_member_overwrites_are_ignored() {
     let findings = evaluate(
         all_required(),
         &[overwrite(OverwriteTarget::Role(1000), 0, PERM_VIEW_CHANNEL)],
-        &[overwrite(OverwriteTarget::Member(1001), 0, PERM_VIEW_CHANNEL)],
+        &[overwrite(
+            OverwriteTarget::Member(1001),
+            0,
+            PERM_VIEW_CHANNEL,
+        )],
     );
     assert!(findings.is_empty());
 }
@@ -289,11 +345,29 @@ fn administrator_guild_base_yields_no_findings() {
 }
 
 #[test]
+fn administrator_bit_in_overwrites_does_not_hide_findings() {
+    let admin = |target| overwrite(target, PERM_ADMINISTRATOR, 0);
+    let findings = evaluate(
+        0,
+        &[admin(OverwriteTarget::Role(ROLE))],
+        &[admin(OverwriteTarget::Member(BOT))],
+    );
+    assert_eq!(findings.len(), 4);
+    assert!(findings
+        .iter()
+        .all(|finding| finding.scope == VoicePermissionScope::Guild));
+}
+
+#[test]
 fn findings_carry_only_enums_and_ids() {
     let findings = evaluate(
         0,
         &[overwrite(OverwriteTarget::Everyone, 0, PERM_MOVE_MEMBERS)],
-        &[overwrite(OverwriteTarget::Member(BOT), 0, PERM_VIEW_CHANNEL)],
+        &[overwrite(
+            OverwriteTarget::Member(BOT),
+            0,
+            PERM_VIEW_CHANNEL,
+        )],
     );
     assert!(!findings.is_empty());
     for finding in &findings {
@@ -354,9 +428,15 @@ fn notice_system_channel_without_setup_user_still_posts() {
 fn notice_falls_back_to_setup_user_then_owner_then_creator() {
     let mut input = candidates();
     input.system_channel_id = None;
-    assert_eq!(notice_target(input), Some(NoticeTarget::UserDm { user_id: 7 }));
+    assert_eq!(
+        notice_target(input),
+        Some(NoticeTarget::UserDm { user_id: 7 })
+    );
     input.setup_user_dm_reachable = false;
-    assert_eq!(notice_target(input), Some(NoticeTarget::UserDm { user_id: 9 }));
+    assert_eq!(
+        notice_target(input),
+        Some(NoticeTarget::UserDm { user_id: 9 })
+    );
     input.owner_dm_reachable = false;
     assert_eq!(
         notice_target(input),
@@ -439,7 +519,11 @@ fn throttle_sends_a_few_times_with_backoff_then_stops() {
 fn throttle_resolve_starts_a_fresh_budget() {
     let failure = tracked();
     let mut throttle = NoticeThrottle::new();
-    for now in [0, NOTICE_BACKOFF_MS[1], NOTICE_BACKOFF_MS[1] + NOTICE_BACKOFF_MS[2]] {
+    for now in [
+        0,
+        NOTICE_BACKOFF_MS[1],
+        NOTICE_BACKOFF_MS[1] + NOTICE_BACKOFF_MS[2],
+    ] {
         throttle.record_sent(failure, now);
     }
     assert!(!throttle.should_notify(failure, u64::MAX));

@@ -12,15 +12,18 @@ requires no `db` feature, Discord wire types, clock, or external I/O.
 
 - `resolve_effective_permissions`: standard Discord resolution as a pure
   function — guild base, then @everyone, then combined role overwrites (allow
-  wins over deny), then member overwrite. A guild-level or overwrite-granted
-  Administrator base yields all bits. Permission bits are plain `u64` values
-  (`PERM_*` constants) so no Discord types leak in.
-- `evaluate_permissions`: effective permissions for one channel under its
-  category (category overwrites apply first, then the channel's own). Each
-  missing Manage Channels / Move Members / Manage Roles / View Channel yields
-  one finding at the outermost responsible level: guild base, the category
-  overwrite (naming `category_id`), or the channel overwrite. Overwrite allows
-  can rescue a missing guild base; unrelated role/member rows are ignored.
+  wins over deny), then member overwrite. A guild-level Administrator base
+  yields all bits. Administrator is not a channel permission, so its bit is
+  ignored in overwrite masks instead of hiding findings. Permission bits are
+  plain `u64` values (`PERM_*` constants) so no Discord types leak in.
+- `evaluate_permissions`: the creator category and one channel inside it each
+  resolve from the guild base with their own overwrite rows, as Discord does
+  (a synced channel carries copies of the category rows; nothing stacks).
+  Each Manage Channels / Move Members / Manage Roles / View Channel missing
+  at either level yields one finding at the outermost responsible level:
+  guild base, the category overwrite (naming `category_id`), or the channel
+  overwrite. Overwrite allows rescue a missing guild base only where they
+  apply; unrelated role/member rows are ignored.
 - `PermissionFinding`: enums plus `category_id`/`channel_id` only — safe to
   render into a notice or `/setup` listing. No name, message text, URL or
   token can be represented here.

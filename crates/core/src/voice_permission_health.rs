@@ -70,8 +70,9 @@ pub struct OverwriteMasks {
 /// combined role overwrites, then the member overwrite. Each step applies
 /// `(permissions & !deny) | allow`, so within combined roles allow wins over
 /// deny. A guild-level Administrator base bypasses every overwrite and
-/// yields all bits; an Administrator bit granted by an overwrite likewise
-/// grants everything downstream of it.
+/// yields all bits. Administrator is not a channel permission: an overwrite
+/// can neither grant nor revoke it, so its bit is ignored in overwrite masks
+/// rather than treated as a bypass that would hide missing permissions.
 #[must_use]
 pub fn resolve_effective_permissions(
     base: u64,
@@ -84,30 +85,24 @@ pub fn resolve_effective_permissions(
     }
     let mut permissions = base;
     if let Some(masks) = everyone {
-        permissions = (permissions & !masks.deny) | masks.allow;
-        if permissions & PERM_ADMINISTRATOR != 0 {
-            return u64::MAX;
-        }
+        permissions = apply(permissions, masks);
     }
     if !role_overrides.is_empty() {
-        let mut allow = 0u64;
-        let mut deny = 0u64;
+        let mut combined = OverwriteMasks::default();
         for masks in role_overrides {
-            allow |= masks.allow;
-            deny |= masks.deny;
+            combined.allow |= masks.allow;
+            combined.deny |= masks.deny;
         }
-        permissions = (permissions & !deny) | allow;
-        if permissions & PERM_ADMINISTRATOR != 0 {
-            return u64::MAX;
-        }
+        permissions = apply(permissions, combined);
     }
     if let Some(masks) = member {
-        permissions = (permissions & !masks.deny) | masks.allow;
-        if permissions & PERM_ADMINISTRATOR != 0 {
-            return u64::MAX;
-        }
+        permissions = apply(permissions, masks);
     }
     permissions
+}
+
+fn apply(permissions: u64, masks: OverwriteMasks) -> u64 {
+    ((permissions & !masks.deny) | masks.allow) & !PERM_ADMINISTRATOR
 }
 
 /// One missing permission attributed to the outermost level responsible for
@@ -126,15 +121,19 @@ pub struct PermissionFinding {
     pub channel_id: Option<Snowflake>,
 }
 
-/// Evaluate effective permissions for one channel under its category.
+/// Evaluate the bot's effective permissions on a creator category and one
+/// channel inside it.
 ///
-/// Category overwrites apply first, then the channel's own overwrites. Each
-/// missing permission yields exactly one finding at the outermost level
-/// responsible: guild base lacks it, else the category overwrite removed it
-/// (naming `category_id`), else the channel overwrite removed it. An
-/// overwrite `allow` can rescue a missing guild base, and a guild-level
-/// Administrator base yields no findings. Role overwrites apply only for
-/// `bot_roles`; member overwrites only for `bot_id`.
+/// As in Discord, the category and the channel each resolve from the guild
+/// base with their own overwrite rows; a channel does not stack on its
+/// category's overwrites (a synced channel simply carries copies of them).
+/// Each required permission missing from either level yields exactly one
+/// finding at the outermost responsible level: the guild base lacks it, else
+/// the category overwrite removed it (naming `category_id`), else the
+/// channel overwrite removed it. Overwrite `allow`s rescue a missing guild
+/// base only where they apply, and a guild-level Administrator base yields
+/// no findings. Role overwrites apply only for `bot_roles`; member
+/// overwrites only for `bot_id`.
 #[must_use]
 pub fn evaluate_permissions(
     guild_perms: u64,
@@ -159,19 +158,20 @@ pub fn evaluate_permissions(
         category_member,
     );
     let channel_effective = resolve_effective_permissions(
-        category_effective,
+        guild_perms,
         channel_everyone,
         &channel_roles,
         channel_member,
     );
     let mut findings = Vec::new();
     for (permission, bit) in REQUIRED {
-        if channel_effective & bit != 0 {
+        let category_missing = category_effective & bit == 0;
+        if !category_missing && channel_effective & bit != 0 {
             continue;
         }
         let (scope, category, channel) = if guild_perms & bit == 0 {
             (VoicePermissionScope::Guild, None, None)
-        } else if category_effective & bit == 0 {
+        } else if category_missing {
             (VoicePermissionScope::Category, Some(category_id), None)
         } else {
             (VoicePermissionScope::Channel, None, Some(channel_id))
@@ -272,10 +272,7 @@ pub fn notice_target(candidates: NoticeCandidates) -> Option<NoticeTarget> {
             mention_user_id: candidates.setup_user_id,
         });
     }
-    if let (Some(user_id), true) = (
-        candidates.setup_user_id,
-        candidates.setup_user_dm_reachable,
-    ) {
+    if let (Some(user_id), true) = (candidates.setup_user_id, candidates.setup_user_dm_reachable) {
         return Some(NoticeTarget::UserDm { user_id });
     }
     if let (Some(user_id), true) = (candidates.owner_id, candidates.owner_dm_reachable) {
@@ -370,7 +367,8 @@ impl NoticeThrottle {
     /// Drop every failure for one guild. Returns the number removed.
     pub fn clear_guild(&mut self, guild_id: Snowflake) -> usize {
         let before = self.entries.len();
-        self.entries.retain(|failure, _| failure.guild_id != guild_id);
+        self.entries
+            .retain(|failure, _| failure.guild_id != guild_id);
         before - self.entries.len()
     }
 
