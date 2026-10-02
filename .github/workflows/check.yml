@@ -682,6 +682,8 @@ jobs:
         run: python3 ../scripts/test-deploy-production.py
       - name: Verify release reconciliation retries
         run: python3 ../scripts/test-release-retry.py
+      - name: Verify staging rollout provenance (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
       - name: Verify runner routing for every workflow job
         run: python3 ../scripts/test-runner-routing.py
       - name: Verify offline release lifecycle

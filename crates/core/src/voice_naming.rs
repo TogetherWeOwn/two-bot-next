@@ -47,8 +47,8 @@
 //! Conditionals (`{{cond ?? yes // no}}`) and styling (`""mode:text""`) are
 //! parsed into [`Segment::Extension`] nodes but evaluated through the
 //! [`ExtensionPolicy`] trait. V5 ships [`PassthroughExtensions`], which
-//! leaves them as literal text; the V6 slice implements the trait with real
-//! conditional and styling passes without touching the parser or pipeline.
+//! leaves them as literal text; [`crate::voice_template::TemplateExtensions`]
+//! implements the trait with the real V6 conditional and styling passes.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1313,11 +1313,27 @@ pub fn resolve_majority_game(
     owner_game: Option<&str>,
     options: &GameOptions,
 ) -> String {
-    let no_game = if options.no_game_label.is_empty() {
+    let games = majority_games(activities, owner_game, options);
+    if !games.is_empty() {
+        return games.join(" & ");
+    }
+    if options.no_game_label.is_empty() {
         "General".to_string()
     } else {
         options.no_game_label.clone()
-    };
+    }
+}
+
+/// The aliased titles [`resolve_majority_game`] shows, under the same rules:
+/// one title, both titles of a two-way tie (alphabetical), or none when no
+/// member shows a game or three or more tie. Feed this to the V6 `GAME`
+/// condition so a condition always agrees with `@@game_name@@`.
+#[must_use]
+pub fn majority_games(
+    activities: &[Option<String>],
+    owner_game: Option<&str>,
+    options: &GameOptions,
+) -> Vec<String> {
     let canonical = |title: &str| -> String {
         options
             .aliases
@@ -1337,18 +1353,18 @@ pub fn resolve_majority_game(
         }
     }
     if counts.is_empty() {
-        return no_game;
+        return Vec::new();
     }
     if options.force_single {
         if let Some(owner) = owner_game {
             let owned = canonical(owner);
             if counts.contains_key(&owned) {
-                return owned;
+                return vec![owned];
             }
         }
         let mut ranked: Vec<&String> = counts.keys().collect();
         ranked.sort_by(|a, b| counts[*a].cmp(&counts[*b]).reverse().then_with(|| a.cmp(b)));
-        return ranked[0].clone();
+        return vec![ranked[0].clone()];
     }
 
     let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
@@ -1357,15 +1373,15 @@ pub fn resolve_majority_game(
         ranked[0].1 += idle;
     }
     let top = ranked[0].1;
-    let leaders: Vec<&String> = ranked
-        .iter()
+    let leaders: Vec<String> = ranked
+        .into_iter()
         .filter(|(_, count)| *count == top)
         .map(|(name, _)| name)
         .collect();
-    match leaders.len() {
-        1 => leaders[0].clone(),
-        2 => format!("{} & {}", leaders[0], leaders[1]),
-        _ => no_game,
+    if leaders.len() > 2 {
+        Vec::new()
+    } else {
+        leaders
     }
 }
 
@@ -1392,15 +1408,30 @@ pub const DEFAULT_NAME_TEMPLATE: &str =
 /// to `raw_name` without touching the engine, and an empty render falls back
 /// through [`RoomContext::fallback_name`] (wired to `raw_name` here).
 /// Output is never empty and never over [`MAX_NAME_LEN`] characters.
+///
+/// This renders conditionals and styling as literal text; runtime callers
+/// use [`crate::voice_template::resolve_room_name`] for full V6 behaviour.
 #[must_use]
 pub fn resolve_room_name(template: &str, ctx: &RoomContext, raw_name: &str) -> String {
+    resolve_room_name_with(template, ctx, raw_name, &PassthroughExtensions)
+}
+
+/// [`resolve_room_name`] with a caller-chosen [`ExtensionPolicy`], under the
+/// same fallback contract.
+#[must_use]
+pub fn resolve_room_name_with<E: ExtensionPolicy>(
+    template: &str,
+    ctx: &RoomContext,
+    raw_name: &str,
+    extensions: &E,
+) -> String {
     let fallback = finalize_raw(raw_name);
     if template.trim().is_empty() || template.len() > MAX_TEMPLATE_BYTES {
         return fallback;
     }
     let mut ctx = ctx.clone();
     ctx.fallback_name = fallback;
-    render_str(template, &ctx)
+    render(&parse(template), &ctx, extensions)
 }
 
 /// Trim → truncate → built-in default, mirroring the engine's pipeline tail.

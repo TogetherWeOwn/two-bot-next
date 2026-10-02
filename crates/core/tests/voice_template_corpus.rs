@@ -1,5 +1,5 @@
 //! Runs the independent voice-template corpus (`tests/voice_templates/`)
-//! against the V5 naming engine with [`PassthroughExtensions`].
+//! against the naming engine with the full V6 policy, [`TemplateExtensions`].
 //!
 //! The corpus was authored from `docs/voice-rooms.md`, not from this engine.
 //! Expected outputs are never edited here: a spec-vs-engine disagreement is a
@@ -11,89 +11,21 @@
 //!   `stability_groups` entry must render the same output across contexts.
 //! - `deferred` cases await spec clarification: skipped and counted.
 //!
-//! Cases that need V6 conditionals or styling are listed in [`PENDING`]. The
-//! list may only shrink: a pending case that starts passing fails the test
-//! until its ID is removed, and any non-pending case that fails is a
-//! regression.
+//! Every non-deferred case must pass, including the V6 conditional and
+//! styling cases.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::Deserialize;
 use time::{Date, Month};
+use two_bot_core::voice_conditions::ConditionFacts;
 use two_bot_core::voice_naming::{
-    parse, render, resolve_majority_game, ChannelKind, GameOptions, PartyInfo,
-    PassthroughExtensions, RoomContext,
+    majority_games, parse, render, resolve_majority_game, ChannelKind, GameOptions, PartyInfo,
+    RoomContext,
 };
+use two_bot_core::voice_template::TemplateExtensions;
 
 const CORPUS: &str = include_str!("../../../tests/voice_templates/corpus.json");
-
-/// Non-deferred cases that need the V6 conditional or styling policy. Remove
-/// an ID once the engine renders that case as the corpus expects.
-const PENDING: &[&str] = &[
-    // V6 conditionals: `{{cond ?? yes // no}}`.
-    "weekend-Monday",
-    "weekend-Tuesday",
-    "weekend-Wednesday",
-    "weekend-Thursday",
-    "weekend-Friday",
-    "weekend-Saturday",
-    "weekend-Sunday",
-    "compare-equal-lt",
-    "compare-equal-gt",
-    "compare-equal-le",
-    "compare-equal-ge",
-    "compare-equal-eq",
-    "compare-equal-ne",
-    "compare-num-limit",
-    "compare-slots-limit",
-    "compare-hour",
-    "compare-room-number",
-    "compare-literal",
-    "full-unlimited",
-    "full-full",
-    "full-space",
-    "private-temporary-False",
-    "private-temporary-True",
-    "private-standalone-False",
-    "private-standalone-True",
-    "role-solo",
-    "role-role-owner",
-    "role-role-other",
-    "any-role-solo",
-    "any-role-role-owner",
-    "any-role-role-other",
-    "person-condition-MEMBER:owner",
-    "person-condition-MEMBER:absent",
-    "person-condition-OWNER:owner",
-    "person-condition-OWNER:absent",
-    "game-condition-GAME:Ape",
-    "game-condition-GAME=Apex",
-    "game-condition-GAME!=Apex",
-    "game-condition-GAME=Chess",
-    "condition-unknown",
-    "condition-name-not-expanded",
-    "optional-else-false",
-    "optional-else-true",
-    "nested-role-owner",
-    "nested-private-temporary-True",
-    "nested-solo",
-    "order-condition-token-style",
-    "discarded-branch",
-    // V6 styling: `""mode:text""`, including the seeded `rand` invariants.
-    "style-upper",
-    "style-caps",
-    "style-lower",
-    "style-title",
-    "style-swap",
-    "style-remshort",
-    "style-1w",
-    "style-2w",
-    "style-chain",
-    "style-unknown",
-    "style-unknown-chain",
-    "random-case-stable",
-    "random-case-stable-rename",
-];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,7 +44,6 @@ struct CorpusContext {
     channel_kind: String,
     number: u32,
     limit: u32,
-    #[allow(dead_code)]
     private: bool,
     seed: String,
     owner_id: String,
@@ -128,7 +59,6 @@ struct Member {
     id: String,
     display_name: String,
     nick: Option<String>,
-    #[allow(dead_code)]
     roles: Vec<String>,
     game: Option<String>,
     live_discord: bool,
@@ -204,11 +134,19 @@ struct StabilityGroup {
     case_ids: Vec<String>,
 }
 
+/// One corpus context as the engine sees it: name tokens and V6 condition
+/// facts.
+struct Room {
+    context: RoomContext,
+    facts: ConditionFacts,
+}
+
 /// Adapt the implementation-independent snapshot to the engine's context,
-/// following V5 and V7: owner name prefers `/nick`, the game is the
+/// following V5 to V7: owner name prefers `/nick`, the game is the
 /// alias-resolved majority, and parties are deduplicated by ID in first-seen
-/// order.
-fn room_context(context: &CorpusContext) -> RoomContext {
+/// order. Condition facts come from the same snapshot, so `GAME` reads the
+/// titles `@@game_name@@` shows and roles are those of the members present.
+fn room(context: &CorpusContext) -> Room {
     let owner = context.members.iter().find(|m| m.id == context.owner_id);
     let mut parties: Vec<(&str, PartyInfo)> = Vec::new();
     for party in context.members.iter().filter_map(|m| m.party.as_ref()) {
@@ -231,7 +169,9 @@ fn room_context(context: &CorpusContext) -> RoomContext {
         count_idle_toward_majority: context.settings.include_inactive,
         no_game_label: context.settings.no_game.clone(),
     };
-    RoomContext {
+    let owner_game = owner.and_then(|m| m.game.as_deref());
+    let count = |is: fn(&Member) -> bool| context.members.iter().filter(|m| is(m)).count() as u32;
+    let room_context = RoomContext {
         channel_kind: match context.channel_kind.as_str() {
             "temporary" => ChannelKind::Temporary,
             "standalone" | "stage" => ChannelKind::Standalone,
@@ -244,13 +184,9 @@ fn room_context(context: &CorpusContext) -> RoomContext {
         original_creator_name: context.original_creator_name.clone(),
         member_count: context.members.len() as u32,
         owner_present: owner.is_some(),
-        live_count: context.members.iter().filter(|m| is_live(m)).count() as u32,
+        live_count: count(is_live),
         user_limit: context.limit,
-        game_name: resolve_majority_game(
-            &activities,
-            owner.and_then(|m| m.game.as_deref()),
-            &game_options,
-        ),
+        game_name: resolve_majority_game(&activities, owner_game, &game_options),
         stream_title: owner
             .filter(|m| is_live(m))
             .and_then(|m| m.stream_title.clone())
@@ -262,6 +198,27 @@ fn room_context(context: &CorpusContext) -> RoomContext {
         seed: seed(&context.seed),
         named_lists: context.settings.named_lists.clone(),
         fallback_name: String::new(),
+    };
+    let facts = ConditionFacts {
+        owner_id: Some(context.owner_id.clone()),
+        owner_role_ids: owner.map(|m| m.roles.clone()).unwrap_or_default(),
+        member_ids: context.members.iter().map(|m| m.id.clone()).collect(),
+        member_role_ids: context
+            .members
+            .iter()
+            .flat_map(|m| m.roles.iter().cloned())
+            .collect(),
+        owner_playing: owner_game.is_some(),
+        owner_live_discord: owner.is_some_and(|m| m.live_discord),
+        owner_live_external: owner.is_some_and(|m| m.live_external),
+        live_discord_count: count(|m| m.live_discord),
+        live_external_count: count(|m| m.live_external),
+        games: majority_games(&activities, owner_game, &game_options),
+        private: context.private,
+    };
+    Room {
+        context: room_context,
+        facts,
     }
 }
 
@@ -296,13 +253,17 @@ fn seed(value: &str) -> u64 {
     })
 }
 
-fn render_case(case: &Case, contexts: &BTreeMap<String, RoomContext>) -> String {
-    let context = &contexts[&case.context];
-    render(&parse(&case.input), context, &PassthroughExtensions)
+fn render_case(case: &Case, rooms: &BTreeMap<String, Room>) -> String {
+    let room = &rooms[&case.context];
+    render(
+        &parse(&case.input),
+        &room.context,
+        &TemplateExtensions::new(&room.facts),
+    )
 }
 
 /// Why an invariant case fails, or `None` when every declared constraint holds.
-fn invariant_failure(case: &Case, contexts: &BTreeMap<String, RoomContext>) -> Option<String> {
+fn invariant_failure(case: &Case, rooms: &BTreeMap<String, Room>) -> Option<String> {
     let Expected::Invariant {
         nonempty,
         max_characters,
@@ -313,7 +274,7 @@ fn invariant_failure(case: &Case, contexts: &BTreeMap<String, RoomContext>) -> O
     else {
         unreachable!("invariant case");
     };
-    let output = render_case(case, contexts);
+    let output = render_case(case, rooms);
     let mut failures = Vec::new();
     if *nonempty && output.is_empty() {
         failures.push("empty output".to_string());
@@ -321,7 +282,7 @@ fn invariant_failure(case: &Case, contexts: &BTreeMap<String, RoomContext>) -> O
     if output.chars().count() > *max_characters {
         failures.push(format!("over {max_characters} characters"));
     }
-    if *stable_for_same_context && render_case(case, contexts) != output {
+    if *stable_for_same_context && render_case(case, rooms) != output {
         failures.push("repeat render differs".to_string());
     }
     if let Some(allowed) = allowed_outputs
@@ -348,20 +309,16 @@ fn invariant_failure(case: &Case, contexts: &BTreeMap<String, RoomContext>) -> O
 fn voice_template_corpus_matches_engine() {
     let corpus: Corpus = serde_json::from_str(CORPUS).expect("corpus parses");
     assert_eq!(corpus.version, 1, "corpus version");
-    let contexts: BTreeMap<String, RoomContext> = corpus
+    let rooms: BTreeMap<String, Room> = corpus
         .contexts
         .iter()
-        .map(|(name, context)| (name.clone(), room_context(context)))
+        .map(|(name, context)| (name.clone(), room(context)))
         .collect();
-    let pending: BTreeSet<&str> = PENDING.iter().copied().collect();
-    assert_eq!(pending.len(), PENDING.len(), "duplicate PENDING entry");
 
     let mut ids = BTreeSet::new();
-    let (mut exact_pass, mut exact_pending, mut invariant_pass, mut invariant_pending) =
-        (0usize, 0usize, 0usize, 0usize);
+    let (mut exact_pass, mut invariant_pass) = (0usize, 0usize);
     let mut deferred: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut regressions = Vec::new();
-    let mut now_passing = Vec::new();
+    let mut failures = Vec::new();
 
     for case in &corpus.cases {
         assert!(
@@ -370,40 +327,28 @@ fn voice_template_corpus_matches_engine() {
             case.id
         );
         assert!(
-            contexts.contains_key(&case.context),
+            rooms.contains_key(&case.context),
             "{}: missing context",
             case.id
         );
-        let is_pending = pending.contains(case.id.as_str());
         let failure = match &case.expected {
             Expected::Deferred { ambiguity_id } => {
-                assert!(!is_pending, "{}: deferred cases cannot be PENDING", case.id);
                 *deferred.entry(ambiguity_id.as_str()).or_default() += 1;
                 continue;
             }
             Expected::Exact { output } => {
-                let actual = render_case(case, &contexts);
+                let actual = render_case(case, &rooms);
                 (actual != *output)
                     .then(|| format!("{}: expected {output:?}, actual {actual:?}", case.id))
             }
-            Expected::Invariant { .. } => invariant_failure(case, &contexts),
+            Expected::Invariant { .. } => invariant_failure(case, &rooms),
         };
-        let is_exact = matches!(case.expected, Expected::Exact { .. });
-        match (failure, is_pending) {
-            (None, false) if is_exact => exact_pass += 1,
-            (None, false) => invariant_pass += 1,
-            (Some(_), true) if is_exact => exact_pending += 1,
-            (Some(_), true) => invariant_pending += 1,
-            (Some(message), false) => regressions.push(message),
-            (None, true) => now_passing.push(case.id.clone()),
+        match failure {
+            Some(message) => failures.push(message),
+            None if matches!(case.expected, Expected::Exact { .. }) => exact_pass += 1,
+            None => invariant_pass += 1,
         }
     }
-
-    let stale: Vec<&&str> = pending.iter().filter(|id| !ids.contains(**id)).collect();
-    assert!(
-        stale.is_empty(),
-        "PENDING names unknown case IDs: {stale:?}"
-    );
 
     for group in &corpus.stability_groups {
         let outputs: BTreeSet<String> = group
@@ -411,11 +356,11 @@ fn voice_template_corpus_matches_engine() {
             .iter()
             .map(|id| {
                 let case = corpus.cases.iter().find(|c| &c.id == id);
-                render_case(case.expect("stability case exists"), &contexts)
+                render_case(case.expect("stability case exists"), &rooms)
             })
             .collect();
         if outputs.len() != 1 {
-            regressions.push(format!(
+            failures.push(format!(
                 "{}: outputs differ across renames: {outputs:?}",
                 group.id
             ));
@@ -424,23 +369,18 @@ fn voice_template_corpus_matches_engine() {
 
     let deferred_total: usize = deferred.values().sum();
     eprintln!(
-        "voice template corpus: {} cases | exact {exact_pass} pass / {exact_pending} pending | \
-         invariant {invariant_pass} pass / {invariant_pending} pending | {deferred_total} deferred \
-         | {} stability groups",
+        "voice template corpus: {} cases | exact {exact_pass} pass | invariant {invariant_pass} \
+         pass | {deferred_total} deferred | {} stability groups",
         corpus.cases.len(),
         corpus.stability_groups.len(),
     );
     eprintln!("deferred by ambiguity: {deferred:?}");
 
     assert!(
-        now_passing.is_empty(),
-        "PENDING cases now pass; remove them from PENDING: {now_passing:?}"
-    );
-    assert!(
-        regressions.is_empty(),
+        failures.is_empty(),
         "{} corpus case(s) disagree with the engine:\n{}",
-        regressions.len(),
-        regressions.join("\n")
+        failures.len(),
+        failures.join("\n")
     );
     // Corpus totals come from an untyped read, independent of the loop above.
     let raw: serde_json::Value = serde_json::from_str(CORPUS).expect("corpus parses");
@@ -451,13 +391,9 @@ fn voice_template_corpus_matches_engine() {
             .filter(|case| case["expected"]["kind"] == kind)
             .count()
     };
+    assert_eq!(exact_pass, total_of("exact"), "exact counts reconcile");
     assert_eq!(
-        exact_pass + exact_pending,
-        total_of("exact"),
-        "exact counts reconcile"
-    );
-    assert_eq!(
-        invariant_pass + invariant_pending,
+        invariant_pass,
         total_of("invariant"),
         "invariant counts reconcile"
     );
@@ -467,13 +403,8 @@ fn voice_template_corpus_matches_engine() {
         "deferred counts reconcile"
     );
     assert_eq!(
-        exact_pass + exact_pending + invariant_pass + invariant_pending + deferred_total,
+        exact_pass + invariant_pass + deferred_total,
         raw_cases.len(),
-        "pass + pending + deferred reconcile with the corpus total"
-    );
-    assert_eq!(
-        exact_pending + invariant_pending,
-        PENDING.len(),
-        "every PENDING ID counted"
+        "pass + deferred reconcile with the corpus total"
     );
 }

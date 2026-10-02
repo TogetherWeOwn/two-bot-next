@@ -33,9 +33,17 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
 # Real sources; the release profile (opt-level=z, lto, strip) targets the
 # `lite` 256 MiB ceiling from ADR 0001.
 COPY . .
+# Non-secret build provenance, compiled into readiness (not a runtime override).
+ARG BOT_BUILD_REVISION=unknown
+ARG BOT_BUILD_ID=unknown
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS certificates
+
+ARG BOT_BUILD_REVISION=unknown
+ARG BOT_BUILD_ID=unknown
+LABEL org.opencontainers.image.revision=$BOT_BUILD_REVISION \
+      com.togetherweown.build-id=$BOT_BUILD_ID
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
