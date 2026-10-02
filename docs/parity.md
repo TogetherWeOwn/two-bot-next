@@ -175,7 +175,7 @@ Migrations: legacy `migrations/0001–0034` (49 files); numbering reserved bot `
 | Tables | Purpose | Map |
 |---|---|---|
 | `events`, `members`, `invite_snapshots` | append-only funnel log + member projection + invite snapshots | **S3** queries, **S6** migrations |
-| `internal_nonces`, `internal_idempotency`, `internal_action_log`, `internal_discord_events` | website-callback replay guard, idempotency, audit, dedupe | **[TOG-9880](/TOG/issues/TOG-9880)** |
+| `internal_nonces`, `internal_clock_high_water`, `internal_idempotency`, `internal_action_log`, `internal_discord_events` | website-callback replay guard (plus its F8 clock high-water mark), idempotency, audit, dedupe | **[TOG-9880](/TOG/issues/TOG-9880)** |
 | `web_contract_meta`, `guild_counters`, `rank_ladder`, `rank_snapshots`, `member_ranks`, `scheduled_events` | website read contract | **S5/S6**, `web_v1` views preserved (**S6**) |
 | `presence_probe` | hourly presence series | **S5** |
 | `counter_snapshots`, `member_exclusions` | live-count audit history, raid exclusions | **S5** |
