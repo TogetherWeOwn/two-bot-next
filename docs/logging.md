@@ -69,9 +69,11 @@ Example (field ordering is not a contract):
 ## Lifecycle event catalog
 
 Names below are stable. Add names rather than renaming existing ones. `ready`
-and `gateway_resumed` are emitted only after successful durable dispatch commit,
-not merely receipt of a Discord packet. A token-free boot parks the gateway;
-`http_listening` is **not** proof of Discord readiness.
+and `gateway_resumed` are emitted only after successful durable dispatch commit
+with a fresh generation, not merely receipt of a Discord packet. A token-free
+boot parks the gateway; `http_listening` is **not** proof of Discord readiness.
+Reception ends cooperatively through the drain, not a stream-end event; the
+draining state is observable via `/readyz` and `shutdown_started/completed`.
 
 | `msg` | Emission point / fields |
 | --- | --- |
@@ -84,7 +86,6 @@ not merely receipt of a Discord packet. A token-free boot parks the gateway;
 | `gateway_resumed` | RESUMED processed and checkpoint committed; `shard` |
 | `shard_closed` | Gateway close received; optional `code`, no close reason/session |
 | `gateway_reconnect_failed` | Twilight reconnect failed; retry remains Twilight-owned |
-| `gateway_stream_ended` | Stream ended; supervisor requires restart |
 | `gateway_failed` | Durable gateway task failed; no SQL/task error or URL |
 | `http_listening` | Listener bound; `addr` (bind address only) |
 | `settings_applied` | Hot-setting refresh report logged; `revision`, `hot_keys` |

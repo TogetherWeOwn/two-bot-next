@@ -503,6 +503,8 @@ pub enum ErrorCode {
     StaleRequest,
     ActionNotAllowed,
     Replayed,
+    /// A settings row changed since the caller observed it; refresh, do not retry blindly.
+    VersionConflict,
     /// The one 409 that IS retryable: an earlier attempt at this same operation
     /// has not finished yet. Retrying with the same key is exactly right.
     InProgress,
@@ -523,6 +525,7 @@ impl ErrorCode {
             Self::StaleRequest => "stale_request",
             Self::ActionNotAllowed => "action_not_allowed",
             Self::Replayed => "replayed",
+            Self::VersionConflict => "version_conflict",
             Self::InProgress => "in_progress",
             Self::DiscordRejected => "discord_rejected",
             Self::RateLimited => "rate_limited",
@@ -539,7 +542,7 @@ impl ErrorCode {
             Self::Malformed => 400,
             Self::Unauthorized | Self::StaleRequest => 401,
             Self::ActionNotAllowed => 403,
-            Self::Replayed | Self::InProgress => 409,
+            Self::Replayed | Self::VersionConflict | Self::InProgress => 409,
             Self::DiscordRejected => 422,
             Self::RateLimited => 429,
             Self::Internal => 500,
@@ -562,6 +565,7 @@ impl ErrorCode {
             | Self::StaleRequest
             | Self::ActionNotAllowed
             | Self::Replayed
+            | Self::VersionConflict
             | Self::DiscordRejected => false,
         }
     }
@@ -1003,27 +1007,42 @@ pub fn require_reason(value: &Value) -> Result<String, ActionError> {
     }
 }
 
-/// An ISO-8601 instant, normalised to RFC 3339 — what Discord wants.
+/// Epoch-millis bounds of the unsigned four-digit years `toISOString()`
+/// prints: `0000-01-01T00:00:00.000Z` ..= `9999-12-31T23:59:59.999Z`.
+const MIN_ISO_MILLIS: i64 = -62_167_219_200_000;
+const MAX_ISO_MILLIS: i64 = 253_402_300_799_999;
+
+/// An ISO-8601 instant, normalised like legacy `new Date(ms).toISOString()`:
+/// UTC with millisecond precision (`…T19:00:00.000Z`), which is the exact form
+/// legacy sends Discord and stores in the event mirror.
 /// Deliberate tightening vs legacy `Date.parse`: legacy accepted any string
 /// the JS engine could date-parse; the Rust port requires RFC 3339, which is
 /// what the website already sends (`toISOString()`).
 pub fn require_timestamp(body: &Map<String, Value>, field: &str) -> Result<String, ActionError> {
+    timestamp_millis(body, field).map(crate::funnel::format_iso_millis)
+}
+
+/// `require_timestamp` as epoch millis, so callers can compare instants
+/// without re-parsing the normalised string.
+fn timestamp_millis(body: &Map<String, Value>, field: &str) -> Result<i64, ActionError> {
     use time::format_description::well_known::Rfc3339;
     let value = require_field_str(body, field)?;
-    let parsed = time::OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+    let malformed = || {
         ActionError::new(
             ErrorCode::Malformed,
             format!(r#""{field}" must be an ISO-8601 timestamp"#),
             format!("bad_{field}"),
         )
-    })?;
-    parsed.format(&Rfc3339).map_err(|_| {
-        ActionError::new(
-            ErrorCode::Internal,
-            "failed to format timestamp",
-            "timestamp_format",
-        )
-    })
+    };
+    let parsed = time::OffsetDateTime::parse(value, &Rfc3339).map_err(|_| malformed())?;
+    // JS Dates hold whole milliseconds; sub-millisecond digits truncate.
+    let millis = parsed.unix_timestamp_nanos().div_euclid(1_000_000);
+    // A four-digit local year can leave 0000-9999 once shifted to UTC
+    // (`9999-12-31T23:30:00-01:00`); refuse it rather than emit `10000-…Z`.
+    i64::try_from(millis)
+        .ok()
+        .filter(|ms| (MIN_ISO_MILLIS..=MAX_ISO_MILLIS).contains(ms))
+        .ok_or_else(malformed)
 }
 
 /// What `validate_idempotency_key` accepts. A UUID is what the doc asks for,
@@ -1132,7 +1151,6 @@ pub fn validate_event_input(
     body: &Map<String, Value>,
     channel_keys: &HashMap<String, String>,
 ) -> Result<EventInput, ActionError> {
-    use time::format_description::well_known::Rfc3339;
     let name = require_field_str(body, "name")?;
     if utf16_len(name) > MAX_EVENT_NAME_CHARS {
         return Err(ActionError::new(
@@ -1141,12 +1159,8 @@ pub fn validate_event_input(
             "name_too_long",
         ));
     }
-    let starts_at = require_timestamp(body, "starts_at")?;
-    let ends_at = require_timestamp(body, "ends_at")?;
-    let starts = time::OffsetDateTime::parse(&starts_at, &Rfc3339)
-        .expect("require_timestamp just normalised this");
-    let ends = time::OffsetDateTime::parse(&ends_at, &Rfc3339)
-        .expect("require_timestamp just normalised this");
+    let starts = timestamp_millis(body, "starts_at")?;
+    let ends = timestamp_millis(body, "ends_at")?;
     if ends <= starts {
         return Err(ActionError::new(
             ErrorCode::Malformed,
@@ -1197,8 +1211,8 @@ pub fn validate_event_input(
     };
     Ok(EventInput {
         name: name.to_owned(),
-        starts_at,
-        ends_at,
+        starts_at: crate::funnel::format_iso_millis(starts),
+        ends_at: crate::funnel::format_iso_millis(ends),
         description,
         place,
     })
@@ -1231,6 +1245,56 @@ pub fn validate_guild_add_member(body: &Map<String, Value>) -> Result<(), Action
     require_snowflake(body, "discord_id")?;
     require_field_str(body, "access_token")?;
     Ok(())
+}
+
+/// Resolved allowlisted role assignment. No caller can supply an arbitrary role ID.
+#[derive(Debug, Clone, Copy)]
+pub struct RoleAssignRequest<'a> {
+    discord_id: &'a str,
+    role_id: &'a str,
+}
+
+impl<'a> RoleAssignRequest<'a> {
+    pub fn validate(
+        body: &'a Map<String, Value>,
+        role_keys: &'a HashMap<String, String>,
+    ) -> Result<Self, ActionError> {
+        let role_id = validate_role_assign(body, role_keys)?;
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+            role_id,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    #[must_use]
+    pub fn role_id(&self) -> &str {
+        self.role_id
+    }
+}
+
+/// Validated member subject only. The OAuth token stays a separate transient argument.
+#[derive(Debug, Clone, Copy)]
+pub struct GuildAddMemberRequest<'a> {
+    discord_id: &'a str,
+}
+
+impl<'a> GuildAddMemberRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        validate_guild_add_member(body)?;
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
 }
 
 /// `announcement.post` field validation: channel through the key map, body
@@ -2114,6 +2178,7 @@ mod tests {
             (ErrorCode::StaleRequest, 401, false),
             (ErrorCode::ActionNotAllowed, 403, false),
             (ErrorCode::Replayed, 409, false),
+            (ErrorCode::VersionConflict, 409, false),
             (ErrorCode::InProgress, 409, true),
             (ErrorCode::DiscordRejected, 422, false),
             (ErrorCode::RateLimited, 429, true),
@@ -2475,6 +2540,70 @@ mod tests {
         backwards.insert("location".to_owned(), json!("Park"));
         backwards.insert("ends_at".to_owned(), json!("2026-10-01T17:00:00Z"));
         assert!(validate_event_input(&backwards, &keys).is_err());
+    }
+
+    /// Legacy `requireTimestamp` returns `new Date(ms).toISOString()`.
+    #[test]
+    fn timestamps_normalise_like_to_iso_string() {
+        let cases = [
+            ("2026-10-01T18:00:00Z", "2026-10-01T18:00:00.000Z"),
+            ("2026-10-01T19:00:00+01:00", "2026-10-01T18:00:00.000Z"),
+            ("2026-10-01T18:00:00.1239Z", "2026-10-01T18:00:00.123Z"),
+            ("2026-10-01T00:30:00-01:00", "2026-10-01T01:30:00.000Z"),
+        ];
+        for (raw, expected) in cases {
+            let body = map(json!({ "starts_at": raw }));
+            assert_eq!(
+                require_timestamp(&body, "starts_at").expect(raw),
+                expected,
+                "{raw}"
+            );
+        }
+        // The extremes `toISOString()` prints without a sign.
+        for (raw, expected) in [
+            ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00.000Z"),
+            ("9999-12-31T23:59:59.999Z", "9999-12-31T23:59:59.999Z"),
+            ("0000-01-01T00:30:00+00:30", "0000-01-01T00:00:00.000Z"),
+        ] {
+            let body = map(json!({ "starts_at": raw }));
+            assert_eq!(
+                require_timestamp(&body, "starts_at").expect(raw),
+                expected,
+                "{raw}"
+            );
+        }
+        // Garbage, and local years that leave 0000-9999 once shifted to UTC.
+        for raw in [
+            "next tuesday",
+            "9999-12-31T23:30:00-01:00",
+            "0000-01-01T00:30:00+01:00",
+        ] {
+            let bad = map(json!({ "starts_at": raw }));
+            let err = require_timestamp(&bad, "starts_at").expect_err(raw);
+            assert_eq!(err.code, ErrorCode::Malformed, "{raw}");
+            assert_eq!(err.log_reason, "bad_starts_at", "{raw}");
+        }
+    }
+
+    /// Out-of-range instants are a typed refusal, never a panic.
+    #[test]
+    fn event_input_refuses_utc_years_outside_four_digits() {
+        let keys = HashMap::new();
+        for (field, raw) in [
+            ("starts_at", "0000-01-01T00:30:00+01:00"),
+            ("ends_at", "9999-12-31T23:30:00-01:00"),
+        ] {
+            let mut body = map(json!({
+                "name": "Raid night",
+                "starts_at": "2026-10-01T18:00:00Z",
+                "ends_at": "2026-10-01T19:00:00Z",
+                "location": "Park",
+            }));
+            body.insert(field.to_owned(), json!(raw));
+            let err = validate_event_input(&body, &keys).expect_err(raw);
+            assert_eq!(err.code, ErrorCode::Malformed, "{raw}");
+            assert_eq!(err.log_reason, format!("bad_{field}"), "{raw}");
+        }
     }
 
     #[test]

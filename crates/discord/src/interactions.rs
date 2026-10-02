@@ -103,30 +103,168 @@ pub fn route_interaction(
     }
 }
 
-/// Refusal reply: ephemeral, legacy text, content capped the way legacy
-/// `ephemeralReply` caps (2000 chars; refusal texts are far shorter).
+use crate::{ActionExecutor, DiscordError};
+use std::{fmt::Debug, future::Future};
+use two_bot_core::router::replies::{
+    run_handler, InteractionReply, ReplyError, ReplyOperation, ReplyPolicy, ReplySession,
+    ReplyTransport, UNKNOWN_INTERACTION_REPLY,
+};
+
+/// Text replies suppress all mentions and respect Discord's content ceiling.
 #[must_use]
-pub fn refusal_response(refusal: RouterRefusal) -> InteractionResponse {
+pub fn text_response(reply: InteractionReply) -> InteractionResponse {
     InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
-            content: Some(refusal.message()),
-            flags: Some(MessageFlags::EPHEMERAL),
+            allowed_mentions: Some(Default::default()),
+            content: Some(reply.content.chars().take(2000).collect()),
+            flags: Some(if reply.ephemeral {
+                MessageFlags::EPHEMERAL
+            } else {
+                MessageFlags::empty()
+            }),
             ..Default::default()
         }),
     }
 }
 
-/// Reply the router itself owes for a slash outcome: refusals get the legacy
-/// text, everything else is `None` — a handled command is answered by its
-/// feature slice through the executor, and an ignored one is silence (some
-/// other application's command, legacy fall-through).
+#[must_use]
+pub fn deferred_response(ephemeral: bool) -> InteractionResponse {
+    InteractionResponse {
+        kind: InteractionResponseType::DeferredChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            flags: Some(if ephemeral {
+                MessageFlags::EPHEMERAL
+            } else {
+                MessageFlags::empty()
+            }),
+            ..Default::default()
+        }),
+    }
+}
+
+/// Refusal reply: ephemeral, legacy text, capped at 2000 chars.
+#[must_use]
+pub fn refusal_response(refusal: RouterRefusal) -> InteractionResponse {
+    text_response(InteractionReply::new(refusal.message(), true))
+}
+
 #[must_use]
 pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse> {
     match outcome {
         SlashOutcome::Refuse { refusal } => Some(refusal_response(*refusal)),
+        SlashOutcome::Unknown => Some(text_response(InteractionReply::new(
+            UNKNOWN_INTERACTION_REPLY,
+            true,
+        ))),
         SlashOutcome::Handled { .. } | SlashOutcome::Ignore => None,
     }
+}
+
+/// Token-bearing transport, deliberately not Debug. Uses the existing executor
+/// and its injectable REST transport rather than a second HTTP client.
+pub struct InteractionReplyTransport<'a> {
+    executor: &'a ActionExecutor,
+    interaction: &'a Interaction,
+}
+
+impl<'a> InteractionReplyTransport<'a> {
+    #[must_use]
+    pub fn new(executor: &'a ActionExecutor, interaction: &'a Interaction) -> Self {
+        Self {
+            executor,
+            interaction,
+        }
+    }
+}
+
+impl ReplyTransport for InteractionReplyTransport<'_> {
+    type Error = DiscordError;
+
+    async fn execute(&self, operation: ReplyOperation) -> Result<Option<u64>, Self::Error> {
+        self.executor
+            .execute_reply_operation(
+                self.interaction.application_id.get(),
+                self.interaction.id.get(),
+                &self.interaction.token,
+                operation,
+            )
+            .await
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DispatchOptions {
+    pub custom_row: Option<bool>,
+    pub reply_policy: ReplyPolicy,
+    /// Set from the feature's visibility policy, not from user-supplied options.
+    pub ephemeral: bool,
+}
+
+/// Route and execute through one shared reply lifecycle. Existing feature
+/// functions are adapted by the closure; registration traits are unchanged.
+/// Returns false only for fenced/disabled/unmodelled events (no handler/I/O).
+pub async fn dispatch_interaction<'a, T, H, F, E>(
+    router: &InteractionRouter,
+    interaction: &Interaction,
+    transport: &'a T,
+    options: DispatchOptions,
+    handler: H,
+) -> Result<bool, ReplyError<T::Error>>
+where
+    T: ReplyTransport,
+    H: FnOnce(RoutedInteraction, ReplySession<'a, T>) -> F,
+    F: Future<Output = Result<InteractionReply, E>>,
+    E: Debug,
+{
+    let routed = route_interaction(router, interaction, options.custom_row);
+    let immediate = match &routed {
+        RoutedInteraction::Slash {
+            outcome: SlashOutcome::Refuse { refusal },
+            ..
+        } => Some(InteractionReply::new(refusal.message(), true)),
+        RoutedInteraction::Slash {
+            outcome: SlashOutcome::Unknown,
+            ..
+        }
+        | RoutedInteraction::Component {
+            outcome: ComponentOutcome::Unknown,
+            ..
+        }
+        | RoutedInteraction::Modal {
+            outcome: ComponentOutcome::Unknown,
+            ..
+        } => Some(InteractionReply::new(UNKNOWN_INTERACTION_REPLY, true)),
+        RoutedInteraction::Slash {
+            outcome: SlashOutcome::Ignore,
+            ..
+        }
+        | RoutedInteraction::Component {
+            outcome: ComponentOutcome::Ignore,
+            ..
+        }
+        | RoutedInteraction::Modal {
+            outcome: ComponentOutcome::Ignore,
+            ..
+        }
+        | RoutedInteraction::Ignore => return Ok(false),
+        _ => None,
+    };
+    if let Some(reply) = immediate {
+        transport
+            .execute(ReplyOperation::Respond(reply))
+            .await
+            .map_err(ReplyError::Transport)?;
+    } else {
+        run_handler(
+            transport,
+            options.reply_policy,
+            options.ephemeral,
+            |session| handler(routed, session),
+        )
+        .await?;
+    }
+    Ok(true)
 }
 
 /// Convert one registry definition to the twilight publish shape.

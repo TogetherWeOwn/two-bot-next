@@ -18,13 +18,15 @@ COPY crates/core/Cargo.toml crates/core/
 COPY crates/discord/Cargo.toml crates/discord/
 COPY crates/bot/Cargo.toml crates/bot/
 COPY crates/cutover/Cargo.toml crates/cutover/
+COPY crates/store/Cargo.toml crates/store/
 COPY crates/testsupport/Cargo.toml crates/testsupport/
-RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutover/src crates/testsupport/src \
+RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutover/src crates/store/src crates/testsupport/src \
     && echo '' > src/lib.rs \
     && echo 'fn main(){}' > crates/bot/src/main.rs \
     && echo '' > crates/core/src/lib.rs \
     && echo '' > crates/discord/src/lib.rs \
     && echo '' > crates/cutover/src/lib.rs \
+    && echo '' > crates/store/src/lib.rs \
     && echo '' > crates/testsupport/src/lib.rs \
     && cargo fetch --locked
 
@@ -33,11 +35,16 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
 COPY . .
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS certificates
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+FROM debian:bookworm-slim AS runtime
+
+# rustls needs the trust bundle, not the package's OpenSSL dependencies.
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # Non-root user: the bot never needs container root.
 RUN useradd --create-home --shell /usr/sbin/nologin two-bot

@@ -148,6 +148,47 @@ two-bot operator commands
       --confirm-staging-guild.
 ";
 
+/// The subcommands whose help is `USAGE`; `db` and `erase-member` parse
+/// their own.
+const SUBCOMMANDS: [&str; 5] = [
+    "backup",
+    "restore",
+    "backup-upload",
+    "guild-config-snapshot",
+    "guild-config-restore",
+];
+
+/// What `dispatch` does with a subcommand, decided from its arguments alone.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    Help,
+    Usage(String),
+    Run,
+}
+
+/// Help and usage errors are settled here, before any env, DB or network
+/// read: `two-bot backup --help` must never dump, prune or upload, and
+/// `backup-upload --help` must never be taken for a path. A `--` ends
+/// options (restore's grammar), so `restore -- -h` still names a file.
+fn route(subcommand: &str, rest: &[String]) -> Route {
+    if !SUBCOMMANDS.contains(&subcommand) {
+        return Route::Run;
+    }
+    if rest
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        return Route::Help;
+    }
+    match (subcommand, rest.first()) {
+        ("backup" | "guild-config-snapshot", Some(extra)) => Route::Usage(format!(
+            "{subcommand}: unexpected argument {extra:?}.\n{USAGE}"
+        )),
+        _ => Route::Run,
+    }
+}
+
 /// Dispatch `args` (without the program name). Returns the exit code.
 /// `serve` is handled by the caller: this returns 100 when no backup
 /// subcommand was given so `main` falls through to the gateway path.
@@ -159,8 +200,20 @@ pub async fn dispatch(args: &[String]) -> i32 {
         print!("{USAGE}");
         return 0;
     }
+    match route(&args[0], &args[1..]) {
+        Route::Help => {
+            print!("{USAGE}");
+            return 0;
+        }
+        Route::Usage(message) => {
+            eprintln!("{message}");
+            return 2;
+        }
+        Route::Run => {}
+    }
     match args[0].as_str() {
         "db" => crate::database_roles_cli::dispatch(&args[1..]).await,
+        "erase-member" => crate::erasure_cli::dispatch(&args[1..]).await,
         "backup" => cmd_backup().await,
         "restore" => cmd_restore(&args[1..]).await,
         "backup-upload" => cmd_backup_upload(&args[1..]).await,
@@ -416,12 +469,13 @@ async fn cmd_restore(args: &[String]) -> i32 {
             return 1;
         }
     };
-    // NOTE: two-bot-next migrations land under S6 (Founding Engineer). Until
-    // then the target must already carry the schema; dump()/restore() refuse
-    // with a named table when it does not. S6 plugs migrate() in here.
+    // Restore deliberately does not apply migrations. The independently
+    // provisioned target must already carry the current cutover schema;
+    // dump()/restore() refuse with a named table when it does not.
     match dump::restore(&pool, Path::new(&file)).await {
         Ok(report) => {
             println!("restore: dump taken {}", report.manifest.created_at);
+            warn_missing_dump_tables(&report.manifest);
             println!(
                 "restore: migrations in dump: {}",
                 if report.manifest.schema_migrations.is_empty() {
@@ -439,6 +493,9 @@ async fn cmd_restore(args: &[String]) -> i32 {
                     got,
                     if got == table.count { "ok" } else { "MISMATCH" }
                 );
+            }
+            for (table, count) in &report.initialized_tables {
+                eprintln!("restore: WARNING: {table}: initialized {count} schema-required baseline row(s), not archived data");
             }
             for (table, cols) in &report.dropped_columns {
                 eprintln!(
@@ -462,6 +519,17 @@ async fn cmd_restore(args: &[String]) -> i32 {
     0
 }
 
+fn warn_missing_dump_tables(manifest: &dump_file::DumpManifest) {
+    let missing = manifest.missing_tables();
+    if !missing.is_empty() {
+        eprintln!(
+            "restore: WARNING: v{} dump lacks tables that will be cleared (settings revision singleton resets to zero): {}",
+            manifest.version,
+            missing.join(", ")
+        );
+    }
+}
+
 async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
     // Nothing in this branch writes. A dry run must not be able to become
     // the outage it rehearses for.
@@ -476,6 +544,7 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
 
     println!("restore: --dry-run of {file}");
     println!("restore: dump taken {}", contents.manifest.created_at);
+    warn_missing_dump_tables(&contents.manifest);
     println!(
         "restore: migrations in dump: {}",
         if contents.manifest.schema_migrations.is_empty() {
@@ -502,9 +571,8 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
                         (*name).to_owned(),
                         match count {
                             Ok((n,)) => n.to_string(),
-                            Err(_) => {
-                                "(no such table - the restore would migrate first)".to_owned()
-                            }
+                            Err(_) => "(no such table - provision matching schema before restore)"
+                                .to_owned(),
                         },
                     );
                 }
@@ -1119,7 +1187,7 @@ async fn cmd_guild_config_restore(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_staging_token, prune_backups};
+    use super::{load_staging_token, prune_backups, route, Route};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1226,6 +1294,78 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn help_after_any_subcommand_routes_to_usage() {
+        for subcommand in super::SUBCOMMANDS {
+            for rest in [
+                &["--help"][..],
+                &["-h"],
+                &["extra", "--help"],
+                &["--snapshot", "-h"],
+                &["--force", "--dry-run", "--help"],
+            ] {
+                assert_eq!(
+                    route(subcommand, &strings(rest)),
+                    Route::Help,
+                    "{subcommand} {rest:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_after_option_terminator_is_an_operand() {
+        // restore reads `-- -h` as a file named `-h`; backup-upload refuses
+        // two arguments itself, so `--help` is still never its path.
+        for subcommand in ["restore", "backup-upload", "guild-config-restore"] {
+            assert_eq!(
+                route(subcommand, &strings(&["--", "-h"])),
+                Route::Run,
+                "{subcommand}"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_argument_to_argumentless_subcommand_is_a_usage_error() {
+        for subcommand in ["backup", "guild-config-snapshot"] {
+            for extra in ["now", "--force", "--"] {
+                let Route::Usage(message) = route(subcommand, &strings(&[extra])) else {
+                    panic!("{subcommand} {extra} must refuse");
+                };
+                assert!(message.starts_with(&format!("{subcommand}: unexpected argument")));
+                assert!(message.contains(&format!("{extra:?}")));
+                assert!(message.ends_with(super::USAGE));
+            }
+            assert_eq!(route(subcommand, &[]), Route::Run);
+        }
+    }
+
+    #[test]
+    fn operand_subcommands_and_foreign_help_run_unchanged() {
+        assert_eq!(
+            route("restore", &strings(&["dump.ndjson.gz", "--dry-run"])),
+            Route::Run
+        );
+        assert_eq!(
+            route("backup-upload", &strings(&["dump.ndjson.gz"])),
+            Route::Run
+        );
+        assert_eq!(
+            route("guild-config-restore", &strings(&["--snapshot", "s.json"])),
+            Route::Run
+        );
+        // `db` and `erase-member` own their help; unknown names reach the
+        // unknown-subcommand refusal.
+        for subcommand in ["db", "erase-member", "serve"] {
+            assert_eq!(route(subcommand, &strings(&["--help"])), Route::Run);
+        }
     }
 
     #[test]

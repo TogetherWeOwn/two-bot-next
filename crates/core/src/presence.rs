@@ -70,6 +70,13 @@ pub struct PresenceReading {
     pub bot_floor: Option<i64>,
 }
 
+/// A completed bot-floor scan never exposes a partial count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotFloorScan {
+    Complete(i64),
+    Truncated,
+}
+
 /// A failed presence read writes NOTHING — not a row with a null count, not a
 /// zero. The series must read as "the times we successfully looked", or a gap
 /// in the collector becomes indistinguishable from a quiet night (legacy
@@ -84,6 +91,8 @@ pub enum ProbeDecision {
         /// A failed member listing must not lose the presence reading, so a
         /// rescan failure also lands here as `None`.
         bot_floor: Option<i64>,
+        /// A bounded scan exhausted its page budget; the 24 h cadence still applies.
+        bot_floor_scan_truncated: bool,
     },
     /// Discord did not answer with a usable number: persist nothing.
     Skip,
@@ -97,11 +106,11 @@ pub fn sanitize_presence_count(raw: Option<i64>) -> Option<i64> {
 }
 
 /// Decide whether the bot floor needs a re-list (legacy `runProbeCycle`):
-/// rescan when no floor was ever observed, or the newest one has aged out
-/// (`now - last >= max_age`, the `>=` boundary included).
+/// rescan when no complete or truncated scan was ever recorded, or the newest
+/// outcome has aged out (`now - last >= max_age`, the `>=` boundary included).
 #[must_use]
-pub fn bot_floor_due(last_floor_at_ms: Option<i64>, now_ms: i64, max_age_ms: u64) -> bool {
-    match last_floor_at_ms {
+pub fn bot_floor_due(last_scan_at_ms: Option<i64>, now_ms: i64, max_age_ms: u64) -> bool {
+    match last_scan_at_ms {
         None => true,
         Some(last) => now_ms.saturating_sub(last) >= max_age_ms as i64,
     }
@@ -111,29 +120,35 @@ pub fn bot_floor_due(last_floor_at_ms: Option<i64>, now_ms: i64, max_age_ms: u64
 /// REST/DB seams): failed presence → [`ProbeDecision::Skip`]; otherwise
 /// record, rescanning the floor only when [`bot_floor_due`].
 ///
-/// `fresh_bot_floor` is the just-completed member-list count, or `None` when
+/// `fresh_bot_floor` is the just-completed scan outcome, or `None` when
 /// no rescan was attempted or the listing failed. It is consulted only when a
-/// rescan is due, so a stale `Some` from an earlier cycle can never leak into
-/// a "not rescanned" row.
+/// rescan is due, so a stale outcome from an earlier cycle can never leak into
+/// a "not rescanned" row. Truncation records no floor but consumes the cadence.
 #[must_use]
 pub fn decide_probe_cycle(
     presence: Option<i64>,
-    last_floor_at_ms: Option<i64>,
-    fresh_bot_floor: Option<i64>,
+    last_scan_at_ms: Option<i64>,
+    fresh_bot_floor: Option<BotFloorScan>,
     now_ms: i64,
 ) -> ProbeDecision {
     let count = match sanitize_presence_count(presence) {
         Some(n) => n,
         None => return ProbeDecision::Skip,
     };
-    let bot_floor = if bot_floor_due(last_floor_at_ms, now_ms, BOT_FLOOR_MAX_AGE_MS) {
-        fresh_bot_floor.filter(|n| *n >= 0)
-    } else {
-        None
-    };
+    let (bot_floor, bot_floor_scan_truncated) =
+        if bot_floor_due(last_scan_at_ms, now_ms, BOT_FLOOR_MAX_AGE_MS) {
+            match fresh_bot_floor {
+                Some(BotFloorScan::Complete(n)) if n >= 0 => (Some(n), false),
+                Some(BotFloorScan::Truncated) => (None, true),
+                _ => (None, false),
+            }
+        } else {
+            (None, false)
+        };
     ProbeDecision::Record {
         presence: count,
         bot_floor,
+        bot_floor_scan_truncated,
     }
 }
 
@@ -409,12 +424,12 @@ mod tests {
     fn failed_presence_read_writes_nothing() {
         // Null count: skip, no row, no floor side effects.
         assert_eq!(
-            decide_probe_cycle(None, None, Some(23), 1_000),
+            decide_probe_cycle(None, None, Some(BotFloorScan::Complete(23)), 1_000),
             ProbeDecision::Skip
         );
         // Negative count: same as unreadable.
         assert_eq!(
-            decide_probe_cycle(Some(-1), None, Some(23), 1_000),
+            decide_probe_cycle(Some(-1), None, Some(BotFloorScan::Complete(23)), 1_000),
             ProbeDecision::Skip
         );
     }
@@ -424,10 +439,11 @@ mod tests {
         let now = ms("2026-09-07T06:15:00.000Z");
         // Due: fresh floor lands on the row.
         assert_eq!(
-            decide_probe_cycle(Some(42), None, Some(23), now),
+            decide_probe_cycle(Some(42), None, Some(BotFloorScan::Complete(23)), now),
             ProbeDecision::Record {
                 presence: 42,
                 bot_floor: Some(23),
+                bot_floor_scan_truncated: false,
             }
         );
         // Due but the listing failed: presence is kept, floor stays NULL
@@ -437,14 +453,61 @@ mod tests {
             ProbeDecision::Record {
                 presence: 42,
                 bot_floor: None,
+                bot_floor_scan_truncated: false,
             }
         );
         // Not due: a stale fresh count must never leak into the row.
         assert_eq!(
-            decide_probe_cycle(Some(42), Some(now - H), Some(99), now),
+            decide_probe_cycle(
+                Some(42),
+                Some(now - H),
+                Some(BotFloorScan::Complete(99)),
+                now
+            ),
             ProbeDecision::Record {
                 presence: 42,
                 bot_floor: None,
+                bot_floor_scan_truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn truncated_cycle_records_no_floor_and_obeys_scan_cadence() {
+        let now = ms("2026-09-07T06:15:00.000Z");
+        assert_eq!(
+            decide_probe_cycle(Some(42), None, Some(BotFloorScan::Truncated), now),
+            ProbeDecision::Record {
+                presence: 42,
+                bot_floor: None,
+                bot_floor_scan_truncated: true,
+            }
+        );
+        // An unattempted hourly tick cannot repeat the truncation evidence.
+        assert_eq!(
+            decide_probe_cycle(Some(43), Some(now), Some(BotFloorScan::Truncated), now + H),
+            ProbeDecision::Record {
+                presence: 43,
+                bot_floor: None,
+                bot_floor_scan_truncated: false,
+            }
+        );
+        assert!(!bot_floor_due(
+            Some(now),
+            now + 24 * H - 1,
+            BOT_FLOOR_MAX_AGE_MS
+        ));
+        assert!(bot_floor_due(Some(now), now + 24 * H, BOT_FLOOR_MAX_AGE_MS));
+        assert_eq!(
+            decide_probe_cycle(None, None, Some(BotFloorScan::Truncated), now),
+            ProbeDecision::Skip
+        );
+        assert_eq!(
+            decide_probe_cycle(Some(42), None, Some(BotFloorScan::Complete(-1)), now),
+            ProbeDecision::Record {
+                presence: 42,
+                bot_floor: None,
+                bot_floor_scan_truncated: false,
             }
         );
     }

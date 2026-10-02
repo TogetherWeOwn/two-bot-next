@@ -493,9 +493,12 @@ mod tests {
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let state = Arc::new(tokio::sync::RwLock::new(
-                crate::gateway::GatewayState::Unconfigured,
-            ));
+            let state = crate::server::SharedState {
+                gateway: Arc::new(tokio::sync::RwLock::new(
+                    crate::gateway::GatewayState::Unconfigured,
+                )),
+                database: None,
+            };
             let (shutdown, _) = tokio::sync::watch::channel(false);
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(
@@ -565,9 +568,12 @@ mod tests {
         use tracing::instrument::WithSubscriber;
 
         let capture = Capture::default();
-        let state = Arc::new(tokio::sync::RwLock::new(
-            crate::gateway::GatewayState::Unconfigured,
-        ));
+        let state = crate::server::SharedState {
+            gateway: Arc::new(tokio::sync::RwLock::new(
+                crate::gateway::GatewayState::Unconfigured,
+            )),
+            database: None,
+        };
         let request = axum::http::Request::builder()
             .uri("/health?access_token=do-not-log-this-query")
             .body(axum::body::Body::empty())
@@ -598,9 +604,12 @@ mod tests {
             capture.clone(),
         ));
         let run = tracing::dispatcher::with_default(&dispatch, run_span);
-        let state = Arc::new(tokio::sync::RwLock::new(
-            crate::gateway::GatewayState::Unconfigured,
-        ));
+        let state = crate::server::SharedState {
+            gateway: Arc::new(tokio::sync::RwLock::new(
+                crate::gateway::GatewayState::Unconfigured,
+            )),
+            database: None,
+        };
         // Bind inside the run span so `http_listening` keeps run correlation,
         // matching `main.rs` where `bind` runs under the run span.
         // `WithSubscriber` sets the capture dispatcher for every poll, so no

@@ -49,20 +49,28 @@ NOTES_BRANCH = branch + "--release-notes"
 git = os.environ["RETRY_REAL_GIT"]
 remote = os.environ["RETRY_REMOTE"]
 head = subprocess.check_output([git, "--git-dir", remote, "rev-parse", "refs/heads/" + branch], text=True).strip()
-pr = {"number": 42, "state": "open", "base": {"ref": "main", "repo": {"full_name": "fixture/repo"}}, "head": {"ref": branch, "sha": head, "repo": {"full_name": state.get("head_repo", "fixture/repo")}}, "labels": [{"name": "autorelease: pending"}]}
+pr = {"number": 42, "state": "open", "body": state["body"], "base": {"ref": "main", "repo": {"full_name": "fixture/repo"}}, "head": {"ref": branch, "sha": head, "repo": {"full_name": state.get("head_repo", "fixture/repo")}}, "labels": [{"name": "autorelease: pending"}]}
+def emit_pages(entries):
+    # Model the older gh CLI: @json emits one compact page per line, and
+    # --slurp is unsupported. Never silently accept the incompatible flags.
+    assert args[2:] == ["--paginate", "--jq", "@json"], args
+    size = state.get("page_size", 1000)
+    pages = [entries[i:i + size] for i in range(0, len(entries), size)] or [[]]
+    if state.get("empty_first_page"):
+        pages.insert(0, [])
+    for page in pages:
+        print(json.dumps(page, separators=(",", ":")))
 if args[1].startswith(repo + "/pulls?"):
-    assert "--paginate" in args and "--slurp" in args
-    print(json.dumps([[pr] if state["open"] else []]))
+    emit_pages([pr] if state["open"] else [])
 elif args[1].startswith(repo + "/compare/"):
     main, compared_head = args[1].rsplit("/", 1)[1].split("...")
     assert compared_head == head
     base = subprocess.check_output([git, "merge-base", main, head], text=True).strip()
     print(json.dumps({"merge_base_commit": {"sha": base}, "status": "identical" if main == head else "ahead" if base == main else "diverged"}))
 elif args[1].startswith(repo + "/pulls/42/commits"):
-    assert "--paginate" in args and "--slurp" in args
     log = subprocess.check_output([git, "log", "--reverse", "--format=%H%x01%s", "refs/heads/" + branch], text=True).strip()
-    entries = [{"sha": line.split("\\x01")[0], "commit": {"message": line.split("\\x01")[1]}} for line in log.splitlines()] if log else []
-    print(json.dumps([entries]))
+    entries = [{"sha": line.split("\\x01")[0], "commit": {"message": line.split("\\x01")[1] + state.get("commit_message_tail", "")}} for line in log.splitlines()] if log else []
+    emit_pages(entries)
 elif args[1].startswith(repo + "/commits/"):
     sha = args[1].rsplit("/", 1)[1]
     parents = subprocess.check_output([git, "show", "-s", "--format=%P", sha], text=True).strip()
@@ -384,6 +392,21 @@ class ReleaseRetryTests(unittest.TestCase):
                     self.assertEqual(self.state(), before, "No push, PATCH, PUT or branch creation before rejection, including retries")
                     self.assertEqual(self.git("rev-parse", "HEAD"), head)
                     self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_old_gh_pagination_reads_later_pages_and_preserves_notes(self):
+        footer = '\nQuoted "notes" and a backslash \\ remain intact.\n'
+        self.state(page_size=1, empty_first_page=True, body=BODY + footer,
+                   commit_message_tail='\n\nMultiline "message" with \\ and Unicode ✓')
+        before = self.state()
+        # The selected PR and newest native commit are both on later pages.
+        self.assertEqual(self.outputs("plan"), {"reuse_pr": "true"})
+        outputs = self.outputs("select")
+        self.assertEqual(outputs["pr_available"], "true")
+        self.assertEqual(json.loads(outputs["pr"]), {"number": 42, "headBranchName": BRANCH})
+        self.assertEqual(self.state(), before, "Inspection is read-only")
+        self.reconcile()
+        self.assert_reconciled()
+        self.assertIn(footer, self.state()["body"])
 
     def test_new_main_snapshot_regenerates_native_pr(self):
         new_main = self.git("commit-tree", "HEAD^{tree}", "-p", self.main, input="feat: next main snapshot\n").strip()

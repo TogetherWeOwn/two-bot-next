@@ -8,3 +8,7 @@ export class DurableObject {
 }
 
 export class WorkerEntrypoint extends DurableObject {}
+
+// The SDK pipes nonempty HTTP bodies through workerd's identity transform.
+// Node's standard TransformStream has the same no-transform behavior.
+globalThis.IdentityTransformStream = TransformStream;

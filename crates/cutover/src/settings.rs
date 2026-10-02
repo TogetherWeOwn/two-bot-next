@@ -27,7 +27,7 @@ pub struct SettingsStore<'a> {
 }
 
 impl<'a> SettingsStore<'a> {
-    /// Borrow the pool; migrations (including `0330`) are applied by
+    /// Borrow the pool; migrations (including `0330`–`0334`) are applied by
     /// [`crate::CutoverDb::migrate`], not here.
     #[must_use]
     pub fn new(pool: &'a Pool<Postgres>) -> Self {
@@ -78,6 +78,23 @@ impl<'a> SettingsStore<'a> {
         .await
     }
 
+    /// Read a stored override only. The key guard runs before any SQL, even
+    /// if a forbidden row somehow exists in the database.
+    pub async fn get(
+        &self,
+        guild_id: &str,
+        key: &str,
+    ) -> Result<Option<(serde_json::Value, i64)>, SettingsWriteError> {
+        validate_write(guild_id, key, None, "settings-reader")?;
+        Ok(sqlx::query_as(
+            "SELECT value, cas_version FROM guild_settings WHERE guild_id = $1 AND key = $2",
+        )
+        .bind(guild_id)
+        .bind(key)
+        .fetch_optional(self.pool)
+        .await?)
+    }
+
     /// Write one setting and its audit row in one transaction, bumping the
     /// global version so every process's next poll picks it up (legacy
     /// `SettingsStore.set`).
@@ -98,6 +115,24 @@ impl<'a> SettingsStore<'a> {
         value: Option<serde_json::Value>,
         actor: &str,
     ) -> Result<ValidatedWrite, SettingsWriteError> {
+        self.set_if_version(guild_id, key, value, actor, None)
+            .await
+            .map(|(validated, _)| validated)
+    }
+
+    /// Compare under the same revision-row lock used by every settings writer.
+    /// Zero expects an absent override. None retains legacy unconditional saves.
+    /// Negative CAS tokens are separate from copyable legacy row versions; old
+    /// nonnegative tokens never match an existing override after migration 0334.
+    /// Returns the committed CAS token (zero after delete), without a value.
+    pub async fn set_if_version(
+        &self,
+        guild_id: &str,
+        key: &str,
+        value: Option<serde_json::Value>,
+        actor: &str,
+        expected_version: Option<i64>,
+    ) -> Result<(ValidatedWrite, i64), SettingsWriteError> {
         let validated = validate_write(guild_id, key, value, actor)?;
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -106,41 +141,54 @@ impl<'a> SettingsStore<'a> {
         .fetch_one(&mut *tx)
         .await?;
 
-        let previous: Option<(serde_json::Value,)> =
-            sqlx::query_as("SELECT value FROM guild_settings WHERE guild_id = $1 AND key = $2")
-                .bind(guild_id)
-                .bind(key)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let previous: Option<(serde_json::Value, i64)> = sqlx::query_as(
+            "SELECT value, cas_version FROM guild_settings WHERE guild_id = $1 AND key = $2",
+        )
+        .bind(guild_id)
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await?;
 
-        match &validated.action {
+        // Zero is an absence precondition, not a row token: legacy direct
+        // writers could store zero before database-owned versions existed.
+        if expected_version.is_some_and(|expected| match previous.as_ref() {
+            None => expected != 0,
+            Some((_, version)) => expected == 0 || expected != *version,
+        }) {
+            tx.rollback().await?;
+            return Err(SettingsWriteError::VersionConflict);
+        }
+
+        let version = match &validated.action {
             WriteAction::Delete => {
                 sqlx::query("DELETE FROM guild_settings WHERE guild_id = $1 AND key = $2")
                     .bind(guild_id)
                     .bind(key)
                     .execute(&mut *tx)
                     .await?;
+                0
             }
             WriteAction::Upsert(value) => {
-                sqlx::query(
-                    "INSERT INTO guild_settings (guild_id, key, value, version, updated_at, updated_by)
-                     VALUES ($1, $2, $3, nextval('guild_settings_version_seq'), now(), $4)
+                sqlx::query_scalar(
+                    "INSERT INTO guild_settings (guild_id, key, value, updated_at, updated_by)
+                     VALUES ($1, $2, $3, now(), $4)
                      ON CONFLICT (guild_id, key) DO UPDATE
                        SET value = EXCLUDED.value,
                            version = EXCLUDED.version,
                            updated_at = EXCLUDED.updated_at,
-                           updated_by = EXCLUDED.updated_by",
+                           updated_by = EXCLUDED.updated_by
+                     RETURNING cas_version",
                 )
                 .bind(guild_id)
                 .bind(key)
                 .bind(value)
                 .bind(&validated.actor)
-                .execute(&mut *tx)
-                .await?;
+                .fetch_one(&mut *tx)
+                .await?
             }
-        }
+        };
 
-        let old_json = previous.map(|(v,)| v);
+        let old_json = previous.map(|(v, _)| v);
         let new_json = match &validated.action {
             WriteAction::Upsert(value) => Some(value.clone()),
             WriteAction::Delete => None,
@@ -158,13 +206,15 @@ impl<'a> SettingsStore<'a> {
         .await?;
 
         tx.commit().await?;
-        Ok(validated)
+        Ok((validated, version))
     }
 }
 
 /// A settings write failure: refused before SQL vs database error.
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsWriteError {
+    #[error("settings version conflict")]
+    VersionConflict,
     #[error("{0}")]
     Refused(#[from] WriteRefusal),
     #[error("database error: {0}")]

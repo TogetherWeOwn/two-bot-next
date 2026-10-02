@@ -3,6 +3,7 @@
 //! The caller must authorize and commit its durable execution claim first.
 //! Only `announcement.post` is implemented here; core feature flags are not
 //! executor capabilities. No runtime flags, stores or listeners are installed.
+//! Every 429 feeds the caller-supplied per-token [`CooldownGovernor`].
 
 use bytes::Bytes;
 use http::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT};
@@ -19,6 +20,9 @@ use twilight_model::{
     id::{marker::ChannelMarker, marker::MessageMarker, Id},
 };
 use two_bot_core::internal_actions::{is_snowflake, validate_announcement, ErrorCode};
+
+mod governor;
+pub use governor::{Clock, CooldownGovernor, MAX_CHANNEL_HOLDS};
 
 pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post"];
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -39,9 +43,11 @@ pub enum Refusal {
     InvalidChannelConfiguration,
     LocalConfiguration,
     DiscordRejected,
+    /// The shared governor holds this channel or the token; nothing was sent.
+    CoolingDown,
 }
 
-/// Apply before any new intent in the caller's shared token governor. Channel
+/// Fed into the shared token governor before any new intent. Channel
 /// scope deliberately covers all buckets on this major resource; bucket strings
 /// and provider text never escape. Missing/ambiguous scope is token-wide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -104,17 +110,24 @@ pub enum ExecutionOutcome {
 /// its ResponseFuture: Twilight retries 429/5xx internally. This transport has
 /// no status retries, redirects, or cancelled pooled-connection retries.
 /// Construction assumes the application's rustls provider is already installed.
+/// Clones share the governor; pass the token's one governor to every executor.
+#[derive(Clone)]
 pub struct AnnouncementExecutor {
     twilight: Arc<TwilightClient>,
     http: HttpClient,
     channel_keys: HashMap<String, String>,
     timeout: Duration,
     api_origin: String,
+    governor: CooldownGovernor,
 }
 
 impl AnnouncementExecutor {
     #[must_use]
-    pub fn new(twilight: Arc<TwilightClient>, channel_keys: HashMap<String, String>) -> Self {
+    pub fn new(
+        twilight: Arc<TwilightClient>,
+        channel_keys: HashMap<String, String>,
+        governor: CooldownGovernor,
+    ) -> Self {
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -129,6 +142,7 @@ impl AnnouncementExecutor {
             channel_keys,
             timeout: Duration::from_secs(10),
             api_origin: "https://discord.com".to_owned(),
+            governor,
         }
     }
 
@@ -145,6 +159,10 @@ impl AnnouncementExecutor {
             return ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed);
         }
         let outcome = self.post(body).await;
+        if let ExecutionOutcome::RateLimited(cooldown) = outcome {
+            // Installed before returning, so no later intent can outrun it.
+            self.governor.record(cooldown);
+        }
         // Only closed enums: no channel key, input, request, token or error source.
         tracing::info!(action = "announcement.post", outcome = ?outcome, "internal action completed");
         outcome
@@ -169,12 +187,17 @@ impl AnnouncementExecutor {
             Some(id) => id,
             None => return ExecutionOutcome::NoEffect(Refusal::InvalidChannelConfiguration),
         };
-        let content = body["body"].as_str().expect("core validated body");
+        let content = two_bot_core::message_safety::content(
+            body["body"].as_str().expect("core validated body"),
+        );
+        if !two_bot_core::message_safety::has_message_text(&content) {
+            return ExecutionOutcome::NoEffect(Refusal::Malformed);
+        }
         let mentions = AllowedMentions::default();
         let request = match self
             .twilight
             .create_message(channel_id)
-            .content(content)
+            .content(&content)
             .allowed_mentions(Some(&mentions))
             .try_into_request()
         {
@@ -201,6 +224,10 @@ impl AnnouncementExecutor {
             Ok(request) => request,
             Err(_) => return ExecutionOutcome::NoEffect(Refusal::LocalConfiguration),
         };
+        // Refuse, never wait: a held intent is terminal, not queued.
+        if !self.governor.admits(channel_id) {
+            return ExecutionOutcome::NoEffect(Refusal::CoolingDown);
+        }
 
         let deadline = tokio::time::Instant::now() + self.timeout;
         let response = match tokio::time::timeout_at(deadline, self.http.request(outbound)).await {
