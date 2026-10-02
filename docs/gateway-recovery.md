@@ -19,6 +19,31 @@ A crash before commit rolls the batch and checkpoint back together; a crash afte
 
 Open voice sessions are **never** restored. The existing pipeline drops them on READY and RESUMED (legacy `ShardReady`/`ShardResume`). This intentionally avoids outage-inflated durations. Twilight's channel/member cache is also cold after a process restart; this slice does not claim a fully restored cache or invite baseline. Facts, real leveling, REST side effects and invite fetching remain the existing S4/S6 seams; this transaction currently covers the S3 funnel, not arbitrary external side effects. Maintain one running shard owner per guild; overlapping independent deployments are not a supported recovery mechanism.
 
+## Force-fresh IDENTIFY (first production boot)
+
+The age policy alone RESUMEs any checkpoint up to 15 minutes old. The first production boot must IDENTIFY with RESUME disabled, so an operator arms a one-shot directive instead of relying on checkpoint age. The Worker forwards no feature flags, so an environment toggle cannot do this.
+
+- Migration 0321 adds `gateway_boot_directives`, keyed by `(guild_id, shard_id)` like `gateway_sessions`, with `armed_at`, `reason` and `consumed_at`. A row with `consumed_at IS NULL` is armed.
+- At boot, `load_for_boot` locks the directive row (`FOR UPDATE`), reads the checkpoint and marks the directive consumed in ONE transaction. An armed directive yields `DiscardAndIdentify` whatever the checkpoint's age (`boot_action_with`). Without one, the age policy above is unchanged. Of two concurrent boot reads, exactly one consumes it; the other waits on the lock and sees nothing armed.
+- The directive never deletes or rewrites `gateway_sessions`. The bot's existing discard path clears the checkpoint before IDENTIFY, and READY persists the new session as usual. The boot after that has no directive and RESUMEs normally.
+
+Procedure, from an operator checkout (only the `two-bot` binary ships in the image). `TWO_DATABASE_URL` is the bot database the target Container uses; `GUILD_ID` is that Container's configured guild, and `--guild` must equal it:
+
+```sh
+# 1. Dry run (default): prints guild, shard 0, checkpoint age and directive; writes nothing.
+cargo run -p two-bot-cutover --bin gateway-force-identify --locked -- --guild "$GUILD_ID"
+# 2. Arm. The live guild also needs --allow-live-guild.
+cargo run -p two-bot-cutover --bin gateway-force-identify --locked -- \
+  --guild "$GUILD_ID" --apply --reason "first production boot" --allow-live-guild
+# 3. Start the bot, then re-run the dry run: the directive shows "consumed at ...".
+```
+
+Then confirm the first READY: `/readyz` reports the gateway connected, and the dry run shows a checkpoint with a small age whose `seq` restarted below the value printed in step 1 (a new session counts from 1; a RESUME would continue above it). Re-arming after consumption arms a new one-shot; arming while one is pending leaves it unchanged (`already armed`).
+
+Exit codes: 0 ok, 1 database failure (including a database without migration 0321; the CLI never runs migrations), 2 usage or refusal. A mismatched or unset `GUILD_ID`, a missing `--reason`, an unknown flag, or the live guild without `--allow-live-guild` all refuse before connecting.
+
+Residual window: the directive is consumed when the boot read commits. If the process dies before the discard and READY are committed, a restart within 15 minutes could RESUME the old checkpoint. After every armed boot, run the dry run; if the directive is consumed but no new READY checkpoint was recorded, arm again before the next start.
+
 ## Verification (test containers only)
 
 ```sh
@@ -27,15 +52,17 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
   cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
+  cargo test -p two-bot-cutover --locked --test gateway_force_identify_cli
 ```
 
-The nine opt-in tests cover stored-sequence RESUME after a new pipeline/shard, saved endpoint selection and failed-saved-endpoint fallback, no duplicate repeatable funnel row when replay uses a newly generated timestamp, opcode-9 and close-4007/4009 fallback to IDENTIFY, stale expiry, restored message ladder, monotonic sequence, session reset, and transaction rollback after a deliberately invalid row. An isolated-schema write-failure trigger proves that the service terminates on a failed funnel dispatch, leaves its checkpoint unchanged, and a recreated runner resumes from the committed sequence after recovery. An isolated advisory-lock test uses a 1000ms HELLO interval: readiness drops immediately, the complete transaction times out at 250ms before a whole heartbeat interval, checkpoint remains at sequence 1, and a recreated runner resumes at 1 and persists the missed dispatch exactly once. Unit tests cover total timeout, readiness while pending, successful restoration, and failure remaining unready. Four socket/task lifecycle tests also prove that error, stream termination and panic stop the health listener, and HTTP shutdown aborts the gateway task. These are local failure/restart simulations, not a deployed Container-supervisor drill.
+The nine opt-in tests cover stored-sequence RESUME after a new pipeline/shard, saved endpoint selection and failed-saved-endpoint fallback, no duplicate repeatable funnel row when replay uses a newly generated timestamp, opcode-9 and close-4007/4009 fallback to IDENTIFY, stale expiry, restored message ladder, monotonic sequence, session reset, and transaction rollback after a deliberately invalid row. An isolated-schema write-failure trigger proves that the service terminates on a failed funnel dispatch, leaves its checkpoint unchanged, and a recreated runner resumes from the committed sequence after recovery. An isolated advisory-lock test uses a 1000ms HELLO interval: readiness drops immediately, the complete transaction times out at 250ms before a whole heartbeat interval, checkpoint remains at sequence 1, and a recreated runner resumes at 1 and persists the missed dispatch exactly once. Unit tests cover total timeout, readiness while pending, successful restoration, and failure remaining unready. Four socket/task lifecycle tests also prove that error, stream termination and panic stop the health listener, and HTTP shutdown aborts the gateway task. Three more opt-in tests in `gateway_tests::force_identify` prove the directive: an armed boot IDENTIFYs over a fresh checkpoint and the next boot after READY RESUMEs, two concurrent boot reads consume it exactly once without changing the checkpoint, and arming keeps a pending directive and re-arms after consumption. `gateway_force_identify_cli` proves the CLI refusals exit 2 before connecting and, on a disposable agent-testdb database, that the dry run leaves both tables byte-identical and `--apply` arms once. These are local failure/restart simulations, not a deployed Container-supervisor drill.
 
 Tests never consult runtime `DATABASE_URL`. Their dedicated URL is restricted to `agent-testdb` or the CI loopback Postgres service, database/user `agent_test`. Each test migrates its own generated schema and deletes only that schema. CI runs these tests explicitly against its service container.
 
 ## Rollback
 
-Rollback the binary to the prior approved image/commit; leave migration 0320 and the existing event rows intact. The old S3 binary ignores `gateway_sessions` and identifies fresh. It is still the old in-memory S3 funnel, not a durable-store alternative. Do not delete or rotate credentials, drop shared tables, or apply a down migration. Redeploying the S5 binary after the rollback will either discard a stale checkpoint or let Discord reject it and IDENTIFY. A deployment/rollback drill is not performed by these tests, and production rollout remains a separate gate.
+Rollback the binary to the prior approved image/commit; leave migrations 0320/0321 and the existing event rows intact. A binary without the directive read ignores `gateway_boot_directives`. The old S3 binary ignores `gateway_sessions` and identifies fresh. It is still the old in-memory S3 funnel, not a durable-store alternative. Do not delete or rotate credentials, drop shared tables, or apply a down migration. Redeploying the S5 binary after the rollback will either discard a stale checkpoint or let Discord reject it and IDENTIFY. A deployment/rollback drill is not performed by these tests, and production rollout remains a separate gate.
 
 ## Sources
 

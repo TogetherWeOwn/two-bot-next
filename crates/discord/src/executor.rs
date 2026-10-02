@@ -879,7 +879,7 @@ impl ActionExecutor {
     /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
     /// is refused without I/O, never silently rewritten (finding 2).
     pub async fn get_json(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
-        self.read_json(path, false).await
+        Ok(self.get_json_observed(path).await?.map(|(data, _)| data))
     }
 
     /// Permission evidence must distinguish denied/absent (403/404) from an
@@ -887,6 +887,52 @@ impl ActionExecutor {
     /// but never let a transient failure look like a proven delivery skip.
     pub async fn get_json_checked(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
         self.read_json(path, true).await
+    }
+
+    /// Membership evidence is bounded by the successful attempt's request
+    /// start, after pacing, never by headers/body completion or an earlier
+    /// failed attempt. Ordinary `get_json` keeps its data-only contract.
+    pub async fn get_json_observed(
+        &self,
+        path: &str,
+    ) -> Result<Option<(serde_json::Value, String)>, String> {
+        let route = raw_get_route(path)?;
+        let mut attempt: u32 = 0;
+        loop {
+            self.pace(false).await;
+            let observed_at = two_bot_core::now_iso();
+            let request = Request::from_route(&route);
+            let res = match self.send(&request).await {
+                Ok(r) => r,
+                Err(detail) => {
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return Err(detail);
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                    attempt += 1;
+                    continue;
+                }
+            };
+            match res.status {
+                200..=299 => {
+                    return Ok(serde_json::from_slice(&res.body)
+                        .ok()
+                        .map(|data| (data, observed_at)));
+                }
+                429 => {
+                    tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                }
+                403 | 404 => return Ok(None),
+                500..=599 => {
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
+                    attempt += 1;
+                }
+                _ => return Ok(None),
+            }
+        }
     }
 
     async fn read_json(

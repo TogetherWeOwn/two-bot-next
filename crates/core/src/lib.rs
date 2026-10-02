@@ -61,6 +61,7 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod membership;
 pub mod message_safety;
 pub mod metrics;
 pub mod moderation;
@@ -72,6 +73,7 @@ pub mod presence;
 pub mod presence_store;
 pub mod raid;
 pub mod raid_removal;
+pub mod rejection_telemetry;
 pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
@@ -95,6 +97,7 @@ pub mod voice_ownership;
 pub mod voice_permission_health;
 pub mod voice_permissions;
 pub mod voice_placement;
+pub mod voice_private;
 pub mod voice_room_controls;
 pub mod voice_text_channel;
 pub mod voice_vote_kick;

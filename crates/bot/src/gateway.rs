@@ -25,7 +25,8 @@ use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, ShardId};
 use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{
-    boot_action, dispatch_action, invalidates_session, BootAction, DispatchAction, GatewaySession,
+    boot_action_with, dispatch_action, invalidates_session, BootAction, DispatchAction,
+    GatewaySession,
 };
 use two_bot_core::{ComponentStatus, Config, InviteState, NoopFacts, NoopLeveling, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
@@ -125,8 +126,12 @@ pub async fn load_boot_session(
     store: &GatewaySessionStore,
 ) -> Result<Option<GatewaySession>, sqlx::Error> {
     tokio::time::timeout(CHECKPOINT_IO_MAX, async {
-        let saved = store.load().await?;
-        match boot_action(saved.as_ref(), two_bot_core::funnel::now_millis_for_test()) {
+        let (saved, directive) = store.load_for_boot().await?;
+        match boot_action_with(
+            saved.as_ref(),
+            directive,
+            two_bot_core::funnel::now_millis_for_test(),
+        ) {
             BootAction::Resume => Ok(saved),
             BootAction::DiscardAndIdentify => {
                 store.clear().await?;
