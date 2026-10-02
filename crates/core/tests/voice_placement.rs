@@ -3,8 +3,8 @@
 use proptest::prelude::*;
 use two_bot_core::voice_config::RoomPosition;
 use two_bot_core::voice_placement::{
-    next_room_number, plan_placement, resolve_initial_state, CategoryChannel, CategoryEntryKind,
-    PlacementError, PlacementRequest, RoomInitialState, MAX_ROOM_USER_LIMIT,
+    next_room_number, plan_placement, position_for_index, resolve_initial_state, CategoryChannel,
+    CategoryEntryKind, PlacementError, PlacementRequest, RoomInitialState, MAX_ROOM_USER_LIMIT,
 };
 
 fn creator(id: u64, position: i32) -> CategoryChannel {
@@ -570,4 +570,29 @@ proptest! {
         padded.extend(taken.iter().copied());
         prop_assert_eq!(next_room_number(&padded, first_number), next);
     }
+}
+
+#[test]
+fn position_for_index_takes_the_slot_of_the_channel_it_displaces() {
+    // Input order is irrelevant: the slot comes from (position, id) order.
+    let order = [other(9, 7), creator(5, 2), room(6, 4)];
+    assert_eq!(position_for_index(&order, 0), 2);
+    assert_eq!(position_for_index(&order, 1), 4);
+    assert_eq!(position_for_index(&order, 2), 7);
+}
+
+#[test]
+fn position_for_index_appends_one_past_the_last_channel() {
+    let order = [creator(5, 0), room(6, 3)];
+    assert_eq!(position_for_index(&order, 2), 4);
+    // Past-the-end indexes behave like appending; an empty category starts at 0.
+    assert_eq!(position_for_index(&order, 9), 4);
+    assert_eq!(position_for_index(&[], 0), 0);
+}
+
+#[test]
+fn position_for_index_never_goes_negative() {
+    let order = [creator(5, -3), room(6, -1)];
+    assert_eq!(position_for_index(&order, 0), 0);
+    assert_eq!(position_for_index(&order, 2), 0);
 }
