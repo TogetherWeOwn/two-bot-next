@@ -139,10 +139,8 @@ fn configured_gateway_initialization_failure_exits_nonzero() {
         logs.contains("database initialization failed"),
         "child logs: {logs}"
     );
-    assert!(
-        logs.contains("container service failed"),
-        "child logs: {logs}"
-    );
+    // No `container service failed` here: a database_init failure exits before
+    // the service_supervisor phase, which is the only place that logs it.
     for secret in ["fixture-user", "fixture-db-secret", "fixture-query-secret"] {
         assert!(!logs.contains(secret), "startup diagnostic leaked: {logs}");
     }
