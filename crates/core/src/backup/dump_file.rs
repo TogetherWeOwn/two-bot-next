@@ -1,4 +1,4 @@
-//! The v3 backup envelope: manifest / rows / end marker, gzipped NDJSON.
+//! The v4 backup envelope (also reads v3): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -36,11 +36,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-/// Everything the bot owns. The website's own tables are not ours to back up.
-///
-/// The moderation tables are here because losing them is not cosmetic: a lost
-/// scheduled unban is a tempban that became permanent, and a lost warn ledger
-/// is a moderation history the staff cannot see (TOG-1659 High 5).
+/// Durable bot-owned tables, parents before children. The first 22 names are
+/// frozen v3 coverage; append new tables after that prefix. Tables retired from
+/// the Rust migration set remain supported when present on a legacy target.
+/// The bot-owned website-contract backing tables ARE included; derived views
+/// and the website service's own database are not application data here.
 pub const DUMP_TABLES: &[&str] = &[
     "events",
     "members",
@@ -48,7 +48,6 @@ pub const DUMP_TABLES: &[&str] = &[
     "operational_audit_log",
     "moderation_warnings",
     "moderation_scheduled_unbans",
-    "moderation_member_bans",
     "moderation_audit",
     "moderation_lockdowns",
     "moderation_idempotency",
@@ -65,10 +64,86 @@ pub const DUMP_TABLES: &[&str] = &[
     "automod_processed_messages",
     "self_role_audit",
     "self_role_panel_claims",
+    "member_levels",
+    "xp_awards",
+    "level_role_rewards",
+    "level_import_runs",
+    "event_rsvps",
+    "announcements_audit_log",
+    "community_facts",
+    "lfg_posts",
+    "lfg_roles",
+    "lfg_signups",
+    "feed_relays",
+    "feed_deliveries",
+    "web_contract_meta",
+    "guild_counters",
+    "rank_ladder",
+    "rank_snapshots",
+    "member_ranks",
+    "scheduled_events",
+    "counter_snapshots",
+    "member_exclusions",
+    "presence_probe",
+    "community_stream_heartbeats",
+    "community_scorecard_runs",
+    "community_scorecard_alerts",
+    "gateway_sessions",
+    "guild_settings_revision",
+    "guild_settings",
+    "guild_settings_audit",
+    "audit_kill_switch",
+    "internal_nonces",
+    "internal_idempotency",
+    "internal_action_log",
+    "internal_discord_events",
+    "moderation_channel_executions",
+    "moderation_member_bans",
 ];
 
-/// The backup format version. Must stay 3: the envelope is frozen.
-pub const DUMP_VERSION: u32 = 3;
+/// Frozen v3 tables no longer created by cutover migrations. Keep their data
+/// when they exist, but do not require nonexistent legacy subsystems on Rust.
+pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
+    "containment_events",
+    "containment_incidents",
+    "automation_commands",
+    "automod_violations",
+    "automod_processed_messages",
+];
+
+/// Explicit migrated-schema exclusions, checked by the schema coverage test.
+pub const EXCLUDED_TABLES: &[&str] = &[
+    // Short-lived XP award throttles, not XP totals/history. Never replay a
+    // pre-restore cooldown into a recovered process.
+    "xp_cooldowns",
+    // Migration ledgers describe target DDL; replacing them would falsely mark
+    // unapplied migrations as applied. Legacy schema_migrations is diagnostic
+    // manifest metadata only, never restored application data.
+    "_sqlx_migrations",
+    "schema_migrations",
+];
+
+/// Columns the destination allocates itself: never archived, never restored.
+pub const DESTINATION_OWNED_COLUMNS: &[(&str, &str)] = &[
+    // CAS tokens come from the never-reseeded guild_settings_cas_seq, and
+    // trg_guild_settings_version replaces supplied tokens on every write. A
+    // restore therefore allocates fresh tokens that invalidate every token
+    // issued before it, as legacy copy does; archiving them would only record
+    // values that restore cannot and must not reproduce.
+    ("guild_settings", "cas_version"),
+];
+
+/// True when `table.column` is allocated by the destination, see
+/// [`DESTINATION_OWNED_COLUMNS`].
+#[must_use]
+pub fn is_destination_owned(table: &str, column: &str) -> bool {
+    DESTINATION_OWNED_COLUMNS
+        .iter()
+        .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
+}
+
+/// Write the complete-schema envelope; the reader also accepts frozen v3.
+pub const DUMP_VERSION: u32 = 4;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -101,6 +176,20 @@ pub struct DumpManifest {
     /// Which migrations the source had applied, for diagnosing an old backup.
     #[serde(rename = "schemaMigrations")]
     pub schema_migrations: Vec<String>,
+}
+
+impl DumpManifest {
+    /// Old v3 archives predate complete table coverage. Restore clears these
+    /// tables too, rather than silently retaining unrelated target contents.
+    #[must_use]
+    pub fn missing_tables(&self) -> Vec<&'static str> {
+        DUMP_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !OPTIONAL_LEGACY_TABLES.contains(name))
+            .filter(|name| !self.tables.iter().any(|t| t.name == *name))
+            .collect()
+    }
 }
 
 /// Maximum compressed AND decoded bytes. Files are streamed rather than
@@ -529,9 +618,9 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     .get("version")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| refuse("manifest has an invalid version"))?;
-                if version != u64::from(DUMP_VERSION) {
+                if version != 3 && version != u64::from(DUMP_VERSION) {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -730,12 +819,18 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // The ownership ledger is additive to the frozen 22-table v3 envelope.
-    // Old dumps remain readable, but restore clears destination ownership and
-    // quarantines their orphan expiries; absence never proves acceptance.
+    // The first 22 entries are frozen v3 coverage, pinned by the checked-in
+    // legacy fixture. V3 may omit later additions; v4 must declare them all.
+    let required = if obj.get("version").and_then(Value::as_u64) == Some(3) {
+        22
+    } else {
+        DUMP_TABLES.len()
+    };
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
-        .filter(|name| **name != "moderation_member_bans" && !names.contains(**name))
+        .take(required)
+        .filter(|name| required == 22 || !OPTIONAL_LEGACY_TABLES.contains(name))
+        .filter(|name| !names.contains(**name))
         .copied()
         .collect();
     if !missing.is_empty() {
@@ -1337,6 +1432,18 @@ mod tests {
         .unwrap();
         let contents = inspect_bytes(&finish_gzip(enc).unwrap()).unwrap();
         assert_eq!(contents.rows, 2);
+        assert_eq!(contents.manifest.version, 3);
+        let legacy_names: std::collections::BTreeSet<_> = contents
+            .manifest
+            .tables
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(legacy_names, DUMP_TABLES.iter().take(22).copied().collect());
+        assert_eq!(
+            contents.manifest.missing_tables().len(),
+            DUMP_TABLES.len() - 22
+        );
         assert!(contents
             .manifest
             .tables
@@ -1351,6 +1458,29 @@ mod tests {
             contents.buffers["join_risk_flags"][0]["flagged"],
             serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn v3_requires_its_original_tables_but_v4_requires_complete_coverage() {
+        let legacy: Value = serde_json::from_str(
+            include_str!("../../tests/fixtures/legacy-v3-native.ndjson")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut missing_v3 = legacy.clone();
+        missing_v3["tables"].as_array_mut().unwrap().remove(0);
+        assert!(validate_manifest(&missing_v3)
+            .unwrap_err()
+            .to_string()
+            .contains("missing tables"));
+        let mut incomplete_v4 = legacy;
+        incomplete_v4["version"] = serde_json::json!(4);
+        assert!(validate_manifest(&incomplete_v4)
+            .unwrap_err()
+            .to_string()
+            .contains("missing tables"));
     }
 
     #[test]

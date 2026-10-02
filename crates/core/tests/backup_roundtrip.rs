@@ -19,7 +19,7 @@
 use sqlx::{PgPool, Row};
 use std::path::PathBuf;
 
-/// All 23 bot-owned tables, with the real legacy type surface represented:
+/// The frozen v3 tables plus member-ban ownership, with the real legacy type surface represented:
 /// bigserial ids, text, timestamptz, booleans, integers, jsonb, bytea, and
 /// nullable columns. Column names per table match the legacy dump's stable
 /// read order (`orderFor`), so the test exercises the real ORDER BY paths.
@@ -109,6 +109,18 @@ async fn build_schema(pool: &PgPool) {
             .execute(pool)
             .await
             .unwrap();
+    }
+    // This fixture intentionally exercises the legacy type surface rather than
+    // migrations. Complete-schema/FK coverage lives in backup_schema_roundtrip.
+    for table in two_bot_core::backup::dump_file::DUMP_TABLES {
+        if !SCHEMA.iter().any(|(name, _)| name == table) {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE TABLE IF NOT EXISTS {table} (id BIGINT PRIMARY KEY)"
+            )))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
     }
     sqlx::query("CREATE TABLE schema_migrations (id TEXT PRIMARY KEY)")
         .execute(pool)
@@ -270,7 +282,11 @@ async fn dump_inspect_restore_round_trip() {
     let manifest = two_bot_core::backup::dump::dump(&pool, &dump_path)
         .await
         .expect("dump");
-    assert_eq!(manifest.tables.len(), 23, "all bot-owned tables dumped");
+    assert_eq!(
+        manifest.tables.len(),
+        two_bot_core::backup::dump_file::DUMP_TABLES.len(),
+        "all covered tables dumped"
+    );
     let events = manifest.tables.iter().find(|t| t.name == "events").unwrap();
     assert_eq!(events.count, 3);
     assert!(dump_path.exists());

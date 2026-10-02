@@ -176,6 +176,18 @@ jobs:
           cargo build -p two-bot --locked
           cargo test -p two-bot-core --features db --locked --test backup_dump_publication -- --nocapture
 
+      - name: Native v3 and real backup CLI regressions (CI service only)
+        run: |
+          export PAPERCLIP_RUN_SCRATCH_DIR
+          PAPERCLIP_RUN_SCRATCH_DIR=$(mktemp -d "$RUNNER_TEMP/backup-regressions.XXXXXX")
+          db="two_next_backup_publication_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          createdb -h agent-testdb -U agent_test "$db"
+          trap 'dropdb -h agent-testdb -U agent_test --if-exists "$db"; rm -rf "$PAPERCLIP_RUN_SCRATCH_DIR"' EXIT
+          export TWO_BOT_TEST_DATABASE_URL="postgres://agent_test:@agent-testdb:5432/$db"
+          cargo build -p two-bot --locked
+          export TWO_BOT_TEST_BACKUP_BIN="$PWD/target/debug/two-bot"
+          cargo test -p two-bot-core --features db --test backup_roundtrip --test backup_dump_publication --locked -- --nocapture --test-threads=1
+
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
       - name: property tests stay under 30 seconds
