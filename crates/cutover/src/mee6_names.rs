@@ -61,8 +61,14 @@ pub fn translate_mee6_template(raw: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Copy one full UTF-8 scalar so accented, CJK and emoji literals
+        // survive byte-for-byte; a byte-as-char copy would mojibake them.
+        let ch = raw[i..]
+            .chars()
+            .next()
+            .expect("byte index is a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -175,6 +181,23 @@ mod tests {
             ),
             "{user} welcome to {server}! #  "
         );
+    }
+
+    #[test]
+    fn unicode_literals_survive_placeholder_translation() {
+        assert_eq!(
+            translate_mee6_template("Olá 👋 {user} — 東京"),
+            "Olá 👋 {user} — 東京"
+        );
+        // Non-ASCII literals on both sides of mapped, unmapped and
+        // malformed spans; nested braces are not a placeholder span.
+        assert_eq!(
+            translate_mee6_template("東京{server}café #{member_count} naïve {user{id} fin {oops"),
+            "東京{server}café # naïve {user fin {oops"
+        );
+        // Deterministic across repeated calls.
+        let raw = "Olá 👋 {user} — 東京 {server} #{bogus}";
+        assert_eq!(translate_mee6_template(raw), translate_mee6_template(raw));
     }
 
     #[test]

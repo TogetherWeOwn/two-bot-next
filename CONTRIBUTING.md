@@ -95,9 +95,13 @@ async fn persists_a_row() {
 ```
 
 Each fixture creates a unique database, applies the supplied migrations, and
-closes/drops only that owned database. All fixture connections, including
-independent pools, enforce a five-second SQL statement timeout. The bootstrap is never migrated or
-dropped. Call `close().await` explicitly so teardown errors fail the test;
+closes/drops only that owned database. Migrations and all fixture connections,
+including independent pools, enforce a five-second SQL statement timeout. Only
+the teardown admin session gets a finite 30-second `DROP DATABASE` budget, since
+Postgres can wait for a forced checkpoint on a loaded test service. That timeout
+is set and the drop is executed on the same acquired connection. The bootstrap
+is never migrated or dropped. Call `close().await` explicitly so teardown errors
+fail the test;
 `Drop` provides only best-effort cleanup while a Tokio runtime remains alive.
 Migration failures clean up immediately. Cancelling explicit close detaches
 teardown rather than cancelling it, but the runtime must stay alive. Do not rely
