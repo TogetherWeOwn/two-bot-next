@@ -54,6 +54,17 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   `Claimed(ExecutionClaim)`, `InFlight`, `NeedsReconciliation`, `Replay(response)`
   or `Mismatch`. All except `Claimed` prohibit execution. An `ExecutionClaim` has
   private fields and is only produced after intent and audit commit.
+- `release_proven_not_sent(ExecutionClaim)` requires owning-executor proof that
+  the mutation was never dispatched. It consumes the opaque, non-Clone claim on
+  every return path, atomically records a `released`/`proven_not_sent` audit and
+  transitions a fresh `in_flight` intent to `not_sent` (migration `0352`). Only
+  that explicit state permits same-key reclaim, under a row lock with exact
+  action/payload **and all original subject scalars** unchanged. Claim refreshes
+  its diagnostic timestamps before commit. The original intent/audits and nonce
+  burn remain; old ownership cannot be used after consuming release. Audit rows
+  are per intent/phase, not per execution attempt: `released` proves at least one
+  no-dispatch release, not an attempt count. Reconciliation refuses `not_sent`
+  even when aged. Unknown, completed or stale ordinary claims cannot be released.
 - `finish(&ExecutionClaim, &TerminalResponse)` commits completion and its audit.
 - `mark_unknown(&ExecutionClaim)` preserves the slot and deduplicates the unknown
   audit. It never releases the claim.
