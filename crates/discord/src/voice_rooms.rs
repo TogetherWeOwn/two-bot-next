@@ -454,8 +454,12 @@ impl RoomHttp {
             .try_into_request()
             .map_err(classify_http_error)?;
         match self.send(request, still_valid).await {
-            Ok(()) | Err(RoomHttpError::NotFound) => Ok(()),
-            Err(error) => Err(error),
+            Ok(_) => Ok(()),
+            Err(error) => match error {
+                // A duplicate disconnect is success: the member already left.
+                RoomHttpError::NotFound => Ok(()),
+                other => Err(other),
+            },
         }
     }
 
