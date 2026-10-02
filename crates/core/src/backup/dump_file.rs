@@ -66,6 +66,13 @@ pub const DUMP_TABLES: &[&str] = &[
     "self_role_panel_claims",
     "self_role_exchanges",
     "self_role_exchange_baselines",
+    // Appended after the frozen v3 prefix: per-delivery automod arbitration
+    // (0221 + counted/preserved-match columns in 0222/0223), one-shot gateway
+    // boot directives (0321) and the erasure accountability log (0410). None
+    // carries foreign keys, so order among them is free.
+    "automod_delivery_claims",
+    "gateway_boot_directives",
+    "member_erasure_audit",
     "member_levels",
     "xp_awards",
     "level_role_rewards",
