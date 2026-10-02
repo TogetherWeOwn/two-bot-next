@@ -1,3 +1,18 @@
+# Voice fixtures
+
+`voice_conditions_golden.json` is the V6b independent golden corpus over the
+`voice_conditions` evaluator ([TOG-12468](/TOG/issues/TOG-12468)): 90 oracle
+rows authored from `docs/voice-rooms.md` §V6 plus the legacy two-bot tempVoice
+runtime state each condition head reads. Contexts are copied verbatim from
+`tests/voice_templates/corpus.json` (same shape, no drift); rows with
+`basis: "choice"` pin TOG-12189's documented choice where the shared corpus
+records an ambiguity. Regenerate with
+`python3 crates/core/tests/fixtures/generate_voice_conditions_golden.py` from
+the repository root (standard library only); the script asserts the spec
+SHA-256 pin and cross-checks every `shared_case` row against the shared
+corpus, so regeneration is verification. `voice_conditions_golden.rs`
+structurally gates the fixture until the eval-wiring follow-up lands.
+
 # Backup compatibility fixtures
 
 `legacy-v3-native.ndjson` was emitted on 2026-09-30 by the **actual frozen writer**
