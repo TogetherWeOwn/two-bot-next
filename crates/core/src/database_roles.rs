@@ -58,6 +58,8 @@ mod tests {
             include_str!("../../cutover/migrations/0113_moderation_unban_retry_order.sql"),
             include_str!("../../cutover/migrations/0114_moderation_member_runtime_grants.sql"),
             include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
+            include_str!("../../cutover/migrations/0140_scheduled_messages.sql"),
+            include_str!("../../cutover/migrations/0141_scheduled_messages_legacy_upgrade.sql"),
             include_str!("../../cutover/migrations/0150_sticky_messages.sql"),
             include_str!("../../cutover/migrations/0160_rsvp.sql"),
             include_str!("../../cutover/migrations/0170_lfg.sql"),
