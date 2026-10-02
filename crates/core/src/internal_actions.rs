@@ -2361,12 +2361,13 @@ mod tests {
 
     #[test]
     fn catalog_counts_match_legacy_census() {
-        // Shared legacy census: hot 41 / cold 28 / env_only 48. Count the
-        // actual entries, not just representatives of each class.
+        // Shared legacy census: hot 41 / cold 28 / env_only 48, plus the
+        // receiver's combined bind and caller mapping (both env-only).
+        // Count actual entries, not just representatives of each class.
         for (class, expected) in [
             (SettingClass::Hot, 41),
             (SettingClass::Cold, 28),
-            (SettingClass::EnvOnly, 48),
+            (SettingClass::EnvOnly, 50),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
