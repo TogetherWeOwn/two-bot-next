@@ -3559,6 +3559,7 @@ mod tests {
         let now_ms = 1_720_000_000_000;
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
         let marker = "synthetic-oauth-body-marker";
         for raw in [
             // Which verb runs would depend on which parser reads the body.
@@ -3578,18 +3579,30 @@ mod tests {
                 raw.as_bytes(),
             );
             let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
-            let err =
-                authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
-                    .expect_err("repeated key");
+            let err = authorize_for_test(
+                &headers,
+                raw.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+                &mut clock,
+            )
+            .expect_err("repeated key");
             assert_eq!(err.code, ErrorCode::Malformed);
             assert_eq!(err.log_reason, "duplicate_json_key");
             for text in [format!("{err}"), format!("{err:?}")] {
                 assert!(!text.contains(marker), "{text}");
                 assert!(!text.contains("guild.add_member"), "{text}");
             }
-            let err =
-                authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
-                    .expect_err("refused body still burned its nonce");
+            let err = authorize_for_test(
+                &headers,
+                raw.as_bytes(),
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+                &mut clock,
+            )
+            .expect_err("refused body still burned its nonce");
             assert_eq!(err.code, ErrorCode::Replayed);
         }
         // The frozen legacy vectors repeat no key and still parse unchanged.
