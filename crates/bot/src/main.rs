@@ -250,8 +250,7 @@ async fn main() {
 
 /// `--help` covers both the gateway server and the backup CLI.
 async fn print_backup_help_and_exit() -> ! {
-    println!("{}", preflight::USAGE);
-    print!("{}", erasure_cli::USAGE);
+    backup_cli::print_server_usage();
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
 }

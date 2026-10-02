@@ -40,6 +40,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'operational_audit_log', 'table'),
     ('public', 'audit_kill_switch', 'table'),
     ('public', 'internal_nonces', 'table'),
+    ('public', 'internal_clock_high_water', 'table'),
     ('public', 'internal_idempotency', 'table'),
     ('public', 'internal_action_log', 'table'),
     ('public', 'internal_discord_events', 'table'),
