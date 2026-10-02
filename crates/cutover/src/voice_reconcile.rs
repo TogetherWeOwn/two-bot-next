@@ -483,6 +483,15 @@ pub struct VoiceHalves {
     pub leaves: Vec<LeaveRow>,
 }
 
+/// One raw `voice_session_end` row from the events feed.
+type EndRow = (
+    String,
+    Option<String>,
+    time::OffsetDateTime,
+    String,
+    Option<String>,
+);
+
 pub async fn fetch_voice_halves(
     pool: &sqlx::PgPool,
     guild: Option<&str>,
@@ -499,13 +508,7 @@ pub async fn fetch_voice_halves(
     .bind(since)
     .fetch_all(pool)
     .await?;
-    let end_rows: Vec<(
-        String,
-        Option<String>,
-        time::OffsetDateTime,
-        String,
-        Option<String>,
-    )> = sqlx::query_as(
+    let end_rows: Vec<EndRow> = sqlx::query_as(
         "SELECT guild_id, member_id, occurred_at, source, metadata FROM events
           WHERE event_type = 'voice_session_end'
             AND ($1::text IS NULL OR guild_id = $1)
@@ -602,7 +605,7 @@ pub fn build_seed_halves(now_ms: i64) -> VoiceHalves {
         occurred_at: at(offset),
         channel: channel.to_owned(),
         start_known,
-        started_at: started_at.map(|o| at(o)),
+        started_at: started_at.map(&at),
         duration_seconds,
     };
     VoiceHalves {
@@ -614,7 +617,7 @@ pub fn build_seed_halves(now_ms: i64) -> VoiceHalves {
             // m3: pre-TOG-6122 server leave: no end row at all.
             start("m3", -2 * HOUR, "ch-a"),
             // m4: nothing after this start: still open (or lost).
-            start("m4", -1 * HOUR, "ch-b"),
+            start("m4", -HOUR, "ch-b"),
             // m5: two starts, one end: the first start is superseded.
             start("m5", -50 * MIN, "ch-a"),
             start("m5", -40 * MIN, "ch-b"),

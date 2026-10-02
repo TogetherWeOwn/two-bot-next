@@ -46,6 +46,7 @@ pub struct RosterMember {
 /// - `2025-07-06-raid` (confirmed): 1,015 accounts between 20:31-21:27 UTC.
 /// - `2025-09-12-raid` (suspected): 15 accounts 17:42:59-17:43:04 UTC.
 /// - `2025-12-15-raid` (suspected): 15 accounts 21:16:49-21:16:56 UTC.
+///
 /// Cleanup/prune windows never classify a join as raid residue.
 /// Day-bounds are whole listed days, half-open `[day 00:00, next day 00:00)`.
 ///
@@ -166,6 +167,10 @@ fn fills_for(joins: &[String], kind: GapKind) -> Vec<ProposedFill> {
 /// `scannedBackTo`). None means unknown, in which case nothing is called
 /// pre-coverage: without a floor that label would be a guess, so those gaps
 /// read as log-miss with the floor-unknown note.
+/// Joins per (guild, member): the guild plus each join instant, both the
+/// epoch millis for comparison and the source spelling for reports/fills.
+type JoinsByMember = std::collections::BTreeMap<(String, String), (String, Vec<(i64, String)>)>;
+
 #[must_use]
 pub fn classify_leave_gaps(
     joins: &[GapJoin],
@@ -175,10 +180,7 @@ pub fn classify_leave_gaps(
 ) -> ClassifyResult {
     let mut result = ClassifyResult::default();
 
-    let mut joins_by_member: std::collections::BTreeMap<
-        (String, String),
-        (String, Vec<(i64, String)>),
-    > = std::collections::BTreeMap::new();
+    let mut joins_by_member: JoinsByMember = std::collections::BTreeMap::new();
     for j in joins {
         let Some(member_id) = j.member_id.as_deref().filter(|m| !m.is_empty()) else {
             result.skipped += 1;
@@ -532,6 +534,7 @@ mod tests {
                 join(Some("m"), "2024-05-01T10:00:00.000Z"),
                 join(Some("m"), "2024-09-01T10:00:00.000Z"),
             ],
+            &[],
             &[],
             None,
         );
