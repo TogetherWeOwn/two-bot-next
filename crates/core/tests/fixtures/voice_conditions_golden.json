@@ -4,7 +4,7 @@
   "path": "docs/voice-rooms.md",
   "sha256": "11d8af8076659c221279cbbbadb477d6c0898c4ef284eef9857b93635fdb44fb"
  },
- "description": "V6b independent golden corpus over the voice_conditions evaluator (TOG-12468). Rows authored from docs/voice-rooms.md V6 plus the legacy two-bot tempVoice runtime state each head reads; basis=spec is determinate from the spec alone, basis=choice pins TOG-12189's documented choice where the shared corpus records an ambiguity.",
+ "description": "V6b independent golden corpus over the voice_conditions evaluator (TOG-12468). Rows authored from docs/voice-rooms.md V6 plus the legacy two-bot tempVoice runtime state each head reads; basis=spec is determinate from the spec alone, basis=choice pins a choice TOG-12189 documents (line cited) where V6 alone does not decide the outcome.",
  "contexts": {
   "day-Monday": {
    "channel_kind": "temporary",
@@ -1204,9 +1204,9 @@
     "condition:GAME",
     "rule:case"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1292,9 +1292,9 @@
     "condition:ROLE:id",
     "rule:case"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
     "legacy": "two-bot src/tempVoice/service.ts permit/reject role overwrites; role membership from Discord guild state"
    }
   },
@@ -1310,9 +1310,9 @@
     "condition:ROLE:id",
     "rule:case"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
     "legacy": "two-bot src/tempVoice/service.ts permit/reject role overwrites; role membership from Discord guild state"
    }
   },
@@ -1507,9 +1507,9 @@
     "condition:FULL",
     "rule:case"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
     "legacy": "two-bot src/tempVoice/service.ts setLimit 0-99, 0 = unlimited (\"User limit removed\")"
    }
   },
@@ -1937,12 +1937,11 @@
     "output": "yes"
    },
    "covers": [
-    "condition:WEEKDAY",
-    "compare:="
+    "condition:WEEKDAY"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1955,12 +1954,11 @@
     "output": "no"
    },
    "covers": [
-    "condition:WEEKDAY",
-    "compare:="
+    "condition:WEEKDAY"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1976,9 +1974,9 @@
     "condition:MONTH",
     "compare:="
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1991,12 +1989,11 @@
     "output": "yes"
    },
    "covers": [
-    "condition:MONTH",
-    "compare:="
+    "condition:MONTH"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -2009,12 +2006,11 @@
     "output": "no"
    },
    "covers": [
-    "condition:MONTH",
-    "compare:="
+    "condition:MONTH"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -2030,9 +2026,9 @@
     "condition:MONTH",
     "rule:case"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L35 WEEKDAY/MONTH compare by position or full English name",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -2274,9 +2270,9 @@
    "covers": [
     "compare:="
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
     "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
    }
   },
@@ -2292,9 +2288,9 @@
     "compare:=",
     "token:@@num_others@@"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
     "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
    }
   },
@@ -2310,9 +2306,9 @@
     "compare:=",
     "token:@@num_live@@"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
     "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
    }
   },
@@ -2328,9 +2324,9 @@
     "compare:=",
     "token:@@num_playing@@"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
     "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
    }
   },
@@ -2346,9 +2342,9 @@
     "compare:=",
     "token:@@party_size@@"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
     "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
    }
   },
@@ -2365,9 +2361,9 @@
     "token:@@num@@",
     "rule:case"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L21 keywords, counters and calendar names match case-insensitively; IDs exact",
     "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
    }
   },
@@ -2383,9 +2379,9 @@
     "compare:=",
     "token:@@slots@@"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L28-34 numeric operands; blank value is false",
     "legacy": "two-bot src/tempVoice/nameFilter.ts renderNameTemplate {count}/{seq}; service.ts reserveIfUnderCaps countForOwner/countForGuild"
    }
   },
@@ -2682,9 +2678,9 @@
     "rule:verbatim",
     "condition:FULL"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L10-11 split at first top-level ?? then first //",
     "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
    }
   },
@@ -2700,9 +2696,9 @@
     "rule:verbatim",
     "condition:FULL"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L10-11 split at first top-level ?? then first //",
     "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
    }
   },
@@ -2718,9 +2714,9 @@
     "rule:verbatim",
     "condition:FULL"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L83 branch text keeps spacing around ?? and //",
     "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
    }
   },
@@ -2736,9 +2732,9 @@
     "rule:verbatim",
     "condition:FULL"
    ],
-   "basis": "spec",
+   "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L13 a node without ?? stays literal",
     "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
    }
   }

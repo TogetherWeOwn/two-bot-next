@@ -3,31 +3,43 @@
 
 V6b independent golden corpus (TOG-12468): condition-evaluator oracle rows
 authored from docs/voice-rooms.md V6 plus the legacy two-bot tempVoice runtime
-state each head reads. Contexts are copied VERBATIM from
-tests/voice_templates/corpus.json (same shape, no drift).
+state each head reads. 26 contexts are copied verbatim from
+tests/voice_templates/corpus.json; DERIVED contexts are synthesised here and
+named in the Rust test's allowlist, which checks both.
 
 Row basis:
   spec   - determinate from docs/voice-rooms.md V6 alone.
-  choice - pins TOG-12189's documented choice where the shared corpus records
-           an ambiguity (condition-grammar, numeric-##, numeric-+#).
+  choice - pins a choice TOG-12189 documents in docs/voice-conditions-core.md
+           (line cited) where V6 alone does not decide the outcome, including
+           the shared corpus's ambiguities (condition-grammar, numeric-##,
+           numeric-+#).
 shared_case marks rows transcribed from the shared corpus; the Rust
 structural test cross-checks input/expected against it.
 """
+import hashlib
 import json
 import os
-import subprocess
 
 SHARED = json.load(open('tests/voice_templates/corpus.json'))
 CTX = SHARED['contexts']
 SPEC_SHA = SHARED['spec']['sha256']
 assert SHARED['spec']['path'] == 'docs/voice-rooms.md'
-mine = subprocess.run(['sha256sum', 'docs/voice-rooms.md'],
-                      capture_output=True, text=True, check=True)
-assert mine.stdout.split()[0] == SPEC_SHA, 'spec moved; update rows consciously'
+with open('docs/voice-rooms.md', 'rb') as spec_file:
+    mine = hashlib.sha256(spec_file.read()).hexdigest()
+assert mine == SPEC_SHA, 'spec moved; update rows consciously'
 
 SPEC_V6 = 'docs/voice-rooms.md §V6'
-CHOICE = ('TOG-12189 docs/voice-conditions-core.md '
-          '(feat/voice-conditions-core); shared-corpus ambiguity ')
+CORE = ('TOG-12189 docs/voice-conditions-core.md '
+        '(feat/voice-conditions-core)')
+CHOICE = CORE + '; shared-corpus ambiguity '
+CORE_SPLIT = CORE + ' L10-11 split at first top-level ?? then first //'
+CORE_LITERAL = CORE + ' L13 a node without ?? stays literal'
+CORE_CASE = (CORE + ' L21 keywords, counters and calendar names match '
+             'case-insensitively; IDs exact')
+CORE_OPERANDS = CORE + ' L28-34 numeric operands; blank value is false'
+CORE_CALENDAR = (CORE + ' L35 WEEKDAY/MONTH compare by position or full '
+                 'English name')
+CORE_SPACING = CORE + ' L83 branch text keeps spacing around ?? and //'
 LEGACY_COUNT = ('two-bot src/tempVoice/nameFilter.ts renderNameTemplate '
                 '{count}/{seq}; service.ts reserveIfUnderCaps '
                 'countForOwner/countForGuild')
@@ -59,22 +71,22 @@ CASES = [
      'game-alias', 'no', ['condition:GAME'], 'spec', SPEC_V6,
      'game-condition-GAME=Chess'),
     ('v6b-game-title-case-insensitive', '{{GAME=apex ??yes//no}}',
-     'game-apex', 'yes', ['condition:GAME', 'rule:case'], 'spec', SPEC_V6,
+     'game-apex', 'yes', ['condition:GAME', 'rule:case'], 'choice', CORE_CASE,
      None),
     ('v6b-game-bare-shown', '{{GAME ??yes//no}}', 'game-apex', 'yes',
      ['condition:GAME'], 'spec', SPEC_V6, None),
     ('v6b-game-bare-empty', '{{GAME ??yes//no}}', 'solo', 'no',
      ['condition:GAME'], 'spec', SPEC_V6, None),
-    # ---- perms: person heads (spec table; IDs exact, scopes case-insensitive) ----
+    # ---- perms: person heads (spec table; case rows are TOG-12189 choices) ----
     ('v6b-role-hit', '{{ROLE:raid ??yes//no}}', 'role-owner', 'yes',
      ['condition:ROLE:id'], 'spec', SPEC_V6, 'role-role-owner'),
     ('v6b-role-miss', '{{ROLE:raid ??yes//no}}', 'solo', 'no',
      ['condition:ROLE:id'], 'spec', SPEC_V6, 'role-solo'),
     ('v6b-role-scope-case-insensitive', '{{role:raid ??yes//no}}',
-     'role-owner', 'yes', ['condition:ROLE:id', 'rule:case'], 'spec',
-     SPEC_V6, None),
+     'role-owner', 'yes', ['condition:ROLE:id', 'rule:case'], 'choice',
+     CORE_CASE, None),
     ('v6b-role-id-exact', '{{ROLE:Raid ??yes//no}}', 'role-owner', 'no',
-     ['condition:ROLE:id', 'rule:case'], 'spec', SPEC_V6, None),
+     ['condition:ROLE:id', 'rule:case'], 'choice', CORE_CASE, None),
     ('v6b-any-role-member', '{{ANY_ROLE:raid ??yes//no}}', 'role-other',
      'yes', ['condition:ANY_ROLE:id'], 'spec', SPEC_V6,
      'any-role-role-other'),
@@ -102,7 +114,7 @@ CASES = [
     ('v6b-full-unlimited', '{{FULL ??full//open}}', 'full-unlimited',
      'open', ['condition:FULL'], 'spec', SPEC_V6, 'full-unlimited'),
     ('v6b-full-keyword-case-insensitive', '{{full ??full//open}}',
-     'full-full', 'full', ['condition:FULL', 'rule:case'], 'spec', SPEC_V6,
+     'full-full', 'full', ['condition:FULL', 'rule:case'], 'choice', CORE_CASE,
      None),
     ('v6b-private-temp-locked', '{{PRIVATE ??private//public}}',
      'private-temporary-True', 'private', ['condition:PRIVATE'], 'spec',
@@ -169,25 +181,25 @@ CASES = [
      'day-Monday', 'weekday', ['condition:WEEKDAY'], 'choice',
      CHOICE + 'condition-grammar', None),
     ('v6b-weekday-name-equals', '{{WEEKDAY:Monday ??yes//no}}',
-     'day-Monday', 'yes', ['condition:WEEKDAY', 'compare:='], 'spec',
-     SPEC_V6, None),
+     'day-Monday', 'yes', ['condition:WEEKDAY'], 'choice',
+     CORE_CALENDAR, None),
     ('v6b-weekday-name-miss', '{{WEEKDAY:Friday ??yes//no}}', 'day-Monday',
-     'no', ['condition:WEEKDAY', 'compare:='], 'spec', SPEC_V6, None),
+     'no', ['condition:WEEKDAY'], 'choice', CORE_CALENDAR, None),
     ('v6b-month-number', '{{MONTH = 9 ??yes//no}}', 'month-September',
-     'yes', ['condition:MONTH', 'compare:='], 'spec', SPEC_V6, None),
+     'yes', ['condition:MONTH', 'compare:='], 'choice', CORE_CALENDAR, None),
     ('v6b-month-name', '{{MONTH:September ??yes//no}}', 'month-September',
-     'yes', ['condition:MONTH', 'compare:='], 'spec', SPEC_V6, None),
+     'yes', ['condition:MONTH'], 'choice', CORE_CALENDAR, None),
     ('v6b-month-name-miss', '{{MONTH:April ??yes//no}}',
-     'month-September', 'no', ['condition:MONTH', 'compare:='], 'spec',
-     SPEC_V6, None),
+     'month-September', 'no', ['condition:MONTH'], 'choice',
+     CORE_CALENDAR, None),
     ('v6b-month-case-insensitive', '{{month:september ??yes//no}}',
-     'month-September', 'yes', ['condition:MONTH', 'rule:case'], 'spec',
-     SPEC_V6, None),
+     'month-September', 'yes', ['condition:MONTH', 'rule:case'], 'choice',
+     CORE_CALENDAR, None),
     ('v6b-hour-early', '{{@@hour@@ < 12 ??early//late}}', 'hour-0',
      'early', ['token:@@hour@@', 'compare:<'], 'spec', SPEC_V6, None),
     ('v6b-hour-late', '{{@@hour@@ < 12 ??early//late}}', 'hour-23',
      'late', ['token:@@hour@@', 'compare:<'], 'spec', SPEC_V6, None),
-    # ---- count / comparison heads (spec: all six ops, token-vs-token) ----
+    # ---- count / comparison heads (spec: six ops, token-vs-token; other operands choice) ----
     ('v6b-cmp-lt-false', '{{@@num@@ < 1 ??yes//no}}', 'solo', 'no',
      ['compare:<', 'token:@@num@@'], 'spec', SPEC_V6, 'compare-equal-lt'),
     ('v6b-cmp-gt-false', '{{@@num@@ > 1 ??yes//no}}', 'solo', 'no',
@@ -213,24 +225,24 @@ CASES = [
     ('v6b-cmp-room-number', '{{$# = 3 ??yes//no}}', 'solo', 'yes',
      ['compare:='], 'spec', SPEC_V6, 'compare-room-number'),
     ('v6b-cmp-room-number-padded', '{{$00# = 3 ??yes//no}}', 'solo',
-     'yes', ['compare:='], 'spec', SPEC_V6, None),
+     'yes', ['compare:='], 'choice', CORE_OPERANDS, None),
     ('v6b-cmp-num-others', '{{@@num_others@@ = 2 ??yes//no}}',
-     'humans-3-4', 'yes', ['compare:=', 'token:@@num_others@@'], 'spec',
-     SPEC_V6, None),
+     'humans-3-4', 'yes', ['compare:=', 'token:@@num_others@@'], 'choice',
+     CORE_OPERANDS, None),
     ('v6b-cmp-num-live', '{{@@num_live@@ = 1 ??yes//no}}', 'live-both',
-     'yes', ['compare:=', 'token:@@num_live@@'], 'spec', SPEC_V6, None),
+     'yes', ['compare:=', 'token:@@num_live@@'], 'choice', CORE_OPERANDS, None),
     ('v6b-cmp-num-playing', '{{@@num_playing@@ = 3 ??yes//no}}',
      'playing-no-party-3', 'yes', ['compare:=', 'token:@@num_playing@@'],
-     'spec', SPEC_V6, None),
+     'choice', CORE_OPERANDS, None),
     ('v6b-cmp-party-size-max', '{{@@party_size@@ = 12 ??yes//no}}',
-     'party-4', 'yes', ['compare:=', 'token:@@party_size@@'], 'spec',
-     SPEC_V6, None),
+     'party-4', 'yes', ['compare:=', 'token:@@party_size@@'], 'choice',
+     CORE_OPERANDS, None),
     ('v6b-cmp-counter-case-insensitive', '{{@@NUM@@ = 1 ??yes//no}}',
-     'solo', 'yes', ['compare:=', 'token:@@num@@', 'rule:case'], 'spec',
-     SPEC_V6, None),
+     'solo', 'yes', ['compare:=', 'token:@@num@@', 'rule:case'], 'choice',
+     CORE_CASE, None),
     ('v6b-cmp-blank-slots-always-false',
      '{{@@slots@@ = 0 ??yes//no}}', 'solo', 'no',
-     ['compare:=', 'token:@@slots@@'], 'spec', SPEC_V6, None),
+     ['compare:=', 'token:@@slots@@'], 'choice', CORE_OPERANDS, None),
     ('v6b-cmp-literals', '{{7 > 2 ??yes//no}}', 'solo', 'yes',
      ['compare:>'], 'spec', SPEC_V6, 'compare-literal'),
     # ---- unknown-head refusal (spec: an unknown condition is false) ----
@@ -283,18 +295,18 @@ CASES = [
     ('v6b-optional-else-true', 'prefix{{ROLE:raid ??role}}', 'role-owner',
      'prefixrole', ['rule:optional-else', 'condition:ROLE:id'], 'spec',
      SPEC_V6, 'optional-else-true'),
-    # ---- verbatim output (spec: branch text kept as written) ----
+    # ---- verbatim output (choice: TOG-12189 keeps branch text as written) ----
     ('v6b-verbatim-extra-separators-true', '{{FULL ??a??b//c//d}}',
-     'full-full', 'a??b', ['rule:verbatim', 'condition:FULL'], 'spec',
-     SPEC_V6, None),
+     'full-full', 'a??b', ['rule:verbatim', 'condition:FULL'], 'choice',
+     CORE_SPLIT, None),
     ('v6b-verbatim-extra-separators-false', '{{FULL ??a??b//c//d}}',
-     'full-space', 'c//d', ['rule:verbatim', 'condition:FULL'], 'spec',
-     SPEC_V6, None),
+     'full-space', 'c//d', ['rule:verbatim', 'condition:FULL'], 'choice',
+     CORE_SPLIT, None),
     ('v6b-verbatim-spaces-kept', '[{{ FULL ?? yes // no }}]',
-     'full-full', '[ yes ]', ['rule:verbatim', 'condition:FULL'], 'spec',
-     SPEC_V6, None),
+     'full-full', '[ yes ]', ['rule:verbatim', 'condition:FULL'], 'choice',
+     CORE_SPACING, None),
     ('v6b-verbatim-no-node-stays-literal', '{{FULL}}', 'solo',
-     '{{FULL}}', ['rule:verbatim', 'condition:FULL'], 'spec', SPEC_V6,
+     '{{FULL}}', ['rule:verbatim', 'condition:FULL'], 'choice', CORE_LITERAL,
      None),
 ]
 
@@ -325,9 +337,6 @@ LEGACY_FOR = {
     'rule:nested': LEGACY_NAME,
     'rule:optional-else': LEGACY_NAME,
     'rule:verbatim': LEGACY_NAME,
-    'rule:case': ('keywords, scopes, counter tokens, game titles and '
-                  'calendar names match ASCII case-insensitively; IDs match '
-                  'exactly (TOG-12189 parse_condition/person_scope/Calendar)'),
 }
 
 
@@ -339,17 +348,22 @@ def legacy_for(covers):
     return LEGACY_NEW
 
 
+def derived_contexts():
+    """Contexts the shared corpus lacks. Keep in sync with DERIVED_CONTEXTS
+    in voice_conditions_golden.rs."""
+    capped = json.loads(json.dumps(CTX['party-4']))
+    capped['members'][0]['party'] = {
+        'id': 'p1', 'size': 4, 'maximum': 4,
+        'state': 'Ranked', 'details': 'Full squad'}
+    return {'v6b-party-capped': capped}
+
+
 def main():
+    derived = derived_contexts()
+    assert not set(derived) & set(CTX), 'derived context shadows shared'
     contexts = {}
     for key in sorted({c for _, _, c, _, _, _, _, _ in CASES}):
-        if key == 'v6b-party-capped':
-            base = json.loads(json.dumps(CTX['party-4']))
-            base['members'][0]['party'] = {
-                'id': 'p1', 'size': 4, 'maximum': 4,
-                'state': 'Ranked', 'details': 'Full squad'}
-            contexts[key] = base
-        else:
-            contexts[key] = CTX[key]
+        contexts[key] = derived[key] if key in derived else CTX[key]
     cases = []
     for cid, src, ctx, exp, covers, basis, spec_cite, shared in CASES:
         if shared is not None:
@@ -374,9 +388,9 @@ def main():
                                'authored from docs/voice-rooms.md V6 plus '
                                'the legacy two-bot tempVoice runtime state '
                                'each head reads; basis=spec is determinate '
-                               'from the spec alone, basis=choice pins '
-                               "TOG-12189's documented choice where the "
-                               'shared corpus records an ambiguity.'),
+                               'from the spec alone, basis=choice pins a '
+                               'choice TOG-12189 documents (line cited) where '
+                               'V6 alone does not decide the outcome.'),
                'contexts': contexts, 'cases': cases}
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                  'voice_conditions_golden.json')

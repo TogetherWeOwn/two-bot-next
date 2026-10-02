@@ -6,9 +6,13 @@
 //! eval-wiring follow-up will consume:
 //! - every condition head has at least one row (`MIN_PER_HEAD`);
 //! - unknown-head rows refuse (`expected.output == "no"`);
-//! - every row parses as a V5 conditional node with its branch text preserved
-//!   verbatim (verbatim-output preservation is parser-level, not evaluator);
+//! - every row's first V5 conditional node is a verbatim slice of its input,
+//!   and every expected output is the text around that node plus a slice of
+//!   the node source, so no row invents text; `rule:verbatim` rows select
+//!   non-empty branch text (verbatim preservation is parser-level);
 //! - `shared_case` rows agree byte-for-byte with `tests/voice_templates/corpus.json`;
+//! - every context equals the shared corpus context of the same name, except
+//!   the `DERIVED_CONTEXTS` allowlist, which the shared corpus must not define;
 //! - the spec pin matches the current `docs/voice-rooms.md` SHA-256.
 //!
 //! The eval follow-up (blocked on TOG-12189) renders `input` through the
@@ -25,6 +29,10 @@ const SHARED: &str = include_str!("../../../tests/voice_templates/corpus.json");
 /// Minimum rows per condition head. The acceptance bar is one row per head;
 /// the count only guards against silent fixture shrinkage.
 const MIN_PER_HEAD: usize = 1;
+
+/// Contexts synthesised by the generator (`derived_contexts`) because the
+/// shared corpus has no equivalent; every other context is copied verbatim.
+const DERIVED_CONTEXTS: &[&str] = &["v6b-party-capped"];
 
 /// Every condition head the fixture must cover.
 const HEADS: &[&str] = &[
@@ -106,6 +114,7 @@ struct Source {
 #[derive(Deserialize)]
 struct Shared {
     spec: Spec,
+    contexts: BTreeMap<String, serde_json::Value>,
     cases: Vec<SharedCase>,
 }
 
@@ -204,19 +213,36 @@ fn heads_have_coverage_unknown_heads_refuse_and_rows_cite_sources() {
         if case.covers.iter().any(|tag| tag == "rule:case") {
             ci += 1;
         }
-        if case.covers.iter().any(|tag| tag == "rule:verbatim") {
-            verbatim += 1;
-        }
         // Verbatim-output preservation: V5 carries the node source through
-        // untouched, so the evaluator receives branch text as written.
+        // untouched, so the evaluator receives branch text as written and the
+        // oracle output can only be the surrounding text plus node text.
         let Some(source) = conditional_source(&case.input) else {
-            panic!("{}: input is not a top-level conditional node", case.id);
+            panic!("{}: input has no top-level conditional node", case.id);
+        };
+        let Some((before, after)) = case.input.split_once(source.as_str()) else {
+            panic!("{}: node source is not a slice of the input", case.id);
+        };
+        let Some(branch) = case
+            .expected
+            .output
+            .strip_prefix(before)
+            .and_then(|rest| rest.strip_suffix(after))
+        else {
+            panic!("{}: output drops the text around the node", case.id);
         };
         assert!(
-            source.starts_with("{{") && source.ends_with("}}"),
-            "{}: node source keeps its braces",
+            source.contains(branch),
+            "{}: output {branch:?} is not text of {source:?}",
             case.id
         );
+        if case.covers.iter().any(|tag| tag == "rule:verbatim") {
+            assert!(
+                !branch.is_empty(),
+                "{}: verbatim row selects no branch text",
+                case.id
+            );
+            verbatim += 1;
+        }
     }
     assert!(unknown >= 1, "unknown-head refusal needs rows");
     assert!(nested >= 1, "nesting needs rows");
@@ -260,4 +286,35 @@ fn shared_rows_match_the_voice_template_corpus() {
         checked += 1;
     }
     assert_eq!(checked, 39, "every shared_case link is asserted");
+}
+
+#[test]
+fn contexts_are_shared_verbatim_except_the_derived_allowlist() {
+    let fixture = fixture();
+    let shared: Shared = serde_json::from_str(SHARED).expect("shared corpus is JSON");
+    for name in DERIVED_CONTEXTS {
+        assert!(
+            fixture.contexts.contains_key(*name),
+            "derived context {name} is unused: drop it from the allowlist"
+        );
+    }
+    let mut copied = 0;
+    for (name, body) in &fixture.contexts {
+        if DERIVED_CONTEXTS.contains(&name.as_str()) {
+            assert!(
+                !shared.contexts.contains_key(name),
+                "derived context {name} shadows a shared corpus context"
+            );
+            continue;
+        }
+        let Some(shared_body) = shared.contexts.get(name) else {
+            panic!("context {name} is neither shared nor in DERIVED_CONTEXTS");
+        };
+        assert_eq!(
+            body, shared_body,
+            "context {name} drifted from the shared corpus"
+        );
+        copied += 1;
+    }
+    assert_eq!(copied, 26, "26 contexts are copied verbatim");
 }

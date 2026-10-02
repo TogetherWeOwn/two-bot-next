@@ -3,10 +3,12 @@
 `voice_conditions_golden.json` is the V6b independent golden corpus over the
 `voice_conditions` evaluator ([TOG-12468](/TOG/issues/TOG-12468)): 90 oracle
 rows authored from `docs/voice-rooms.md` §V6 plus the legacy two-bot tempVoice
-runtime state each condition head reads. Contexts are copied verbatim from
-`tests/voice_templates/corpus.json` (same shape, no drift); rows with
-`basis: "choice"` pin TOG-12189's documented choice where the shared corpus
-records an ambiguity. Regenerate with
+runtime state each condition head reads. 26 contexts are copied verbatim from
+`tests/voice_templates/corpus.json` and 1 is derived (`v6b-party-capped`,
+`party-4` with a full advertised party); the Rust gate asserts both. Rows with
+`basis: "spec"` are determinate from §V6 alone; rows with `basis: "choice"`
+pin a choice TOG-12189 documents in `docs/voice-conditions-core.md` (line
+cited) where §V6 alone does not decide the outcome. Regenerate with
 `python3 crates/core/tests/fixtures/generate_voice_conditions_golden.py` from
 the repository root (standard library only); the script asserts the spec
 SHA-256 pin and cross-checks every `shared_case` row against the shared
