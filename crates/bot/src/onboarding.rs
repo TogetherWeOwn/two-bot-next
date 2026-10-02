@@ -704,13 +704,12 @@ impl OnboardingRuntime {
             .collect();
         // The frozen domain assumes the hub is public. Do not link it if a live
         // overwrite has made it unavailable; keep successful role selection honest.
-        plan.destinations
-            .retain(|destination| {
-                destination
-                    .channel_id
-                    .as_ref()
-                    .is_none_or(|channel| visible.contains(channel))
-            });
+        plan.destinations.retain(|destination| {
+            destination
+                .channel_id
+                .as_ref()
+                .is_none_or(|channel| visible.contains(channel))
+        });
         plan.channel_ids.retain(|channel| visible.contains(channel));
         plan.degraded_count = plan
             .destinations

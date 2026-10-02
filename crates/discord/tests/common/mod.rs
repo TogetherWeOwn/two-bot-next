@@ -472,6 +472,28 @@ pub struct RestResponse {
     pub sent_at: std::time::Instant,
 }
 
+/// Synchronize request arrival, response release and handler completion without timers.
+#[derive(Default)]
+pub struct ResponseGate {
+    arrived: tokio::sync::Notify,
+    released: tokio::sync::Notify,
+    completed: tokio::sync::Notify,
+}
+
+impl ResponseGate {
+    pub async fn wait_for_request(&self) {
+        self.arrived.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.released.notify_one();
+    }
+
+    pub async fn wait_for_completion(&self) {
+        self.completed.notified().await;
+    }
+}
+
 /// The running scripted REST double.
 pub struct MockRest {
     /// Listener address; `origin()` renders the `DISCORD_API_BASE` override.
@@ -481,20 +503,50 @@ pub struct MockRest {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-type RestResponder = Arc<dyn Fn(&RestRequest) -> ScriptedResponse + Send + Sync>;
+type RestResponder =
+    Arc<dyn Fn(&RestRequest) -> (ScriptedResponse, Option<Arc<ResponseGate>>) + Send + Sync>;
 
 impl MockRest {
     /// Bind on 127.0.0.1 and start serving `script` in order; once the queue
     /// is spent, every further request gets `default`.
     pub async fn start(script: Vec<ScriptedResponse>, default: ScriptedResponse) -> Self {
-        let queue = Mutex::new(VecDeque::from(script));
-        Self::with_responder(move |_| {
+        Self::start_inner(
+            script
+                .into_iter()
+                .map(|response| (response, None))
+                .collect(),
+            default,
+        )
+        .await
+    }
+
+    /// Hold the final scripted response until the caller releases its gate.
+    pub async fn start_gated(
+        mut script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+    ) -> (Self, Arc<ResponseGate>) {
+        let last = script.pop().expect("a gated response needs a script");
+        let gate = Arc::new(ResponseGate::default());
+        let mut queue: VecDeque<_> = script
+            .into_iter()
+            .map(|response| (response, None))
+            .collect();
+        queue.push_back((last, Some(Arc::clone(&gate))));
+        (Self::start_inner(queue, default).await, gate)
+    }
+
+    async fn start_inner(
+        script: VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)>,
+        default: ScriptedResponse,
+    ) -> Self {
+        let queue = Mutex::new(script);
+        Self::serve(Arc::new(move |_: &RestRequest| {
             queue
                 .lock()
                 .expect("queue")
                 .pop_front()
-                .unwrap_or_else(|| default.clone())
-        })
+                .unwrap_or_else(|| (default.clone(), None))
+        }))
         .await
     }
 
@@ -502,11 +554,17 @@ impl MockRest {
     pub async fn with_responder(
         responder: impl Fn(&RestRequest) -> ScriptedResponse + Send + Sync + 'static,
     ) -> Self {
+        Self::serve(Arc::new(move |request: &RestRequest| {
+            (responder(request), None)
+        }))
+        .await
+    }
+
+    async fn serve(responder: RestResponder) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let responses = Arc::new(Mutex::new(Vec::new()));
-        let responder: RestResponder = Arc::new(responder);
         let handle = {
             let recorded = Arc::clone(&recorded);
             let responses = Arc::clone(&responses);
@@ -578,9 +636,13 @@ async fn handle_rest(
         body,
         received_at: std::time::Instant::now(),
     };
-    let next = responder(&request);
+    let (next, gate) = responder(&request);
     let path = request.path.clone();
     recorded.lock().expect("recorded").push(request);
+    if let Some(gate) = &gate {
+        gate.arrived.notify_one();
+        gate.released.notified().await;
+    }
     if !next.delay.is_zero() {
         tokio::time::sleep(next.delay).await;
     }
@@ -601,6 +663,9 @@ async fn handle_rest(
             status: next.status,
             sent_at: std::time::Instant::now(),
         });
+    }
+    if let Some(gate) = gate {
+        gate.completed.notify_one();
     }
 }
 
