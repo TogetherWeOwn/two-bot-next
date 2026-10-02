@@ -14,7 +14,10 @@ fn run(args: &[&str], url: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dedupe-events"));
     command.env_clear().args(args);
     if let Some(url) = url {
-        command.env("TWO_DATABASE_URL", url);
+        // CI service only: the explicit test policy for plaintext local hosts.
+        command
+            .env("TWO_DATABASE_URL", url)
+            .env("TWO_DATABASE_TLS", "local-only");
     }
     command.output().unwrap()
 }

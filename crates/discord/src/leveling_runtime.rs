@@ -310,6 +310,12 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.handlers()
     }
 
+    /// Access the cache (shard runner updates, tests seed).
+    #[must_use]
+    pub fn cache(&self) -> &twilight_cache_inmemory::InMemoryCache {
+        self.pipeline.cache()
+    }
+
     /// Drain deferred XP awards without holding the async dispatch lock.
     /// The caller owns ordering (the serial checkpoint writer); this only
     /// preserves the funnel-before-award sequence per dispatch.
