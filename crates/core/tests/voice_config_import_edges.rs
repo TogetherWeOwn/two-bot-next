@@ -151,7 +151,7 @@ fn oversized_imports_fail_at_the_documented_limit_without_partial_application() 
 
     // The cap is inclusive: a document of exactly MAX_IMPORT_BYTES imports.
     let mut exact = valid.clone();
-    exact.extend(std::iter::repeat(b' ').take(MAX_IMPORT_BYTES - valid.len()));
+    exact.extend(std::iter::repeat_n(b' ', MAX_IMPORT_BYTES - valid.len()));
     assert_eq!(exact.len(), MAX_IMPORT_BYTES);
     assert_eq!(import_configuration(&exact, &inventory).unwrap(), config);
 
@@ -195,9 +195,10 @@ fn oversized_imports_fail_at_the_documented_limit_without_partial_application() 
 
 #[test]
 fn duplicate_room_definitions_are_reported_not_silently_merged() {
+    type DuplicateRow = (&'static str, Box<dyn Fn(&mut Value)>, &'static str);
     let (config, inventory) = fixture();
     let original = serde_json::to_value(&config).unwrap();
-    let rows: Vec<(&str, Box<dyn Fn(&mut Value)>, &str)> = vec![
+    let rows: Vec<DuplicateRow> = vec![
         (
             "second creator reuses the channel with a different template",
             Box::new(|value: &mut Value| {
