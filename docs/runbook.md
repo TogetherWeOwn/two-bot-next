@@ -421,6 +421,32 @@ Source: [`gateway.rs`](../crates/bot/src/gateway.rs),
 [`durable store`](../crates/cutover/src/gateway_session.rs),
 [recovery notes](gateway-recovery.md).
 
+### Force-fresh IDENTIFY (first production boot only)
+
+First production boot only: the age policy above alone would RESUME a
+checkpoint up to 15 minutes old, so the first production boot arms a one-shot
+directive to force a fresh IDENTIFY instead. Authority and full contract:
+[Force-fresh IDENTIFY](gateway-recovery.md#force-fresh-identify-first-production-boot).
+`TWO_DATABASE_URL` is the bot database the target Container uses; `GUILD_ID`
+is that Container's configured guild, and `--guild` must equal it. Quoted
+verbatim from the authority (only the `two-bot` binary ships in the image;
+run from an operator checkout):
+
+```sh
+# 1. Dry run (default): prints guild, shard 0, checkpoint age and directive; writes nothing.
+cargo run -p two-bot-cutover --bin gateway-force-identify --locked -- --guild "$GUILD_ID"
+# 2. Arm. The live guild also needs --allow-live-guild.
+cargo run -p two-bot-cutover --bin gateway-force-identify --locked -- \
+  --guild "$GUILD_ID" --apply --reason "first production boot" --allow-live-guild
+# 3. Start the bot, then re-run the dry run: the directive shows "consumed at ...".
+```
+
+The live (production) guild refuses without `--allow-live-guild`. One-shot
+consume semantics: of two concurrent boot reads, exactly one consumes the
+directive; the directive never deletes or rewrites `gateway_sessions` — the
+bot's existing discard path clears the checkpoint before IDENTIFY, and the
+next boot after READY has no directive and RESUMEs normally.
+
 ## Containment, kill switches and feature flags
 
 **Do not confuse a ported core contract with an active control.** The current
