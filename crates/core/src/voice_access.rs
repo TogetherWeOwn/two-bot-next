@@ -155,7 +155,7 @@ pub fn validate_access_controls(controls: &AccessControls) -> Result<(), AccessE
         if !is_voice_command(command) {
             return Err(AccessError::UnknownCommand(command.clone()));
         }
-        if roles.iter().any(|role| *role == 0) {
+        if roles.contains(&0) {
             return Err(AccessError::InvalidRoleId);
         }
     }
