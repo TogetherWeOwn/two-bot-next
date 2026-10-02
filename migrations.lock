@@ -101,6 +101,14 @@
       "sha256": "c5f2bc418224a3c684c5d50bbdaf78ab082590477147f81279c276327314f1e8",
       "justification": "Preserve pre-count automod decisions across safely released retries for TOG-10089."
     },
+    "crates/cutover/migrations/0224_voice_rooms.sql": {
+      "sha256": "369accb6dacb308212282b37883a52579c3a168b8ab19b41027672878c0259d5",
+      "justification": "Renumber unmerged TOG-10093 voice schema 0220 to 0224 to avoid main's 0220-0223 automod migrations, SQL unchanged."
+    },
+    "crates/cutover/migrations/0225_voice_inherit_limit.sql": {
+      "sha256": "d1a9abe893e8b030db21452f29506a924d60bd7b880d7cef9debc53deb0dd4b4",
+      "justification": "Renumber unmerged TOG-10093 voice inherit 0221 to 0225 to follow 0224 voice schema, SQL unchanged."
+    },
     "crates/cutover/migrations/0300_website_contract.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "7d67d32e021ca9e9162474e1acfd9411ef68f4d3ec4e1289901dd4825b8eea43"

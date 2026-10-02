@@ -81,6 +81,7 @@ impl TestDb {
         command
             .env_clear()
             .env("TWO_DATABASE_URL", &self.url)
+            .env("TWO_DATABASE_TLS", "local-only")
             .env("TWO_DB_POOL_MAX", "1")
             .args(args)
             .args(["--guild", GUILD]);

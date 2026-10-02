@@ -49,7 +49,7 @@ impl MembershipClock {
 
 /// Normalize a database text timestamp to UTC, preserving six fractional
 /// digits. Accepts PostgreSQL's space separator and hour-only session offset.
-/// Source: https://docs.rs/time/0.3.55/time/struct.OffsetDateTime.html#method.parse
+/// Source: <https://docs.rs/time/0.3.55/time/struct.OffsetDateTime.html#method.parse>
 pub fn normalize_timestamp(value: &str) -> Option<String> {
     let mut input = value.trim().to_owned();
     if !input.is_ascii() {

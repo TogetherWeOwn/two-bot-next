@@ -109,6 +109,8 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_discord_events",
     "moderation_channel_executions",
     "invite_campaigns",
+    "voice_creators",
+    "voice_rooms",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data
