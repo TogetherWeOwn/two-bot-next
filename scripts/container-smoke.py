@@ -12,9 +12,14 @@ import uuid
 
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
-# Raised from 10 MiB: the durable store runtime plus the ticket runtime from main
-# measured 10.01 MiB under opt-level z/LTO/strip; image budget unchanged.
-BINARY_MAX_BYTES = 11 * MIB
+# Recalibrated for the linked S4 self-role runtime (TOG-10292): PR head
+# measured 10,805,344 bytes (10.30 MiB) on the ephemeral runner vs main
+# baseline 10,377,112 bytes (9.90 MiB) at ec49663. Growth is linked
+# runtime/handlers/REST + previously-dead domain/store code, no new
+# dependencies; release profile already minimal (opt-level=z, lto, strip).
+# Per b1-baseline calibration (measured * 1.4 rounded up to the next MiB):
+# 10.30 * 1.4 = 14.42 -> 15 MiB. Image still within budget (101.61/112).
+BINARY_MAX_BYTES = 15 * MIB
 BINARY = "/home/two-bot/two-bot"
 CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
@@ -63,11 +68,18 @@ def http_response(url):
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
     metadata = json.loads(docker("image", "inspect", image).stdout)[0]
-    # Sum of uncompressed layer sizes. With the containerd image store (the
-    # self-hosted runners) `inspect .Size` also counts the compressed content
-    # blobs; the layer sum equals the classic overlay2 Size on both stores.
+    # Resolve the tag once; measurement and every image probe use this ID.
+    image = metadata["Id"]
+    report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")
+    # Sum Docker's uncompressed history layer sizes. Containerd inspect Size
+    # also counts compressed content blobs, so it is not the budget metric.
     history = docker("history", "--no-trunc", "--human=false", "--format", "{{.Size}}", image).stdout
-    image_bytes = sum(int(line) for line in history.split())
+    records = [line.strip() for line in history.splitlines()]
+    require(records, "Docker history returned no layer sizes")
+    require(all(record.isascii() and record.isdecimal() for record in records),
+            "Docker history layer sizes must be nonempty nonnegative integers")
+    measured_image_bytes = sum(int(record) for record in records)
+    require(measured_image_bytes > 0, "Docker history returned only zero-size layers")
     # Named (not --rm/unnamed) so a timed-out Docker client cannot leave an
     # orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex
@@ -80,11 +92,11 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     finally:
         docker("rm", "--force", measure, check=False)
     for label, size, limit in (
-        ("image (uncompressed Docker Size)", image_bytes, image_max_bytes),
+        ("image (summed uncompressed Docker history layer bytes)", measured_image_bytes, image_max_bytes),
         ("release binary", binary_bytes, binary_max_bytes),
     ):
         report(f"{label}: {size} bytes ({size / MIB:.2f} MiB); budget {limit} bytes ({limit / MIB:.2f} MiB)")
-    require(image_bytes <= image_max_bytes, "image exceeds size budget")
+    require(measured_image_bytes <= image_max_bytes, "image exceeds size budget")
     require(binary_bytes <= binary_max_bytes, "release binary exceeds size budget")
     config = metadata["Config"]
     require(config.get("User") not in (None, "", "root", "0", "0:0"), "image must specify a non-root user")
@@ -122,19 +134,23 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         require(isinstance(body, dict), "/readyz body must be a JSON object")
         require(body.get("components") == [
             ["process", "ready"], ["gateway", "down"], ["database", "down"],
-        ], "/readyz body must report a ready process and parked gateway with database down")
+            ["token_invalid", "ready"],
+        ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
         # The runtime always reports informational job status alongside
-        # readiness; with no credentials all six jobs must be parked,
-        # non-running and never started. Jobs never flip the 503 above.
+        # readiness; with no credentials all eight jobs must be parked,
+        # non-running and never started. Jobs never flip the 503 above. The
+        # audit-retry and self-role recovery entries are always listed
+        # (parked when their services are unregistered).
         parked = {"parked": True, "running": False, "last_start": None,
                   "last_success": None, "last_error_class": None,
                   "consecutive_failures": 0}
         require(body.get("jobs") == {
             name: dict(parked) for name in (
                 "counter", "rank", "scheduled_events", "presence_probe",
-                "community_scorecard", "inactivity",
+                "community_scorecard", "inactivity", "audit_retry",
+                "self_role_recovery",
             )
-        }, "/readyz body must report all six jobs parked, non-running, never started")
+        }, "/readyz body must report all eight jobs parked, non-running, never started")
         # Check PID 1, not merely Docker's configured user or an exec helper.
         status = docker("exec", name, "cat", "/proc/1/status").stdout
         uid = next(line.split()[1:] for line in status.splitlines() if line.startswith("Uid:"))

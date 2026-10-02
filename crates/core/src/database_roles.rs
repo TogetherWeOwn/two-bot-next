@@ -59,14 +59,19 @@ mod tests {
             include_str!("../../cutover/migrations/0160_rsvp.sql"),
             include_str!("../../cutover/migrations/0170_lfg.sql"),
             include_str!("../../cutover/migrations/0200_self_roles.sql"),
+            include_str!("../../cutover/migrations/0205_self_role_exchange_receipts.sql"),
+            include_str!("../../cutover/migrations/0206_self_role_exchange_baselines.sql"),
             include_str!("../../cutover/migrations/0210_tickets.sql"),
             include_str!("../../cutover/migrations/0220_automod.sql"),
             include_str!("../../cutover/migrations/0221_automod_delivery_claims.sql"),
             include_str!("../../cutover/migrations/0222_automod_counted_claim.sql"),
             include_str!("../../cutover/migrations/0223_automod_preserved_match.sql"),
+            include_str!("../../cutover/migrations/0224_voice_rooms.sql"),
+            include_str!("../../cutover/migrations/0225_voice_inherit_limit.sql"),
             include_str!("../../cutover/migrations/0300_website_contract.sql"),
             include_str!("../../cutover/migrations/0310_presence_probe.sql"),
             include_str!("../../cutover/migrations/0311_community_scorecard.sql"),
+            include_str!("../../cutover/migrations/0312_community_scorecard_attempts.sql"),
             include_str!("../../cutover/migrations/0320_gateway_sessions.sql"),
             include_str!("../../cutover/migrations/0321_gateway_boot_directives.sql"),
             include_str!("../../cutover/migrations/0330_guild_settings.sql"),
@@ -76,13 +81,21 @@ mod tests {
             include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
             include_str!("../../cutover/migrations/0340_operational_audit.sql"),
             include_str!("../../cutover/migrations/0350_internal_actions.sql"),
+            include_str!("../../cutover/migrations/0353_internal_clock_high_water.sql"),
+            include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
         ] {
             let mut table = None;
             for line in migration.lines() {
                 if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
                     let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
                     let name = rest.split_whitespace().next().unwrap();
-                    assert!(MATRIX.contains(&format!("'public', '{name}', 'table'")));
+                    let name = name.strip_prefix("public.").unwrap_or(name);
+                    let kind = if name == "discord_send_admission" {
+                        "admission"
+                    } else {
+                        "table"
+                    };
+                    assert!(MATRIX.contains(&format!("'public', '{name}', '{kind}'")));
                     table = Some(name);
                 } else if let Some(rest) = line.strip_prefix("CREATE SEQUENCE ") {
                     let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);

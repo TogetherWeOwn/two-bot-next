@@ -9,7 +9,9 @@ restores, token rotation, and live-guild changes need their separate authorizati
 
 1. Confirm the affected environment, reviewed Git SHA, Worker version ID,
    container image, time of last good readiness, and incident reference.
-2. Check **both** liveness and readiness; capture their component breakdown.
+2. Read [persisted ownership](#persisted-ownership-control) before a probe that
+   could start the gateway. Then check **both** liveness and readiness; capture
+   their component breakdown.
 3. Read Worker **and container** logs. Contain the problem before redeploying;
    do not turn on an unwired feature in an attempt to repair it.
 4. For a regression, select a known-good version/image pair compatible with the
@@ -49,6 +51,7 @@ They are HTTP observations, **not database probes or test authorization**.
 |---|---|
 | `/health` 200, `{"status":"ok"}` | The process can answer HTTP. Not proof of Discord, database, feature services, or end-to-end delivery. |
 | `/readyz` 200, `{"components":[["process","ready"],["gateway","ready"]]}` | READY/RESUMED dispatch has committed. Only these two components are currently wired. |
+| 503 `{"error":"ownership_fenced","reason":...}` | Worker/DO did not admit the probe. Read ownership state; never interpret this as the container's readiness breakdown or bypass it with a direct start. |
 | `/readyz` 503, gateway `down` | Missing gateway prerequisites; service is parked. Check binding **names**, not values. |
 | `/readyz` 503, gateway `starting` | Connecting/reconnecting or bounded checkpoint I/O. Compare duration with logs; persistent 503 is not healthy operation. |
 | Neither route answers / 500 / HTTP 1101 | Inspect Worker bindings and container startup. Named environments must repeat all Container/DO/exports wiring; do not bypass readiness. |
@@ -194,6 +197,58 @@ when exhaustion coincides with gateway `starting`/`down` or job-failure
 alerts, or when the Neon dashboard shows trouble on the staging branch — the
 fix then belongs to the dependency owner, not a redeploy.
 
+## Persisted ownership control
+
+The Worker/DO fence is implemented, not implicitly released by deployment.
+`CF_VERSION_METADATA.id` identifies the eligible Worker version; the singleton's
+persisted `deploymentId + epoch + phase` grants ownership. Missing/unreadable
+storage fails closed. Startup/proxy/keepalive gates cover the pinned SDK's
+separate auto-start paths. A changed version stops an inactive reattached
+process and cannot auto-claim the record. The fence coordinates **only one shared
+DO namespace/singleton**, not legacy or another namespace. See the full
+[control protocol and staging rehearsal](cutover.md#workerdo-ownership-fence-implemented-rehearsal-still-required).
+
+The staging-only client validates a `two-bot-next-staging.<subdomain>.workers.dev`
+HTTPS origin, refuses redirects, reads the dedicated `OWNERSHIP_CONTROL_TOKEN`
+from an **already approved** environment binding, and never prints it. The same
+secret must be provisioned as the staging Worker secret `OWNERSHIP_CONTROL_TOKEN`
+and GitHub Actions secret `STAGING_OWNERSHIP_CONTROL_TOKEN` before rollout. This
+runbook does not authorize creating/rotating credentials. If binding/provisioning
+is missing, route through the Director of Engineering; do not substitute Discord,
+QA, Access, production or broad Cloudflare API credentials.
+
+```bash
+# Read-only control state; does not start the container.
+node wrangler/scripts/ownership-control.mjs status
+# The epoch below is the exact authenticated readback, not a guessed default.
+# OWNERSHIP_ACTOR must be a non-secret operator/run audit label from the receipt.
+node wrangler/scripts/ownership-control.mjs takeover "${CURRENT_OWNER_EPOCH}"
+# Release does not start the container: only now may the approved health probe
+# start it. Retain /readyz, version, image and single-session observations.
+# To park ALL Worker versions before legacy ownership/rollback:
+node wrangler/scripts/ownership-control.mjs fence "${CURRENT_OWNER_EPOCH}"
+node wrangler/scripts/ownership-control.mjs status
+```
+
+`STAGING_WORKER_URL`, `OWNERSHIP_ACTOR` and the approved secret binding are inputs.
+Refresh the epoch before **each** change. `fence` is a persisted parking owner
+(`deploymentId=null`, `phase=fenced`); health/readyz and stale schedules refuse.
+Takeover/fence increment the epoch and record actor, timestamp, old/new epoch and
+owner. Durable revocation is written before awaited native destruction;
+`running=false` is required before active release. A crash, storage-write failure
+or unconfirmed shutdown leaves denial; do not assume a 503 stopped the old
+process. Preserve maintenance until teardown is confirmed. 401/auth failure is
+a stop, 409 requires state reconciliation, and 503 is never permission to clear
+storage/alarms. No operation clears SDK state or changes guild/database bindings.
+
+The workflow preflight stops **before deploy** if control configuration is absent.
+After deployment it explicitly transfers only a previously active owner. First
+boot or an intentionally parked singleton needs an authorized staging manual
+dispatch with `release_fence=true`; a routine push never unparks it. It still must
+prove readiness, not accept the ownership receipt as a gateway-ready event.
+Production control uses B4's separately reviewed execution sheet/API contract;
+this client rejects production origins. Never roll back to an unfenced wrapper.
+
 ## Redeploy and rollback
 
 ### Before changing anything
@@ -222,6 +277,49 @@ Wrangler lists the ten most recent versions/deployments. Select the actual
 previously healthy version from your deployment record; never silently choose
 "latest" or omit the rollback ID.
 
+### Staging-only migration runner
+
+`.github/workflows/staging-migrate.yml` (manual, staging-only, no production
+path) runs `staging-migrate --plan|--apply` from `crates/cutover/src/bin/staging_migrate.rs`.
+It embeds this crate's migrations through the SQLx **0.9.0 library** (no
+`sqlx-cli`; the pin is asserted against `Cargo.lock`), keeps the ledger in
+`public._sqlx_migrations`, and runs `SET ROLE two_bot_migrator` in SQLx's
+per-connection `after_connect`, verifying `current_user` on every connection.
+Invocation (secret-free; the URL comes only from the existing
+`TWO_BOT_STAGING_MIGRATOR_DATABASE_URL` binding):
+
+```text
+staging-migrate --plan --source-sha <40hex> --staging-host <host> \
+  --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
+```
+
+It refuses (exit 2, before any DDL) when the binding is absent, the target does
+not equal the named staging identity, the database name does not contain
+`staging` or looks like production, the login cannot assume `two_bot_migrator`,
+a reference is missing, or the ledger has a failed/incomplete row, a SHA-384
+mismatch, an unknown version or a non-prefix order. It never resets, reverts,
+restores, creates roles or grants. The sanitized JSON manifest (source SHA,
+per-migration SHA-384, ledger before/after, applied count) is the evidence; on
+failure the ledger-after is preserved, not repaired.
+
+The workflow runs only when dispatched from `main` and reads the binding from
+the `staging-migrate` GitHub environment. That environment must have a required
+reviewer and a main-only deployment-branch rule, and the binding must be an
+environment secret, not a repository secret; otherwise a workflow edited on
+another branch could read it. This change does not create the environment or
+the secret.
+
+Prerequisites the legitimate principal must verify **before dispatch** (the
+runner cannot, and this change does not claim them): the real staging Neon
+identity; that the dedicated migrator binding already exists; the
+`staging-migrate` environment protections above; and a complete
+recovery set covering the Next schema, `_sqlx_migrations` ledger, object
+ownership, ACLs and logins. The generic legacy backup omits Next tables and the
+SQLx history, and unverified Neon PITR is not a working recovery. Apply the
+reviewed ACL sequence in `docs/database-roles.md` so other shared-database
+services keep their access. Real SQLx proof runs only against disposable CI
+services (`crates/cutover/tests/staging_migrate_db.rs`).
+
 ### Redeploy the approved revision
 
 With the correct revision already selected in a separate clean operator checkout,
@@ -235,7 +333,10 @@ This is the same full Worker + Container deploy used by staging CI. Keep named
 environment bindings explicit. Do **not** use versions upload/deploy as a
 substitute for a full container-image deploy. Deployment is not transactional:
 Worker activation can succeed while a later image/rollout step fails. Recheck
-both Worker version and running image, then `/health`, `/readyz` and startup
+both Worker version and running image. Unlike CI's explicit handoff step, the
+bare deploy command does **not** transfer ownership: read control state, confirm
+old-process teardown, and perform the authorized takeover with its current epoch
+before any startup-capable probe. Then check `/health`, `/readyz` and startup
 logs; record finish-to-first-ready gap (soak target under 60 seconds). A container
 replacement can restart the shard; there is no promise of zero downtime.
 
@@ -262,9 +363,13 @@ using the full `deploy` command above, only after confirming it supports the
 current schema and bindings. Confirm the running image separately. If no safe
 pair is known, contain and escalate instead of guessing.
 
-After either recovery: repeat the health/readiness/log observations, confirm
-only one gateway session, and record version, image, first ready time and
-remaining limitations. None of these examples were a live rollback drill.
+Before rollback, persist a parking fence and confirm native destruction. Roll
+back **only to another fence-capable version**; an unfenced baseline ignores this
+record and could restart an unauthorized gateway. After either recovery, read
+ownership, explicitly take over the current epoch under the incident's handoff
+authorization, then repeat health/readiness/log observations. Confirm only one
+gateway session and record version, image, first ready time and remaining
+limitations. None of these examples were a live rollback drill.
 
 Cloudflare references:
 [Worker rollbacks and resource limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/),

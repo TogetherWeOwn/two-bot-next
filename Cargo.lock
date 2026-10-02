@@ -2334,6 +2334,7 @@ version = "0.2.0"
 dependencies = [
  "hex",
  "libc",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2355,8 +2356,10 @@ name = "two-bot-discord"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bytes",
  "futures-util",
+ "hex",
  "http",
  "http-body-util",
  "hyper",
@@ -2365,6 +2368,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "thiserror",
  "tokio",
