@@ -289,7 +289,9 @@ pub async fn watermark_for(
 
 /// The global restorable point: the newest journal id across all tables.
 /// Rollback replays every row after the pre-window baseline up to this id.
-/// Zero on an empty journal.
+/// Zero on an empty journal. `BIGSERIAL` ids commit out of order under
+/// concurrent writers, so a point of N does not prove every id below N has
+/// committed: read it, and replay, only after the bot's writers have stopped.
 pub async fn restorable_point(pool: &Pool<Postgres>) -> Result<i64, JournalError> {
     let id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM rollback_journal")
         .fetch_one(pool)
