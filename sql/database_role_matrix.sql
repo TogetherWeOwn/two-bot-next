@@ -47,6 +47,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'self_role_panel_claims', 'table'),
     ('public', 'self_role_exchanges', 'table'),
     ('public', 'self_role_exchange_baselines', 'table'),
+    ('public', 'discord_send_admission', 'admission'),
     ('public', 'tickets', 'table'),
     ('public', 'ticket_transcripts', 'table'),
     ('public', 'automod_violations', 'table'),

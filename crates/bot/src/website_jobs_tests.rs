@@ -1,8 +1,34 @@
 use super::*;
 use serde_json::json;
+use two_bot_core::apply_web_contract;
 use two_bot_testsupport::TestDatabase;
 
 use crate::discord_test_common::{MockRest, ScriptedResponse};
+
+use crate::tracing_capture;
+
+#[test]
+fn admission_lazy_pool_rejects_query_secrets_before_sqlx_logging() {
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let error = admission_pool("postgres://fixture:fixture-password@127.0.0.1:1/fixture?api_key=fixture-admission-query-secret").unwrap_err();
+            assert_eq!(error, "invalid admission authority");
+            let pool = admission_pool("postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable").unwrap();
+            assert_eq!(pool.size(), 0);
+            pool.close().await;
+            tracing::warn!("website admission capture remains active");
+        });
+    });
+    let text = capture.text();
+    assert!(text.contains("website admission capture remains active"));
+    assert!(!text.contains("fixture-admission-query-secret"));
+    assert!(!text.contains("ignoring unrecognized connect parameter"));
+}
 
 async fn tick(
     kind: Kind,
@@ -165,7 +191,12 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     let observation = Arc::new(Mutex::new(()));
 
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
-    let rest = executor(&mock);
+    let rest = governed_executor(
+        "synthetic-job-test-token",
+        Some(mock.origin()),
+        pool.clone(),
+    )
+    .unwrap();
     tick(Kind::Rank, &pool, &rest, guild, &observation)
         .await
         .unwrap();
@@ -207,7 +238,12 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         ScriptedResponse::status(500),
     )
     .await;
-    let rest = executor(&mock);
+    let rest = governed_executor(
+        "synthetic-job-test-token",
+        Some(mock.origin()),
+        pool.clone(),
+    )
+    .unwrap();
     // Exercise the supervisor as well as the adapters, sequentially for the
     // ordered-response mock. Each job has an immediate first deadline.
     for (name, kind) in NAMES
@@ -293,6 +329,36 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         .unwrap();
     assert_eq!(rows, 0, "valid empty response clears mirror");
     assert_eq!(mock.requests().len(), 8);
+    // The production constructor joins the same lane even for a mock proxy.
+    let guarded = governed_executor(
+        "synthetic-job-test-token",
+        Some(mock.origin()),
+        pool.clone(),
+    )
+    .unwrap();
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(
+        pool.clone(),
+        "synthetic-job-test-token",
+    )
+    .unwrap();
+    admission
+        .extend(two_bot_core::send_admission::SendCooldown::Indefinite)
+        .await
+        .unwrap();
+    let (_stop, shutdown) = watch::channel(false);
+    assert_eq!(
+        run_once(
+            Kind::Events,
+            &pool,
+            &guarded,
+            guild,
+            &observation,
+            &shutdown
+        )
+        .await,
+        Err(ErrorClass::Rest)
+    );
+    assert_eq!(mock.requests().len(), 8, "held job must not reach HTTP");
     mock.shutdown().await;
     for query in [
         "SELECT human_member_count_at FROM guild_counters WHERE guild_id=$1",

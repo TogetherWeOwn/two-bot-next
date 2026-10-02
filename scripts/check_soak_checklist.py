@@ -3,9 +3,12 @@
 
 import argparse
 from collections import Counter
+from functools import cache
 import json
 from pathlib import Path
 import re
+import shlex
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_ROW = (7, ("Config / env catalogue",))
@@ -17,6 +20,26 @@ DISPOSITION_HEADERS = ("Disposition", "Next boundary / disposition")
 LEDGER_HEADER = ("Legacy commit", "Area", "Change", "Status", "Disposition")
 LEDGER_STATUSES = ("ported", "carded", "gap", "dropped")
 CARD = re.compile(r"\bTOG-\d+\b")
+# Automated rows run Cargo through the controller cache wrapper only.
+WRAPPER = ("python3", "scripts/cargo_cache.py", "run", "--")
+CARGO_VALUE_OPTIONS = ("-p", "--package", "--test", "-F", "--features", "--target",
+                       "--target-dir", "--manifest-path", "-j", "--jobs", "--profile",
+                       "--message-format", "--color", "--config", "-Z")
+LIBTEST_VALUE_OPTIONS = ("--test-threads", "--skip", "--format", "--color", "--logfile",
+                         "--shuffle-seed", "-Z")
+UNSUPPORTED_TARGETS = ("--bin", "--bins", "--example", "--examples", "--bench",
+                       "--benches", "--doc")
+RUST_TOKEN = re.compile(r"""
+    (?P<space>\s+|//[^\n]*)
+  | (?P<block>/\*)
+  | (?P<raw>[bc]?r(?P<hashes>\#*)")
+  | (?P<string>[bc]?"(?:\\.|[^\\"])*")
+  | (?P<char>b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])')
+  | (?P<lifetime>'(?:r\#)?[^\W\d]\w*)
+  | (?P<ident>(?:r\#)?[^\W\d]\w*)
+  | (?P<number>\d\w*)
+  | (?P<punct>::|.)
+""", re.X | re.S)
 
 
 def split_cells(text):
@@ -174,7 +197,238 @@ def delta_rows(markdown):
     return rows
 
 
-def validate(markdown, checklist):
+def rust_tokens(source):
+    """Identifier, string and punctuation tokens; comments and chars dropped."""
+    tokens = []
+    pos = 0
+    while pos < len(source):
+        match = RUST_TOKEN.match(source, pos)
+        kind = match.lastgroup if match.lastgroup != "hashes" else "raw"
+        pos = match.end()
+        if kind == "block":
+            depth = 1
+            while depth:
+                close = source.find("*/", pos)
+                if close < 0:
+                    raise ValueError("unterminated block comment")
+                opened = source.find("/*", pos, close)
+                depth, pos = (depth + 1, opened + 2) if opened >= 0 else (depth - 1, close + 2)
+        elif kind == "raw":
+            end = source.find('"' + match["hashes"], pos)
+            if end < 0:
+                raise ValueError("unterminated raw string")
+            tokens.append(("string", source[pos:end]))
+            pos = end + 1 + len(match["hashes"])
+        elif kind == "string":
+            tokens.append(("string", re.sub(r'^[bc]?"|"$', "", match[0])))
+        elif kind in ("ident", "punct"):
+            tokens.append((kind, match[0]))
+    return tokens
+
+
+def is_test_attribute(tokens):
+    """`#[test]`, `#[tokio::test(...)]` and similar `...::test` attributes."""
+    end = 0
+    while (end + 2 < len(tokens) and tokens[end][0] == "ident"
+           and tokens[end + 1] == ("punct", "::")):
+        end += 2
+    return (end < len(tokens) and tokens[end] == ("ident", "test")
+            and tokens[end + 1:end + 2] in ([], [("punct", "(")]))
+
+
+def libtest_names(path, mod_rs=True, prefix=(), seen=None):
+    """Libtest names (`module::fn`) of test fns reachable from a target root.
+
+    Follows `mod name;` (including `#[path]`) and inline `mod name { }` like
+    rustc, ignoring cfg: a renamed or removed test leaves no name behind.
+    Frames hold a module name, "" for a macro body or None for other blocks.
+    """
+    seen = set() if seen is None else seen
+    if path.resolve() in seen:
+        return []
+    seen.add(path.resolve())
+    tokens = rust_tokens(path.read_text())
+    names = []
+    frames = []
+    attributes = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        following = tokens[i + 1:i + 3]
+        start = i + 2 if tokens[i + 1:i + 2] == [("punct", "!")] else i + 1
+        if token == ("punct", "#") and tokens[start:start + 1] == [("punct", "[")]:
+            depth = 0
+            for end in range(start, len(tokens)):
+                depth += {("punct", "["): 1, ("punct", "]"): -1}.get(tokens[end], 0)
+                if not depth:
+                    break
+            if start == i + 1:
+                attributes.append(tokens[start + 1:end])
+            i = end + 1
+            continue
+        inline = [frame for frame in frames if frame]
+        if token in (("punct", "{"), ("punct", "}"), ("punct", ";")):
+            if token[1] == "{":
+                # `proptest! { #[test] fn ... }` emits its tests in place;
+                # any other block (fn, impl, ...) hides nested items.
+                macro = i >= 2 and tokens[i - 1] == ("punct", "!") and tokens[i - 2][0] == "ident"
+                frames.append("" if macro else None)
+            elif token[1] == "}":
+                if not frames:
+                    raise ValueError(f"unbalanced braces in {path}")
+                frames.pop()
+            attributes = []
+        elif token == ("ident", "mod") and len(following) == 2 and following[0][0] == "ident":
+            name = following[0][1]
+            if following[1] == ("punct", "{"):
+                frames.append(name)
+                attributes = []
+                i += 3
+                continue
+            if following[1] == ("punct", ";"):
+                directory = path.parent if mod_rs else path.parent / path.stem
+                explicit = [a[2][1] for a in attributes
+                            if len(a) == 3 and a[:2] == [("ident", "path"), ("punct", "=")]]
+                if explicit:
+                    # `#[path]` files own their directory, like `mod.rs`.
+                    base = directory.joinpath(*inline) if inline else path.parent
+                    candidates = ((base / explicit[0], True),)
+                else:
+                    base = directory.joinpath(*inline)
+                    candidates = ((base / f"{name}.rs", False), (base / name / "mod.rs", True))
+                for child, child_mod_rs in candidates:
+                    if child.is_file():
+                        names += libtest_names(child, child_mod_rs,
+                                               (*prefix, *inline, name), seen)
+                        break
+        elif (token == ("ident", "fn") and following and following[0][0] == "ident"
+              and None not in frames and any(map(is_test_attribute, attributes))):
+            names.append("::".join((*prefix, *inline, following[0][1])))
+        i += 1
+    return names
+
+
+@cache
+def target_tests(root):
+    """Test names of one target root; sources are fixed for a process."""
+    return frozenset(libtest_names(root))
+
+
+def workspace_packages(root):
+    """Workspace package name -> crate directory, from the Cargo manifests."""
+    workspace = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]
+    directories = [root] + [root / member for member in workspace["members"]]
+    manifests = {d: tomllib.loads((d / "Cargo.toml").read_text()) for d in directories}
+    return {m["package"]["name"]: d for d, m in manifests.items() if "package" in m}
+
+
+def crate_targets(directory):
+    """Testable target roots of one crate, by kind and target name."""
+    manifest = tomllib.loads((directory / "Cargo.toml").read_text())
+    targets = {"lib": {}, "bin": {}, "test": {}}
+    if (directory / "src/lib.rs").is_file():
+        targets["lib"][manifest["package"]["name"]] = directory / "src/lib.rs"
+    roots = [directory / "src/main.rs"] + sorted(directory.glob("src/bin/*.rs"))
+    roots += [directory / b["path"] for b in manifest.get("bin", []) if "path" in b]
+    targets["bin"] = {root.stem: root for root in roots if root.is_file()}
+    for root in sorted(directory.glob("tests/*.rs")) + sorted(directory.glob("tests/*/main.rs")):
+        targets["test"][root.stem if root.name != "main.rs" else root.parent.name] = root
+    for test in manifest.get("test", []):
+        targets["test"][test["name"]] = directory / test.get("path", f"tests/{test['name']}.rs")
+    return targets
+
+
+def cargo_commands(verification):
+    """Cargo argument lists of each wrapper invocation in a shell command."""
+    lexer = shlex.shlex(verification, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    commands = [[]]
+    for word in lexer:
+        if set(word) <= set("();<>|&"):
+            commands.append([])
+        else:
+            commands[-1].append(word)
+    found = []
+    for words in commands:
+        if tuple(words[:4]) == WRAPPER:
+            found.append(words[4:])
+        elif any(Path(word).name in ("cargo", "cargo_cache.py") for word in words):
+            raise ValueError(f"run Cargo as `{' '.join(WRAPPER)} test ...`: {' '.join(words)}")
+    return found
+
+
+def check_cargo_test(args, root, packages):
+    """Fail unless `cargo test` args name a real package, target and tests."""
+    if args[:1] != ["test"]:
+        raise ValueError(f"automated verification must be `cargo test`: {' '.join(args)}")
+    names, selectors, filters, exact, libtest = [], [], [], False, False
+    words = iter(args[1:])
+    for word in words:
+        option, has_value, value = word.partition("=")
+        if libtest:
+            if word == "--exact":
+                exact = True
+            elif option in LIBTEST_VALUE_OPTIONS and not has_value:
+                next(words, None)
+            elif not word.startswith("-"):
+                filters.append(word)
+        elif word == "--":
+            libtest = True
+        elif option in UNSUPPORTED_TARGETS:
+            raise ValueError(f"unsupported target selector {option}")
+        elif option in CARGO_VALUE_OPTIONS:
+            value = value if has_value else next(words, "")
+            if option in ("-p", "--package"):
+                names.append(value)
+            elif option == "--test":
+                selectors.append(("test", value))
+        elif word in ("--lib", "--tests", "--all-targets"):
+            selectors.append((word, None))
+        elif not word.startswith("-"):
+            filters.append(word)
+    if len(names) != 1:
+        raise ValueError(f"name exactly one -p package, got {names}")
+    if names[0] not in packages:
+        raise ValueError(f"unknown package -p {names[0]}; workspace has {sorted(packages)}")
+    directory = packages[names[0]]
+    targets = crate_targets(directory)
+    roots = []
+    for selector, name in selectors or [("--tests", None)]:
+        if selector == "test":
+            if name not in targets["test"]:
+                where = (directory / "tests" / f"{name}.rs").relative_to(root)
+                raise ValueError(f"missing test target --test {name} ({where})")
+            roots.append(targets["test"][name])
+        elif selector == "--lib":
+            if not targets["lib"]:
+                raise ValueError(f"{names[0]} has no library target")
+            roots += targets["lib"].values()
+        else:
+            roots += [*targets["lib"].values(), *targets["bin"].values(),
+                      *targets["test"].values()]
+    tests = frozenset().union(*map(target_tests, roots))
+    if not tests:
+        raise ValueError(f"no tests in the selected targets of {names[0]}")
+    for pattern in filters:
+        if not (pattern in tests if exact else any(pattern in name for name in tests)):
+            raise ValueError(
+                f"no test {'named' if exact else 'matching'} {pattern!r} in the selected targets")
+
+
+def check_verification(entry_id, verification, root=ROOT):
+    """Offline guard: every Cargo invocation of an automated row resolves."""
+    try:
+        commands = cargo_commands(verification)
+        if not commands:
+            raise ValueError("no cargo test invocation")
+        packages = workspace_packages(root)
+        for args in commands:
+            check_cargo_test(args, root, packages)
+    except (ValueError, OSError) as error:
+        raise ValueError(f"{entry_id}: {error}") from error
+
+
+def validate(markdown, checklist, root=ROOT):
     owners = delta_rows(markdown)
     expected = set(parity_rows(markdown)) | set(owners)
     if checklist.get("schema_version") != 1:
@@ -198,6 +452,8 @@ def validate(markdown, checklist):
             raise ValueError(f"{entry['id']}: waiver requires approver")
         if entry["status"] == "automated" and not entry.get("verification", "").strip():
             raise ValueError(f"{entry['id']}: automated requires verification")
+        if entry["status"] == "automated":
+            check_verification(entry["id"], entry["verification"], root)
         # Voice-sensitive rows are cross-links, never a second voice procedure.
         voice = any("voice" in c.lower() for c in key[1])
         voice = voice or (key[0] == 3 and "ShardResume" in key[1][0])

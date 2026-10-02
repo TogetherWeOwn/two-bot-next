@@ -117,8 +117,6 @@ pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
     "containment_events",
     "containment_incidents",
     "automation_commands",
-    "automod_violations",
-    "automod_processed_messages",
 ];
 
 /// Explicit migrated-schema exclusions, checked by the schema coverage test.
@@ -126,6 +124,11 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // Short-lived XP award throttles, not XP totals/history. Never replay a
     // pre-restore cooldown into a recovered process.
     "xp_cooldowns",
+    // Durable send admission is per-credential runtime lane state: occupancy
+    // generations and Discord cooldown timing, not application data. Never
+    // replay a pre-restore lane hold into a recovered process; a restored
+    // database re-admits from generation zero and re-learns cooldowns.
+    "discord_send_admission",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data.
@@ -186,9 +189,52 @@ pub struct DumpManifest {
     /// Which migrations the source had applied, for diagnosing an old backup.
     #[serde(rename = "schemaMigrations")]
     pub schema_migrations: Vec<String>,
+    /// Source allocator positions. Absent from v3 and from v4 archives written
+    /// before marks existed; restore then knows only the restored rows and the
+    /// target's own allocators, which cannot see deleted top rows.
+    #[serde(
+        rename = "sequenceMarks",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub sequence_marks: Vec<SequenceMark>,
+}
+
+/// A sequence's position when the dump was taken, keyed by the column it
+/// feeds. Sequences are not MVCC, so the dump reads the live position: it is
+/// at or beyond every value in the archived snapshot, never behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceMark {
+    pub table: String,
+    pub column: String,
+    #[serde(rename = "lastValue")]
+    pub last_value: i64,
+    #[serde(rename = "isCalled")]
+    pub is_called: bool,
+    pub increment: i64,
+}
+
+impl SequenceMark {
+    /// The value the source would have allocated next; `None` past `i64`.
+    #[must_use]
+    pub fn next(&self) -> Option<i64> {
+        if self.is_called {
+            self.last_value.checked_add(self.increment)
+        } else {
+            Some(self.last_value)
+        }
+    }
 }
 
 impl DumpManifest {
+    /// The archived position of the allocator feeding `table.column`, if any.
+    #[must_use]
+    pub fn sequence_mark(&self, table: &str, column: &str) -> Option<&SequenceMark> {
+        self.sequence_marks
+            .iter()
+            .find(|mark| mark.table == table && mark.column == column)
+    }
+
     /// Old v3 archives predate complete table coverage. Restore clears these
     /// tables too, rather than silently retaining unrelated target contents.
     #[must_use]
@@ -791,6 +837,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             }
         }
     }
+    if let Some(marks) = obj.get("sequenceMarks") {
+        validate_sequence_marks(marks)?;
+    }
     let tables = obj
         .get("tables")
         .and_then(Value::as_array)
@@ -850,6 +899,47 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         )));
     }
     serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
+}
+
+/// Restore raises allocators to these marks, so a malformed one must refuse
+/// rather than silently restore without the high-water it was meant to carry.
+fn validate_sequence_marks(marks: &Value) -> Result<(), DumpError> {
+    let marks = marks
+        .as_array()
+        .ok_or_else(|| refuse("manifest has invalid sequenceMarks"))?;
+    let mut keys = std::collections::BTreeSet::new();
+    for mark in marks {
+        let mark = mark
+            .as_object()
+            .ok_or_else(|| refuse("manifest sequence mark is not an object"))?;
+        let table = mark
+            .get("table")
+            .and_then(Value::as_str)
+            .filter(|table| is_dump_table(table))
+            .ok_or_else(|| refuse("manifest sequence mark names no backup table"))?;
+        let column = mark
+            .get("column")
+            .and_then(Value::as_str)
+            .filter(|column| !column.is_empty())
+            .ok_or_else(|| refuse(format!("manifest sequence mark on {table} has no column")))?;
+        if mark.get("lastValue").and_then(Value::as_i64).is_none()
+            || mark.get("isCalled").and_then(Value::as_bool).is_none()
+            || mark
+                .get("increment")
+                .and_then(Value::as_i64)
+                .is_none_or(|increment| increment == 0)
+        {
+            return Err(refuse(format!(
+                "manifest sequence mark {table}.{column} has an invalid position"
+            )));
+        }
+        if !keys.insert((table, column)) {
+            return Err(refuse(format!(
+                "manifest sequence mark {table}.{column} is duplicated"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Convert a validated cell to bound PostgreSQL input, never coercing an
@@ -1118,6 +1208,66 @@ mod tests {
             objs[0]["sequences"] = sequences.clone();
             let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
             assert!(err.to_string().contains("sequence"), "{sequences}: {err}");
+        }
+    }
+
+    #[test]
+    fn sequence_marks_parse_and_report_the_next_allocation() {
+        let mut objs = empty_dump();
+        objs[0]["sequenceMarks"] = serde_json::json!([
+            {"table": "events", "column": "id", "lastValue": 41, "isCalled": true, "increment": 1},
+            {"table": "members", "column": "backup_identity", "lastValue": 17, "isCalled": false, "increment": 3},
+            {"table": "guild_settings", "column": "cas_version", "lastValue": -9, "isCalled": true, "increment": -1},
+            {"table": "xp_awards", "column": "id", "lastValue": i64::MAX, "isCalled": true, "increment": 1},
+        ]);
+        let marks = inspect_bytes(&gzip_lines(&objs))
+            .unwrap()
+            .manifest
+            .sequence_marks;
+        let next: Vec<_> = marks.iter().map(SequenceMark::next).collect();
+        assert_eq!(next, vec![Some(42), Some(17), Some(-10), None]);
+        // Absent marks (v3, older v4) default to none and are not re-emitted.
+        let manifest = inspect_bytes(&gzip_lines(&empty_dump())).unwrap().manifest;
+        assert!(manifest.sequence_marks.is_empty());
+        assert!(serde_json::to_value(&manifest)
+            .unwrap()
+            .get("sequenceMarks")
+            .is_none());
+    }
+
+    #[test]
+    fn refuses_malformed_sequence_marks() {
+        let good = serde_json::json!({"table": "events", "column": "id", "lastValue": 1, "isCalled": true, "increment": 1});
+        let with = |field: &str, value: Value| {
+            let mut mark = good.clone();
+            mark[field] = value;
+            serde_json::json!([mark])
+        };
+        let mut cases = vec![
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("events"),
+            serde_json::json!([1]),
+            serde_json::json!([good.clone(), good.clone()]),
+            with("table", serde_json::json!("website_users")),
+            with("table", Value::Null),
+            with("column", serde_json::json!("")),
+            with("column", serde_json::json!(1)),
+            with("lastValue", serde_json::json!("1")),
+            with("lastValue", serde_json::json!(0.5)),
+            with("lastValue", serde_json::json!(i64::MAX as u64 + 1)),
+            with("isCalled", serde_json::json!("true")),
+            with("increment", serde_json::json!(0)),
+            with("increment", Value::Null),
+        ];
+        let mut missing = good.clone();
+        missing.as_object_mut().unwrap().shift_remove("isCalled");
+        cases.push(serde_json::json!([missing]));
+        for marks in cases {
+            let mut objs = empty_dump();
+            objs[0]["sequenceMarks"] = marks.clone();
+            let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+            assert!(err.to_string().contains("sequence"), "{marks}: {err}");
         }
     }
 

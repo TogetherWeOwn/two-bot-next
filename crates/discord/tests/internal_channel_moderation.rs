@@ -450,7 +450,7 @@ async fn recovery_read_failures_release_both_fences_and_preserve_original_seed()
                 channel(Some("3072"), "8192"),
                 ScriptedResponse::status(204),
                 channel(Some("3072"), "8192"),
-                ScriptedResponse::json(200, json!({})),
+                ScriptedResponse::json(200, json!({"id": CHANNEL})),
             ],
             ScriptedResponse::status(500),
         )
@@ -518,7 +518,7 @@ async fn rejected_channel_reservations_release_request_claim_and_allow_same_key_
                 channel(Some("3072"), "8192"),
                 ScriptedResponse::status(204),
                 channel(None, "0"),
-                ScriptedResponse::json(200, json!({})),
+                ScriptedResponse::json(200, json!({"id": CHANNEL})),
             ],
             ScriptedResponse::status(500),
         )
@@ -667,7 +667,7 @@ async fn rejected_recovery_writes_release_reservations_without_discord_mutation(
                 channel(Some("3072"), "8192"),
                 ScriptedResponse::status(204),
                 channel(None, "0"),
-                ScriptedResponse::json(200, json!({})),
+                ScriptedResponse::json(200, json!({"id": CHANNEL})),
             ],
             ScriptedResponse::status(500),
         )
@@ -772,7 +772,7 @@ async fn purge_history_failures_are_retryable_without_any_deletion() {
                 ),
                 ScriptedResponse::status(204),
                 channel(None, "0"),
-                ScriptedResponse::json(200, json!({})),
+                ScriptedResponse::json(200, json!({"id": CHANNEL})),
             ],
             ScriptedResponse::status(500),
         )
@@ -1244,7 +1244,7 @@ async fn slowmode_zero_and_signed_maximum_unicode_reason_survive_replay() {
     let mock = MockRest::start(
         vec![
             channel(Some("1024"), "8192"),
-            ScriptedResponse::json(200, json!({})),
+            ScriptedResponse::json(200, json!({"id": CHANNEL})),
         ],
         ScriptedResponse::status(500),
     )

@@ -153,9 +153,17 @@
       "justification": "Pin the validated resolved role in internal-action intents and audits before REST for TOG-10861.",
       "sha256": "889864e3d2768c5b95455b6b1e2071e20921cd65d5f8a017aad8668093b8f489"
     },
+    "crates/cutover/migrations/0352_internal_action_not_sent.sql": {
+      "sha256": "eee55973b4e8cfd1bf5c0014d0ec80599f48c0954c373c86597d183af08acb16",
+      "justification": "Allow audited, owning-executor proof of no dispatch to retry a guarded member action under the original key for TOG-10857; unknown and stale intents remain fenced."
+    },
     "crates/cutover/migrations/0360_join_risk_flags.sql": {
       "sha256": "e3215b7b6b878e710a75acf33ecdc61ce3c2955b60ce4e523509bdc1fa92aea2",
       "justification": "Add legacy join-risk evidence schema for manually approved raid-list and raid-remove tooling (TOG-10867); no containment activation or automatic removal."
+    },
+    "crates/cutover/migrations/0361_discord_send_admission.sql": {
+      "sha256": "5f5986ae81173571aaea237bff45f09d6e23256f5023ed7a3570697796da791d",
+      "justification": "TOG-11045: add durable token-wide Discord send admission; no existing migration SQL changed."
     },
     "crates/cutover/migrations/0390_legacy_copy_presence.sql": {
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes.",
