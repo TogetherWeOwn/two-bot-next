@@ -1030,13 +1030,27 @@ impl ActionExecutor {
     /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
     /// is refused without I/O, never silently rewritten (finding 2).
     pub async fn get_json(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
+        Ok(self.get_json_observed(path).await?.map(|(data, _)| data))
+    }
+
+    /// Membership evidence is bounded by the successful attempt's request
+    /// start, after pacing, never by headers/body completion or an earlier
+    /// failed attempt. Ordinary `get_json` keeps its data-only contract.
+    pub async fn get_json_observed(
+        &self,
+        path: &str,
+    ) -> Result<Option<(serde_json::Value, String)>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
         loop {
             let request = Request::from_route(&route);
-            let (res, global) = match self.send_paced(&request, false).await {
+            // Guard refusals are terminal; pacing completes before the stamp.
+            self.admit(&request, Some(false))
+                .await
+                .map_err(|error| error.to_string())?;
+            let observed_at = two_bot_core::now_iso();
+            let (res, global) = match self.send_admitted(&request).await {
                 Ok(r) => r,
-                Err(DiscordError::Guard(error)) => return Err(error.to_string()),
                 Err(detail) => {
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return Err(detail.to_string());
@@ -1047,7 +1061,11 @@ impl ActionExecutor {
                 }
             };
             match res.status {
-                200..=299 => return Ok(serde_json::from_slice(&res.body).ok()),
+                200..=299 => {
+                    return Ok(serde_json::from_slice(&res.body)
+                        .ok()
+                        .map(|data| (data, observed_at)));
+                }
                 429 => {
                     if !global {
                         tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
