@@ -986,10 +986,21 @@ impl ActionExecutor {
     /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
     /// is refused without I/O, never silently rewritten (finding 2).
     pub async fn get_json(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
+        Ok(self.get_json_observed(path).await?.map(|(data, _)| data))
+    }
+
+    /// Membership evidence is bounded by the successful attempt's request
+    /// start, after pacing, never by headers/body completion or an earlier
+    /// failed attempt. Ordinary `get_json` keeps its data-only contract.
+    pub async fn get_json_observed(
+        &self,
+        path: &str,
+    ) -> Result<Option<(serde_json::Value, String)>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
         loop {
             self.pace(false).await;
+            let observed_at = two_bot_core::now_iso();
             let request = Request::from_route(&route);
             let res = match self.send(&request).await {
                 Ok(r) => r,
@@ -1003,7 +1014,11 @@ impl ActionExecutor {
                 }
             };
             match res.status {
-                200..=299 => return Ok(serde_json::from_slice(&res.body).ok()),
+                200..=299 => {
+                    return Ok(serde_json::from_slice(&res.body)
+                        .ok()
+                        .map(|data| (data, observed_at)));
+                }
                 429 => {
                     tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
                 }
@@ -1713,6 +1728,95 @@ impl ActionExecutor {
                 res.complete().await;
                 Ok(())
             }
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
+    /// Execute a router reply operation in the unpaced interaction lane.
+    /// No automatic retries: a lost callback response may already be an ACK.
+    pub async fn execute_reply_operation(
+        &self,
+        application_id: u64,
+        interaction_id: u64,
+        interaction_token: &str,
+        operation: two_bot_core::router::replies::ReplyOperation,
+    ) -> Result<Option<u64>, DiscordError> {
+        use twilight_model::channel::message::{AllowedMentions, MessageFlags};
+        use two_bot_core::router::replies::ReplyOperation;
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let client = self.inner.factory.interaction(application);
+        let mentions = AllowedMentions::default();
+        let creates_followup = matches!(operation, ReplyOperation::Followup(_));
+        let req = match operation {
+            ReplyOperation::Respond(reply) => {
+                let response = super::interactions::text_response(reply);
+                return self
+                    .answer_interaction(interaction_id, interaction_token, &response)
+                    .await
+                    .map(|()| None);
+            }
+            ReplyOperation::Defer { ephemeral } => {
+                let response = super::interactions::deferred_response(ephemeral);
+                return self
+                    .answer_interaction(interaction_id, interaction_token, &response)
+                    .await
+                    .map(|()| None);
+            }
+            ReplyOperation::EditOriginal { content } => Self::request_of(
+                client
+                    .update_response(interaction_token)
+                    .content(Some(&content))
+                    .allowed_mentions(Some(&mentions)),
+            )?,
+            ReplyOperation::EditFollowup {
+                message_id,
+                content,
+            } => {
+                let message_id = Id::<MessageMarker>::new_checked(message_id)
+                    .ok_or_else(|| DiscordError::Rejected("bad followup message id".to_owned()))?;
+                Self::request_of(
+                    client
+                        .update_followup(interaction_token, message_id)
+                        .content(Some(&content))
+                        .allowed_mentions(Some(&mentions)),
+                )?
+            }
+            ReplyOperation::Followup(reply) => Self::request_of(
+                client
+                    .create_followup(interaction_token)
+                    .content(&reply.content)
+                    .flags(if reply.ephemeral {
+                        MessageFlags::EPHEMERAL
+                    } else {
+                        MessageFlags::empty()
+                    })
+                    .allowed_mentions(Some(&mentions)),
+            )?,
+            ReplyOperation::DeleteOriginal => {
+                Self::request_of(client.delete_response(interaction_token))?
+            }
+        };
+        let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
+            .await
+            .map_err(|_| DiscordError::Timeout)?
+            .map_err(DiscordError::Unavailable)?;
+        match res.status {
+            200..=299 if creates_followup => {
+                // Discord returns the created message; retain its identity so
+                // progress/completion can edit it after @original is deleted.
+                let message: serde_json::Value =
+                    serde_json::from_slice(&res.body).map_err(|_| {
+                        DiscordError::Unavailable("invalid followup response".to_owned())
+                    })?;
+                let id = message["id"]
+                    .as_str()
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .filter(|id| *id != 0)
+                    .ok_or_else(|| DiscordError::Unavailable("missing followup id".to_owned()))?;
+                Ok(Some(id))
+            }
+            200..=299 => Ok(None),
             _ => Err(throw_for_status(&res)),
         }
     }
