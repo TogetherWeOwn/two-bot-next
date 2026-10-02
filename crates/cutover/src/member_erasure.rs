@@ -55,6 +55,7 @@ pub fn is_identity_column(column: &str) -> bool {
         || column == "member_id"
         || column.ends_with("_member_id")
         || column.ends_with("_by")
+        || column.ends_with("_author_id")
         || matches!(
             column,
             "actor"
@@ -207,6 +208,10 @@ pub async fn erase_member(
                 "self_role_panel_claims",
                 "processing_expires_at > clock_timestamp()",
             ),
+            // Only a settled claim (result recorded) is a receipt. Every
+            // other state - fresh, started-uncertain, counted, released - must
+            // keep its row or a gateway retry could sanction twice.
+            ("automod_delivery_claims", "result_json IS NULL"),
         ] {
             let entry = plan
                 .tables
@@ -294,6 +299,7 @@ mod tests {
             "recipient_user_id",
             "member_id",
             "inviter_id",
+            "matched_author_id",
             "created_by",
             "actor",
         ] {
