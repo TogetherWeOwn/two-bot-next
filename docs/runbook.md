@@ -126,6 +126,41 @@ and response guidance. `container_keepalive_arm_failed` indicates monitoring
 setup failed; health/readiness responses still reflect the Container, not proof
 that monitoring is armed.
 
+### Metrics alerts
+
+The Container DO pulls the container-internal `/metrics` on every keepalive tick,
+evaluates the rules in `wrangler/src/alert-rules.ts`, and posts one message per
+transition (fire, resolve) to `OPS_ALERT_WEBHOOK_URL`. See
+[metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
+with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
+
+#### Alert: job stale
+
+A scheduled job's last success is older than two cadences. Check `/readyz` job
+status and Worker/container logs for `periodic job failed`. A job that never
+succeeded since start (timestamp zero) is not reported here. If the Container
+restarted the series resets; wait one cadence before acting. Restart only after
+the logs show the job loop is wedged, per the [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+
+#### Alert: job failures
+
+A job failed three completions in a row. Read `periodic job failed` logs (error
+class only; payloads are never logged). Usual causes: database unreachable,
+Discord REST failing. Fix the dependency; the streak clears on the next success.
+
+#### Alert: REST 429
+
+More than 10% of Discord REST requests between two samples (min 10 requests)
+returned 429. Look at `two_bot_rest_requests_total{route,result="429"}` for the
+hot route, then pause the offending job or feature flag
+([containment](#containment-kill-switches-and-feature-flags)).
+
+#### Alert: DB pool
+
+The SQLx pool sat at its maximum with zero idle connections for three
+consecutive samples. This is pool exhaustion, a proxy for DB trouble; there is
+no DB error counter yet. Check Neon status and long-running queries.
+
 ## Redeploy and rollback
 
 ### Before changing anything
