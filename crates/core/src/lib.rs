@@ -6,6 +6,7 @@
 //! or by future transports. Slices S3+ build on these seams.
 
 pub mod action_outcomes;
+pub mod anchor_event;
 pub mod audit;
 pub mod audit_mirror;
 #[cfg(feature = "db")]
@@ -21,6 +22,7 @@ pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;
+pub mod clock_guard;
 pub mod command_permissions;
 pub mod commands;
 pub mod community;
@@ -61,6 +63,7 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod membership;
 pub mod message_safety;
 pub mod metrics;
 pub mod moderation;
@@ -72,6 +75,7 @@ pub mod presence;
 pub mod presence_store;
 pub mod raid;
 pub mod raid_removal;
+pub mod rejection_telemetry;
 pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
@@ -83,20 +87,34 @@ pub mod scheduled_store;
 pub mod secret;
 pub use secret::Secret;
 pub mod self_roles;
+pub mod send_admission;
 pub mod settings;
 pub mod sticky;
 pub mod tickets;
 pub mod voice;
+pub mod voice_access;
+pub mod voice_alias;
 pub mod voice_assistant_cap;
+pub mod voice_assistant_request;
+pub mod voice_assistant_validate;
+pub mod voice_conditions;
 pub mod voice_config;
 pub mod voice_config_diff;
+pub mod voice_custom_id;
+pub mod voice_logging;
+pub mod voice_name_filter;
 pub mod voice_naming;
 pub mod voice_ownership;
 pub mod voice_permission_health;
 pub mod voice_permissions;
 pub mod voice_placement;
+pub mod voice_private;
+pub mod voice_rename_coalescer;
 pub mod voice_room_controls;
+pub mod voice_style;
+pub mod voice_template_lint;
 pub mod voice_text_channel;
+pub mod voice_utilities;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
@@ -125,6 +143,7 @@ pub use channel_moderation_store::{
     ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore, DB_POOL_MAX_DEFAULT,
     STATEMENT_TIMEOUT_MS,
 };
+pub use clock_guard::{ClockGuard, ClockRollback, CLOCK_SKEW_TOLERANCE_MS};
 pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
@@ -156,8 +175,8 @@ pub use evidence::{
 };
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
-    announcement_commands, automation_commands, feature_commands, scorecard_attendance_command,
-    FeatureGates, GateError,
+    announcement_commands, automation_commands, feature_commands, parse_prefix_trigger,
+    scorecard_attendance_command, FeatureGates, GateError,
 };
 pub use funnel::{
     format_iso_millis, idempotency_key, is_measurable_gate_clearing, now_iso, parse_iso_millis,
@@ -181,17 +200,18 @@ pub use inactivity::{
 pub use internal_actions::{
     assert_allowed, assert_private_bind, auth_failure, authorize, body_hash, build_channel_keys,
     build_key_map, build_role_keys, canonical_string, check_setting_value_size, is_private_address,
-    new_request_id, normalise_bind_host, parse_keys, require_field_str, require_reason,
-    require_settings_key, require_snowflake, require_timestamp, sign, signatures_match, utf16_len,
-    valid_idempotency_key, valid_nonce_format, validate_announcement, validate_event_input,
-    validate_guild_add_member, validate_idempotency_key, validate_moderation_numbers,
-    validate_role_assign, within_skew, ActionError, AuthDecision, AuthHeaders, BindError,
-    BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace, InternalFlags, KeyMapError,
-    KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets, ACTIONS_PATH, ADD_MEMBER_BUCKET,
-    AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET, IMPLEMENTED_ACTIONS, MAX_BODY_BYTES,
-    MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS, MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN,
-    MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN, MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY,
-    NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS, REQUEST_ID_LEN, SKEW_SECONDS,
+    new_request_id, normalise_bind_host, parse_body_object, parse_keys, require_field_str,
+    require_reason, require_settings_key, require_snowflake, require_timestamp, sign,
+    signatures_match, utf16_len, valid_idempotency_key, valid_nonce_format, validate_announcement,
+    validate_event_input, validate_guild_add_member, validate_idempotency_key,
+    validate_moderation_numbers, validate_role_assign, within_skew, ActionError, AuthDecision,
+    AuthHeaders, BindError, BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace,
+    InternalFlags, KeyMapError, KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets,
+    ACTIONS_PATH, ADD_MEMBER_BUCKET, AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET,
+    IMPLEMENTED_ACTIONS, MAX_BODY_BYTES, MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS,
+    MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN, MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN,
+    MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY, NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS,
+    REQUEST_ID_LEN, SKEW_SECONDS,
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
@@ -245,14 +265,16 @@ pub use onboarding_store::{
     record_prompted, record_session_routed, OnboardingStoreError, PromptGuard,
 };
 pub use presence::{
-    bot_floor_due, daily_peaks, decide_probe_cycle, evaluate_trigger, latest_bot_floor,
-    sanitize_presence_count, BotFloorScan, DailyPeak, PresenceReading, ProbeDecision,
-    TriggerOptions, TriggerStatus, TriggerVerdict, BOT_FLOOR_MAX_AGE_MS,
-    PRESENCE_PROBE_INTERVAL_MS, REOPEN_PEAK_THRESHOLD,
+    bot_floor_due, daily_peaks, decide_probe_cycle, decide_probe_lease, evaluate_trigger,
+    latest_bot_floor, release_probe_lease, sanitize_presence_count, BotFloorScan, DailyPeak,
+    PresenceReading, ProbeDecision, ProbeLease, ProbeLeaseDecision, TriggerOptions, TriggerStatus,
+    TriggerVerdict, BOT_FLOOR_MAX_AGE_MS, PRESENCE_PROBE_INTERVAL_MS, PRESENCE_PROBE_LEASE_MS,
+    REOPEN_PEAK_THRESHOLD,
 };
 pub use raid::{
-    count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,
-    RaidAlert, RaidConfigError, RaidTuning, RaidWatch, RecordedJoinRisk, StaffAlertMessage,
+    count_recent_join_risks, scan_joins_for_bursts, HistoricalJoin, JoinRiskEvidence,
+    JoinRiskInput, JoinRiskObservation, JoinRiskPolicy, RaidAlert, RaidConfigError,
+    RaidScanOptions, RaidTuning, RaidWatch, RecordedJoinRisk, StaffAlertMessage,
     DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS, DEFAULT_RAID_COOLDOWN_SECONDS,
     DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
 };
@@ -324,6 +346,10 @@ pub use voice::{
     known_voice_durations, parse_voice_end_metadata, resolve_voice_end, summarize_voice_durations,
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
+};
+pub use voice_access::{
+    is_voice_command, may_create_room, may_use_command, validate_access_controls, AccessControls,
+    AccessDecision, AccessDenyReason, AccessError, AccessMember, RoleId, VOICE_COMMANDS,
 };
 pub use voice_permission_health::{
     evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
