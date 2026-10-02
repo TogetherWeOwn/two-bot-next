@@ -26,6 +26,16 @@ raw result cells without text casts. Unsupported native composite cells refuse
 at restore rather than silently becoming SQL NULL. Legacy JSON `null` cannot
 distinguish JSON null from SQL NULL; the legacy contract maps it to SQL NULL.
 
+`backup_schema_seed.sql` is the separate migration-backed v4 fixture for
+`backup_schema_roundtrip.rs`. It seeds every active covered table, including
+FK chains, durable dedupe/lease state, settings revision/audit history, gapped
+serial IDs and difficult text/null/JSON/timestamp values. Those tests create
+isolated databases with the real cutover migrations and compare every column
+of every restored row against an independent fresh migrated destination. The
+Rust harness adds a non-`id` ALWAYS identity with a custom start/increment to
+exercise catalog sequence discovery beyond the current production serials.
+This fixture does not replace the frozen-writer compatibility bytes above.
+
 `aws-sigv4-worked-example-secret.txt` is AWS's public test vector, never a usable
 credential. The full PUT signature is independently reconstructed with Python
 `hashlib`/`hmac`, and the loopback S3 verifier rejects unordered SignedHeaders

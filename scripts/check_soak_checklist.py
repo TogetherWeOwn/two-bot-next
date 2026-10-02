@@ -119,6 +119,8 @@ def validate(markdown, checklist):
                 raise ValueError(f"{entry.get('id')}: missing {field}")
         if entry["status"] == "waived" and not entry.get("reason", "").strip():
             raise ValueError(f"{entry['id']}: waiver requires reason")
+        if entry["status"] == "waived" and not entry.get("approver", "").strip():
+            raise ValueError(f"{entry['id']}: waiver requires approver")
         if entry["status"] == "automated" and not entry.get("verification", "").strip():
             raise ValueError(f"{entry['id']}: automated requires verification")
         # Voice-sensitive rows are cross-links, never a second voice procedure.
@@ -149,7 +151,7 @@ def render(checklist):
                       f"- **Action:** {entry['action']}",
                       f"- **Expected:** {entry['expected']}",
                       f"- **Evidence:** {entry['evidence']}"]
-            for field in ("verification", "reason", "reference"):
+            for field in ("verification", "reason", "approver", "reference"):
                 if entry.get(field):
                     lines.append(f"- **{field.title()}:** {entry[field]}")
             lines.append("")
