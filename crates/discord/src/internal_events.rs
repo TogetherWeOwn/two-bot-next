@@ -14,6 +14,7 @@ use two_bot_core::internal_actions::{ActionError, ErrorCode, EventInput, EventPl
 use two_bot_core::{normalize_event, EventStatus, RawScheduledEvent, ScheduledEventMirror};
 
 use crate::executor::snowflake;
+use crate::ratelimit_guard::GuardError;
 use crate::{ActionExecutor, DiscordError};
 
 /// An already-validated action. `None` creates; a mapped ID updates. Cancelling
@@ -54,6 +55,20 @@ impl EventActionError {
     #[must_use]
     pub fn action_error(&self) -> ActionError {
         let (code, reason) = match self {
+            // Local guard refusals never reached the wire: a dead token is an
+            // outage, any other refusal is a retryable local pause. Neither is
+            // a Discord rejection.
+            Self::Discord(DiscordError::Guard(GuardError::TokenInvalid)) => {
+                (ErrorCode::DiscordUnavailable, "discord_guard_refused")
+            }
+            Self::Discord(DiscordError::Guard(_)) => {
+                return ActionError::new(
+                    ErrorCode::RateLimited,
+                    self.to_string(),
+                    "discord_guard_refused",
+                )
+                .with_retry_after(1);
+            }
             Self::Discord(DiscordError::Rejected(_)) => {
                 (ErrorCode::DiscordRejected, "discord_rejected")
             }
@@ -183,7 +198,7 @@ impl ActionExecutor {
             .map_err(|error| DiscordError::Rejected(format!("build: {error}")))?;
         // Legacy cancel does not swallow 404 or an already-cancelled 400.
         // Idempotency is durable replay of the original claim, not a new PATCH.
-        let response = self.call_once_raw(request, &[200, 201]).await?;
+        let mut response = self.call_once_raw(request, &[200, 201]).await?;
         let body: Value = serde_json::from_slice(&response.body)
             .map_err(|_| EventActionError::InvalidResponse)?;
         let string = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -206,6 +221,12 @@ impl ActionExecutor {
         {
             return Err(EventActionError::InvalidResponse);
         }
+        // The accepted outcome and required receipt are validated, so the
+        // mutation boundary now owns consuming completion. Reads already
+        // auto-completed in the transport; an invalid identity above drops
+        // the retained permit and keeps the token-wide lane held (fail
+        // closed) instead of authorizing a replay onto another resource.
+        response.complete().await;
         mirror
             .upsert(guild_id, observed_at, &event)
             .await

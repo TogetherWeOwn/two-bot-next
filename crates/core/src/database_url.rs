@@ -132,8 +132,8 @@ fn url_for_sqlx(raw: &str) -> Result<String, &'static str> {
 /// All decoded occurrences of libpq's `channel_binding` are dropped before the
 /// driver sees them. This does not enforce channel binding or change SSL mode.
 ///
-/// Call [`validate`] first so unsupported query keys are refused before the
-/// driver can WARN-log them. The parse itself runs under a thread-scoped
+/// Unsupported query keys are refused before the driver can WARN-log them.
+/// The parse itself runs under a thread-scoped
 /// subscriber that drops the driver's passfile target: a malformed passfile
 /// line (which can contain a credential) must not reach logs, while a
 /// well-formed entry still supplies the password exactly as `FromStr` would.

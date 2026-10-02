@@ -10,6 +10,9 @@
 //! Exit codes: 0 fine, 1 the export is not importable or the report does
 //! not balance, 2 usage or a refused guild.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use two_bot_cutover::cli::{open_db, require_guild, Args};
 use two_bot_cutover::{
     is_snowflake, parse_mee6_role_rewards, parse_roles_snapshot, plan_reward_role_import,

@@ -9,16 +9,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use two_bot_core::backup::dump::{dump, restore, DbDumpError};
 use two_bot_core::backup::dump_file::{
     finish_gzip, inspect, is_destination_owned, new_encoder, write_line, DumpContents,
-    DumpTableInfo, DESTINATION_OWNED_COLUMNS, DUMP_TABLES, DUMP_VERSION, EXCLUDED_TABLES,
-    OPTIONAL_LEGACY_TABLES,
+    DumpTableInfo, SequenceMark, DESTINATION_OWNED_COLUMNS, DUMP_TABLES, DUMP_VERSION,
+    EXCLUDED_TABLES, OPTIONAL_LEGACY_TABLES,
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -473,8 +474,8 @@ struct SequenceSnapshot {
 }
 
 /// Transactional sequence state. guild_settings_cas_seq is left out: nextval is
-/// not transactional, so even a rolled-back restore consumes CAS tokens. Tests
-/// assert that sequence only descends instead ([`next_cas_token`]).
+/// not transactional, so a rolled-back settings write can consume CAS tokens.
+/// Tests assert that sequence only descends instead ([`next_cas_token`]).
 async fn sequence_snapshot(pool: &PgPool) -> Vec<SequenceSnapshot> {
     let rows: Vec<(String, i64, i64, i64, i64, i64, bool)> = sqlx::query_as(
         "SELECT format('%I.%I', n.nspname, c.relname), s.seqstart, s.seqincrement, \
@@ -502,9 +503,51 @@ async fn sequence_snapshot(pool: &PgPool) -> Vec<SequenceSnapshot> {
     snapshots
 }
 
+/// The value `sequence` would hand out next, without consuming it.
+async fn sequence_next(pool: &PgPool, sequence: &str) -> i64 {
+    let increment: i64 =
+        sqlx::query_scalar("SELECT seqincrement FROM pg_sequence WHERE seqrelid = $1::regclass")
+            .bind(sequence)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    // `sequence` comes from pg_get_serial_sequence (already quoted) or a literal.
+    let (last, called): (i64, bool) = sqlx::query_as(audited(format!(
+        "SELECT last_value, is_called FROM {sequence}"
+    )))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    if called {
+        last + increment
+    } else {
+        last
+    }
+}
+
+/// Per owned allocator, the furthest of the target's own next value and the
+/// archive's mark. Restore must not hand out anything before it.
+async fn allocation_floors(
+    pool: &PgPool,
+    marks: &[SequenceMark],
+) -> BTreeMap<(String, String), i64> {
+    let mut floors = BTreeMap::new();
+    for sequence in owned_sequences(pool).await {
+        assert!(sequence.increment > 0, "owned allocators ascend");
+        let own = sequence_next(pool, &sequence.name).await;
+        let marked = marks
+            .iter()
+            .find(|mark| mark.table == sequence.table && mark.column == sequence.column)
+            .map_or(own, |mark| mark.next().unwrap());
+        floors.insert((sequence.table, sequence.column), own.max(marked));
+    }
+    floors
+}
+
 async fn allocate_owned_sequences(
     pool: &PgPool,
     empty: bool,
+    floors: &BTreeMap<(String, String), i64>,
 ) -> BTreeMap<(String, String), (i64, i64)> {
     let mut allocated = BTreeMap::new();
     for sequence in owned_sequences(pool).await {
@@ -523,7 +566,9 @@ async fn allocate_owned_sequences(
             sequence.table,
             sequence.column
         );
-        let expected = maximum.map_or(sequence.start, |maximum| maximum + sequence.increment);
+        let edge = maximum.map_or(sequence.start, |maximum| maximum + sequence.increment);
+        let floor = floors[&(sequence.table.clone(), sequence.column.clone())];
+        let expected = edge.max(floor);
         let next: i64 = sqlx::query_scalar("SELECT nextval($1::regclass)")
             .bind(&sequence.name)
             .fetch_one(pool)
@@ -792,10 +837,13 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     reversed.manifest.tables.reverse();
     let reversed_path = directory.path("reversed.ndjson.gz");
     write_archive(&reversed_path, &reversed);
+    let mut floors = BTreeMap::new();
     for (revision_mode, audit_mode) in [("O", "O"), ("A", "R"), ("R", "D"), ("D", "A")] {
         set_guard_modes(pool, revision_mode, audit_mode).await;
         let modes_before = triggers(pool).await;
         dirty_target(pool).await;
+        // Keep the floors in force before the last restore.
+        floors.extend(allocation_floors(pool, &reversed.manifest.sequence_marks).await);
         let cas_before = next_cas_token(pool).await;
         let report = restore(pool, &reversed_path)
             .await
@@ -818,7 +866,13 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     set_guard_modes(pool, "O", "O").await;
     assert_guards_work(pool).await;
     assert_eq!(snapshot(pool, &ledgers).await, ledger_before);
-    let allocations = allocate_owned_sequences(pool, false).await;
+    let allocations = allocate_owned_sequences(pool, false, &floors).await;
+    // dirty_target allocated identities on the target past the restored 313;
+    // their rows are gone, but restore must not rewind the allocator onto them.
+    assert!(
+        allocations[&("members".into(), "backup_identity".into())].0 > 316,
+        "the target's own high-water survives restore"
+    );
     assert_default_inserts(pool, &allocations).await;
     let allocated_version: i64 = sqlx::query_scalar("SELECT nextval('guild_settings_version_seq')")
         .fetch_one(pool)
@@ -846,7 +900,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
 }
 
 #[tokio::test]
-async fn empty_archived_sequence_tables_restart_at_the_target_configured_start() {
+async fn empty_archived_sequence_tables_keep_the_target_position() {
     let Some(db) = database().await else {
         return;
     };
@@ -871,31 +925,214 @@ async fn empty_archived_sequence_tables_restart_at_the_target_configured_start()
     empty.rows = empty.manifest.tables.iter().map(|table| table.count).sum();
     let empty_path = directory.path("empty-sequences.ndjson.gz");
     write_archive(&empty_path, &empty);
+    let floors = allocation_floors(pool, &empty.manifest.sequence_marks).await;
     let report = restore(pool, &empty_path).await.unwrap();
     assert!(report.ok);
     assert!(report.initialized_tables.is_empty());
     for table in sequence_tables {
         assert_eq!(report.restored[table], 0, "{table} must really be empty");
     }
-    let allocations = allocate_owned_sequences(pool, true).await;
+    let allocations = allocate_owned_sequences(pool, true, &floors).await;
+    // The seed binds explicit member rows, so the test identity hands out 17
+    // and 20 for the two fixture rows before the dump; the target's own next
+    // value is 23, and restore keeps that position rather than rewinding to
+    // the configured start. `floors` already pins this exact expectation.
     assert_eq!(
         allocations[&("members".into(), "backup_identity".into())].0,
-        17
+        floors[&("members".into(), "backup_identity".into())],
+    );
+    assert_eq!(
+        allocations[&("members".into(), "backup_identity".into())].0,
+        23
     );
     let version: i64 = sqlx::query_scalar("SELECT nextval('guild_settings_version_seq')")
         .fetch_one(pool)
         .await
         .unwrap();
+    // Migration 0331's setval leaves an empty table's sequence at (1, called):
+    // 1 counts as issued, and restore never reissues a value.
     assert_eq!(
-        version, 1,
-        "empty standalone sequence restarts at its configured start"
+        version, 2,
+        "empty standalone sequence resumes past its own issued start"
     );
     let intent: i64 = sqlx::query_scalar("INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('4', 64), repeat('5', 64), 'event.read', repeat('6', 64), 'in_flight') RETURNING intent_id").fetch_one(pool).await.unwrap();
     assert_eq!(intent, 2);
     let audit: i64 = sqlx::query_scalar("INSERT INTO internal_action_log (intent_id, phase, caller_hash, action) VALUES ($1, 'intent', repeat('4', 64), 'event.read') RETURNING audit_id").bind(intent).fetch_one(pool).await.unwrap();
     assert_eq!(audit, 2);
     let identity: i64 = sqlx::query_scalar("INSERT INTO members (guild_id, member_id) VALUES ('100000000000000001', 'empty-default-member') RETURNING backup_identity").fetch_one(pool).await.unwrap();
-    assert_eq!(identity, 20);
+    assert_eq!(identity, 26);
+    db.close().await.unwrap();
+}
+
+const EVENT_INSERT: &str = "INSERT INTO events (event_type, guild_id, occurred_at, source, idempotency_key) VALUES ('member_join', '100000000000000001', now(), 'backup-test', $1) RETURNING id";
+const MEMBER_INSERT: &str =
+    "INSERT INTO members (guild_id, member_id) VALUES ('100000000000000001', $1) RETURNING backup_identity";
+const FACT_INSERT: &str = "INSERT INTO community_facts (guild_id, event_type, source_event_id, occurred_at, source, classifier_version, classification, matched_rule, idempotency_key) VALUES ('100000000000000001', 'rules_accepted', $1, '2026-08-04T00:00:00.000Z', 'backup-test', 'classifier-v1', 'test', 'default', $1) RETURNING id";
+const SETTING_INSERT: &str = "INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES ('100000000000000001', 'TWO_BACKUP_TEST', 'true', nextval('guild_settings_version_seq'), $1) RETURNING version";
+const BACKUP_IDENTITY: &str = "ALTER TABLE members ADD COLUMN backup_identity BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 17 INCREMENT BY 3) UNIQUE";
+
+async fn insert_returning(pool: &PgPool, statement: &'static str, key: &str) -> i64 {
+    sqlx::query_scalar(statement)
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// TOG-12232, the cutover allocator gate: rows alone cannot show values handed
+/// out and then deleted, so the archive carries each allocator's mark. Restore
+/// resumes past it, keeps a target that is further ahead, and gives restored
+/// settings CAS tokens beyond every token the source issued.
+#[tokio::test]
+async fn restore_never_reissues_values_handed_out_before_their_rows_were_deleted() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let source = db.pool();
+    seed(source).await;
+    // The fixture binds explicit ids; a live source's allocators sit past its rows.
+    for sequence in owned_sequences(source).await {
+        sqlx::query(audited(format!(
+            "SELECT setval($1::regclass, MAX({})::bigint) FROM {}",
+            identifier(&sequence.column),
+            identifier(&sequence.table)
+        )))
+        .bind(&sequence.name)
+        .execute(source)
+        .await
+        .unwrap();
+    }
+    sqlx::query("SELECT setval('guild_settings_version_seq', MAX(version)) FROM guild_settings")
+        .execute(source)
+        .await
+        .unwrap();
+    // Insert, then delete, the top rows: the archive holds none of these values.
+    let deleted_event = insert_returning(source, EVENT_INSERT, "deleted-top:event").await;
+    let deleted_identity = insert_returning(source, MEMBER_INSERT, "deleted-top-member").await;
+    let deleted_fact = insert_returning(source, FACT_INSERT, "deleted-top:fact").await;
+    let deleted_version = insert_returning(source, SETTING_INSERT, "deleted-top").await;
+    sqlx::raw_sql(
+        "DELETE FROM events WHERE idempotency_key = 'deleted-top:event'; \
+         DELETE FROM members WHERE member_id = 'deleted-top-member'; \
+         DELETE FROM community_facts WHERE idempotency_key = 'deleted-top:fact'; \
+         DELETE FROM guild_settings WHERE key = 'TWO_BACKUP_TEST';",
+    )
+    .execute(source)
+    .await
+    .unwrap();
+    // Every other allocator hands out a value too, as a rolled-back insert does.
+    for sequence in owned_sequences(source).await {
+        sqlx::query("SELECT nextval($1::regclass)")
+            .bind(&sequence.name)
+            .execute(source)
+            .await
+            .unwrap();
+    }
+
+    let directory = ArchiveDirectory::new();
+    let path = directory.path("deleted-top-rows.ndjson.gz");
+    let manifest = dump(source, &path).await.unwrap();
+    let mut expected = BTreeMap::new();
+    for sequence in owned_sequences(source).await {
+        let next = sequence_next(source, &sequence.name).await;
+        expected.insert((sequence.table, sequence.column), next);
+    }
+    let version_key = ("guild_settings".to_owned(), "version".to_owned());
+    let source_version_next = sequence_next(source, "guild_settings_version_seq").await;
+    expected.insert(version_key.clone(), source_version_next);
+    let source_cas_next = next_cas_token(source).await;
+    expected.insert(
+        ("guild_settings".to_owned(), "cas_version".to_owned()),
+        source_cas_next,
+    );
+    assert_eq!(
+        manifest
+            .sequence_marks
+            .iter()
+            .map(|mark| (
+                (mark.table.clone(), mark.column.clone()),
+                mark.next().unwrap()
+            ))
+            .collect::<BTreeMap<_, _>>(),
+        expected,
+        "the archive marks every allocator, owned or standalone"
+    );
+    assert_eq!(
+        inspect(&path).unwrap().manifest.sequence_marks,
+        manifest.sequence_marks
+    );
+
+    let target = database().await.expect("test bootstrap already configured");
+    let pool = target.pool();
+    sqlx::query(BACKUP_IDENTITY).execute(pool).await.unwrap();
+    // A target allocator already further ahead than the archive stays there.
+    sqlx::query("SELECT setval(pg_get_serial_sequence('xp_awards', 'id'), 9000)")
+        .execute(pool)
+        .await
+        .unwrap();
+    let report = restore(pool, &path).await.unwrap();
+    assert!(report.ok);
+    assert!(report.dropped_columns.is_empty());
+    for sequence in owned_sequences(pool).await {
+        let key = (sequence.table, sequence.column);
+        let resumes = if key == ("xp_awards".to_owned(), "id".to_owned()) {
+            9001
+        } else {
+            expected[&key]
+        };
+        assert_eq!(
+            sequence_next(pool, &sequence.name).await,
+            resumes,
+            "{key:?} resumes at the furthest of mark, rows and target"
+        );
+    }
+    assert_eq!(
+        sequence_next(pool, "guild_settings_version_seq").await,
+        source_version_next
+    );
+    let restored_tokens = cas_tokens(pool).await;
+    assert!(!restored_tokens.is_empty(), "seeded settings exercise CAS");
+    assert!(
+        restored_tokens
+            .iter()
+            .all(|(_, _, token)| *token <= source_cas_next),
+        "a stale source CAS token must never match a restored row: {restored_tokens:?}, source next {source_cas_next}"
+    );
+
+    let event = insert_returning(pool, EVENT_INSERT, "post-restore:event").await;
+    assert!(event > deleted_event, "event {deleted_event} reissued");
+    let identity = insert_returning(pool, MEMBER_INSERT, "post-restore-member").await;
+    assert!(
+        identity > deleted_identity,
+        "identity {deleted_identity} reissued"
+    );
+    // Scorecard runs publish MAX(community_facts.id) as their watermark.
+    let fact = insert_returning(pool, FACT_INSERT, "post-restore:fact").await;
+    assert!(fact > deleted_fact, "fact {deleted_fact} reissued");
+    let version = insert_returning(pool, SETTING_INSERT, "post-restore").await;
+    assert!(
+        version > deleted_version,
+        "version {deleted_version} reissued"
+    );
+
+    // An archive written before marks existed cannot meet the gate: it holds
+    // only the rows, so the deleted top id comes back (docs/cutover.md).
+    let mut unmarked = inspect(&path).unwrap();
+    unmarked.manifest.sequence_marks.clear();
+    let unmarked_path = directory.path("unmarked.ndjson.gz");
+    write_archive(&unmarked_path, &unmarked);
+    let fresh = database().await.expect("test bootstrap already configured");
+    sqlx::query(BACKUP_IDENTITY)
+        .execute(fresh.pool())
+        .await
+        .unwrap();
+    assert!(restore(fresh.pool(), &unmarked_path).await.unwrap().ok);
+    assert_eq!(
+        insert_returning(fresh.pool(), EVENT_INSERT, "post-restore:event").await,
+        deleted_event
+    );
+    fresh.close().await.unwrap();
+    target.close().await.unwrap();
     db.close().await.unwrap();
 }
 
@@ -965,7 +1202,7 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
             assert_eq!(
                 sequence_snapshot(pool).await,
                 sequences,
-                "rollback TRUNCATE RESTART IDENTITY"
+                "rollback sequence restarts"
             );
             assert_eq!(cas_tokens(pool).await, tokens, "rollback keeps CAS tokens");
             assert!(
@@ -977,8 +1214,8 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
     set_guard_modes(pool, "O", "O").await;
     assert_guards_work(pool).await;
 
-    // A refusal in the LAST sequence reset comes after all INSERTs, guard
-    // re-enabling and owned-sequence resets. It catches nontransactional setval
+    // A refusal in the settings-version reset comes after all INSERTs, guard
+    // re-enabling and most owned-sequence resets. It catches nontransactional setval
     // regressions that an earlier constraint error cannot exercise.
     sqlx::query("SELECT setval('guild_settings_version_seq', 7, TRUE)")
         .execute(pool)
@@ -1031,6 +1268,7 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
     dump(pool, &source).await.unwrap();
     let mut legacy = inspect(&source).unwrap();
     legacy.manifest.version = 3;
+    legacy.manifest.sequence_marks.clear();
     // The frozen writer's fixture is tested in backup_roundtrip. Here synthesize
     // its required 22-table envelope using valid REAL migrated prefix rows, and
     // omit every later table to exercise cutover compatibility (no fake DDL).
@@ -1143,8 +1381,8 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
     assert_eq!(snapshot(pool, &ledgers).await, ledger_before);
     let version: i64 = sqlx::query_scalar("INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES ('100000000000000001', 'TWO_BACKUP_TEST', 'true', nextval('guild_settings_version_seq'), 'v3-probe') RETURNING version").fetch_one(pool).await.unwrap();
     assert_eq!(
-        version, 1,
-        "v3-empty standalone version sequence starts at 1"
+        version, 2,
+        "v3-empty standalone version sequence resumes past the target's issued 1"
     );
     let revision: i64 =
         sqlx::query_scalar("SELECT revision FROM guild_settings_revision WHERE singleton = TRUE")
@@ -1161,5 +1399,262 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
         "v3-missing audit history resumes an empty serial sequence"
     );
     assert_guards_work(pool).await;
+    db.close().await.unwrap();
+}
+
+/// The bootstrap's service URL with only the database path replaced.
+/// TestDatabase::create already refused anything but agent_test with an
+/// explicit empty password on agent-testdb:5432 and no query, so the shipped
+/// binary below can reach nothing else.
+fn fixture_url(db: &TestDatabase) -> String {
+    let bootstrap = std::env::var("TWO_TEST_DATABASE_URL").expect("bootstrap already validated");
+    let (service, _) = bootstrap
+        .rsplit_once('/')
+        .expect("validated bootstrap names a database");
+    format!("{service}/{}", db.name())
+}
+
+/// The drill script interpolates both paths unquoted, as the unit does.
+fn shell_word(path: &Path) -> &str {
+    let text = path.to_str().expect("UTF-8 path");
+    assert!(
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b)),
+        "path must not need shell quoting: {text}"
+    );
+    text
+}
+
+/// The shipped drill's own ExecStart body, with only its archive directory and
+/// binary replaced, so a changed selector or restore invocation is exercised
+/// here rather than a copy of it.
+fn shipped_drill_script(archives: &Path, binary: &Path) -> String {
+    let unit = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/two-bot-next-restore-drill.service"),
+    )
+    .expect("read the shipped restore drill unit");
+    // systemd joins a line ending in a backslash with the next one and
+    // replaces the backslash with a space (systemd.syntax(7)).
+    let joined = unit.replace("\\\n", " ");
+    let exec = joined
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .expect("drill unit has an ExecStart");
+    let script = exec
+        .trim_end()
+        .strip_prefix("/usr/bin/bash -o pipefail -c '")
+        .and_then(|rest| rest.strip_suffix('\''))
+        .expect("drill runs one single-quoted bash -o pipefail script");
+    for shipped in ["/var/backups/two-bot-next/", "/opt/two-bot-next/two-bot "] {
+        assert_eq!(script.matches(shipped).count(), 1, "{shipped} in {script}");
+    }
+    script
+        .replace(
+            "/var/backups/two-bot-next/",
+            &format!("{}/", shell_word(archives)),
+        )
+        .replace(
+            "/opt/two-bot-next/two-bot ",
+            &format!("{} ", shell_word(binary)),
+        )
+}
+
+fn shipped_cli(command: &mut Command, label: &str) -> Output {
+    let output = command.output().expect("start the shipped two-bot binary");
+    // Drill evidence for the CI log. The CLI never prints database URLs.
+    println!(
+        "--- {label}: {}\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+async fn schema_version(pool: &PgPool) -> (i64, String, i64) {
+    sqlx::query_as(
+        "SELECT version, description, (SELECT count(*) FROM _sqlx_migrations) \
+         FROM _sqlx_migrations ORDER BY version DESC LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn assert_drill_verified(output: &Output, archive: &Path, tables: &[String]) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "drill failed");
+    assert!(
+        stdout.contains(&format!(
+            "drill: restoring {} into the scratch database",
+            archive.display()
+        )),
+        "the drill must select the newest archive, not the older decoy"
+    );
+    assert_eq!(stdout.lines().last(), Some("RESTORE VERIFIED"));
+    assert!(!stdout.contains("MISMATCH"));
+    assert!(!stderr.contains("WARNING"), "no baseline rows initialized");
+    assert!(
+        !stderr.contains("does not have"),
+        "no archived column dropped"
+    );
+    let verified = stdout
+        .lines()
+        .filter(|line| line.contains(" manifest ") && line.ends_with(" ok"))
+        .count();
+    assert_eq!(verified, tables.len(), "one verified count line per table");
+    for table in tables {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{table} "))
+                    && line.ends_with(" ok")),
+            "{table} restored with a matching count"
+        );
+    }
+}
+
+/// The shipped monthly drill on the complete migrated schema (TOG-11804): the
+/// built `two-bot backup`, then the restore drill unit's own ExecStart script,
+/// into an independent freshly migrated scratch database, twice. CI's backup
+/// CLI step supplies the binary; without TWO_BOT_TEST_BACKUP_BIN this skips.
+#[tokio::test]
+async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema() {
+    let Some(binary) = std::env::var_os("TWO_BOT_TEST_BACKUP_BIN").map(PathBuf::from) else {
+        eprintln!("SKIP shipped restore drill: TWO_BOT_TEST_BACKUP_BIN is not set");
+        return;
+    };
+    let Some(db) = database().await else {
+        return;
+    };
+    let source = db.pool();
+    seed(source).await;
+    let tables = covered_tables(source).await;
+    let before = snapshot(source, &tables).await;
+    let version = schema_version(source).await;
+    println!(
+        "drill: schema at migration {} {} ({} applied), {} bot-owned tables",
+        version.0,
+        version.1,
+        version.2,
+        tables.len()
+    );
+
+    // An older archive the newest-file selector must pass over.
+    let directory = ArchiveDirectory::new();
+    let decoy = directory.path("two-funnel-20000101T000000Z.ndjson.gz");
+    std::fs::write(&decoy, b"not a backup").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&decoy)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(946_684_800))
+        .unwrap();
+    let backup = shipped_cli(
+        Command::new(&binary)
+            .arg("backup")
+            .current_dir(&directory.0)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TWO_DATABASE_URL", fixture_url(&db))
+            .env("TWO_BACKUP_DIR", &directory.0)
+            .env("TWO_BACKUP_KEEP", "14"),
+        "two-bot backup",
+    );
+    assert!(backup.status.success(), "backup failed");
+    assert!(String::from_utf8_lossy(&backup.stdout).contains("backup: done"));
+    let published: Vec<PathBuf> = std::fs::read_dir(&directory.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| *path != decoy)
+        .collect();
+    let [archive] = published.as_slice() else {
+        panic!("exactly one published archive besides the decoy: {published:?}");
+    };
+    let contents = inspect(archive).unwrap();
+    assert_archive_matches(&contents, &before);
+    assert_eq!(contents.manifest.events_sequence, 107);
+
+    // Independent, freshly migrated scratch target, as the drill unit expects.
+    let target = database().await.expect("test bootstrap already configured");
+    let pool = target.pool();
+    assert_eq!(schema_version(pool).await, version);
+    sqlx::raw_sql(
+        "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY); \
+         INSERT INTO schema_migrations VALUES ('destination-ledger-only'); \
+         ALTER TABLE members ADD COLUMN backup_identity BIGINT GENERATED ALWAYS AS IDENTITY \
+             (START WITH 17 INCREMENT BY 3) UNIQUE;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let guard_before = triggers(pool).await;
+    let script = shipped_drill_script(&directory.0, &binary);
+    let target_url = fixture_url(&target);
+    // Month one restores into a dirtied scratch; month two into the previous
+    // drill's result, as the monthly timer does.
+    for month in 1..=2 {
+        dirty_target(pool).await;
+        let cas_before = next_cas_token(pool).await;
+        let drill = shipped_cli(
+            Command::new("/usr/bin/bash")
+                .args(["-o", "pipefail", "-c", script.as_str()])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("TWO_RESTORE_URL", &target_url),
+            &format!("restore drill, month {month}"),
+        );
+        assert_drill_verified(&drill, archive, &tables);
+        let after = snapshot(pool, &tables).await;
+        for table in &tables {
+            println!(
+                "drill: month {month} {table:32} source {:5} restored {:5}",
+                before[table].rows.len(),
+                after[table].rows.len()
+            );
+        }
+        assert_eq!(after, before, "month {month}: every archived row");
+        assert_fresh_cas_tokens(pool, cas_before).await;
+        assert_eq!(triggers(pool).await, guard_before);
+        let cooldowns: i64 = sqlx::query_scalar("SELECT count(*) FROM xp_cooldowns")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(cooldowns, 0, "excluded throttles are not replayed");
+    }
+    assert_guards_work(pool).await;
+
+    let allocations = allocate_owned_sequences(pool, false).await;
+    for ((table, column), (next, increment)) in &allocations {
+        println!("drill: sequence {table}.{column} resumed at {next} (increment {increment})");
+    }
+    assert_default_inserts(pool, &allocations).await;
+    let allocated_version: i64 = sqlx::query_scalar("SELECT nextval('guild_settings_version_seq')")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        allocated_version, 84,
+        "standalone settings version resumes beyond restored max"
+    );
+    println!("drill: sequence guild_settings_version_seq resumed at {allocated_version}");
+    let inserted_version: i64 = sqlx::query_scalar("INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES ('100000000000000001', 'TWO_BACKUP_TEST', 'true', nextval('guild_settings_version_seq'), 'post-restore') RETURNING version").fetch_one(pool).await.unwrap();
+    assert_eq!(inserted_version, 85);
+    for (table, statement) in [
+        ("internal_nonces", "INSERT INTO internal_nonces SELECT * FROM internal_nonces WHERE nonce_hash = repeat('a', 64)"),
+        ("internal_discord_events", "INSERT INTO internal_discord_events SELECT * FROM internal_discord_events WHERE event_hash = repeat('3', 64)"),
+        ("internal_idempotency", "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')"),
+        ("feed_deliveries", "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'"),
+        ("self_role_panel_claims", "INSERT INTO self_role_panel_claims SELECT * FROM self_role_panel_claims"),
+        ("automod_delivery_claims", "INSERT INTO automod_delivery_claims SELECT * FROM automod_delivery_claims"),
+    ] {
+        assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
+        println!("drill: replay refused (23505) in {table}");
+    }
+    target.close().await.unwrap();
     db.close().await.unwrap();
 }

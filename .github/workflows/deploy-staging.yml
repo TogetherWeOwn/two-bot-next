@@ -6,9 +6,13 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_fence:
+        description: Explicitly release an uninitialized/parked STAGING singleton after handoff authorization
+        type: boolean
+        default: false
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: deploy-staging
@@ -19,6 +23,10 @@ jobs:
     name: wrangler deploy + intended rollout gate
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'deploy') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
+    # secret (TOG-12030); the job must declare the environment to read it.
+    # (Kept while the job is suspended so re-activation cannot drop the scope.)
+    environment: staging
     timeout-minutes: 30
     defaults:
       run:
@@ -26,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 1
       # The runner context is not available in job-level env, so derive the
       # per-attempt paths here and export them to every later step.
@@ -38,9 +47,16 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: wrangler/package-lock.json
+          # Deploys must not consume caches populated by untrusted PR checks.
+          package-manager-cache: false
       - run: npm ci
+      # Validate the dedicated staging control binding BEFORE replacing a healthy
+      # deployment. Missing credentials are not permission to auto-claim an owner.
+      - name: Require staging ownership-control configuration
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+        run: node scripts/ownership-control.mjs preflight
       - name: Snapshot staging identity and generate per-deploy image provenance
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -62,6 +78,13 @@ jobs:
           environment: staging
           wranglerVersion: "4.143.1"
           command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging
+      - name: Transfer staging ownership to the deployed version
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          OWNERSHIP_ACTOR: github-actions:${{ github.run_id }}:${{ github.sha }}
+          OWNERSHIP_RELEASE_FENCE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_fence && 'true' || 'false' }}
+        run: node scripts/ownership-control.mjs deployment-takeover
       - name: Verify exact new rollout and serving Worker/container readiness
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
