@@ -78,3 +78,7 @@ path = "src/bin/raid_list.rs"
 [[bin]]
 name = "raid-remove"
 path = "src/bin/raid_remove.rs"
+
+[[bin]]
+name = "gateway-force-identify"
+path = "src/bin/gateway_force_identify.rs"
