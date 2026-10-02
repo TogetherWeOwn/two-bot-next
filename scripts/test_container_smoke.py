@@ -172,7 +172,7 @@ PARKED_JOB = {"parked": True, "running": False, "last_start": None,
 
 
 def parked_readyz_body():
-    return {"components": [["process", "ready"], ["gateway", "down"], ["database", "down"]],
+    return {"components": [["process", "ready"], ["gateway", "down"], ["database", "down"], ["token_invalid", "ready"]],
             "jobs": {name: dict(PARKED_JOB) for name in (
                 "counter", "rank", "scheduled_events", "presence_probe",
                 "community_scorecard", "inactivity",
@@ -383,11 +383,15 @@ class ContainerSmokeTests(unittest.TestCase):
         # The pre-jobs contract is deliberately superseded: an informational
         # jobs map is now always serialized, so a bare components body no
         # longer satisfies the smoke gate.
-        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"], ["database", "down"]]}) if url.endswith("/readyz") else (200, {"status": "ok"})
+        body = parked_readyz_body()
+        del body["jobs"]
+        self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
         self.assert_rejected("all six jobs parked")
 
     def test_readyz_without_jobs_map_fails(self):
-        self.http = lambda url: (503, {"components": [["process", "ready"], ["gateway", "down"], ["database", "down"]], "jobs": {}}) if url.endswith("/readyz") else (200, {"status": "ok"})
+        body = parked_readyz_body()
+        body["jobs"] = {}
+        self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
         self.assert_rejected("all six jobs parked")
 
     def test_readyz_with_missing_job_fails(self):
@@ -424,7 +428,24 @@ class ContainerSmokeTests(unittest.TestCase):
         body = parked_readyz_body()
         body["components"] = [["process", "ready"], ["gateway", "ready"]]
         self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
-        self.assert_rejected("ready process and parked gateway")
+        self.assert_rejected("ready process, parked gateway")
+
+    def test_readyz_missing_or_down_token_state_fails(self):
+        for token in (None, ["token_invalid", "down"]):
+            with self.subTest(token=token):
+                body = parked_readyz_body()
+                body["components"].pop()
+                if token is not None:
+                    body["components"].append(token)
+                self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+                self.assert_rejected("valid token state")
+
+    def test_readyz_components_mismatch_reports_actual_body(self):
+        body = parked_readyz_body()
+        body["components"] = [["process", "ready"]]
+        self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+        with self.assertRaisesRegex(RuntimeError, r"got status=503 body="):
+            self.run_smoke()
 
     def test_readyz_database_contract_is_enforced(self):
         for components in (
