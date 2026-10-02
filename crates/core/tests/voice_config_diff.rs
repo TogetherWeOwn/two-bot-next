@@ -296,16 +296,16 @@ fn uploaded_text_cannot_break_the_layout() {
 
 fn inject_unknown_channels(config: &mut VoiceConfiguration, unknown: [bool; 4]) -> Vec<String> {
     let mut skipped = Vec::new();
-    if unknown[0] && config.logging.is_some() {
-        config.logging.as_mut().unwrap().channel_id = "996".to_owned();
+    if let (true, Some(logging)) = (unknown[0], config.logging.as_mut()) {
+        logging.channel_id = "996".to_owned();
         skipped.push("996".to_owned());
     }
     if unknown[1] {
         config.templates.push(template("997"));
         skipped.push("997".to_owned());
     }
-    if unknown[2] && !config.creators.is_empty() {
-        config.creators[0].permission_source = PermissionSource::Channel {
+    if let (true, Some(first)) = (unknown[2], config.creators.first_mut()) {
+        first.permission_source = PermissionSource::Channel {
             channel_id: "998".to_owned(),
         };
         skipped.push("998".to_owned());
