@@ -29,6 +29,7 @@ use crate::gateway::{
 
 mod commands;
 mod deadline;
+mod force_identify;
 mod member_journey;
 mod persistent;
 mod recovery;
