@@ -60,7 +60,7 @@ fn overrides(plan: RoomPermissionPlan) -> Vec<ChannelOverride> {
     }
 }
 
-fn find<'a>(list: &'a [ChannelOverride], id: u64, kind: OverrideKind) -> &'a ChannelOverride {
+fn find(list: &[ChannelOverride], id: u64, kind: OverrideKind) -> &ChannelOverride {
     list.iter()
         .find(|o| o.id == id && o.kind == kind)
         .unwrap_or_else(|| panic!("missing override for ({id}, {kind:?})"))
@@ -387,8 +387,10 @@ proptest! {
         let (src_allow, src_deny) =
             owner_source.map_or((0, 0), |o| (o.allow, o.deny));
         prop_assert_eq!(owner_out.allow, (src_allow | grant) & !src_deny);
-        prop_assert_eq!(owner_out.allow & PERM_MANAGE_ROLES, 0);
-        prop_assert_eq!(owner_out.allow & PERM_ADMINISTRATOR, 0);
+        // Bits the builder added (beyond the source) never escalate. A
+        // source allow on the owner is inherited, not granted.
+        let added = owner_out.allow & !src_allow;
+        prop_assert_eq!(added & (PERM_MANAGE_ROLES | PERM_ADMINISTRATOR), 0);
 
         if private {
             let everyone = list
