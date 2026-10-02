@@ -280,7 +280,7 @@ pub use scheduled::{
 };
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
-    ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+    ScheduledEventMirror, ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 #[cfg(feature = "db")]
 pub use scheduled_store::{
@@ -324,6 +324,6 @@ pub use voice_vote_kick::{
 };
 #[cfg(feature = "db")]
 pub use website_store::{
-    apply_web_contract, read_raid_windows, replace_events, write_counter, write_rank_snapshot,
-    WebsiteStoreError, WEB_CONTRACT_VERSION, WEB_CONTRACT_VIEWS,
+    apply_web_contract, read_raid_windows, replace_events, upsert_event, write_counter,
+    write_rank_snapshot, WebsiteStoreError, WEB_CONTRACT_VERSION, WEB_CONTRACT_VIEWS,
 };
