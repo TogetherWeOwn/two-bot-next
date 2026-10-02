@@ -382,8 +382,9 @@ impl InternalActionStore {
             "SELECT high_water_ms FROM internal_clock_high_water WHERE domain = $1",
         )
         .bind(NONCE_DB_CLOCK_DOMAIN)
-        .fetch_one(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
         mark.map(|ms| u64::try_from(ms).map_err(|_| InternalStoreError::InvalidInput))
             .transpose()
     }
