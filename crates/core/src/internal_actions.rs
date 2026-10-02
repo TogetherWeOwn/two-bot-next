@@ -173,10 +173,19 @@ pub enum KeySpecError {
     SecretTooShort(String),
     #[error("TWO_INTERNAL_ACTIONS=1 but no signing keys are configured")]
     NoKeys,
+    /// The ring is a map: a repeated id would silently keep one secret and
+    /// present as intermittent 401s for whichever signer holds the other.
+    #[error("TWO_INTERNAL_KEYS: key id \"{0}\" appears more than once")]
+    DuplicateKeyId(String),
+    /// Two ids sharing one secret are aliases, not separate callers: either id
+    /// verifies a capture signed for the other, and per-key buckets double.
+    #[error("TWO_INTERNAL_KEYS: key ids \"{first}\" and \"{second}\" share one secret")]
+    ReusedSecret { first: String, second: String },
 }
 
 /// Parse a `TWO_INTERNAL_KEYS` spec. Error messages name the key id, never the
-/// secret.
+/// secret. Ids must be unique and no two ids may share a secret (threat model
+/// F3); both compare exactly, after the trim the parser already applies.
 pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
     let mut out = Vec::new();
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -189,6 +198,18 @@ pub fn parse_keys(spec: &str) -> Result<Vec<SigningKey>, KeySpecError> {
         }
         if secret.len() < MIN_KEY_SECRET_LEN {
             return Err(KeySpecError::SecretTooShort(id.to_owned()));
+        }
+        if out.iter().any(|key: &SigningKey| key.id == id) {
+            return Err(KeySpecError::DuplicateKeyId(id.to_owned()));
+        }
+        if let Some(alias) = out
+            .iter()
+            .find(|key| bool::from(key.secret.expose().as_slice().ct_eq(secret.as_bytes())))
+        {
+            return Err(KeySpecError::ReusedSecret {
+                first: alias.id.clone(),
+                second: id.to_owned(),
+            });
         }
         out.push(SigningKey {
             id: id.to_owned(),
@@ -227,6 +248,8 @@ impl std::fmt::Debug for KeyRing {
 }
 
 impl KeyRing {
+    /// Build from [`parse_keys`] output. The ring is a map, so a repeated id
+    /// here keeps only the last secret; `parse_keys` refuses that spec first.
     #[must_use]
     pub fn new(keys: Vec<SigningKey>) -> Self {
         Self {
@@ -1521,7 +1544,8 @@ impl std::fmt::Debug for AuthDecision {
 /// 1. headers present → 2. signature (unknown id and bad signature are one
 ///    refusal) → 3. freshness → 4. replay (nonce burns before the body is
 ///    read, so a replay can never reach Discord) → 5. per-key bucket → 6. body
-///    parses as a JSON object → 7. action allowlisted and enabled, store and
+///    parses as one JSON object with no repeated key at any depth → 7. action
+///    allowlisted and enabled, store and
 ///    settings present where required → 8. `guild.add_member`'s tighter bucket.
 ///
 /// Buckets 5 and 8 run after verification on purpose: rate-limiting an
@@ -1638,10 +1662,19 @@ pub fn authorize(
     })
 }
 
-/// Body parses as JSON and must be an object. The content-type refusal lives
-/// with the route (it needs the headers); JSON shape lives here so the order
-/// — after verify, skew, replay, and the key bucket — is pinned in one place.
-fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
+/// Body parses as JSON, repeats no object key at any depth, and is an object.
+/// The content-type refusal lives with the route (it needs the headers); JSON
+/// shape lives here so the order — after verify, skew, replay, and the key
+/// bucket — is pinned in one place. Executors that re-read the authenticated
+/// bytes call this too, so every reader of one signed body sees one document.
+///
+/// Duplicate keys are refused, not resolved (threat model F3): `serde_json`
+/// and `JSON.parse` keep the last value while other parsers keep the first or
+/// refuse, so a signed body with `"action"` twice could mean one verb to the
+/// website's audit and another here. Keys compare after unescaping, so `"a"`
+/// and `"\u0061"` collide. The refusal is one scalar class that never names
+/// the key: a body may carry an OAuth token.
+pub fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
     if raw.len() > MAX_BODY_BYTES {
         return Err(ActionError::new(
             ErrorCode::Malformed,
@@ -1652,6 +1685,15 @@ fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
     let parsed: Value = serde_json::from_slice(raw).map_err(|_| {
         ActionError::new(ErrorCode::Malformed, "Body is not valid JSON", "bad_json")
     })?;
+    // Second pass over bytes that already parsed: syntax and nesting depth
+    // are proven, so the only refusal left is a repeated key.
+    if serde_json::from_slice::<UniqueKeys>(raw).is_err() {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            "Body repeats a JSON object key",
+            "duplicate_json_key",
+        ));
+    }
     match parsed {
         Value::Object(map) => Ok(map),
         _ => Err(ActionError::new(
@@ -1659,6 +1701,64 @@ fn parse_body_object(raw: &[u8]) -> Result<Map<String, Value>, ActionError> {
             "Body must be a JSON object",
             "body_not_object",
         )),
+    }
+}
+
+/// Walks one JSON value without building it and fails on the first object
+/// that repeats a key. The error text is fixed and never reaches a caller.
+struct UniqueKeys;
+
+impl<'de> serde::Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueKeys)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeys {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self, A::Error> {
+        while seq.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key) {
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            map.next_value::<UniqueKeys>()?;
+        }
+        Ok(self)
     }
 }
 
@@ -1726,7 +1826,7 @@ mod tests {
 
         #[test]
         fn property_valid_key_specs_round_trip_and_enforce_the_minimum(
-            entries in proptest::collection::vec(("[a-z0-9_-]{1,16}", "[a-zA-Z0-9:]{32,80}"), 1..=8),
+            entries in unique_key_entries(),
             length in 0usize..=64,
         ) {
             let wire = entries.iter().map(|(id, secret)| format!(" {id} : {secret} "))
@@ -1739,6 +1839,76 @@ mod tests {
                 let spec = format!("fixture:{}", "a".repeat(n));
                 prop_assert_eq!(parse_keys(&spec).is_ok(), n >= 32);
             }
+        }
+
+        #[test]
+        fn property_duplicate_key_ids_and_reused_secrets_refuse_naming_ids_only(
+            entries in unique_key_entries(),
+            pick in any::<proptest::sample::Index>(),
+            insert_at in any::<proptest::sample::Index>(),
+            fresh in "[a-zA-Z0-9]{32,40}",
+        ) {
+            let (id, secret) = pick.get(&entries).clone();
+            let at = insert_at.index(entries.len() + 1);
+            let refused = |extra: (String, String)| {
+                let mut spec = entries.clone();
+                spec.insert(at, extra);
+                let wire = spec.iter().map(|(id, secret)| format!("{id}:{secret}"))
+                    .collect::<Vec<_>>().join(",");
+                parse_keys(&wire).expect_err("ambiguous spec must refuse")
+            };
+            // Generated ids are lowercase and every generated secret ends in
+            // two digits, so `ALIAS` and a `--`-suffixed secret are new.
+            let fresh = format!("{fresh}--");
+            let alias = "ALIAS".to_owned();
+            // Whichever copy parses second is the one refused.
+            let duplicate = refused((id.clone(), fresh.clone()));
+            prop_assert_eq!(&duplicate, &KeySpecError::DuplicateKeyId(id.clone()));
+            let reused = refused((alias.clone(), secret.clone()));
+            let pick_first = entries.iter().position(|(other, _)| *other == id).unwrap() < at;
+            let (first, second) = if pick_first { (id.clone(), alias) } else { (alias, id.clone()) };
+            prop_assert_eq!(&reused, &KeySpecError::ReusedSecret { first, second });
+            for err in [duplicate, reused] {
+                let text = format!("{err} {err:?}");
+                prop_assert!(!text.contains(&fresh));
+                for (_, secret) in &entries {
+                    prop_assert!(!text.contains(secret.as_str()));
+                }
+            }
+        }
+
+        #[test]
+        fn property_duplicate_json_keys_refuse_at_any_depth(
+            path in proptest::collection::vec(("[a-z]{1,6}", any::<bool>()), 0..6),
+            key in "[a-z]{1,8}",
+            escaped in any::<bool>(),
+            first in any::<i64>(),
+            second in any::<i64>(),
+        ) {
+            // Nest `inner` under each segment: an object member, or the second
+            // element of an array inside one.
+            let wrap = |inner: String| path.iter().rev().fold(inner, |acc, (name, in_array)| {
+                if *in_array {
+                    format!("{{\"{name}\":[null,{acc}]}}")
+                } else {
+                    format!("{{\"{name}\":{acc}}}")
+                }
+            });
+            let alias = if escaped {
+                format!("\\u{:04x}{}", key.as_bytes()[0], &key[1..])
+            } else {
+                key.clone()
+            };
+            let distinct = wrap(format!("{{\"{key}\":{first},\"{key}_\":{second}}}"));
+            let repeated = wrap(format!("{{\"{key}\":{first},\"{alias}\":{second}}}"));
+            let accepted = parse_body_object(distinct.as_bytes()).expect("distinct keys parse");
+            prop_assert_eq!(Value::Object(accepted), serde_json::from_str::<Value>(&distinct).unwrap());
+            // `serde_json` alone accepts the repeat and keeps one value.
+            prop_assert!(serde_json::from_str::<Value>(&repeated).is_ok());
+            let err = parse_body_object(repeated.as_bytes()).expect_err("repeated key refuses");
+            prop_assert_eq!(err.code, ErrorCode::Malformed);
+            prop_assert_eq!(err.log_reason.as_str(), "duplicate_json_key");
+            prop_assert_eq!(err.message.as_str(), "Body repeats a JSON object key");
         }
 
         #[test]
@@ -1764,6 +1934,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 1–8 entries with unique ids and unique secrets: ids come from a set and
+    /// each secret ends in its own two-digit index.
+    fn unique_key_entries() -> impl Strategy<Value = Vec<(String, String)>> {
+        proptest::collection::btree_set("[a-z0-9_-]{1,16}", 1..=8).prop_flat_map(|ids| {
+            let n = ids.len();
+            (
+                Just(ids),
+                proptest::collection::vec("[a-zA-Z0-9:]{30,78}", n),
+            )
+                .prop_map(|(ids, secrets)| {
+                    ids.into_iter()
+                        .zip(secrets)
+                        .enumerate()
+                        .map(|(i, (id, secret))| (id, format!("{secret}{i:02}")))
+                        .collect::<Vec<_>>()
+                })
+        })
     }
 
     use crate::settings::{classify_key, SETTING_CLASSES};
@@ -2016,6 +2205,46 @@ mod tests {
         // The error names the id, never the secret.
         let err = parse_keys("web:short").expect_err("must fail");
         assert!(!format!("{err}").contains("short") || format!("{err}").contains("web"));
+    }
+
+    #[test]
+    fn parse_keys_refuses_duplicate_ids_and_reused_secrets() {
+        let (s1, s2) = (vec1().secret.as_str(), vec2().secret.as_str());
+        let duplicate = KeySpecError::DuplicateKeyId("web".to_owned());
+        assert_eq!(
+            parse_keys(&format!("web:{s1},web:{s2}")),
+            Err(duplicate.clone())
+        );
+        // Repeating the identical entry is still refused: a spec that lists
+        // one caller twice was not written the way the operator thinks.
+        assert_eq!(
+            parse_keys(&format!("web:{s1}, web : {s1} ")),
+            Err(duplicate.clone())
+        );
+        let reused = KeySpecError::ReusedSecret {
+            first: "web".to_owned(),
+            second: "web2".to_owned(),
+        };
+        // Secrets compare after the parser's own trim.
+        assert_eq!(
+            parse_keys(&format!("web:{s1},web2: {s1} ")),
+            Err(reused.clone())
+        );
+        assert_eq!(
+            parse_keys(&format!("other:{s2},web:{s1},web2:{s1}")),
+            Err(reused.clone())
+        );
+        // Ids and secrets compare exactly: case-distinct ids are separate keys.
+        assert_eq!(
+            parse_keys(&format!("web:{s1},WEB:{s2}")).map(|keys| keys.len()),
+            Ok(2)
+        );
+        for err in [duplicate, reused] {
+            for text in [format!("{err}"), format!("{err:?}")] {
+                assert!(text.contains("web"), "{text}");
+                assert!(!text.contains(s1) && !text.contains(s2), "{text}");
+            }
+        }
     }
 
     #[test]
@@ -3136,6 +3365,54 @@ mod tests {
         let err = authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
             .expect_err("rejected JSON still burned its nonce");
         assert_eq!(err.code, ErrorCode::Replayed);
+    }
+
+    #[test]
+    fn pipeline_duplicate_json_keys_refuse_after_burning_the_nonce() {
+        let vector = vec1();
+        let now_ms = 1_720_000_000_000;
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let marker = "synthetic-oauth-body-marker";
+        for raw in [
+            // Which verb runs would depend on which parser reads the body.
+            r#"{"action":"settings.get","action":"role.assign","discord_id":"123456789012345678","role_key":"member"}"#.to_owned(),
+            // An escaped spelling of the same key is the same key.
+            r#"{"action":"role.assign","\u0061ction":"guild.add_member"}"#.to_owned(),
+            // Nested, beside a token that must never be echoed.
+            format!(
+                r#"{{"action":"guild.add_member","access_token":"{marker}","meta":[{{"k":1,"k":2}}]}}"#
+            ),
+        ] {
+            let nonce = test_nonce();
+            let sig = sign(
+                vector.secret.as_bytes(),
+                &vector.timestamp,
+                &nonce,
+                raw.as_bytes(),
+            );
+            let headers = signed_headers("web", &vector.timestamp, &nonce, &sig);
+            let err =
+                authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
+                    .expect_err("repeated key");
+            assert_eq!(err.code, ErrorCode::Malformed);
+            assert_eq!(err.log_reason, "duplicate_json_key");
+            for text in [format!("{err}"), format!("{err:?}")] {
+                assert!(!text.contains(marker), "{text}");
+                assert!(!text.contains("guild.add_member"), "{text}");
+            }
+            let err =
+                authorize_for_test(&headers, raw.as_bytes(), now_ms, &mut nonces, &mut buckets)
+                    .expect_err("refused body still burned its nonce");
+            assert_eq!(err.code, ErrorCode::Replayed);
+        }
+        // The frozen legacy vectors repeat no key and still parse unchanged.
+        for vector in vectors() {
+            assert_eq!(
+                Value::Object(parse_body_object(vector.body.as_bytes()).expect("vector body")),
+                serde_json::from_str::<Value>(&vector.body).unwrap()
+            );
+        }
     }
 
     #[test]

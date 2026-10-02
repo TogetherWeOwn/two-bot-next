@@ -13,7 +13,7 @@ use two_bot_core::internal_action_store::{
     AuditSubject, DiscordId, InternalActionStore, InternalClaim, InternalStoreError,
     RequestIdentity, TerminalFailure, TerminalResponse,
 };
-use two_bot_core::internal_actions::require_field_str;
+use two_bot_core::internal_actions::{parse_body_object, require_field_str};
 
 pub struct MemberActionConfig<'a> {
     pub guild_id: &'a str,
@@ -43,14 +43,6 @@ fn pending() -> ActionError {
         "idempotency_in_flight",
     )
 }
-fn malformed() -> ActionError {
-    ActionError::new(
-        ErrorCode::Malformed,
-        "Body must be a JSON object",
-        "body_not_object",
-    )
-}
-
 fn replay(action: &str, response: TerminalResponse) -> Result<MemberExecution, ActionError> {
     let outcome = match response {
         TerminalResponse::Success {
@@ -110,11 +102,9 @@ impl ActionExecutor {
         authenticated_payload: &[u8],
         config: &MemberActionConfig<'_>,
     ) -> Result<MemberExecution, ActionError> {
-        let value: serde_json::Value =
-            serde_json::from_slice(authenticated_payload).map_err(|_| {
-                ActionError::new(ErrorCode::Malformed, "Body is not valid JSON", "bad_json")
-            })?;
-        let body = value.as_object().ok_or_else(malformed)?;
+        // The same parser `authorize` used: one document per signed body, and
+        // a repeated key at any depth refuses before any store or REST call.
+        let body = &parse_body_object(authenticated_payload)?;
         let action = require_field_str(body, "action")?;
         let (user, role_request, member_request) = match action {
             "role.assign" => {
