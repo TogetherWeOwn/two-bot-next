@@ -162,6 +162,22 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      # Fail-fast (TOG-12055): cheap lint/format/guard checks run before the
+      # ~4 GiB cargo cache restore, so a failure skips the big download. The
+      # Docker layer check is split: the offline shape check fails fast here;
+      # the real locked `cargo fetch` stays after the restore (below) so it
+      # reuses the warm registry cache instead of fetching cold.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Prevent raw secrets under derived Debug
+        run: |
+          python3 scripts/check-secret-debug.py --test
+          python3 scripts/check-secret-debug.py
+
+      - name: Verify Docker dependency layer (offline)
+        run: python3 scripts/test-docker-deps.py
+
       # TOG-11810: dependency build cache. The raw ~4 GiB target/ upload
       # blew the 30-minute PR timeout (#147); rust-cache stores ~/.cargo and
       # the dependency builds in target/, stripping workspace crates, so
@@ -175,19 +191,18 @@ jobs:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
 
-      - name: Verify Docker dependency layer
+      # Real locked fetch: needs the warm registry cache restored above, so it
+      # stays here. The offline layer-shape check already ran before the
+      # restore (TOG-12055), so a drifted Dockerfile fails before any download.
+      - name: Verify Docker dependency layer (locked fetch)
         run: python3 scripts/test-docker-deps.py --cargo
 
-      - name: Prevent raw secrets under derived Debug
-        run: |
-          python3 scripts/check-secret-debug.py --test
-          python3 scripts/check-secret-debug.py
-
+      # TOG-12134: cheap static guard, adopted from main. The fmt and
+      # secret-Debug checks already ran before the restore (TOG-12055), so
+      # main's post-restore duplicates of them are dropped here — no coverage
+      # change, same steps run once and earlier.
       - name: Verify check job disk hygiene
         run: python3 scripts/test-check-disk-hygiene.py
-
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
 
       # Compile optional stores and run their safety and scratch-DB tests too.
       # Onboarding/sticky live tests remain explicitly ignored by default.
