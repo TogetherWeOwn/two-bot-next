@@ -200,20 +200,21 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
     };
     let mock = MockRest::start(
         vec![
+            // Deferred edits require ID-bearing 200 receipts (executor mutation_receipt_id).
             ScriptedResponse::status(204),
             event(1),
-            ScriptedResponse::status(200),
+            ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
             event(2),
-            ScriptedResponse::status(200),
+            ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
             event(3),
-            ScriptedResponse::status(200),
+            ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
             event(1),
-            ScriptedResponse::status(200),
+            ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
-            ScriptedResponse::status(200),
+            ScriptedResponse::json(200, json!({"id": "99"})),
         ],
         ScriptedResponse::status(500),
     )
@@ -329,7 +330,8 @@ async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
             vec![
                 ScriptedResponse::status(204),
                 lookup,
-                ScriptedResponse::status(200),
+                // Refusal text is still delivered as a deferred edit: ID receipt required.
+                ScriptedResponse::json(200, json!({"id": "99"})),
             ],
             ScriptedResponse::status(500),
         )
@@ -366,7 +368,10 @@ async fn totals_remain_readable_without_live_event_access() {
         ScriptedResponse::status(403),
     ] {
         let mock = MockRest::start(
-            vec![ScriptedResponse::status(204), ScriptedResponse::status(200)],
+            vec![
+                ScriptedResponse::status(204),
+                ScriptedResponse::json(200, json!({"id": "99"})),
+            ],
             unavailable,
         )
         .await;
@@ -455,7 +460,21 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
     let Some((pool, schema)) = pool().await else {
         return;
     };
-    let mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
+    // Four check-ins, each a 204 callback plus an ID-bearing 200 deferred edit.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(204),
+    )
+    .await;
     let occ = "weekly:2026-09-30";
     run(
         &pool,
@@ -522,7 +541,19 @@ async fn malformed_inputs_and_failed_ack_do_not_write() {
     let Some((pool, schema)) = pool().await else {
         return;
     };
-    let mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
+    // Three malformed inputs, each a 204 callback plus an ID-bearing 200 error edit.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(204),
+    )
+    .await;
     run(&pool, &mock, &rsvp(500, "bogus")).await;
     run(&pool, &mock, &attendance(501, MANAGE_EVENTS, USER, "  ")).await;
     assert_reply(&mock, "event occurrence must not be empty.", true);
@@ -567,7 +598,8 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
             ScriptedResponse::status(204),
             ScriptedResponse::status(500),
             ScriptedResponse::status(204),
-            ScriptedResponse::status(200),
+            // Intended successful duplicate check-in edit: ID receipt required.
+            ScriptedResponse::json(200, json!({"id": "99"})),
         ],
         ScriptedResponse::status(500),
     )
@@ -606,7 +638,9 @@ async fn shared_runtime_publishes_complete_registry_once() {
     let Some((pool, schema)) = pool().await else {
         return;
     };
-    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!([]))).await;
+    // Bare 200 triggers the mock's guild-command PUT echo self-heal, returning the
+    // complete submitted command list as the registry receipt.
+    let mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
     runtime(&pool, &mock).publish(1111).await.unwrap();
     let requests = mock.requests();
     assert_eq!(requests.len(), 1);

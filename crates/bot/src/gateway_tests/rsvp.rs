@@ -177,9 +177,10 @@ async fn queued_commands(
                 Duration::from_millis(3200)
             }),
             ScriptedResponse::status(204),
-            ScriptedResponse::status(200),
+            // Deferred original edits require ID-bearing 200 receipts.
+            ScriptedResponse::json(200, json!({"id": "99"})),
             event,
-            ScriptedResponse::status(200),
+            ScriptedResponse::json(200, json!({"id": "99"})),
         ],
         ScriptedResponse::status(500),
     )
@@ -384,7 +385,9 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
             ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}))
                 .delayed(Duration::from_millis(3200)),
         ],
-        ScriptedResponse::status(200),
+        // Catch-all must satisfy receipt validation for both 200 callbacks and
+        // successful deferred-original edits.
+        ScriptedResponse::json(200, json!({"id": "99"})),
     )
     .await;
     let (runner, mut ws) = connect(&db, &rest).await;
