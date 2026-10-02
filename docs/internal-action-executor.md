@@ -12,8 +12,15 @@ HMAC provisioning HOLD. Future receiver work owns those steps.
 core phase-1 defaults. The receiver must intersect its enabled/authorized actions
 with this capability; the core's 19-verb catalogue is not executor parity.
 
-Construct with the application's `Arc<twilight_http::Client>` and configured
-channel-key map. The application's rustls provider must already be installed.
+Pass the body `authorize` returned (or `parse_body_object` output); never
+re-parse the signed bytes with a lenient parser. That parser refuses a JSON
+object key repeated at any depth, so the executor and any later reader see the
+one value the MAC covered. `execute_stored_member` applies it to its raw bytes
+before any claim or REST call (threat model F3).
+
+Construct with the application's `Arc<twilight_http::Client>`, configured
+channel-key map and the bot token's one `CooldownGovernor`. The application's
+rustls provider must already be installed.
 The map is held privately, starts empty if unconfigured, and is the only source
 of target channels. A request cannot override it using a raw channel ID.
 
@@ -39,18 +46,27 @@ application status retries or redirects. The production origin is fixed to
 `https://discord.com`; only module-local test code overrides it with loopback.
 The raw transport sends the required `DiscordBot (URL, version)` User-Agent.
 
-The adapter does not share Twilight's limiter or install a governor. In addition
-to per-caller/action admission throttling, the receiver **must** feed every
-`RateLimited(RateLimitCooldown)` into one shared governor for this bot token,
-covering all callers/guild workers and any other Discord transports. Install the
-cooldown before admitting a subsequent independent intent. `Global` pauses all
-sends with that token; `Channel(id)` conservatively pauses all buckets using that
+The adapter does not share Twilight's limiter. It feeds every
+`RateLimited(RateLimitCooldown)` into the `CooldownGovernor` passed at
+construction before returning, and consults that governor before every send
+(`crates/discord/src/internal_actions/governor.rs`). Build one governor per bot
+token and hand clones to every executor, guild worker and other Discord
+transport using that token; executor clones share it. `Global` holds every send
+with that token; `Channel(id)` conservatively holds all buckets using that
 channel major resource (this executor implements just the create-message route,
-so no raw provider bucket ID is needed or exposed). Start the returned
-`retry_after_ms` wait when consuming the outcome. Do not reset/shorten an existing
-longer cooldown. If timing is `None`, pause the scope until independent
-reconciliation; never invent a short default delay. This is a typed caller
-obligation, not a claim that shared runtime rate limiting is already wired.
+so no raw provider bucket ID is needed or exposed). A hold starts when the
+outcome is recorded and only ever lengthens: a shorter later cooldown never
+resets it. If timing is `None`, the scope stays held until independent
+reconciliation calls `reconcile(scope)`; there is no invented short default.
+
+While a matching hold is active the executor returns `NoEffect(CoolingDown)`
+without HTTP. It refuses; it never queues, sleeps or retries, so repeated 429s
+cannot keep an operation alive. The governor is in memory and per process, so a
+restart forgets holds. It keeps at most `MAX_CHANNEL_HOLDS` (1,024) channel
+holds: expired holds are reclaimed first, and past the ceiling a further channel
+cooldown widens to the token-wide hold instead of evicting a live one. Intents
+already in flight when a 429 lands are not recalled; this is admission control,
+not pacing. Per-caller/action admission throttling stays with the receiver.
 
 Timing uses the longer valid `Retry-After` header/body `retry_after`, in seconds
 rounded up to milliseconds, without shortening long waits. Global header/body
@@ -75,7 +91,8 @@ request values, token headers and provider error sources are dropped.
 | `NoEffect(ActionNotAllowed)` | Unknown verb/key, no request sent | Terminal `ActionNotAllowed` |
 | `NoEffect(InvalidChannelConfiguration / LocalConfiguration)` | Invalid mapping/header or missing client authentication, no request sent | Terminal `NoEffect`; repair configuration separately |
 | `NoEffect(DiscordRejected)` | Discord rejected with 400/401/403/404/405/413/415/422 | Terminal `DiscordRejected`; no automatic resend |
-| `RateLimited(cooldown)` | Discord rejected with 429; timing/scope retained safely | Apply shared token/channel governor cooldown, then persist terminal `DiscordRejected`; never resend this key |
+| `NoEffect(CoolingDown)` | The shared governor holds this channel or the token, no request sent | Terminal `NoEffect`; no automatic resend |
+| `RateLimited(cooldown)` | Discord rejected with 429; timing/scope retained safely | The executor already recorded the cooldown in its governor; persist terminal `DiscordRejected`; never resend this key |
 | `Unknown(reason)` | Timeout, transport failure, redirect/408/5xx/unrecognized status, malformed/truncated/oversized success or wrong channel | `mark_unknown`; retain claim, require independent reconciliation |
 
 The receiver must authorize, burn the nonce, check capability, and commit its

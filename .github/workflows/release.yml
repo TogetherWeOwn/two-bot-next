@@ -9,10 +9,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
+permissions: {}
 
 concurrency:
   group: release
@@ -21,14 +18,20 @@ concurrency:
 jobs:
   release-please:
     name: release-please
+    permissions:
+      contents: write # Publish releases and reconcile the release/notes branches.
+      pull-requests: write # Create and reconcile the release PR.
     if: github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'release-please') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
     outputs:
       pr_available: ${{ steps.select.outputs.pr_available }}
       pr: ${{ steps.select.outputs.pr }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Inspect existing release PR
         id: plan
         env:
@@ -57,6 +60,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.select.outputs.pr_available == 'true'
         with:
+          persist-credentials: false
           ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
       # Env expressions are evaluated even on a skipped step. Selection emits
       # valid {} JSON when publication leaves no open PR; the guard stays false.
@@ -100,7 +104,12 @@ jobs:
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add CHANGELOG.md
             git commit -m 'chore(release): preserve bootstrap release notes' -m 'Co-Authored-By: Paperclip <noreply@paperclip.ing>'
-            git push origin HEAD
+            # Authenticate only this push via GH_TOKEN; write no credential config.
+            GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
+              GIT_CONFIG_KEY_1=credential.https://github.com.helper \
+              GIT_CONFIG_VALUE_1='!gh auth git-credential' \
+              git push origin HEAD
           fi
           # Body reconciliation is independent of the file diff: a retry after
           # a successful push but failed PATCH must still repair Release notes.
@@ -150,9 +159,12 @@ jobs:
 
   dispatch-checks:
     name: dispatch-checks
+    permissions:
+      actions: write # Dispatch required checks for GITHUB_TOKEN-created release PRs.
     needs: release-please
     if: needs.release-please.outputs.pr_available == 'true'
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'dispatch-checks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     steps:
       - env:
@@ -169,5 +181,6 @@ jobs:
           ")
           echo "Release PR #$PR_NUMBER on branch $HEAD_BRANCH; dispatching required checks."
           gh workflow run check.yml --ref "$HEAD_BRANCH"
-          gh workflow run secret-scan.yml --ref "$HEAD_BRANCH"
-          gh workflow run pr-lint.yml --ref "$HEAD_BRANCH" -f pr_number="$PR_NUMBER"
+          # TOG-11810: pr-lint and gitleaks are folded into supply-chain.yml,
+          # whose dispatch form keeps the pr_number input for the lint job.
+          gh workflow run supply-chain.yml --ref "$HEAD_BRANCH" -f pr_number="$PR_NUMBER"

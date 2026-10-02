@@ -47,6 +47,18 @@ export const RULES: readonly RuleDef[] = [
   { id: "db_pool_saturated", summary: `database pool exhausted for ${POOL_SATURATED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-db-pool" },
 ];
 
+/**
+ * Public docs base for fired-packet runbook deep links. The packet carries the
+ * full URL (not the relative `docs/...` path) so the soak operator can jump
+ * straight from the webhook message to the matching runbook section.
+ */
+export const RUNBOOK_BASE_URL = "https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/";
+
+/** Full deep link for a rule's runbook anchor. */
+export function runbookUrl(rule: RuleDef): string {
+  return `${RUNBOOK_BASE_URL}${rule.runbook}`;
+}
+
 export interface MetricsAlertState {
   /** Rule ids (with subject) currently firing, e.g. `job_stale:rank`. */
   firing: string[];
@@ -122,12 +134,28 @@ export function ruleFor(key: string): RuleDef | undefined {
   return RULES.find((r) => r.id === id);
 }
 
+/**
+ * Fired-packet filename carrying the producer identity (TOG-12100):
+ * `evidence-{ruleId}-{window}.json`. The rule id is the single shared
+ * spelling also pinned in Rust (`ALERT_RULE_IDS` in
+ * `crates/core/src/evidence.rs`) and documented in `docs/metrics.md`, so the
+ * QA evidence table can attribute packets when several rules fire in one soak
+ * window. Returns `undefined` for unknown keys rather than a misleading name.
+ */
+export function packetFilename(key: string, window: string): string | undefined {
+  const rule = ruleFor(key);
+  if (!rule) return undefined;
+  const safe = (part: string) => part.replace(/[^A-Za-z0-9._-]/g, "-");
+  return `evidence-${safe(rule.id)}-${safe(window)}.json`;
+}
+
 /** Alert-message lines for transitions; no mentions, no secrets. */
 export function transitionMessages(before: string[], after: string[]): string[] {
   const out: string[] = [];
   for (const key of after.filter((k) => !before.includes(k))) {
     const rule = ruleFor(key);
-    out.push(`two-bot-next ALERT ${key}: ${rule?.summary ?? key}. Runbook: docs/${rule?.runbook ?? "runbook.md"}`);
+    const runbook = rule ? runbookUrl(rule) : `${RUNBOOK_BASE_URL}runbook.md`;
+    out.push(`two-bot-next ALERT ${key}: ${rule?.summary ?? key}. Runbook: ${runbook}`);
   }
   for (const key of before.filter((k) => !after.includes(k))) {
     out.push(`two-bot-next RESOLVED ${key}.`);
