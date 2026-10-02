@@ -20,7 +20,9 @@ apply.
 Until the Environment exists with reviewers and a main-only branch policy, the
 `sha guard` job refuses every dispatch. A job that names a missing Environment
 makes GitHub create it with no protection, so the guard checks before the
-deploy job can run.
+deploy job can run. This repository is private. GitHub offers required
+reviewers on private repositories only on the Enterprise plan; on Free, Pro
+and Team plans, the guard keeps refusing.
 
 **Deploy.** Dispatch with `sha` set to a full 40-character commit that is on
 `main`. That commit needs green `check` and `worker check` runs (from GitHub
