@@ -192,6 +192,13 @@ impl VoiceChains {
     }
 }
 
+/// Eligibility decisions supplied by the upstream message acceptance path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MessageEligibility {
+    pub is_staff_automation: bool,
+    pub capture_only: bool,
+}
+
 /// The S3 gateway pipeline. `S`/`L`/`F` are the core seams; `I` serves invite
 /// counters; `C` classifies channels. Share via `Arc` between the shard
 /// runner and the HTTP layer (snapshot reads, health).
@@ -386,7 +393,18 @@ impl<
     /// Drive a received event after queueing without changing its occurrence
     /// time. Payload timestamps win; timestamp-less transitions use receipt time.
     pub fn handle_at(&self, event: &Event, observed_at: &str) {
-        self.handle_at_with_message_disposition(event, observed_at, FunnelDisposition::Accept);
+        self.handle_at_with_eligibility(event, observed_at, MessageEligibility::default());
+    }
+
+    /// The ordered async bridge supplies one processing instant for both halves
+    /// of a voice move and carries the existing automod/staff eligibility gates.
+    pub fn handle_at_with_eligibility(
+        &self,
+        event: &Event,
+        observed_at: &str,
+        eligibility: MessageEligibility,
+    ) {
+        self.handle_inner(event, observed_at, eligibility, true);
     }
 
     /// Combine the replay clock with the automod decision without handling twice.
@@ -395,6 +413,26 @@ impl<
         event: &Event,
         observed_at: &str,
         disposition: FunnelDisposition,
+    ) {
+        self.handle_inner(
+            event,
+            observed_at,
+            MessageEligibility {
+                is_staff_automation: false,
+                capture_only: disposition == FunnelDisposition::CaptureOnly,
+            },
+            disposition != FunnelDisposition::None,
+        );
+    }
+
+    /// Shared funnel core. `deliver` is false only for the automod `None`
+    /// disposition: cache handling still runs, message handlers are skipped.
+    fn handle_inner(
+        &self,
+        event: &Event,
+        observed_at: &str,
+        eligibility: MessageEligibility,
+        deliver: bool,
     ) {
         match event {
             // Fresh session after (re-)identify: first connect starts empty
@@ -517,14 +555,14 @@ impl<
                     is_bot: msg.author.bot,
                     message_id: Some(msg.id.get().to_string()),
                     webhook_id: msg.webhook_id.map(|w| w.get()),
-                    is_staff_automation: false,
+                    is_staff_automation: eligibility.is_staff_automation,
                     channel_id,
                     channel_class: self.classifier.classify(channel_id),
-                    capture_only: disposition == FunnelDisposition::CaptureOnly,
+                    capture_only: eligibility.capture_only,
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
                 };
                 self.cache.update(event);
-                if disposition != FunnelDisposition::None {
+                if deliver {
                     self.handlers.on_message(input);
                 }
             }

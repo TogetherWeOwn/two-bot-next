@@ -89,6 +89,7 @@ pub mod settings;
 pub mod sticky;
 pub mod tickets;
 pub mod voice;
+pub mod voice_alias;
 pub mod voice_assistant_cap;
 pub mod voice_config;
 pub mod voice_config_diff;
@@ -99,6 +100,7 @@ pub mod voice_permissions;
 pub mod voice_placement;
 pub mod voice_private;
 pub mod voice_room_controls;
+pub mod voice_template_lint;
 pub mod voice_text_channel;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]

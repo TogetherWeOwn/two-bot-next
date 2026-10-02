@@ -60,7 +60,7 @@ async fn spawn_with_shutdown(
         crate::gateway::build_shard(TOKEN.into(), Intents::empty(), saved.as_ref(), Some(url));
     tokio::spawn(run_shard(
         shard,
-        Arc::new(build_pipeline(db.store.milestones().await.unwrap())),
+        Arc::new(build_pipeline(db.store.milestones().await.unwrap(), None)),
         Arc::new(RwLock::new(GatewayState::Armed)),
         db.store.clone(),
         Some(runtime(db, rest)),
