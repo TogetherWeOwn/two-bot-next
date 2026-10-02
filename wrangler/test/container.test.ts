@@ -199,6 +199,36 @@ for (const path of ["/health", "/readyz"]) {
         !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
     });
 
+    // SDK 0.3.7 containerFetch maps these start errors to text 429 (raw
+    // e.message) and text 503 instead of rejecting or returning 500.
+    for (const [sdkStatus, message] of [
+      [429, "You are requesting too many containers per second"],
+      [503, "There is no container instance that can be provided to this Durable Object"],
+    ] as const) {
+      test(`SDK start ${sdkStatus} returns sanitized outer ${path} 500 with ${provenance}`, async (t) => {
+        const h = await harness(t);
+        t.mock.method(h.runtime, "start", () => {
+          throw new Error(`${message} ${WORKER_ENV.DISCORD_TOKEN} ${WORKER_ENV.DATABASE_URL}`);
+        });
+        const sdkResponse = await h.bot.containerFetch(new Request(`https://worker.invalid${path}`));
+        assert.equal(sdkResponse.status, sdkStatus, "fixture must reach the SDK's synthetic branch");
+        assert.notEqual(sdkResponse.headers.get("content-type")?.split(";")[0], "application/json");
+        await sdkResponse.arrayBuffer();
+        const response = await worker.fetch(new Request(`https://worker.invalid${path}`), {
+          CF_VERSION_METADATA: metadata,
+          TWO_BOT: { getByName: () => h.bot },
+        } as unknown as Env, {} as ExecutionContext);
+        assert.equal(response.status, 500);
+        assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
+        const body = await response.text();
+        assert.deepEqual(JSON.parse(body), { ready: false, error_class: "container_unavailable" });
+        for (const secret of [WORKER_ENV.DISCORD_TOKEN, WORKER_ENV.DATABASE_URL]) {
+          assert.ok(!body.includes(secret));
+          assert.ok(h.logs.every((line) => !line.includes(secret)));
+        }
+      });
+    }
+
     for (const failure of ["lookup", "fetch"]) {
       test(`Worker DO ${failure} rejection returns sanitized ${path} 500 with ${provenance}`, async (t) => {
         const h = await harness(t);
@@ -214,6 +244,41 @@ for (const path of ["/health", "/readyz"]) {
       });
     }
   }
+}
+
+// Only 200 and JSON 503 are the bot's own probe answers; anything else that
+// reaches the container port is replaced, whatever its status or media type.
+for (const [status, contentType, forwarded] of [
+  [503, "application/json; charset=utf-8", true],
+  [503, "text/plain", false],
+  [503, null, false],
+  [429, "application/json", false],
+  [404, "application/json", false],
+  [500, "application/json", false],
+] as const) {
+  test(`container /readyz ${status} ${contentType ?? "without content-type"} is ${forwarded ? "forwarded" : "sanitized"}`, async (t) => {
+    const h = await harness(t);
+    h.setProbeStatus(status);
+    const leak = `container body ${WORKER_ENV.DATABASE_URL}`;
+    h.setProbeResponse((s) => {
+      if (s === 200) return Response.json({ status: "ok" });
+      const response = new Response(forwarded ? JSON.stringify({ ready: false }) : leak, { status: s });
+      if (contentType) response.headers.set("content-type", contentType);
+      else response.headers.delete("content-type");
+      return response;
+    });
+    const response = await h.bot.fetch(new Request("https://worker.invalid/readyz"));
+    const body = await response.text();
+    if (forwarded) {
+      assert.equal(response.status, status);
+      assert.deepEqual(JSON.parse(body), { ready: false });
+    } else {
+      assert.equal(response.status, 500);
+      assert.deepEqual(JSON.parse(body), { ready: false, error_class: "container_unavailable" });
+      assert.ok(!body.includes(WORKER_ENV.DATABASE_URL));
+    }
+    assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DATABASE_URL)));
+  });
 }
 
 test("lifecycle error replaces arbitrary exception without inspecting it", async (t) => {

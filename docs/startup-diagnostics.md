@@ -40,10 +40,13 @@ The Worker returns JSON HTTP 500 on a Container/DO fetch failure:
 ```
 
 The installed Container SDK 0.3.7 can either reject a fetch **or return a
-text/plain 500 containing the startup exception**. Both paths are sanitized.
-Healthy container responses and parked readiness 503 remain unchanged. The
-application lifecycle hook logs/throws only `container_lifecycle_failed`, without
-an exception-derived message or cause.
+synthetic text response built from the startup exception**: 500, 429 carrying the
+raw exception message, or 503 when no instance is available. The DO therefore
+forwards only the bot's own probe answers, HTTP 200 or a parked readiness 503
+with `application/json` content type. Every other status or media type, whether
+from the SDK or from the container port, is drained and replaced with the JSON
+500 above. The application lifecycle hook logs/throws only
+`container_lifecycle_failed`, without an exception-derived message or cause.
 
 Rust stderr is **not** a structured SDK diagnostic channel. The Worker therefore
 cannot distinguish `database_connect_failed` from another container startup or
@@ -60,7 +63,9 @@ outside the application's hook are not claimed to be controlled by this wrapper.
 - The startup binary test rejects an unknown synthetic URL option before connecting,
   requires exit 1 and fixed diagnostic classes, and checks secret sentinels.
 - Worker tests execute the installed SDK against in-memory storage/TCP doubles;
-  native startup throws are converted by the SDK to 500 and sanitized by the DO.
+  native startup throws are converted by the SDK to 500, 429 or text 503 and
+  sanitized by the DO. Container-port responses other than 200 or JSON 503 are
+  also sanitized, while a JSON 503 (with or without a charset) is forwarded.
   A separate Worker/DO rejection test covers the outer RPC boundary.
 
 These tests are not a live Rust → Cloudflare crash reproduction, a deployment,

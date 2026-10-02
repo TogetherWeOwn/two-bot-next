@@ -91,6 +91,16 @@ function containerUnavailable(): Response {
   return Response.json({ ready: false, error_class: "container_unavailable" }, { status: 500 });
 }
 
+// Allowlist, not denylist: only the bot's own answers may reach the public
+// probe, i.e. 200 or its parked readiness as JSON 503. SDK 0.3.7 synthesizes
+// text 429 (raw e.message), 500 and 503 bodies from startup failures.
+// Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
+function isBotProbeResponse(response: Response): boolean {
+  if (response.status === 200) return true;
+  const mediaType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+  return response.status === 503 && mediaType === "application/json";
+}
+
 function containerPort(raw: string | undefined): number {
   if (raw === undefined) return 8080;
   const port = Number(raw);
@@ -128,9 +138,9 @@ export class TwoBotContainer extends Container<Env> {
       await this.armKeepalive();
       try {
         const response = await this.containerFetch(request);
-        // SDK 0.3.7 also returns startup exceptions as text/plain 500 rather
-        // than rejecting. Drop that body without exposing its error message.
-        if (response.status >= 500 && response.status !== 503) {
+        // SDK startup failures arrive as responses rather than rejections.
+        // Drop any other body without exposing its error message.
+        if (!isBotProbeResponse(response)) {
           await response.arrayBuffer();
           return containerUnavailable();
         }
