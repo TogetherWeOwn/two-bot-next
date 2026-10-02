@@ -98,16 +98,19 @@ are not modeled. Member/channel cache population is asserted, not inferred.
 
 Baseline: `docs/pipeline-benchmark-baseline.json`, summarized in
 [`b1-baseline.md`](b1-baseline.md). Comparator defaults to **25%** tolerance for
-peak RSS, handler p50/p99 and logical DB exchanges/event, plus an independent
+peak RSS, handler p50 and logical DB exchanges/event, plus an independent
 strict **<200 MiB** RSS target (256 MiB lite ceiling cannot be overridden).
+Handler p99 is **advisory**: it is printed as `ADVISORY` when beyond tolerance
+but never fails the comparison, because it swings 6-232 ms on the shared runner
+pool (CTO decision TOG-11786).
 It fails closed on unavailable/nonfinite/negative metrics, reversed percentiles,
-invalid limits, mismatched workloads and any regression beyond tolerance.
+invalid limits, mismatched workloads and any gated regression beyond tolerance.
 Exit codes: 0 PASS, 1 NEEDS WORK, 2 invalid measurement/input.
 
 Offline comparator tests:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test*pipeline_bench*.py' -v
 ```
 
 Driver fixture/percentile/bounds tests and database guard tests run in CI job containers:
