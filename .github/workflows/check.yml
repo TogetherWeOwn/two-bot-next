@@ -404,6 +404,11 @@ jobs:
             grep -F "exceeds size budget" "$log"
             printf 'PASS: deliberate %s budget violation rejected\n' "$budget"
           done
+      # Per-run tags (SMOKE_TAG) would otherwise accumulate ~100 MiB images
+      # on the shared Docker host; always remove our own tag when done.
+      - name: Remove per-run smoke image
+        if: always() && needs.container-inputs.outputs.build == 'true'
+        run: docker rmi --force "$SMOKE_TAG" || true
 
   community-db:
     name: community db
