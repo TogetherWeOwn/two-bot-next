@@ -102,11 +102,13 @@ jobs:
           exit 1
 
       - name: Selection note (dependency-aware skip)
+        env:
+          SEL_RUST: ${{ needs.job-inputs.outputs.rust }}
+          SEL_WORKER: ${{ needs.job-inputs.outputs.worker }}
+          SEL_PARITY: ${{ needs.job-inputs.outputs.parity }}
         run: |
           printf 'job-inputs: rust=%s worker=%s parity=%s\n' \
-            "${{ needs.job-inputs.outputs.rust }}" \
-            "${{ needs.job-inputs.outputs.worker }}" \
-            "${{ needs.job-inputs.outputs.parity }}"
+            "$SEL_RUST" "$SEL_WORKER" "$SEL_PARITY"
 
       - name: require parity docs to pass
         if: needs.parity-docs.result != 'success' && needs.job-inputs.outputs.parity != 'false'
