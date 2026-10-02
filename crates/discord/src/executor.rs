@@ -2003,11 +2003,13 @@ impl ActionExecutor {
                 .with_localizations(true),
         )?;
         for attempt in 0..MAX_HTTP_TRIES {
-            self.pace(false).await;
-            let res = tokio::time::timeout(self.inner.moderation_timeout, self.send(&req))
-                .await
-                .map_err(|_| DiscordError::Timeout)?
-                .map_err(DiscordError::Unavailable)?;
+            // Paced non-kick lane with the same bounded wire budget as the
+            // publish sibling; 429 parks and 5xx back off within MAX_HTTP_TRIES.
+            self.admit(&req, Some(false)).await?;
+            let (res, _) =
+                tokio::time::timeout(self.inner.moderation_timeout, self.send_admitted(&req))
+                    .await
+                    .map_err(|_| DiscordError::Timeout)??;
             match res.status {
                 200..=299 => {
                     return crate::command_registry::decode_guild_commands(&res.body).map_err(
