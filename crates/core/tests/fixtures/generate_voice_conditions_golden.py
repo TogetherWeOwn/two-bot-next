@@ -10,9 +10,9 @@ named in the Rust test's allowlist, which checks both.
 Row basis:
   spec   - determinate from docs/voice-rooms.md V6 alone.
   choice - pins a choice TOG-12189 documents in docs/voice-conditions-core.md
-           (line cited) where V6 alone does not decide the outcome, including
-           the shared corpus's ambiguities (condition-grammar, numeric-##,
-           numeric-+#).
+           (line cited) where V6 alone does not decide the outcome; rows that
+           settle a shared-corpus ambiguity (condition-grammar, numeric-##,
+           numeric-+#) also name its tests/voice_templates/coverage.json ID.
 shared_case marks rows transcribed from the shared corpus; the Rust
 structural test cross-checks input/expected against it.
 """
@@ -31,7 +31,11 @@ assert mine == SPEC_SHA, 'spec moved; update rows consciously'
 SPEC_V6 = 'docs/voice-rooms.md §V6'
 CORE = ('TOG-12189 docs/voice-conditions-core.md '
         '(feat/voice-conditions-core)')
-CHOICE = CORE + '; shared-corpus ambiguity '
+AMBIGUITY = '; tests/voice_templates/coverage.json ambiguity '
+CORE_KEYWORDS = (CORE + ' L40-55 keyword table: the fact each head reads'
+                 + AMBIGUITY + 'condition-grammar')
+CORE_NUMERIC = (CORE + ' L23-26 untyped conditions are false; L34 ##, +# '
+                'and name tokens are not numeric' + AMBIGUITY)
 CORE_SPLIT = CORE + ' L10-11 split at first top-level ?? then first //'
 CORE_LITERAL = CORE + ' L13 a node without ?? stays literal'
 CORE_CASE = (CORE + ' L21 keywords, counters and calendar names match '
@@ -105,7 +109,7 @@ CASES = [
      ['condition:OWNER:id'], 'spec', SPEC_V6,
      'person-condition-OWNER:absent'),
     ('v6b-owner-bare-present', '{{OWNER ??yes//no}}', 'solo', 'yes',
-     ['condition:OWNER'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:OWNER'], 'choice', CORE_KEYWORDS, None),
     # ---- perms: room state (spec: FULL requires a limit; PRIVATE never standalone) ----
     ('v6b-full-at-limit', '{{FULL ??full//open}}', 'full-full', 'full',
      ['condition:FULL'], 'spec', SPEC_V6, 'full-full'),
@@ -125,50 +129,50 @@ CASES = [
     ('v6b-private-standalone-never', '{{PRIVATE ??private//public}}',
      'private-standalone-True', 'public', ['condition:PRIVATE'], 'spec',
      SPEC_V6, 'private-standalone-True'),
-    # ---- activity / streaming (choice: spec records condition-grammar) ----
+    # ---- activity / streaming (choice: TOG-12189 keyword table) ----
     ('v6b-playing-idle', '{{PLAYING ??yes//no}}', 'live-offline', 'no',
-     ['condition:PLAYING'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:PLAYING'], 'choice', CORE_KEYWORDS, None),
     ('v6b-playing-active', '{{PLAYING ??yes//no}}', 'game-apex', 'yes',
-     ['condition:PLAYING'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:PLAYING'], 'choice', CORE_KEYWORDS, None),
     ('v6b-live-offline', '{{LIVE ??yes//no}}', 'live-offline', 'no',
-     ['condition:LIVE'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:LIVE'], 'choice', CORE_KEYWORDS, None),
     ('v6b-live-discord', '{{LIVE ??yes//no}}', 'live-discord', 'yes',
-     ['condition:LIVE'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:LIVE'], 'choice', CORE_KEYWORDS, None),
     ('v6b-live-external', '{{LIVE ??yes//no}}', 'live-external', 'yes',
-     ['condition:LIVE'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:LIVE'], 'choice', CORE_KEYWORDS, None),
     ('v6b-live-discord-miss-external',
      '{{LIVE_DISCORD ??yes//no}}', 'live-external', 'no',
-     ['condition:LIVE_DISCORD'], 'choice', CHOICE + 'condition-grammar',
+     ['condition:LIVE_DISCORD'], 'choice', CORE_KEYWORDS,
      None),
     ('v6b-live-external-miss-discord',
      '{{LIVE_EXTERNAL ??yes//no}}', 'live-discord', 'no',
-     ['condition:LIVE_EXTERNAL'], 'choice', CHOICE + 'condition-grammar',
+     ['condition:LIVE_EXTERNAL'], 'choice', CORE_KEYWORDS,
      None),
     ('v6b-any-live', '{{ANY_LIVE ??yes//no}}', 'live-both', 'yes',
-     ['condition:ANY_LIVE'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:ANY_LIVE'], 'choice', CORE_KEYWORDS, None),
     ('v6b-any-live-offline', '{{ANY_LIVE ??yes//no}}', 'live-offline',
-     'no', ['condition:ANY_LIVE'], 'choice', CHOICE + 'condition-grammar',
+     'no', ['condition:ANY_LIVE'], 'choice', CORE_KEYWORDS,
      None),
     ('v6b-live-keyword-case-insensitive', '{{live ??yes//no}}',
      'live-discord', 'yes', ['condition:LIVE', 'rule:case'], 'choice',
-     CHOICE + 'condition-grammar', None),
-    # ---- party heads (choice: spec records condition-grammar) ----
+     CORE_KEYWORDS, None),
+    # ---- party heads (choice: TOG-12189 keyword table) ----
     ('v6b-players-three', '{{PLAYERS ??yes//no}}', 'playing-no-party-3',
-     'yes', ['condition:PLAYERS'], 'choice', CHOICE + 'condition-grammar',
+     'yes', ['condition:PLAYERS'], 'choice', CORE_KEYWORDS,
      None),
     ('v6b-players-none', '{{PLAYERS ??yes//no}}', 'solo', 'no',
-     ['condition:PLAYERS'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:PLAYERS'], 'choice', CORE_KEYWORDS, None),
     ('v6b-max-capped', '{{MAX ??yes//no}}', 'v6b-party-capped', 'yes',
-     ['condition:MAX'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:MAX'], 'choice', CORE_KEYWORDS, None),
     ('v6b-max-uncapped', '{{MAX ??yes//no}}', 'party-4', 'no',
-     ['condition:MAX'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:MAX'], 'choice', CORE_KEYWORDS, None),
     ('v6b-max-no-advertised-max', '{{MAX ??yes//no}}',
      'party-no-maximum', 'no', ['condition:MAX'], 'choice',
-     CHOICE + 'condition-grammar', None),
+     CORE_KEYWORDS, None),
     ('v6b-rich-party', '{{RICH ??yes//no}}', 'party-4', 'yes',
-     ['condition:RICH'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:RICH'], 'choice', CORE_KEYWORDS, None),
     ('v6b-rich-none', '{{RICH ??yes//no}}', 'solo', 'no',
-     ['condition:RICH'], 'choice', CHOICE + 'condition-grammar', None),
+     ['condition:RICH'], 'choice', CORE_KEYWORDS, None),
     # ---- time heads ----
     ('v6b-weekend-saturday', '{{WEEKEND ??weekend//weekday}}',
      'day-Saturday', 'weekend', ['condition:WEEKEND'], 'spec', SPEC_V6,
@@ -179,7 +183,7 @@ CASES = [
      'weekday', ['condition:WEEKEND'], 'spec', SPEC_V6, 'weekend-Monday'),
     ('v6b-weekday-bare-monday', '{{WEEKDAY ??weekday//weekend}}',
      'day-Monday', 'weekday', ['condition:WEEKDAY'], 'choice',
-     CHOICE + 'condition-grammar', None),
+     CORE_KEYWORDS, None),
     ('v6b-weekday-name-equals', '{{WEEKDAY:Monday ??yes//no}}',
      'day-Monday', 'yes', ['condition:WEEKDAY'], 'choice',
      CORE_CALENDAR, None),
@@ -254,10 +258,10 @@ CASES = [
       'token:@@owner@@'], 'spec', SPEC_V6, 'condition-name-not-expanded'),
     ('v6b-unknown-hash-not-numeric', '{{## = 3 ??yes//no}}', 'solo',
      'no', ['rule:unknown-condition', 'token:##'], 'choice',
-     CHOICE + 'numeric-##', None),
+     CORE_NUMERIC + 'numeric-##', None),
     ('v6b-unknown-roman-not-numeric', '{{+# = 3 ??yes//no}}', 'solo',
      'no', ['rule:unknown-condition', 'token:+#'], 'choice',
-     CHOICE + 'numeric-+#', None),
+     CORE_NUMERIC + 'numeric-+#', None),
     ('v6b-unknown-person-with-compare', '{{ROLE=raid ??yes//no}}',
      'role-owner', 'no', ['rule:unknown-condition', 'condition:ROLE:id'],
      'spec', SPEC_V6, None),

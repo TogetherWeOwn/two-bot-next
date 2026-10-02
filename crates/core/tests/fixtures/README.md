@@ -6,9 +6,12 @@ rows authored from `docs/voice-rooms.md` §V6 plus the legacy two-bot tempVoice
 runtime state each condition head reads. 26 contexts are copied verbatim from
 `tests/voice_templates/corpus.json` and 1 is derived (`v6b-party-capped`,
 `party-4` with a full advertised party); the Rust gate asserts both. Rows with
-`basis: "spec"` are determinate from §V6 alone; rows with `basis: "choice"`
-pin a choice TOG-12189 documents in `docs/voice-conditions-core.md` (line
-cited) where §V6 alone does not decide the outcome. Regenerate with
+`basis: "spec"` are determinate from §V6 alone and cite only §V6; rows with
+`basis: "choice"` pin a choice TOG-12189 documents in
+`docs/voice-conditions-core.md` where §V6 alone does not decide the outcome,
+cite that document's line, and name the `tests/voice_templates/coverage.json`
+ambiguity they settle, if any. The Rust gate asserts both citation forms.
+Regenerate with
 `python3 crates/core/tests/fixtures/generate_voice_conditions_golden.py` from
 the repository root (standard library only); the script asserts the spec
 SHA-256 pin and cross-checks every `shared_case` row against the shared

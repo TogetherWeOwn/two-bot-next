@@ -6,6 +6,8 @@
 //! eval-wiring follow-up will consume:
 //! - every condition head has at least one row (`MIN_PER_HEAD`);
 //! - unknown-head rows refuse (`expected.output == "no"`);
+//! - `spec` rows cite §V6 alone and `choice` rows cite the TOG-12189
+//!   `docs/voice-conditions-core.md` line they pin;
 //! - every row's first V5 conditional node is a verbatim slice of its input,
 //!   and every expected output is the text around that node plus a slice of
 //!   the node source, so no row invents text; `rule:verbatim` rows select
@@ -153,6 +155,17 @@ fn conditional_source(template: &str) -> Option<String> {
         })
 }
 
+/// Whether a citation names a `docs/voice-conditions-core.md` line (`L21`,
+/// `L28-34`) after the document path.
+fn cites_core_line(spec: &str) -> bool {
+    spec.split_once("docs/voice-conditions-core.md")
+        .is_some_and(|(_, cite)| {
+            cite.split(" L")
+                .skip(1)
+                .any(|line| line.starts_with(|c: char| c.is_ascii_digit()))
+        })
+}
+
 #[test]
 fn heads_have_coverage_unknown_heads_refuse_and_rows_cite_sources() {
     let fixture = fixture();
@@ -190,6 +203,21 @@ fn heads_have_coverage_unknown_heads_refuse_and_rows_cite_sources() {
             case.basis
         );
         assert!(!case.source.spec.is_empty(), "{} cites no spec", case.id);
+        // `spec` rows follow from §V6 alone; `choice` rows pin a TOG-12189
+        // decision and cite the `docs/voice-conditions-core.md` line for it.
+        if case.basis == "spec" {
+            assert_eq!(
+                case.source.spec, "docs/voice-rooms.md §V6",
+                "{}: a spec row cites only §V6",
+                case.id
+            );
+        } else {
+            assert!(
+                cites_core_line(&case.source.spec),
+                "{}: a choice row cites a docs/voice-conditions-core.md line",
+                case.id
+            );
+        }
         assert!(
             !case.source.legacy.is_empty(),
             "{} cites no legacy template source",

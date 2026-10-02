@@ -1437,7 +1437,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "two-bot src/tempVoice/service.ts claim/transfer, persisted row.ownerId"
    }
   },
@@ -1580,7 +1580,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1597,7 +1597,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1614,7 +1614,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1631,7 +1631,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1648,7 +1648,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1665,7 +1665,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1682,7 +1682,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1699,7 +1699,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1716,7 +1716,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1734,7 +1734,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1751,7 +1751,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1768,7 +1768,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1785,7 +1785,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1802,7 +1802,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1819,7 +1819,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1836,7 +1836,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1853,7 +1853,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -1924,7 +1924,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity condition-grammar",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L40-55 keyword table: the fact each head reads; tests/voice_templates/coverage.json ambiguity condition-grammar",
     "legacy": "no legacy conditional; legacy naming renders only {username}/{count}/{seq} (nameFilter.ts renderNameTemplate); state read from Discord gateway voice states (service.ts occupantsOf)"
    }
   },
@@ -2455,7 +2455,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity numeric-##",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L23-26 untyped conditions are false; L34 ##, +# and name tokens are not numeric; tests/voice_templates/coverage.json ambiguity numeric-##",
     "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
    }
   },
@@ -2473,7 +2473,7 @@
    ],
    "basis": "choice",
    "source": {
-    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core); shared-corpus ambiguity numeric-+#",
+    "spec": "docs/voice-rooms.md \u00a7V6; TOG-12189 docs/voice-conditions-core.md (feat/voice-conditions-core) L23-26 untyped conditions are false; L34 ##, +# and name tokens are not numeric; tests/voice_templates/coverage.json ambiguity numeric-+#",
     "legacy": "legacy names carry no game/live/time tokens (nameFilter.ts); V5 tail trim\u2192truncate\u2192fallback (crates/core/src/voice_naming.rs render)"
    }
   },
