@@ -84,6 +84,7 @@ pub mod settings;
 pub mod sticky;
 pub mod tickets;
 pub mod voice;
+pub mod voice_channelinfo;
 pub mod voice_config;
 pub mod voice_naming;
 pub mod voice_ownership;
