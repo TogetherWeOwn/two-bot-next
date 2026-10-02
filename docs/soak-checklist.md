@@ -857,7 +857,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** 3 verifier retries ≤30s; REST/internal §6 bounds; 5 joins/60s +900s raid cooldown; ticket 300s; executor cooldown; 5m audit lease,1h recheck,≤25 claims.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
-### s8-05: Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete) — bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist
+### s8-05: Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete) — bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist; whitespace edge accepted ([TOG-12582](/TOG/issues/TOG-12582)): legacy JS `\s` treats U+FEFF as blank and U+0085 as non-blank while Rust `split_whitespace` does the opposite, but both collapse to empty-vs-nonempty only for these two codepoints and all repeat-expiry blanks stay agreed (NEL: [TOG-10052](/TOG/issues/TOG-10052), format chars: [TOG-10048](/TOG/issues/TOG-10048))
 
 - **Method:** `manual` (not an execution verdict).
 - **Action:** In disposable approved staging channel with dryRun enabled, send one benign fixture per six configured filters; use local mocks for enforced ladder and protected-target deletion.
