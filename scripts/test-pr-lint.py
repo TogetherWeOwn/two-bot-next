@@ -17,7 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def inline_script(name):
-    lines = (ROOT / ".github/workflows/pr-lint.yml").read_text().splitlines()
+    # TOG-11810: the pr-lint steps live in the folded supply-chain workflow;
+    # the exercised text must be the exact inline script CI runs.
+    lines = (ROOT / ".github/workflows/supply-chain.yml").read_text().splitlines()
     start = lines.index(f"      - name: {name}")
     start = lines.index("        run: |", start) + 1
     end = start

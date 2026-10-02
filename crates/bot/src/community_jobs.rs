@@ -10,6 +10,11 @@
 //! Monday's window. Reservations and completion live beside the scorecard
 //! runs in Postgres, so restarting cannot reset the budget. Inactivity is
 //! read-only by construction: its outcome carries no channel/message/DM field.
+//!
+//! The presence probe holds a per-process overlap lease (TOG-12142): a
+//! concurrent trigger skips with `presence_probe_overlap_skipped` instead of
+//! duplicating the daily roster scan, and a holder older than
+//! `PRESENCE_PROBE_LEASE_MS` is presumed dead and taken over.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -19,11 +24,12 @@ use two_bot_core::community_store::{
     mark_stream_coverage, run_closed_week, CommunityStoreError, ScorecardLoad,
 };
 use two_bot_core::{
-    bot_floor_due, decide_probe_cycle, format_iso_millis, inactivity_store, now_iso,
-    parse_inactivity_days, parse_iso_millis, presence_store, previous_closed_week,
-    sanitize_presence_count, scorecard_tick, ClassifierConfig, ScorecardGates,
-    BOT_FLOOR_MAX_AGE_MS, COMMUNITY_FACT_TYPES, INACTIVITY_SWEEP_INTERVAL_MS,
-    PRESENCE_PROBE_INTERVAL_MS, SCORECARD_TICK_INTERVAL_MS,
+    bot_floor_due, decide_probe_cycle, decide_probe_lease, format_iso_millis, inactivity_store,
+    now_iso, parse_inactivity_days, parse_iso_millis, presence_store, previous_closed_week,
+    release_probe_lease, sanitize_presence_count, scorecard_tick, ClassifierConfig, ProbeLease,
+    ProbeLeaseDecision, ScorecardGates, BOT_FLOOR_MAX_AGE_MS, COMMUNITY_FACT_TYPES,
+    INACTIVITY_SWEEP_INTERVAL_MS, PRESENCE_PROBE_INTERVAL_MS, PRESENCE_PROBE_LEASE_MS,
+    SCORECARD_TICK_INTERVAL_MS,
 };
 use two_bot_discord::executor::ActionExecutor;
 
@@ -73,6 +79,10 @@ pub(crate) struct State {
     /// Held across a scorecard attempt; cancellation drops the guard. Durable
     /// budget/backoff/completion are stored in `community_scorecard_attempts`.
     scorecard_lane: Mutex<()>,
+    /// Probe overlap lease (TOG-12142): `started_at_ms` of the in-flight
+    /// cycle, cleared when the cycle finishes. A restart starts unleased, so a
+    /// dead process can never block the next tick past one lease period.
+    probe_lease: Mutex<ProbeLease>,
 }
 
 /// A job the env gates refuse to register.
@@ -170,6 +180,7 @@ pub(crate) fn register(context: Arc<Context>) -> Registration {
         }),
         inactivity_days: gates.inactivity_days.unwrap_or(0),
         scorecard_lane: Mutex::new(()),
+        probe_lease: Mutex::new(None),
     });
     let mut out = Vec::new();
     for (name, kind, enabled) in [
@@ -240,7 +251,7 @@ pub(crate) async fn run_once(
     now_ms: i64,
 ) -> Result<(), ErrorClass> {
     match kind {
-        Kind::PresenceProbe => presence_tick(pool, rest, guild, now_ms).await,
+        Kind::PresenceProbe => presence_tick(pool, rest, guild, state, now_ms).await,
         Kind::Scorecard => scorecard_once(pool, guild, state, now_ms).await,
         Kind::Inactivity => inactivity_tick(pool, state, now_ms).await,
     }
@@ -252,6 +263,40 @@ pub(crate) async fn run_once(
 /// listing keeps the presence row with a NULL floor rather than losing the
 /// cycle.
 async fn presence_tick(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    state: &State,
+    now_ms: i64,
+) -> Result<(), ErrorClass> {
+    // Overlap guard (TOG-12142): decide and claim under one lock acquisition,
+    // so two triggers can never both see a free lease, and skip before any
+    // REST call, so a slow cycle cannot duplicate the daily roster scan. A
+    // stale holder is taken over on the spot.
+    {
+        let mut lease = state.probe_lease.lock().await;
+        match decide_probe_lease(*lease, now_ms, PRESENCE_PROBE_LEASE_MS) {
+            ProbeLeaseDecision::Skip => {
+                tracing::warn!(job = "presence_probe", "presence_probe_overlap_skipped");
+                return Ok(());
+            }
+            ProbeLeaseDecision::Takeover => {
+                tracing::warn!(job = "presence_probe", "presence_probe_lease_takeover");
+            }
+            ProbeLeaseDecision::Run => {}
+        }
+        *lease = Some(now_ms);
+    }
+    let outcome = presence_tick_inner(pool, rest, guild, now_ms).await;
+    // Success or failure, release only this cycle's own claim. A cancelled
+    // cycle (supervisor timeout) never gets here; its lease goes stale and the
+    // next tick takes it over.
+    let mut lease = state.probe_lease.lock().await;
+    *lease = release_probe_lease(*lease, now_ms);
+    outcome
+}
+
+async fn presence_tick_inner(
     pool: &PgPool,
     rest: &ActionExecutor,
     guild: &str,

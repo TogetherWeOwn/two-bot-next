@@ -15,7 +15,7 @@ const dirty = execFileSync('git', [
 ], { encoding: 'utf8' }).trim();
 if (dirty) throw new Error(`Refusing dirty legacy clone; restore frozen source and lockfile:\n${dirty}`);
 const revision = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-if (revision !== 'd5d1179348feb9157bcac8c875de9399d4f5c76a') {
+if (revision !== 'dbee695b95aabf9234cad28a6b24692e2d07314d') {
   throw new Error(`Expected docs/parity.md frozen legacy revision, got ${revision}`);
 }
 const load = (path) => import(pathToFileURL(resolve(root, path)).href);
