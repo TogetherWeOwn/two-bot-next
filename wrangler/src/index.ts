@@ -25,10 +25,18 @@ import {
   TokenBuckets,
   handleRedirect,
   isReservedInternal,
-  type Campaign,
+  isValidFallback,
+  redirectErrorClass,
   type RedirectClick,
 } from "./redirect.ts";
 import { RedirectStore, parseMappingsSnapshot } from "./redirect-store.ts";
+import {
+  EMPTY_STATE,
+  evaluateMetrics,
+  parseExposition,
+  transitionMessages,
+  type MetricsAlertState,
+} from "./alert-rules.ts";
 
 export interface Env {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
@@ -41,6 +49,8 @@ export interface Env {
   UNREADY_ALERT_FAILURES?: string;
   /** Optional Worker secret; never forwarded to the container or logged. */
   OPS_ALERT_WEBHOOK_URL?: string;
+  /** Optional Worker secret: bearer token for GET /ops/metrics. Unset → route 404s. */
+  METRICS_SCRAPE_TOKEN?: string;
   /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -54,14 +64,8 @@ export interface Env {
 const clickBuckets = new TokenBuckets();
 
 function redirectStore(env: Env): RedirectStore {
-  let snapshot: Campaign[] = [];
-  try {
-    snapshot = env.REDIRECT_MAPPINGS_JSON
-      ? parseMappingsSnapshot(env.REDIRECT_MAPPINGS_JSON)
-      : [];
-  } catch {
-    snapshot = [];
-  }
+  const raw = env.REDIRECT_MAPPINGS_JSON;
+  const snapshot = raw === undefined || raw === "" ? [] : parseMappingsSnapshot(raw);
   // node-postgres ships inside the Worker via the `nodejs_compat` flag only
   // when S1 wires Hyperdrive; until then connect stays undefined and the
   // store serves the snapshot with clicks dropped (logged, never faked).
@@ -86,6 +90,22 @@ const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
 const DEFAULT_UNREADY_SECONDS = 600;
 const READINESS_KEY = "two-bot:readiness";
+const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
+const OPS_METRICS_PATH = "/ops/metrics";
+
+/** Compare via digests so length/prefix timing does not leak the token. */
+async function tokenMatches(provided: string, expected: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(provided)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  const x = new Uint8Array(a);
+  const y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i]! ^ y[i]!;
+  return diff === 0;
+}
 
 function containerPort(raw: string | undefined): number {
   if (raw === undefined) return 8080;
@@ -123,6 +143,16 @@ export class TwoBotContainer extends Container<Env> {
     if (url.pathname === "/health" || url.pathname === "/readyz") {
       await this.armKeepalive();
       return this.containerFetch(request);
+    }
+
+    // Reached only through the Worker's bearer-token gate (see default export).
+    if (url.pathname === OPS_METRICS_PATH && request.method === "GET") {
+      await this.armKeepalive();
+      const upstream = await this.containerFetch("http://c/metrics");
+      return new Response(await upstream.text(), {
+        status: upstream.status,
+        headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
+      });
     }
 
     return new Response("not found", { status: 404 });
@@ -195,6 +225,7 @@ export class TwoBotContainer extends Container<Env> {
           console.warn("two-bot keepalive probe failed");
         }
         await this.recordReadiness(status);
+        await this.evaluateMetricsAlerts();
       } finally {
         // Replace the executing row AND any legacy duplicate chains with one
         // successor. onStart/inbound requests must not arm during this tick.
@@ -256,6 +287,48 @@ export class TwoBotContainer extends Container<Env> {
     await this.postReadinessWebhook(event);
   }
 
+  /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
+  private async evaluateMetricsAlerts(): Promise<void> {
+    try {
+      const res = await this.containerFetch("http://c/metrics", { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) {
+        await res.arrayBuffer();
+        return;
+      }
+      const samples = parseExposition(await res.text());
+      const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
+      const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
+      // Persist before notifying: at most one attempt per transition.
+      await this.ctx.storage.put(METRICS_ALERT_KEY, state);
+      for (const content of transitionMessages(previous.firing, firing)) {
+        console.warn(JSON.stringify({ event: "metrics_alert", service: "two-bot-next", content }));
+        await this.postWebhookText(content);
+      }
+    } catch {
+      console.warn("two-bot metrics scrape failed");
+    }
+  }
+
+  private async postWebhookText(content: string): Promise<void> {
+    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
+    if (!binding) return;
+    try {
+      const url = new URL(binding);
+      if (url.protocol !== "https:" || url.username || url.password) throw new Error("invalid webhook binding");
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(6000),
+        body: JSON.stringify({ content, allowed_mentions: { parse: [], replied_user: false } }),
+      });
+      await response.body?.cancel();
+      if (!response.ok) console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: response.status }));
+    } catch {
+      console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: null }));
+    }
+  }
+
   private async postReadinessWebhook(event: ReadinessEvent): Promise<void> {
     const binding = this.env.OPS_ALERT_WEBHOOK_URL;
     if (!binding) return;
@@ -315,10 +388,20 @@ export default {
       return container.fetch(request);
     }
 
-    // Metrics are container-internal, never a public proxy or invite campaign.
-    // Canonicalized like the campaign lookup so /METRICS, /%6detrics,
-    // //metrics and /metrics/* cannot become a campaign redirect.
-    if (isReservedInternal(url.pathname)) {
+    // Authenticated off-container scrape path. No configured token → 404 (the
+    // route does not exist); missing/wrong bearer → 401. Exact path only.
+    if (url.pathname === OPS_METRICS_PATH) {
+      if (!env.METRICS_SCRAPE_TOKEN || request.method !== "GET") return new Response("not found", { status: 404 });
+      const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
+      if (!m || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
+        return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
+      }
+      return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(request);
+    }
+
+    // Internal metrics and healthz aliases never become invite campaigns.
+    // The exact /healthz redirect probe is handled below after config validation.
+    if (url.pathname !== "/healthz" && isReservedInternal(url.pathname)) {
       return new Response("not found", { status: 404 });
     }
 
@@ -326,7 +409,22 @@ export default {
     // the 302 via waitUntil — the visitor never waits on the database, and a
     // failed write costs a click, never a member. Record failures are logged
     // with slug only (never visitor data — see redirect.ts privacy note).
-    const store = redirectStore(env);
+    // Workers have no Node listen-port setting. Validate redirect configuration
+    // before serving campaigns or the redirect probe, without logging values.
+    const invalidConfig = (errorClass: string) => {
+      console.error(`invite_redirect_invalid_config ${JSON.stringify({ errorClass })}`);
+      return new Response("redirect service misconfigured\n", {
+        status: 503,
+        headers: { "content-type": "text/plain", "retry-after": "30" },
+      });
+    };
+    if (!isValidFallback(env.REDIRECT_FALLBACK_CODE)) return invalidConfig("invalid_fallback");
+    let store: RedirectStore;
+    try {
+      store = redirectStore(env);
+    } catch {
+      return invalidConfig("invalid_snapshot");
+    }
     const result = await handleRedirect(
       request.method,
       url.pathname,
@@ -346,7 +444,7 @@ export default {
       ctx.waitUntil(
         store.recordClick(click).catch((err: unknown) =>
           console.error(
-            `invite_click_record_failed ${JSON.stringify({ campaign: click.campaign, err: String(err) })}`,
+            `invite_click_record_failed ${JSON.stringify({ campaign: click.campaign, errorClass: redirectErrorClass(err) })}`,
           ),
         ),
       );

@@ -109,8 +109,8 @@ headroom below are historical, not measurements of the current PR head:
 
 | Artifact | Historical definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|
-| Runtime image | Docker image inspect `Size` on the original runner | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 10 MiB / 10,485,760 bytes | 2.99 MiB / 42.7% |
+| Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 7.01 MiB / 7,346,736 bytes | 11 MiB / 11,534,336 bytes | 3.99 MiB / 56.9% |
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
@@ -203,8 +203,78 @@ Proposed branch protection: require **`container smoke`** alongside `check`,
 `pr-lint` and `gitleaks` after the first green PR. This PR does not change
 repository rules or production/staging deployments.
 
+## Rust synthetic pipeline baseline — TOG-10886
+
+Measured 2026-10-01 at source `445ca88f538c0a9b5913c1f1f53c12dd64501a52`.
+The actual Twilight `Pipeline<GatewayFunnelBuffer>` and durable dispatch
+transaction ran in an ephemeral Rust job container on
+`[self-hosted, two-selfhosted]`, with mock REST and a job-private Postgres 18.6
+service. No staging/production database or live Discord connection was used.
+This is a **debug-profile synthetic pipeline**, not the entire bot or a
+production sizing approval; the historical Node verdict above is unchanged.
+
+| Metric | Standalone baseline | Same-head nightly repeat |
+|---|---:|---:|
+| Peak process RSS | 24.676 MiB | 24.082 MiB |
+| Handler p50 | 18,675.202 µs | 2,857.018 µs |
+| Handler p99 | 119,271.538 µs | 12,171.162 µs |
+| Logical DB exchanges/event | 8.45 | 8.45 |
+| Mock REST p50 / p99 | 3,945.614 / 48,439.975 µs | 1,025.072 / 1,393.941 µs |
+| Paced replay time | 29.988 s | 29.971 s |
+| Command time, including setup and verified teardown | 38.265 s | 30.929 s |
+
+Sources: [standalone run 36821344440](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36821344440)
+and [nightly benchmark job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36821344778/job/110237375246).
+Both uploaded `pipeline-benchmark.json` and the exact tested revision. The nightly
+benchmark job passed; its separate broad sweep failed on database teardown
+statement timeouts and rustdoc bare URLs, so this is not a claim that all nightly
+jobs passed.
+
+The committed [baseline JSON](pipeline-benchmark-baseline.json) retains the first
+successful standalone report verbatim apart from added provenance. It is not
+an average, a synthetic envelope, or the faster repeat. Shared-runner latency
+varied by about 6.5× at p50 and 9.8× at p99 between these runs; host contention
+is a hypothesis, not a proven attribution. Treat the 25% comparison as a coarse
+regression signal pending controlled-runner repeatability work, not a stable
+latency SLA. Neither the tolerance nor baseline was raised to hide a failure.
+
+Both reports prove 107 cached/durable members, 10 cached channels, 600 messages
+plus 300 voice updates, 30 mock REST calls, 942 durable effects, checkpoint 1017,
+and successful disposable DB drop. DB accounting is `(6705 completed SQL
+statements + 900 unlogged BEGIN exchanges) / 900 measured events`; 900 observed
+COMMITs independently validate the transaction count. It is not transport RTT
+or prepared-statement handshake accounting. Handler nearest-rank percentiles
+include handling, drain and awaited commit, but exclude pacing, JSON parsing
+and the separately timed REST calls.
+
+**Synthetic budget verdict: PASS** — both peaks are below the strict 200 MiB
+target and both commands finish well under five minutes. No cgroup memory cap,
+CPU budget, feature-runtime overhead, real-guild soak, or production resize is
+proved by this result.
+
+After building in the authorized CI job container, reproduce in under five
+minutes with:
+
+```sh
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_pipeline_bench \
+  timeout 240s target/debug/examples/pipeline_bench > pipeline-benchmark.json
+python3 scripts/compare_pipeline_bench.py pipeline-benchmark.json
+```
+
+Compilation is separate. The existing strict test-database guard runs before
+connection, creates/migrates a unique disposable database, and verifies its drop
+before reporting success. See [the benchmark runbook](pipeline-benchmark.md)
+for the build command, configurable workload, controller cache restrictions,
+measurement definitions and non-required nightly integration.
+
 ## Reproduce
 
 Driver: `/tmp/tog9694/soak.mjs` (kept on the run host, not committed — it
 points at an absolute checkout path). Scratch DB `tog9694_baseline` on
 agent-testdb left intact for B2 cross-checks.
+
+Gate policy (CTO decision, TOG-11786): the comparator fails on peak RSS,
+SQL exchanges per event and handler p50 (25% tolerance). Handler p99 is still
+measured and compared to the same limit, but a breach prints an `ADVISORY` line
+and does not fail the job. Raising the p99 limit needs at least five controlled
+repeats recorded in the baseline JSON plus independent QA acceptance.

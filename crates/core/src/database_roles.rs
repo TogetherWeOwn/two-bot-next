@@ -53,6 +53,8 @@ mod tests {
             include_str!("../../cutover/migrations/0001_funnel.sql"),
             include_str!("../../cutover/migrations/0002_leveling.sql"),
             include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
+            include_str!("../../cutover/migrations/0140_scheduled_messages.sql"),
+            include_str!("../../cutover/migrations/0141_scheduled_messages_legacy_upgrade.sql"),
             include_str!("../../cutover/migrations/0150_sticky_messages.sql"),
             include_str!("../../cutover/migrations/0160_rsvp.sql"),
             include_str!("../../cutover/migrations/0170_lfg.sql"),
@@ -69,7 +71,7 @@ mod tests {
             include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
             include_str!("../../cutover/migrations/0340_operational_audit.sql"),
             include_str!("../../cutover/migrations/0350_internal_actions.sql"),
-            include_str!("../../cutover/migrations/0360_discord_send_admission.sql"),
+            include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
         ] {
             let mut table = None;
             for line in migration.lines() {

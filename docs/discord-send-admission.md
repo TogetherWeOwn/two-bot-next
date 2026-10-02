@@ -11,7 +11,7 @@ installed by this change.
 `AdmissionError`, `SendCooldown`, `TokenKey` and, with feature `db`,
 `PgSendAdmission`.
 
-1. Apply migration `0360_discord_send_admission.sql` through the existing,
+1. Apply migration `0361_discord_send_admission.sql` through the existing,
    separately authorized migration process. Every consumer of the same token
    must use the **same database authority**. Container gateway/sticky/jobs use
    `Config.database_url` (`DATABASE_URL`); administrative tools use

@@ -22,10 +22,15 @@ concurrency:
 jobs:
   check:
     name: check
-    needs: self-role-store
+    needs: [self-role-store, parity-docs]
     # A skipped dependency must not make the required check appear green.
     if: ${{ always() }}
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch (TOG ops, 2026-10-01): stays on self-hosted unless repo vars
+    # CI_OVERFLOW_RUNNER (JSON runs-on, e.g. ["ubuntu-latest"]), CI_OVERFLOW_JOBS
+    # (JSON job ids) and CI_OVERFLOW_EVENTS (JSON event names) all select this job.
+    # Flip back without a PR by deleting CI_OVERFLOW_RUNNER. Private repo: hosted
+    # minutes come from the included allowance; an rbx1 guard reverts at 45k.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -58,6 +63,9 @@ jobs:
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
         run: |
+          # On hosted/overflow runners the job container's root does not own the
+          # runner-owned checkout, so Git refuses it as dubious ownership.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
           # Tests that pin 127.0.0.1/localhost:5432 reach the service through
@@ -65,6 +73,10 @@ jobs:
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
+
+      - name: require parity docs to pass
+        if: needs.parity-docs.result != 'success'
+        run: exit 1
 
       - name: require self-role store tests to pass
         if: needs.self-role-store.result != 'success'
@@ -84,6 +96,11 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+
+      - name: Validate voice template fixtures (hermetic, no renderer)
+        run: |
+          python3 tests/voice_templates/validate.py
+          python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
@@ -137,6 +154,18 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --test '*' --features two-bot-core/db --locked
 
+      - name: Native v3 and real backup CLI regressions (CI service only)
+        run: |
+          export PAPERCLIP_RUN_SCRATCH_DIR
+          PAPERCLIP_RUN_SCRATCH_DIR=$(mktemp -d "$RUNNER_TEMP/backup-regressions.XXXXXX")
+          db="two_next_backup_publication_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          createdb -h agent-testdb -U agent_test "$db"
+          trap 'dropdb -h agent-testdb -U agent_test --if-exists "$db"; rm -rf "$PAPERCLIP_RUN_SCRATCH_DIR"' EXIT
+          export TWO_BOT_TEST_DATABASE_URL="postgres://agent_test:@agent-testdb:5432/$db"
+          cargo build -p two-bot --locked
+          export TWO_BOT_TEST_BACKUP_BIN="$PWD/target/debug/two-bot"
+          cargo test -p two-bot-core --features db --test backup_roundtrip --test backup_dump_publication --locked -- --nocapture --test-threads=1
+
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
       - name: property tests stay under 30 seconds
@@ -160,8 +189,26 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
+      - name: leveling Postgres parity tests
+        env:
+          TWO_LEVELING_TEST_CI: '1'
+        run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
+
+      - name: Raid cohort query (CI service container only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test raid_list_db --locked -- --ignored
+
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
+
+      - name: Docker dependency-layer manifests (offline)
+        run: python3 scripts/check-docker-manifests.py
+
+      - name: Store Postgres integration (isolated CI schemas)
+        env:
+          TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
+        run: cargo test -p two-bot-store --locked --test postgres -- --ignored
 
       - name: legacy copy acceptance (two owned databases on CI service only)
         run: cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
@@ -174,9 +221,7 @@ jobs:
       - name: channel moderation store clippy
         run: cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
 
-      # TWO_TEST_DATABASE_URL is scoped to this step only: the workspace suite
-      # above runs exactly as on main (RSVP store tests skip without it), and
-      # only this slice's tests activate their test-container guard here.
+      # Only this slice's tests activate their test-container guard here.
       - name: channel moderation domain and store tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
@@ -191,6 +236,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored
+
+      - name: Internal event executor mirror acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-discord --features db --locked --test internal_events -- --include-ignored
 
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
@@ -226,9 +276,28 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+  parity-docs:
+    name: parity docs
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Offline parity guard regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_parity_baseline.py' -v
+      - name: Fetch public legacy history (no credentials)
+        run: |
+          git -c credential.helper= clone --bare https://github.com/TogetherWeOwn/two-bot.git "$RUNNER_TEMP/legacy.git"
+          start=$(python3 -c 'import json; print(json.load(open("docs/parity-baseline.json"))["historyStart"])')
+          git -C "$RUNNER_TEMP/legacy.git" -c credential.helper= fetch origin "$start"
+      - name: Check baseline ancestry, complete ledger and permalink targets
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_parity_baseline.py --legacy-repo "$RUNNER_TEMP/legacy.git"
+
   self-role-store:
     name: self-role store leases
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'self-role-store') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     # A job container resolves service names directly. The test's fixed
     # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
@@ -256,8 +325,51 @@ jobs:
       - name: self-role claim, renewal, recovery and fencing tests
         run: cargo test -p two-bot-cutover --test self_role_store --locked -- --ignored
 
+  # Dependency-aware selector for the container job (TOG-12056): PRs that
+  # touch only docs, worker UI or unrelated CI tooling skip the ~15-minute
+  # amd64 release build. No `paths:` filter on the workflow: that would
+  # skip the whole workflow including required checks. Needs nothing so it
+  # starts immediately and never blocks on the test jobs. Fail-closed end
+  # to end: the shell step defaults to build=true, so an undecidable diff,
+  # missing SHAs, a classifier error or any non-PR event selects a full
+  # build. Skipped PR runs deliberately write no image cache: the GHA
+  # cache is PR-safe by platform ref-scoping (PR restores base/main, PR
+  # writes stay on the merge ref), so no scope-string change is needed.
+  container-inputs:
+    name: container inputs changed
+    runs-on: [self-hosted, two-selfhosted]
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.select.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The base/head SHAs must resolve locally for the diff below.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Offline container-inputs regressions
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_inputs.py' -v
+      - name: Select image build or skip
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          build=true
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+            && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
+            && result=$(python3 scripts/container-inputs.py \
+              --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA"); then
+            build="$result"
+          fi
+          printf 'container-inputs: build=%s (event=%s)\n' \
+            "$build" "${{ github.event_name }}"
+          printf 'build=%s\n' "$build" >>"$GITHUB_OUTPUT"
+
   container:
     name: container smoke
+    needs: container-inputs
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
     steps:
@@ -267,9 +379,20 @@ jobs:
           persist-credentials: false
       - name: Offline smoke-test regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
+      # A skipped build still reports success: the offline tests above ran,
+      # and container smoke is not a required check, so the check stays
+      # green without hiding anything the branch protection demands.
+      - name: Skip note (no image inputs changed)
+        if: needs.container-inputs.outputs.build != 'true'
+        run: |
+          printf 'Skipping the runtime image build: no image inputs changed.\n'
+          printf 'Selector output: build=%s\n' \
+            "${{ needs.container-inputs.outputs.build }}"
       - name: Set up BuildKit
+        if: needs.container-inputs.outputs.build == 'true'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Build runtime image (local only)
+        if: needs.container-inputs.outputs.build == 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -281,8 +404,10 @@ jobs:
           cache-from: type=gha,scope=two-bot-runtime-amd64
           cache-to: type=gha,mode=max,scope=two-bot-runtime-amd64
       - name: Runtime contract and size budgets
+        if: needs.container-inputs.outputs.build == 'true'
         run: python3 scripts/container-smoke.py two-bot:ci
       - name: Prove deliberate budget breakage fails
+        if: needs.container-inputs.outputs.build == 'true'
         run: |
           set -euo pipefail
           for budget in image binary; do
@@ -297,7 +422,8 @@ jobs:
 
   community-db:
     name: community db
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'community-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -332,7 +458,8 @@ jobs:
 
   feeds-db:
     name: feeds db check
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'feeds-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
@@ -363,7 +490,8 @@ jobs:
 
   tickets-postgres:
     name: tickets postgres
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tickets-postgres') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
     # Service DNS stays inside this job's network; never publish a shared port.
     container:
@@ -396,10 +524,14 @@ jobs:
           key: ${{ runner.os }}-tickets-cargo-${{ hashFiles('Cargo.lock') }}
       - name: Ticket lifecycle and migration integration tests
         run: cargo test -p two-bot-cutover --locked --test tickets_store -- --ignored
+      - name: Ticket shared router and mock Discord lifecycle acceptance
+        run: >-
+          cargo test -p two-bot --locked --bin two-bot ticket_runtime:: -- --include-ignored
 
   worker:
     name: worker check
-    runs-on: [self-hosted, two-selfhosted]
+    # Overflow switch: see CI_OVERFLOW_* note on the first job above.
+    runs-on: ${{ fromJSON((contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'worker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
     defaults:
       run:
@@ -426,6 +558,8 @@ jobs:
         run: node --test ../scripts/test-export-legacy-registry.mjs
       - name: Verify PR lint event and dispatch paths
         run: python3 ../scripts/test-pr-lint.py
+      - name: Verify secret-scan trigger and concurrency surface
+        run: python3 ../scripts/test-secret-scan.py
       - name: Verify release reconciliation retries
         run: python3 ../scripts/test-release-retry.py
       - name: Verify offline release lifecycle

@@ -31,7 +31,7 @@ Required environment:
   the alias. A rejected credential stops the check; there is no retry with the
   alias.
 - `TWO_DATABASE_URL`: the same durable admission authority used by the runtime,
-  with migration 0360 already installed. It is not an alternative data target;
+  with migration 0361 already installed. It is not an alternative data target;
   no live request is permitted without this authority.
 - `GUILD_ID`: one nonzero guild snowflake, pinned to the deployment under test.
   `DISCORD_GUILD_ID` is a legacy fallback when `GUILD_ID` is absent/empty.

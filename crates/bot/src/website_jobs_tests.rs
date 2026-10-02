@@ -30,6 +30,17 @@ fn admission_lazy_pool_rejects_query_secrets_before_sqlx_logging() {
     assert!(!text.contains("ignoring unrecognized connect parameter"));
 }
 
+async fn tick(
+    kind: Kind,
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    observation: &Mutex<()>,
+) -> Result<(), ErrorClass> {
+    let (_stop, shutdown) = watch::channel(false);
+    run_once(kind, pool, rest, guild, observation, &shutdown).await
+}
+
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
     ActionExecutor::with_proxy("synthetic-job-test-token".to_owned(), Some(mock.origin())).unwrap()
@@ -166,10 +177,10 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         pool.clone(),
     )
     .unwrap();
-    run_once(Kind::Rank, &pool, &rest, guild, &observation)
+    tick(Kind::Rank, &pool, &rest, guild, &observation)
         .await
         .unwrap();
-    run_once(Kind::Counter, &pool, &rest, guild, &observation)
+    tick(Kind::Counter, &pool, &rest, guild, &observation)
         .await
         .unwrap();
     assert!(
@@ -234,9 +245,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
                     let pool = pool.clone();
                     let rest = rest.clone();
                     let observation = observation.clone();
-                    Box::pin(
-                        async move { run_once(kind, &pool, &rest, "2222", &observation).await },
-                    )
+                    Box::pin(async move { tick(kind, &pool, &rest, "2222", &observation).await })
                 }),
             }],
             status.clone(),
@@ -282,7 +291,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     }
     for _ in 0..3 {
         assert_eq!(
-            run_once(Kind::Events, &pool, &rest, guild, &observation).await,
+            tick(Kind::Events, &pool, &rest, guild, &observation).await,
             Err(ErrorClass::Rest)
         );
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduled_events")
@@ -291,7 +300,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
             .unwrap();
         assert_eq!(rows, 1, "failed/malformed reads preserve mirror");
     }
-    run_once(Kind::Events, &pool, &rest, guild, &observation)
+    tick(Kind::Events, &pool, &rest, guild, &observation)
         .await
         .unwrap();
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduled_events")
@@ -376,7 +385,7 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
         let pool = pool.clone();
         let rest = executor(&mock);
         let observation = observation.clone();
-        tokio::spawn(async move { run_once(Kind::Rank, &pool, &rest, "2222", &observation).await })
+        tokio::spawn(async move { tick(Kind::Rank, &pool, &rest, "2222", &observation).await })
     };
     // Rank has observed its old roster and is stalled on the role response.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -390,9 +399,7 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
         let pool = pool.clone();
         let rest = executor(&mock);
         let observation = observation.clone();
-        tokio::spawn(
-            async move { run_once(Kind::Counter, &pool, &rest, "2222", &observation).await },
-        )
+        tokio::spawn(async move { tick(Kind::Counter, &pool, &rest, "2222", &observation).await })
     };
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut counter)
@@ -405,7 +412,7 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
         "counter must wait before observing"
     );
     // Independent events still publish while the shared denominator lane is busy.
-    run_once(Kind::Events, pool, &executor(&mock), "2222", &observation)
+    tick(Kind::Events, pool, &executor(&mock), "2222", &observation)
         .await
         .unwrap();
     assert!(!rank.is_finished());

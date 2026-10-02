@@ -87,7 +87,12 @@ fn guard_environment(mut is_set: impl FnMut(&str) -> bool) -> Result<()> {
     Ok(())
 }
 
-fn connect_options(raw: &str) -> Result<PgConnectOptions> {
+// Fixture pools keep a tight timeout; the admin connection only runs
+// CREATE/DROP DATABASE, which can legitimately exceed it on a loaded runner.
+const FIXTURE_STATEMENT_TIMEOUT: &str = "5000ms";
+const ADMIN_DDL_STATEMENT_TIMEOUT: &str = "120s";
+
+fn connect_options(raw: &str, statement_timeout: &str) -> Result<PgConnectOptions> {
     guard_database_url(raw)?;
     let url = Url::parse(raw).expect("guard already parsed URL");
     Ok(PgConnectOptions::new_without_pgpass()
@@ -96,7 +101,8 @@ fn connect_options(raw: &str) -> Result<PgConnectOptions> {
         .username("agent_test")
         .password("")
         .database(url.path().trim_start_matches('/'))
-        .ssl_mode(PgSslMode::Disable))
+        .ssl_mode(PgSslMode::Disable)
+        .options([("statement_timeout", statement_timeout)]))
 }
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -146,13 +152,11 @@ pub struct TestDatabase {
 
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
-        let options = connect_options(raw)?;
-        // CREATE/DROP DATABASE can wait for a checkpoint on busy CI storage.
-        // Keep a finite administrative bound without relaxing test query limits.
+        let options = connect_options(raw, FIXTURE_STATEMENT_TIMEOUT)?;
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_with(options.clone().options([("statement_timeout", "120000ms")]))
+            .connect_with(connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?)
             .await
             .context("connect to test bootstrap database")?;
         let name = database_name();

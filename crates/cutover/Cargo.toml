@@ -32,6 +32,9 @@ twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 url = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
 [[bin]]
 name = "legacy_verify"
 path = "src/bin/legacy_verify.rs"
@@ -71,3 +74,11 @@ path = "src/bin/dedupe_events.rs"
 [[bin]]
 name = "legacy_copy"
 path = "src/bin/legacy_copy.rs"
+
+[[bin]]
+name = "raid-list"
+path = "src/bin/raid_list.rs"
+
+[[bin]]
+name = "raid-remove"
+path = "src/bin/raid_remove.rs"
