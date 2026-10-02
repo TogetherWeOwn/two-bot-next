@@ -3,90 +3,506 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 use serde_json::json;
 use two_bot_core::voice_config::{
-    export_configuration, validate_configuration, ChannelKind, ChannelReference, GuildInventory,
-    VoiceConfiguration,
+    export_configuration, validate_configuration, ChannelKind, ChannelReference, ChannelTemplates,
+    CommandRoles, CreatorConfiguration, GameAlias, GuildInventory, GuildSettings, LogDetail,
+    LoggingConfiguration, PermissionSource, RandomList, RoomPosition, VoiceConfiguration,
 };
 use two_bot_core::voice_config_diff::{
-    apply_diff, diff_configuration, render_preview, PREVIEW_CHAR_LIMIT,
+    apply_diff, diff_configuration, render_preview, skip_unknown_channels, PREVIEW_CHAR_LIMIT,
 };
 
+const GUILD: &str = "18446744073709551615";
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
-    fn property_voice_diff_self_is_empty(raw in proptest::collection::vec(any::<u8>(), 0..512)) {
-        let (_, inventory) = fixture();
-        if let Ok(config) = two_bot_core::voice_config::import_configuration(&raw, &inventory) {
-            let diff = diff_configuration(&config, &config, &inventory);
-            prop_assert!(diff.is_empty());
-            prop_assert_eq!(diff.change_count(), 0);
-            prop_assert_eq!(render_preview(&diff, usize::MAX), "No changes");
-        }
+    fn property_voice_diff_of_identical_configs_is_empty(config in config_strategy()) {
+        let inventory = inventory();
+        prop_assert!(validate_configuration(&config, &inventory).is_ok());
+        let diff = diff_configuration(&config, &config, &inventory);
+        prop_assert!(diff.is_empty());
+        prop_assert_eq!(diff.change_count(), 0);
+        prop_assert_eq!(render_preview(&diff, usize::MAX), "No changes");
+        prop_assert_eq!(apply_diff(&config, &diff), config);
     }
 
     #[test]
-    fn property_voice_apply_matches_filtered_incoming(
-        removals in proptest::collection::vec(any::<bool>(), 0..16),
+    fn property_voice_apply_yields_validated_incoming_minus_skipped(
+        current in config_strategy(),
+        mut incoming in config_strategy(),
+        unknown in any::<[bool; 4]>(),
     ) {
-        let (current, inventory) = fixture();
-        let mut incoming = current.clone();
-        // Bounded mutation: toggle one flag, swap one label and drop entries.
-        incoming.settings.creation_enabled = !incoming.settings.creation_enabled;
-        incoming.settings.no_game_label = if incoming.settings.no_game_label == "General" {
-            "Lobby".to_owned()
+        let inventory = inventory();
+        let expected_skipped = inject_unknown_channels(&mut incoming, unknown);
+        let diff = diff_configuration(&current, &incoming, &inventory);
+        prop_assert_eq!(&diff.skipped_unknown_channels, &expected_skipped);
+
+        let (remaining, skipped) = skip_unknown_channels(&incoming, &inventory);
+        prop_assert_eq!(&skipped, &expected_skipped);
+        prop_assert!(validate_configuration(&remaining, &inventory).is_ok());
+        let mut expected = remaining;
+        sort_configuration(&mut expected);
+        let applied = apply_diff(&current, &diff);
+        prop_assert_eq!(&applied, &expected);
+        prop_assert!(export_configuration(&applied, &inventory).is_ok());
+
+        // Entry order within a section is insignificant.
+        let mut reversed = incoming.clone();
+        reversed.creators.reverse();
+        reversed.templates.reverse();
+        reversed.aliases.reverse();
+        reversed.lists.reverse();
+        prop_assert_eq!(diff_configuration(&current, &reversed, &inventory), diff);
+    }
+
+    #[test]
+    fn property_voice_preview_fits_discord_limit(
+        current in config_strategy(),
+        mut incoming in config_strategy(),
+        games in proptest::collection::vec(".{0,300}", 0..40),
+        max_lines in 0usize..64,
+    ) {
+        let inventory = inventory();
+        incoming.aliases.extend(games.into_iter().map(|game| GameAlias {
+            game,
+            alias: "x".to_owned(),
+        }));
+        let diff = diff_configuration(&current, &incoming, &inventory);
+        let preview = render_preview(&diff, max_lines);
+        prop_assert!(preview.encode_utf16().count() <= PREVIEW_CHAR_LIMIT);
+        prop_assert!(preview.chars().count() <= PREVIEW_CHAR_LIMIT);
+        if diff.is_empty() {
+            prop_assert_eq!(preview, "No changes");
         } else {
-            "General".to_owned()
-        };
-        for (i, drop) in removals.iter().enumerate() {
-            match i % 4 {
-                0 if *drop && !incoming.creators.is_empty() => { incoming.creators.pop(); }
-                1 if *drop && !incoming.aliases.is_empty() => { incoming.aliases.pop(); }
-                2 if *drop && !incoming.lists.is_empty() => { incoming.lists.pop(); }
-                3 if *drop && !incoming.templates.is_empty() => { incoming.templates.pop(); }
-                _ => {}
+            let mut lines = preview.lines();
+            prop_assert!(lines.next().unwrap().starts_with("Import preview: "));
+            let rest: Vec<&str> = lines.collect();
+            prop_assert!(rest.len() <= max_lines + 1);
+            for line in rest {
+                prop_assert!(
+                    ["+ ", "- ", "~ ", "! "].iter().any(|sign| line.starts_with(sign))
+                        || (line.starts_with('+') && line.ends_with(" more")),
+                    "unexpected line {:?}",
+                    line
+                );
             }
         }
-        prop_assert!(validate_configuration(&incoming, &inventory).is_ok());
-        let diff = diff_configuration(&current, &incoming, &inventory);
-        let applied = apply_diff(&current, &diff);
-        let mut expected = incoming.clone();
-        sort_configuration(&mut expected);
-        let mut applied_sorted = applied.clone();
-        sort_configuration(&mut applied_sorted);
-        prop_assert_eq!(applied_sorted, expected);
-        // The applied result revalidates: the diff never invents IDs.
-        prop_assert!(validate_configuration(&applied, &inventory).is_ok());
-        // Entry order is insignificant: shuffling changes nothing.
-        let mut shuffled = incoming.clone();
-        shuffled.creators.reverse();
-        shuffled.aliases.reverse();
-        prop_assert_eq!(diff_configuration(&current, &shuffled, &inventory), diff);
-    }
-
-    #[test]
-    fn property_voice_preview_never_exceeds_limit(
-        lines in 0usize..32,
-        extra in proptest::collection::vec(0u8..8, 0..64),
-    ) {
-        let (current, inventory) = fixture();
-        let mut incoming = current.clone();
-        for (i, byte) in extra.iter().enumerate() {
-            incoming.aliases.push(two_bot_core::voice_config::GameAlias {
-                game: format!("game {i} {byte}"),
-                alias: format!("alias {i}"),
-            });
-        }
-        let diff = diff_configuration(&current, &incoming, &inventory);
-        let preview = render_preview(&diff, lines);
-        prop_assert!(preview.chars().count() <= PREVIEW_CHAR_LIMIT);
     }
 }
 
-// Synthetic IDs only, mirroring the codec fixture. No Discord or DB.
+#[test]
+fn golden_full_preview_reports_every_section() {
+    let (current, inventory) = fixture();
+    let mut incoming = current.clone();
+    incoming.creators[0].default_limit = 4;
+    incoming
+        .creators
+        .push(creator("106", PermissionSource::Creator {}));
+    incoming.templates.retain(|t| t.channel_id != "102");
+    incoming.templates[0].name_template = "renamed".to_owned();
+    incoming.aliases = vec![alias("A game", "changed"), alias("B game", "new")];
+    incoming.lists = vec![];
+    incoming.logging = None;
+    incoming.settings.unique_names = false;
+
+    let diff = diff_configuration(&current, &incoming, &inventory);
+    assert_eq!(diff.creators.changed[0].fields, ["default_limit"]);
+    assert_eq!(diff.templates.changed[0].fields, ["name_template"]);
+    assert_eq!(diff.settings.as_ref().unwrap().fields, ["unique_names"]);
+    assert!(diff.skipped_unknown_channels.is_empty());
+    assert_eq!(
+        render_preview(&diff, usize::MAX),
+        "Import preview: 9 changes, 0 unknown channels skipped\n\
+         ~ creator 101 (default_limit)\n\
+         + creator 106\n\
+         - template 102\n\
+         ~ template 103 (name_template)\n\
+         ~ alias \"A game\" (alias)\n\
+         + alias \"B game\"\n\
+         - list \"rooms\"\n\
+         - logging\n\
+         ~ settings (unique_names)"
+    );
+
+    let applied = apply_diff(&current, &diff);
+    let mut expected = incoming;
+    sort_configuration(&mut expected);
+    assert_eq!(applied, expected);
+    export_configuration(&applied, &inventory).unwrap();
+}
+
+#[test]
+fn golden_unknown_channels_are_reported_and_skipped() {
+    let (current, inventory) = fixture();
+    let mut incoming = current.clone();
+    incoming
+        .creators
+        .push(creator("999", PermissionSource::Creator {}));
+    incoming.creators[0].permission_source = PermissionSource::Channel {
+        channel_id: "998".to_owned(),
+    };
+    incoming.templates.push(template("997"));
+    incoming.logging.as_mut().unwrap().channel_id = "996".to_owned();
+
+    let diff = diff_configuration(&current, &incoming, &inventory);
+    assert_eq!(diff.skipped_unknown_channels, ["996", "997", "998", "999"]);
+    // Known IDs are never reported as skipped, even when their entry was.
+    assert!(!diff.skipped_unknown_channels.contains(&"101".to_owned()));
+    // Import replaces the configuration, so a skipped entry leaves the
+    // current entry under the same key to be removed.
+    assert_eq!(
+        render_preview(&diff, usize::MAX),
+        "Import preview: 2 changes, 4 unknown channels skipped\n\
+         - creator 101\n\
+         - logging\n\
+         ! skipped unknown channel 996\n\
+         ! skipped unknown channel 997\n\
+         ! skipped unknown channel 998\n\
+         ! skipped unknown channel 999"
+    );
+
+    let (remaining, skipped) = skip_unknown_channels(&incoming, &inventory);
+    assert_eq!(skipped, diff.skipped_unknown_channels);
+    validate_configuration(&remaining, &inventory).unwrap();
+    assert_eq!(apply_diff(&current, &diff), remaining);
+}
+
+#[test]
+fn skipped_only_diff_is_not_empty() {
+    let (current, inventory) = fixture();
+    let mut incoming = current.clone();
+    incoming.templates.push(template("997"));
+    let diff = diff_configuration(&current, &incoming, &inventory);
+    assert_eq!(diff.change_count(), 0);
+    assert!(!diff.is_empty());
+    assert_eq!(
+        render_preview(&diff, 10),
+        "Import preview: 0 changes, 1 unknown channel skipped\n\
+         ! skipped unknown channel 997"
+    );
+    assert_eq!(apply_diff(&current, &diff), current);
+}
+
+#[test]
+fn empty_diff_renders_no_changes() {
+    let (current, inventory) = fixture();
+    let diff = diff_configuration(&current, &current, &inventory);
+    assert!(diff.is_empty());
+    assert_eq!(render_preview(&diff, 10), "No changes");
+    assert_eq!(render_preview(&diff, 0), "No changes");
+    assert_eq!(apply_diff(&current, &diff), current);
+}
+
+#[test]
+fn diff_is_sorted_by_section_then_key() {
+    let (current, inventory) = fixture();
+    let mut incoming = current.clone();
+    incoming.aliases.push(alias("z game", "z"));
+    incoming.aliases.push(alias("a game", "a"));
+    incoming
+        .creators
+        .insert(0, creator("106", PermissionSource::Category {}));
+    incoming.creators[1].default_limit = 1;
+
+    let diff = diff_configuration(&current, &incoming, &inventory);
+    let games: Vec<&str> = diff.aliases.added.iter().map(|a| a.game.as_str()).collect();
+    assert_eq!(games, ["a game", "z game"]);
+    assert_eq!(
+        render_preview(&diff, usize::MAX),
+        "Import preview: 4 changes, 0 unknown channels skipped\n\
+         ~ creator 101 (default_limit)\n\
+         + creator 106\n\
+         + alias \"a game\"\n\
+         + alias \"z game\""
+    );
+}
+
+#[test]
+fn preview_truncates_with_more_and_stays_within_limit() {
+    let (current, inventory) = fixture();
+    let mut incoming = current.clone();
+    for i in 0..40 {
+        incoming
+            .aliases
+            .push(alias(&format!("game {i:02}"), &format!("alias {i:02}")));
+    }
+    let diff = diff_configuration(&current, &incoming, &inventory);
+    assert_eq!(
+        render_preview(&diff, 5),
+        "Import preview: 40 changes, 0 unknown channels skipped\n\
+         + alias \"game 00\"\n\
+         + alias \"game 01\"\n\
+         + alias \"game 02\"\n\
+         + alias \"game 03\"\n\
+         + alias \"game 04\"\n\
+         +35 more"
+    );
+    assert_eq!(
+        render_preview(&diff, 0),
+        "Import preview: 40 changes, 0 unknown channels skipped\n+40 more"
+    );
+    assert!(!render_preview(&diff, 40).contains("more"));
+
+    // Many wide entries: the limit, not max_lines, decides how many show.
+    let mut wide = current.clone();
+    for i in 0..3000 {
+        wide.aliases
+            .push(alias(&format!("{i:04} {}", "🎮".repeat(70)), "x"));
+    }
+    let diff = diff_configuration(&current, &wide, &inventory);
+    let preview = render_preview(&diff, usize::MAX);
+    assert!(preview.encode_utf16().count() <= PREVIEW_CHAR_LIMIT);
+    let shown = preview
+        .lines()
+        .filter(|line| line.starts_with("+ "))
+        .count();
+    let hidden: usize = preview
+        .lines()
+        .last()
+        .and_then(|line| line.strip_prefix('+')?.strip_suffix(" more"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(shown > 0);
+    assert_eq!(shown + hidden, 3000);
+}
+
+#[test]
+fn uploaded_text_cannot_break_the_layout() {
+    let (current, inventory) = fixture();
+    let mut incoming = current.clone();
+    incoming.aliases = vec![alias("line\nbreak \"q\"", "x")];
+    incoming.templates.push(template("not\na snowflake"));
+    incoming.lists[0].name = "y".repeat(500);
+
+    let preview = render_preview(
+        &diff_configuration(&current, &incoming, &inventory),
+        usize::MAX,
+    );
+    let lines: Vec<&str> = preview.lines().collect();
+    let long_list = format!("+ list \"{}\"…", "y".repeat(80));
+    assert_eq!(
+        lines[1..],
+        [
+            "- alias \"A game\"",
+            "+ alias \"line\\nbreak \\\"q\\\"\"",
+            "- list \"rooms\"",
+            long_list.as_str(),
+            "! skipped unknown channel \"not\\na snowflake\"",
+        ]
+    );
+}
+
+fn inject_unknown_channels(config: &mut VoiceConfiguration, unknown: [bool; 4]) -> Vec<String> {
+    let mut skipped = Vec::new();
+    if unknown[0] && config.logging.is_some() {
+        config.logging.as_mut().unwrap().channel_id = "996".to_owned();
+        skipped.push("996".to_owned());
+    }
+    if unknown[1] {
+        config.templates.push(template("997"));
+        skipped.push("997".to_owned());
+    }
+    if unknown[2] && !config.creators.is_empty() {
+        config.creators[0].permission_source = PermissionSource::Channel {
+            channel_id: "998".to_owned(),
+        };
+        skipped.push("998".to_owned());
+    }
+    if unknown[3] {
+        config
+            .creators
+            .push(creator("999", PermissionSource::Creator {}));
+        skipped.push("999".to_owned());
+    }
+    skipped
+}
+
+fn config_strategy() -> impl Strategy<Value = VoiceConfiguration> {
+    (
+        proptest::option::of(creator_strategy("101")),
+        proptest::option::of(creator_strategy("106")),
+        proptest::option::of(template_strategy("102")),
+        proptest::option::of(template_strategy("103")),
+        proptest::option::of(template_strategy("108")),
+        proptest::collection::btree_map("[ab]{1,2}", "[xy]", 0..4),
+        proptest::collection::btree_map("[ab]{1,2}", proptest::collection::vec("[pq]", 1..3), 0..3),
+        proptest::option::of(logging_strategy()),
+        settings_strategy(),
+    )
+        .prop_map(
+            |(first, second, voice, stage, other, aliases, lists, logging, settings)| {
+                VoiceConfiguration {
+                    version: 1,
+                    guild_id: GUILD.to_owned(),
+                    creators: [first, second].into_iter().flatten().collect(),
+                    templates: [voice, stage, other].into_iter().flatten().collect(),
+                    aliases: aliases
+                        .into_iter()
+                        .map(|(game, alias)| GameAlias { game, alias })
+                        .collect(),
+                    lists: lists
+                        .into_iter()
+                        .map(|(name, choices)| RandomList { name, choices })
+                        .collect(),
+                    logging,
+                    settings,
+                }
+            },
+        )
+}
+
+// Small value domains so both sides often share keys and values.
+fn creator_strategy(channel_id: &'static str) -> impl Strategy<Value = CreatorConfiguration> {
+    (
+        prop::sample::select(vec!["##", "@@owner@@ ##"]),
+        any::<[bool; 6]>(),
+        prop::sample::select(vec![
+            PermissionSource::Creator {},
+            PermissionSource::Category {},
+            PermissionSource::Channel {
+                channel_id: "105".to_owned(),
+            },
+            PermissionSource::Channel {
+                channel_id: "104".to_owned(),
+            },
+        ]),
+    )
+        .prop_map(
+            move |(name, flags, permission_source)| CreatorConfiguration {
+                channel_id: channel_id.to_owned(),
+                name_template: name.to_owned(),
+                status_template: flags[0].then(|| "@@game_name@@".to_owned()),
+                default_limit: if flags[1] { 4 } else { 0 },
+                always_private: flags[2],
+                text_channels: flags[3],
+                position: if flags[4] {
+                    RoomPosition::Below
+                } else {
+                    RoomPosition::Above
+                },
+                first_number: 1,
+                group_by_category: flags[5],
+                permission_source,
+            },
+        )
+}
+
+fn template_strategy(channel_id: &'static str) -> impl Strategy<Value = ChannelTemplates> {
+    (
+        prop::sample::select(vec!["@@num@@", "Stage"]),
+        any::<bool>(),
+    )
+        .prop_map(move |(name, status)| ChannelTemplates {
+            channel_id: channel_id.to_owned(),
+            name_template: name.to_owned(),
+            status_template: status.then(|| "LIVE".to_owned()),
+        })
+}
+
+fn logging_strategy() -> impl Strategy<Value = LoggingConfiguration> {
+    (
+        prop::sample::select(vec!["104", "107"]),
+        prop::sample::select(vec![LogDetail::Errors, LogDetail::Verbose]),
+        any::<bool>(),
+        role_ids(),
+    )
+        .prop_map(
+            |(channel_id, detail, mention, mention_role_ids)| LoggingConfiguration {
+                channel_id: channel_id.to_owned(),
+                detail,
+                mention_member_ids: if mention {
+                    vec!["301".to_owned()]
+                } else {
+                    vec![]
+                },
+                mention_role_ids,
+            },
+        )
+}
+
+fn settings_strategy() -> impl Strategy<Value = GuildSettings> {
+    (
+        any::<[bool; 4]>(),
+        prop::sample::select(vec!["General", "Lobby"]),
+        prop::sample::select(vec!["Europe/London", "UTC"]),
+        proptest::option::of(prop::sample::select(vec!["201", GUILD])),
+        proptest::collection::btree_map(
+            prop::sample::select(vec!["kick", "lock"]),
+            role_ids(),
+            0..3,
+        ),
+    )
+        .prop_map(
+            |(flags, no_game_label, time_zone, command_role_id, command_roles)| GuildSettings {
+                creation_enabled: flags[0],
+                unique_names: flags[1],
+                no_game_label: no_game_label.to_owned(),
+                force_single_game: flags[2],
+                count_members_without_activity: flags[3],
+                time_zone: time_zone.to_owned(),
+                text_channel_name: "voice-chat".to_owned(),
+                text_viewer_role_id: None,
+                command_role_id: command_role_id.map(str::to_owned),
+                command_roles: command_roles
+                    .into_iter()
+                    .map(|(command, role_ids)| CommandRoles {
+                        command: command.to_owned(),
+                        role_ids,
+                    })
+                    .collect(),
+            },
+        )
+}
+
+fn role_ids() -> impl Strategy<Value = Vec<String>> {
+    prop::sample::select(vec![vec![], vec!["201"], vec!["201", GUILD]])
+        .prop_map(|ids| ids.into_iter().map(str::to_owned).collect())
+}
+
+fn creator(channel_id: &str, permission_source: PermissionSource) -> CreatorConfiguration {
+    CreatorConfiguration {
+        channel_id: channel_id.to_owned(),
+        name_template: "new".to_owned(),
+        status_template: None,
+        default_limit: 0,
+        always_private: false,
+        text_channels: false,
+        position: RoomPosition::Below,
+        first_number: 1,
+        group_by_category: false,
+        permission_source,
+    }
+}
+
+fn template(channel_id: &str) -> ChannelTemplates {
+    ChannelTemplates {
+        channel_id: channel_id.to_owned(),
+        name_template: "ghost".to_owned(),
+        status_template: None,
+    }
+}
+
+fn alias(game: &str, alias: &str) -> GameAlias {
+    GameAlias {
+        game: game.to_owned(),
+        alias: alias.to_owned(),
+    }
+}
+
+fn sort_configuration(config: &mut VoiceConfiguration) {
+    config.creators.sort_by_key(|c| c.channel_id.clone());
+    config.templates.sort_by_key(|t| t.channel_id.clone());
+    config.aliases.sort_by_key(|a| a.game.clone());
+    config.lists.sort_by_key(|l| l.name.clone());
+}
+
+// The codec's synthetic fixture. No Discord or DB.
 fn fixture() -> (VoiceConfiguration, GuildInventory) {
     let config = serde_json::from_value(json!({
         "version": 1,
-        "guild_id": "18446744073709551615",
+        "guild_id": GUILD,
         "creators": [{
             "channel_id": "101",
             "name_template": "@@random_emoji@@ @@owner@@'s [[den/crew/lair]] ##",
@@ -114,7 +530,7 @@ fn fixture() -> (VoiceConfiguration, GuildInventory) {
             "count_members_without_activity": true,
             "time_zone": "Europe/London",
             "text_channel_name": "voice-chat",
-            "text_viewer_role_id": "18446744073709551615",
+            "text_viewer_role_id": GUILD,
             "command_role_id": "201",
             "command_roles": [{"command": "kick", "role_ids": ["201"]}]
         }
@@ -123,260 +539,36 @@ fn fixture() -> (VoiceConfiguration, GuildInventory) {
     (config, inventory())
 }
 
-fn extended_inventory() -> GuildInventory {
-    let mut inventory = inventory();
-    let guild_id = inventory.guild_id.clone();
-    for (id, kind) in [
-        ("106", ChannelKind::Voice),
-        ("107", ChannelKind::Text),
-        ("108", ChannelKind::Stage),
-    ] {
-        inventory.channels.insert(
-            id.to_owned(),
-            ChannelReference {
-                guild_id: guild_id.clone(),
-                kind,
-            },
-        );
-    }
-    inventory
-}
-
+// The codec fixture's inventory plus spare voice/text/stage channels.
 fn inventory() -> GuildInventory {
-    let guild_id = "18446744073709551615".to_owned();
     let channels = [
         ("101", ChannelKind::Voice),
         ("102", ChannelKind::Voice),
         ("103", ChannelKind::Stage),
         ("104", ChannelKind::Text),
         ("105", ChannelKind::Category),
+        ("106", ChannelKind::Voice),
+        ("107", ChannelKind::Text),
+        ("108", ChannelKind::Stage),
     ]
     .into_iter()
     .map(|(id, kind)| {
         (
             id.to_owned(),
             ChannelReference {
-                guild_id: guild_id.clone(),
+                guild_id: GUILD.to_owned(),
                 kind,
             },
         )
     })
     .collect();
     GuildInventory {
-        guild_id: guild_id.clone(),
+        guild_id: GUILD.to_owned(),
         channels,
         roles: BTreeMap::from([
-            ("201".to_owned(), guild_id.clone()),
-            (guild_id.clone(), guild_id.clone()),
+            ("201".to_owned(), GUILD.to_owned()),
+            (GUILD.to_owned(), GUILD.to_owned()),
         ]),
-        members: BTreeMap::from([("301".to_owned(), guild_id)]),
+        members: BTreeMap::from([("301".to_owned(), GUILD.to_owned())]),
     }
-}
-
-fn sort_configuration(config: &mut VoiceConfiguration) {
-    config
-        .creators
-        .sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
-    config
-        .templates
-        .sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
-    config.aliases.sort_by(|a, b| a.game.cmp(&b.game));
-    config.lists.sort_by(|a, b| a.name.cmp(&b.name));
-}
-
-#[test]
-fn golden_full_preview_reports_every_section() {
-    let (current, _) = fixture();
-    let inventory = extended_inventory();
-    let mut incoming = current.clone();
-    incoming.creators[0].default_limit = 4;
-    incoming.creators.push(
-        serde_json::from_value(json!({
-            "channel_id": "106",
-            "name_template": "new",
-            "status_template": null,
-            "default_limit": 0,
-            "always_private": false,
-            "text_channels": false,
-            "position": "below",
-            "first_number": 1,
-            "group_by_category": false,
-            "permission_source": {"kind": "creator"}
-        }))
-        .unwrap(),
-    );
-    incoming.templates.retain(|t| t.channel_id != "102");
-    incoming.templates[0].name_template = "renamed".to_owned();
-    incoming.aliases = vec![
-        serde_json::from_value(json!({"game": "A game", "alias": "changed"})).unwrap(),
-        serde_json::from_value(json!({"game": "B game", "alias": "new"})).unwrap(),
-    ];
-    incoming.lists = vec![];
-    incoming.logging = None;
-    incoming.settings.unique_names = false;
-
-    let diff = diff_configuration(&current, &incoming, &inventory);
-    assert_eq!(diff.creators_added.len(), 1);
-    assert_eq!(diff.creators_changed.len(), 1);
-    assert_eq!(diff.creators_changed[0].fields, ["default_limit"]);
-    assert_eq!(diff.templates_removed.len(), 1);
-    assert_eq!(diff.templates_changed.len(), 1);
-    assert_eq!(diff.aliases_added.len(), 1);
-    assert_eq!(diff.aliases_changed.len(), 1);
-    assert_eq!(diff.lists_removed.len(), 1);
-    assert!(diff.logging_removed.is_some());
-    assert!(diff.settings_changed.is_some());
-    assert!(diff.skipped_unknown_channels.is_empty());
-
-    let preview = render_preview(&diff, usize::MAX);
-    for line in [
-        "+ creator 106",
-        "~ creator 101 (default_limit)",
-        "~ template 103 (name_template)",
-        "- template 102",
-        "+ alias \"B game\"",
-        "~ alias \"A game\"",
-        "- list rooms",
-        "- logging",
-        "~ settings (unique_names)",
-    ] {
-        assert!(preview.contains(line), "missing {line} in:\n{preview}");
-    }
-    assert!(preview.chars().count() <= PREVIEW_CHAR_LIMIT);
-
-    // Applying reaches the incoming exactly (sorted deterministically).
-    let applied = apply_diff(&current, &diff);
-    let mut expected = incoming.clone();
-    sort_configuration(&mut expected);
-    let mut applied_sorted = applied.clone();
-    sort_configuration(&mut applied_sorted);
-    assert_eq!(applied_sorted, expected);
-    validate_configuration(&applied, &inventory).unwrap();
-    export_configuration(&applied, &inventory).unwrap();
-}
-
-#[test]
-fn unknown_channels_are_reported_and_skipped() {
-    let (current, inventory) = fixture();
-    let mut incoming = current.clone();
-    incoming.creators.push(
-        serde_json::from_value(json!({
-            "channel_id": "999",
-            "name_template": "ghost",
-            "status_template": null,
-            "default_limit": 0,
-            "always_private": false,
-            "text_channels": false,
-            "position": "above",
-            "first_number": 1,
-            "group_by_category": false,
-            "permission_source": {"kind": "creator"}
-        }))
-        .unwrap(),
-    );
-    incoming.creators[0].permission_source =
-        serde_json::from_value(json!({"kind": "channel", "channel_id": "998"})).unwrap();
-    // Push (don't mutate in place): mutating a key would also remove the old
-    // key, so a push keeps the current config untouched after apply.
-    incoming.templates.push(
-        serde_json::from_value(
-            json!({"channel_id": "997", "name_template": "ghost", "status_template": null}),
-        )
-        .unwrap(),
-    );
-    incoming.logging.as_mut().unwrap().channel_id = "996".to_owned();
-
-    let diff = diff_configuration(&current, &incoming, &inventory);
-    assert_eq!(
-        diff.skipped_unknown_channels,
-        ["101", "996", "997", "998", "999"]
-    );
-    assert!(diff.creators_added.is_empty());
-    // The known creator 101 keeps its usable shape: the skipped
-    // permission-source edit is not applied as a change.
-    assert!(diff.creators_changed.is_empty());
-    assert!(diff.templates_added.is_empty());
-    assert!(diff.templates_changed.is_empty());
-    assert!(diff.logging_changed.is_none());
-    assert!(diff.logging_removed.is_none());
-
-    let preview = render_preview(&diff, usize::MAX);
-    for id in ["101", "996", "997", "998", "999"] {
-        assert!(
-            preview.contains(&format!("! skipped channel {id}")),
-            "missing skip {id} in:\n{preview}"
-        );
-    }
-    // Applying the diff leaves the current config untouched.
-    assert_eq!(apply_diff(&current, &diff), current);
-}
-
-#[test]
-fn diff_ordering_is_deterministic_by_section_then_id() {
-    let (current, _) = fixture();
-    let inventory = extended_inventory();
-    let mut incoming = current.clone();
-    // Insert in reverse order; the diff must still sort ascending.
-    incoming
-        .aliases
-        .push(serde_json::from_value(json!({"game": "z game", "alias": "z"})).unwrap());
-    incoming
-        .aliases
-        .push(serde_json::from_value(json!({"game": "a game", "alias": "a"})).unwrap());
-    // A creator change plus an alias change checks section order too.
-    incoming.creators[0].default_limit = 1;
-    let diff = diff_configuration(&current, &incoming, &inventory);
-    assert_eq!(
-        diff.aliases_added
-            .iter()
-            .map(|a| a.game.as_str())
-            .collect::<Vec<_>>(),
-        ["a game", "z game"]
-    );
-    let preview = render_preview(&diff, usize::MAX);
-    let creator_pos = preview.find("creator").unwrap();
-    let alias_pos = preview.find("alias").unwrap();
-    assert!(creator_pos < alias_pos, "sections out of order:\n{preview}");
-}
-
-#[test]
-fn empty_diff_renders_no_changes() {
-    let (current, inventory) = fixture();
-    let diff = diff_configuration(&current, &current, &inventory);
-    assert!(diff.is_empty());
-    assert_eq!(render_preview(&diff, 10), "No changes");
-    assert_eq!(apply_diff(&current, &diff), current);
-}
-
-#[test]
-fn preview_truncates_with_more_and_stays_within_limit() {
-    let (current, inventory) = fixture();
-    let mut incoming = current.clone();
-    for i in 0..40 {
-        incoming
-            .aliases
-            .push(two_bot_core::voice_config::GameAlias {
-                game: format!("game {i:02}"),
-                alias: format!("alias {i:02}"),
-            });
-    }
-    let diff = diff_configuration(&current, &incoming, &inventory);
-    let preview = render_preview(&diff, 5);
-    assert!(
-        preview.contains("+36 more"),
-        "missing trailer in:\n{preview}"
-    );
-    assert_eq!(preview.lines().count(), 1 + 4 + 1);
-    assert!(preview.chars().count() <= PREVIEW_CHAR_LIMIT);
-
-    // max_lines 0 still reports the count without entry lines.
-    let hidden = render_preview(&diff, 0);
-    assert!(hidden.contains("+40 more"));
-    assert_eq!(hidden.lines().count(), 2);
-
-    // A pathological single entry still fits the Discord limit.
-    let mut wide = current.clone();
-    wide.lists[0].choices = vec!["x".repeat(5000)];
-    let wide_diff = diff_configuration(&current, &wide, &inventory);
-    assert!(render_preview(&wide_diff, usize::MAX).chars().count() <= PREVIEW_CHAR_LIMIT);
 }

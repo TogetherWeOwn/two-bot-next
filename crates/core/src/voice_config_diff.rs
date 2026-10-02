@@ -1,763 +1,545 @@
-//! Pure V11 import diff preview, built from `docs/voice-rooms.md` §V11 only.
+//! Pure V11 import diff preview, written from `docs/voice-rooms.md` §V11 only.
 //!
-//! The caller supplies the current configuration, a candidate incoming
-//! configuration and a trusted guild inventory. This module performs no I/O,
-//! no Discord work and no persistence. It never validates beyond unknown
-//! channel detection; the parent must revalidate the filtered candidate with
-//! `voice_config::validate_configuration` before confirmation.
-//!
-//! Semantics: incoming entries that reference a channel ID absent from the
-//! inventory are reported in `skipped_unknown_channels` and excluded from the
-//! change lists. The diff is computed between `current` and the filtered
-//! incoming, so `apply_diff(current, diff)` equals the incoming with skipped
-//! entries dropped (sorted deterministically). Entry order in the input lists
-//! is insignificant; only keyed membership and values are compared.
+//! The caller supplies the current configuration, an incoming candidate and a
+//! trusted guild inventory. Incoming entries that reference a channel ID absent
+//! from the inventory are reported and skipped; the diff compares `current`
+//! with what remains. No Discord, persistence or I/O lives here, and nothing is
+//! validated beyond channel presence: the integration layer revalidates the
+//! remaining candidate with `voice_config::validate_configuration` before it
+//! asks for confirmation and again before it writes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use crate::voice_config::{
     ChannelTemplates, CreatorConfiguration, GameAlias, GuildInventory, GuildSettings,
     LoggingConfiguration, PermissionSource, RandomList, VoiceConfiguration,
 };
 
-/// One changed creator entry with the field names that differ.
+/// Discord's message length limit, applied to the whole preview body.
+pub const PREVIEW_CHAR_LIMIT: usize = 2000;
+
+/// No single preview line is longer than this many characters.
+const LINE_CHAR_LIMIT: usize = 200;
+
+/// Free-text keys (game and list names) are shown up to this many characters.
+const KEY_CHAR_LIMIT: usize = 80;
+
+/// One keyed entry present on both sides with a different value. `fields`
+/// names the differing fields in declaration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatorChanged {
-    pub channel_id: String,
-    pub before: CreatorConfiguration,
-    pub after: CreatorConfiguration,
+pub struct EntryChange<T> {
+    pub key: String,
+    pub before: T,
+    pub after: T,
     pub fields: Vec<&'static str>,
 }
 
-/// One changed standalone-template entry.
+/// Added, removed and changed entries of one section, each sorted by key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TemplateChanged {
-    pub channel_id: String,
-    pub before: ChannelTemplates,
-    pub after: ChannelTemplates,
-    pub fields: Vec<&'static str>,
+pub struct SectionDiff<T> {
+    pub added: Vec<T>,
+    pub removed: Vec<T>,
+    pub changed: Vec<EntryChange<T>>,
 }
 
-/// One changed alias entry (`game` is the key).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AliasChanged {
-    pub game: String,
-    pub before: GameAlias,
-    pub after: GameAlias,
+impl<T> Default for SectionDiff<T> {
+    fn default() -> Self {
+        Self {
+            added: Vec::new(),
+            removed: Vec::new(),
+            changed: Vec::new(),
+        }
+    }
 }
 
-/// One changed named-list entry (`name` is the key).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListChanged {
-    pub name: String,
-    pub before: RandomList,
-    pub after: RandomList,
+impl<T> SectionDiff<T> {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.added.len() + self.removed.len() + self.changed.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
-/// Changed logging configuration (singleton section).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoggingChanged {
-    pub before: LoggingConfiguration,
-    pub after: LoggingConfiguration,
-    pub fields: Vec<&'static str>,
-}
-
-/// Changed guild settings (singleton section).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SettingsChanged {
-    pub before: GuildSettings,
-    pub after: GuildSettings,
-    pub fields: Vec<&'static str>,
-}
-
-/// Deterministic diff between `current` and the filtered `incoming`.
-///
-/// All lists are sorted by their key. Section order for rendering is
-/// creators, templates, aliases, lists, logging, settings, then skipped.
+/// Deterministic difference between `current` and the incoming candidate after
+/// unknown-channel entries are skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigDiff {
-    pub creators_added: Vec<CreatorConfiguration>,
-    pub creators_removed: Vec<CreatorConfiguration>,
-    pub creators_changed: Vec<CreatorChanged>,
-    pub templates_added: Vec<ChannelTemplates>,
-    pub templates_removed: Vec<ChannelTemplates>,
-    pub templates_changed: Vec<TemplateChanged>,
-    pub aliases_added: Vec<GameAlias>,
-    pub aliases_removed: Vec<GameAlias>,
-    pub aliases_changed: Vec<AliasChanged>,
-    pub lists_added: Vec<RandomList>,
-    pub lists_removed: Vec<RandomList>,
-    pub lists_changed: Vec<ListChanged>,
-    pub logging_added: Option<LoggingConfiguration>,
-    pub logging_removed: Option<LoggingConfiguration>,
-    pub logging_changed: Option<LoggingChanged>,
-    pub settings_changed: Option<SettingsChanged>,
-    /// Sorted unique IDs to report: unknown channel IDs referenced by
-    /// `incoming`, plus the keys of entries skipped because they touch an
-    /// unknown channel (for example a creator whose permission-source channel
-    /// is unknown). Skipped entries are excluded from the change lists.
+    pub creators: SectionDiff<CreatorConfiguration>,
+    pub templates: SectionDiff<ChannelTemplates>,
+    pub aliases: SectionDiff<GameAlias>,
+    pub lists: SectionDiff<RandomList>,
+    /// A singleton section: at most one entry in total.
+    pub logging: SectionDiff<LoggingConfiguration>,
+    /// Settings always exist on both sides, so they can only change.
+    pub settings: Option<EntryChange<GuildSettings>>,
+    /// Sorted, unique channel IDs referenced by `incoming` but absent from the
+    /// inventory. Every entry referencing one was left out of the diff.
     pub skipped_unknown_channels: Vec<String>,
 }
 
 impl ConfigDiff {
-    /// Number of added/removed/changed entries, excluding skipped IDs.
+    /// Added, removed and changed entries across all sections.
     #[must_use]
     pub fn change_count(&self) -> usize {
-        self.creators_added.len()
-            + self.creators_removed.len()
-            + self.creators_changed.len()
-            + self.templates_added.len()
-            + self.templates_removed.len()
-            + self.templates_changed.len()
-            + self.aliases_added.len()
-            + self.aliases_removed.len()
-            + self.aliases_changed.len()
-            + self.lists_added.len()
-            + self.lists_removed.len()
-            + self.lists_changed.len()
-            + usize::from(self.logging_added.is_some())
-            + usize::from(self.logging_removed.is_some())
-            + usize::from(self.logging_changed.is_some())
-            + usize::from(self.settings_changed.is_some())
+        self.creators.len()
+            + self.templates.len()
+            + self.aliases.len()
+            + self.lists.len()
+            + self.logging.len()
+            + usize::from(self.settings.is_some())
     }
 
-    /// True when there is nothing to apply and nothing was skipped.
+    /// Nothing to apply and nothing skipped.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.change_count() == 0 && self.skipped_unknown_channels.is_empty()
     }
 }
 
-/// Discord's per-message character limit for the ephemeral preview body.
-pub const PREVIEW_CHAR_LIMIT: usize = 2000;
+/// Removes every incoming entry that references a channel ID absent from the
+/// inventory: a creator whose room or permission-source channel is unknown, a
+/// template on an unknown channel, and logging to an unknown channel. Returns
+/// the remaining candidate and the sorted, unique unknown IDs. Cross-guild or
+/// wrong-kind channels are present, so they stay for the codec to reject.
+#[must_use]
+pub fn skip_unknown_channels(
+    incoming: &VoiceConfiguration,
+    inventory: &GuildInventory,
+) -> (VoiceConfiguration, Vec<String>) {
+    let mut unknown = BTreeSet::new();
+    let mut known = |id: &str| {
+        let present = inventory.channels.contains_key(id);
+        if !present {
+            unknown.insert(id.to_owned());
+        }
+        present
+    };
+    let mut remaining = incoming.clone();
+    remaining.creators.retain(|creator| {
+        let room = known(&creator.channel_id);
+        let source = match &creator.permission_source {
+            PermissionSource::Channel { channel_id } => known(channel_id),
+            PermissionSource::Creator {} | PermissionSource::Category {} => true,
+        };
+        room && source
+    });
+    remaining
+        .templates
+        .retain(|template| known(&template.channel_id));
+    if remaining
+        .logging
+        .as_ref()
+        .is_some_and(|logging| !known(&logging.channel_id))
+    {
+        remaining.logging = None;
+    }
+    (remaining, unknown.into_iter().collect())
+}
 
-/// Compute the preview diff. Unknown-channel entries in `incoming` are
-/// collected into `skipped_unknown_channels` and excluded from the change
-/// lists. Duplicate keys behave as last-wins for diff purposes; the parent
-/// revalidation still rejects them.
+/// Compares `current` with `incoming` minus its unknown-channel entries.
+/// Entry order within a section is insignificant. A duplicated incoming key
+/// counts once (last wins); the codec rejects duplicates on revalidation.
 #[must_use]
 pub fn diff_configuration(
     current: &VoiceConfiguration,
     incoming: &VoiceConfiguration,
     inventory: &GuildInventory,
 ) -> ConfigDiff {
-    // Every incoming entry is keyed, but entries touching an unknown channel
-    // are skipped: they produce no add/remove/change and leave any current
-    // entry with the same key untouched.
-    let mut skipped: BTreeSet<String> = BTreeSet::new();
-    let incoming_creators: BTreeMap<&str, &CreatorConfiguration> = incoming
-        .creators
-        .iter()
-        .map(|c| (c.channel_id.as_str(), c))
-        .collect();
-    let skipped_creators: BTreeSet<&str> = incoming_creators
-        .values()
-        .filter(|c| !creator_usable(c, inventory))
-        .map(|c| c.channel_id.as_str())
-        .collect();
-    for creator in &skipped_creators {
-        skipped.insert((*creator).to_owned());
-    }
-    // The permission-source channel is not keyed by creator: the owning entry
-    // is already skipped with its own key above, so report the source too.
-    for creator in incoming_creators.values() {
-        if let PermissionSource::Channel { channel_id } = &creator.permission_source {
-            if !inventory.channels.contains_key(channel_id) {
-                skipped.insert(channel_id.clone());
-            }
-        }
-    }
-    let current_creators: BTreeMap<&str, &CreatorConfiguration> = current
-        .creators
-        .iter()
-        .map(|c| (c.channel_id.as_str(), c))
-        .collect();
-    let (creators_added, creators_removed, creators_changed) = diff_keyed(
-        &current_creators,
-        &incoming_creators,
-        &skipped_creators,
-        |id, before, after| CreatorChanged {
-            channel_id: (*id).to_owned(),
-            before: (*before).clone(),
-            after: (*after).clone(),
-            fields: creator_fields(before, after),
-        },
-    );
-
-    let incoming_templates: BTreeMap<&str, &ChannelTemplates> = incoming
-        .templates
-        .iter()
-        .map(|t| (t.channel_id.as_str(), t))
-        .collect();
-    let skipped_templates: BTreeSet<&str> = incoming_templates
-        .values()
-        .filter(|t| !inventory.channels.contains_key(&t.channel_id))
-        .map(|t| t.channel_id.as_str())
-        .collect();
-    for template in &skipped_templates {
-        skipped.insert((*template).to_owned());
-    }
-    let current_templates: BTreeMap<&str, &ChannelTemplates> = current
-        .templates
-        .iter()
-        .map(|t| (t.channel_id.as_str(), t))
-        .collect();
-    let (templates_added, templates_removed, templates_changed) = diff_keyed(
-        &current_templates,
-        &incoming_templates,
-        &skipped_templates,
-        |id, before, after| TemplateChanged {
-            channel_id: (*id).to_owned(),
-            before: (*before).clone(),
-            after: (*after).clone(),
-            fields: template_fields(before, after),
-        },
-    );
-
-    let current_aliases: BTreeMap<&str, &GameAlias> = current
-        .aliases
-        .iter()
-        .map(|a| (a.game.as_str(), a))
-        .collect();
-    let incoming_aliases: BTreeMap<&str, &GameAlias> = incoming
-        .aliases
-        .iter()
-        .map(|a| (a.game.as_str(), a))
-        .collect();
-    let (aliases_added, aliases_removed, aliases_changed) = diff_keyed(
-        &current_aliases,
-        &incoming_aliases,
-        &BTreeSet::new(),
-        |game, before, after| AliasChanged {
-            game: (*game).to_owned(),
-            before: (*before).clone(),
-            after: (*after).clone(),
-        },
-    );
-
-    let current_lists: BTreeMap<&str, &RandomList> =
-        current.lists.iter().map(|l| (l.name.as_str(), l)).collect();
-    let incoming_lists: BTreeMap<&str, &RandomList> = incoming
-        .lists
-        .iter()
-        .map(|l| (l.name.as_str(), l))
-        .collect();
-    let (lists_added, lists_removed, lists_changed) = diff_keyed(
-        &current_lists,
-        &incoming_lists,
-        &BTreeSet::new(),
-        |name, before, after| ListChanged {
-            name: (*name).to_owned(),
-            before: (*before).clone(),
-            after: (*after).clone(),
-        },
-    );
-
-    // A logging block whose channel is unknown is skipped, never applied.
-    if let Some(logging) = &incoming.logging {
-        if !inventory.channels.contains_key(&logging.channel_id) {
-            skipped.insert(logging.channel_id.clone());
-        }
-    }
-    let incoming_logging_known = incoming
-        .logging
-        .as_ref()
-        .filter(|l| inventory.channels.contains_key(&l.channel_id));
-    let incoming_logging_skipped = incoming.logging.is_some() && incoming_logging_known.is_none();
-    let (logging_added, logging_removed, logging_changed) = diff_singleton(
-        current.logging.as_ref(),
-        incoming_logging_known,
-        incoming_logging_skipped,
-        |before, after| LoggingChanged {
-            before: (*before).clone(),
-            after: (*after).clone(),
-            fields: logging_fields(before, after),
-        },
-    );
-
-    let settings_changed = if current.settings == incoming.settings {
-        None
-    } else {
-        Some(SettingsChanged {
-            before: current.settings.clone(),
-            after: incoming.settings.clone(),
-            fields: settings_fields(&current.settings, &incoming.settings),
-        })
-    };
-
+    let (incoming, skipped_unknown_channels) = skip_unknown_channels(incoming, inventory);
     ConfigDiff {
-        creators_added,
-        creators_removed,
-        creators_changed,
-        templates_added,
-        templates_removed,
-        templates_changed,
-        aliases_added,
-        aliases_removed,
-        aliases_changed,
-        lists_added,
-        lists_removed,
-        lists_changed,
-        logging_added,
-        logging_removed,
-        logging_changed,
-        settings_changed,
-        skipped_unknown_channels: skipped.into_iter().collect(),
+        creators: diff_section(&current.creators, &incoming.creators),
+        templates: diff_section(&current.templates, &incoming.templates),
+        aliases: diff_section(&current.aliases, &incoming.aliases),
+        lists: diff_section(&current.lists, &incoming.lists),
+        logging: diff_section(current.logging.as_slice(), incoming.logging.as_slice()),
+        settings: change(&current.settings, &incoming.settings),
+        skipped_unknown_channels,
     }
 }
 
-/// Apply a diff to `current`, yielding the filtered incoming in deterministic
-/// sorted order. `version` and `guild_id` are carried from `current`; the
-/// caller must ensure both sides target the same guild before diffing.
+/// Applies `diff` to `current`. For a diff produced against `current`, this
+/// equals the remaining incoming candidate with each section sorted by key.
+/// `version` and `guild_id` come from `current`.
 #[must_use]
 pub fn apply_diff(current: &VoiceConfiguration, diff: &ConfigDiff) -> VoiceConfiguration {
-    let mut creators: BTreeMap<&str, CreatorConfiguration> = current
-        .creators
-        .iter()
-        .map(|c| (c.channel_id.as_str(), c.clone()))
-        .collect();
-    for removed in &diff.creators_removed {
-        creators.remove(removed.channel_id.as_str());
-    }
-    for changed in &diff.creators_changed {
-        creators.insert(changed.channel_id.as_str(), changed.after.clone());
-    }
-    for added in &diff.creators_added {
-        creators.insert(added.channel_id.as_str(), added.clone());
-    }
-
-    let mut templates: BTreeMap<&str, ChannelTemplates> = current
-        .templates
-        .iter()
-        .map(|t| (t.channel_id.as_str(), t.clone()))
-        .collect();
-    for removed in &diff.templates_removed {
-        templates.remove(removed.channel_id.as_str());
-    }
-    for changed in &diff.templates_changed {
-        templates.insert(changed.channel_id.as_str(), changed.after.clone());
-    }
-    for added in &diff.templates_added {
-        templates.insert(added.channel_id.as_str(), added.clone());
-    }
-
-    let mut aliases: BTreeMap<&str, GameAlias> = current
-        .aliases
-        .iter()
-        .map(|a| (a.game.as_str(), a.clone()))
-        .collect();
-    for removed in &diff.aliases_removed {
-        aliases.remove(removed.game.as_str());
-    }
-    for changed in &diff.aliases_changed {
-        aliases.insert(changed.game.as_str(), changed.after.clone());
-    }
-    for added in &diff.aliases_added {
-        aliases.insert(added.game.as_str(), added.clone());
-    }
-
-    let mut lists: BTreeMap<&str, RandomList> = current
-        .lists
-        .iter()
-        .map(|l| (l.name.as_str(), l.clone()))
-        .collect();
-    for removed in &diff.lists_removed {
-        lists.remove(removed.name.as_str());
-    }
-    for changed in &diff.lists_changed {
-        lists.insert(changed.name.as_str(), changed.after.clone());
-    }
-    for added in &diff.lists_added {
-        lists.insert(added.name.as_str(), added.clone());
-    }
-
-    let logging = if let Some(added) = &diff.logging_added {
-        Some(added.clone())
-    } else if diff.logging_removed.is_some() {
-        None
-    } else if let Some(changed) = &diff.logging_changed {
-        Some(changed.after.clone())
-    } else {
-        current.logging.clone()
-    };
-    let settings = diff
-        .settings_changed
-        .as_ref()
-        .map_or_else(|| current.settings.clone(), |c| c.after.clone());
-
     VoiceConfiguration {
         version: current.version,
         guild_id: current.guild_id.clone(),
-        creators: creators.into_values().collect(),
-        templates: templates.into_values().collect(),
-        aliases: aliases.into_values().collect(),
-        lists: lists.into_values().collect(),
-        logging,
-        settings,
+        creators: apply_section(&current.creators, &diff.creators),
+        templates: apply_section(&current.templates, &diff.templates),
+        aliases: apply_section(&current.aliases, &diff.aliases),
+        lists: apply_section(&current.lists, &diff.lists),
+        logging: apply_section(current.logging.as_slice(), &diff.logging).pop(),
+        settings: diff
+            .settings
+            .as_ref()
+            .map_or_else(|| current.settings.clone(), |change| change.after.clone()),
     }
 }
 
-/// Compact ephemeral-message body. Shows at most `max_lines` entry lines in
-/// section-then-id order, then a `+N more` trailer. The result never exceeds
-/// [`PREVIEW_CHAR_LIMIT`] characters. An empty diff renders `No changes`.
+/// Compact ephemeral-message body: a summary line, then at most `max_lines`
+/// entry lines in section order (creators, templates, aliases, lists, logging,
+/// settings, skipped channels) and key order within a section, then `+N more`
+/// for the lines left out. The body never exceeds [`PREVIEW_CHAR_LIMIT`]
+/// characters. An empty diff renders `No changes`.
+///
+/// Free-text keys are quoted and escaped, but the text is not Markdown-escaped;
+/// send it with mentions disabled.
 #[must_use]
 pub fn render_preview(diff: &ConfigDiff, max_lines: usize) -> String {
     if diff.is_empty() {
         return "No changes".to_owned();
     }
-    let mut entries: Vec<String> = Vec::new();
-    push_merged(
-        &mut entries,
-        "creator",
-        diff.creators_added.iter().map(|c| c.channel_id.as_str()),
-        diff.creators_removed.iter().map(|c| c.channel_id.as_str()),
-        diff.creators_changed
-            .iter()
-            .map(|c| (c.channel_id.as_str(), join_fields(&c.fields))),
-    );
-    push_merged(
-        &mut entries,
-        "template",
-        diff.templates_added.iter().map(|c| c.channel_id.as_str()),
-        diff.templates_removed.iter().map(|c| c.channel_id.as_str()),
-        diff.templates_changed
-            .iter()
-            .map(|c| (c.channel_id.as_str(), join_fields(&c.fields))),
-    );
-    push_simple(
-        &mut entries,
-        "alias",
-        diff.aliases_added.iter().map(|a| display_key(&a.game)),
-        diff.aliases_removed.iter().map(|a| display_key(&a.game)),
-        diff.aliases_changed.iter().map(|c| display_key(&c.game)),
-    );
-    push_simple(
-        &mut entries,
-        "list",
-        diff.lists_added.iter().map(|l| display_key(&l.name)),
-        diff.lists_removed.iter().map(|l| display_key(&l.name)),
-        diff.lists_changed.iter().map(|c| display_key(&c.name)),
-    );
-    if diff.logging_added.is_some() {
-        entries.push("+ logging".to_owned());
-    } else if diff.logging_removed.is_some() {
-        entries.push("- logging".to_owned());
-    } else if let Some(changed) = &diff.logging_changed {
-        entries.push(truncate_line(&format!(
-            "~ logging ({})",
-            join_fields(&changed.fields)
-        )));
-    }
-    if let Some(changed) = &diff.settings_changed {
-        entries.push(truncate_line(&format!(
-            "~ settings ({})",
-            join_fields(&changed.fields)
-        )));
+    let mut lines = Vec::new();
+    section_lines(&mut lines, &diff.creators);
+    section_lines(&mut lines, &diff.templates);
+    section_lines(&mut lines, &diff.aliases);
+    section_lines(&mut lines, &diff.lists);
+    section_lines(&mut lines, &diff.logging);
+    if let Some(change) = &diff.settings {
+        lines.push(changed_line(change));
     }
     for id in &diff.skipped_unknown_channels {
-        entries.push(truncate_line(&format!("! skipped channel {id}")));
+        lines.push(cap_line(format!(
+            "! skipped unknown channel {}",
+            display_key(id)
+        )));
     }
-
-    let header = format!(
-        "Voice config import preview ({} changes):",
-        diff.change_count()
+    let skipped = diff.skipped_unknown_channels.len();
+    let summary = format!(
+        "Import preview: {}, {} skipped",
+        counted(diff.change_count(), "change"),
+        counted(skipped, "unknown channel"),
     );
-    fit_preview(&header, &entries, max_lines)
+    fit_preview(summary, &lines, max_lines)
 }
 
-fn join_fields(fields: &[&'static str]) -> String {
-    fields.join(", ")
+/// A keyed configuration entry. Singletons use their section name as the key.
+trait Entry: Clone + PartialEq {
+    const SECTION: &'static str;
+    const SINGLETON: bool = false;
+
+    fn key(&self) -> &str;
+
+    fn fields(&self, after: &Self) -> Vec<&'static str>;
 }
 
-/// Single-line display for free-text keys: newlines flattened, capped at 80
-/// characters and quoted when they contain spaces (readable in the preview).
-fn display_key(key: &str) -> String {
-    let flat: String = key
-        .chars()
-        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+impl Entry for CreatorConfiguration {
+    const SECTION: &'static str = "creator";
+
+    fn key(&self) -> &str {
+        &self.channel_id
+    }
+
+    fn fields(&self, after: &Self) -> Vec<&'static str> {
+        let Self {
+            channel_id: _,
+            name_template,
+            status_template,
+            default_limit,
+            always_private,
+            text_channels,
+            position,
+            first_number,
+            group_by_category,
+            permission_source,
+        } = self;
+        differing([
+            ("name_template", name_template != &after.name_template),
+            ("status_template", status_template != &after.status_template),
+            ("default_limit", default_limit != &after.default_limit),
+            ("always_private", always_private != &after.always_private),
+            ("text_channels", text_channels != &after.text_channels),
+            ("position", position != &after.position),
+            ("first_number", first_number != &after.first_number),
+            (
+                "group_by_category",
+                group_by_category != &after.group_by_category,
+            ),
+            (
+                "permission_source",
+                permission_source != &after.permission_source,
+            ),
+        ])
+    }
+}
+
+impl Entry for ChannelTemplates {
+    const SECTION: &'static str = "template";
+
+    fn key(&self) -> &str {
+        &self.channel_id
+    }
+
+    fn fields(&self, after: &Self) -> Vec<&'static str> {
+        let Self {
+            channel_id: _,
+            name_template,
+            status_template,
+        } = self;
+        differing([
+            ("name_template", name_template != &after.name_template),
+            ("status_template", status_template != &after.status_template),
+        ])
+    }
+}
+
+impl Entry for GameAlias {
+    const SECTION: &'static str = "alias";
+
+    fn key(&self) -> &str {
+        &self.game
+    }
+
+    fn fields(&self, after: &Self) -> Vec<&'static str> {
+        let Self { game: _, alias } = self;
+        differing([("alias", alias != &after.alias)])
+    }
+}
+
+impl Entry for RandomList {
+    const SECTION: &'static str = "list";
+
+    fn key(&self) -> &str {
+        &self.name
+    }
+
+    fn fields(&self, after: &Self) -> Vec<&'static str> {
+        let Self { name: _, choices } = self;
+        differing([("choices", choices != &after.choices)])
+    }
+}
+
+impl Entry for LoggingConfiguration {
+    const SECTION: &'static str = "logging";
+    const SINGLETON: bool = true;
+
+    fn key(&self) -> &str {
+        Self::SECTION
+    }
+
+    fn fields(&self, after: &Self) -> Vec<&'static str> {
+        let Self {
+            channel_id,
+            detail,
+            mention_member_ids,
+            mention_role_ids,
+        } = self;
+        differing([
+            ("channel_id", channel_id != &after.channel_id),
+            ("detail", detail != &after.detail),
+            (
+                "mention_member_ids",
+                mention_member_ids != &after.mention_member_ids,
+            ),
+            (
+                "mention_role_ids",
+                mention_role_ids != &after.mention_role_ids,
+            ),
+        ])
+    }
+}
+
+impl Entry for GuildSettings {
+    const SECTION: &'static str = "settings";
+    const SINGLETON: bool = true;
+
+    fn key(&self) -> &str {
+        Self::SECTION
+    }
+
+    fn fields(&self, after: &Self) -> Vec<&'static str> {
+        let Self {
+            creation_enabled,
+            unique_names,
+            no_game_label,
+            force_single_game,
+            count_members_without_activity,
+            time_zone,
+            text_channel_name,
+            text_viewer_role_id,
+            command_role_id,
+            command_roles,
+        } = self;
+        differing([
+            (
+                "creation_enabled",
+                creation_enabled != &after.creation_enabled,
+            ),
+            ("unique_names", unique_names != &after.unique_names),
+            ("no_game_label", no_game_label != &after.no_game_label),
+            (
+                "force_single_game",
+                force_single_game != &after.force_single_game,
+            ),
+            (
+                "count_members_without_activity",
+                count_members_without_activity != &after.count_members_without_activity,
+            ),
+            ("time_zone", time_zone != &after.time_zone),
+            (
+                "text_channel_name",
+                text_channel_name != &after.text_channel_name,
+            ),
+            (
+                "text_viewer_role_id",
+                text_viewer_role_id != &after.text_viewer_role_id,
+            ),
+            ("command_role_id", command_role_id != &after.command_role_id),
+            ("command_roles", command_roles != &after.command_roles),
+        ])
+    }
+}
+
+fn differing<const N: usize>(checks: [(&'static str, bool); N]) -> Vec<&'static str> {
+    checks
+        .into_iter()
+        .filter_map(|(field, differs)| differs.then_some(field))
+        .collect()
+}
+
+fn change<T: Entry>(before: &T, after: &T) -> Option<EntryChange<T>> {
+    (before != after).then(|| EntryChange {
+        key: after.key().to_owned(),
+        before: before.clone(),
+        after: after.clone(),
+        fields: before.fields(after),
+    })
+}
+
+fn by_key<T: Entry>(entries: &[T]) -> BTreeMap<&str, &T> {
+    entries.iter().map(|entry| (entry.key(), entry)).collect()
+}
+
+fn diff_section<T: Entry>(current: &[T], incoming: &[T]) -> SectionDiff<T> {
+    let current = by_key(current);
+    let incoming = by_key(incoming);
+    let mut diff = SectionDiff::default();
+    for (key, after) in &incoming {
+        match current.get(key) {
+            None => diff.added.push(T::clone(after)),
+            Some(before) => diff.changed.extend(change(*before, *after)),
+        }
+    }
+    diff.removed = current
+        .iter()
+        .filter(|(key, _)| !incoming.contains_key(*key))
+        .map(|(_, before)| T::clone(before))
         .collect();
-    let truncated: String = flat.chars().take(80).collect();
-    if truncated.contains(' ') || truncated.chars().count() >= 20 {
-        format!("\"{truncated}\"")
-    } else {
-        truncated
-    }
+    diff
 }
 
-fn truncate_line(line: &str) -> String {
-    if line.chars().count() <= 200 {
-        line.to_owned()
-    } else {
-        line.chars().take(197).collect::<String>() + "..."
+fn apply_section<T: Entry>(current: &[T], diff: &SectionDiff<T>) -> Vec<T> {
+    let mut entries = by_key(current);
+    for removed in &diff.removed {
+        entries.remove(removed.key());
     }
+    for entry in diff
+        .added
+        .iter()
+        .chain(diff.changed.iter().map(|change| &change.after))
+    {
+        entries.insert(entry.key(), entry);
+    }
+    entries.into_values().cloned().collect()
 }
 
-/// Interleave added/removed/changed for one ID-keyed section in ascending ID
-/// order: a changed ID renders once with its field list.
-fn push_merged<'a>(
-    entries: &mut Vec<String>,
-    section: &str,
-    added: impl Iterator<Item = &'a str>,
-    removed: impl Iterator<Item = &'a str>,
-    changed: impl Iterator<Item = (&'a str, String)>,
-) {
-    let mut order: BTreeSet<&'a str> = BTreeSet::new();
-    let mut changed_fields: BTreeMap<&'a str, String> = BTreeMap::new();
-    let mut added_ids: BTreeSet<&'a str> = BTreeSet::new();
-    for id in added {
-        order.insert(id);
-        added_ids.insert(id);
-    }
-    for id in removed {
-        order.insert(id);
-    }
-    for (id, fields) in changed {
-        order.insert(id);
-        changed_fields.insert(id, fields);
-    }
-    for id in order {
-        if let Some(fields) = changed_fields.get(id) {
-            entries.push(truncate_line(&format!("~ {section} {id} ({fields})")));
-        } else if added_ids.contains(id) {
-            entries.push(truncate_line(&format!("+ {section} {id}")));
-        } else {
-            entries.push(truncate_line(&format!("- {section} {id}")));
-        }
-    }
-}
-
-/// Interleave added/removed/changed for one key-keyed section in ascending
-/// key order. Keys are pre-formatted with [`display_key`].
-fn push_simple(
-    entries: &mut Vec<String>,
-    section: &str,
-    added: impl Iterator<Item = String>,
-    removed: impl Iterator<Item = String>,
-    changed: impl Iterator<Item = String>,
-) {
-    let mut order: BTreeSet<String> = BTreeSet::new();
-    let mut added_keys: BTreeSet<String> = BTreeSet::new();
-    let mut changed_keys: BTreeSet<String> = BTreeSet::new();
-    for key in added {
-        order.insert(key.clone());
-        added_keys.insert(key);
-    }
-    for key in removed {
-        order.insert(key);
-    }
-    for key in changed {
-        order.insert(key.clone());
-        changed_keys.insert(key);
-    }
-    for key in &order {
-        if changed_keys.contains(key) {
-            entries.push(truncate_line(&format!("~ {section} {key}")));
-        } else if added_keys.contains(key) {
-            entries.push(truncate_line(&format!("+ {section} {key}")));
-        } else {
-            entries.push(truncate_line(&format!("- {section} {key}")));
-        }
-    }
-}
-
-/// Emit the header plus at most `max_lines` entry lines, then a `+N more`
-/// trailer counting the hidden lines. Drops trailing lines until the whole
-/// body fits [`PREVIEW_CHAR_LIMIT`] characters.
-fn fit_preview(header: &str, entries: &[String], max_lines: usize) -> String {
-    let mut shown: Vec<&str> = if entries.len() <= max_lines {
-        entries.iter().map(String::as_str).collect()
-    } else if max_lines == 0 {
-        Vec::new()
-    } else {
-        entries[..max_lines.saturating_sub(1)]
+/// Appends one line per entry, ordered by key across added/removed/changed.
+fn section_lines<T: Entry>(lines: &mut Vec<String>, diff: &SectionDiff<T>) {
+    let mut keyed: Vec<(&str, String)> = Vec::with_capacity(diff.len());
+    keyed.extend(
+        diff.added
             .iter()
-            .map(String::as_str)
-            .collect()
-    };
-    let mut hidden = entries.len().saturating_sub(shown.len());
-    loop {
-        let mut output = String::from(header);
-        for line in &shown {
-            output.push('\n');
-            output.push_str(line);
-        }
-        if hidden > 0 {
-            output.push('\n');
-            output.push_str(&format!("+{hidden} more"));
-        }
-        if output.chars().count() <= PREVIEW_CHAR_LIMIT {
-            return output;
-        }
-        if shown.is_empty() {
-            // Header plus trailer alone exceed the limit; truncate the body.
-            return output.chars().take(PREVIEW_CHAR_LIMIT).collect();
-        }
-        shown.pop();
-        hidden += 1;
+            .map(|entry| (entry.key(), entry_line::<T>('+', entry.key()))),
+    );
+    keyed.extend(
+        diff.removed
+            .iter()
+            .map(|entry| (entry.key(), entry_line::<T>('-', entry.key()))),
+    );
+    keyed.extend(
+        diff.changed
+            .iter()
+            .map(|change| (change.key.as_str(), changed_line(change))),
+    );
+    keyed.sort_by_key(|(key, _)| *key);
+    lines.extend(keyed.into_iter().map(|(_, line)| line));
+}
+
+fn entry_line<T: Entry>(sign: char, key: &str) -> String {
+    if T::SINGLETON {
+        format!("{sign} {}", T::SECTION)
+    } else {
+        cap_line(format!("{sign} {} {}", T::SECTION, display_key(key)))
     }
 }
 
-/// A creator entry is usable unless it or its permission-source channel is
-/// unknown. Cross-guild or wrong-kind channels stay the codec's concern; only
-/// absence from the inventory skips here.
-fn creator_usable(creator: &CreatorConfiguration, inventory: &GuildInventory) -> bool {
-    inventory.channels.contains_key(&creator.channel_id)
-        && match &creator.permission_source {
-            PermissionSource::Channel { channel_id } => inventory.channels.contains_key(channel_id),
-            PermissionSource::Creator {} | PermissionSource::Category {} => true,
+fn changed_line<T: Entry>(change: &EntryChange<T>) -> String {
+    let fields = change.fields.join(", ");
+    cap_line(format!("{} ({fields})", entry_line::<T>('~', &change.key)))
+}
+
+/// Snowflake-shaped keys are shown bare; anything else is quoted, escaped and
+/// shortened, so uploaded text cannot break the line layout.
+fn display_key(key: &str) -> String {
+    if (1..=20).contains(&key.len()) && key.bytes().all(|byte| byte.is_ascii_digit()) {
+        return key.to_owned();
+    }
+    let shown: String = key.chars().take(KEY_CHAR_LIMIT).collect();
+    let cut = if shown.len() < key.len() { "…" } else { "" };
+    format!("{shown:?}{cut}")
+}
+
+fn cap_line(line: String) -> String {
+    if line.chars().count() <= LINE_CHAR_LIMIT {
+        return line;
+    }
+    let mut capped: String = line.chars().take(LINE_CHAR_LIMIT - 1).collect();
+    capped.push('…');
+    capped
+}
+
+fn counted(count: usize, noun: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {noun}{plural}")
+}
+
+/// Length in UTF-16 code units. That is never less than the character count,
+/// so the limit holds whichever of the two the message is measured in.
+fn message_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// Keeps the longest prefix of at most `max_lines` lines that fits the limit
+/// together with a `+N more` trailer for the rest.
+fn fit_preview(summary: String, lines: &[String], max_lines: usize) -> String {
+    let trailer_room = message_len(&format!("\n+{} more", lines.len()));
+    let mut body = summary;
+    let mut used = message_len(&body);
+    let mut shown = 0;
+    for line in lines.iter().take(max_lines) {
+        let needed = 1 + message_len(line);
+        let reserve = if shown + 1 < lines.len() {
+            trailer_room
+        } else {
+            0
+        };
+        if used + needed + reserve > PREVIEW_CHAR_LIMIT {
+            break;
         }
-}
-
-/// Sorted added/removed/changed between two keyed maps. Keys in `skipped`
-/// are ignored on both sides: an incoming skipped entry is not added or
-/// changed, and a current entry under a skipped key is not removed.
-/// Duplicate keys in the input lists were already collapsed by the caller
-/// collecting into a map.
-fn diff_keyed<'a, T: Clone + PartialEq, C>(
-    current: &BTreeMap<&'a str, &'a T>,
-    incoming: &BTreeMap<&'a str, &'a T>,
-    skipped: &BTreeSet<&'a str>,
-    on_changed: impl Fn(&'a str, &'a T, &'a T) -> C,
-) -> (Vec<T>, Vec<T>, Vec<C>) {
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    let mut changed = Vec::new();
-    for (id, next) in incoming {
-        if skipped.contains(*id) {
-            continue;
-        }
-        match current.get(*id) {
-            None => added.push((**next).clone()),
-            Some(prev) if **prev != **next => changed.push(on_changed(*id, *prev, *next)),
-            Some(_) => {}
-        }
+        body.push('\n');
+        body.push_str(line);
+        used += needed;
+        shown += 1;
     }
-    for (id, prev) in current {
-        if !incoming.contains_key(*id) && !skipped.contains(*id) {
-            removed.push((**prev).clone());
-        }
+    let hidden = lines.len() - shown;
+    if hidden > 0 {
+        write!(body, "\n+{hidden} more").unwrap();
     }
-    (added, removed, changed)
-}
-
-/// Singleton diff with a skip switch: when `skipped` is true the incoming
-/// value is dropped and the current value is kept, producing no change.
-fn diff_singleton<T: Clone + PartialEq, C>(
-    current: Option<&T>,
-    incoming: Option<&T>,
-    skipped: bool,
-    on_changed: impl Fn(&T, &T) -> C,
-) -> (Option<T>, Option<T>, Option<C>) {
-    if skipped {
-        return (None, None, None);
-    }
-    match (current, incoming) {
-        (None, None) => (None, None, None),
-        (None, Some(next)) => (Some(next.clone()), None, None),
-        (Some(_), None) => (None, current.cloned(), None),
-        (Some(prev), Some(next)) if prev == next => (None, None, None),
-        (Some(prev), Some(next)) => (None, None, Some(on_changed(prev, next))),
-    }
-}
-
-fn creator_fields(
-    before: &CreatorConfiguration,
-    after: &CreatorConfiguration,
-) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if before.name_template != after.name_template {
-        fields.push("name_template");
-    }
-    if before.status_template != after.status_template {
-        fields.push("status_template");
-    }
-    if before.default_limit != after.default_limit {
-        fields.push("default_limit");
-    }
-    if before.always_private != after.always_private {
-        fields.push("always_private");
-    }
-    if before.text_channels != after.text_channels {
-        fields.push("text_channels");
-    }
-    if before.position != after.position {
-        fields.push("position");
-    }
-    if before.first_number != after.first_number {
-        fields.push("first_number");
-    }
-    if before.group_by_category != after.group_by_category {
-        fields.push("group_by_category");
-    }
-    if before.permission_source != after.permission_source {
-        fields.push("permission_source");
-    }
-    fields
-}
-
-fn template_fields(before: &ChannelTemplates, after: &ChannelTemplates) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if before.name_template != after.name_template {
-        fields.push("name_template");
-    }
-    if before.status_template != after.status_template {
-        fields.push("status_template");
-    }
-    fields
-}
-
-fn logging_fields(
-    before: &LoggingConfiguration,
-    after: &LoggingConfiguration,
-) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if before.channel_id != after.channel_id {
-        fields.push("channel_id");
-    }
-    if before.detail != after.detail {
-        fields.push("detail");
-    }
-    if before.mention_member_ids != after.mention_member_ids {
-        fields.push("mention_member_ids");
-    }
-    if before.mention_role_ids != after.mention_role_ids {
-        fields.push("mention_role_ids");
-    }
-    fields
-}
-
-#[allow(clippy::too_many_lines)]
-fn settings_fields(before: &GuildSettings, after: &GuildSettings) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if before.creation_enabled != after.creation_enabled {
-        fields.push("creation_enabled");
-    }
-    if before.unique_names != after.unique_names {
-        fields.push("unique_names");
-    }
-    if before.no_game_label != after.no_game_label {
-        fields.push("no_game_label");
-    }
-    if before.force_single_game != after.force_single_game {
-        fields.push("force_single_game");
-    }
-    if before.count_members_without_activity != after.count_members_without_activity {
-        fields.push("count_members_without_activity");
-    }
-    if before.time_zone != after.time_zone {
-        fields.push("time_zone");
-    }
-    if before.text_channel_name != after.text_channel_name {
-        fields.push("text_channel_name");
-    }
-    if before.text_viewer_role_id != after.text_viewer_role_id {
-        fields.push("text_viewer_role_id");
-    }
-    if before.command_role_id != after.command_role_id {
-        fields.push("command_role_id");
-    }
-    if before.command_roles != after.command_roles {
-        fields.push("command_roles");
-    }
-    fields
+    body
 }
