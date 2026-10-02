@@ -184,6 +184,10 @@
     "crates/store/migrations/0405_timestamptz_and_boolean.sql": {
       "sha256": "5c00a07ac5565bd668e5804aa9e681c5bc8ebe1728d6f700fa5b956a8b0bb987",
       "justification": "Add unpublished S6 dependency-preserving normalization gate for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
+    },
+    "crates/store/migrations/0406_rollback_journal.sql": {
+      "sha256": "13a396ea63ea19cf64e5b9abee940f845189ace2ec5c950f29db7baf22e42c57",
+      "justification": "Add durable cutover rollback journal and per-table watermarks for TOG-12137; additive tables only."
     }
   }
 }
