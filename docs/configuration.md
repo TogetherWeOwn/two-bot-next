@@ -124,7 +124,7 @@ Catalog entries: 117.
 | `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored unwired | Staging guilds excluded from human community activity. |
 | `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored unwired | Test actors excluded from human community activity. |
 | `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Welcome-channel classification for community analytics. |
-| `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Legacy database connection secret; distinct from Container DATABASE_URL. |
+| `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
 | `TWO_FEED_POLL_SECONDS` | cold | `300` | env at boot; stored unwired | Feed polling interval (validated from 60 to 86400 seconds). |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |

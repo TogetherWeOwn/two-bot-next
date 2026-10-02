@@ -79,6 +79,9 @@ BEGIN
                 EXECUTE format('GRANT ALL ON TABLE %s TO two_bot_migrator', target);
                 IF obj.kind = 'table' THEN
                     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE %s TO two_bot_runtime', target);
+                ELSIF obj.kind = 'admission' THEN
+                    -- Runtime may reserve/complete holds, never erase the lane.
+                    EXECUTE format('GRANT SELECT, INSERT, UPDATE ON TABLE %s TO two_bot_runtime', target);
                 ELSIF obj.kind = 'view' THEN
                     EXECUTE format('GRANT SELECT ON TABLE %s TO two_web_reader', target);
                 END IF;
@@ -86,7 +89,7 @@ BEGIN
                 FOR seq IN (
                     SELECT c.oid::regclass AS name FROM pg_class c
                     JOIN pg_depend d ON d.objid = c.oid AND d.classid = 'pg_class'::regclass
-                    WHERE c.relkind = 'S' AND d.refobjid = to_regclass(target)
+                    WHERE obj.kind = 'table' AND c.relkind = 'S' AND d.refobjid = to_regclass(target)
                       AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')
                 ) LOOP
                     EXECUTE format('REVOKE ALL ON SEQUENCE %s FROM PUBLIC, two_bot_runtime, two_web_reader', seq.name);

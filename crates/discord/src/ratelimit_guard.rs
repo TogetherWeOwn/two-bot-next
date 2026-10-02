@@ -462,6 +462,7 @@ mod tests {
             status: 429,
             retry_after_header: None,
             body: br#"{"retry_after":0.1}"#.to_vec(),
+            completion: None,
         });
         drop(accounting);
         assert_eq!(
@@ -537,6 +538,7 @@ mod tests {
                 body: serde_json::json!({"retry_after": body_timing})
                     .to_string()
                     .into_bytes(),
+                completion: None,
             }));
             let until =
                 observed_at + Duration::from_secs_f64(body_timing) + Duration::from_millis(250);
@@ -572,6 +574,7 @@ mod tests {
                         status: 429,
                         retry_after_header: None,
                         body: Vec::new(),
+                        completion: None,
                     });
                 }
                 let ordinary = tokio::spawn({

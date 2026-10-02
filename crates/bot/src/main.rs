@@ -5,6 +5,8 @@
 //! `GUILD_ID` the shard stays parked and `/readyz` reports `gateway: down`
 //! (HTTP 503) — the Container boots healthy on incomplete staging config.
 
+#[cfg(test)]
+mod admission_test_support;
 mod audit_runtime;
 mod backup_cli;
 mod command_runtime;
@@ -29,6 +31,9 @@ mod metrics_http;
 mod preflight;
 mod server;
 mod ticket_runtime;
+#[cfg(test)]
+#[path = "../../core/tests/support/tracing_capture.rs"]
+mod tracing_capture;
 mod website_jobs;
 
 use std::sync::Arc;

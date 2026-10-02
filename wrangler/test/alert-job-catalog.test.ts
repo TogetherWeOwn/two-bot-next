@@ -22,6 +22,7 @@ const STALE_EXEMPT = new Map<string, string>([
   ["invite_snapshot", "no periodic caller; stays zero until a real caller records a completion"],
   ["session_checkpoint", "event-driven: one success per durable gateway commit, not a scheduled tick"],
   ["other", "catch-all for unknown job names; unrelated jobs share it, so no single cadence exists"],
+  ["audit_retry", "supervisor sweep with its own 30 s loop and parked/halt reporting in audit_runtime.rs; not registered through the website/community schedulers this catalog parses"],
 ]);
 
 function parseJobs(source: string): string[] {
@@ -125,7 +126,7 @@ const real: Catalog = { jobs: JOBS, rust: RUST, worker: JOB_INTERVAL_SECONDS, ex
 test("parses the full Rust job allowlist and every registered cadence", () => {
   assert.deepEqual(JOBS, [
     "invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events",
-    "presence_probe", "community_scorecard", "inactivity", "other",
+    "presence_probe", "community_scorecard", "inactivity", "audit_retry", "other",
   ]);
   // Rust *_INTERVAL_MS / 1000: community_snapshots.rs:45,47, scheduled_events.rs:26,
   // presence.rs:36, community.rs:61, inactivity.rs:27.
