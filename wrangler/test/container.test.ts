@@ -275,7 +275,7 @@ for (const path of ["/health", "/readyz", "keepalive", "start", "startAndWaitFor
     } else if (path === "startAndWaitForPorts") {
       await h.bot.startAndWaitForPorts();
     } else {
-      await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+      await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
     }
     assert.equal(h.starts.length, 1);
     assert.deepEqual(h.starts[0]?.env, { ...EXPECTED_ENV, ...PUBLICATION_ENV });
@@ -287,7 +287,7 @@ for (const path of ["/health", "/readyz", "keepalive", "start", "startAndWaitFor
 test("registry feature bindings do not opt in to publication or acknowledge live writes", async (t) => {
   const { TWO_COMMANDS_PUBLISH_ON_BOOT, TWO_COMMANDS_ALLOW_LIVE_GUILD, ...features } = PUBLICATION_ENV;
   const h = await harness(t, { ...WORKER_ENV, ...features });
-  await h.bot.fetch(new Request("https://worker.invalid/health"));
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
   assert.deepEqual(h.starts[0]?.env, { ...EXPECTED_ENV, ...features });
   assert.equal(h.starts[0]?.env?.["TWO_COMMANDS_PUBLISH_ON_BOOT"], undefined);
   assert.equal(h.starts[0]?.env?.["TWO_COMMANDS_ALLOW_LIVE_GUILD"], undefined);
@@ -300,7 +300,7 @@ for (const value of ["0", "true", ""]) {
       TWO_COMMANDS_PUBLISH_ON_BOOT: value,
       TWO_COMMANDS_ALLOW_LIVE_GUILD: value,
     });
-    await h.bot.fetch(new Request("https://worker.invalid/health"));
+    await h.bot.fetch(probeRequest("https://worker.invalid/health"));
     assert.deepEqual(h.starts[0]?.env, {
       ...EXPECTED_ENV,
       TWO_COMMANDS_PUBLISH_ON_BOOT: value,
