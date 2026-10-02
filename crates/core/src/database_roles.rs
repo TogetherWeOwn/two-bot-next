@@ -59,6 +59,8 @@ mod tests {
             include_str!("../../cutover/migrations/0160_rsvp.sql"),
             include_str!("../../cutover/migrations/0170_lfg.sql"),
             include_str!("../../cutover/migrations/0200_self_roles.sql"),
+            include_str!("../../cutover/migrations/0205_self_role_exchange_receipts.sql"),
+            include_str!("../../cutover/migrations/0206_self_role_exchange_baselines.sql"),
             include_str!("../../cutover/migrations/0210_tickets.sql"),
             include_str!("../../cutover/migrations/0220_automod.sql"),
             include_str!("../../cutover/migrations/0221_automod_delivery_claims.sql"),

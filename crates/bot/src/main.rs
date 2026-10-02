@@ -32,6 +32,12 @@ mod metrics_http;
 mod preflight;
 mod schedule_runtime;
 mod server;
+// TOG-10292: boot composes the gated service below; fixture-only seams keep
+// the module-level allowance.
+#[allow(dead_code)]
+mod self_role_handlers;
+#[allow(dead_code)]
+mod self_role_runtime;
 mod shutdown;
 mod ticket_runtime;
 #[cfg(test)]
@@ -174,6 +180,15 @@ async fn main() {
         database: store.as_ref().map(|s| s.pool().clone()),
     };
 
+    // ONE optional self-role service: gateway dispatch and the supervised
+    // recovery job share this Arc. Empty/invalid catalogues, non-staging guilds
+    // and failed identity reads leave the surface and the job unregistered.
+    let self_roles = match (gateway_prerequisites(&config), store.as_ref()) {
+        (Ok((token, _, guild_id)), Some(db)) => {
+            self_role_handlers::SelfRoleService::from_env(db.pool().clone(), token, guild_id).await
+        }
+        _ => None,
+    };
     // V1 voice rooms: per-guild lifecycle actors fed by the gateway sink.
     // Inert unless TWO_VOICE=1 with token + database present; any failure
     // degrades to voice-off with a warn, never a boot failure.
@@ -183,6 +198,7 @@ async fn main() {
     let gateway_task = if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
         let token = token.to_owned();
         let state = Arc::clone(&gateway);
+        let self_roles = self_roles.clone();
         Some(tokio::spawn(async move {
             let result: Result<(), sqlx::Error> = async {
                 // Opt-in registry sync already ran before Store::connect; the
@@ -207,8 +223,9 @@ async fn main() {
                 // Bad command env gates still park only the command surface.
                 // The ordered leveling path shares this runtime's
                 // executor/pacing for XP awards and role rewards.
-                let runtime =
-                    command_runtime::CommandRuntime::from_env(pool, &token, guild_id, onboarding);
+                let runtime = command_runtime::CommandRuntime::from_env(
+                    pool, &token, guild_id, self_roles, onboarding,
+                );
                 let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
                 let pipeline = Arc::new(
                     build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
@@ -264,7 +281,7 @@ async fn main() {
         None
     };
 
-    let http = serve(&config, listener, state, shutdown.clone());
+    let http = serve(&config, listener, state, shutdown.clone(), self_roles);
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
