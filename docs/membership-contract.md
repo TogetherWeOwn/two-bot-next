@@ -38,13 +38,20 @@ The common entry point is
 It requires `S: MembershipStore`; that read/observation extension itself requires
 `FunnelStore`. A future sqlx integration test can import it with:
 
-```rust,ignore
-#[path = "support/membership_contract.rs"]
+```rust
+#[path = "../../core/tests/support/membership_contract.rs"]
 mod contract;
 
+// crates/store/tests/membership_pg.rs: `SchemaFixture` migrates once per
+// test; each factory call truncates the log back to empty, and a
+// non-UTC-session variant pins every connection to America/New_York.
+
 #[test]
-fn sqlx_membership_contract() {
-    contract::run(|| make_isolated_sqlx_funnel_adapter());
+#[ignore = "requires authorized TEST_DATABASE_URL"]
+fn sqlx_membership_chronology_contract() {
+    let f = SchemaFixture::new(false);
+    contract::run(|| f.make());
+    f.finish();
 }
 ```
 
@@ -117,8 +124,13 @@ On the controller, from the isolated worktree:
 ```sh
 cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --test membership_contract
+python3 scripts/cargo_cache.py run -- test -p two-bot-store --test membership_pg -- --ignored
 python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test membership_observation
 ```
+
+`membership_pg` needs `TEST_DATABASE_URL` on agent-testdb (or the CI
+service container); its tests stay `#[ignore]`d by default like the other
+opt-in store suites.
 
 Use the bounded wrapper; do not create a target directory or bypass a refusal.
 Hosted CI's existing integration-test command includes both suites. A local

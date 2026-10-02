@@ -23,7 +23,12 @@ use std::collections::HashSet;
 
 use sqlx::{Pool, Postgres};
 use two_bot_core::{
-    idempotency_key, EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake, MESSAGE_RUNGS,
+    idempotency_key,
+    membership::{
+        advance_observation, is_membership, project, set_observation, valid_observation,
+        Membership, MembershipStore,
+    },
+    EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake, StoredRow, MESSAGE_RUNGS,
 };
 
 /// Postgres-backed [`FunnelStore`].
@@ -58,7 +63,20 @@ impl PgFunnelStore {
     /// Fallible append + projection for async callers. The sync core seam
     /// fails closed on an error; async tools can handle the error explicitly.
     pub async fn try_record(&self, event: &FunnelEvent) -> Result<RecordOutcome, sqlx::Error> {
-        record_async(&self.pool, event).await
+        record_async(&self.pool, event, None).await
+    }
+
+    /// Fallible append-or-reconfirm for async callers. Carries the
+    /// observation hint through the same duplicate-convergence path as the
+    /// sync [`MembershipStore`] seam.
+    ///
+    /// [`MembershipStore`]: two_bot_core::membership::MembershipStore
+    pub async fn try_record_observed(
+        &self,
+        event: &FunnelEvent,
+        observed_at: Option<&str>,
+    ) -> Result<RecordOutcome, sqlx::Error> {
+        record_observed_async(&self.pool, event, observed_at).await
     }
 
     /// Run an async query from the sync trait methods.
@@ -84,11 +102,19 @@ fn metadata_text(event: &FunnelEvent) -> Option<String> {
 async fn record_async(
     pool: &Pool<Postgres>,
     event: &FunnelEvent,
+    observed_at: Option<&str>,
 ) -> Result<RecordOutcome, sqlx::Error> {
-    let key = idempotency_key(event);
-    let member_id = event.member_id.map(snowflake_text);
-    let guild_id = snowflake_text(event.guild_id);
-    let metadata = metadata_text(event);
+    // Build the insert row through the shared observation helpers so durable
+    // inserts stamp exactly like memory: the hint lands verbatim in the blob,
+    // invalid hints and non-membership events keep the event payload as-is.
+    let mut new_row = StoredRow::from(event);
+    if let Some(hint) = observed_at {
+        set_observation(&mut new_row, hint);
+    }
+    let key = new_row.idempotency_key.clone();
+    let member_id = new_row.member_id.map(snowflake_text);
+    let guild_id = snowflake_text(new_row.guild_id);
+    let metadata = new_row.metadata.as_ref().map(|v| v.to_string());
     let mut tx = pool.begin().await?;
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
@@ -98,19 +124,138 @@ async fn record_async(
     .bind(event.event_type.as_str())
     .bind(member_id.as_deref())
     .bind(&guild_id)
-    .bind(&event.occurred_at)
-    .bind(&event.source)
+    .bind(&new_row.occurred_at)
+    .bind(&new_row.source)
     .bind(metadata.as_deref())
     .bind(&key)
     .fetch_optional(&mut *tx)
     .await?;
     if inserted.is_none() {
+        let outcome = advance_duplicate(&mut tx, event, &key, observed_at).await?;
         tx.commit().await?;
-        return Ok(RecordOutcome { inserted: false });
+        return Ok(outcome);
     }
     project_event(&mut tx, event, &guild_id).await?;
     tx.commit().await?;
     Ok(RecordOutcome { inserted: true })
+}
+
+async fn record_observed_async(
+    pool: &Pool<Postgres>,
+    event: &FunnelEvent,
+    observed_at: Option<&str>,
+) -> Result<RecordOutcome, sqlx::Error> {
+    record_async(pool, event, observed_at).await
+}
+
+/// Reconfirm an existing row: advance its stored observation maximum under
+/// the event-row lock, never touching occurrence/source/identity. The winner
+/// of `ON CONFLICT DO NOTHING` never reaches here; concurrent reconfirmations
+/// serialize on `FOR UPDATE` and converge on the newest hint, so a delayed
+/// stale duplicate cannot overwrite a newer maximum. The `IS NOT DISTINCT
+/// FROM` predicate is the compare-and-swap fallback: the update lands only
+/// against the value this transaction locked and read. Duplicates without a
+/// usable hint skip the lock entirely.
+async fn advance_duplicate(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    event: &FunnelEvent,
+    key: &str,
+    observed_at: Option<&str>,
+) -> Result<RecordOutcome, sqlx::Error> {
+    let Some(hint) = observed_at else {
+        return Ok(RecordOutcome { inserted: false });
+    };
+    if !is_membership(event.event_type) || valid_observation(hint).is_none() {
+        return Ok(RecordOutcome { inserted: false });
+    }
+    let current: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT metadata FROM events WHERE idempotency_key = $1 FOR UPDATE")
+            .bind(key)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((current_meta,)) = current else {
+        // Unreachable: rows are append-only, so the lost insert race that
+        // reached this path still left a row behind. Report the duplicate.
+        return Ok(RecordOutcome { inserted: false });
+    };
+    // Only metadata participates in the maximum; the scratch row reuses the
+    // shared helper so durable convergence matches memory exactly.
+    let mut stored = StoredRow {
+        guild_id: event.guild_id,
+        member_id: event.member_id,
+        event_type: event.event_type,
+        occurred_at: event.occurred_at.clone(),
+        source: event.source.clone(),
+        metadata: current_meta
+            .as_deref()
+            .map(|s| serde_json::from_str(s).expect("funnel observation metadata parses")),
+        dedupe_token: event.dedupe_token.clone(),
+        idempotency_key: key.to_owned(),
+    };
+    advance_observation(&mut stored, hint);
+    let next = stored.metadata.as_ref().map(|v| v.to_string());
+    if next != current_meta {
+        sqlx::query(
+            "UPDATE events SET metadata = $1 WHERE idempotency_key = $2 AND metadata IS NOT DISTINCT FROM $3",
+        )
+        .bind(next.as_deref())
+        .bind(key)
+        .bind(current_meta.as_deref())
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(RecordOutcome { inserted: false })
+}
+
+/// Read back one member's event rows with microsecond UTC ISO text. The
+/// `US` pattern (not `MS`) preserves the six fractional digits the contract
+/// asserts through round trips; `AT TIME ZONE 'UTC'` keeps the text
+/// independent of the connection's session time zone.
+async fn fetch_member_rows(
+    pool: &Pool<Postgres>,
+    guild_id: Snowflake,
+    member_id: Snowflake,
+) -> Result<Vec<StoredRow>, sqlx::Error> {
+    let rows: Vec<(
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT event_type, member_id, guild_id,
+                to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+                source, metadata, idempotency_key
+         FROM events WHERE guild_id = $1 AND member_id = $2",
+    )
+    .bind(snowflake_text(guild_id))
+    .bind(snowflake_text(member_id))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)| {
+                StoredRow {
+                    guild_id: guild_id.parse().expect("funnel row guild id"),
+                    member_id: member_id
+                        .as_deref()
+                        .map(|s| s.parse().expect("funnel row member id")),
+                    event_type: EventType::from_wire(&event_type)
+                        .expect("funnel row event type"),
+                    occurred_at,
+                    source,
+                    metadata: metadata
+                        .as_deref()
+                        .map(|s| serde_json::from_str(s).expect("funnel row metadata parses")),
+                    dedupe_token: None,
+                    idempotency_key,
+                }
+            },
+        )
+        .collect())
 }
 
 /// Members projection guards (legacy `EventStore.project`): joins overwrite
@@ -265,7 +410,7 @@ impl FunnelStore for PgFunnelStore {
     /// rather than silently drop data; the release profile aborts the process
     /// so the container can restart without partially advanced in-memory state.
     fn record(&self, event: FunnelEvent) -> RecordOutcome {
-        self.block_on(record_async(&self.pool, &event))
+        self.block_on(record_async(&self.pool, &event, None))
             .expect("funnel record failed")
     }
 
@@ -355,6 +500,34 @@ impl FunnelStore for PgFunnelStore {
             .await
         })
         .expect("funnel has_event failed")
+    }
+}
+
+/// Chronological membership read model over the durable event log. The
+/// projection derives from persisted event rows (not arrival-ordered
+/// `members` columns), so historical joins and any-order replays converge
+/// exactly like memory. Duplicate reconfirmations advance only the stored
+/// observation maximum. Failures panic — see [`FunnelStore::record`].
+impl MembershipStore for PgFunnelStore {
+    fn membership(&self, guild_id: Snowflake, member_id: Snowflake) -> Option<Membership> {
+        let rows = self
+            .block_on(fetch_member_rows(&self.pool, guild_id, member_id))
+            .expect("funnel membership failed");
+        project(rows.iter())
+    }
+
+    fn membership_rows(&self, guild_id: Snowflake, member_id: Snowflake) -> Vec<StoredRow> {
+        self.block_on(fetch_member_rows(&self.pool, guild_id, member_id))
+            .expect("funnel membership rows failed")
+    }
+
+    /// Insert or reconfirm a membership event. Invalid/non-membership hints
+    /// are ignored; an existing row's occurrence/source/other metadata stay
+    /// put. Failures panic — see [`FunnelStore::record`].
+    fn record_observed(&self, event: FunnelEvent, observed_at: Option<&str>) -> RecordOutcome {
+        let observed_at = observed_at.map(str::to_owned);
+        self.block_on(record_async(&self.pool, &event, observed_at.as_deref()))
+            .expect("funnel record_observed failed")
     }
 }
 
