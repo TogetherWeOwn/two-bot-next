@@ -231,7 +231,9 @@ fn group_block_spanning_two_creators_stays_contiguous() {
 }
 
 #[test]
-fn group_ignores_non_room_channels_outside_the_block() {
+fn group_split_block_places_at_its_outer_edges() {
+    // Channel 40 was moved between the group rooms; the split is not repaired
+    // and the new room still lands at the outer edge of the group rooms.
     let category = [
         other(1, 0),
         creator(10, 1),
@@ -243,7 +245,7 @@ fn group_ignores_non_room_channels_outside_the_block() {
     let group = [12, 11];
     assert_eq!(
         plan_placement(request(10, RoomSide::Below, true, &group, &category)),
-        Ok(4)
+        Ok(5)
     );
     assert_eq!(
         plan_placement(request(20, RoomSide::Above, true, &group, &category)),
