@@ -6,6 +6,7 @@
 //! or by future transports. Slices S3+ build on these seams.
 
 pub mod action_outcomes;
+pub mod anchor_event;
 pub mod audit;
 pub mod audit_mirror;
 #[cfg(feature = "db")]
