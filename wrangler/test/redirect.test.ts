@@ -667,6 +667,75 @@ describe("idle buckets expire but throttles never reset", () => {
     assert.ok(buckets.take("a").allowed);
   });
 
+  test("a full map of idle keys drains on new-key traffic alone", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 60, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 100 },
+    );
+    for (let i = 0; i < 100; i++) {
+      assert.ok(buckets.take(`filler-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 100);
+    // No tracked key ever returns. Every new caller must still be admitted
+    // once the fillers have sat idle past the full-refill window.
+    now += 24 * 60 * 60 * 1000;
+    for (let i = 0; i < 50; i++) {
+      assert.ok(buckets.take(`newcomer-${i}`).allowed);
+    }
+    assert.equal(buckets.size, 50);
+  });
+
+  test("the reap before an at-cap refusal stays within the sweep budget", async () => {
+    let now = 1_000_000;
+    const buckets = new TokenBuckets(
+      { capacity: 1, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 10, sweepBudget: 2 },
+    );
+    for (let i = 0; i < 10; i++) {
+      assert.ok(buckets.take(`filler-${i}`).allowed);
+    }
+    now += 2_000;
+    // Reap 2 to make room, write the newcomer, reap 2 more: 10 - 2 + 1 - 2.
+    assert.ok(buckets.take("newcomer").allowed);
+    assert.equal(buckets.size, 7);
+  });
+
+  test("at the cap a live map still refuses and a depleted key keeps its debt", async () => {
+    const t0 = 1_000_000;
+    let now = t0;
+    const buckets = new TokenBuckets(
+      { capacity: 4, refillPerSecond: 1 },
+      () => now,
+      { maxBuckets: 3 },
+    );
+    assert.ok(buckets.take("old").allowed);
+    now = t0 + 3_500;
+    for (let i = 0; i < 4; i++) assert.ok(buckets.take("hot").allowed);
+    assert.ok(!buckets.take("hot").allowed);
+    assert.ok(buckets.take("a").allowed);
+    assert.equal(buckets.size, 3);
+    // "old" has sat idle for the 4s full-refill window; "hot" owes tokens.
+    // The newcomer may take only the idle slot.
+    now = t0 + 4_000;
+    assert.ok(buckets.take("new").allowed);
+    assert.equal(buckets.size, 3);
+    const hot = buckets.take("hot");
+    assert.ok(!hot.allowed);
+    assert.equal(hot.retryAfter, 1);
+    // Every remaining entry is live: fail closed.
+    const shed = buckets.take("late");
+    assert.ok(!shed.allowed);
+    assert.ok(shed.retryAfter >= 1);
+    assert.equal(buckets.size, 3);
+    // 0.5 + 1 refilled tokens: one take, not the four a reset would grant.
+    now = t0 + 5_000;
+    assert.ok(buckets.take("hot").allowed);
+    assert.ok(!buckets.take("hot").allowed);
+  });
+
   test("sweep work per call is bounded regardless of map size", async () => {
     let now = 1_000_000;
     const buckets = new TokenBuckets(

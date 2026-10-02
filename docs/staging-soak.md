@@ -75,14 +75,18 @@ The ledger is machine-checked, not prose:
 
 - Authoritative: `docs/soak-checklist.json` — one entry per non-DROP parity
   row in `docs/parity.md` §§1–8 (pure `DROP` rows are not ported, so they
-  carry no soak obligation; mixed mapped/`DROP` rows stay covered).
+  carry no soak obligation; mixed mapped/`DROP` rows stay covered), per §12
+  addition under the same rule, and per non-`dropped` §13 ledger row
+  (history-rewrite replays are `dropped`). §12/§13 entries name their
+  `owner` cards, which must match the cards in the parity disposition.
 - Rendered: `docs/soak-checklist.md` (regenerate with
   `python3 scripts/check_soak_checklist.py --render` after editing JSON).
 - Gate (offline, runs in CI before Cargo):
   `python3 scripts/check_soak_checklist.py` plus
   `python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`.
-  Any unmapped row, any `waived` entry without **both** `reason` and
-  `approver`, or any Markdown drift fails the gate.
+  Any unmapped row, any missing or stale owner card, any `waived` entry
+  without **both** `reason` and `approver`, or any Markdown drift fails the
+  gate.
 
 Every `waived` entry carries `reason` and `approver`. The first waivers,
 filed under [TOG-12140](/TOG/issues/TOG-12140), cover the 25 rows staging

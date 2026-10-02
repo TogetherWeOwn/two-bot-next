@@ -122,7 +122,8 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
         require(isinstance(body, dict), "/readyz body must be a JSON object")
         require(body.get("components") == [
             ["process", "ready"], ["gateway", "down"], ["database", "down"],
-        ], "/readyz body must report a ready process and parked gateway with database down")
+            ["token_invalid", "ready"],
+        ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
         # The runtime always reports informational job status alongside
         # readiness; with no credentials all six jobs must be parked,
         # non-running and never started. Jobs never flip the 503 above.
