@@ -26,7 +26,7 @@ use two_bot_cutover::legacy_mapping::MappingSpec;
 use two_bot_cutover::legacy_verify::verify;
 use two_bot_cutover::{connect, run_mee6_import, CutoverDb};
 
-type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const GUILD: &str = "777777777777777777";
 const IMPORTED_AT: &str = "2026-10-02T00:00:00Z";
@@ -407,16 +407,20 @@ async fn scenario(
     assert_eq!(member_snapshot(db).await?, after_apply);
 
     // 6. Drift: one changed target row fails verification and names the table.
+    // Scoped to the funnel group because the MEE6 import legitimately wrote
+    // leveling rows (member_levels, level_import_runs) after the copy.
     sqlx::query("UPDATE events SET source='drifted rehearsal' WHERE id=2")
         .execute(target)
         .await?;
     let (mut source_conn, mut target_conn) = verify_pair(host, source_name, target_name).await?;
-    let drifted = verify(&mut source_conn, &mut target_conn, &spec, &groups, 10).await?;
+    let funnel = ["funnel".to_owned()];
+    let drifted = verify(&mut source_conn, &mut target_conn, &spec, &funnel, 10).await?;
     source_conn.close().await?;
     target_conn.close().await?;
     assert!(!drifted.matches);
     let failing: Vec<_> = drifted.tables.iter().filter(|t| !t.matches).collect();
     assert_eq!(failing.len(), 1);
+    assert_eq!(failing[0].group, "funnel");
     assert_eq!(failing[0].source, "events");
     assert_eq!(failing[0].target, "events");
     assert_eq!(failing[0].source_rows, failing[0].target_rows);
