@@ -9,10 +9,13 @@
 //!    mock REST double.
 //! 2. `#[ignore]` agent-testdb acceptance: burst coalescing to one re-post,
 //!    previous-sticky retirement, `/sticky-remove` clearing state + message,
-//!    claim collision, debounce hold, REST-failure cleanup, and the feed
-//!    slice's CRUD + `announcements_audit_log` journeys. These run in CI via
+//!    claim collision, debounce hold, REST-failure cleanup, the feed slice's
+//!    CRUD + `announcements_audit_log` journeys, and the schedule slice's
+//!    CRUD + `automation_audit_log` journeys. These run in CI via
 //!    `TWO_GATEWAY_TEST_DATABASE_URL` (same approved service as the gateway
 //!    suite — never the runtime DATABASE_URL).
+
+#![cfg(test)]
 
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -53,6 +56,7 @@ use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
     sticky_options, CommandRuntime, RegistrySyncError,
 };
+use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
 const GUILD: u64 = 2222;
 const GUILD_S: &str = "2222";
@@ -599,6 +603,9 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-list"
                         | "lfg"
                         | "lfg-close"
+                        | "schedule"
+                        | "schedule-remove"
+                        | "schedule-list"
                         | "rank"
                         | "leaderboard"
                 )
@@ -1158,6 +1165,51 @@ fn new_id_is_unique_hex_that_validate_id_accepts() {
     assert_ne!(first, second);
 }
 
+// ---------------------------------------------------------------------------
+// Schedule slice units (no database)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn schedule_options_extract_body_and_timings() {
+    let interaction = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("hello".to_owned())),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+            option("every-minutes", CommandOptionValue::Integer(90)),
+        ],
+    );
+    assert_eq!(
+        schedule_options(&interaction),
+        (Some("hello".to_owned()), Some(30), Some(90))
+    );
+}
+
+#[test]
+fn schedule_options_missing_values_decode_to_none() {
+    let interaction = slash("schedule", Some(CHANNEL), Vec::new());
+    assert_eq!(schedule_options(&interaction), (None, None, None));
+}
+
+#[test]
+fn schedule_remove_option_extracts_id() {
+    let interaction = slash(
+        "schedule-remove",
+        Some(CHANNEL),
+        vec![option(
+            "id",
+            CommandOptionValue::String("abc123".to_owned()),
+        )],
+    );
+    assert_eq!(
+        schedule_remove_option(&interaction),
+        Some("abc123".to_owned())
+    );
+    let missing = slash("schedule-remove", Some(CHANNEL), Vec::new());
+    assert_eq!(schedule_remove_option(&missing), None);
+}
+
 #[tokio::test]
 async fn feed_commands_refuse_ephemerally_while_announcements_off() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
@@ -1218,6 +1270,74 @@ async fn feed_commands_from_other_guilds_are_silent() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
     for name in ["feed-add", "feed-remove", "feed-list"] {
+        let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+        interaction.guild_id = Some(Id::new(9999));
+        runtime.on_interaction(&interaction).await;
+    }
+    assert!(
+        mock.requests().is_empty(),
+        "wrong-guild interactions get silence, not a refusal"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn schedule_commands_refuse_ephemerally_while_automations_off() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    // automations OFF in the router gates → the shared router refuses all
+    // three schedule commands; the runtime answers through the shared executor.
+    let runtime = runtime_without_db(gates(false, true), false, origin);
+    for name in ["schedule", "schedule-remove", "schedule-list"] {
+        runtime
+            .on_interaction(&slash(name, Some(CHANNEL), Vec::new()))
+            .await;
+    }
+    let requests = mock.requests();
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 3, "one ephemeral refusal per command");
+    assert_eq!(
+        requests.len(),
+        3,
+        "no defer, no edit, no publish: {requests:?}"
+    );
+    for callback in &callbacks {
+        let json: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback json");
+        assert_eq!(json["type"], 4);
+        assert_eq!(json["data"]["content"], AUTOMATIONS_DISABLED_REPLY);
+        assert_eq!(json["data"]["flags"], 64, "ephemeral");
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn schedule_without_manage_server_is_refused() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let mut interaction = slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("hello".to_owned())),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+        ],
+    );
+    interaction.member.as_mut().unwrap().permissions = Some(Permissions::empty());
+    runtime.on_interaction(&interaction).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1, "refusal only; no defer or mutation");
+    let json: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("callback json");
+    assert_eq!(json["type"], 4);
+    assert_eq!(json["data"]["content"], MANAGE_SERVER_REQUIRED);
+    assert_eq!(json["data"]["flags"], 64);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn schedule_commands_from_other_guilds_are_silent() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    for name in ["schedule", "schedule-remove", "schedule-list"] {
         let mut interaction = slash(name, Some(CHANNEL), Vec::new());
         interaction.guild_id = Some(Id::new(9999));
         runtime.on_interaction(&interaction).await;
@@ -1827,6 +1947,51 @@ impl TestDb {
         .fetch_all(&self.pool)
         .await
         .expect("announcement audit rows")
+    }
+
+    /// Seed a scheduled message directly (other-guild isolation rows,
+    /// extra-id targets for ambiguous prefixes) without going through the
+    /// command path under test.
+    async fn seed_schedule(&self, guild_id: &str, id: &str) {
+        // next_run_at/created_at/updated_at are NOT NULL TEXT without
+        // defaults (0140_scheduled_messages.sql).
+        sqlx::query(
+            "INSERT INTO scheduled_messages
+               (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                created_by, created_at, updated_by, updated_at)
+             VALUES ($1, $2, $3, 'remember this', '2030-01-01T00:00:00.000Z', NULL, TRUE,
+                     '77', '2026-09-30T12:00:00.000Z', '77', '2026-09-30T12:00:00.000Z')",
+        )
+        .bind(id)
+        .bind(guild_id)
+        .bind(CHANNEL_S)
+        .execute(&self.pool)
+        .await
+        .expect("seed scheduled message");
+    }
+
+    /// (id, channel_id) for this guild's scheduled messages, in list order.
+    async fn schedule_rows(&self) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT id, channel_id FROM scheduled_messages
+              WHERE guild_id = $1 ORDER BY next_run_at, id",
+        )
+        .bind(GUILD_S)
+        .fetch_all(&self.pool)
+        .await
+        .expect("scheduled message rows")
+    }
+
+    /// (action, target_key, outcome) from the shared automation audit log.
+    async fn schedule_audits(&self) -> Vec<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT action, target_key, outcome FROM automation_audit_log
+              WHERE guild_id = $1 ORDER BY created_at, id",
+        )
+        .bind(GUILD_S)
+        .fetch_all(&self.pool)
+        .await
+        .expect("automation audit rows")
     }
 }
 
@@ -2474,6 +2639,320 @@ async fn feed_failed_defer_leaves_store_untouched() {
         "no mutation when the defer fails"
     );
     assert!(db.feed_audits().await.is_empty());
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "the failed defer is the only call"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+// --- schedule slice: guild-scoped CRUD + automation_audit_log -------------
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_persists_one_shot_for_the_invoking_channel_and_audits() {
+    let db = TestDb::new().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        ))
+        .await;
+
+    let rows = db.schedule_rows().await;
+    assert_eq!(rows.len(), 1, "one scheduled row written");
+    let (id, channel_id) = &rows[0];
+    assert_eq!(channel_id, CHANNEL_S, "schedule binds the invoking channel");
+    let interval: Option<i64> =
+        sqlx::query_scalar("SELECT interval_seconds FROM scheduled_messages WHERE id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("interval");
+    assert_eq!(interval, None, "in-minutes is a one-shot");
+
+    let json = mock.deferred_reply();
+    assert!(
+        json["content"]
+            .as_str()
+            .expect("confirm text")
+            .starts_with(&format!("Scheduled message `{id}` at ")),
+        "ephemeral confirmation names the new id: {}",
+        json["content"]
+    );
+    assert_eq!(
+        db.schedule_audits().await,
+        vec![("scheduled.create".to_owned(), id.clone(), "ok".to_owned())]
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_recurring_sets_interval() {
+    let db = TestDb::new().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hourly".to_owned())),
+                option("every-minutes", CommandOptionValue::Integer(90)),
+            ],
+        ))
+        .await;
+
+    let rows = db.schedule_rows().await;
+    assert_eq!(rows.len(), 1, "one scheduled row written");
+    let interval: Option<i64> =
+        sqlx::query_scalar("SELECT interval_seconds FROM scheduled_messages WHERE id = $1")
+            .bind(&rows[0].0)
+            .fetch_one(&db.pool)
+            .await
+            .expect("interval");
+    assert_eq!(interval, Some(90 * 60), "every-minutes becomes seconds");
+
+    let content = mock.deferred_reply()["content"]
+        .as_str()
+        .expect("confirm text")
+        .to_owned();
+    assert!(
+        content.contains(&format!("`{}` every 90m", rows[0].0)),
+        "recurring confirmation renders the interval: {content}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_rejects_invalid_input_and_audits_rejected() {
+    let db = TestDb::new().await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    // No timing option: validation's missing-timing refusal, no row.
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![option(
+                "body",
+                CommandOptionValue::String("hello".to_owned()),
+            )],
+        ))
+        .await;
+    // Out-of-range in-minutes: same refusal posture.
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(0)),
+            ],
+        ))
+        .await;
+
+    assert!(
+        db.schedule_rows().await.is_empty(),
+        "no rows on validation failures"
+    );
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 2, "both refusals still complete the defer");
+    let first: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
+    assert_eq!(
+        first["content"],
+        "Give either in-minutes (one-shot) or every-minutes (recurring)."
+    );
+    let second: serde_json::Value = serde_json::from_slice(&edits[1].body).unwrap();
+    assert_eq!(
+        second["content"],
+        "in-minutes must be between 1 and 525600, got 0."
+    );
+    let audits = db.schedule_audits().await;
+    assert_eq!(audits.len(), 2, "both failures audit");
+    assert!(
+        audits
+            .iter()
+            .all(|(action, _, outcome)| action == "scheduled.create" && outcome == "rejected"),
+        "validation failures audit scheduled.create/rejected: {audits:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_is_scoped_to_the_configured_guild_and_audits_nothing() {
+    let db = TestDb::new().await;
+    db.seed_schedule(GUILD_S, "sched-own").await;
+    db.seed_schedule("9999", "sched-foreign").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    assert!(content.contains("sched-own"), "own row listed: {content}");
+    assert!(
+        !content.contains("sched-foreign"),
+        "other guild's row never listed: {content}"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_remove_deletes_by_unique_prefix_and_refuses_ambiguous() {
+    let db = TestDb::new().await;
+    db.seed_schedule(GUILD_S, "abc111").await;
+    db.seed_schedule(GUILD_S, "abc222").await;
+    db.seed_schedule(GUILD_S, "xyz999").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    // Unique prefix resolves and deletes one row.
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String("xyz".to_owned()))],
+        ))
+        .await;
+    // Ambiguous prefix refuses and mutates nothing.
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String("abc".to_owned()))],
+        ))
+        .await;
+    // No match refuses the same way.
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String("zzz".to_owned()))],
+        ))
+        .await;
+
+    let remaining: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec!["abc111".to_owned(), "abc222".to_owned()],
+        "only the uniquely-resolved row is deleted"
+    );
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 3, "one completion per remove");
+    let removed: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
+    assert_eq!(removed["content"], "Cancelled.");
+    let ambiguous: serde_json::Value = serde_json::from_slice(&edits[1].body).unwrap();
+    assert_eq!(
+        ambiguous["content"],
+        "No unique scheduled message matches `abc`. Use the full id from /schedule-list."
+    );
+    let missing: serde_json::Value = serde_json::from_slice(&edits[2].body).unwrap();
+    assert_eq!(
+        missing["content"],
+        "No unique scheduled message matches `zzz`. Use the full id from /schedule-list."
+    );
+    // Only the successful delete audits: ambiguous/missing prefixes resolve
+    // to nothing and mutate nothing.
+    assert_eq!(
+        db.schedule_audits().await,
+        vec![(
+            "scheduled.delete".to_owned(),
+            "xyz999".to_owned(),
+            "ok".to_owned()
+        )]
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_store_failure_replies_generic() {
+    let db = TestDb::new().await;
+    // Drop the table after migrations: every store call fails. No FK points
+    // at scheduled_messages (0140/0141/0150), so no CASCADE is needed.
+    sqlx::query("DROP TABLE scheduled_messages")
+        .execute(&db.pool)
+        .await
+        .expect("drop scheduled_messages");
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        "Schedule command failed; try again."
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_failed_defer_leaves_store_untouched() {
+    let db = TestDb::new().await;
+    let (runtime, mock) = db_runtime(&db, vec![404]).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        ))
+        .await;
+
+    assert!(
+        db.schedule_rows().await.is_empty(),
+        "no mutation when the defer fails"
+    );
+    assert!(db.schedule_audits().await.is_empty());
     assert_eq!(
         mock.requests().len(),
         1,

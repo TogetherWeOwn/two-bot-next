@@ -5,7 +5,7 @@
 //! `src/backfill/` + `src/core/inviteTracker.ts`). The library holds the pure
 //! logic — parsing, planning, reconciliation — so it unit-tests without a
 //! database or Discord; `db` and `rest` hold the sqlx/twilight seams and the
-//! seven `src/bin/` CLIs are thin arg-parsing shells around them.
+//! `src/bin/` CLIs are thin arg-parsing shells around them.
 //!
 //! Conventions inherited from legacy: dry run is the default everywhere that
 //! writes (`--apply` is the only thing that writes); every CLI refuses the
@@ -32,15 +32,17 @@ pub mod member_erasure;
 pub mod message_scan;
 pub mod parse;
 pub mod raid_tools;
+pub mod reengagement;
 pub mod rest;
+pub mod rollback_delta;
 pub mod self_role_store;
 pub mod settings;
 pub mod tickets;
 
 pub use backfill_plan::{plan_backfill_merge, BackfillMerge, ListedMember, PlannedEvent};
 pub use db::{
-    connect, mark_bot, record_earliest, record_event, replace_role_rewards, role_rewards,
-    touch_activity, CutoverDb, FunnelWrite, ReplaceRewardsError, DB_POOL_MAX_DEFAULT,
+    connect, connect_with_tls, mark_bot, record_earliest, record_event, replace_role_rewards,
+    role_rewards, touch_activity, CutoverDb, FunnelWrite, ReplaceRewardsError, DB_POOL_MAX_DEFAULT,
     STATEMENT_TIMEOUT_MS,
 };
 pub use dedupe::{

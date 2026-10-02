@@ -65,6 +65,7 @@ function harness(opts: {
   recorderThrows?: boolean;
   fallback?: string | null;
   bucket?: { capacity: number; refillPerSecond: number };
+  limits?: ConstructorParameters<typeof TokenBuckets>[2];
   now?: () => number;
 } = {}): Harness {
   const clicks: RedirectClick[] = [];
@@ -72,6 +73,7 @@ function harness(opts: {
   const buckets = new TokenBuckets(
     opts.bucket ?? { capacity: 60, refillPerSecond: 1 },
     opts.now ?? Date.now,
+    opts.limits,
   );
   let token = 0;
   const deps: RedirectDeps = {
@@ -88,7 +90,7 @@ function harness(opts: {
     onError: (msg, detail) => errors.push(`${msg} ${JSON.stringify(detail)}`),
     now: () => new Date("2026-09-03T12:00:00.000Z").getTime(),
     uuid: () => `token-${++token}`,
-    isThrottled: (key) => !buckets.take(key).allowed,
+    throttle: (key) => buckets.take(key),
   };
   return {
     deps,
@@ -447,7 +449,7 @@ describe("configuration and campaign ingress fail closed", () => {
       for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
         const h = harness({ fallback: "has space" });
         h.deps.lookup = async () => { assert.fail("reserved paths must skip lookup"); };
-        h.deps.isThrottled = () => { assert.fail("reserved paths must skip rate limiting"); };
+        h.deps.throttle = () => { assert.fail("reserved paths must skip rate limiting"); };
         const res = await h.call(method, path);
         assert.equal(res.status, 404, `${method} ${path}`);
         assert.equal(res.headers.location, undefined);
@@ -474,7 +476,7 @@ describe("configuration and campaign ingress fail closed", () => {
         for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
           const h = harness({ fallback });
           h.deps.lookup = async () => { assert.fail("reserved prefixes must skip lookup"); };
-          h.deps.isThrottled = () => { assert.fail("reserved prefixes must skip throttling"); };
+          h.deps.throttle = () => { assert.fail("reserved prefixes must skip throttling"); };
           const res = await h.call(method, path);
           assert.equal(res.status, 404, `${method} ${path}`);
           assert.equal(res.headers.location, undefined);
@@ -496,7 +498,7 @@ describe("configuration and campaign ingress fail closed", () => {
         const h = harness();
         h.deps.fallbackInviteCode = value as string;
         h.deps.lookup = async () => { assert.fail("invalid fallback must skip lookup"); };
-        h.deps.isThrottled = () => { assert.fail("invalid fallback must skip throttling"); };
+        h.deps.throttle = () => { assert.fail("invalid fallback must skip throttling"); };
         const res = await h.call("GET", path);
         assert.equal(res.status, 503);
         assert.equal(res.headers.location, undefined);
@@ -904,6 +906,82 @@ describe("F7 residual: canonical quota, unknown budget, terminal 429s (TOG-12469
     const throttled = await h.call("GET", "/reddit", "203.0.113.44");
     assert.equal(throttled.status, 429);
     assert.equal(h.clicks.length, 2);
+  });
+
+  test("refill accrues across a hold, capped at capacity (deliberate, TOG-12533)", () => {
+    let now = 1_000_000;
+    // Long idle TTL: the post-hold quota below comes from refill, not expiry.
+    const limits = { idleTtlMs: 3_600_000, maxConsecutiveDenials: 2 };
+    const short = new TokenBuckets(
+      { capacity: 60, refillPerSecond: 1 },
+      () => now,
+      { ...limits, terminalCooldownMs: 3_000 },
+    );
+    for (let i = 0; i < 60; i++) assert.ok(short.take("k").allowed);
+    assert.ok(!short.take("k").allowed);
+    assert.equal(short.take("k").retryAfter, 3);
+    now += 1_000;
+    assert.equal(short.take("k").retryAfter, 2, "mid-hold takes spend nothing");
+    now += 2_000;
+    // The 3-second hold refilled exactly 3 tokens: obeying the advertised
+    // wait earns what any idle caller would, never more.
+    for (let i = 0; i < 3; i++) assert.ok(short.take("k").allowed, `admit ${i}`);
+    const after = short.take("k");
+    assert.ok(!after.allowed);
+    assert.equal(after.retryAfter, 1);
+
+    const long = new TokenBuckets(
+      { capacity: 5, refillPerSecond: 1 },
+      () => now,
+      { ...limits, terminalCooldownMs: 30_000 },
+    );
+    for (let i = 0; i < 5; i++) assert.ok(long.take("k").allowed);
+    assert.ok(!long.take("k").allowed);
+    assert.equal(long.take("k").retryAfter, 30);
+    now += 30_000;
+    // A hold longer than the refill window still banks only one bucket.
+    for (let i = 0; i < 5; i++) assert.ok(long.take("k").allowed, `admit ${i}`);
+    assert.ok(!long.take("k").allowed);
+  });
+
+  test("a held caller's redirect 429 carries the remaining hold, counting down", async () => {
+    let now = 1_000_000;
+    const h = harness({
+      bucket: { capacity: 2, refillPerSecond: 1 },
+      limits: { maxConsecutiveDenials: 3, terminalCooldownMs: 60_000 },
+      now: () => now,
+    });
+    const lookup = h.deps.lookup;
+    let lookups = 0;
+    h.deps.lookup = (slug) => { lookups += 1; return lookup(slug); };
+    assert.equal((await h.call("GET", "/reddit")).status, 302);
+    assert.equal((await h.call("GET", "/reddit")).status, 302);
+    // Plain refill denials before the streak earns a hold: a short wait.
+    for (let i = 0; i < 2; i++) {
+      const refill = await h.call("GET", "/reddit");
+      assert.equal(refill.status, 429);
+      assert.equal(refill.headers["retry-after"], "1");
+    }
+    // The denial that earns the hold advertises it, not a one-second retry.
+    const held = await h.call("GET", "/reddit");
+    assert.equal(held.status, 429);
+    assert.equal(held.headers["retry-after"], "60");
+    // Retries during the hold, on any path or caller alias, see the same hold
+    // end counting down and never reach the store.
+    now += 15_000;
+    const later = await h.call("GET", "/no-such-campaign", " CALLER-1 ");
+    assert.equal(later.status, 429);
+    assert.equal(later.headers["retry-after"], "45");
+    now += 44_500;
+    const last = await h.call("HEAD", "/reddit");
+    assert.equal(last.status, 429);
+    assert.equal(last.headers["retry-after"], "1", "a partial second rounds up");
+    assert.equal(lookups, 2);
+    assert.equal(h.clicks.length, 2);
+    // Hold over: the caller is served again.
+    now += 500;
+    assert.equal((await h.call("GET", "/reddit")).status, 302);
+    assert.equal(h.clicks.length, 3);
   });
 });
 
