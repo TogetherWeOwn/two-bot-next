@@ -12,8 +12,7 @@ on:
   # / `worker check` would never run on the release PR without this path.
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: check-${{ github.event.pull_request.number || github.sha }}
@@ -22,6 +21,8 @@ concurrency:
 jobs:
   check:
     name: check
+    permissions:
+      contents: read
     needs: [self-role-store, parity-docs, job-inputs]
     # A skipped dependency must not make the required check appear green.
     if: ${{ always() }}
@@ -45,6 +46,19 @@ jobs:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       CARGO_TERM_COLOR: always
+      # Disk hygiene for hosted overflow runners (TOG-12134): the integration
+      # link step (`cargo test --workspace --test '*'`) links ~70 test
+      # binaries and exhausted the job-container overlay (98 MB left, rust-lld
+      # bus error on two consecutive main heads). Line tables keep failure
+      # backtraces useful while cutting binary size; codegen, debug
+      # assertions and test semantics are unchanged. `cargo test` compiles
+      # under the `test` profile, so both profiles are pinned.
+      CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
+      # Incremental artifacts multiply with ~70 linked test binaries; a cold
+      # CI link does not reuse them, so skip writing them (TOG-12134).
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
       TWO_LFG_TESTDB_CI: '1'
       TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
     services:
@@ -64,6 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           # The migration guard reads PR base/push-before blobs, including the lock.
           fetch-depth: 0
 
@@ -73,7 +88,10 @@ jobs:
           # runner-owned checkout, so Git refuses it as dubious ownership.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          # Disk hygiene for hosted overflow runners (TOG-12134): the package
+          # lists stay on the job-container overlay otherwise.
+          rm -rf /var/lib/apt/lists/*
           # Tests that pin 127.0.0.1/localhost:5432 reach the service through
           # this job-private forward.
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
@@ -102,6 +120,23 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
+      - name: Install pinned static audit tools
+        run: |
+          python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/zizmor" 'zizmor==1.30.1' 'PyYAML==6.0.3'
+
+      - name: Source-level CI gate regressions
+        run: PYTHONPATH="$RUNNER_TEMP/zizmor" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
+      - name: Reject hard-coded source snowflakes
+        run: python3 scripts/ci/check-src-snowflakes.py
+
+      - name: Verify CODEOWNERS syntax and coverage
+        run: python3 scripts/ci/verify-codeowners.py
+
+      - name: Audit GitHub Actions workflows
+        # Offline static audits need no GitHub credentials or security-events writes.
+        run: '"$RUNNER_TEMP/zizmor/bin/zizmor" --offline --strict-collection --no-progress .github/workflows'
+
       - name: offline build-cache safety regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
 
@@ -114,6 +149,17 @@ jobs:
         run: |
           python3 tests/voice_templates/validate.py
           python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
+
+      # `check all` reads Cargo.lock by default (no --locked flag exists).
+      # deny.toml's allow-list is verified tight: no unmatched allowances.
+      # Runs before the toolchain install and every compile/link step
+      # (TOG-12134): the deny image ships its own toolchain and rustup-syncs
+      # the pinned one, so it must run while the disk is at its freest.
+      - name: cargo-deny
+        if: needs.job-inputs.outputs.rust != 'false'
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check all
 
       - name: Install Rust toolchain
         if: needs.job-inputs.outputs.rust != 'false'
@@ -144,6 +190,9 @@ jobs:
         run: |
           python3 scripts/check-secret-debug.py --test
           python3 scripts/check-secret-debug.py
+
+      - name: Verify check job disk hygiene
+        run: python3 scripts/test-check-disk-hygiene.py
 
       - name: cargo fmt --check
         if: needs.job-inputs.outputs.rust != 'false'
@@ -185,6 +234,9 @@ jobs:
           cargo build -p two-bot --locked
           export TWO_BOT_TEST_BACKUP_BIN="$PWD/target/debug/two-bot"
           cargo test -p two-bot-core --features db --test backup_roundtrip --test backup_dump_publication --locked -- --nocapture --test-threads=1
+          # The shipped monthly drill on the complete migrated schema (TOG-11804).
+          export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          cargo test -p two-bot-core --features db --test backup_schema_roundtrip --locked shipped_backup_and_restore_drill -- --nocapture --test-threads=1
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -236,6 +288,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test raid_list_db --locked -- --ignored
+
+      - name: Reengagement list query (CI service container only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test reengagement_list_db --locked -- --ignored
 
       - name: settings database regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -293,6 +350,14 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
 
+      - name: Durable Discord send admission (isolated DBs and mock HTTP only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: |
+          cargo test -p two-bot-core --features db --test send_admission --locked -- --ignored
+          cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --ignored
+          cargo test -p two-bot-cutover --test send_admission --locked -- --ignored
+
       - name: Command runtime acceptance tests (sticky, feeds and leveling, CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
@@ -303,16 +368,10 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
 
-      # `check all` reads Cargo.lock by default (no --locked flag exists).
-      # deny.toml's allow-list is verified tight: no unmatched allowances.
-      - name: cargo-deny
-        if: needs.job-inputs.outputs.rust != 'false'
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check all
-
   parity-docs:
     name: parity docs
+    permissions:
+      contents: read
     needs: [job-inputs]
     # Skip when the selector sees no parity inputs; the `check`
     # aggregator only enforces this job when parity was selected.
@@ -336,6 +395,8 @@ jobs:
 
   self-role-store:
     name: self-role store leases
+    permissions:
+      contents: read
     needs: [job-inputs]
     # Skip when the selector sees no Rust inputs; the `check`
     # aggregator only enforces this job when rust was selected.
@@ -362,6 +423,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -432,6 +494,8 @@ jobs:
   # writes stay on the merge ref), so no scope-string change is needed.
   container-inputs:
     name: container inputs changed
+    permissions:
+      contents: read
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container-inputs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
@@ -465,6 +529,8 @@ jobs:
 
   container:
     name: container smoke
+    permissions:
+      contents: read
     needs: container-inputs
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
@@ -486,10 +552,11 @@ jobs:
       # green without hiding anything the branch protection demands.
       - name: Skip note (no image inputs changed)
         if: needs.container-inputs.outputs.build != 'true'
+        env:
+          BUILD_SELECTION: ${{ needs.container-inputs.outputs.build }}
         run: |
           printf 'Skipping the runtime image build: no image inputs changed.\n'
-          printf 'Selector output: build=%s\n' \
-            "${{ needs.container-inputs.outputs.build }}"
+          printf 'Selector output: build=%s\n' "$BUILD_SELECTION"
       - name: Set up BuildKit
         if: needs.container-inputs.outputs.build == 'true'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -529,6 +596,8 @@ jobs:
 
   community-db:
     name: community db
+    permissions:
+      contents: read
     needs: [job-inputs]
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
@@ -542,7 +611,7 @@ jobs:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     services:
       agent-testdb:
-        image: postgres:17
+        image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
         env:
           POSTGRES_USER: agent_test
           POSTGRES_DB: postgres
@@ -554,6 +623,8 @@ jobs:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/postgres
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
@@ -568,6 +639,8 @@ jobs:
 
   feeds-db:
     name: feeds db check
+    permissions:
+      contents: read
     needs: [job-inputs]
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
@@ -593,6 +666,8 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
@@ -603,6 +678,8 @@ jobs:
 
   tickets-postgres:
     name: tickets postgres
+    permissions:
+      contents: read
     needs: [job-inputs]
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
@@ -628,6 +705,8 @@ jobs:
       TICKET_TEST_DB_HOST: agent-testdb
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
@@ -646,6 +725,8 @@ jobs:
 
   worker:
     name: worker check
+    permissions:
+      contents: read
     needs: [job-inputs]
     # Skip when the selector sees no worker inputs (not a required check).
     if: needs.job-inputs.outputs.worker != 'false'
@@ -658,6 +739,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -686,7 +768,9 @@ jobs:
       - name: Verify runner routing for every workflow job
         run: python3 ../scripts/test-runner-routing.py
       - name: Verify offline release lifecycle
-        run: |
+        # Match the library bundled by the pinned release action, in an isolated
+        # API-double fixture with lifecycle scripts disabled and no write token.
+        run: | # zizmor: ignore[adhoc-packages] pinned offline release fixture only
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs

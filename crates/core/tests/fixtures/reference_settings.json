@@ -59,7 +59,7 @@
   "TWO_COMMUNITY_STAGING_GUILD_IDS": "Staging guilds excluded from human community activity.",
   "TWO_COMMUNITY_TEST_ACTOR_IDS": "Test actors excluded from human community activity.",
   "TWO_COMMUNITY_WELCOME_CHANNEL_IDS": "Welcome-channel classification for community analytics.",
-  "TWO_DATABASE_URL": "Legacy database connection secret; distinct from Container DATABASE_URL.",
+  "TWO_DATABASE_URL": "Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token.",
   "TWO_DB_POOL_MAX": "Legacy database pool maximum read before the settings store exists.",
   "TWO_FEED_POLL_SECONDS": "Feed polling interval (validated from 60 to 86400 seconds).",
   "TWO_HEALTH_BIND_HOST": "Legacy health listener interface; environment-only network bind.",

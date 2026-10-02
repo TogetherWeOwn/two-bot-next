@@ -97,6 +97,7 @@ RUST_DOCS = frozenset({
     "docs/commands.md",
     "docs/configuration.md",
     "docs/voice-rooms.md",
+    "docs/voice-conditions-core.md",
     "docs/soak-checklist.json",
     "docs/soak-checklist.md",
 })

@@ -1,5 +1,8 @@
 //! Database-role commands never enter the gateway or migration path.
 
+// Operator commands intentionally emit human-readable/SQL output to stdout.
+#![allow(clippy::print_stdout)]
+
 use two_bot_core::database_roles;
 
 const USAGE: &str = "two-bot db roles plan|verify\n\
