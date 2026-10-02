@@ -1123,8 +1123,23 @@ async fn restore_never_reissues_values_handed_out_before_their_rows_were_deleted
     assert!(report.dropped_columns.is_empty());
     for sequence in owned_sequences(pool).await {
         let key = (sequence.table, sequence.column);
+        // 0113 retry tickets share the ban-ownership allocator without owning
+        // a column; restore resumes past them too, not at the ban mark.
+        let shared_edge: Option<i64> =
+            if key == ("moderation_member_bans".to_owned(), "generation".to_owned()) {
+                sqlx::query_scalar(
+                    "SELECT MAX(retry_generation)::bigint FROM moderation_scheduled_unbans",
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap()
+            } else {
+                None
+            };
         let resumes = if key == ("xp_awards".to_owned(), "id".to_owned()) {
             9001
+        } else if let Some(edge) = shared_edge {
+            expected[&key].max(edge + sequence.increment)
         } else {
             expected[&key]
         };
