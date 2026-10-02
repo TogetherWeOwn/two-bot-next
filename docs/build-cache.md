@@ -14,6 +14,13 @@ python3 scripts/cargo_cache.py run -- check -p two-bot-core
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib
 ```
 
+Run the wrapper with a Bash timeout that covers the build (600000 ms) or in
+the background. An interrupted run keeps its `lease.json` sentinel and any
+partial output stays in the slot, counting against its budget; a stale
+under-budget lease with a dead recorded Cargo process group is recovered on
+the next acquire, while over-budget or live-group leases stay for Operator
+inspection.
+
 Choose the smallest useful target. The wrapper adds `--offline --locked`, uses
 `/paperclip/.cache/two-bot-next-bounded/slot-N/target`, and overrides inherited
 `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`, including
@@ -40,8 +47,13 @@ The wrapper samples allocated blocks for the **whole slot**, including retained
 scratch and lease metadata, and `f_bavail * f_frsize` every second. Scratch is
 retained under the same lease/quota; it is not automatically cleaned. A
 budget/floor breach terminates its own process group and leaves `lease.json` for
-inspection. A crashed wrapper's sentinel is **never stolen**, regardless of PID
-reuse or issue status. Cargo inherits the lease FD too. Normal completed Cargo
+inspection. A stale under-budget sentinel is recovered automatically: holding the
+slot flock proves no wrapper, Cargo, or fd-inheriting descendant is alive, and a
+dead recorded Cargo process group confirms it; recovery emits a
+`stale_lease_recovered` line and unlinks the sentinel. Over-budget sentinels,
+live recorded groups, and unparseable or pgid-less leases (including ones minted
+before pgid recording) are **never stolen** — the Operator inspects those.
+Cargo inherits the lease FD too. Normal completed Cargo
 invocations release the lease, including commands returning a compile/test error.
 An outliving process group leaves the sentinel. Do not clear a sentinel without
 both control-plane and actual-process checks. Build cancellation is idempotent
@@ -143,7 +155,9 @@ Cargo/temp/**repository-scratch** overrides
 (`PAPERCLIP_RUN_SCRATCH_DIR`/`PAPERCLIP_SCRATCH_DIR`, which `mac.rs` tests
 prefer over `temp_dir`), real `tempfile` placement, unchanged parent
 environment, repeated signals during shutdown plus a deterministic second-signal
-transition fixture, missing/symlink scratch refusal,
+transition fixture, stale-lease recovery on a free lock with a dead recorded
+group (held locks, over-budget leases and live groups stay refused),
+missing/symlink scratch refusal,
 retained-scratch admission limits, missing scratch-coverage attestation, and
 preservation of the three external path fixtures. Retention tests
 include an **actual Linux child process with an open FD and mmap**, plus container

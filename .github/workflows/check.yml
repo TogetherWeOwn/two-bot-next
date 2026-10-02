@@ -446,6 +446,8 @@ jobs:
         run: node --test ../scripts/test-export-legacy-registry.mjs
       - name: Verify PR lint event and dispatch paths
         run: python3 ../scripts/test-pr-lint.py
+      - name: Verify secret-scan trigger and concurrency surface
+        run: python3 ../scripts/test-secret-scan.py
       - name: Verify release reconciliation retries
         run: python3 ../scripts/test-release-retry.py
       - name: Verify offline release lifecycle

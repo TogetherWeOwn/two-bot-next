@@ -30,6 +30,7 @@ pub mod containment;
 pub mod database_roles;
 pub mod database_url;
 pub mod events;
+pub mod evidence;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod feeds;
@@ -86,6 +87,7 @@ pub mod voice;
 pub mod voice_config;
 pub mod voice_naming;
 pub mod voice_ownership;
+pub mod voice_permissions;
 pub mod voice_placement;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
@@ -138,6 +140,11 @@ pub use containment::{
     CONTAINMENT_ALERT_MAX_IDS, CONTAINMENT_SUPPRESSED_EVENT,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
+pub use evidence::{
+    family_of, Disposition, EventFamily, EvidenceLedger, ExpectedAction, ReceiptingStore,
+    ReconciledItem, Reconciliation, StoreReceipt, EVIDENCE_SCHEMA_VERSION, MATCH_WINDOW_MS,
+    MAX_EXPECTED_ACTIONS, MAX_RECEIPTS,
+};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
     announcement_commands, automation_commands, feature_commands, scorecard_attendance_command,
