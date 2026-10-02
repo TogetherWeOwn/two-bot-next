@@ -444,7 +444,9 @@ impl RejectionTelemetry {
     /// budget. Usually empty during a flood.
     pub fn record(&mut self, rejection: Rejection, now_ms: u64) -> Vec<RejectionRecord> {
         let mut out = self.flush(now_ms);
-        self.window_start_ms.get_or_insert(now_ms);
+        if self.window_start_ms.is_none() {
+            self.window_start_ms = Some(now_ms);
+        }
 
         let Rejection { class, key, action } = rejection;
         let bucket_key = (class, key, action);
