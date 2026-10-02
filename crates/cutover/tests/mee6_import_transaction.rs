@@ -4,6 +4,7 @@
 //! --test mee6_import_transaction -- --nocapture
 //! No inherited app URL, migrations in a shared schema, or Discord calls.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -26,6 +27,9 @@ const EXPORT: &[u8] = br#"{"players":[
 ]}"#;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+// Parallel tests share one pid and can read the same clock tick.
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
 struct TestDb {
     admin: Pool<Postgres>,
@@ -62,13 +66,14 @@ impl TestDb {
             .connect_with(options)
             .await?;
         let name = format!(
-            "mee6_test_{}_{}",
+            "mee6_test_{}_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
         );
         // Like legacy_verify_db, use an owned database so the public CutoverDb
         // API cannot open another connection outside a test search_path.
-        // Identifier is a fixed prefix plus decimal PID/time only.
+        // Identifier is a fixed prefix plus decimal PID/time/sequence only.
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&admin)
             .await?;
