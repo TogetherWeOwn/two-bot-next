@@ -254,20 +254,20 @@ class SupplyChainTests(unittest.TestCase):
     def test_required_check_rejects_every_non_success_scan_result(self):
         workflow = (ROOT / ".github/workflows/check.yml").read_text()
         job = workflow.split("\n  check:\n", 1)[1]
-        self.assertIn("needs: [self-role-store, supply-chain, parity-docs]", job)
+        # Merged with main's dependency-aware selector (#282): the
+        # self-role/parity gates are selector-aware, but the supply-chain
+        # gate stays unconditional — no job-inputs exception may hide a
+        # failed, skipped or cancelled scan.
+        self.assertIn("needs: [self-role-store, supply-chain, parity-docs, job-inputs]", job)
         self.assertIn("if: ${{ always() }}", job)
-        guard = re.search(r"if: (needs\.self-role-store\.result != 'success'[^\n]*)\n\s+run: exit 1", job)
+        guard = re.search(r"- name: require supply-chain gate to pass\n\s+if: ([^\n]*)\n\s+run: exit 1", job)
         self.assertIsNotNone(guard)
-        self.assertEqual(guard[1], "needs.self-role-store.result != 'success' || needs.supply-chain.result != 'success' || needs.parity-docs.result != 'success'")
-        for store in ["success", "failure", "skipped", "cancelled"]:
-            for scan in ["success", "failure", "skipped", "cancelled"]:
-                for docs in ["success", "failure", "skipped", "cancelled"]:
-                    with self.subTest(store=store, scan=scan, docs=docs):
-                        condition = (guard[1].replace("needs.self-role-store.result", f"'{store}'")
-                                     .replace("needs.supply-chain.result", f"'{scan}'")
-                                     .replace("needs.parity-docs.result", f"'{docs}'"))
-                        result = subprocess.run(["bash", "-c", f"if [[ {condition} ]]; then exit 1; fi"])
-                        self.assertEqual(result.returncode, 0 if store == scan == docs == "success" else 1)
+        self.assertEqual(guard[1], "needs.supply-chain.result != 'success'")
+        for scan in ["success", "failure", "skipped", "cancelled"]:
+            with self.subTest(scan=scan):
+                condition = guard[1].replace("needs.supply-chain.result", f"'{scan}'")
+                result = subprocess.run(["bash", "-c", f"if [[ {condition} ]]; then exit 1; fi"])
+                self.assertEqual(result.returncode, 0 if scan == "success" else 1)
 
     def test_shared_gate_and_dry_run_publication_guards(self):
         supply = (ROOT / ".github/workflows/sbom.yml").read_text()
