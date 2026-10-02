@@ -57,17 +57,19 @@ jobs:
             exit 1
           }
           # Container cold start can take a minute; poll /health up to ~5 min.
+          # Per-job $RUNNER_TEMP: fixed /tmp paths collide across the runners
+          # sharing one Docker host (TOG-11810).
           for i in $(seq 1 30); do
-            code=$(curl -s -o /tmp/health.json -w '%{http_code}' "$STAGING_URL/health" || true)
+            code=$(curl -s -o "$RUNNER_TEMP/health.json" -w '%{http_code}' "$STAGING_URL/health" || true)
             if [ "$code" = "200" ]; then
               echo "health 200 after ~$((i * 10))s"
-              cat /tmp/health.json
+              cat "$RUNNER_TEMP/health.json"
               break
             fi
             echo "attempt $i: /health -> $code; waiting 10s"
             if [ "$i" = "30" ]; then
               echo "health never returned 200 (bindings still broken?)"
-              cat /tmp/health.json || true
+              cat "$RUNNER_TEMP/health.json" || true
               exit 1
             fi
             sleep 10
@@ -75,9 +77,9 @@ jobs:
           # /readyz must answer with a component breakdown: 200 once S2/S3
           # meet contract, 503 while the shard is parked. Anything else
           # (500/1101/...) means the deploy is still broken.
-          code=$(curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_URL/readyz" || true)
+          code=$(curl -s -o "$RUNNER_TEMP/readyz.json" -w '%{http_code}' "$STAGING_URL/readyz" || true)
           echo "readyz -> $code"
-          cat /tmp/readyz.json || true
+          cat "$RUNNER_TEMP/readyz.json" || true
           case "$code" in
             200) echo "gateway ready" ;;
             503) echo "gateway parked (S2/S3 pending); deploy is healthy" ;;

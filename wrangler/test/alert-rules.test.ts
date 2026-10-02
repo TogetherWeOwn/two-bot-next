@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
-  EMPTY_STATE, RULES, RUNBOOK_BASE_URL, evaluateMetrics, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  EMPTY_STATE, RULES, RUNBOOK_BASE_URL, evaluateMetrics, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
 } from "../src/alert-rules.ts";
 
 const NOW = 1_000_000;
@@ -55,6 +55,26 @@ test("transitions notify once on fire and once on resolve", () => {
   assert.equal(transitionMessages([], ["job_stale:rank"]).length, 1);
   assert.equal(transitionMessages(["job_stale:rank"], ["job_stale:rank"]).length, 0);
   assert.match(transitionMessages(["job_stale:rank"], [])[0]!, /RESOLVED/);
+});
+
+test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
+  const window = "2026-10-09T20-11-06Z";
+  // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
+  // crates/core/src/evidence.rs); both sides pin all four here and there.
+  assert.deepEqual(RULES.map((r) => r.id), [
+    "job_stale",
+    "job_consecutive_failures",
+    "rest_429_rate",
+    "db_pool_saturated",
+  ]);
+  assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
+  assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
+  assert.equal(packetFilename("rest_429_rate", window), `evidence-rest_429_rate-${window}.json`);
+  assert.equal(packetFilename("db_pool_saturated", window), `evidence-db_pool_saturated-${window}.json`);
+  // Unknown keys get no filename rather than a misleading one; hostile
+  // window stamps stay filename-safe.
+  assert.equal(packetFilename("no_such_rule", window), undefined);
+  assert.equal(packetFilename("rest_429_rate", "2026-10-09T20:11:06Z"), "evidence-rest_429_rate-2026-10-09T20-11-06Z.json");
 });
 
 test("every rule links to an existing runbook heading", () => {

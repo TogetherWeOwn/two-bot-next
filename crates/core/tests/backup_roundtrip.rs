@@ -104,6 +104,18 @@ async fn build_schema(pool: &PgPool) {
             .await
             .unwrap();
     }
+    // This fixture intentionally exercises the legacy type surface rather than
+    // migrations. Complete-schema/FK coverage lives in backup_schema_roundtrip.
+    for table in two_bot_core::backup::dump_file::DUMP_TABLES {
+        if !SCHEMA.iter().any(|(name, _)| name == table) {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE TABLE IF NOT EXISTS {table} (id BIGINT PRIMARY KEY)"
+            )))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
     sqlx::query("CREATE TABLE schema_migrations (id TEXT PRIMARY KEY)")
         .execute(pool)
         .await
@@ -261,7 +273,11 @@ async fn dump_inspect_restore_round_trip() {
     let manifest = two_bot_core::backup::dump::dump(&pool, &dump_path)
         .await
         .expect("dump");
-    assert_eq!(manifest.tables.len(), 22, "all bot-owned tables dumped");
+    assert_eq!(
+        manifest.tables.len(),
+        two_bot_core::backup::dump_file::DUMP_TABLES.len(),
+        "all covered tables dumped"
+    );
     let events = manifest.tables.iter().find(|t| t.name == "events").unwrap();
     assert_eq!(events.count, 3);
     assert!(dump_path.exists());
