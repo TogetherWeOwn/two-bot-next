@@ -2,7 +2,9 @@
 
 use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use two_bot_core::voice_rooms::{CreatorChannel, PermissionSource, RoomPosition, VoiceRoom};
+use two_bot_core::voice_rooms::{
+    CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
+};
 use two_bot_cutover::voice_rooms::PgRoomStore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -58,11 +60,40 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     creator.default_limit = Some(99);
     creator.private_default = true;
     creator.text_channels = true;
+    creator.text_channel_name = Some("Lounge; SELECT 'not SQL'".to_owned());
+    creator.text_viewer_role_id = Some(u64::MAX);
     creator.position = RoomPosition::Below;
     creator.first_room_number = 3;
     store.add_creator(&creator).await?;
     assert_eq!(store.creator_for(100, 200).await?, Some(creator.clone()));
     assert_eq!(store.creator_for(101, 200).await?, None);
+    assert_eq!(
+        store
+            .creator_for(100, 200)
+            .await?
+            .expect("creator row")
+            .text_channel_settings(),
+        two_bot_core::voice_text_channel::TextChannelSettings {
+            enabled: true,
+            configured_name: Some("Lounge; SELECT 'not SQL'".to_owned()),
+            viewer_role_id: Some(u64::MAX),
+        }
+    );
+    // Clearing the toggle (plus NULL name/viewer columns) decodes to the
+    // default (off) settings.
+    let mut cleared = creator.clone();
+    cleared.text_channels = false;
+    cleared.text_channel_name = None;
+    cleared.text_viewer_role_id = None;
+    store.add_creator(&cleared).await?;
+    assert_eq!(
+        store
+            .creator_for(100, 200)
+            .await?
+            .expect("creator row")
+            .text_channel_settings(),
+        two_bot_core::voice_text_channel::TextChannelSettings::default()
+    );
     creator.default_limit = Some(4);
     store.add_creator(&creator).await?;
     assert_eq!(store.creators(100).await?, vec![creator.clone()]);
@@ -92,6 +123,37 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(store.room_for(100, 500).await?, Some(first.clone()));
     assert_eq!(store.rooms_for_owner(100, 300).await?, vec![first.clone()]);
     assert!(store.rooms_in_guild(101).await?.is_empty());
+
+    // V9b companion records: creation snapshot round-trips, insert-once, and
+    // get/delete per room. The snapshot decodes back into the pure settings.
+    let companion = TextCompanion {
+        guild_id: 100,
+        room_channel_id: 500,
+        text_channel_id: 600,
+        settings: two_bot_core::voice_text_channel::TextChannelSettings {
+            enabled: true,
+            configured_name: Some("Lounge; SELECT 'not SQL'".to_owned()),
+            viewer_role_id: Some(u64::MAX),
+        },
+        created_at: "2026-09-30T01:00:00.123Z".to_owned(),
+    };
+    assert!(store.add_companion(&companion).await?);
+    let mut companion_dup = companion.clone();
+    companion_dup.text_channel_id = 999;
+    assert!(!store.add_companion(&companion_dup).await?);
+    assert_eq!(
+        store.companion_for(100, 500).await?,
+        Some(companion.clone())
+    );
+    assert_eq!(store.companion_for(101, 500).await?, None);
+    assert_eq!(store.companion_for(100, 501).await?, None);
+    assert_eq!(
+        store.remove_companion(101, 500).await?,
+        None,
+        "wrong guild deletes nothing"
+    );
+    assert_eq!(store.remove_companion(100, 500).await?, Some(companion));
+    assert_eq!(store.remove_companion(100, 500).await?, None);
 
     // Reconstructing the adapter reloads durable state; removing the creator
     // must not cascade-delete rooms that are still occupied.

@@ -375,12 +375,12 @@ pub use voice_reconcile::{
 };
 pub use voice_rooms::{
     category_full_message, decide_room_join, decide_room_leave, fail_backoff_ms,
-    parse_retry_after_ms, reconcile, voice_commands, ActionQueue, CreatorChannel,
-    CreatorSettingsError, FailedAction, MemRoomStore, NewRoomSpec, PermissionSource,
-    ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction, RoomJoinDecision,
-    RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore, SeenChannel,
-    VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT,
-    QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
+    is_usable_channel_name, parse_retry_after_ms, reconcile, voice_commands, ActionQueue,
+    CreatorChannel, CreatorSettingsError, FailedAction, MemRoomStore, NewRoomSpec,
+    PermissionSource, ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction,
+    RoomJoinDecision, RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore,
+    SeenChannel, TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY,
+    MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT, QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
