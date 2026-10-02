@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "measured_at": "2026-10-01",
+    "source_revision": "445ca88f538c0a9b5913c1f1f53c12dd64501a52",
+    "workflow_run": "https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36821344440",
+    "artifact_name": "pipeline-benchmark",
+    "environment": "self-hosted two-selfhosted; ephemeral rust:bookworm job container; private Postgres 18.6 service",
+    "selection": "First successful standalone benchmark report; retained unchanged, not the faster nightly repeat or a per-metric aggregate. Shared-runner latency dispersion is documented in docs/b1-baseline.md."
+  },
+  "workload": {
+    "members": 107,
+    "channels": 10,
+    "duration_secs": 30,
+    "messages_per_sec": 20,
+    "voice_per_sec": 10,
+    "rest_every": 30,
+    "profile": "debug",
+    "handler": "twilight-funnel+dispatch-commit",
+    "db_accounting": "sqlx-completed-statements+unlogged-BEGIN"
+  },
+  "metrics": {
+    "peak_rss_mib": 24.67578125,
+    "handler_latency_us": {
+      "p50": 18675.201999999997,
+      "p99": 119271.538
+    },
+    "db_round_trips_per_event": 8.45,
+    "mock_rest_latency_us": {
+      "p50": 3945.614,
+      "p99": 48439.975000000006
+    },
+    "replay_secs": 29.987706241,
+    "command_secs": 38.2645219
+  },
+  "evidence": {
+    "measured_events": 900,
+    "messages": 600,
+    "voice_updates": 300,
+    "sqlx_statements": 6705,
+    "begin_exchanges": 900,
+    "commits": 900,
+    "mock_rest_calls": 30,
+    "durable_events": 942,
+    "durable_members": 107,
+    "cached_members": 107,
+    "cached_channels": 10,
+    "checkpoint_sequence": 1017,
+    "disposable_database_dropped": true
+  }
+}

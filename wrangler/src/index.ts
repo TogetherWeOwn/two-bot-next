@@ -26,10 +26,18 @@ import {
   RedirectMissCache,
   handleRedirect,
   isReservedInternal,
-  type Campaign,
+  isValidFallback,
+  redirectErrorClass,
   type RedirectClick,
 } from "./redirect.ts";
 import { RedirectStore, parseMappingsSnapshot } from "./redirect-store.ts";
+import {
+  EMPTY_STATE,
+  evaluateMetrics,
+  parseExposition,
+  transitionMessages,
+  type MetricsAlertState,
+} from "./alert-rules.ts";
 
 export interface Env {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
@@ -38,6 +46,12 @@ export interface Env {
   GUILD_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
+  /** Consecutive failed probes; default covers ~10 minutes of keepalive ticks. */
+  UNREADY_ALERT_FAILURES?: string;
+  /** Optional Worker secret; never forwarded to the container or logged. */
+  OPS_ALERT_WEBHOOK_URL?: string;
+  /** Optional Worker secret: bearer token for GET /ops/metrics. Unset → route 404s. */
+  METRICS_SCRAPE_TOKEN?: string;
   /** Hyperdrive binding to shared Postgres (S1). Absent until S1 lands. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -49,18 +63,25 @@ export interface Env {
 // Per-isolate crawler cap (60 burst, 1/sec refill — matches legacy
 // CLICK_BUCKET). Module-level so one isolate shares the budget.
 const clickBuckets = new TokenBuckets();
-// Store instances are request-scoped; misses must survive across requests.
-const redirectMisses = new RedirectMissCache();
+// Store instances are request-scoped; misses must survive across requests —
+// but only while the backing configuration is identical. A changed snapshot
+// or mapping source must not inherit another config's misses, or a newly
+// added slug would 404 until the TTL expires.
+let redirectMissKey = "";
+let redirectMisses = new RedirectMissCache();
+function missCacheFor(env: Env): RedirectMissCache {
+  const raw = env.REDIRECT_MAPPINGS_JSON;
+  const key = `${env.REDIRECT_DB === undefined ? "snapshot" : "live"}:${typeof raw === "string" ? raw : typeof raw}`;
+  if (key !== redirectMissKey) {
+    redirectMissKey = key;
+    redirectMisses = new RedirectMissCache();
+  }
+  return redirectMisses;
+}
 
 function redirectStore(env: Env): RedirectStore {
-  let snapshot: Campaign[] = [];
-  try {
-    snapshot = env.REDIRECT_MAPPINGS_JSON
-      ? parseMappingsSnapshot(env.REDIRECT_MAPPINGS_JSON)
-      : [];
-  } catch {
-    snapshot = [];
-  }
+  const raw = env.REDIRECT_MAPPINGS_JSON;
+  const snapshot = raw === undefined || raw === "" ? [] : parseMappingsSnapshot(raw);
   // node-postgres ships inside the Worker via the `nodejs_compat` flag only
   // when S1 wires Hyperdrive; until then connect stays undefined and the
   // store serves the snapshot with clicks dropped (logged, never faked).
@@ -71,8 +92,36 @@ interface KeepalivePayload {
   startedAt: number;
 }
 
+interface ReadinessState {
+  failures: number;
+  firstFailureAt: number | null;
+  alerted: boolean;
+  lastProbeAt: number;
+  lastStatus: number | null;
+}
+
+type ReadinessEvent = "container_unready_alert" | "container_unready_recovery";
+
 const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
+const DEFAULT_UNREADY_SECONDS = 600;
+const READINESS_KEY = "two-bot:readiness";
+const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
+const OPS_METRICS_PATH = "/ops/metrics";
+
+/** Compare via digests so length/prefix timing does not leak the token. */
+async function tokenMatches(provided: string, expected: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(provided)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  const x = new Uint8Array(a);
+  const y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i]! ^ y[i]!;
+  return diff === 0;
+}
 
 function containerPort(raw: string | undefined): number {
   if (raw === undefined) return 8080;
@@ -108,20 +157,46 @@ export class TwoBotContainer extends Container<Env> {
     const url = new URL(request.url);
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {
-      this.armKeepalive();
+      await this.armKeepalive();
       return this.containerFetch(request);
+    }
+
+    // Reached only through the Worker's bearer-token gate (see default export).
+    if (url.pathname === OPS_METRICS_PATH && request.method === "GET") {
+      await this.armKeepalive();
+      const upstream = await this.containerFetch("http://c/metrics");
+      return new Response(await upstream.text(), {
+        status: upstream.status,
+        headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
+      });
     }
 
     return new Response("not found", { status: 404 });
   }
 
-  /** Arm the self-perpetuating schedule() keepalive (idempotent). */
-  private armKeepalive(): void {
-    // schedule() rejects while an identical pending task exists — that just
-    // means the loop is already armed.
-    void this.schedule(this.keepaliveSeconds(), "keepalive", {
-      startedAt: Date.now(),
-    } satisfies KeepalivePayload).catch(() => undefined);
+  private keepaliveArming: Promise<void> | undefined;
+  private keepaliveRunning = false;
+
+  /** Arm one persistent chain, including after Container restart/DO eviction. */
+  private armKeepalive(): Promise<void> {
+    if (this.keepaliveRunning) return Promise.resolve();
+    if (this.keepaliveArming) return this.keepaliveArming;
+    // SDK 0.3.7 creates a new task ID on EVERY schedule() call. Coalesce local
+    // callers and check persisted schedules before inserting a new task.
+    // Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
+    this.keepaliveArming = (async () => {
+      if ((await this.listSchedules("keepalive")).length === 0) {
+        await this.schedule(this.keepaliveSeconds(), "keepalive", {
+          startedAt: Date.now(),
+        } satisfies KeepalivePayload);
+      }
+    })().catch(() => {
+      // Monitoring setup must not replace health/readiness responses or fail
+      // SDK startup via onStart. Later callers retry; never log error details.
+      // https://developers.cloudflare.com/containers/api/container-class/#onstart
+      console.warn(JSON.stringify({ event: "container_keepalive_arm_failed" }));
+    }).finally(() => { this.keepaliveArming = undefined; });
+    return this.keepaliveArming;
   }
 
   private keepaliveSeconds(): number {
@@ -135,24 +210,175 @@ export class TwoBotContainer extends Container<Env> {
    * idles out from under the gateway) and probes /readyz; then re-arms.
    * Invoked by name via schedule() — keep public.
    */
-  public async keepalive(payload: KeepalivePayload): Promise<void> {
-    this.renewActivityTimeout();
+  public async keepalive(payload: KeepalivePayload, schedule?: { taskId: string }): Promise<void> {
+    // SDK 0.3.7 passes undefined when an earlier callback deleted a row in
+    // its due-task snapshot. Such stale callbacks must not sample or re-arm.
+    if (!schedule || this.keepaliveRunning) return;
+    this.keepaliveRunning = true;
     try {
-      const res = await this.containerFetch("http://c/readyz", {
-        signal: AbortSignal.timeout(6000),
-      });
-      if (!res.ok) {
-        console.warn(`two-bot /readyz unhealthy: ${res.status}`);
+      await this.keepaliveArming;
+      // The SDK already looked up this due task by ID before invoking us.
+      // listSchedules() in 0.3.7 is unordered LIMIT 1: it can select a future
+      // legacy row, and a failed extra lookup loses this task when the SDK
+      // deletes it after the callback. Trust the live callback context instead.
+      // Source: https://github.com/cloudflare/containers/blob/v0.3.7/src/lib/container.ts
+      this.renewActivityTimeout();
+      try {
+        let status: number | null = null;
+        try {
+          const res = await this.containerFetch("http://c/readyz", {
+            signal: AbortSignal.timeout(6000),
+          });
+          status = res.status;
+          if (!res.ok) {
+            console.warn(`two-bot /readyz unhealthy: ${status}`);
+          }
+          // /readyz is a small JSON response. Drain rather than cancel: SDK
+          // 0.3.7's proxy pipe has an unhandled rejection on cancellation.
+          await res.arrayBuffer();
+        } catch {
+          status = null;
+          console.warn("two-bot keepalive probe failed");
+        }
+        await this.recordReadiness(status);
+        await this.evaluateMetricsAlerts();
+      } finally {
+        // Replace the executing row AND any legacy duplicate chains with one
+        // successor. onStart/inbound requests must not arm during this tick.
+        // https://developers.cloudflare.com/containers/api/container-class/#schedule
+        this.deleteSchedules("keepalive");
+        await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
       }
-    } catch (err) {
-      console.warn(`two-bot keepalive probe failed: ${String(err)}`);
+    } finally {
+      this.keepaliveRunning = false;
     }
-    await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
   }
 
-  override onStart(): void {
+  private unreadyAlertFailures(): number {
+    const raw = this.env.UNREADY_ALERT_FAILURES;
+    const count = Number(raw);
+    if (raw && /^\d+$/.test(raw) && Number.isSafeInteger(count) && count > 0) {
+      return count;
+    }
+    return Math.max(1, Math.ceil(DEFAULT_UNREADY_SECONDS / this.keepaliveSeconds()));
+  }
+
+  private async recordReadiness(status: number | null): Promise<void> {
+    const now = Date.now();
+    const ready = status !== null && status >= 200 && status < 300;
+    const threshold = this.unreadyAlertFailures();
+    // Container extends DurableObject; KV survives restarts and DO eviction.
+    // No network await between the read and write: DO storage input gates
+    // protect this transition from interleaving read/modify/write calls.
+    // https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#access-storage
+    const previous = await this.ctx.storage.get<ReadinessState>(READINESS_KEY);
+    const failures = ready ? 0 : (previous?.failures ?? 0) + 1;
+    let event: ReadinessEvent | undefined;
+    if (ready && previous?.alerted) {
+      event = "container_unready_recovery";
+    } else if (!ready && failures >= threshold && !previous?.alerted) {
+      event = "container_unready_alert";
+    }
+    const state: ReadinessState = {
+      failures,
+      firstFailureAt: ready ? null : previous?.firstFailureAt ?? now,
+      alerted: !ready && (previous?.alerted === true || event === "container_unready_alert"),
+      lastProbeAt: now,
+      lastStatus: status,
+    };
+    // Persist the transition BEFORE notifying: at most one attempt per event,
+    // even if the webhook times out after accepting it or an alarm is retried.
+    await this.ctx.storage.put(READINESS_KEY, state);
+    if (!event) return;
+
+    console.warn(JSON.stringify({
+      event,
+      service: "two-bot-next",
+      consecutive_failures: ready ? previous!.failures : failures,
+      threshold,
+      status,
+      first_failure_at: ready ? previous!.firstFailureAt : state.firstFailureAt,
+      observed_at: now,
+    }));
+    await this.postReadinessWebhook(event);
+  }
+
+  /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
+  private async evaluateMetricsAlerts(): Promise<void> {
+    try {
+      const res = await this.containerFetch("http://c/metrics", { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) {
+        await res.arrayBuffer();
+        return;
+      }
+      const samples = parseExposition(await res.text());
+      const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
+      const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
+      // Persist before notifying: at most one attempt per transition.
+      await this.ctx.storage.put(METRICS_ALERT_KEY, state);
+      for (const content of transitionMessages(previous.firing, firing)) {
+        console.warn(JSON.stringify({ event: "metrics_alert", service: "two-bot-next", content }));
+        await this.postWebhookText(content);
+      }
+    } catch {
+      console.warn("two-bot metrics scrape failed");
+    }
+  }
+
+  private async postWebhookText(content: string): Promise<void> {
+    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
+    if (!binding) return;
+    try {
+      const url = new URL(binding);
+      if (url.protocol !== "https:" || url.username || url.password) throw new Error("invalid webhook binding");
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(6000),
+        body: JSON.stringify({ content, allowed_mentions: { parse: [], replied_user: false } }),
+      });
+      await response.body?.cancel();
+      if (!response.ok) console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: response.status }));
+    } catch {
+      console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: null }));
+    }
+  }
+
+  private async postReadinessWebhook(event: ReadinessEvent): Promise<void> {
+    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
+    if (!binding) return;
+    try {
+      const url = new URL(binding);
+      if (url.protocol !== "https:" || url.username || url.password) {
+        throw new Error("invalid webhook binding");
+      }
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(6000),
+        body: JSON.stringify({
+          content: event === "container_unready_alert"
+            ? "two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs."
+            : "two-bot-next: Container /readyz is ready again. The unready incident has recovered.",
+          // https://docs.discord.com/developers/resources/webhook#execute-webhook
+          allowed_mentions: { parse: [], replied_user: false },
+        }),
+      });
+      await response.body?.cancel();
+      if (!response.ok) {
+        console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: response.status }));
+      }
+    } catch {
+      // Fetch errors can contain the secret URL. Never log the error or body.
+      console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: null }));
+    }
+  }
+
+  override async onStart(): Promise<void> {
     console.log("two-bot container started");
-    this.armKeepalive();
+    await this.armKeepalive();
   }
 
   override onStop(): void {
@@ -178,10 +404,20 @@ export default {
       return container.fetch(request);
     }
 
-    // Metrics are container-internal, never a public proxy or invite campaign.
-    // Canonicalized like the campaign lookup so /METRICS, /%6detrics,
-    // //metrics and /metrics/* cannot become a campaign redirect.
-    if (isReservedInternal(url.pathname)) {
+    // Authenticated off-container scrape path. No configured token → 404 (the
+    // route does not exist); missing/wrong bearer → 401. Exact path only.
+    if (url.pathname === OPS_METRICS_PATH) {
+      if (!env.METRICS_SCRAPE_TOKEN || request.method !== "GET") return new Response("not found", { status: 404 });
+      const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
+      if (!m || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
+        return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
+      }
+      return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(request);
+    }
+
+    // Internal metrics and healthz aliases never become invite campaigns.
+    // The exact /healthz redirect probe is handled below after config validation.
+    if (url.pathname !== "/healthz" && isReservedInternal(url.pathname)) {
       return new Response("not found", { status: 404 });
     }
 
@@ -189,7 +425,22 @@ export default {
     // the 302 via waitUntil — the visitor never waits on the database, and a
     // failed write costs a click, never a member. Record failures are logged
     // with slug only (never visitor data — see redirect.ts privacy note).
-    const store = redirectStore(env);
+    // Workers have no Node listen-port setting. Validate redirect configuration
+    // before serving campaigns or the redirect probe, without logging values.
+    const invalidConfig = (errorClass: string) => {
+      console.error(`invite_redirect_invalid_config ${JSON.stringify({ errorClass })}`);
+      return new Response("redirect service misconfigured\n", {
+        status: 503,
+        headers: { "content-type": "text/plain", "retry-after": "30" },
+      });
+    };
+    if (!isValidFallback(env.REDIRECT_FALLBACK_CODE)) return invalidConfig("invalid_fallback");
+    let store: RedirectStore;
+    try {
+      store = redirectStore(env);
+    } catch {
+      return invalidConfig("invalid_snapshot");
+    }
     const result = await handleRedirect(
       request.method,
       url.pathname,
@@ -204,7 +455,7 @@ export default {
         onError: (msg, detail) =>
           console.error(`${msg} ${JSON.stringify(detail)}`),
         isThrottled: (key) => !clickBuckets.take(key).allowed,
-        missCache: redirectMisses,
+        missCache: missCacheFor(env),
       },
     );
     if (result.click) {
@@ -212,7 +463,7 @@ export default {
       ctx.waitUntil(
         store.recordClick(click).catch((err: unknown) =>
           console.error(
-            `invite_click_record_failed ${JSON.stringify({ campaign: click.campaign, err: String(err) })}`,
+            `invite_click_record_failed ${JSON.stringify({ campaign: click.campaign, errorClass: redirectErrorClass(err) })}`,
           ),
         ),
       );

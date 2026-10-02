@@ -4,6 +4,17 @@ use two_bot_testsupport::TestDatabase;
 
 use crate::discord_test_common::{MockRest, ScriptedResponse};
 
+async fn tick(
+    kind: Kind,
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    observation: &Mutex<()>,
+) -> Result<(), ErrorClass> {
+    let (_stop, shutdown) = watch::channel(false);
+    run_once(kind, pool, rest, guild, observation, &shutdown).await
+}
+
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
     ActionExecutor::with_proxy("synthetic-job-test-token".to_owned(), Some(mock.origin())).unwrap()
@@ -58,6 +69,60 @@ async fn roster_paginates_and_rejects_failed_or_repeated_pages() {
     }
 }
 
+#[tokio::test]
+async fn bot_floor_scan_caps_requests_and_never_returns_a_partial_count() {
+    use two_bot_core::BotFloorScan;
+
+    for total in [0_u64, 23, 999, 1000, 10_000, 10_999, 11_000, 11_001, 12_000] {
+        let mut responses = Vec::new();
+        for start in (0..=total).step_by(1000) {
+            let page: Vec<_> = (start + 1..=(start + 1000).min(total))
+                .map(|id| member(id, id % 10 == 0, &[]))
+                .collect();
+            responses.push(ScriptedResponse::json(200, json!(page)));
+        }
+        let mock = MockRest::start(responses, ScriptedResponse::status(500)).await;
+        let outcome = bot_floor_scan(&executor(&mock), "2222").await.unwrap();
+        let expected = if total >= 11_000 {
+            BotFloorScan::Truncated
+        } else {
+            BotFloorScan::Complete((total / 10) as i64)
+        };
+        assert_eq!(outcome, expected, "guild size {total}");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), ((total / 1000 + 1) as usize).min(11));
+        for (index, request) in requests.iter().enumerate() {
+            let (_, query) = request.path.split_once('?').unwrap();
+            let params: std::collections::HashMap<_, _> = query
+                .split('&')
+                .map(|pair| pair.split_once('=').unwrap())
+                .collect();
+            assert_eq!(params["limit"], "1000");
+            assert_eq!(params["after"], (index * 1000).to_string());
+        }
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn bot_floor_scan_errors_do_not_retry_or_report_a_count() {
+    for response in [
+        ScriptedResponse::status(403),
+        ScriptedResponse::status(429),
+        ScriptedResponse::status(500),
+        ScriptedResponse::json(200, json!({"not":"array"})),
+        ScriptedResponse::json(200, json!([member(2, false, &[]), member(2, true, &[])])),
+    ] {
+        let mock = MockRest::start(vec![response], ScriptedResponse::status(500)).await;
+        assert_eq!(
+            bot_floor_scan(&executor(&mock), "2222").await,
+            Err(ErrorClass::Rest)
+        );
+        assert_eq!(mock.requests().len(), 1, "wire request is not retried");
+        mock.shutdown().await;
+    }
+}
+
 /// Real migrations + actual REST executor/mock + all three scheduled actions.
 /// Uses the shared strict fixture and a unique disposable database:
 /// no bootstrap reset and no interference with the core acceptance tests.
@@ -81,10 +146,10 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
 
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
     let rest = executor(&mock);
-    run_once(Kind::Rank, &pool, &rest, guild, &observation)
+    tick(Kind::Rank, &pool, &rest, guild, &observation)
         .await
         .unwrap();
-    run_once(Kind::Counter, &pool, &rest, guild, &observation)
+    tick(Kind::Counter, &pool, &rest, guild, &observation)
         .await
         .unwrap();
     assert!(
@@ -144,9 +209,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
                     let pool = pool.clone();
                     let rest = rest.clone();
                     let observation = observation.clone();
-                    Box::pin(
-                        async move { run_once(kind, &pool, &rest, "2222", &observation).await },
-                    )
+                    Box::pin(async move { tick(kind, &pool, &rest, "2222", &observation).await })
                 }),
             }],
             status.clone(),
@@ -192,7 +255,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     }
     for _ in 0..3 {
         assert_eq!(
-            run_once(Kind::Events, &pool, &rest, guild, &observation).await,
+            tick(Kind::Events, &pool, &rest, guild, &observation).await,
             Err(ErrorClass::Rest)
         );
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduled_events")
@@ -201,7 +264,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
             .unwrap();
         assert_eq!(rows, 1, "failed/malformed reads preserve mirror");
     }
-    run_once(Kind::Events, &pool, &rest, guild, &observation)
+    tick(Kind::Events, &pool, &rest, guild, &observation)
         .await
         .unwrap();
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduled_events")
@@ -265,7 +328,7 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
         let pool = pool.clone();
         let rest = executor(&mock);
         let observation = observation.clone();
-        tokio::spawn(async move { run_once(Kind::Rank, &pool, &rest, "2222", &observation).await })
+        tokio::spawn(async move { tick(Kind::Rank, &pool, &rest, "2222", &observation).await })
     };
     // Rank has observed its old roster and is stalled on the role response.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -279,9 +342,7 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
         let pool = pool.clone();
         let rest = executor(&mock);
         let observation = observation.clone();
-        tokio::spawn(
-            async move { run_once(Kind::Counter, &pool, &rest, "2222", &observation).await },
-        )
+        tokio::spawn(async move { tick(Kind::Counter, &pool, &rest, "2222", &observation).await })
     };
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut counter)
@@ -294,7 +355,7 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
         "counter must wait before observing"
     );
     // Independent events still publish while the shared denominator lane is busy.
-    run_once(Kind::Events, pool, &executor(&mock), "2222", &observation)
+    tick(Kind::Events, pool, &executor(&mock), "2222", &observation)
         .await
         .unwrap();
     assert!(!rank.is_finished());

@@ -7,7 +7,7 @@
 //! every Discord side effect, and each feature's domain + sqlx store owns
 //! its validation and mutation. No competing interaction listener, private
 //! dispatcher, or Discord client exists: gateway events arrive via
-//! [`Self::dispatch`] and are handled entirely through those interfaces.
+//! [`CommandRuntime::dispatch`] and are handled entirely through those interfaces.
 //!
 //! Served slices:
 //! - sticky (`/sticky`, `/sticky-remove` + the accepted-message re-post hook;
@@ -50,8 +50,9 @@ use two_bot_core::{
         sticky_set_reply, store, validate_body, ActivityDecision, ActivityOutcome, PutSticky,
         RemoveOutcome, StickyAudit, StickyAuditAction, StickyAuditOutcome,
     },
-    FeatureGates, HandlerId, InteractionHandler, InteractionRouter, ModerationGates, RouterGates,
-    SlashOutcome, SurfaceFlags,
+    tickets::TicketAction,
+    ComponentHandler, ComponentOutcome, FeatureGates, HandlerId, InteractionHandler,
+    InteractionRouter, ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
 };
 use two_bot_discord::{
     publish_commands, response_for_slash, route_interaction, ActionExecutor, RoutedInteraction,
@@ -106,6 +107,7 @@ pub struct CommandRuntime {
     router: InteractionRouter,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
+    tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
     /// `TWO_AUTOMATIONS=1`: fast-path gate for the message hook (the router
     /// still answers `/sticky*` refusals when it is off).
     automations: bool,
@@ -138,11 +140,15 @@ impl CommandRuntime {
                 return None;
             }
         };
+        let ticket_config = crate::ticket_runtime::TicketConfig::from_env(guild_id);
         let gates = RouterGates::from_slices(
             Some(guild_id),
             &features,
             &moderation,
-            SurfaceFlags::default(),
+            SurfaceFlags {
+                tickets: ticket_config.is_some(),
+                ..SurfaceFlags::default()
+            },
         );
         let mut router = InteractionRouter::new(gates);
         router.register(Box::new(StickyHandler));
@@ -163,11 +169,23 @@ impl CommandRuntime {
                 return None;
             }
         };
+        let tickets = match ticket_config {
+            Some(config) => match crate::ticket_runtime::TicketRuntime::new(
+                pool.clone(),
+                executor.clone(),
+                config,
+            ) {
+                Ok(runtime) => Some(Arc::new(runtime)),
+                Err(_) => return None,
+            },
+            None => None,
+        };
         Some(Arc::new(Self {
             pool,
             executor,
             router,
             guild_id,
+            tickets,
             automations: features.automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
@@ -189,10 +207,45 @@ impl CommandRuntime {
             executor,
             router,
             guild_id,
+            tickets: None,
             automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tickets(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        tickets: Arc<crate::ticket_runtime::TicketRuntime>,
+    ) -> Arc<Self> {
+        let router = InteractionRouter::new(RouterGates {
+            configured_guild: Some(100),
+            tickets: true,
+            scorecard: false,
+            automations: false,
+            announcements: false,
+            moderation: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        });
+        let mut runtime = Self::new(pool, executor, router, 100, false);
+        Arc::get_mut(&mut runtime)
+            .expect("unshared test runtime")
+            .tickets = Some(tickets);
+        runtime
+    }
+
+    /// Isolate ticket gateway acceptance from unrelated command publication.
+    #[cfg(test)]
+    pub(crate) async fn suppress_registry_for_test(&self) {
+        *self.registry_synced.lock().await = true;
+    }
+
+    pub(crate) fn start_tickets(&self) -> Option<crate::ticket_runtime::TicketSupervisor> {
+        self.tickets.as_ref().and_then(|tickets| tickets.start())
     }
 
     /// Detached dispatch for one gateway event. Clones the payload and spawns
@@ -215,11 +268,25 @@ impl CommandRuntime {
             Event::InteractionCreate(interaction) => {
                 let runtime = Arc::clone(self);
                 let interaction = interaction.0.clone();
-                drop(tokio::spawn(async move {
-                    runtime.on_interaction(&interaction).await;
-                }));
+                let is_ticket = matches!(
+                    interaction.data.as_ref(),
+                    Some(twilight_model::application::interaction::InteractionData::MessageComponent(component))
+                        if TicketAction::from_custom_id(&component.custom_id).is_some()
+                );
+                if let Some(tickets) = self.tickets.as_ref().filter(|_| is_ticket) {
+                    tickets.spawn(async move {
+                        runtime.on_interaction(&interaction).await;
+                    });
+                } else {
+                    drop(tokio::spawn(async move {
+                        runtime.on_interaction(&interaction).await;
+                    }));
+                }
             }
             Event::Ready(ready) => {
+                if let Some(tickets) = &self.tickets {
+                    tickets.on_ready(ready.user.id.get());
+                }
                 let runtime = Arc::clone(self);
                 let application_id = ready.application.id.get();
                 drop(tokio::spawn(async move {
@@ -227,12 +294,35 @@ impl CommandRuntime {
                 }));
             }
             Event::Resumed => {
+                if let Some(tickets) = &self.tickets {
+                    let runtime = Arc::clone(self);
+                    // Saved sessions emit RESUMED without READY. Resolve the
+                    // authenticated USER through the shared executor before
+                    // waking maintenance; application ids are not author ids.
+                    // Keep the lookup in the ticket shutdown scope, independent
+                    // of registry publication and its success/dedup gate.
+                    tickets.spawn(async move {
+                        runtime.ready_tickets_after_resume().await;
+                    });
+                }
                 let runtime = Arc::clone(self);
                 drop(tokio::spawn(async move {
                     runtime.publish_registry(None).await;
                 }));
             }
             _ => {}
+        }
+    }
+
+    async fn ready_tickets_after_resume(&self) {
+        let Some(tickets) = &self.tickets else {
+            return;
+        };
+        match self.executor.current_bot_user_id().await {
+            Ok(bot_id) => tickets.on_ready(bot_id),
+            Err(_) => {
+                warn!("bot user lookup failed; ticket readiness skipped");
+            }
         }
     }
 
@@ -282,9 +372,25 @@ impl CommandRuntime {
     /// an unavailable reply. Only the five implemented names defer and run
     /// their slice. Router Ignore (unknown names/guild fence) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
-        let RoutedInteraction::Slash { name, outcome } =
-            route_interaction(&self.router, interaction, None)
-        else {
+        let routed = route_interaction(&self.router, interaction, None);
+        if let RoutedInteraction::Component {
+            custom_id,
+            outcome:
+                ComponentOutcome::Handled {
+                    handler: ComponentHandler::Tickets,
+                },
+            ..
+        } = &routed
+        {
+            if let (Some(tickets), Some(action)) =
+                (&self.tickets, TicketAction::from_custom_id(custom_id))
+            {
+                self.on_ticket_interaction(tickets, interaction, action)
+                    .await;
+            }
+            return;
+        }
+        let RoutedInteraction::Slash { name, outcome } = routed else {
             return;
         };
         if let Some(response) = response_for_slash(&outcome) {
@@ -332,6 +438,52 @@ impl CommandRuntime {
             "feed-remove" => self.feed_remove(interaction).await,
             "feed-list" => self.feed_list(interaction).await,
             _ => {}
+        }
+    }
+
+    async fn on_ticket_interaction(
+        &self,
+        tickets: &crate::ticket_runtime::TicketRuntime,
+        interaction: &Interaction,
+        action: TicketAction,
+    ) {
+        if let Err(error) = tickets.authorize(interaction, action) {
+            self.answer(interaction, ephemeral(error.to_string())).await;
+            return;
+        }
+        if self
+            .executor
+            .answer_interaction(
+                interaction.id.get(),
+                &interaction.token,
+                &InteractionResponse {
+                    kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                    data: Some(InteractionResponseData {
+                        flags: Some(MessageFlags::EPHEMERAL),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .is_err()
+        {
+            warn!("ticket defer failed; no state mutated");
+            return;
+        }
+        let reply = match tickets.execute(interaction, action).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                warn!(error_class = ?error.class(), "ticket action incomplete");
+                error.reply()
+            }
+        };
+        if self
+            .executor
+            .edit_interaction_response(interaction.application_id.get(), &interaction.token, &reply)
+            .await
+            .is_err()
+        {
+            warn!("ticket response edit failed; durable state retained");
         }
     }
 
@@ -979,3 +1131,7 @@ pub(crate) fn sticky_options(interaction: &Interaction) -> (Option<String>, Opti
     }
     (body, debounce)
 }
+
+#[cfg(test)]
+#[path = "command_runtime_resumed_tests.rs"]
+mod resumed_tests;

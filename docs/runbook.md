@@ -117,6 +117,80 @@ an idle container awake. Do not disable the keepalive or increase capacity
 without measured evidence. `lite`, `max_instances=1` is the declared placement,
 not evidence of the measured RSS budget. See [staging soak](staging-soak.md).
 
+### Sustained-unready alerts
+
+The keepalive records consecutive failed readiness probes and emits one alert
+and one recovery per incident. See [Container readiness monitoring](container-readiness.md)
+for threshold tuning, the optional Worker-only webhook secret, delivery limits
+and response guidance. `container_keepalive_arm_failed` indicates monitoring
+setup failed; health/readiness responses still reflect the Container, not proof
+that monitoring is armed.
+
+### Metrics alerts
+
+The Container DO pulls the container-internal `/metrics` on every keepalive tick,
+evaluates the rules in `wrangler/src/alert-rules.ts`, and posts one message per
+transition (fire, resolve) to `OPS_ALERT_WEBHOOK_URL`. See
+[metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
+with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
+
+#### Alert: job stale
+
+A scheduled job's last success is older than two cadences. Check `/readyz` job
+status and Worker/container logs for `periodic job failed`. A job that never
+succeeded since start (timestamp zero) is not reported here. If the Container
+restarted the series resets; wait one cadence before acting. Restart only after
+the logs show the job loop is wedged, per the [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+
+#### Alert: job failures
+
+A job failed three completions in a row. Read `periodic job failed` logs (error
+class only; payloads are never logged). Usual causes: database unreachable,
+Discord REST failing. Fix the dependency; the streak clears on the next success.
+
+#### Alert: REST 429
+
+More than 10% of Discord REST requests between two keepalive samples (minimum
+10 requests in the window) returned 429. This is Discord-side rate limiting,
+usually a hot route from a recent deploy or a busy job, not proof of a Discord
+outage. A counter reset (process restart) skips the window rather than firing.
+
+First response: read the hot route from the `route` label on
+`two_bot_rest_requests_total{route,result="429"}` via the authorized
+`/ops/metrics` scrape; confirm no deploy is in progress (check the staging
+workflow result and recent merges — a fresh deploy can explain a new hot
+route). The ported executor already honors `retry-after` per attempt (see
+[Common failures](#common-failures)), so do not hammer Discord, replay
+uncertain writes, or invent a breaker-reset command. Contain through the
+actual writer's verified control
+([containment](#containment-kill-switches-and-feature-flags)).
+
+Escalate when the 429 share stays above threshold across several windows after
+containment, when the hot route belongs to a writer this team does not own, or
+when 429s coincide with 5xx/transport failures suggesting a wider Discord or
+network incident.
+
+#### Alert: DB pool
+
+The SQLx pool sat at its maximum with zero idle connections for three
+consecutive keepalive samples. This is pool exhaustion, a proxy for DB trouble;
+there is no DB error counter yet. It means every checkout is held — new queries
+wait rather than fail fast — not proof that Neon itself is down (pool gauges
+sample SQLx bookkeeping, not DB reachability).
+
+First response: check Neon status for the staging branch before touching the
+bot; then look at recent deploys for a change that could hold checkouts open
+(new query path, widened job fan-out, a job whose cadence no longer matches its
+duration). Compare against the scrape window — a short burst that self-clears
+across the next samples is not exhaustion. Do not run SQL probes against
+staging or production, add grants, or restart the container to "free" the
+pool; a replacement restarts the shard without fixing a leak.
+
+Escalate when the streak persists after the suspect deploy is identified,
+when exhaustion coincides with gateway `starting`/`down` or job-failure
+alerts, or when the Neon dashboard shows trouble on the staging branch — the
+fix then belongs to the dependency owner, not a redeploy.
+
 ## Redeploy and rollback
 
 ### Before changing anything

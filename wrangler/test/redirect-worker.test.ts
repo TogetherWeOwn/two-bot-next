@@ -28,6 +28,35 @@ test("Worker shares misses across request-scoped store instances", async (t) => 
   assert.deepEqual(lookups, ["worker-missing"]);
 });
 
+test("Worker drops misses when the mapping configuration changes", async (t) => {
+  // Count store lookups while keeping the real snapshot behavior: a mocked
+  // lookup would bypass the snapshot and could never produce a miss.
+  const realLookup = RedirectStore.prototype.lookup;
+  const lookups: string[] = [];
+  t.mock.method(RedirectStore.prototype, "lookup", async function (
+    this: RedirectStore, slug: string,
+  ) {
+    lookups.push(slug);
+    return realLookup.call(this, slug);
+  });
+  const empty = { ...env, REDIRECT_MAPPINGS_JSON: "[]" } as Env;
+  const writes: Promise<unknown>[] = [];
+  const ctx = { waitUntil: (p: Promise<unknown>) => { writes.push(p); } } as unknown as ExecutionContext;
+  const miss = (e: Env) => worker.fetch(new Request("https://worker.invalid/worker-rotated"), e, ctx);
+  assert.equal((await miss(empty)).status, 404);
+  assert.equal((await miss(empty)).status, 404);
+  assert.deepEqual(lookups, ["worker-rotated"], "same config shares one lookup");
+  const populated = {
+    ...env,
+    REDIRECT_MAPPINGS_JSON: JSON.stringify([{ slug: "worker-rotated", invite_code: "freshCode" }]),
+  } as Env;
+  const res = await miss(populated);
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get("location"), "https://discord.gg/freshCode");
+  assert.equal(lookups.length, 2, "changed config must re-lookup, not serve a stale miss");
+  await Promise.all(writes);
+});
+
 test("spoofed X-Forwarded-For cannot change the edge IP bucket or stored click", async (t) => {
   const callerKeys: string[] = [];
   const clicks: RedirectClick[] = [];

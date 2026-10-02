@@ -34,6 +34,7 @@ pub struct Mee6RoleReward {
 #[serde(rename_all = "snake_case")]
 pub enum RewardSkipReason {
     RoleAbsent,
+    RoleEveryone,
     RoleManaged,
     AboveBotRole,
     DuplicateLevel,
@@ -361,6 +362,19 @@ pub fn plan_reward_role_import(
             });
             continue;
         };
+        if role_id == guild_id {
+            unmapped.push(UnmappedReward {
+                level,
+                role_id: role_id.to_owned(),
+                role_name: Some(live.name.clone()),
+                reason: RewardSkipReason::RoleEveryone,
+                detail: format!(
+                    "role \"{}\" ({role_id}) is the guild's @everyone role; it cannot be individually granted, even by the guild owner",
+                    live.name
+                ),
+            });
+            continue;
+        }
         if live.managed {
             unmapped.push(UnmappedReward {
                 level,
@@ -480,6 +494,7 @@ pub fn plan_reward_role_import(
 
     let mut by_reason: BTreeMap<String, usize> = [
         ("role_absent", 0),
+        ("role_everyone", 0),
         ("role_managed", 0),
         ("above_bot_role", 0),
         ("duplicate_level", 0),
@@ -491,6 +506,7 @@ pub fn plan_reward_role_import(
     for u in &unmapped {
         let key = match u.reason {
             RewardSkipReason::RoleAbsent => "role_absent",
+            RewardSkipReason::RoleEveryone => "role_everyone",
             RewardSkipReason::RoleManaged => "role_managed",
             RewardSkipReason::AboveBotRole => "above_bot_role",
             RewardSkipReason::DuplicateLevel => "duplicate_level",
@@ -600,6 +616,96 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn everyone_is_ungrantable_even_below_bot_or_with_owner_bypass() {
+        for owner_id in [None, Some(BOT_ID)] {
+            let ordinary = parse_mee6_role_rewards(EXPORT).unwrap();
+            let baseline =
+                plan_reward_role_import(GUILD, &ordinary, &roles(), BOT_ID, owner_id, None);
+            let mut rewards = ordinary.clone();
+            for level in [1, 2] {
+                rewards.push(Mee6RoleReward {
+                    level,
+                    role_id: GUILD.to_owned(),
+                    role_name: Some("advisory export name".to_owned()),
+                });
+            }
+            let report = plan_reward_role_import(GUILD, &rewards, &roles(), BOT_ID, owner_id, None);
+            assert_eq!(report.owner_bypass, owner_id.is_some());
+            assert_eq!(report.bot_position, Some(50));
+            assert_eq!(report.mapped, baseline.mapped);
+            assert_eq!(report.apply, baseline.apply);
+            assert!(report.apply.iter().all(|r| r.role_id != GUILD));
+            assert_eq!(report.counts.rewards_in, 9);
+            assert_eq!(report.counts.mapped, baseline.counts.mapped);
+            assert_eq!(report.counts.unmapped, baseline.counts.unmapped + 2);
+            assert!(report.counts.unmapped > 0); // --require-all-mapped must fail.
+            assert!(report.counts.balances);
+            assert_eq!(report.counts.by_reason["role_everyone"], 2);
+            for (reason, count) in baseline.counts.by_reason {
+                if reason != "role_everyone" {
+                    assert_eq!(report.counts.by_reason[&reason], count);
+                }
+            }
+            assert_eq!(&report.unmapped[2..], baseline.unmapped.as_slice());
+            for skipped in &report.unmapped[..2] {
+                assert_eq!(skipped.role_id, GUILD);
+                assert_eq!(skipped.role_name.as_deref(), Some("@everyone"));
+                assert!(skipped.detail.contains("cannot be individually granted"));
+            }
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(json["unmapped"][0]["reason"], "role_everyone");
+            assert_eq!(json["counts"]["byReason"]["role_everyone"], 2);
+            assert_eq!(
+                serde_json::from_value::<RewardImportReport>(json).unwrap(),
+                report
+            );
+        }
+    }
+
+    #[test]
+    fn everyone_does_not_claim_a_level_or_become_a_duplicate() {
+        let rewards = vec![
+            Mee6RoleReward {
+                level: 5,
+                role_id: GUILD.to_owned(),
+                role_name: None,
+            },
+            Mee6RoleReward {
+                level: 5,
+                role_id: GUILD.to_owned(),
+                role_name: None,
+            },
+            Mee6RoleReward {
+                level: 5,
+                role_id: "900000000000000020".to_owned(),
+                role_name: None,
+            },
+        ];
+        for owner_id in [None, Some(BOT_ID)] {
+            let report = plan_reward_role_import(GUILD, &rewards, &roles(), BOT_ID, owner_id, None);
+            assert_eq!(report.counts.rewards_in, 3);
+            assert_eq!(report.counts.mapped, 1);
+            assert_eq!(report.counts.unmapped, 2);
+            assert!(report.counts.balances);
+            assert_eq!(report.counts.by_reason["role_everyone"], 2);
+            assert_eq!(report.counts.by_reason["duplicate_level"], 0);
+            assert_eq!(report.counts.by_reason["duplicate_role"], 0);
+            assert_eq!(
+                report.apply,
+                vec![LevelRoleReward {
+                    level: 5,
+                    role_id: "900000000000000020".to_owned(),
+                }]
+            );
+            let reversed: Vec<_> = rewards.iter().rev().cloned().collect();
+            assert_eq!(
+                report,
+                plan_reward_role_import(GUILD, &reversed, &roles(), BOT_ID, owner_id, None)
+            );
+        }
     }
 
     #[test]
