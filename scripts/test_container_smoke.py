@@ -351,6 +351,13 @@ class ContainerSmokeTests(unittest.TestCase):
                 self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
                 self.assert_rejected("valid token state")
 
+    def test_readyz_components_mismatch_reports_actual_body(self):
+        body = parked_readyz_body()
+        body["components"] = [["process", "ready"]]
+        self.http = lambda url: (503, body) if url.endswith("/readyz") else (200, {"status": "ok"})
+        with self.assertRaisesRegex(RuntimeError, r"got status=503 body="):
+            self.run_smoke()
+
     def test_readyz_database_contract_is_enforced(self):
         for components in (
             [["process", "ready"], ["gateway", "down"]],

@@ -352,6 +352,11 @@ jobs:
     needs: container-inputs
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 30
+    env:
+      # Unique per run: runners share one Docker host, so the historical
+      # shared two-bot:ci tag let a concurrent PR's image replace the one
+      # just built before the smoke below ran against it.
+      SMOKE_TAG: two-bot:ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -380,19 +385,19 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: two-bot:ci
+          tags: ${{ env.SMOKE_TAG }}
           cache-from: type=gha,scope=two-bot-runtime-amd64
           cache-to: type=gha,mode=max,scope=two-bot-runtime-amd64
       - name: Runtime contract and size budgets
         if: needs.container-inputs.outputs.build == 'true'
-        run: python3 scripts/container-smoke.py two-bot:ci
+        run: python3 scripts/container-smoke.py "$SMOKE_TAG"
       - name: Prove deliberate budget breakage fails
         if: needs.container-inputs.outputs.build == 'true'
         run: |
           set -euo pipefail
           for budget in image binary; do
             log="$RUNNER_TEMP/container-negative-$budget.log"
-            if python3 scripts/container-smoke.py two-bot:ci "--$budget-max-bytes" 1 >"$log" 2>&1; then
+            if python3 scripts/container-smoke.py "$SMOKE_TAG" "--$budget-max-bytes" 1 >"$log" 2>&1; then
               printf 'FAIL: deliberate %s budget violation was accepted\n' "$budget"
               exit 1
             fi
