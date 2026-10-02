@@ -20,6 +20,8 @@ use tracing::{Event, Metadata, Subscriber};
 /// Reject unsupported parameters without passing their values to SQLx or logs.
 /// Supported keys mirror the pinned sqlx-postgres 0.9 URL parser; re-audit this
 /// allowlist when upgrading SQLx. Known parameter values remain SQLx's concern.
+/// `channel_binding` is a libpq compatibility option: accepted here, but removed
+/// by [`connect_options`] because SQLx does not implement channel binding.
 pub fn validate(raw: &str) -> Result<(), &'static str> {
     let url = url::Url::parse(raw).map_err(|_| "invalid database URL")?;
     for (key, _) in url.query_pairs() {
@@ -42,6 +44,7 @@ pub fn validate(raw: &str) -> Result<(), &'static str> {
                 | "user"
                 | "password"
                 | "application_name"
+                | "channel_binding"
                 | "options"
         ) || (key.starts_with("options[") && key.ends_with(']'));
         if !supported {
@@ -106,7 +109,28 @@ impl Subscriber for PassfileSilencer {
     }
 }
 
-/// Validate and parse a database URL into SQLx options.
+#[cfg(any(feature = "db", test))]
+fn url_for_sqlx(raw: &str) -> Result<String, &'static str> {
+    validate(raw)?;
+    let mut url = url::Url::parse(raw).map_err(|_| "invalid database URL")?;
+    if !url.query_pairs().any(|(key, _)| key == "channel_binding") {
+        return Ok(raw.to_owned());
+    }
+    let pairs: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "channel_binding")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.set_query(None);
+    if !pairs.is_empty() {
+        url.query_pairs_mut().extend_pairs(pairs);
+    }
+    Ok(url.into())
+}
+
+/// Parse a validated database URL into SQLx options.
+/// All decoded occurrences of libpq's `channel_binding` are dropped before the
+/// driver sees them. This does not enforce channel binding or change SSL mode.
 ///
 /// Unsupported query keys are refused before the driver can WARN-log them.
 /// The parse itself runs under a thread-scoped
@@ -117,10 +141,11 @@ impl Subscriber for PassfileSilencer {
 /// ambient subscriber and no await point can interleave on this thread.
 #[cfg(feature = "db")]
 pub fn connect_options(url: &str) -> Result<PgConnectOptions, sqlx::Error> {
-    validate(url).map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
+    let url =
+        url_for_sqlx(url).map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))?;
     let current = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
     tracing::subscriber::with_default(PassfileSilencer(current), || {
-        PgConnectOptions::from_str(url)
+        PgConnectOptions::from_str(&url)
             .map_err(|_| sqlx::Error::InvalidArgument("invalid database URL".to_owned()))
     })
 }
@@ -153,6 +178,37 @@ mod tests {
             "options[statement_timeout]",
         ] {
             assert!(validate(&format!("postgres://agent-testdb/db?{key}=fixture")).is_ok());
+        }
+    }
+
+    #[test]
+    fn neon_channel_binding_is_removed_without_changing_sslmode() {
+        for query in [
+            "sslmode=require&channel_binding=require",
+            "channel%5Fbinding=fixture-secret&sslmode=require&channel_binding=require",
+        ] {
+            let raw =
+                format!("postgres://fixture:fixture-password@ep-fixture.neon.tech/db?{query}");
+            assert!(validate(&raw).is_ok());
+            let filtered = url::Url::parse(&url_for_sqlx(&raw).unwrap()).unwrap();
+            assert_eq!(filtered.query().unwrap(), "sslmode=require");
+            assert_eq!(filtered.password(), Some("fixture-password"));
+            #[cfg(feature = "db")]
+            assert!(matches!(
+                connect_options(&raw).unwrap().get_ssl_mode(),
+                sqlx::postgres::PgSslMode::Require
+            ));
+        }
+        assert_eq!(
+            url_for_sqlx("postgres://agent-testdb/db?channel_binding=require").unwrap(),
+            "postgres://agent-testdb/db"
+        );
+        let unknown = "postgres://agent-testdb/db?channel_binding=require&api_key=fixture-secret";
+        assert!(url_for_sqlx(unknown).is_err());
+        #[cfg(feature = "db")]
+        {
+            let invalid = "postgres://agent-testdb/db?sslmode=invalid&channel_binding=require";
+            assert!(connect_options(invalid).is_err());
         }
     }
 

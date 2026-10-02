@@ -121,6 +121,10 @@
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "cae5eaf03794586465d2a1bbb25138cd5009ee0acfc8a01976c506e5a78a904c"
     },
+    "crates/cutover/migrations/0312_community_scorecard_attempts.sql": {
+      "sha256": "a4fc13a49856cf9cacd6a32994fa7762a7e5034143fa901e43b1c44e3eabc0cf",
+      "justification": "Persist weekly scorecard retry reservations and completion across restart for TOG-11145; leave output tables unchanged."
+    },
     "crates/cutover/migrations/0320_gateway_sessions.sql": {
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "f6f39298deee84821f408c7b851b507debef7a22ef02ef3781528cd2b5111c83"

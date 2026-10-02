@@ -35,7 +35,8 @@ URLs are not printed.
 
 Each table reports `{table, status, columns?, count?, reason?}`. `status` is
 `measured` (exact post-`T_f` row count), `unmeasurable` (no usable timestamp
-column, with a reason: `guild_settings_revision`, `level_role_rewards`,
+column, with a reason: `community_scorecard_attempts`,
+`guild_settings_revision`, `level_role_rewards`,
 `lfg_roles`, `moderation_channel_executions`, `rank_ladder`,
 `self_role_exchange_baselines`, `web_contract_meta`), or `missing` (table absent
 from this database, e.g. a partially migrated one). Every classified table
