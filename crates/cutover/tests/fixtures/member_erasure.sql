@@ -65,6 +65,11 @@ BEGIN
         VALUES (g, u, '2026-10-01T00:00:00Z');
       INSERT INTO member_exclusions (guild_id, member_id, reason, updated_at)
         VALUES (g, u, 'raid', '2026-10-01T00:00:00Z');
+      INSERT INTO join_risk_flags
+        (event_id, guild_id, member_id, account_created_at, joined_at, source, score,
+         reasons_json, bulk_join_window, flagged, created_at)
+        VALUES (k, g, u, '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z', 'fixture', 3,
+          '[]', false, true, '2026-10-01T00:00:00Z');
       INSERT INTO operational_audit_log
         (entry_id, event_kind, guild_id, occurred_at, actor_id, target_id, metadata_json, created_at)
         VALUES (k, 'fixture', g, now(), u, u, '{}', now());
