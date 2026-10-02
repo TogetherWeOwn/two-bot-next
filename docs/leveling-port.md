@@ -1,8 +1,14 @@
 # Leveling domain and PostgreSQL runtime
 
-This S4 slice implements plain-data leveling decisions in `two-bot-core::leveling`
-and async persistence in `two-bot-core::leveling_store` (feature `db`). It does not
-publish commands, dispatch interactions or perform Discord REST writes.
+Leveling uses plain-data decisions in `two-bot-core::leveling`, async persistence
+in `two-bot-core::leveling_store` (feature `db`), and the ordered S3/S4 bridge in
+`two-bot-discord::leveling_runtime`. Configured gateway startup installs the
+award bridge using the pool, cloned REST executor (shared transport/pacing) and
+onboarding gates owned by `CommandRuntime`. That runtime alone routes interactions
+and publishes the complete shared registry on READY/first RESUMED. The award
+pipeline never answers interactions or publishes a private registry. Invalid
+feature/moderation gates or executor construction disable the shared runtime,
+including leveling; invalid onboarding mode remains a startup error.
 
 ## Legacy contract
 
@@ -16,8 +22,10 @@ and [`discord.ts`](https://github.com/TogetherWeOwn/two-bot/blob/d5d11793/src/le
   `9_007_199_254_740_991`; a rejected award does not consume its cooldown.
 - `/rank [member]`: ephemeral; display name is `globalName ?? username`. XP,
   progress, span and remaining XP are grouped with commas; level, rank and
-  member count are not grouped. Missing members read zero XP and rank below
-  members holding XP. XP ties use stored member IDs ascending.
+  member count are not grouped. Missing members read zero XP. Unlike the frozen
+  legacy behavior, the current store renders a missing XP row as
+  `Rank **Unranked** (no XP recorded)`; an existing zero-XP row retains a numeric
+  rank. XP ties use stored member IDs ascending.
 - `/leaderboard`: public top 10, mention parsing suppressed; empty text is
   `No XP has been earned yet.`. The store supports a limit clamped to 1–25.
   Legacy has no offset/cursor paging or page components; none are invented here.
@@ -51,26 +59,47 @@ and the legacy unique-role constraint remains enforced.
 large for the audit column returns a database error with no projection/cooldown
 write retained; reward levels outside INT4 range fail input validation.
 
-## Integration handoff
+## Ordered runtime integration
 
-At base `db47381`, the router and REST executor slices are not merged.
-`handlers::LevelingHook` and `discord::Pipeline::handle` are synchronous, while
-these sqlx functions are async. Do not block a Tokio runtime or substitute a
-private dispatcher/client to bridge them.
+`DeferredLeveling` collects requests only when the synchronous S3 handlers call
+their existing hook. `OrderedLevelingPipeline` holds a Tokio dispatch mutex over
+session/cache transitions, draining requests, awaited sqlx awards and REST
+reward effects. There is no `block_on`, detached award task or synchronous lock
+held across an await. This single-shard serialization preserves member ordering
+and READY/RESUMED/member-removal barriers. Unknown or reconnect-spanning voice
+duration is never reconstructed or awarded. `MessageEligibility` carries the
+existing staff-automation/capture-only guards for callers that classify messages.
 
-The follow-up integration must:
+The configured bot dispatches through this wrapper before committing the existing
+funnel/checkpoint transaction, under the gateway's heartbeat-safe deadline. Store
+or executor errors propagate to the supervisor and make readiness unavailable;
+logs do not expose SQL connection details, tokens or message bodies. XP
+projection/cooldown/audit remain one store transaction, **not** a transaction with
+Discord or the gateway checkpoint. A REST failure can leave committed XP without
+its role grant; no durable reward outbox/retry is claimed by this slice. A future
+level-up re-reads the whole earned ladder and can reconcile missing grants.
 
-1. Use the S4 interaction router for `/rank` and `/leaderboard`, mapping
-   `profile`/`leaderboard` through `rank_reply`/`leaderboard_reply`.
-2. Await `award_message` and `award_voice` from the S3 eligibility/session path
-   through an ordered async gateway bridge. Preserve bot/webhook/staff/capture
-   filtering, measured-duration requirements and per-member event ordering.
-3. On `XpAward.leveled_up`, resolve the current member roles and reward ladder,
-   apply the onboarding gate, and pass `RewardRolePlan` to the S4 executor.
-   Ordinary level-ups use `staging_revoke_allowed = false`.
-4. Enforce the explicit staging fence and all-or-nothing permission/hierarchy
-   checks for a separately authorized revoke operation. Test side effects only
-   against the mock Discord double, never the production guild/token.
+`CommandRuntime` routes `/rank [member]` and `/leaderboard` once through the shared
+router, then delegates the accepted HandlerId to the leveling slice before its
+sticky/feed generic defer. The slice maps `profile`/`leaderboard` through the
+existing replies and shared executor callback. Rank is ephemeral. Leaderboard
+always uses limit 10, suppresses mention parsing and has no paging components.
+Other routes are left for their owning feature. Startup strictly validates
+`TWO_ONBOARDING_MODE` with the existing gates; session mode and onboarding dry-run
+both suppress reward writes without suppressing XP.
+
+On an actual level-up, the runtime reads the current ladder and member roles,
+plans grants with `staging_revoke_allowed = false`, and sends idempotent role PUTs
+through the shared executor. It sends no channel announcement. Ordinary runtime
+never constructs a revoke fence. Separately authorized callers must supply
+`StagingRevokeFence` whose staging/production identities match the existing
+pinned TWO identities in `backup::guild_config`; callers cannot relabel production
+as staging. Production and nonstaging guilds are rejected before any I/O. For a nonempty revoke set, current
+bot identity/roles and the guild role catalog must prove Manage Roles (or
+Administrator), a complete catalog, nonmanaged targets and strict hierarchy for
+**every** target before any grant/removal is sent. Discord permission changes
+after that preflight can still fail individual mutations; errors are propagated,
+not treated as successful or atomic remote effects.
 
 ## Verification
 
@@ -81,13 +110,17 @@ permission (see [CONTRIBUTING.md](../CONTRIBUTING.md#database-tests)). Then run:
 ```sh
 export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --features two-bot-core/db --locked -- -D warnings
-cargo test --workspace --features two-bot-core/db --locked
-cargo test -p two-bot-core --features db --locked --test leveling_store
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test leveling_store
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test leveling_roles
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test leveling_runtime -- --ignored --test-threads=1
+python3 scripts/cargo_cache.py run -- test -p two-bot --locked command_runtime_tests::shared_runtime_routes_leveling -- --ignored
 ```
 
-The last command executes all 13 leveling tests (none are ignored). The shared
-`two-bot-testsupport` fixture connects only to `agent-testdb:5432`, uses the
+Controller compilation must use the bounded cache wrapper; a missing/refused pool
+is not permission to compile directly. Hosted CI uses its ephemeral Cargo cache.
+The store command executes all 15 leveling tests (none are ignored); the runtime
+command explicitly activates the six ignored integration proofs. Both use the shared
+`two-bot-testsupport` fixture, which connects only to `agent-testdb:5432`, uses the
 passwordless `agent_test` principal, and creates a unique migrated database per
 test. The bootstrap is never migrated, reset or dropped. It never reads
 `DATABASE_URL` or inherited application credentials and never falls back on
@@ -116,3 +149,15 @@ The Postgres proofs cover 59/60-second boundaries, voice minutes, profile and
 leaderboard ordering/text, ceiling rollback, reward replacement rollback,
 threshold grants, concurrent first-award races, independent-source races,
 imported-XP preservation, zero/oversized no-ops and audit-insert rollback.
+
+Runtime proofs use synthetic Twilight gateway events, the existing local mock
+REST double and isolated migrated disposable databases: independent concurrent sources
+produce exactly two audit rows and one threshold crossing; duplicate dispatches
+preserve totals; delayed role reads yield the current-thread Tokio executor while
+later member events remain ordered. Tests assert reply text, optional-member
+fallback, fixed top 10, mention suppression, no announcements, eligibility and
+unknown-duration guards, session suppression, observable executor failures,
+idempotent grant readback and whole-set revoke refusal. The bot acceptance proof
+passes the same interaction through the silent award pipeline and the shared
+command runtime, asserting exactly one callback, visibility and foreign-guild
+silence. No staging deployment or live Discord verification is claimed.

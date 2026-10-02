@@ -6,15 +6,15 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
-    apply_web_contract, build_community_snapshot, build_counter_reading, match_rank_roles,
-    normalize_events, now_iso, read_raid_windows, replace_events, write_counter,
-    write_rank_snapshot, Config, RawScheduledEvent, RosterMember, WebsiteStoreError,
-    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    build_community_snapshot, build_counter_reading, match_rank_roles, normalize_events, now_iso,
+    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config,
+    RawScheduledEvent, RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
+    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
-    community_jobs,
+    audit_runtime, community_jobs,
     jobs::{self, ErrorClass, Job},
     server,
 };
@@ -77,15 +77,11 @@ impl Context {
                 let db = two_bot_cutover::connect(
                     &self.url,
                     two_bot_cutover::DB_POOL_MAX_DEFAULT,
-                    false,
+                    true, // Operator provisions migrations/views; runtime is DML-only.
                 )
                 .await
                 .map_err(|_| ErrorClass::Database)?;
-                let pool = db.pool().clone();
-                apply_web_contract(&pool)
-                    .await
-                    .map_err(|_| ErrorClass::Database)?;
-                Ok(pool)
+                Ok(db.pool().clone())
             })
             .await
     }
@@ -99,6 +95,24 @@ impl Drop for Shutdown {
     }
 }
 
+fn governed_executor(
+    token: &str,
+    proxy: Option<String>,
+    pool: PgPool,
+) -> Result<ActionExecutor, String> {
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(pool, token)
+        .map_err(|error| error.to_string())?;
+    ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
+}
+
+fn admission_pool(url: &str) -> Result<PgPool, String> {
+    let options = two_bot_core::database_url::connect_options(url)
+        .map_err(|_| "invalid admission authority".to_owned())?;
+    Ok(sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(options))
+}
+
 pub async fn serve(
     config: &Config,
     listener: tokio::net::TcpListener,
@@ -109,7 +123,12 @@ pub async fn serve(
     let mut registered = Vec::new();
     let mut parked = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
-        match ActionExecutor::with_proxy(token.to_owned(), std::env::var("DISCORD_API_BASE").ok()) {
+        // Lazy connection preserves parked/startup behavior; every wire attempt
+        // still fails closed on this same runtime database authority.
+        let rest = admission_pool(url).and_then(|pool| {
+            governed_executor(token, std::env::var("DISCORD_API_BASE").ok(), pool)
+        });
+        match rest {
             Ok(rest) => {
                 let context = Arc::new(Context {
                     url: url.to_owned(),
@@ -156,12 +175,16 @@ pub async fn serve(
                         }),
                     });
                 }
-                let registration = community_jobs::register(context);
+                let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
                 // Repeat-history expiry rides the shared supervisor.
                 if crate::automod_gateway::enabled() {
                     registered.push(crate::automod_gateway::expiry_job(automod));
+                }
+                match audit_runtime::register(context, shutdown.subscribe()) {
+                    Some(job) => registered.push(job),
+                    None => parked.extend(audit_runtime::NAMES),
                 }
             }
             Err(_) => tracing::warn!("website jobs parked: invalid REST configuration"),
@@ -169,12 +192,16 @@ pub async fn serve(
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let mut names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
+    let mut names: Vec<&'static str> = NAMES
+        .into_iter()
+        .chain(community_jobs::NAMES)
+        .chain(audit_runtime::NAMES)
+        .collect();
     if crate::automod_gateway::enabled() {
         names.push(crate::automod_gateway::JOB_NAME);
     }
-    // All six names park together when nothing registered; otherwise only the
-    // env-gated community names are parked and the rest report live status.
+    // Every name parks when nothing registered; otherwise only the env-gated
+    // community and audit names are parked and the rest report live status.
     let status = jobs::statuses(&names, registered.is_empty());
     {
         let mut entries = status.write().await;

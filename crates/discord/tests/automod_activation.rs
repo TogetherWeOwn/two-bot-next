@@ -517,7 +517,9 @@ async fn ladder_deletes_then_warns_then_times_out() {
             ScriptedResponse::status(204),
             ScriptedResponse::status(204),
             ScriptedResponse::status(204),
-            ScriptedResponse::json(200, json!({})),
+            // The timeout PATCH gets the member receipt Discord echoes back;
+            // the admission contract treats an id-less body as unreadable.
+            ScriptedResponse::json(200, json!({"user": {"id": AUTHOR}})),
         ],
         ScriptedResponse::status(500),
     )

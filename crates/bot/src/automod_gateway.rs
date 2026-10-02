@@ -2,7 +2,7 @@
 //!
 //! The serial dispatch worker calls [`process`] once per translated delivery,
 //! in gateway order and before the funnel, then hands the returned disposition
-//! to `Pipeline::handle_at_with_message_disposition` exactly once. There is no
+//! to `OrderedLevelingPipeline::collect_at_with_message_disposition` exactly once. There is no
 //! private client, router or timer: Discord reads and mutations go through the
 //! command runtime's [`ActionExecutor`], and repeat history expires on the
 //! shared periodic-job supervisor ([`expiry_job`]).

@@ -5,15 +5,15 @@
 //! release a slot or silently retry a mutation (docs/internal-action-store.md).
 
 use super::{
-    numeric_id, ActionError, ActionExecutor, ErrorCode, GuildAddMemberRequest, MemberOutcome,
-    RoleAssignRequest,
+    numeric_id, ActionError, ActionExecutor, ErrorCode, GuildAddMemberRequest, MemberError,
+    MemberOutcome, RoleAssignRequest,
 };
 use std::collections::HashMap;
 use two_bot_core::internal_action_store::{
     AuditSubject, DiscordId, InternalActionStore, InternalClaim, InternalStoreError,
     RequestIdentity, TerminalFailure, TerminalResponse,
 };
-use two_bot_core::internal_actions::require_field_str;
+use two_bot_core::internal_actions::{parse_body_object, require_field_str};
 
 pub struct MemberActionConfig<'a> {
     pub guild_id: &'a str,
@@ -43,14 +43,6 @@ fn pending() -> ActionError {
         "idempotency_in_flight",
     )
 }
-fn malformed() -> ActionError {
-    ActionError::new(
-        ErrorCode::Malformed,
-        "Body must be a JSON object",
-        "body_not_object",
-    )
-}
-
 fn replay(action: &str, response: TerminalResponse) -> Result<MemberExecution, ActionError> {
     let outcome = match response {
         TerminalResponse::Success {
@@ -110,11 +102,9 @@ impl ActionExecutor {
         authenticated_payload: &[u8],
         config: &MemberActionConfig<'_>,
     ) -> Result<MemberExecution, ActionError> {
-        let value: serde_json::Value =
-            serde_json::from_slice(authenticated_payload).map_err(|_| {
-                ActionError::new(ErrorCode::Malformed, "Body is not valid JSON", "bad_json")
-            })?;
-        let body = value.as_object().ok_or_else(malformed)?;
+        // The same parser `authorize` used: one document per signed body, and
+        // a repeated key at any depth refuses before any store or REST call.
+        let body = &parse_body_object(authenticated_payload)?;
         let action = require_field_str(body, "action")?;
         let (user, role_request, member_request) = match action {
             "role.assign" => {
@@ -172,12 +162,12 @@ impl ActionExecutor {
             }
         };
         let result = if let Some(request) = role_request {
-            self.assign_internal_role(config.guild_id, config.bot_user_id, &request)
+            self.assign_internal_role_once(config.guild_id, config.bot_user_id, &request)
                 .await
         } else {
             // Already validated; never format the parsed body or this local.
             let token = require_field_str(body, "access_token")?;
-            self.add_internal_member(
+            self.add_internal_member_once(
                 config.guild_id,
                 &member_request.expect("validated member action"),
                 token,
@@ -205,7 +195,18 @@ impl ActionExecutor {
                     replayed: false,
                 })
             }
-            Err(error) => {
+            Err(error @ MemberError::Guard(_)) => {
+                // Member actions have one mutation, last. A typed admission
+                // refusal therefore proves it was never dispatched, even if
+                // preceding hierarchy GETs succeeded. Do not release on a wire
+                // 429, timeout or transport failure.
+                store
+                    .release_proven_not_sent(claim)
+                    .await
+                    .map_err(storage_error)?;
+                Err(error.into_action_error())
+            }
+            Err(MemberError::Action(error)) => {
                 if error.code == ErrorCode::DiscordRejected {
                     store
                         .finish(
