@@ -1,5 +1,8 @@
 //! Operator-only member erasure. No gateway, Discord calls, or migrations.
 
+// Operator command intentionally emits its dry-run/execute report to stdout.
+#![allow(clippy::print_stdout)]
+
 use two_bot_cutover::member_erasure::{erase_member, ErasureMode};
 
 pub(crate) const USAGE: &str = "\
