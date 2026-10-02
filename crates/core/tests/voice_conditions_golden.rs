@@ -1,9 +1,9 @@
-//! Structural gate for the V6b independent golden corpus
-//! (`fixtures/voice_conditions_golden.json`, [TOG-12468](/TOG/issues/TOG-12468)).
+//! The V6b independent golden corpus (`fixtures/voice_conditions_golden.json`,
+//! [TOG-12468](/TOG/issues/TOG-12468)) and its evaluation through the merged
+//! `voice_conditions` evaluator ([TOG-12528](/TOG/issues/TOG-12528)).
 //!
-//! This test never touches the `voice_conditions` evaluator (TOG-12189 owns
-//! it; PR #246 unmerged at authoring time). It pins the fixture contract the
-//! eval-wiring follow-up will consume:
+//! The structural gate pins the fixture contract independently of the
+//! evaluator:
 //! - every condition head has at least one row (`MIN_PER_HEAD`);
 //! - unknown-head rows refuse (`expected.output == "no"`);
 //! - `spec` rows cite §V6 alone and `choice` rows cite the TOG-12189
@@ -17,13 +17,20 @@
 //!   the `DERIVED_CONTEXTS` allowlist, which the shared corpus must not define;
 //! - the spec pin matches the current `docs/voice-rooms.md` SHA-256.
 //!
-//! The eval follow-up (blocked on TOG-12189) renders `input` through the
-//! merged evaluator over the inlined `contexts` and asserts `expected.output`.
+//! The eval test renders every row's `input` through [`Conditions`] over the
+//! row's inlined context and asserts `expected.output` byte-for-byte. Expected
+//! outputs are never edited here: a disagreement is a finding for the
+//! evaluator owner, reported as row ID, basis, expected and actual.
+
+#[path = "support/voice_corpus_context.rs"]
+mod voice_corpus_context;
 
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use two_bot_core::voice_naming::{parse, Extension, Segment};
+use two_bot_core::voice_conditions::{ConditionFacts, Conditions};
+use two_bot_core::voice_naming::{parse, render, Extension, Segment};
+use voice_corpus_context::{room_context, CorpusContext};
 
 const GOLDEN: &str = include_str!("fixtures/voice_conditions_golden.json");
 const SHARED: &str = include_str!("../../../tests/voice_templates/corpus.json");
@@ -101,7 +108,6 @@ struct Case {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Expected {
-    #[allow(dead_code)]
     kind: String,
     output: String,
 }
@@ -345,4 +351,101 @@ fn contexts_are_shared_verbatim_except_the_derived_allowlist() {
         copied += 1;
     }
     assert_eq!(copied, 26, "26 contexts are copied verbatim");
+}
+
+/// Facts the parent runtime resolves from guild state, read from the same
+/// snapshot as [`room_context`]: the owner and members by ID, their roles,
+/// the owner's game and streams, and the lock flag.
+fn condition_facts(context: &CorpusContext) -> ConditionFacts {
+    let owner = context.members.iter().find(|m| m.id == context.owner_id);
+    let count = |live: usize| u32::try_from(live).expect("member count fits u32");
+    ConditionFacts {
+        owner_id: Some(context.owner_id.clone()),
+        owner_role_ids: owner.map(|m| m.roles.clone()).unwrap_or_default(),
+        member_ids: context.members.iter().map(|m| m.id.clone()).collect(),
+        member_role_ids: context
+            .members
+            .iter()
+            .flat_map(|m| m.roles.iter().cloned())
+            .collect(),
+        owner_playing: owner.is_some_and(|m| m.game.is_some()),
+        owner_live_discord: owner.is_some_and(|m| m.live_discord),
+        owner_live_external: owner.is_some_and(|m| m.live_external),
+        live_discord_count: count(context.members.iter().filter(|m| m.live_discord).count()),
+        live_external_count: count(context.members.iter().filter(|m| m.live_external).count()),
+        games: shown_games(context),
+        private: context.private,
+    }
+}
+
+/// V5 shown titles: the alias-resolved majority, both titles on a two-way
+/// tie, none on a wider tie or when nobody plays. Only the default majority
+/// settings are modelled; every corpus context uses them.
+fn shown_games(context: &CorpusContext) -> Vec<String> {
+    assert!(
+        !context.settings.force_single_game && !context.settings.include_inactive,
+        "shown_games models only the default majority settings"
+    );
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for title in context.members.iter().filter_map(|m| m.game.as_deref()) {
+        let title = context
+            .settings
+            .aliases
+            .get(title)
+            .map_or(title, String::as_str);
+        *counts.entry(title.to_string()).or_default() += 1;
+    }
+    let top = counts.values().copied().max().unwrap_or(0);
+    let leaders: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, count)| *count == top)
+        .map(|(title, _)| title)
+        .collect();
+    if leaders.len() > 2 {
+        Vec::new()
+    } else {
+        leaders
+    }
+}
+
+#[test]
+fn every_row_renders_its_expected_output_through_the_evaluator() {
+    let fixture = fixture();
+    let mut rooms = BTreeMap::new();
+    for (name, body) in &fixture.contexts {
+        let context: CorpusContext = serde_json::from_value(body.clone())
+            .unwrap_or_else(|error| panic!("context {name}: {error}"));
+        let room = room_context(&context);
+        let facts = condition_facts(&context);
+        // `GAME` must agree with the `@@game@@` the same name renders.
+        let shown = match facts.games.as_slice() {
+            [] => context.settings.no_game.clone(),
+            titles => titles.join(" & "),
+        };
+        assert_eq!(room.game_name, shown, "context {name}: GAME facts drift");
+        rooms.insert(name.as_str(), (room, facts));
+    }
+    let mut failures = Vec::new();
+    for case in &fixture.cases {
+        assert_eq!(case.expected.kind, "exact", "{}: not exact", case.id);
+        let (room, facts) = &rooms[case.context.as_str()];
+        let actual = render(&parse(&case.input), room, &Conditions::new(facts));
+        if actual != case.expected.output {
+            failures.push(format!(
+                "{} ({}): expected {:?}, actual {actual:?}",
+                case.id, case.basis, case.expected.output
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} row(s) disagree with the evaluator:\n{}",
+        failures.len(),
+        fixture.cases.len(),
+        failures.join("\n")
+    );
+    assert!(
+        rooms.contains_key("v6b-party-capped"),
+        "the derived context is evaluated"
+    );
 }
