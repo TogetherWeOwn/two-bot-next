@@ -5,10 +5,16 @@
 //! Claim tokens fence stale completions. No lease automatically retries a
 //! mutation whose Discord outcome is uncertain. Never log SQL binds here.
 
+use std::future::Future;
+
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::automod::AutomodFilter;
-use crate::automod_runtime::{AutomodMatch, DeliveryKey, MessageSubject, ViolationRecord};
+use crate::automod_runtime::{
+    AutomodClaimLedger, AutomodMatch, DeliveryKey, LedgerClaim, MessageSubject, ViolationRecord,
+};
+// Receipts live with the store-agnostic seam; this path stays stable.
+pub use crate::automod_runtime::{CompletionKind, StoredOutcome};
 
 #[derive(Debug, Clone)]
 pub struct AutomodStore {
@@ -34,6 +40,71 @@ pub enum ClaimResult {
     Preserved(DeliveryClaim, AutomodMatch),
 }
 
+impl From<ClaimResult> for LedgerClaim<DeliveryClaim> {
+    fn from(result: ClaimResult) -> Self {
+        match result {
+            ClaimResult::Acquired(claim) => Self::Acquired(claim),
+            ClaimResult::InFlight => Self::InFlight,
+            ClaimResult::Replayed(outcome) => Self::Replayed(outcome),
+            ClaimResult::Preserved(claim, matched) => Self::Preserved(claim, matched),
+        }
+    }
+}
+
+/// Production ledger: delegates 1:1 so the SQL above stays the single
+/// arbitration authority for the shared activation orchestrator.
+impl AutomodClaimLedger for AutomodStore {
+    type Claim = DeliveryClaim;
+    type Error = sqlx::Error;
+
+    fn ledger_claim(
+        &self,
+        key: &DeliveryKey,
+    ) -> impl Future<Output = Result<LedgerClaim<DeliveryClaim>, sqlx::Error>> + Send {
+        async move { self.claim(key).await.map(LedgerClaim::from) }
+    }
+
+    fn ledger_preserve(
+        &self,
+        claim: &DeliveryClaim,
+        matched: &AutomodMatch,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send {
+        self.preserve_match(claim, matched)
+    }
+
+    fn ledger_mark_started(
+        &self,
+        claim: &DeliveryClaim,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send {
+        self.mark_mutation_started(claim)
+    }
+
+    fn ledger_complete(
+        &self,
+        claim: &DeliveryClaim,
+        outcome: &StoredOutcome,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send {
+        self.complete(claim, outcome)
+    }
+
+    fn ledger_release(
+        &self,
+        claim: &DeliveryClaim,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send {
+        self.release_unmutated(claim)
+    }
+
+    fn ledger_record(
+        &self,
+        claim: &DeliveryClaim,
+        subject: &MessageSubject,
+        filter: AutomodFilter,
+        at_iso: &str,
+    ) -> impl Future<Output = Result<ViolationRecord, sqlx::Error>> + Send {
+        self.record_violation(claim, subject, filter, at_iso)
+    }
+}
+
 /// One conflicting delivery-claim row: settled receipt plus the preserved
 /// pre-count decision (IDs only, no message content).
 type ClaimRow = (
@@ -45,28 +116,6 @@ type ClaimRow = (
     Option<String>,
     bool,
 );
-
-/// Execution receipt, not a plan: `deleted` is true only after confirmed REST
-/// success. Completion has no arbitrary metadata field to smuggle message text.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct StoredOutcome {
-    pub matched: bool,
-    pub deleted: bool,
-    pub outcome: CompletionKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompletionKind {
-    Accepted,
-    AlreadyProcessed,
-    DryRun,
-    Protected,
-    Deleted,
-    Warned,
-    TimedOut,
-    SanctionRefused,
-}
 
 impl AutomodStore {
     #[must_use]
