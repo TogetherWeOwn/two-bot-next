@@ -13,6 +13,7 @@
 //! them into a notice or `/setup` listing cannot leak user-provided text.
 //! Choosing display wording and sending notices stay with the V10 runtime.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 use serde::Serialize;
@@ -59,7 +60,8 @@ pub struct PermissionOverwrite {
 }
 
 /// Allow/deny masks for one resolution step. Absent steps use `None`;
-/// [`OverwriteMasks::default`] (neutral) is only a test convenience.
+/// [`OverwriteMasks::default`] is the neutral mask (allows and denies
+/// nothing), also used to accumulate combined role overwrites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OverwriteMasks {
     pub allow: u64,
@@ -308,15 +310,20 @@ pub struct TrackedFailure {
 
 #[derive(Debug, Clone, Copy)]
 struct ThrottleEntry {
+    /// Notices actually sent; 0 for a failure observed but not yet sent.
     sends: u32,
+    /// Time of the last send; meaningless while `sends` is 0.
     last_sent_ms: u64,
 }
 
 /// Pure repeat state over caller-supplied timestamps: "a few times, then
-/// stop". The caller owns persistence, supplies `now_ms`, records each
-/// actual send and resolves failures the health check no longer reports, so
-/// a recurrence starts a fresh budget. `current_failures` backs the `/setup`
-/// failure list in deterministic (guild, location, diagnostic) order.
+/// stop". The caller owns persistence and supplies `now_ms`. On each health
+/// check it [`observe`](Self::observe)s every detected failure, so `/setup`
+/// lists it even when no notice target is available or the send fails;
+/// records each actual send; and resolves failures the check no longer
+/// reports, so a recurrence starts a fresh budget. `current_failures` backs
+/// the `/setup` failure list in deterministic (guild, location, diagnostic)
+/// order.
 #[derive(Debug, Clone, Default)]
 pub struct NoticeThrottle {
     entries: BTreeMap<TrackedFailure, ThrottleEntry>,
@@ -328,9 +335,26 @@ impl NoticeThrottle {
         Self::default()
     }
 
+    /// Track a detected failure for `/setup` without counting a send.
+    /// Inserts it with no sends when absent, so it is listed and immediately
+    /// due; an already tracked failure keeps its send count and timestamp.
+    /// Returns true when the failure was newly tracked.
+    pub fn observe(&mut self, failure: TrackedFailure) -> bool {
+        match self.entries.entry(failure) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(ThrottleEntry {
+                    sends: 0,
+                    last_sent_ms: 0,
+                });
+                true
+            }
+        }
+    }
+
     /// True when a notice for `failure` may be sent at `now_ms`: fewer than
     /// [`NOTICE_MAX_SENDS`] sends so far and the backoff since the previous
-    /// send elapsed. Unknown failures are always due.
+    /// send elapsed. Unknown and observed-but-unsent failures are due.
     #[must_use]
     pub fn should_notify(&self, failure: TrackedFailure, now_ms: u64) -> bool {
         let Some(entry) = self.entries.get(&failure) else {
@@ -343,8 +367,9 @@ impl NoticeThrottle {
         now_ms.saturating_sub(entry.last_sent_ms) >= delay
     }
 
-    /// Record one sent notice. Late duplicates beyond the budget keep the
-    /// failure listed but silent.
+    /// Record one sent notice, tracking the failure if it was not observed
+    /// first. Late duplicates beyond the budget keep the failure listed but
+    /// silent.
     pub fn record_sent(&mut self, failure: TrackedFailure, now_ms: u64) {
         self.entries
             .entry(failure)

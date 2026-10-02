@@ -34,10 +34,12 @@ requires no `db` feature, Discord wire types, clock, or external I/O.
 - `NoticeThrottle`: pure repeat state over caller-supplied timestamps —
   **N = 3 sends** (`NOTICE_MAX_SENDS`), first notice immediately, repeats
   after 5 then 30 minutes (`NOTICE_BACKOFF_MS`). Exhausted failures stay
-  listed but silent. The caller persists state, supplies `now_ms`, records
-  actual sends, and resolves failures the health check no longer reports, so
-  a recurrence starts a fresh budget. `current_failures` backs the `/setup`
-  failure list in deterministic order.
+  listed but silent. The caller persists state, supplies `now_ms`, calls
+  `observe` for every failure each health check detects (tracked with no
+  sends, so it is listed and due even when `notice_target` returns `None` or
+  the send fails), records actual sends, and resolves failures the check no
+  longer reports, so a recurrence starts a fresh budget. `current_failures`
+  backs the `/setup` failure list in deterministic order.
 
 The caller supplies authoritative permission snapshots, overwrite rows, bot
 identity and candidate availability, authenticates actor identity, chooses

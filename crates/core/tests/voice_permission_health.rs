@@ -516,6 +516,44 @@ fn throttle_sends_a_few_times_with_backoff_then_stops() {
 }
 
 #[test]
+fn throttle_lists_observed_but_unsent_failures_and_keeps_them_due() {
+    let failure = tracked();
+    let mut throttle = NoticeThrottle::new();
+    // Detected, but no notice target was available (or the send failed):
+    // /setup must still list it, and the first notice stays due.
+    assert!(throttle.observe(failure));
+    assert_eq!(throttle.current_failures(), vec![failure]);
+    assert!(throttle.should_notify(failure, 0));
+    assert!(throttle.should_notify(failure, 60 * 60 * 1_000));
+    // Re-observing on later health checks changes nothing.
+    assert!(!throttle.observe(failure));
+    assert_eq!(throttle.current_failures(), vec![failure]);
+    // The first actual send starts the normal backoff schedule.
+    throttle.record_sent(failure, 1_000);
+    assert!(!throttle.should_notify(failure, 1_000 + NOTICE_BACKOFF_MS[1] - 1));
+    assert!(throttle.should_notify(failure, 1_000 + NOTICE_BACKOFF_MS[1]));
+}
+
+#[test]
+fn throttle_observe_does_not_reset_a_sent_failure() {
+    let failure = tracked();
+    let mut throttle = NoticeThrottle::new();
+    throttle.record_sent(failure, 0);
+    assert!(!throttle.observe(failure));
+    // Still in backoff: observing did not reset the send count or timestamp.
+    assert!(!throttle.should_notify(failure, NOTICE_BACKOFF_MS[1] - 1));
+    for now in [
+        NOTICE_BACKOFF_MS[1],
+        NOTICE_BACKOFF_MS[1] + NOTICE_BACKOFF_MS[2],
+    ] {
+        throttle.record_sent(failure, now);
+    }
+    assert!(!throttle.observe(failure));
+    assert!(!throttle.should_notify(failure, u64::MAX));
+    assert_eq!(throttle.current_failures(), vec![failure]);
+}
+
+#[test]
 fn throttle_resolve_starts_a_fresh_budget() {
     let failure = tracked();
     let mut throttle = NoticeThrottle::new();
