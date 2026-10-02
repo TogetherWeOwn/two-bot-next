@@ -1,5 +1,8 @@
 //! Dry-run-first operator registry workflow, shared with opt-in boot publication.
 
+// Operator CLI intentionally emits diff/publish reports and help to stdout.
+#![allow(clippy::print_stdout)]
+
 use std::collections::HashMap;
 
 use two_bot_core::commands::CommandDefinition;
@@ -16,6 +19,15 @@ pub const USAGE: &str = "\
       Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot.
       No database is opened. See docs/command-publish.md before applying a cutover.
 ";
+
+/// Top-level `--help` surface: the registry usage plus the sibling CLI
+/// usages the entrypoint used to print inline. Lives here (not in
+/// `main.rs`) so the workspace `print_stdout` deny only touches CLI modules.
+pub fn print_all_usage() {
+    print!("{USAGE}");
+    println!("{}", crate::preflight::USAGE);
+    print!("{}", crate::erasure_cli::USAGE);
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {

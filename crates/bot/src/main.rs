@@ -248,10 +248,9 @@ async fn main() {
 }
 
 /// `--help` covers the gateway server and both operator CLI surfaces.
+// Stdout lives in the CLI modules; the entrypoint only dispatches.
 async fn print_backup_help_and_exit() -> ! {
-    print!("{}", commands_cli::USAGE);
-    println!("{}", preflight::USAGE);
-    print!("{}", erasure_cli::USAGE);
+    commands_cli::print_all_usage();
     backup_cli::print_server_usage();
     let code = backup_cli::dispatch(&["--help".to_owned()]).await;
     std::process::exit(code);
