@@ -132,6 +132,16 @@ class NightlyRoutingTests(unittest.TestCase):
         self.assertEqual(bare, [], "rustdoc reads bare <placeholder> as an unclosed HTML tag")
         self.assertNotIn("invalid_html_tags", source)
 
+    def test_method_doc_links_are_self_qualified_without_suppressing_doc_lint(self):
+        source = (ROOT / "crates/cutover/src/rest.rs").read_text()
+        self.assertIn("[`Self::scan_channel`]", source)
+        # rustdoc resolves intra-doc links at module scope, so a bare
+        # [`method`] to a sibling method is a broken link under -D warnings.
+        # Free functions (iso_to_millis) stay valid bare links.
+        free = set(re.findall(r"(?m)^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn (\w+)\(", source))
+        bare = set(re.findall(r"\[`([a-z][a-z0-9_]*)`\]", source))
+        self.assertEqual(bare - free, set(), "method links must be Self:: qualified")
+
 
 if __name__ == "__main__":
     unittest.main()
