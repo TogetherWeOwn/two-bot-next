@@ -253,7 +253,7 @@ impl ActionExecutor {
         let outcome = match response.status {
             201 => MemberOutcome::Added,
             200 | 204 => MemberOutcome::AlreadyMember,
-            _ => return Err(unreadable()),
+            _ => return Err(unreadable().into()),
         };
         // This endpoint's accepted status distinguishes added/already present;
         // no message/resource id is consumed by the caller.
@@ -347,7 +347,7 @@ impl ActionExecutor {
             )
             .await?;
         if response.status != 204 {
-            return Err(unreadable());
+            return Err(unreadable().into());
         }
         response.complete().await;
         Ok(MemberOutcome::Assigned)
