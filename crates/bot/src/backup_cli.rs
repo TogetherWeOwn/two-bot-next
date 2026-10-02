@@ -416,9 +416,8 @@ async fn cmd_restore(args: &[String]) -> i32 {
             return 1;
         }
     };
-    // NOTE: two-bot-next migrations land under S6 (Founding Engineer). Until
-    // then the target must already carry the schema; dump()/restore() refuse
-    // with a named table when it does not. S6 plugs migrate() in here.
+    // The target must already carry the schema (crates/cutover/migrations):
+    // restore() never migrates, and refuses with the missing tables named.
     match dump::restore(&pool, Path::new(&file)).await {
         Ok(report) => {
             println!("restore: dump taken {}", report.manifest.created_at);
@@ -433,12 +432,15 @@ async fn cmd_restore(args: &[String]) -> i32 {
             for table in &report.manifest.tables {
                 let got = report.restored.get(&table.name).copied().unwrap_or(0);
                 println!(
-                    "  {:17} manifest {:7}  restored {:7}  {}",
+                    "  {:29} manifest {:7}  restored {:7}  {}",
                     table.name,
                     table.count,
                     got,
                     if got == table.count { "ok" } else { "MISMATCH" }
                 );
+            }
+            for (table, high) in &report.allocators {
+                println!("restore: {table}: allocator high-water {high}");
             }
             for (table, cols) in &report.dropped_columns {
                 eprintln!(
@@ -493,18 +495,20 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
         // URL and its query secrets never reach logs or CLI output.
         match open_pool(url).await {
             Ok(probe) => {
-                for name in dump_file::DUMP_TABLES {
+                // Names come from the inspected manifest, already gated by
+                // dump_file::is_dump_table.
+                for table in &contents.manifest.tables {
+                    let name = &table.name;
                     let count: Result<(i64,), _> =
                         sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {name}")))
                             .fetch_one(&probe)
                             .await;
                     before.insert(
-                        (*name).to_owned(),
+                        name.clone(),
                         match count {
                             Ok((n,)) => n.to_string(),
-                            Err(_) => {
-                                "(no such table - the restore would migrate first)".to_owned()
-                            }
+                            Err(_) => "(no such table - the restore would refuse; migrate first)"
+                                .to_owned(),
                         },
                     );
                 }
@@ -512,16 +516,10 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
             }
             Err(_) => {
                 eprintln!("restore: cannot probe target; database details redacted; checking the file only.");
-                for name in dump_file::DUMP_TABLES {
-                    before.insert((*name).to_owned(), "(not checked)".to_owned());
-                }
             }
         }
     } else {
         println!("restore: no TWO_RESTORE_URL - checking the file only.");
-        for name in dump_file::DUMP_TABLES {
-            before.insert((*name).to_owned(), "(not checked)".to_owned());
-        }
     }
 
     let mut short = false;
@@ -531,7 +529,7 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
             short = true;
         }
         println!(
-            "  {:17} manifest {:7}  in file {:7}  {}   target now {}",
+            "  {:29} manifest {:7}  in file {:7}  {}   target now {}",
             table.name,
             table.count,
             held,
@@ -540,7 +538,10 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
             } else {
                 "MISMATCH"
             },
-            before.get(&table.name).map(String::as_str).unwrap_or("?"),
+            before
+                .get(&table.name)
+                .map(String::as_str)
+                .unwrap_or("(not checked)"),
         );
     }
     if short {

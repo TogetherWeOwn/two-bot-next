@@ -42,8 +42,53 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-All 22 bot-owned tables are dumped (see `DUMP_TABLES` in
-`crates/core/src/backup/dump_file.rs`); the website's tables are not ours.
+## What is dumped, and what a restore does (TOG-11878)
+
+The dump covers the tables the bot itself creates in
+`crates/cutover/migrations`, listed in `DUMP_TABLES` in
+`crates/core/src/backup/dump_file.rs`. The website's tables are not ours. The
+list is closed under foreign keys: every table that references a dumped table
+is dumped too. It is also ordered so that each table comes after the tables it
+references. A unit test fails when a migration creates a table that is neither
+in `DUMP_TABLES` nor in `NOT_DUMPED`; `NOT_DUMPED` gives the reason for each
+table it excludes:
+
+- `guild_settings`, `guild_settings_revision` and `guild_settings_audit`
+  are excluded because the configuration audit is append-only, and its
+  trigger refuses `TRUNCATE`. Putting these tables back needs an audited
+  restore of its own; a bulk table copy cannot do it.
+- `gateway_sessions`, `internal_nonces`, `audit_kill_switch` and
+  `web_contract_meta` are runtime or deployment state. They belong to the
+  running process or the deploy, not to the data being recovered.
+
+`LEGACY_DUMP_TABLES` is the frozen list of 22 tables in the legacy bot's
+dumps. Restore still reads that profile, but only into a schema that has
+those tables. Next does not have them: 8 of the 22 do not exist in it. A
+manifest must name exactly one profile, never a mix of the two.
+
+Restore never creates or changes tables, and it refuses before it writes
+anything when either of these is true:
+
+- **A table is missing.** One of the dump's tables is absent from the
+  target. The error names the missing tables. Migrate the target first.
+- **A table outside the dump references one inside it.** The error names
+  the table and its constraint. A plain `TRUNCATE` would fail on that
+  reference, and `TRUNCATE … CASCADE` would silently empty the table.
+
+When neither applies, restore runs in one transaction:
+
+1. It truncates only the dump's tables, without `RESTART IDENTITY`.
+2. It inserts the rows.
+3. It moves each serial or identity allocator to the highest of these
+   values: the target's own position, the restored `MAX(id)`, and the mark
+   recorded in the dump. The dump records that mark in the manifest's
+   additive `sequences` map. The allocator never moves backwards, so an ID
+   already handed out, before or after the dump, is never handed out again.
+
+The CLI prints each high-water mark it sets. Tables such as `guild_settings`
+keep their contents when a restore runs. Dumps are ordered by each table's
+primary key; the dump refuses a table with no primary key, or with more than
+one serial column, rather than guess.
 
 ## Nightly DB backup — daily 04:17
 
@@ -215,9 +260,9 @@ cutover plan and gates separately; these examples are scratch-only.
 
 ## S6 hook (Founding Engineer)
 
-`cmd_restore` does **not** run migrations: two-bot-next migrations land
-under S6, so the target must already carry the schema and `dump()` refuses
-with a named table when it does not. S6 plugs `migrate()` in at the marked
-`NOTE` in `crates/bot/src/backup_cli.rs` (same position legacy
-`pg-restore.ts` ran it). The dump reader already tolerates dumps whose
-columns the target lacks (`droppedColumns` report, target types win).
+`cmd_restore` does **not** run migrations. Bring the target to the
+`crates/cutover/migrations` schema first. If the target lacks any of the
+dump's tables, restore refuses and names them (TOG-11878). The restore
+comment in `crates/bot/src/backup_cli.rs` marks where legacy `pg-restore.ts`
+migrated. The dump reader already accepts dumps that have columns the target
+lacks: it reports them as `droppedColumns`, and the target's types win.

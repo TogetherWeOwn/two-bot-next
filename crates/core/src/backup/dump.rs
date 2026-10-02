@@ -19,6 +19,14 @@
 //! The dump runs in a single `REPEATABLE READ` transaction: every table is
 //! read as of the same instant, so the bot does not have to be stopped to
 //! take a backup.
+//!
+//! ## Allocators
+//!
+//! Sequences are not transactional, so the dump records each serial/identity
+//! column's high-water mark in the manifest's `sequences`. Restore sets every
+//! restored table's allocator to the highest of the target's own position,
+//! the restored rows and that mark: it never rewinds, so an ID handed out
+//! before the restore is never handed out again (cutover allocator gate).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -45,41 +53,6 @@ pub enum DbDumpError {
     Refused(String),
 }
 
-/// Stable read order, so two dumps of an unchanged database are comparable.
-/// (Port of legacy `orderFor`.)
-fn order_for(table: &str, columns: &[String]) -> String {
-    let order = match table {
-        "events" => "id",
-        "members" => "guild_id, member_id",
-        "invite_snapshots" => "guild_id, code",
-        "operational_audit_log" => "entry_id",
-        "moderation_warnings" => "created_at, id",
-        "moderation_scheduled_unbans" => "execute_at, request_id",
-        "moderation_audit" => "created_at, request_id",
-        "moderation_lockdowns" => "guild_id, channel_id",
-        "moderation_idempotency" => "guild_id, idempotency_key",
-        "containment_events" => "occurred_at, audit_entry_id",
-        "containment_incidents" => "started_at, id",
-        "join_risk_flags" => "joined_at, event_id",
-        "automation_commands" => "guild_id, name",
-        "scheduled_messages" => "guild_id, id",
-        "sticky_messages" => "guild_id, channel_id",
-        "automation_audit_log" => "created_at, id",
-        "tickets" => "created_at, id",
-        "ticket_transcripts" => "created_at, ticket_id",
-        "automod_violations" => "guild_id, user_id",
-        "automod_processed_messages" => "guild_id, message_id",
-        "self_role_audit" => "created_at, event_id",
-        "self_role_panel_claims" => "guild_id, member_id, panel_id",
-        _ => "",
-    };
-    if order.is_empty() {
-        columns.first().cloned().unwrap_or_else(|| "1".to_owned())
-    } else {
-        order.to_owned()
-    }
-}
-
 /// Postgres caps a statement at 65535 bound parameters. Stay well under.
 ///
 /// This bounds multi-row INSERT pages on the *restore* path only. It must
@@ -97,7 +70,8 @@ fn batch_size_for(column_count: usize) -> usize {
 /// interpolated identifier is either an [`is_dump_table`] allowlist member
 /// (re-checked at every call site, including the restore path that reads
 /// table names out of the file) or came from the target database itself
-/// (`information_schema` / `pg_attribute`) and is double-quote-escaped;
+/// (`information_schema` / `pg_attribute` names, double-quote-escaped by
+/// [`ident`]; `pg_get_serial_sequence` output, which Postgres quotes);
 /// limits/offsets are integers; row values travel only as bound parameters.
 /// File-supplied *values* never reach this function.
 fn audited(sql: String) -> sqlx::AssertSqlSafe<String> {
@@ -131,6 +105,61 @@ async fn columns_of(
         .collect())
 }
 
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Primary-key columns in key order: the stable read order, so two dumps of
+/// an unchanged database are comparable. Every owned table has one.
+async fn primary_key_of(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+) -> Result<Vec<String>, DbDumpError> {
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_index i \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+         WHERE i.indrelid = to_regclass(format('%I.%I', current_schema(), $1::text)) \
+           AND i.indisprimary \
+         ORDER BY array_position(i.indkey::int2[], a.attnum)",
+    )
+    .bind(table)
+    .fetch_all(&mut **tx)
+    .await?;
+    if columns.is_empty() {
+        return Err(DbDumpError::Refused(format!(
+            "table {table} has no primary key, so it has no stable dump order"
+        )));
+    }
+    Ok(columns)
+}
+
+/// The table's serial/identity column and its sequence, if it has one.
+/// The manifest keeps one mark per table, so a second one is refused.
+async fn serial_of(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+) -> Result<Option<(String, String)>, DbDumpError> {
+    let mut found: Vec<(String, String)> = sqlx::query_as(
+        "SELECT attname::text, seq FROM ( \
+           SELECT a.attname, a.attnum, \
+             pg_get_serial_sequence(format('%I.%I', current_schema(), $1::text), a.attname) AS seq \
+           FROM pg_attribute a \
+           WHERE a.attrelid = to_regclass(format('%I.%I', current_schema(), $1::text)) \
+             AND a.attnum > 0 AND NOT a.attisdropped \
+         ) s WHERE seq IS NOT NULL ORDER BY attnum",
+    )
+    .bind(table)
+    .fetch_all(&mut **tx)
+    .await?;
+    if found.len() > 1 {
+        return Err(DbDumpError::Refused(format!(
+            "table {table} has {} allocator columns; the manifest records one per table",
+            found.len()
+        )));
+    }
+    Ok(found.pop())
+}
+
 async fn count_of(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table: &str,
@@ -151,6 +180,8 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         .await?;
 
     let mut tables: Vec<DumpTableInfo> = Vec::with_capacity(DUMP_TABLES.len());
+    let mut orders: BTreeMap<&str, String> = BTreeMap::new();
+    let mut sequences: BTreeMap<String, i64> = BTreeMap::new();
     for name in DUMP_TABLES {
         if !is_dump_table(name) {
             return Err(DbDumpError::Refused(format!("{name} is not a dump table")));
@@ -162,6 +193,28 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
             )));
         }
         let count = count_of(&mut tx, name).await? as u64;
+        let key = primary_key_of(&mut tx, name).await?;
+        orders.insert(
+            *name,
+            key.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", "),
+        );
+        if let Some((column, seq)) = serial_of(&mut tx, name).await? {
+            // pg_sequences reports NULL before first use (and without
+            // privilege); the snapshot's own rows are then the floor.
+            let (mark,): (i64,) = sqlx::query_as(audited(format!(
+                "SELECT GREATEST( \
+                   COALESCE((SELECT s.last_value FROM pg_sequences s \
+                     JOIN pg_class c ON c.relname = s.sequencename \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname \
+                     WHERE c.oid = $1::regclass), 0), \
+                   (SELECT COALESCE(MAX({})::bigint, 0) FROM {name}))",
+                ident(&column)
+            )))
+            .bind(&seq)
+            .fetch_one(&mut *tx)
+            .await?;
+            sequences.insert((*name).to_owned(), mark);
+        }
         tables.push(DumpTableInfo {
             name: (*name).to_owned(),
             columns: cols.iter().map(|(c, _)| c.clone()).collect(),
@@ -196,6 +249,7 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         tables,
         events_sequence: seq.0,
         schema_migrations: migrations.into_iter().map(|(id,)| id).collect(),
+        sequences,
     };
 
     let mut writer = DumpWriter::new(out_path)?;
@@ -206,10 +260,10 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         let quoted: Vec<String> = table
             .columns
             .iter()
-            .map(|c| format!("\"{}\"::text", c.replace('"', "\"\"")))
+            .map(|c| format!("{}::text", ident(c)))
             .collect();
         let select_list = quoted.join(", ");
-        let order = order_for(&table.name, &table.columns);
+        let order = &orders[table.name.as_str()];
         // Stream row-by-row: each row passes through the bounded writer
         // (8 MiB decoded-line cap, cumulative budgets) BEFORE the next row
         // is materialised. An early oversized row refuses before later rows
@@ -250,29 +304,74 @@ pub struct RestoreReport {
     pub manifest: DumpManifest,
     pub restored: BTreeMap<String, u64>,
     pub dropped_columns: BTreeMap<String, Vec<String>>,
+    /// Restored table -> its allocator's high-water mark after the restore
+    /// (the next default ID is above it). Tables without one are absent.
+    pub allocators: BTreeMap<String, i64>,
     pub ok: bool,
 }
 
-/// Replace the contents of the bot-owned tables with a dump.
+/// Replace the contents of the dump's tables with the dump.
 ///
 /// Destructive by design: the tables are truncated first, so a restore
-/// produces the database as it was, not a merge. It runs in one transaction,
-/// so a failure part way through leaves the target exactly as it was rather
-/// than half-wiped — the state you least want to discover during a recovery.
+/// produces their data as it was, not a merge. Tables outside the dump (see
+/// [`super::dump_file::NOT_DUMPED`]) are left alone. It runs in one
+/// transaction, so a failure part way through leaves the target exactly as it
+/// was rather than half-wiped — the state you least want to discover during a
+/// recovery. The target schema must already exist: this never migrates.
 pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbDumpError> {
     let contents: DumpContents = inspect(in_path)?;
     let manifest = contents.manifest;
     let mut dropped_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut allocators: BTreeMap<String, i64> = BTreeMap::new();
+    let names: Vec<String> = manifest.tables.iter().map(|t| t.name.clone()).collect();
+    // Re-checked before any of these names is interpolated below.
+    if let Some(name) = names.iter().find(|n| !is_dump_table(n)) {
+        return Err(DbDumpError::Refused(format!(
+            "manifest table {name:?} is not a dump table"
+        )));
+    }
 
     let mut tx = pool.begin().await?;
-    // RESTART IDENTITY so the sequence does not carry over from whatever was
-    // in the target before; it is set explicitly below.
-    sqlx::query(audited(format!(
-        "TRUNCATE {} RESTART IDENTITY",
-        DUMP_TABLES.join(", ")
-    )))
-    .execute(&mut *tx)
+    let absent: Vec<String> = sqlx::query_scalar(
+        "SELECT t FROM unnest($1::text[]) AS t \
+         WHERE to_regclass(format('%I.%I', current_schema(), t)) IS NULL ORDER BY t",
+    )
+    .bind(&names)
+    .fetch_all(&mut *tx)
     .await?;
+    if !absent.is_empty() {
+        return Err(DbDumpError::Refused(format!(
+            "target lacks {}: migrate it first (restore never creates tables; \
+             a legacy-format dump restores only into a legacy-shaped schema)",
+            absent.join(", ")
+        )));
+    }
+    // A table outside the dump that references one inside would block the
+    // TRUNCATE (or, with CASCADE, be silently emptied). Name it instead.
+    let orphaned: Vec<(String, String, String)> = sqlx::query_as(
+        "WITH dumped AS ( \
+           SELECT to_regclass(format('%I.%I', current_schema(), t)) AS rel \
+           FROM unnest($1::text[]) AS t) \
+         SELECT c.conrelid::regclass::text, c.confrelid::regclass::text, c.conname::text \
+         FROM pg_constraint c \
+         WHERE c.contype = 'f' \
+           AND c.confrelid IN (SELECT rel FROM dumped) \
+           AND c.conrelid NOT IN (SELECT rel FROM dumped) \
+         ORDER BY 1, 3",
+    )
+    .bind(&names)
+    .fetch_all(&mut *tx)
+    .await?;
+    if let Some((from, to, constraint)) = orphaned.first() {
+        return Err(DbDumpError::Refused(format!(
+            "{from} references {to} ({constraint}) but is not in this dump; \
+             refusing rather than orphaning or emptying it"
+        )));
+    }
+    // No RESTART IDENTITY: allocators only move forward, set below.
+    sqlx::query(audited(format!("TRUNCATE {}", names.join(", "))))
+        .execute(&mut *tx)
+        .await?;
 
     for table in &manifest.tables {
         // Re-checked at the point of interpolation, not just at parse time:
@@ -330,7 +429,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
 
         let quoted = kept
             .iter()
-            .map(|(c, _)| format!("\"{}\"", c.replace('"', "\"\"")))
+            .map(|(c, _)| ident(c))
             .collect::<Vec<_>>()
             .join(", ");
         let batch = batch_size_for(kept.len());
@@ -368,15 +467,37 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         }
     }
 
-    // Put the id sequence back past the restored high-water mark, or the
-    // first write after the restore collides with a row we just put back.
-    sqlx::query(
-        "SELECT setval(pg_get_serial_sequence('events', 'id'), \
-         GREATEST((SELECT COALESCE(MAX(id), 0) FROM events), 1), \
-         (SELECT COUNT(*) FROM events) > 0)",
-    )
-    .execute(&mut *tx)
-    .await?;
+    // Put every allocator past the restored rows, or the first write after
+    // the restore collides with a row we just put back. Never below the
+    // target's own position or the dump's mark: an ID already handed out
+    // (and perhaps referenced outside this database) is not reissued.
+    for name in &names {
+        let Some((column, seq)) = serial_of(&mut tx, name).await? else {
+            continue;
+        };
+        let mut mark = manifest.sequences.get(name).copied().unwrap_or(0);
+        if name == "events" {
+            mark = mark.max(manifest.events_sequence);
+        }
+        let (high,): (i64,) = sqlx::query_as(audited(format!(
+            "SELECT GREATEST( \
+               (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM {seq}), \
+               (SELECT COALESCE(MAX({})::bigint, 0) FROM {name}), \
+               $1::bigint)",
+            ident(&column)
+        )))
+        .bind(mark)
+        .fetch_one(&mut *tx)
+        .await?;
+        if high >= 1 {
+            sqlx::query("SELECT setval($1::regclass, $2, true)")
+                .bind(&seq)
+                .bind(high)
+                .execute(&mut *tx)
+                .await?;
+        }
+        allocators.insert(name.clone(), high);
+    }
     tx.commit().await?;
 
     let mut restored = BTreeMap::new();
@@ -402,6 +523,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         manifest,
         restored,
         dropped_columns,
+        allocators,
         ok,
     })
 }

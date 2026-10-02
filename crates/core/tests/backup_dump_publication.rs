@@ -139,7 +139,8 @@ async fn cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dum
         .unwrap();
     for table in dump_file::DUMP_TABLES {
         // Audited identifiers come exclusively from the production allowlist.
-        // This compact fixture supports every owned table's stable ORDER BY.
+        // A compact stand-in: what the dump needs of each table is a primary
+        // key (its order) and at most one serial column (its allocator).
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
             .execute(&pool)
             .await

@@ -36,12 +36,102 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-/// Everything the bot owns. The website's own tables are not ours to back up.
+/// Every table `crates/cutover/migrations` creates that a restore replaces.
+/// The website's own tables are not ours to back up.
+///
+/// The set is closed under foreign keys: every table that references a member
+/// is itself a member, so one TRUNCATE of the set needs no CASCADE (TOG-11878:
+/// `moderation_channel_executions` was missing and blocked every restore).
+/// A unit test holds this list and [`NOT_DUMPED`] to exactly the migrations'
+/// tables, so a new migration cannot silently fall outside the backup.
 ///
 /// The moderation tables are here because losing them is not cosmetic: a lost
-/// scheduled unban is a tempban that became permanent, and a lost warn ledger
-/// is a moderation history the staff cannot see (TOG-1659 High 5).
+/// lockdown or idempotency key re-applies or forgets a staff action
+/// (TOG-1659 High 5).
 pub const DUMP_TABLES: &[&str] = &[
+    "events",
+    "members",
+    "invite_snapshots",
+    "member_levels",
+    "xp_cooldowns",
+    "xp_awards",
+    "level_role_rewards",
+    "level_import_runs",
+    "moderation_lockdowns",
+    "moderation_audit",
+    "moderation_idempotency",
+    "moderation_channel_executions",
+    "scheduled_messages",
+    "automation_audit_log",
+    "sticky_messages",
+    "event_rsvps",
+    "announcements_audit_log",
+    "community_facts",
+    "lfg_posts",
+    "lfg_roles",
+    "lfg_signups",
+    "feed_relays",
+    "feed_deliveries",
+    "self_role_audit",
+    "self_role_panel_claims",
+    "tickets",
+    "ticket_transcripts",
+    "guild_counters",
+    "rank_ladder",
+    "rank_snapshots",
+    "member_ranks",
+    "scheduled_events",
+    "counter_snapshots",
+    "member_exclusions",
+    "presence_probe",
+    "community_stream_heartbeats",
+    "community_scorecard_runs",
+    "community_scorecard_alerts",
+    "operational_audit_log",
+    "internal_idempotency",
+    "internal_action_log",
+    "internal_discord_events",
+];
+
+/// Migration-created tables a restore deliberately leaves alone, and why.
+/// Nothing here references or is referenced by a [`DUMP_TABLES`] member.
+pub const NOT_DUMPED: &[(&str, &str)] = &[
+    (
+        "guild_settings",
+        "trigger-allocated version/CAS counters; a restore would rewrite settings \
+         without the audit record every change requires",
+    ),
+    (
+        "guild_settings_revision",
+        "single-row revision allocator for guild_settings; never rewound",
+    ),
+    (
+        "guild_settings_audit",
+        "append-only: its trigger refuses TRUNCATE, so a restore cannot replace it",
+    ),
+    (
+        "gateway_sessions",
+        "Discord resume checkpoint; a restored one is stale and would replay \
+         or skip gateway events",
+    ),
+    (
+        "internal_nonces",
+        "anti-replay nonces live for minutes; every dumped one has expired by restore",
+    ),
+    (
+        "audit_kill_switch",
+        "operator halt control; a restore must neither engage nor release it",
+    ),
+    (
+        "web_contract_meta",
+        "describes the installed website views, not data; migrations own it",
+    ),
+];
+
+/// The 22 tables frozen legacy `two-bot` wrote (restore-only). Eight of them
+/// no Next migration creates, so these dumps restore only into a legacy-shaped
+/// schema; the Next writer never emits this set.
+pub const LEGACY_DUMP_TABLES: &[&str] = &[
     "events",
     "members",
     "invite_snapshots",
@@ -66,10 +156,13 @@ pub const DUMP_TABLES: &[&str] = &[
     "self_role_panel_claims",
 ];
 
+/// A manifest must name exactly one of these sets, never a mix.
+const DUMP_PROFILES: &[&[&str]] = &[DUMP_TABLES, LEGACY_DUMP_TABLES];
+
 /// The backup format version. Must stay 3: the envelope is frozen.
 pub const DUMP_VERSION: u32 = 3;
 
-/// A table name in the dump, validated against [`DUMP_TABLES`].
+/// A table name in the dump, validated by [`is_dump_table`].
 pub type DumpTable = String;
 
 /// Per-table manifest entry: live column order, Postgres type per column
@@ -100,6 +193,11 @@ pub struct DumpManifest {
     /// Which migrations the source had applied, for diagnosing an old backup.
     #[serde(rename = "schemaMigrations")]
     pub schema_migrations: Vec<String>,
+    /// Allocator high-water mark per dumped table with a serial/identity
+    /// column. Restore never sets an allocator below its mark. Additive:
+    /// frozen v3 omits it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sequences: BTreeMap<String, i64>,
 }
 
 /// Maximum compressed AND decoded bytes. Files are streamed rather than
@@ -223,7 +321,7 @@ pub enum DumpError {
     Refused(String),
 }
 
-/// True when `name` is a table this backup format owns.
+/// True when `name` is a table this backup format owns, in either profile.
 ///
 /// The restore interpolates table names into SQL, and a backup file is not a
 /// trusted input — bytes off a disk someone else may have written. Without
@@ -231,7 +329,7 @@ pub enum DumpError {
 /// truncated-and-inserted like one of ours.
 #[must_use]
 pub fn is_dump_table(name: &str) -> bool {
-    DUMP_TABLES.contains(&name)
+    DUMP_PROFILES.iter().any(|tables| tables.contains(&name))
 }
 
 fn refuse(message: impl Into<String>) -> DumpError {
@@ -672,25 +770,6 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
     {
         return Err(refuse("manifest has an invalid schemaMigrations list"));
     }
-    // Frozen v3 omits this additive metadata. When present, do not silently
-    // ignore malformed marks just because this reader restores only events.
-    if let Some(sequences) = obj.get("sequences") {
-        let sequences = sequences
-            .as_object()
-            .ok_or_else(|| refuse("manifest has invalid sequences"))?;
-        for (name, mark) in sequences {
-            if !is_dump_table(name) {
-                return Err(refuse(format!(
-                    "manifest sequence {name:?} is not a table this backup format owns"
-                )));
-            }
-            if mark.as_i64().is_none_or(|mark| mark < 0) {
-                return Err(refuse(format!(
-                    "manifest sequence {name} has an invalid high-water mark"
-                )));
-            }
-        }
-    }
     let tables = obj
         .get("tables")
         .and_then(Value::as_array)
@@ -729,16 +808,45 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    let missing: Vec<&str> = DUMP_TABLES
+    // Exactly one whole profile. A subset is a dump that silently lost tables;
+    // a mix of profiles is no writer's output.
+    if !DUMP_PROFILES
         .iter()
-        .filter(|name| !names.contains(**name))
-        .copied()
-        .collect();
-    if !missing.is_empty() {
-        return Err(refuse(format!(
-            "manifest is missing tables: {}",
-            missing.join(", ")
-        )));
+        .any(|profile| profile.len() == names.len() && profile.iter().all(|t| names.contains(*t)))
+    {
+        let missing = DUMP_PROFILES
+            .iter()
+            .find(|profile| names.iter().all(|n| profile.contains(&n.as_str())))
+            .map(|profile| {
+                profile
+                    .iter()
+                    .filter(|t| !names.contains(**t))
+                    .copied()
+                    .collect::<Vec<_>>()
+            });
+        return Err(refuse(match missing {
+            Some(missing) => format!("manifest is missing tables: {}", missing.join(", ")),
+            None => "manifest mixes the current and legacy table sets".to_owned(),
+        }));
+    }
+    // Frozen v3 omits this additive metadata. When present, every mark must
+    // be well-formed and belong to a table this restore replaces.
+    if let Some(sequences) = obj.get("sequences") {
+        let sequences = sequences
+            .as_object()
+            .ok_or_else(|| refuse("manifest has invalid sequences"))?;
+        for (name, mark) in sequences {
+            if !names.contains(name) {
+                return Err(refuse(format!(
+                    "manifest sequence {name:?} is not a table in this dump"
+                )));
+            }
+            if mark.as_i64().is_none_or(|mark| mark < 0) {
+                return Err(refuse(format!(
+                    "manifest sequence {name} has an invalid high-water mark"
+                )));
+            }
+        }
     }
     serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
 }
@@ -1322,6 +1430,70 @@ mod tests {
         let bytes = gzip_lines(&[manifest(tables), serde_json::json!({"kind":"end","rows":0})]);
         let err = inspect_bytes(&bytes).expect_err("missing tables");
         assert!(err.to_string().contains("missing tables"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_manifest_mixing_current_and_legacy_tables() {
+        let mut tables = complete_tables(&BTreeMap::new());
+        tables.push(
+            serde_json::json!({"name":"join_risk_flags","columns":[],"column_types":[],"count":0}),
+        );
+        let bytes = gzip_lines(&[manifest(tables), serde_json::json!({"kind":"end","rows":0})]);
+        let err = inspect_bytes(&bytes).expect_err("mixed profiles");
+        assert!(err.to_string().contains("mixes"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_sequence_mark_for_a_table_outside_the_dump() {
+        // xp_awards is ours, but not in a legacy-profile dump: a mark for it
+        // would claim an allocator this restore never replaces.
+        let tables: Vec<Value> = LEGACY_DUMP_TABLES
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "columns": [], "count": 0}))
+            .collect();
+        let mut m = manifest(tables);
+        m["sequences"] = serde_json::json!({"xp_awards": 1});
+        let bytes = gzip_lines(&[m, serde_json::json!({"kind":"end","rows":0})]);
+        let err = inspect_bytes(&bytes).expect_err("foreign sequence");
+        assert!(
+            err.to_string().contains("not a table in this dump"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_migration_table_is_dumped_or_excluded_with_a_reason() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
+        let mut created = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let sql = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            for line in sql.lines() {
+                let Some(rest) = line.trim_start().strip_prefix("CREATE TABLE ") else {
+                    continue;
+                };
+                let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                created.insert(name);
+            }
+        }
+        assert!(
+            created.contains("moderation_channel_executions"),
+            "{created:?}"
+        );
+        let mut covered = std::collections::BTreeSet::new();
+        for name in DUMP_TABLES.iter().chain(NOT_DUMPED.iter().map(|(n, _)| n)) {
+            assert!(covered.insert((*name).to_owned()), "{name} listed twice");
+        }
+        assert!(NOT_DUMPED.iter().all(|(_, why)| !why.is_empty()));
+        assert_eq!(
+            covered, created,
+            "classify every migration table in DUMP_TABLES or NOT_DUMPED"
+        );
+        let legacy: std::collections::BTreeSet<_> = LEGACY_DUMP_TABLES.iter().collect();
+        assert_eq!(legacy.len(), LEGACY_DUMP_TABLES.len());
     }
 
     #[test]

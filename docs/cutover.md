@@ -166,7 +166,7 @@ subcommand help paths require source/fixture verification before approval; a
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
 Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L82),
-[restore implementation](../crates/bot/src/backup_cli.rs#L354) and
+[restore implementation](../crates/bot/src/backup_cli.rs#L379) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -180,11 +180,22 @@ env -u TWO_RESTORE_URL two-bot restore fixture.ndjson.gz --dry-run
 
 Use a disposable fixture for a test. Missing/tampered file or nonzero exit means
 FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
-verify canonical content and required table coverage. The generic allowlist
-omits leveling, gateway checkpoints, guild settings, internal actions and other
-Next tables, and requires some legacy tables absent from embedded migrations.
-It can fail against a fresh Next schema. See
-[`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44). Do not treat its
+verify canonical content and required table coverage. The dump covers the
+tables created by `crates/cutover/migrations`, closed under foreign keys
+([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L51)). It excludes the
+tables listed in [`NOT_DUMPED`](../crates/core/src/backup/dump_file.rs#L98),
+which gives the reason for each exclusion:
+
+- guild settings, with their revisions and append-only audit;
+- gateway sessions;
+- internal nonces;
+- the audit kill switch;
+- web contract metadata.
+
+A restore into a migrated Next schema leaves those tables as they are. Restore
+refuses before any write when the target lacks a dumped table, or when a table
+outside the dump references one inside it. Legacy-format dumps restore only
+into a legacy-shaped schema. See [backup.md](backup.md). Do not treat the
 per-table count checks as complete final-copy verification.
 
 MEE6 XP/backfill/capture/reward utilities are **separate binaries**, not a
@@ -437,7 +448,7 @@ receipt is **NO-GO**. The same allocator gate applies to a rollback recovery tar
 Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L13)
 is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L98)
 that handle only idempotency-key conflicts, not primary-key collisions. The
-[limited restore's events sequence adjustment](../crates/core/src/backup/dump.rs#L371)
+[restore's never-rewind allocator step](../crates/core/src/backup/dump.rs#L470)
 illustrates the hazard; it does not prove the planned copier covers every table.
 
 Do not start either gateway while verification is unresolved. Record the baseline
