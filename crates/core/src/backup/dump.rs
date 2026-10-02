@@ -30,7 +30,8 @@ use thiserror::Error;
 
 use super::dump_file::{
     cell_input, inspect, is_destination_owned, is_dump_table, DumpContents, DumpError,
-    DumpManifest, DumpTableInfo, DumpWriter, DUMP_TABLES, DUMP_VERSION, OPTIONAL_LEGACY_TABLES,
+    DumpManifest, DumpTableInfo, DumpWriter, SequenceMark, DUMP_TABLES, DUMP_VERSION,
+    OPTIONAL_LEGACY_TABLES,
 };
 use super::guild_config::unix_now_iso;
 
@@ -118,64 +119,160 @@ async fn count_of(
     Ok(row.0)
 }
 
-/// Restart transactionally rather than using setval (which survives rollback).
+/// Allocators not OWNED BY a column, keyed by the column they feed.
+const STANDALONE_SEQUENCES: &[(&str, &str, &str)] = &[
+    ("guild_settings", "version", "guild_settings_version_seq"),
+    ("guild_settings", "cas_version", "guild_settings_cas_seq"),
+];
+
+/// `(column, sequence)` for every serial AND identity sequence owned by a
+/// column of `table`, including columns not named `id`, from the catalog
+/// rather than a hardcoded list or archive-supplied names. Standalone
+/// allocators that exist follow.
+/// https://www.postgresql.org/docs/16/functions-info.html
+async fn table_sequences(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+) -> Result<Vec<(String, String)>, DbDumpError> {
+    let mut sequences: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name::text, pg_get_serial_sequence(\
+         quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) \
+         FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1 \
+         AND pg_get_serial_sequence(\
+         quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) IS NOT NULL \
+         ORDER BY ordinal_position",
+    )
+    .bind(table)
+    .fetch_all(&mut **tx)
+    .await?;
+    for (owner, column, sequence) in STANDALONE_SEQUENCES {
+        if *owner != table {
+            continue;
+        }
+        let (exists,): (bool,) = sqlx::query_as("SELECT to_regclass($1) IS NOT NULL")
+            .bind(*sequence)
+            .fetch_one(&mut **tx)
+            .await?;
+        if exists {
+            sequences.push(((*column).to_owned(), (*sequence).to_owned()));
+        }
+    }
+    Ok(sequences)
+}
+
+/// A sequence's definition and live position. Sequences are not MVCC: inside
+/// the dump's snapshot this reads the current position, which is at or beyond
+/// every value the snapshot can contain.
+struct SequenceState {
+    quoted: String,
+    start: i64,
+    increment: i64,
+    min: i64,
+    max: i64,
+    last_value: i64,
+    is_called: bool,
+}
+
+async fn sequence_state(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sequence: &str,
+) -> Result<SequenceState, DbDumpError> {
+    let (quoted, start, increment, min, max): (String, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
+         s.seqstart, s.seqincrement, s.seqmin, s.seqmax \
+         FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE s.seqrelid = $1::regclass",
+    )
+    .bind(sequence)
+    .fetch_one(&mut **tx)
+    .await?;
+    // `quoted` is the catalog's own quote_ident spelling.
+    let (last_value, is_called): (i64, bool) = sqlx::query_as(audited(format!(
+        "SELECT last_value, is_called FROM {quoted}"
+    )))
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(SequenceState {
+        quoted,
+        start,
+        increment,
+        min,
+        max,
+        last_value,
+        is_called,
+    })
+}
+
+/// Restart transactionally rather than using setval (which survives rollback),
+/// at the furthest of: the configured start, one step past the restored rows,
+/// the archive's mark and the target's own position. A restore therefore never
+/// reissues a value the source or the target already handed out, including
+/// one whose row was deleted (the cutover allocator gate).
 /// Catalog identifiers are quoted by Postgres; restart values are checked i64s.
 /// `sources` are every restored (table, column) allocated from `sequence`; the
-/// first names it in refusals. It resumes past the edge across all of them.
+/// first names it in refusals and supplies the archive mark. It resumes past
+/// the edge across all of them.
 /// https://www.postgresql.org/docs/16/sql-altersequence.html
 async fn restart_sequence(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sources: &[(&str, &str)],
     sequence: &str,
+    mark: Option<&SequenceMark>,
 ) -> Result<(), DbDumpError> {
-    let (quoted_sequence, start, increment, min, max): (String, i64, i64, i64, i64) =
-        sqlx::query_as(
-            "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
-             s.seqstart, s.seqincrement, s.seqmin, s.seqmax \
-             FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE s.seqrelid = $1::regclass",
-        )
-        .bind(sequence)
-        .fetch_one(&mut **tx)
-        .await?;
-    let aggregate = if increment > 0 { "MAX" } else { "MIN" };
+    let state = sequence_state(tx, sequence).await?;
+    // The first source names the allocator in refusals and supplies the
+    // archive mark; later sources only widen the restored edge (0113 draws
+    // retry tickets from the ban-ownership sequence without owning a column).
+    let (table, column) = sources[0];
+    let exhausted =
+        || DbDumpError::Refused(format!("{table}.{column}: restored sequence exhausted"));
+    let ascending = state.increment > 0;
+    let aggregate = if ascending { "MAX" } else { "MIN" };
     let mut edge: Option<i64> = None;
-    for (table, column) in sources {
-        let column = format!("\"{}\"", column.replace('"', "\"\""));
+    for (source_table, source_column) in sources {
+        let quoted_column = format!("\"{}\"", source_column.replace('"', "\"\""));
         let (value,): (Option<i64>,) = sqlx::query_as(audited(format!(
-            "SELECT {aggregate}({column})::bigint FROM {table}"
+            "SELECT {aggregate}({quoted_column})::bigint FROM {source_table}"
         )))
         .fetch_one(&mut **tx)
         .await?;
         edge = match (edge, value) {
-            (Some(a), Some(b)) if increment > 0 => Some(a.max(b)),
+            (Some(a), Some(b)) if ascending => Some(a.max(b)),
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
     }
-    let (table, column) = sources[0];
-    let column = format!("\"{}\"", column.replace('"', "\"\""));
-    let next = match edge {
-        None => start,
-        Some(edge) => {
-            let next = edge.checked_add(increment).ok_or_else(|| {
-                DbDumpError::Refused(format!("{table}.{column}: restored sequence exhausted"))
-            })?;
-            if increment > 0 {
-                next.max(start)
-            } else {
-                next.min(start)
-            }
-        }
+    let own = if state.is_called {
+        state.last_value.checked_add(state.increment)
+    } else {
+        Some(state.last_value)
     };
-    if !(min..=max).contains(&next) {
-        return Err(DbDumpError::Refused(format!(
-            "{table}.{column}: restored sequence exhausted"
-        )));
+    let mut candidates = vec![state.start, own.ok_or_else(exhausted)?];
+    if let Some(edge) = edge {
+        candidates.push(edge.checked_add(state.increment).ok_or_else(exhausted)?);
+    }
+    if let Some(mark) = mark {
+        if mark.increment.signum() != state.increment.signum() {
+            return Err(DbDumpError::Refused(format!(
+                "{table}.{column}: archived sequence mark runs the other way from the target"
+            )));
+        }
+        candidates.push(mark.next().ok_or_else(exhausted)?);
+    }
+    let next = if ascending {
+        candidates.into_iter().max()
+    } else {
+        candidates.into_iter().min()
+    }
+    .ok_or_else(exhausted)?;
+    if !(state.min..=state.max).contains(&next) {
+        return Err(exhausted());
     }
     sqlx::query(audited(format!(
-        "ALTER SEQUENCE {quoted_sequence} RESTART WITH {next}"
+        "ALTER SEQUENCE {} RESTART WITH {next}",
+        state.quoted
     )))
     .execute(&mut **tx)
     .await?;
@@ -236,6 +333,22 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         Vec::new()
     };
 
+    // Rows alone cannot show values handed out and then deleted; the marks
+    // let restore resume past them (the cutover allocator gate).
+    let mut sequence_marks = Vec::new();
+    for table in &tables {
+        for (column, sequence) in table_sequences(&mut tx, &table.name).await? {
+            let state = sequence_state(&mut tx, &sequence).await?;
+            sequence_marks.push(SequenceMark {
+                table: table.name.clone(),
+                column,
+                last_value: state.last_value,
+                is_called: state.is_called,
+                increment: state.increment,
+            });
+        }
+    }
+
     let manifest = DumpManifest {
         kind: "manifest".to_owned(),
         version: DUMP_VERSION,
@@ -243,6 +356,7 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         tables,
         events_sequence: seq.0,
         schema_migrations: migrations.into_iter().map(|(id,)| id).collect(),
+        sequence_marks,
     };
 
     let mut writer = DumpWriter::new(out_path)?;
@@ -397,18 +511,36 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         }
     }
     // A single explicit truncate covers all FK dependencies, without CASCADE
-    // touching foreign/website tables. RESTART IDENTITY is transactional.
-    sqlx::query(audited(format!(
-        "TRUNCATE {} RESTART IDENTITY",
-        target_tables.join(", ")
-    )))
-    .execute(&mut *tx)
-    .await?;
+    // touching foreign/website tables. No RESTART IDENTITY: that would discard
+    // the target's own high-water mark, which the restarts below preserve.
+    sqlx::query(audited(format!("TRUNCATE {}", target_tables.join(", "))))
+        .execute(&mut *tx)
+        .await?;
     // Cooldowns are intentionally not archived; discard stale target throttles.
     if !columns_of(&mut tx, "xp_cooldowns").await?.is_empty() {
         sqlx::query("TRUNCATE xp_cooldowns")
             .execute(&mut *tx)
             .await?;
+    }
+    if manifest.sequence_marks.is_empty() {
+        tracing::warn!(version = manifest.version, "archive carries no sequence marks; allocators resume past the restored rows and the target's own position only");
+    }
+    // Destination-owned columns (CAS tokens) are allocated by the inserts
+    // below. Move their allocator past the archive's mark first, so no restored
+    // row receives a token a client of the source may still hold.
+    for &table in &target_tables {
+        for (column, sequence) in table_sequences(&mut tx, table).await? {
+            if is_destination_owned(table, &column) {
+                let sources = [(table, column.as_str())];
+                restart_sequence(
+                    &mut tx,
+                    &sources,
+                    &sequence,
+                    manifest.sequence_mark(table, &column),
+                )
+                .await?;
+            }
+        }
     }
 
     // Never trust manifest order: a legacy or reordered file can put children
@@ -575,51 +707,33 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         .await?;
     }
 
-    // Discover owned serial AND identity sequences, including columns not
-    // named `id`. Empty tables restart at the target sequence's configured start.
-    // https://www.postgresql.org/docs/16/functions-info.html
-    for table in &target_tables {
-        let sequences: Vec<(String, String)> = sqlx::query_as(
-            "SELECT column_name, pg_get_serial_sequence(\
-             quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) \
-             FROM information_schema.columns \
-             WHERE table_schema = current_schema() AND table_name = $1 \
-             AND pg_get_serial_sequence(\
-             quote_ident(table_schema) || '.' || quote_ident(table_name), column_name) IS NOT NULL",
-        )
-        .bind(*table)
-        .fetch_all(&mut *tx)
-        .await?;
-        for (column, sequence) in sequences {
-            let mut sources = vec![(*table, column.as_str())];
-            // 0113 draws retry queue tickets from the ban-ownership generation
-            // sequence without owning a column: resume past restored tickets
-            // too, or the next PUT or retry reuses a restored queue position.
-            if *table == "moderation_member_bans"
-                && column == "generation"
-                && columns_of(&mut tx, "moderation_scheduled_unbans")
-                    .await?
-                    .iter()
-                    .any(|(name, _)| name == "retry_generation")
-            {
+    // Every other allocator (owned serial/identity, including columns not
+    // named `id`, and the standalone table_sequences allocators) resumes past
+    // the restored rows, the archive's mark and the target's own position.
+    // 0113 draws retry queue tickets from the ban-ownership generation
+    // sequence without owning a column: resume past restored tickets too, or
+    // the next PUT or retry reuses a restored queue position.
+    let has_retry_generation = columns_of(&mut tx, "moderation_scheduled_unbans")
+        .await?
+        .iter()
+        .any(|(name, _)| name == "retry_generation");
+    for &table in &target_tables {
+        for (column, sequence) in table_sequences(&mut tx, table).await? {
+            if is_destination_owned(table, &column) {
+                continue;
+            }
+            let mut sources = vec![(table, column.as_str())];
+            if table == "moderation_member_bans" && column == "generation" && has_retry_generation {
                 sources.push(("moderation_scheduled_unbans", "retry_generation"));
             }
-            restart_sequence(&mut tx, &sources, &sequence).await?;
-        }
-    }
-    // Settings versions use a standalone sequence, not OWNED BY a column.
-    // Its allocation must also resume past restored versions.
-    let (has_settings_sequence,): (bool,) =
-        sqlx::query_as("SELECT to_regclass('guild_settings_version_seq') IS NOT NULL")
-            .fetch_one(&mut *tx)
+            restart_sequence(
+                &mut tx,
+                &sources,
+                &sequence,
+                manifest.sequence_mark(table, &column),
+            )
             .await?;
-    if has_settings_sequence {
-        restart_sequence(
-            &mut tx,
-            &[("guild_settings", "version")],
-            "guild_settings_version_seq",
-        )
-        .await?;
+        }
     }
     tx.commit().await?;
 

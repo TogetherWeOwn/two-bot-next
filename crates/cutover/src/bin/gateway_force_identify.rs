@@ -11,6 +11,9 @@
 //! Exit codes: 0 ok (already armed counts as ok), 1 database failure,
 //! 2 usage or refused target.
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use two_bot_core::gateway_session::{boot_action, BootAction};
 use two_bot_cutover::cli::{now_iso, open_db, require_guild, require_guild_read, Args};
 use two_bot_cutover::gateway_session::{ArmOutcome, ForceIdentifyStatus, GatewaySessionStore};
