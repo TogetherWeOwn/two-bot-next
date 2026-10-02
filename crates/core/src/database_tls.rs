@@ -76,7 +76,7 @@ pub fn enforce(raw: &str, policy: TlsPolicy) -> Result<(), &'static str> {
     }
     let mut modes = Vec::new();
     for (key, value) in url.query_pairs() {
-        match key.as_ref() {
+        match &*key {
             "host" | "hostaddr" if value.is_empty() => return Err(MISSING_HOST),
             "host" if value.starts_with('/') => hosts.push(HostClass::Socket),
             "host" | "hostaddr" => hosts.push(classify_name(&value)),
@@ -297,7 +297,7 @@ mod tests {
                 Err(REMOTE_REFUSED),
             ),
             (
-                "postgres://agent_test@/db?host=/var/run/postgresql",
+                "postgres:///agent_test?host=/var/run/postgresql&user=agent_test",
                 Err(LOCAL_REFUSED),
                 Ok(()),
             ),
@@ -321,11 +321,6 @@ mod tests {
             // No host at all would fall back to PGHOST or a local default.
             (
                 "postgres:///db?sslmode=require",
-                Err(MISSING_HOST),
-                Err(MISSING_HOST),
-            ),
-            (
-                "postgres://u:p@/db?sslmode=require",
                 Err(MISSING_HOST),
                 Err(MISSING_HOST),
             ),
@@ -359,6 +354,15 @@ mod tests {
         ] {
             assert_eq!(enforce(raw, REQUIRED), required, "{raw}");
             assert_eq!(enforce(raw, LOCAL_ONLY), local_only, "{raw}");
+        }
+        // Credentials with an empty authority host do not parse as a URL
+        // (WHATWG host-missing); either way it is refused.
+        for policy in [REQUIRED, LOCAL_ONLY] {
+            let refused = enforce("postgres://u:p@/db?sslmode=require", policy);
+            assert!(
+                matches!(refused, Err(INVALID_URL | MISSING_HOST)),
+                "{refused:?}"
+            );
         }
     }
 
