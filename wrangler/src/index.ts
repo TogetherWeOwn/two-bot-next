@@ -30,6 +30,7 @@ import {
 } from "./ownership.ts";
 import {
   TokenBuckets,
+  RedirectMissCache,
   handleRedirect,
   isReservedInternal,
   isValidFallback,
@@ -75,6 +76,27 @@ export interface Env extends ForwardedFlagEnv {
 // Per-isolate crawler cap (60 burst, 1/sec refill — matches legacy
 // CLICK_BUCKET). Module-level so one isolate shares the budget.
 const clickBuckets = new TokenBuckets();
+// Store instances are request-scoped; misses must survive across requests —
+// but only while the backing configuration is identical. A changed snapshot
+// or mapping source must not inherit another config's misses, or a newly
+// added slug would 404 until the TTL expires.
+let redirectMissKey = "";
+let redirectMisses = new RedirectMissCache();
+function missCacheFor(env: Env): RedirectMissCache {
+  const raw = env.REDIRECT_MAPPINGS_JSON;
+  const key = `${env.REDIRECT_DB === undefined ? "snapshot" : "live"}:${typeof raw === "string" ? raw : typeof raw}`;
+  if (key !== redirectMissKey) {
+    redirectMissKey = key;
+    redirectMisses = new RedirectMissCache();
+  }
+  return redirectMisses;
+}
+
+// Public probe cap (threat-model F7, TOG-12245): /health and /readyz are
+// unauthenticated, so each caller gets a bounded budget before the Container
+// is touched. Over budget → 429. The Container's own alarm probe bypasses
+// the Worker and is unaffected.
+const healthBuckets = new TokenBuckets();
 
 function redirectStore(env: Env): RedirectStore {
   const raw = env.REDIRECT_MAPPINGS_JSON;
@@ -510,8 +532,8 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/health" || url.pathname === "/readyz" || url.pathname === CONTROL_PATH) {
-      if (url.pathname === CONTROL_PATH && !await authenticated(request, env.OWNERSHIP_CONTROL_TOKEN)) {
+    if (url.pathname === CONTROL_PATH) {
+      if (!await authenticated(request, env.OWNERSHIP_CONTROL_TOKEN)) {
         return new Response("unauthorized", { status: 401 });
       }
       try {
@@ -519,8 +541,46 @@ export default {
         // A stale Worker sharing this namespace cannot impersonate the current
         // DO version; always overwrite untrusted ingress identity.
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
-        if (url.pathname !== CONTROL_PATH) forwarded.headers.delete("authorization");
         return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch (error) { return refused(error); }
+    }
+
+    if (url.pathname === "/health" || url.pathname === "/readyz") {
+      // Public probes carry no credentials, so only GET/HEAD are meaningful.
+      // Anything else cannot be a scraper or load-balancer check: refuse it
+      // before the Container is touched.
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return new Response("method not allowed", {
+          status: 405,
+          headers: { allow: "GET, HEAD" },
+        });
+      }
+      // Per-caller budget before the Container is touched. The key picks a
+      // bucket and never survives the call.
+      const probe = healthBuckets.take(
+        request.headers.get("cf-connecting-ip") ?? "unknown",
+      );
+      if (!probe.allowed) {
+        return new Response("slow down\n", {
+          status: 429,
+          headers: {
+            "content-type": "text/plain",
+            "retry-after": String(probe.retryAfter),
+          },
+        });
+      }
+      // Sanitize the forwarded probe: keep the origin (Host) the Container
+      // expects, but drop the query, caller headers and body. The only header
+      // the DO sees is the Worker-stamped deployment id the fence requires.
+      const clean = new URL(request.url);
+      clean.search = "";
+      clean.hash = "";
+      try {
+        const sanitized = new Request(clean.toString(), {
+          method: request.method,
+          headers: { [DEPLOYMENT_HEADER]: deploymentId(env.CF_VERSION_METADATA?.id) },
+        });
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
       } catch (error) { return refused(error); }
     }
 
@@ -570,6 +630,8 @@ export default {
     const result = await handleRedirect(
       request.method,
       url.pathname,
+      // Cloudflare supplies this at ingress. Never trust X-Forwarded-For;
+      // when no edge IP exists, callers share the conservative unknown bucket.
       request.headers.get("cf-connecting-ip") ?? "unknown",
       {
         guildId: env.GUILD_ID ?? "",
@@ -579,6 +641,7 @@ export default {
         onError: (msg, detail) =>
           console.error(`${msg} ${JSON.stringify(detail)}`),
         isThrottled: (key) => !clickBuckets.take(key).allowed,
+        missCache: missCacheFor(env),
       },
     );
     if (result.click) {

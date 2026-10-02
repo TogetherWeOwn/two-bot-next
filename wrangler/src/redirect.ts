@@ -25,13 +25,15 @@
  * - Bare `/` → fallback code redirect (uncounted), else 404.
  * - Lookup outage (throw) → fallback redirect when configured, else 503 +
  *   `retry-after: 30`. Unknown slug (null) → 404 with no Location (no open
- *   redirect). Invalid stored code → 500, nothing recorded.
+ *   redirect). Confirmed misses are cached per isolate for 5s (1,024 slots);
+ *   cache hits still consume caller budget. Outages and live rows are uncached.
+ *   Invalid stored code → 500, nothing recorded.
  * - Slugs: lowercase alnum + internal hyphens, 2–40 chars; lookup is
  *   case-insensitive, tolerates leading/trailing slashes, percent-decodes
  *   (malformed escape → 404). Disabled campaigns still redirect.
  * - Privacy (docs/PRIVACY.md in two-bot): a click is a campaign + timestamp.
  *   No cookies, IP, UA, referrer — nothing about the visitor is stored,
- *   logged, or set. The caller key for rate limiting never survives the call.
+ *   logged, or set. Caller keys stay only in the isolate's rate-limit buckets.
  */
 
 export interface Campaign {
@@ -64,6 +66,8 @@ export interface RedirectDeps {
   uuid?: () => string;
   /** Rate-limit decision for this caller; true = over budget. */
   isThrottled?: (callerKey: string) => boolean;
+  /** Shared by requests in one isolate; caches only confirmed missing slugs. */
+  missCache?: RedirectMissCache;
 }
 
 export interface RedirectResult {
@@ -241,6 +245,46 @@ export class TokenBuckets {
   }
 }
 
+/** Short, bounded negative cache: a new campaign becomes visible within 5s. */
+export class RedirectMissCache {
+  private misses = new Map<string, number>();
+  private ttlMs: number;
+  private maxEntries: number;
+  private clock: () => number;
+
+  constructor(
+    spec: { ttlMs: number; maxEntries: number } = {
+      ttlMs: 5_000,
+      maxEntries: 1_024,
+    },
+    now: () => number = Date.now,
+  ) {
+    this.ttlMs = spec.ttlMs;
+    this.maxEntries = spec.maxEntries;
+    this.clock = now;
+  }
+
+  has(slug: string): boolean {
+    const expiresAt = this.misses.get(slug);
+    if (expiresAt === undefined) return false;
+    if (this.clock() >= expiresAt) {
+      this.misses.delete(slug);
+      return false;
+    }
+    return true;
+  }
+
+  add(slug: string): void {
+    if (this.maxEntries <= 0 || this.ttlMs <= 0) return;
+    this.misses.delete(slug);
+    if (this.misses.size >= this.maxEntries) {
+      const oldest = this.misses.keys().next().value;
+      if (oldest !== undefined) this.misses.delete(oldest);
+    }
+    this.misses.set(slug, this.clock() + this.ttlMs);
+  }
+}
+
 function redirect(location: string): RedirectResult {
   return {
     status: 302,
@@ -352,9 +396,11 @@ export async function handleRedirect(
     return text(404, "not found\n");
   }
 
-  // Reject malformed input before lookup or logging: slugs are bounded labels,
-  // not arbitrary visitor-supplied paths that may contain identifying data.
-  if (!isValidSlug(slug)) return text(404, "not found\n");
+  // Malformed paths never consume cache slots or touch the store. Cached
+  // misses still pass the caller cap above; cache hits do not extend the TTL.
+  if (!isValidSlug(slug) || deps.missCache?.has(slug)) {
+    return text(404, "not found\n");
+  }
 
   let campaign: Campaign | null;
   try {
@@ -371,6 +417,7 @@ export async function handleRedirect(
   }
 
   if (campaign === null) {
+    deps.missCache?.add(slug);
     return text(404, "not found\n");
   }
 
