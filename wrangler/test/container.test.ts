@@ -310,11 +310,14 @@ for (const [automations, textCommands] of [
 ] as const) {
   test(`custom-command gates pass through unchanged (${JSON.stringify([automations, textCommands])})`, async (t) => {
     const h = await harness(t, {
+      ...WORKER_ENV,
       TWO_AUTOMATIONS: automations,
       TWO_TEXT_COMMANDS: textCommands,
     });
-    await h.bot.fetch(new Request("https://worker.invalid/health"));
-    const expected: Record<string, string> = { LISTEN_ADDR: "0.0.0.0:8080" };
+    await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+    const expected: Record<string, string> = { ...EXPECTED_ENV };
+    delete expected.TWO_AUTOMATIONS;
+    delete expected.TWO_TEXT_COMMANDS;
     if (automations !== undefined) expected.TWO_AUTOMATIONS = automations;
     if (textCommands !== undefined) expected.TWO_TEXT_COMMANDS = textCommands;
     assert.equal(h.starts.length, 1);
@@ -325,13 +328,13 @@ for (const [automations, textCommands] of [
 for (const automod of [undefined, "0", "1", "", "false", " 0", "00"] as const) {
   for (const path of ["/health", "keepalive"]) {
     test(`moderation availability passes through unchanged (${JSON.stringify(automod)}, ${path})`, async (t) => {
-      const h = await harness(t, { TWO_AUTOMOD: automod });
+      const h = await harness(t, { ...WORKER_ENV, TWO_AUTOMOD: automod });
       if (path === "keepalive") {
         await tickKeepalive(h.bot);
       } else {
-        await h.bot.fetch(new Request(`https://worker.invalid${path}`));
+        await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
       }
-      const expected: Record<string, string> = { LISTEN_ADDR: "0.0.0.0:8080" };
+      const expected: Record<string, string> = { ...EXPECTED_ENV };
       if (automod !== undefined) expected.TWO_AUTOMOD = automod;
       assert.equal(h.starts.length, 1);
       assert.deepEqual(h.starts[0]?.env, expected);

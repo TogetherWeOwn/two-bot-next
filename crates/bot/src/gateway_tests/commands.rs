@@ -7,10 +7,7 @@ use std::collections::HashMap;
 use crate::gateway_commands::{GatewayCommandConfig, GatewayCommands};
 use two_bot_discord::ActionExecutor;
 
-#[allow(dead_code)]
-#[path = "../../../discord/tests/common/mod.rs"]
-mod common;
-use common::{MockRest, ScriptedResponse};
+use crate::discord_test_common::{MockRest, ScriptedResponse};
 
 const RENDERED: &str = "Hi <@3333> tester in Bootstrap guild <#4444>";
 const BOUND: Duration = Duration::from_secs(5);
