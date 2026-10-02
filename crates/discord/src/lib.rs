@@ -15,6 +15,7 @@ pub mod interactions;
 pub mod internal_actions;
 #[cfg(feature = "db")]
 pub mod internal_channel_moderation;
+pub mod internal_events;
 #[cfg(feature = "db")]
 pub mod lfg_interactions;
 mod message_safety;
@@ -32,6 +33,7 @@ pub use interactions::{
     command_to_twilight, publish_commands, refusal_response, response_for_slash, route_interaction,
     RoutedInteraction,
 };
+pub use internal_events::{event_status_name, scheduled_event_body, EventActionError, EventCall};
 pub use pipeline::{
     build_cache, ChannelClassifier, InviteSource, MemPipeline, NoClassification, NoInvites,
     Pipeline, PipelineSnapshots, ScriptedInvites,
