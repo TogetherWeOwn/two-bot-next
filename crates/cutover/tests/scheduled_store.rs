@@ -535,6 +535,89 @@ async fn two_due_messages_claim_independently_and_retry_keeps_nonce() {
 }
 
 #[tokio::test]
+async fn single_due_row_has_exactly_one_winner_under_contention() {
+    with_db(|pool| async move {
+        let pool = &pool;
+        let guild = "sched-claim-race";
+
+        // A guild with no rows claims nothing.
+        assert!(
+            claim_due(
+                pool,
+                "sched-claim-race-empty",
+                &iso(NOW),
+                "claim-empty",
+                &iso(LEASE),
+                "nonce-empty"
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "empty queue returns none"
+        );
+
+        // One due row plus a future-dated row that must stay untouched (it is
+        // not due at the tick time, so the race loser must find nothing).
+        assert!(put_scheduled(pool, &write(guild, "race", &iso(T0), None))
+            .await
+            .unwrap());
+        assert!(
+            put_scheduled(pool, &write(guild, "later", &iso(NOW + 3_600_000), None))
+                .await
+                .unwrap()
+        );
+
+        // Two schedulers race for the queue: exactly one wins, and the winner
+        // takes the earliest-due row.
+        let now = iso(NOW);
+        let lease = iso(LEASE);
+        let (first, second) = tokio::join!(
+            claim_due(pool, guild, &now, "claim-race-a", &lease, "nonce-race-a"),
+            claim_due(pool, guild, &now, "claim-race-b", &lease, "nonce-race-b"),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(
+            first.len() + second.len(),
+            1,
+            "single due row claimed exactly once under contention"
+        );
+        let winner = first.first().or(second.first()).unwrap();
+        assert_eq!(winner.id, "race", "earliest-due row wins the race");
+        assert_eq!(
+            winner.next_run_at, lease,
+            "claim parks the row at the lease"
+        );
+        let (token, nonce) = if first.len() == 1 {
+            ("claim-race-a", "nonce-race-a")
+        } else {
+            ("claim-race-b", "nonce-race-b")
+        };
+        assert_eq!(winner.claim_token.as_deref(), Some(token));
+        assert_eq!(winner.occurrence_nonce.as_deref(), Some(nonce));
+
+        // The loser (and any latecomer) finds nothing due: no double-fire.
+        assert!(
+            claim_due(
+                pool,
+                guild,
+                &iso(NOW),
+                "claim-race-c",
+                &iso(LEASE),
+                "nonce-race-c"
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "claimed row must not be re-claimed"
+        );
+        let later = get_scheduled(pool, guild, "later").await.unwrap().unwrap();
+        assert!(later.claim_token.is_none(), "later-due row stays unclaimed");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn claim_happens_once_then_one_shot_disables() {
     with_db(|pool| async move {
         let pool = &pool;
