@@ -226,6 +226,11 @@ VALUES (71, '100000000000000001', '2026-07-27T00:00:00.000Z', '2026-08-03T00:00:
         'maintain', '2026-08-03T00:00:01.000Z');
 INSERT INTO community_scorecard_alerts (guild_id, week_start, alert_key, created_at)
 VALUES ('100000000000000001', '2026-07-27T00:00:00.000Z', 'backup:alert:dedupe', '2026-08-03T00:00:02.000Z');
+-- Preserve both a spent-but-pending retry budget and terminal completion.
+INSERT INTO community_scorecard_attempts
+    (guild_id, week_key, attempts, next_attempt_at, completed)
+VALUES ('100000000000000001', '2026-08-10', 2, 1786343100000, FALSE),
+       ('100000000000000001', '2026-08-03', 1, 1785738000000, TRUE);
 INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at)
 VALUES ('100000000000000001', 2, 'backup-resume-session', 9007199254740993,
         'wss://gateway.example.invalid', '2026-08-01T10:00:00.123456Z');
