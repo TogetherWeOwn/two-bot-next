@@ -1027,8 +1027,8 @@ impl MockDiscord {
             }
             let mut want_rows: Vec<&PermissionOverride> = target.explicit_overrides(name);
             let mut got_rows: Vec<&PermissionOverride> = live.explicit_overrides(name);
-            want_rows.sort_by_key(override_key);
-            got_rows.sort_by_key(override_key);
+            want_rows.sort_by_key(|row| override_key(row));
+            got_rows.sort_by_key(|row| override_key(row));
             if want_rows != got_rows {
                 mismatches.push(format!("live overrides for `{name}` differ from target"));
             }
