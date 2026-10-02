@@ -1629,7 +1629,11 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     }
     assert_guards_work(pool).await;
 
-    let allocations = allocate_owned_sequences(pool, false).await;
+    // Floors pin the post-restore high-water: the furthest of the scratch
+    // target's own next value and the archive's mark, mirroring the other
+    // callers. Computed after the month loop so it captures the final state.
+    let floors = allocation_floors(pool, &contents.manifest.sequence_marks).await;
+    let allocations = allocate_owned_sequences(pool, false, &floors).await;
     for ((table, column), (next, increment)) in &allocations {
         println!("drill: sequence {table}.{column} resumed at {next} (increment {increment})");
     }
