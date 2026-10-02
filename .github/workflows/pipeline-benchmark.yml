@@ -43,6 +43,10 @@ jobs:
           persist-credentials: false
       - name: Job-container prerequisites
         run: |
+          # On hosted/overflow runners the job container's root does not own
+          # the runner-owned checkout, so Git refuses it as dubious ownership
+          # (same fix as check.yml prerequisites).
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 >/dev/null
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
