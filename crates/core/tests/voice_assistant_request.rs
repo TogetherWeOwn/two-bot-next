@@ -14,7 +14,9 @@ use two_bot_core::voice_assistant_request::{
 };
 use two_bot_core::voice_naming::{self, PartyInfo, RoomContext};
 
-const MARKER: &str = "LEAK-MARKER-7f3a";
+// Token-safe and lowercase, so `@@{MARKER}@@` parses as an unknown token whose
+// name the parser keeps verbatim.
+const MARKER: &str = "leak_marker_7f3a";
 
 fn model() -> ModelName {
     ModelName::new("example-model").expect("valid model name")
