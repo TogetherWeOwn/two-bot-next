@@ -1868,9 +1868,14 @@ impl ActionExecutor {
         components: &[serde_json::Value],
         nonce: &str,
     ) -> Result<String, DiscordError> {
-        self.pace(false).await;
-        self.send_message_components(channel_id, content, Some(nonce.into()), Some(components))
-            .await
+        self.send_message_components(
+            channel_id,
+            content,
+            Some(nonce.into()),
+            Some(components),
+            false,
+        )
+        .await
     }
 
     /// Refresh content and selects. Edits must suppress mentions independently of POST.
@@ -1899,8 +1904,7 @@ impl ActionExecutor {
         .body(body)
         .build()
         .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
-        self.pace(false).await;
-        self.call_once_raw(req, &[200]).await?;
+        self.call_once_raw_paced(req, &[200]).await?;
         Ok(())
     }
 
@@ -1923,9 +1927,8 @@ impl ActionExecutor {
                 None => format!("/channels/{channel_id}/messages?limit=100"),
             };
             let route = raw_get_route(&path).map_err(DiscordError::Rejected)?;
-            self.pace(false).await;
             let res = self
-                .call_once_raw(Request::from_route(&route), &[200])
+                .call_once_raw_paced(Request::from_route(&route), &[200])
                 .await?;
             let rows: Vec<serde_json::Value> = serde_json::from_slice(&res.body)
                 .map_err(|_| DiscordError::Unavailable("unreadable message history".into()))?;
@@ -2001,7 +2004,7 @@ impl ActionExecutor {
         nonce: Option<serde_json::Value>,
         after_authorization: bool,
     ) -> Result<String, DiscordError> {
-        self.send_message_components(channel_id, content, nonce, None)
+        self.send_message_components(channel_id, content, nonce, None, after_authorization)
             .await
     }
 
@@ -2011,6 +2014,7 @@ impl ActionExecutor {
         content: &str,
         nonce: Option<serde_json::Value>,
         components: Option<&[serde_json::Value]>,
+        after_authorization: bool,
     ) -> Result<String, DiscordError> {
         // Legacy ceiling is UTF-16 units (two-bot counts JS string length),
         // not scalar values: 1001 astral chars are 2002 units and must be
@@ -2051,6 +2055,7 @@ impl ActionExecutor {
         .body(body_bytes)
         .build()
         .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
+        let paced = components.is_some();
         let message_id = if after_authorization {
             self.inner.transport.guard.check_now(false)?;
             let (mut res, _) =
@@ -2067,7 +2072,13 @@ impl ActionExecutor {
             res.complete().await;
             id
         } else {
-            let mut res = self.call_once_raw(req, &[200, 201]).await?;
+            // Feature posts with selects take the paced lane; the plain
+            // `post_message` path keeps main's unpaced single attempt.
+            let mut res = if paced {
+                self.call_once_raw_paced(req, &[200, 201]).await?
+            } else {
+                self.call_once_raw(req, &[200, 201]).await?
+            };
             let id = mutation_receipt_id(&res.body)?;
             res.complete().await;
             id
