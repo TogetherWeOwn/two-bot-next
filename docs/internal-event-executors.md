@@ -38,6 +38,9 @@ Source comparison uses legacy two-bot revision
   status uses `SCHEDULED`, `ACTIVE`, `COMPLETED`, `CANCELED`; the DB uses
   lowercase `cancelled`. The read result retains the upstream start string;
   the DB mirror normalizes it to UTC milliseconds.
+- `src/internal/actions.ts:510–518`: `requireTimestamp` sends Discord
+  `new Date(ms).toISOString()` (UTC, `.mmmZ`), so the validated
+  `starts_at`/`ends_at` use that form, not the raw RFC 3339 input.
 - `test/e2e.internalactions.test.ts:252–260,1159–1248,1333–1415` provides the
   Launch Night request vector, mutation/replay and narrow read contracts.
   `test/unit.internalallowlist.test.ts:536–564` pins the placement body shape;

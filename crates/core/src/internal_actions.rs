@@ -1007,7 +1007,9 @@ pub fn require_reason(value: &Value) -> Result<String, ActionError> {
     }
 }
 
-/// An ISO-8601 instant, normalised to RFC 3339 — what Discord wants.
+/// An ISO-8601 instant, normalised like legacy `new Date(ms).toISOString()`:
+/// UTC with millisecond precision (`…T19:00:00.000Z`), which is the exact form
+/// legacy sends Discord and stores in the event mirror.
 /// Deliberate tightening vs legacy `Date.parse`: legacy accepted any string
 /// the JS engine could date-parse; the Rust port requires RFC 3339, which is
 /// what the website already sends (`toISOString()`).
@@ -1021,13 +1023,11 @@ pub fn require_timestamp(body: &Map<String, Value>, field: &str) -> Result<Strin
             format!("bad_{field}"),
         )
     })?;
-    parsed.format(&Rfc3339).map_err(|_| {
-        ActionError::new(
-            ErrorCode::Internal,
-            "failed to format timestamp",
-            "timestamp_format",
-        )
-    })
+    // JS Dates hold whole milliseconds; sub-millisecond digits truncate.
+    // RFC 3339 years are four digits, so the millis always fit an i64.
+    let millis = i64::try_from(parsed.unix_timestamp_nanos().div_euclid(1_000_000))
+        .expect("RFC 3339 instants fit epoch millis");
+    Ok(crate::funnel::format_iso_millis(millis))
 }
 
 /// What `validate_idempotency_key` accepts. A UUID is what the doc asks for,
@@ -2530,6 +2530,32 @@ mod tests {
         backwards.insert("location".to_owned(), json!("Park"));
         backwards.insert("ends_at".to_owned(), json!("2026-10-01T17:00:00Z"));
         assert!(validate_event_input(&backwards, &keys).is_err());
+    }
+
+    /// Legacy `requireTimestamp` returns `new Date(ms).toISOString()`.
+    #[test]
+    fn timestamps_normalise_like_to_iso_string() {
+        let cases = [
+            ("2026-10-01T18:00:00Z", "2026-10-01T18:00:00.000Z"),
+            ("2026-10-01T19:00:00+01:00", "2026-10-01T18:00:00.000Z"),
+            ("2026-10-01T18:00:00.1239Z", "2026-10-01T18:00:00.123Z"),
+            ("2026-10-01T00:30:00-01:00", "2026-10-01T01:30:00.000Z"),
+        ];
+        for (raw, expected) in cases {
+            let body = map(json!({ "starts_at": raw }));
+            assert_eq!(
+                require_timestamp(&body, "starts_at").expect(raw),
+                expected,
+                "{raw}"
+            );
+        }
+        let bad = map(json!({ "starts_at": "next tuesday" }));
+        assert_eq!(
+            require_timestamp(&bad, "starts_at")
+                .expect_err("garbage")
+                .code,
+            ErrorCode::Malformed
+        );
     }
 
     #[test]
