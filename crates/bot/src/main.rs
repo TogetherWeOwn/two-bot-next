@@ -26,6 +26,7 @@ mod jobs;
 mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
+mod schedule_runtime;
 mod server;
 mod ticket_runtime;
 mod website_jobs;
