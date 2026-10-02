@@ -30,6 +30,7 @@ pub mod containment;
 pub mod database_roles;
 pub mod database_url;
 pub mod events;
+pub mod evidence;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod feeds;
@@ -130,6 +131,11 @@ pub use containment::{
     DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan, QuarantineRefusal,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
+pub use evidence::{
+    family_of, Disposition, EVIDENCE_SCHEMA_VERSION, EventFamily, EvidenceLedger, ExpectedAction,
+    MATCH_WINDOW_MS, MAX_EXPECTED_ACTIONS, MAX_RECEIPTS, ReceiptingStore, ReconciledItem,
+    Reconciliation, StoreReceipt,
+};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
     announcement_commands, automation_commands, feature_commands, scorecard_attendance_command,
