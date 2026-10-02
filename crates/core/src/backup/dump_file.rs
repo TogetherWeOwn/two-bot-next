@@ -107,7 +107,6 @@ pub const OPTIONAL_LEGACY_TABLES: &[&str] = &[
     "moderation_scheduled_unbans",
     "containment_events",
     "containment_incidents",
-    "join_risk_flags",
     "automation_commands",
     "automod_violations",
     "automod_processed_messages",

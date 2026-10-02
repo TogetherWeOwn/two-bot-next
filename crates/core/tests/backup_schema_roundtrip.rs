@@ -1080,17 +1080,18 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
 
     // Missing legacy subsystems may be omitted only when their archive is empty.
     // Refuse nonempty data BEFORE touching current tables or guard modes.
+    let absent_name = OPTIONAL_LEGACY_TABLES[0];
     let mut incompatible = copy_contents(&legacy);
     let absent = incompatible
         .manifest
         .tables
         .iter_mut()
-        .find(|table| table.name == "join_risk_flags")
+        .find(|table| table.name == absent_name)
         .unwrap();
     absent.columns = vec!["flagged".to_owned()];
     absent.count = 1;
     incompatible.buffers.insert(
-        "join_risk_flags".to_owned(),
+        absent_name.to_owned(),
         vec![serde_json::Map::from_iter([(
             "flagged".to_owned(),
             json!(true),
@@ -1105,7 +1106,7 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
     let error = restore(pool, &incompatible_path).await.unwrap_err();
     assert!(error
         .to_string()
-        .contains("join_risk_flags is absent from target"));
+        .contains(&format!("{absent_name} is absent from target")));
     assert_eq!(snapshot(pool, &all_tables).await, unchanged);
     assert_eq!(triggers(pool).await, guards);
     assert_eq!(sequence_snapshot(pool).await, sequences);

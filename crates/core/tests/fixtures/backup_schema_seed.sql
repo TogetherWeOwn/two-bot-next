@@ -60,6 +60,17 @@ VALUES ('100000000000000001', 'backup:moderation:key', 'lockdown', 'backup-reque
 INSERT INTO moderation_channel_executions (channel_id, guild_id, idempotency_key, claim_token)
 VALUES ('100000000000000003', '100000000000000001', 'backup:moderation:key', 'backup-channel-claim');
 
+INSERT INTO join_risk_flags
+    (event_id, guild_id, member_id, account_created_at, joined_at, source, score, reasons_json,
+     bulk_join_window, flagged, created_at)
+VALUES ('backup:risk:flagged', '100000000000000001', '100000000000000005',
+        '2026-07-31T23:59:00.000Z', '2026-08-01T08:00:00.000Z', 'gateway', 85,
+        E'["new_account","bulk_join | NULL\\n雪 \\"quote\\""]', TRUE, TRUE,
+        '2026-08-01T08:00:00.123Z'),
+       ('backup:risk:clear', '100000000000000001', '100000000000000002',
+        '2020-01-01T00:00:00.000Z', '2026-08-01T08:05:00.000Z', 'gateway', 0, '[]', FALSE,
+        FALSE, '2026-08-01T08:05:00.000Z');
+
 INSERT INTO sticky_messages
     (guild_id, channel_id, body, debounce_seconds, enabled, last_message_id, last_posted_at,
      created_by, created_at, updated_by, updated_at, claim_token, claimed_at)
