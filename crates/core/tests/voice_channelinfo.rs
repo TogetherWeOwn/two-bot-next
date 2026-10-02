@@ -229,6 +229,7 @@ fn all_six_preview_states_render_in_button_order() {
             .rendered
             .clone()
     };
+    // No game: the token vanishes, the join space trims away, number stays.
     assert_eq!(name(PreviewState::SoloNoGame), "#3");
     assert_eq!(name(PreviewState::InGame), "Apex #3");
     assert_eq!(name(PreviewState::Streaming), "Apex #3");
