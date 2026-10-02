@@ -31,6 +31,7 @@ mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
 mod server;
+mod shutdown;
 mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
@@ -274,14 +275,7 @@ async fn supervise_gateway(
     state: Arc<RwLock<GatewayState>>,
     shutdown: tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<()> {
-    supervise_gateway_bounded(
-        task,
-        http,
-        state,
-        shutdown,
-        dispatch::DISPATCH_DRAIN_MAX + std::time::Duration::from_secs(5),
-    )
-    .await
+    supervise_gateway_bounded(task, http, state, shutdown, shutdown::deadline()).await
 }
 
 async fn supervise_gateway_bounded(
@@ -331,7 +325,13 @@ async fn supervise_gateway_bounded(
         }
     })
     .await
-    .unwrap_or_else(|_| Err(std::io::Error::other("service shutdown deadline exceeded")))
+    .unwrap_or_else(|_| {
+        tracing::error!(
+            deadline_ms = shutdown_max.as_millis() as u64,
+            "shutdown_deadline_exceeded: abandoning in-flight work"
+        );
+        Err(std::io::Error::other("service shutdown deadline exceeded"))
+    })
 }
 
 /// Probe /health over plain HTTP using only tokio (no client dependency).
