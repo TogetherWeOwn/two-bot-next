@@ -205,6 +205,7 @@ class SupplyChainTests(unittest.TestCase):
         self.assertEqual(supply.count("image-ref: ${{ env.IMAGE }}"), 2)
         self.assertIn('docker image rm "$IMAGE"', supply)
         self.assertEqual(supply.count("cache-dir: ${{ runner.temp }}/trivy-cache"), 4)
+        self.assertEqual(supply.count("cache: false"), 4)
         # Folded pr-lint + gitleaks gate (TOG-11810) shares its filename
         # with the pre-fold SBOM workflow; assert on our renamed file plus
         # the callers that reference it.
@@ -218,6 +219,17 @@ class SupplyChainTests(unittest.TestCase):
             # Only the documented routing expression may name a hosted runner.
             routed = "'[\"ubuntu-latest\"]'"
             self.assertNotIn("ubuntu-latest", code.replace(routed, ""), str(path))
+
+    def test_no_shared_caches(self):
+        # The reusable workflow can run in default-branch context against an
+        # arbitrary inputs.ref (release dispatch), so no cross-run cache may
+        # be written or read: a poisoned Trivy DB or layer cache could make
+        # the HIGH/CRITICAL gate pass. Trivy downloads a fresh DB every run;
+        # per-run caches live only under runner.temp.
+        supply = (ROOT / ".github/workflows/sbom.yml").read_text()
+        for shared in ("cache-from", "cache-to", "two-bot-sbom-amd64", "cache: true"):
+            self.assertNotIn(shared, supply)
+        self.assertEqual(supply.count("cache: false"), 4)
 
     def test_candidate_preflight_cannot_replace_existing_gates(self):
         supply = (ROOT / ".github/workflows/sbom.yml").read_text()

@@ -13,8 +13,10 @@ recoverable by image analysis, so the separate lockfile scan is intentional.
 
 Both gates use SHA-pinned Trivy Action 0.35.0 with Trivy v0.69.3. They fail on
 HIGH/CRITICAL in OS and library dependencies, **including unfixed findings**.
-A fresh vulnerability DB is downloaded/updated by Trivy (the daily cache does
-not skip updates). Scanner errors also fail; no `continue-on-error` or blanket
+A fresh vulnerability DB is downloaded by Trivy on every run. No shared cache
+is written or read: the BuildKit GitHub-Actions cache is disabled and every
+Trivy step sets `cache: false`, so a poisoned cross-run DB or layer cache
+cannot make the gate pass. Scanner errors also fail; no `continue-on-error` or blanket
 `ignore-unfixed` is allowed. SBOMs and JSON findings remain in the `supply-chain`
 Actions artifact for 14 days, including on a vulnerability failure. The existing
 required `check` depends on this scan job and explicitly rejects failed, skipped
@@ -126,8 +128,10 @@ gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 
 The PR dry-run inventories the exact PR head SHA, validates lockfile coverage
 and Debian image components, and records checksums/provenance before scanning.
-Image tags include the Actions run ID and attempt; Trivy's cache is run-local.
-Cleanup removes only that run's image tag, never shared Docker caches.
+Image tags include the Actions run ID and attempt. No shared cache exists:
+the image build uses no `cache-from`/`cache-to`, and Trivy caching is off
+(`cache: false`), so per-run state lives only under `runner.temp`.
+Cleanup removes only that run's image tag.
 The separate container smoke job also uses a run/attempt-owned tag and binds
 both runtime probes and deliberate budget failures to the build action's immutable
 image output. This prevents another job's tag from changing the tested image;
