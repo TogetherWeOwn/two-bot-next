@@ -17,7 +17,7 @@ This is the **unexecuted** B4 coverage plan for [TOG-9699](/TOG/issues/TOG-9699)
 
 JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only DROP-prefixed Maps without an S/B/NEW slice or TOG owner are excluded; mixed mapped/DROP rows remain covered in either order, including mapped replacement work. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries.
 
-Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, empty steps/evidence, invalid statuses, reasonless waivers, missing automated commands, missing voice links or Markdown drift fail the gate.
+Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, missing voice links or Markdown drift fail the gate.
 
 ## Existing fixture entry points
 
@@ -537,6 +537,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Dump/upload timer equivalent invokes once with integrity receipt; no staging/production DB connection.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s4-15: systemd `two-bot-guild-config-backup.timer` (sealed Discord config snapshot) — daily 04:31 UTC
 
@@ -545,6 +546,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Sealed snapshot timer equivalent invokes once; allowlisted metadata only, no secret/log leakage.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s4-16: systemd `two-bot-restore-drill.timer` — monthly
 
@@ -553,6 +555,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Restore verifies integrity and fixture row counts in isolated test DB; never replaces staging or production.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ## 5. DB tables & queries
 
@@ -563,6 +566,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Append-only events and member/invite projections are idempotent and guild-scoped.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-02: `internal_nonces`, `internal_idempotency`, `internal_action_log`, `internal_discord_events` — website-callback replay guard, idempotency, audit, dedupe
 
@@ -571,6 +575,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Durable nonce refusal, stable replay response and one action/event audit across restart.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-03: `web_contract_meta`, `guild_counters`, `rank_ladder`, `rank_snapshots`, `member_ranks`, `scheduled_events` — website read contract
 
@@ -579,6 +584,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Contract metadata, counters, ranks and scheduled events agree atomically; no staging database queried.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-04: `presence_probe` — hourly presence series
 
@@ -587,6 +593,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** One bounded presence row per tick with correct series ordering.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-05: `counter_snapshots`, `member_exclusions` — live-count audit history, raid exclusions
 
@@ -595,6 +602,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Excluded members do not inflate live counts; history preserves prior snapshots.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-06: `invite_campaigns` (`go.two.gg/<slug>`) — tracked short links
 
@@ -603,6 +611,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Known slug records invite_click once and redirects; unknown slug uses fallback without invented attribution.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-07: `member_levels`, `xp_cooldowns` (60s msg/voice), `xp_awards`, `level_role_rewards`, `level_import_runs` — leveling, MEE6-compat (5 XP/min voice)
 
@@ -611,6 +620,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** 60s cooldown, 5 XP/min voice compatibility, reward idempotency and import-run ledger match fixture expectations.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s5-08: `moderation_warnings`, `moderation_scheduled_unbans`, `moderation_audit`, `moderation_lockdowns`, `moderation_idempotency` — moderation ledger, tempban queue, lockdown state, claim table
@@ -620,6 +630,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Ledger, expiry queue, prior overwrite and idempotency claim persist across replay.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-09: `operational_audit_log` (states `none/pending/delivering/delivered/quarantined`, 5-min lease, hourly mirror recheck) — metadata-only Discord-event parity audit
 
@@ -628,6 +639,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Only valid none/pending/delivering/delivered/quarantined transitions; expired claim recoverable and duplicates blocked.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-10: `automod_violations`, `automod_processed_messages` — sanctions ladder, gateway-retry dedupe
 
@@ -636,6 +648,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** One processed-message claim; violation ladder advances only for distinct qualifying violations.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-11: `tickets`, `ticket_transcripts` — ticket lifecycle + transcripts
 
@@ -644,6 +657,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Lifecycle and transcript retention persist through restart; duplicate open does not create second ticket.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-12: `containment_events`, `containment_incidents`, `join_risk_flags` — anti-nuke signals/incidents, join-risk (flag-only, never kicks)
 
@@ -652,6 +666,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Signals/incidents/risk flags persist; join-risk never kicks.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-13: `automation_commands`, `scheduled_messages`, `sticky_messages`, `automation_audit_log` — custom commands, schedule queue, stickies
 
@@ -660,6 +675,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Definitions, due queue, last sticky and audit persist with guild isolation and idempotent claims.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-14: `self_role_audit`, `self_role_panel_claims` — self-role audit + claim leases
 
@@ -668,6 +684,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Claim lease prevents duplicate role action; metadata-only audit persists.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-15: `community_facts`, `community_stream_heartbeats`, `community_scorecard_runs/alerts` — scorecard facts/runs/alerts
 
@@ -676,6 +693,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Facts and stream liveness yield one weekly run/alert; dropped rota tables are not required.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-16: `event_rsvps`, `lfg_posts/roles/signups`, `feed_relays`, `feed_deliveries`, `announcements_audit_log` — RSVP, LFG, feed relay + delivery claims
 
@@ -684,6 +702,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Latest RSVP, bounded signups, single delivery and idempotent announcement audit persist.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-17: `guild_settings`, `guild_settings_audit` — dashboard-writable hot settings
 
@@ -692,6 +711,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Guild setting version and audit advance together for attributed hot/cold writes; wired hot changes apply live, cold changes require restart; env_only and unknown writes are refused before persistence/audit.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s5-18: `audit_kill_switch` (presence = halt; audit fail-open, rota fail-closed) — audit pipeline kill switch
 
@@ -700,6 +720,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Presence halts the audit pipeline; absence permits resume; failure mode matches audit policy.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ## 6. External integrations
 
@@ -740,6 +761,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** POST canonical HMAC, replay/skew rejection, durable idempotency; 20 burst/1s and add_member 10/0.5s buckets; nine moderation actions keep protection.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s6-06: `go.two.gg` redirect (`GET /<slug>` → `invite_click` → 302; unknown → fallback code) — ~450-line server + campaigns
 
@@ -763,6 +785,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Wrong stage/guild guard refuses before connect; configured pool ≤5 and statement timeout bounded.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s6-09: Health endpoint (`TWO_HEALTH_PORT`, `503 gateway_disconnected` pre-ready) — Container probe
 
@@ -825,6 +848,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Switch presence halts, status reports accurately, resume clears only the fixture switch and pending audit resumes safely.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 
 ### s8-04: Rate limits: staging-verifier 3 retries ≤30s; REST pacing §6; internal buckets §6; raid-watch 5 joins/60s + 900s cooldown; ticket cooldown 300s; containment per-executor cooldown — alert cooldowns + sweep/lease bounds (audit 5-min lease, 1-h recheck, claim ≤25)
 
@@ -861,4 +885,5 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Ported one-shots preserve fixture totals/reward/history idempotency; sealed restore validated in test DB; manual raid tools default to dry-run, fence live guild access, protect staff on every retry and audit each reached target; other reports/reconcile/rota stay dropped; temp-voice has no runtime promise.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
+- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
