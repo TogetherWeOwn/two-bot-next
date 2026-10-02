@@ -146,7 +146,7 @@ async fn initialize(source: &PgPool, target: &PgPool) -> TestResult {
 async fn scenarios(source: PgPool, target: PgPool) -> TestResult {
     initialize(&source, &target).await?;
     let tables = mapping::select(&["ready".to_owned()])?;
-    assert_eq!(tables.len(), 25);
+    assert_eq!(tables.len(), 26);
     let before: Vec<_> = {
         let mut rows = Vec::new();
         for table in &tables {

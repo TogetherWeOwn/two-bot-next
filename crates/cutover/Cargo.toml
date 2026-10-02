@@ -5,10 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 # Cutover data path (TOG-9882): one-shot MEE6 XP / reward / history
 # import-backfill operator tools. Library modules port the pure legacy logic
 # (parse, plan, reconcile); `src/db.rs` + `src/rest.rs` hold the sqlx and
-# twilight seams; `src/bin/` holds the seven operator CLIs.
+# twilight seams; `src/bin/` holds the operator CLIs.
 #
 # Intra-workspace path deps carry an explicit version (still resolved via
 # path): cargo-deny `wildcards = "deny"` rejects version-less deps.
@@ -90,3 +93,11 @@ path = "src/bin/raid_remove.rs"
 [[bin]]
 name = "gateway-force-identify"
 path = "src/bin/gateway_force_identify.rs"
+
+[[bin]]
+name = "reengagement-list"
+path = "src/bin/reengagement_list.rs"
+
+[[bin]]
+name = "rollback-delta"
+path = "src/bin/rollback_delta.rs"

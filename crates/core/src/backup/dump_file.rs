@@ -94,6 +94,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "guild_settings_audit",
     "audit_kill_switch",
     "internal_nonces",
+    "internal_clock_high_water",
     "internal_idempotency",
     "internal_action_log",
     "internal_discord_events",
@@ -101,6 +102,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "automod_delivery_claims",
     "gateway_boot_directives",
     "member_erasure_audit",
+    "invite_campaigns",
 ];
 
 /// Frozen v3 tables no longer created by cutover migrations. Keep their data
