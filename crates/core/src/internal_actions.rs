@@ -3646,7 +3646,8 @@ mod tests {
         let attempt = |raw: &[u8],
                        nonce: &str,
                        nonces: &mut NonceCache,
-                       buckets: &mut TokenBuckets|
+                       buckets: &mut TokenBuckets,
+                       clock: &mut ClockGuard|
          -> ActionError {
             let sig = sign(
                 vec1().secret.as_bytes(),
@@ -3666,15 +3667,30 @@ mod tests {
                 1_720_000_000_000,
                 nonces,
                 buckets,
+                clock,
             )
             .expect_err("malformed")
         };
         assert_eq!(
-            attempt(b"not json", &test_nonce(), &mut nonces, &mut buckets).code,
+            attempt(
+                b"not json",
+                &test_nonce(),
+                &mut nonces,
+                &mut buckets,
+                &mut clock
+            )
+            .code,
             ErrorCode::Malformed
         );
         assert_eq!(
-            attempt(b"[1,2]", &test_nonce(), &mut nonces, &mut buckets).code,
+            attempt(
+                b"[1,2]",
+                &test_nonce(),
+                &mut nonces,
+                &mut buckets,
+                &mut clock
+            )
+            .code,
             ErrorCode::Malformed
         );
         assert_eq!(
@@ -3682,7 +3698,8 @@ mod tests {
                 br#"{"no_action":1}"#,
                 &test_nonce(),
                 &mut nonces,
-                &mut buckets
+                &mut buckets,
+                &mut clock
             )
             .code,
             ErrorCode::Malformed
