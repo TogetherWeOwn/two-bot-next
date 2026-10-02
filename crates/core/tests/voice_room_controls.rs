@@ -177,16 +177,16 @@ fn clamp_keeps_every_value_in_range() {
 }
 
 #[test]
-fn name_conflict_is_case_sensitive_literal_match() {
+fn name_conflict_folds_case_nfkc_and_trims() {
     let existing = ["Lounge", "lounge room"];
     // Exact literal match conflicts when the setting is on.
     assert!(name_conflicts("Lounge", &existing, true));
-    // Case-sensitive: different case is a different name.
-    assert!(!name_conflicts("lounge", &existing, true));
-    assert!(!name_conflicts("LOUNGE", &existing, true));
-    // Literal only: no trimming or normalization.
-    assert!(!name_conflicts(" Lounge", &existing, true));
-    assert!(!name_conflicts("Lounge ", &existing, true));
+    // Case folds: different case is the same name.
+    assert!(name_conflicts("lounge", &existing, true));
+    assert!(name_conflicts("LOUNGE", &existing, true));
+    // Leading/trailing whitespace is trimmed before comparing.
+    assert!(name_conflicts(" Lounge", &existing, true));
+    assert!(name_conflicts("Lounge ", &existing, true));
     // Absent name does not conflict.
     assert!(!name_conflicts("Den", &existing, true));
     assert!(!name_conflicts("Den", &[] as &[&str], true));
