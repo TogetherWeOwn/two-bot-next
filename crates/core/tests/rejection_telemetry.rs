@@ -189,8 +189,8 @@ fn action_label_echoes_only_catalog_names() {
 
 #[test]
 fn from_body_extracts_only_catalog_actions() {
-    let known = br#"{"action":"role.assign","guild_id":"123"}"#;
-    assert_eq!(ActionLabel::from_body(known), known("role.assign"));
+    let raw_known = br#"{"action":"role.assign","guild_id":"123"}"#;
+    assert_eq!(ActionLabel::from_body(raw_known), known("role.assign"));
     for raw in [
         br#"{"action":"moderation.nuke"}"#.as_slice(),
         br#"{"action":42}"#,
