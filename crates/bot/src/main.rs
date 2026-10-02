@@ -115,6 +115,17 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Opt-in boot command registry sync (TOG-10860) runs before opening the
+    // gateway database so a configured registry is never skipped by a later
+    // DB failure; refusal/failure exits before shard startup. Opt-out is a
+    // no-op and preserves existing server behavior.
+    if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
+        if let Err(error) = commands_cli::publish_on_boot(token, guild_id).await {
+            tracing::error!(error = %error, "boot command registry synchronization failed");
+            std::process::exit(1);
+        }
+    }
+
     let store = match gateway_prerequisites(&config).ok().map(|(_, url, _)| url) {
         Some(url) => match tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -146,9 +157,8 @@ async fn main() {
         let state = Arc::clone(&gateway);
         Some(tokio::spawn(async move {
             let result: Result<(), sqlx::Error> = async {
-                commands_cli::publish_on_boot(&token, guild_id)
-                    .await
-                    .map_err(sqlx::Error::Protocol)?;
+                // Opt-in registry sync already ran before Store::connect; the
+                // gateway task proceeds directly to checkpoint/shard startup.
                 let db = store.ok_or_else(|| {
                     sqlx::Error::InvalidArgument(
                         "DATABASE_URL required for gateway checkpoint".into(),
