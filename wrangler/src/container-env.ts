@@ -108,6 +108,7 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
+  TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
