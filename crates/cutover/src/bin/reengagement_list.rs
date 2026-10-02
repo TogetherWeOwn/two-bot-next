@@ -2,7 +2,8 @@
 //! scheduled; §9 drops the scheduled runtime but keeps the on-demand query).
 //!
 //! Prints the inactivity selector's quiet members for one guild as CSV on
-//! stdout (header always; a `#`-prefixed hint line and exit 0 when empty).
+//! stdout (header always; a `#`-prefixed hint line and exit 0 when empty or
+//! unscoped, i.e. no `--guild`).
 //! Read-only: no `member_inactive` events, no `inactive_flagged_at`
 //! projection, no timer/service/job registration — an operator runs this once
 //! and it exits. Nothing here messages anybody (parity forbids DMs).
@@ -11,7 +12,9 @@
 //! Env: `TWO_DATABASE_URL` (required), `TWO_INACTIVITY_DAYS` (fallback for
 //! `--days`, legacy default 14).
 
-use two_bot_core::inactivity::{parse_inactivity_days, render_reengagement_csv, InactivityOutcome};
+use two_bot_core::inactivity::{
+    parse_inactivity_days, render_reengagement_csv, render_reengagement_unscoped, InactivityOutcome,
+};
 use two_bot_cutover::{
     cli::{now_iso, open_db, require_guild, Args},
     reengagement::list_reengagement,
@@ -21,7 +24,22 @@ use two_bot_cutover::{
 async fn main() {
     let args = Args::parse(&std::env::args().skip(1).collect::<Vec<_>>());
     if args.has("help") {
-        println!("Usage: reengagement-list --guild <ID> [--days <N>] [--now <RFC3339>] [--allow-live-guild]\nOn-demand reengagement list (never scheduled): quiet members past the inactivity cutoff as CSV on stdout. TWO_DATABASE_URL required.");
+        println!("Usage: reengagement-list --guild <ID> [--days <N>] [--now <RFC3339>] [--allow-live-guild]\nOn-demand reengagement list (never scheduled): quiet members past the inactivity cutoff as CSV on stdout. TWO_DATABASE_URL required. Without --guild: header plus hint, exit 0.");
+        return;
+    }
+    if args
+        .values
+        .keys()
+        .any(|k| !["guild", "days", "now"].contains(&k.as_str()))
+        || args.flags.iter().any(|k| k != "allow-live-guild")
+        || !args.positionals.is_empty()
+    {
+        eprintln!("reengagement-list: unknown or malformed argument");
+        std::process::exit(2);
+    }
+    // Unscoped: exit 0 with the empty-state hint; no database is opened.
+    if !args.values.contains_key("guild") {
+        print!("{}", render_reengagement_unscoped());
         return;
     }
     let guild = require_guild(&args, "guild");
@@ -32,15 +50,6 @@ async fn main() {
 }
 
 async fn run(args: Args, guild: String) -> Result<(), String> {
-    if args
-        .values
-        .keys()
-        .any(|k| !["guild", "days", "now"].contains(&k.as_str()))
-        || args.flags.iter().any(|k| k != "allow-live-guild")
-        || !args.positionals.is_empty()
-    {
-        return Err("unknown or malformed argument".into());
-    }
     // Explicit `--days` wins; otherwise the legacy `TWO_INACTIVITY_DAYS`
     // gate; otherwise the 14-day default — one parser for all three.
     let days_raw = args

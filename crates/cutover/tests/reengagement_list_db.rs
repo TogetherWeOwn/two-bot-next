@@ -268,8 +268,8 @@ async fn list_is_guild_scoped_selector_shaped_and_read_only() {
     .unwrap();
     assert_eq!(
         (events, flagged),
-        (0, 1),
-        "no events recorded; only the seeded flag row is projected"
+        (0, 2),
+        "no events recorded; only the two seeded flag rows (...002, ...006) remain"
     );
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

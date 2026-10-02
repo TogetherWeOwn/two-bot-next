@@ -152,6 +152,16 @@ pub fn flag_inactive(
     InactivityOutcome { flagged }
 }
 
+/// Header row of the reengagement CSV (always the first line).
+pub const REENGAGEMENT_CSV_HEADER: &str = "guild_id,member_id,occurred_at,threshold_days";
+
+/// Unscoped invocation (no `--guild`): the header plus a `#`-prefixed hint,
+/// so the CLI exits 0 with parseable, empty CSV and never opens a database.
+#[must_use]
+pub fn render_reengagement_unscoped() -> String {
+    format!("{REENGAGEMENT_CSV_HEADER}\n# no --guild given; pass --guild <ID> to list one guild\n")
+}
+
 /// On-demand reengagement list (parity §4/§9: on-demand CLI only, never
 /// scheduled): render the selector's flagged members row-for-row as CSV.
 /// The header always prints; an empty outcome yields the header plus one
@@ -162,7 +172,7 @@ pub fn flag_inactive(
 /// before emission, mirroring the `raid_tools::cohort_csv` gate: a bad ID is
 /// a hard error, not a skipped row.
 pub fn render_reengagement_csv(outcome: &InactivityOutcome) -> Result<String, &'static str> {
-    let mut out = "guild_id,member_id,occurred_at,threshold_days\n".to_owned();
+    let mut out = format!("{REENGAGEMENT_CSV_HEADER}\n");
     if outcome.flagged.is_empty() {
         out.push_str("# no members past the inactivity cutoff; list is empty\n");
         return Ok(out);
@@ -196,9 +206,8 @@ pub fn is_snowflake_like(id: &str) -> bool {
 /// Returns an error for a bad header, a bad row, or a non-snowflake ID.
 pub fn parse_reengagement_csv(text: &str) -> Result<Vec<FlaggedMember>, &'static str> {
     let mut lines = text.lines();
-    match lines.next() {
-        Some("guild_id,member_id,occurred_at,threshold_days") => {}
-        _ => return Err("reengagement CSV has an unexpected header"),
+    if lines.next() != Some(REENGAGEMENT_CSV_HEADER) {
+        return Err("reengagement CSV has an unexpected header");
     }
     let mut rows = Vec::new();
     for line in lines {
@@ -486,6 +495,15 @@ mod tests {
         assert_eq!(lines[0], "guild_id,member_id,occurred_at,threshold_days");
         assert_eq!(lines.len(), 2, "header plus one hint line");
         assert!(lines[1].starts_with('#'), "hint is a CSV comment");
+        assert!(parse_reengagement_csv(&csv).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reengagement_unscoped_is_header_plus_hint_and_parses_to_nothing() {
+        let csv = render_reengagement_unscoped();
+        let lines: Vec<_> = csv.lines().collect();
+        assert_eq!(lines, [REENGAGEMENT_CSV_HEADER, lines[1]]);
+        assert!(lines[1].starts_with('#') && lines[1].contains("--guild"));
         assert!(parse_reengagement_csv(&csv).unwrap().is_empty());
     }
 
