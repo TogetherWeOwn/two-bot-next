@@ -2,6 +2,7 @@
 """Offline regressions: no Cargo, network, services, or large fixtures."""
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -129,6 +130,75 @@ class CacheTests(unittest.TestCase):
             (slot / 'lease.json').write_text('{"wrapper_pid": 99999999}')
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
             cache.acquire(self.pool, self.policy)
+
+    def dead_pgid(self):
+        terminated = subprocess.Popen(['true'])
+        terminated.wait()
+        self.assertFalse(cache.group_alive(terminated.pid))
+        return terminated.pid
+
+    def test_stale_lease_with_free_lock_is_recovered(self):
+        slot = self.pool / 'slot-0'
+        lease = {'workspace': str(self.root), 'wrapper_pid': 99999999,
+                 'started_at': 0, 'cargo_pgid': self.dead_pgid()}
+        (slot / 'lease.json').write_text(json.dumps(lease))
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            got, _, fd = cache.acquire(self.pool, self.policy)
+        os.close(fd)
+        self.assertEqual(got.name, 'slot-0')
+        self.assertFalse((slot / 'lease.json').exists())
+        line = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(line['finding'], 'stale_lease_recovered')
+        self.assertEqual(line['cargo_pgid'], lease['cargo_pgid'])
+        print(f"stale recovery receipt: slot-0 lease with dead pgid "
+              f"{lease['cargo_pgid']} admitted, sentinel unlinked")
+
+    def test_held_lock_is_skipped_not_recovered(self):
+        slot = self.pool / 'slot-0'
+        (slot / 'lease.json').write_text(json.dumps(
+            {'workspace': str(self.root), 'wrapper_pid': 99999999,
+             'started_at': 0, 'cargo_pgid': self.dead_pgid()}))
+        held = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        got, _, fd = cache.acquire(self.pool, self.policy)
+        os.close(fd)
+        self.assertEqual(got.name, 'slot-1')
+        self.assertTrue((slot / 'lease.json').exists())
+
+    def test_over_budget_stale_lease_is_still_refused(self):
+        dead = self.dead_pgid()
+        for slot in self.pool.glob('slot-*'):
+            (slot / 'scratch' / 'retained').write_bytes(
+                b'x' * self.policy['slot_budget_bytes'])
+            (slot / 'lease.json').write_text(json.dumps(
+                {'workspace': str(self.root), 'wrapper_pid': 99999999,
+                 'started_at': 0, 'cargo_pgid': dead}))
+        with self.assertRaisesRegex(cache.Refusal, 'no idle'):
+            cache.acquire(self.pool, self.policy)
+        self.assertEqual(len(list(self.pool.glob('slot-*/lease.json'))), 2)
+
+    def test_live_recorded_group_is_still_refused(self):
+        live = subprocess.Popen(['sleep', '30'], start_new_session=True)
+
+        def finish_live():
+            live.terminate()
+            try:
+                live.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                live.kill()
+                live.wait(timeout=5)
+
+        self.addCleanup(finish_live)
+        self.assertTrue(cache.group_alive(live.pid))
+        for slot in self.pool.glob('slot-*'):
+            (slot / 'lease.json').write_text(json.dumps(
+                {'workspace': str(self.root), 'wrapper_pid': 99999999,
+                 'started_at': 0, 'cargo_pgid': live.pid}))
+        with self.assertRaisesRegex(cache.Refusal, 'no idle'):
+            cache.acquire(self.pool, self.policy)
+        self.assertEqual(len(list(self.pool.glob('slot-*/lease.json'))), 2)
 
     def test_over_budget_idle_slots_are_not_reused(self):
         self.policy['slot_budget_bytes'] = 1
