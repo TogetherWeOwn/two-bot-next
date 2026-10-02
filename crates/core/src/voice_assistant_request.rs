@@ -301,7 +301,9 @@ fn redact_ids(text: &str) -> String {
     let mut run_start = None;
     for (i, c) in text.char_indices() {
         if c.is_ascii_digit() {
-            run_start.get_or_insert(i);
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
             continue;
         }
         if let Some(start) = run_start.take() {
