@@ -14,16 +14,16 @@
 //! Every non-deferred case must pass, including the V6 conditional and
 //! styling cases.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[path = "support/voice_corpus_context.rs"]
+mod voice_corpus_context;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
-use time::{Date, Month};
 use two_bot_core::voice_conditions::ConditionFacts;
-use two_bot_core::voice_naming::{
-    majority_games, parse, render, resolve_majority_game, ChannelKind, GameOptions, PartyInfo,
-    RoomContext,
-};
+use two_bot_core::voice_naming::{parse, render, RoomContext};
 use two_bot_core::voice_template::TemplateExtensions;
+use voice_corpus_context::{condition_facts, room_context, CorpusContext};
 
 const CORPUS: &str = include_str!("../../../tests/voice_templates/corpus.json");
 
@@ -36,64 +36,6 @@ struct Corpus {
     contexts: BTreeMap<String, CorpusContext>,
     cases: Vec<Case>,
     stability_groups: Vec<StabilityGroup>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CorpusContext {
-    channel_kind: String,
-    number: u32,
-    limit: u32,
-    private: bool,
-    seed: String,
-    owner_id: String,
-    original_creator_name: String,
-    members: Vec<Member>,
-    clock: Clock,
-    settings: Settings,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Member {
-    id: String,
-    display_name: String,
-    nick: Option<String>,
-    roles: Vec<String>,
-    game: Option<String>,
-    live_discord: bool,
-    live_external: bool,
-    stream_title: Option<String>,
-    party: Option<Party>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Party {
-    id: String,
-    size: u32,
-    maximum: Option<u32>,
-    state: String,
-    details: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Clock {
-    weekday: String,
-    month: String,
-    hour: u8,
-    timezone: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Settings {
-    no_game: String,
-    aliases: HashMap<String, String>,
-    named_lists: HashMap<String, Vec<String>>,
-    force_single_game: bool,
-    include_inactive: bool,
 }
 
 #[derive(Deserialize)]
@@ -141,116 +83,13 @@ struct Room {
     facts: ConditionFacts,
 }
 
-/// Adapt the implementation-independent snapshot to the engine's context,
-/// following V5 to V7: owner name prefers `/nick`, the game is the
-/// alias-resolved majority, and parties are deduplicated by ID in first-seen
-/// order. Condition facts come from the same snapshot, so `GAME` reads the
-/// titles `@@game_name@@` shows and roles are those of the members present.
+/// One corpus context as the engine sees it: name tokens and V6 condition
+/// facts, both derived from the shared mapping so the two agrees.
 fn room(context: &CorpusContext) -> Room {
-    let owner = context.members.iter().find(|m| m.id == context.owner_id);
-    let mut parties: Vec<(&str, PartyInfo)> = Vec::new();
-    for party in context.members.iter().filter_map(|m| m.party.as_ref()) {
-        if !parties.iter().any(|(id, _)| *id == party.id) {
-            parties.push((
-                party.id.as_str(),
-                PartyInfo {
-                    size: party.size,
-                    max: party.maximum,
-                    state: party.state.clone(),
-                    details: party.details.clone(),
-                },
-            ));
-        }
-    }
-    let activities: Vec<Option<String>> = context.members.iter().map(|m| m.game.clone()).collect();
-    let game_options = GameOptions {
-        aliases: context.settings.aliases.clone(),
-        force_single: context.settings.force_single_game,
-        count_idle_toward_majority: context.settings.include_inactive,
-        no_game_label: context.settings.no_game.clone(),
-    };
-    let owner_game = owner.and_then(|m| m.game.as_deref());
-    let count = |is: fn(&Member) -> bool| context.members.iter().filter(|m| is(m)).count() as u32;
-    let room_context = RoomContext {
-        channel_kind: match context.channel_kind.as_str() {
-            "temporary" => ChannelKind::Temporary,
-            "standalone" | "stage" => ChannelKind::Standalone,
-            other => panic!("unknown channel kind {other}"),
-        },
-        room_number: context.number,
-        owner_name: owner
-            .map(|m| m.nick.clone().unwrap_or_else(|| m.display_name.clone()))
-            .unwrap_or_default(),
-        original_creator_name: context.original_creator_name.clone(),
-        member_count: context.members.len() as u32,
-        owner_present: owner.is_some(),
-        live_count: count(is_live),
-        user_limit: context.limit,
-        game_name: resolve_majority_game(&activities, owner_game, &game_options),
-        stream_title: owner
-            .filter(|m| is_live(m))
-            .and_then(|m| m.stream_title.clone())
-            .unwrap_or_default(),
-        members_playing: context.members.iter().filter(|m| m.game.is_some()).count() as u32,
-        parties: parties.into_iter().map(|(_, party)| party).collect(),
-        timestamp: civil_timestamp(&context.clock),
-        tz_offset_minutes: 0,
-        seed: seed(&context.seed),
-        named_lists: context.settings.named_lists.clone(),
-        fallback_name: String::new(),
-    };
-    let facts = ConditionFacts {
-        owner_id: Some(context.owner_id.clone()),
-        owner_role_ids: owner.map(|m| m.roles.clone()).unwrap_or_default(),
-        member_ids: context.members.iter().map(|m| m.id.clone()).collect(),
-        member_role_ids: context
-            .members
-            .iter()
-            .flat_map(|m| m.roles.iter().cloned())
-            .collect(),
-        owner_playing: owner_game.is_some(),
-        owner_live_discord: owner.is_some_and(|m| m.live_discord),
-        owner_live_external: owner.is_some_and(|m| m.live_external),
-        live_discord_count: count(|m| m.live_discord),
-        live_external_count: count(|m| m.live_external),
-        games: majority_games(&activities, owner_game, &game_options),
-        private: context.private,
-    };
     Room {
-        context: room_context,
-        facts,
+        context: room_context(context),
+        facts: condition_facts(context),
     }
-}
-
-/// V5: `@@num_live@@` counts members streaming in Discord or externally.
-fn is_live(member: &Member) -> bool {
-    member.live_discord || member.live_external
-}
-
-/// The corpus clock is already guild-local civil time. Pick the first day of
-/// that month in 2026 with that weekday, at that hour, as a UTC timestamp.
-fn civil_timestamp(clock: &Clock) -> i64 {
-    assert_eq!(clock.timezone, "UTC", "corpus clocks are UTC");
-    let month = (1..=12u8)
-        .map(|m| Month::try_from(m).expect("month"))
-        .find(|m| m.to_string() == clock.month)
-        .unwrap_or_else(|| panic!("unknown month {}", clock.month));
-    let mut date = Date::from_calendar_date(2026, month, 1).expect("date");
-    while date.weekday().to_string() != clock.weekday {
-        date = date.next_day().expect("next day");
-        assert_eq!(date.month(), month, "unknown weekday {}", clock.weekday);
-    }
-    date.with_hms(clock.hour, 0, 0)
-        .expect("hour")
-        .assume_utc()
-        .unix_timestamp()
-}
-
-/// The corpus seed is opaque; map it consistently with 64-bit FNV-1a.
-fn seed(value: &str) -> u64 {
-    value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    })
 }
 
 fn render_case(case: &Case, rooms: &BTreeMap<String, Room>) -> String {
