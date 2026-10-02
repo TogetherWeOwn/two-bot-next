@@ -38,6 +38,7 @@
 
 ### Fixed
 
+- Accept and strip Neon's `channel_binding` URL option before SQLx without changing TLS mode; retain fatal startup exits with fixed, credential-safe diagnostics and sanitized Worker HTTP 500 responses. Gate staging deployments on the intended new container rollout, immutable image/build identity and serving Worker version; parked readiness 503 no longer passes deployment acceptance.
 - Keep parallel settings DB fixture schemas distinct when wall-clock readings
   repeat, without sharing schemas or serializing the CAS regressions. (TOG-10089)
 - Grant runtime-only CRUD on the automod relations and cover migrations 0220–0223
