@@ -5,7 +5,7 @@ use std::fmt::Debug;
 mod tracing_capture;
 use two_bot_core::{
     backup::{
-        guild_config_api::{checked_base, GuildConfigDiscordApi},
+        guild_config_api::{checked_base, GuildConfigApiError, GuildConfigDiscordApi},
         http::{HttpError, HttpResponse},
         s3,
     },
@@ -127,7 +127,6 @@ fn guild_config_client_and_invalid_base_hide_credentials() {
     )
     .unwrap();
     assert_redacted(&api, &["fixture-guild-config-token"]);
-    assert_redacted(&api.token, &["fixture-guild-config-token"]);
     let error = checked_base(
         Some("https://fixture-user:fixture-password@remote.invalid"),
         "GUILD_CONFIG_API_BASE",
@@ -222,8 +221,8 @@ async fn real_http_refusal_redacts_webhook_before_network_access() {
 }
 
 #[test]
-fn accepted_guild_config_overrides_redact_private_paths_and_queries() {
-    let base = "http://localhost:9000/private/fixture-base-secret?key=fixture-query-secret";
+fn accepted_guild_config_overrides_redact_private_paths() {
+    let base = "http://localhost:9000/private/fixture-base-secret";
     let api = GuildConfigDiscordApi::new(
         Some(base),
         Some(base),
@@ -232,15 +231,39 @@ fn accepted_guild_config_overrides_redact_private_paths_and_queries() {
         "2".to_owned(),
     )
     .unwrap();
-    let secrets = [
-        base,
-        "fixture-base-secret",
-        "fixture-query-secret",
-        "fixture-bot-token",
-    ];
+    let secrets = [base, "fixture-base-secret", "fixture-bot-token"];
     assert_redacted(&api, &secrets);
     assert_redacted(&api.api_base, &secrets);
     assert_redacted(&api.cdn_base, &secrets);
+}
+
+#[test]
+fn rejected_guild_config_overrides_redact_private_paths_and_queries() {
+    let base = "http://localhost:9000/private/fixture-base-secret?key=fixture-query-secret";
+    for (api_base, cdn_base) in [(Some(base), None), (None, Some(base))] {
+        let error = GuildConfigDiscordApi::new(
+            api_base,
+            cdn_base,
+            "fixture-bot-token".to_owned(),
+            "1".to_owned(),
+            "2".to_owned(),
+        )
+        .unwrap_err();
+        let secrets = [
+            base,
+            "fixture-base-secret",
+            "fixture-query-secret",
+            "fixture-bot-token",
+        ];
+        assert_redacted(&error, &secrets);
+        for secret in secrets {
+            assert!(!error.to_string().contains(secret));
+        }
+        assert!(matches!(
+            error,
+            two_bot_core::backup::guild_config_api::GuildConfigApiError::BadBase(_)
+        ));
+    }
 }
 
 #[tokio::test]
@@ -450,4 +473,55 @@ fn channel_store_rejects_unknown_query_secrets_without_sqlx_warning() {
     assert!(text.contains("capture remains active"));
     assert!(!text.contains("fixture-query-secret"));
     assert!(!text.contains("ignoring unrecognized connect parameter"));
+}
+
+#[test]
+fn guild_config_wrapper_rerender_keeps_webhook_userinfo_and_query_redacted() {
+    // `GuildConfigApiError::Http` re-renders the wrapped error through
+    // `http: {0}`: pin that the `#[from]` composition cannot reintroduce a
+    // webhook token, userinfo, or query credential into Display or Debug.
+    let url = "https://fixture-user:fixture-password@discord.invalid/api/webhooks/1/fixture-webhook-token?key=fixture-query-secret";
+    let http = HttpError::Status {
+        url: url.to_owned().into(),
+        status: http::StatusCode::FORBIDDEN,
+        detail: "fixture-echoed-authorization".to_owned().into(),
+    };
+    let wrapped = GuildConfigApiError::from(http);
+    let secrets = [
+        url,
+        "fixture-user",
+        "fixture-password",
+        "fixture-webhook-token",
+        "fixture-query-secret",
+        "fixture-echoed-authorization",
+    ];
+    assert_redacted(&wrapped, &secrets);
+    for secret in secrets {
+        assert!(!wrapped.to_string().contains(secret));
+    }
+}
+
+#[test]
+fn status_detail_echoing_a_webhook_url_is_redacted_wholesale() {
+    // A remote body can echo the request URL (webhook token plus query) or
+    // an Authorization value back at us; the `detail` field must redact the
+    // echo wholesale rather than truncate around it.
+    let error = HttpError::Status {
+        url: "https://discord.invalid/api/webhooks/1/unrelated"
+            .to_owned()
+            .into(),
+        status: http::StatusCode::BAD_REQUEST,
+        detail: "https://discord.invalid/api/webhooks/1/fixture-echoed-token?key=fixture-echoed-query with header fixture-echoed-auth"
+            .to_owned()
+            .into(),
+    };
+    let secrets = [
+        "fixture-echoed-token",
+        "fixture-echoed-query",
+        "fixture-echoed-auth",
+    ];
+    assert_redacted(&error, &secrets);
+    for secret in secrets {
+        assert!(!error.to_string().contains(secret));
+    }
 }

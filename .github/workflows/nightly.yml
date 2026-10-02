@@ -19,9 +19,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pipeline-benchmark:
+    name: nightly pipeline budget
+    uses: ./.github/workflows/pipeline-benchmark.yml
+
   advisories:
     name: nightly advisories
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'advisories') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,9 +41,10 @@ jobs:
 
   sweep:
     name: nightly ignored tests and docs
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 45
-    # Match check.yml: no service ports on the shared Docker host.
+    # Match required CI isolation on the shared Docker host.
     container:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
@@ -66,6 +72,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Job-container prerequisites (job-private loopback forward)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -84,12 +97,7 @@ jobs:
       - name: Prepare isolated test databases
         id: databases
         run: |
-          # Match check.yml's job-private loopback for fixed-endpoint fixtures.
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends postgresql-client socat >/dev/null
-          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
-          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && break; sleep 1; done
-          pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test
+          # Match the existing guards; never relax them or use a repository secret.
           createdb -h agent-testdb -U agent_test two_bot_test_tog10090_nightly
           createdb -h agent-testdb -U agent_test two_next_backup_nightly
           createdb -h agent-testdb -U agent_test two_next_backup_publication_nightly

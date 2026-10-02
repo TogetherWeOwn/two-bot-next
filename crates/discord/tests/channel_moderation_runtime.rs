@@ -156,6 +156,13 @@ fn overwrite(allow: &str, deny: &str) -> ScriptedResponse {
     )
 }
 
+/// PATCH mutations (slowmode channel PATCH, `@original` response edit) require
+/// a validated message/channel id receipt under main's durable send admission;
+/// a bare 200 with an empty body is `Unavailable`, not success.
+fn patched() -> ScriptedResponse {
+    ScriptedResponse::json(200, json!({"id": CHANNEL}))
+}
+
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service"]
 async fn defer_precedes_sql_and_effect_then_edits_original_with_no_mentions() {
@@ -163,8 +170,8 @@ async fn defer_precedes_sql_and_effect_then_edits_original_with_no_mentions() {
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204).delayed(std::time::Duration::from_millis(300)),
-            ScriptedResponse::status(200),
-            ScriptedResponse::status(200),
+            patched(),
+            patched(),
         ],
         ScriptedResponse::status(500),
     )
@@ -257,7 +264,7 @@ async fn failed_result_edit_never_repeats_a_completed_effect() {
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204),
-            ScriptedResponse::status(200),
+            patched(),
             ScriptedResponse::status(503),
         ],
         ScriptedResponse::status(500),
@@ -290,11 +297,7 @@ async fn persistence_failure_edits_safe_reconciliation_reply_and_keeps_lane() {
     let db = Database::open().await;
     sqlx::query("ALTER TABLE moderation_audit ADD CONSTRAINT reject_success CHECK (outcome <> 'slowmode_updated')").execute(db.store.pool()).await.unwrap();
     let mock = MockRest::start(
-        vec![
-            ScriptedResponse::status(204),
-            ScriptedResponse::status(200),
-            ScriptedResponse::status(200),
-        ],
+        vec![ScriptedResponse::status(204), patched(), patched()],
         ScriptedResponse::status(500),
     )
     .await;
@@ -332,7 +335,7 @@ async fn persistence_failure_edits_safe_reconciliation_reply_and_keeps_lane() {
 async fn disabled_command_uses_ephemeral_lifecycle_and_other_slices_are_untouched() {
     let db = Database::open().await;
     let mock = MockRest::start(
-        vec![ScriptedResponse::status(204), ScriptedResponse::status(200)],
+        vec![ScriptedResponse::status(204), patched()],
         ScriptedResponse::status(500),
     )
     .await;
@@ -458,8 +461,8 @@ async fn purge_and_slowmode_success_audit_and_replay_without_repeating_effects()
                 json!([{"id":"600000000000000001"},{"id":"600000000000000002"}]),
             ),
             ScriptedResponse::status(204),
-            ScriptedResponse::status(200),
-            ScriptedResponse::status(200),
+            patched(),
+            patched(),
         ],
         ScriptedResponse::status(500),
     )
@@ -756,11 +759,7 @@ async fn audit_failure_retries_only_finalization_not_a_successful_discord_effect
         BEGIN IF nextval('audit_attempts') = 1 THEN RAISE EXCEPTION 'injected audit failure'; END IF; RETURN NEW; END $$;
         CREATE TRIGGER fail_first BEFORE INSERT ON moderation_audit FOR EACH ROW EXECUTE FUNCTION fail_first_audit();")
         .execute(db.store.pool()).await.unwrap();
-    let mock = MockRest::start(
-        vec![ScriptedResponse::status(200)],
-        ScriptedResponse::status(500),
-    )
-    .await;
+    let mock = MockRest::start(vec![patched()], ScriptedResponse::status(500)).await;
     let runtime = runtime(&db, &mock);
     let router = router(true);
     let request = interaction(70, "slowmode", options(Some(("seconds", 10))), PERMISSIONS);
@@ -837,11 +836,7 @@ async fn exhausted_audit_failure_retains_lane_and_cannot_redo_successful_effect(
     let db = Database::open().await;
     sqlx::query("ALTER TABLE moderation_audit ADD CONSTRAINT deny_audit CHECK (outcome <> 'slowmode_updated')")
         .execute(db.store.pool()).await.unwrap();
-    let mock = MockRest::start(
-        vec![ScriptedResponse::status(200)],
-        ScriptedResponse::status(500),
-    )
-    .await;
+    let mock = MockRest::start(vec![patched()], ScriptedResponse::status(500)).await;
     let runtime = runtime(&db, &mock);
     let router = router(true);
     let request = interaction(76, "slowmode", options(Some(("seconds", 10))), PERMISSIONS);

@@ -31,6 +31,7 @@ fn fresh_state(gates: ScorecardGates, inactivity_days: u64) -> State {
         gates,
         inactivity_days,
         last_attempted_week: Mutex::new(None),
+        probe_lease: Mutex::new(None),
     }
 }
 
@@ -80,6 +81,81 @@ fn gates_follow_legacy_env_semantics() {
             .any(|p| p.name == "community_scorecard" && p.reason == "invalid_config"),
         "bad scorecard gate value parks the scorecard"
     );
+}
+
+#[test]
+fn parked_reason_taxonomy_selects_warn_vs_info() {
+    // Contract: `register` logs WARN exactly when a parked job's `reason`
+    // is `"invalid_config"` and INFO otherwise (its match on the reason).
+    // This pins the reason every gate state produces, so a future refactor
+    // cannot silently move a misconfiguration onto the info path — or a
+    // plain disable onto warn — without failing here.
+    let reasons_for = |parked: &[Parked], name: &str| {
+        parked
+            .iter()
+            .filter(|p| p.name == name)
+            .map(|p| p.reason)
+            .collect::<Vec<_>>()
+    };
+
+    // Default env: the scorecard is off (a plain disable) and the sweep
+    // runs at the legacy default.
+    let (gates, parked) = resolve_gates(&HashMap::new());
+    assert_eq!(gates.inactivity_days, Some(14));
+    assert_eq!(
+        parked
+            .iter()
+            .map(|p| (p.name, p.reason))
+            .collect::<Vec<_>>(),
+        [("community_scorecard", "disabled")]
+    );
+
+    // Presence explicitly off is a disable (info), not a config error.
+    let vars = HashMap::from([("TWO_PRESENCE_PROBE".to_owned(), "0".to_owned())]);
+    let (gates, parked) = resolve_gates(&vars);
+    assert!(!gates.presence);
+    assert_eq!(reasons_for(&parked, "presence_probe"), ["disabled"]);
+
+    // A bad scorecard value is a config error (warn).
+    let vars = HashMap::from([
+        ("TWO_COMMUNITY_SCORECARD".to_owned(), "1".to_owned()),
+        (
+            "TWO_COMMUNITY_CORRECTION_CYCLES".to_owned(),
+            "bogus".to_owned(),
+        ),
+    ]);
+    let (gates, parked) = resolve_gates(&vars);
+    assert!(gates.scorecard.is_none());
+    assert_eq!(
+        reasons_for(&parked, "community_scorecard"),
+        ["invalid_config"]
+    );
+
+    // Every non-numeric TWO_INACTIVITY_DAYS shape parks the sweep as
+    // invalid_config (warn): never "disabled", never the raw value.
+    for raw in ["many", "", "-1", "14.5", "18446744073709551616"] {
+        let vars = HashMap::from([("TWO_INACTIVITY_DAYS".to_owned(), raw.to_owned())]);
+        let (gates, parked) = resolve_gates(&vars);
+        assert_eq!(gates.inactivity_days, None, "days {raw:?} parks the sweep");
+        assert_eq!(
+            reasons_for(&parked, "inactivity"),
+            ["invalid_config"],
+            "days {raw:?} must select the warn path"
+        );
+    }
+
+    // Parseable shapes stay green — including the saturation extreme, which
+    // `inactivity_cutoff_ms` pins to the `i64::MIN`-bounded floor, and
+    // surrounding whitespace, which the parser trims.
+    for (raw, days) in [("0", 0), (" 30 ", 30), ("18446744073709551615", u64::MAX)] {
+        let vars = HashMap::from([("TWO_INACTIVITY_DAYS".to_owned(), raw.to_owned())]);
+        let (gates, parked) = resolve_gates(&vars);
+        assert_eq!(gates.inactivity_days, Some(days), "days {raw:?} parses");
+        assert!(
+            reasons_for(&parked, "inactivity").is_empty(),
+            "days {raw:?} parks nothing"
+        );
+    }
 }
 
 #[tokio::test]
@@ -182,8 +258,11 @@ async fn truncated_presence_scan_persists_and_waits_24_hours_across_restart() {
     ]);
     let mock = MockRest::start(responses, ScriptedResponse::status(500)).await;
     let rest = executor(&mock);
+    let state = fresh_state(enabled_gates(), 14);
     let now = parse_iso_millis("2026-10-01T00:00:00.000Z").unwrap();
-    presence_tick(pool, &rest, guild, now).await.unwrap();
+    presence_tick(pool, &rest, guild, &state, now)
+        .await
+        .unwrap();
     assert_eq!(
         mock.requests().len(),
         12,
@@ -191,21 +270,28 @@ async fn truncated_presence_scan_persists_and_waits_24_hours_across_restart() {
     );
     // A fresh executor has no in-memory cadence state: the persisted bit gates it.
     let restarted = executor(&mock);
-    presence_tick(pool, &restarted, guild, now + 3_600_000)
+    presence_tick(pool, &restarted, guild, &state, now + 3_600_000)
         .await
         .unwrap();
     presence_tick(
         pool,
         &restarted,
         guild,
+        &state,
         now + BOT_FLOOR_MAX_AGE_MS as i64 - 1,
     )
     .await
     .unwrap();
     assert_eq!(mock.requests().len(), 14, "no premature roster rescan");
-    presence_tick(pool, &restarted, guild, now + BOT_FLOOR_MAX_AGE_MS as i64)
-        .await
-        .unwrap();
+    presence_tick(
+        pool,
+        &restarted,
+        guild,
+        &state,
+        now + BOT_FLOOR_MAX_AGE_MS as i64,
+    )
+    .await
+    .unwrap();
     assert_eq!(mock.requests().len(), 16, "24 h boundary rescans");
     let rows: Vec<(i32, Option<i32>, bool)> = sqlx::query_as(
         "SELECT approximate_presence_count, bot_floor, bot_floor_scan_truncated
@@ -224,6 +310,161 @@ async fn truncated_presence_scan_persists_and_waits_24_hours_across_restart() {
             (42, Some(1), false)
         ]
     );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+/// Overlap guard (TOG-12142): a concurrent trigger skips before any REST
+/// call, the in-flight cycle still records its row, and the lease clears so
+/// the next tick runs normally.
+#[tokio::test]
+async fn overlapping_probe_trigger_skips_and_inflight_cycle_records() {
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP community job integration: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = fixture.pool().clone();
+    let guild = "3333";
+    let counts = || ScriptedResponse::json(200, json!({"approximate_presence_count": 42}));
+    let members = vec![member(5000, false), member(5001, true), member(5002, true)];
+    // The roster page is gated: the first cycle parks inside the scan holding
+    // the lease while the concurrent trigger fires. The default keeps serving
+    // counts so the post-skip tick proves the normal cycle is unaffected.
+    let (mock, gate) = MockRest::start_gated(
+        vec![counts(), ScriptedResponse::json(200, json!(members))],
+        counts(),
+    )
+    .await;
+    let rest = executor(&mock);
+    let state = Arc::new(fresh_state(enabled_gates(), 14));
+    let t0 = parse_iso_millis("2026-09-28T01:00:00.000Z").unwrap();
+
+    let first = {
+        let pool = pool.clone();
+        let rest = rest.clone();
+        let state = Arc::clone(&state);
+        tokio::spawn(async move { presence_tick(&pool, &rest, guild, &state, t0).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), gate.wait_for_request())
+        .await
+        .expect("the first cycle must reach the gated roster scan");
+    assert!(
+        !first.is_finished(),
+        "the roster scan is still withheld: the lease is held"
+    );
+    // Concurrent trigger while the first cycle holds the lease: skips before
+    // any REST call and writes no row.
+    presence_tick(&pool, &rest, guild, &state, t0)
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "counts plus the gated roster page; the skipped trigger calls nothing"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM presence_probe WHERE guild_id=$1")
+        .bind(guild)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a skipped trigger writes nothing");
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the first cycle finishes after release")
+        .unwrap()
+        .unwrap();
+    assert!(
+        state.probe_lease.lock().await.is_none(),
+        "the lease clears when the cycle finishes"
+    );
+    // Normal cycle unaffected: an hour later the tick runs and records.
+    presence_tick(&pool, &rest, guild, &state, t0 + 3_600_000)
+        .await
+        .unwrap();
+    let rows: Vec<(i32, Option<i32>)> = sqlx::query_as(
+        "SELECT approximate_presence_count, bot_floor FROM presence_probe
+          WHERE guild_id=$1 ORDER BY observed_at",
+    )
+    .bind(guild)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![(42, Some(2)), (42, None)]);
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+/// Overlap guard (TOG-12142): a lease older than `PRESENCE_PROBE_LEASE_MS`
+/// is presumed dead and taken over on the spot, while a fresh holder still
+/// makes the next trigger skip.
+#[tokio::test]
+async fn stale_probe_lease_is_taken_over() {
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP community job integration: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = fixture.pool().clone();
+    let guild = "3333";
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"approximate_presence_count": 42})),
+            ScriptedResponse::json(200, json!([member(5000, false)])),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+    let state = fresh_state(enabled_gates(), 14);
+    let t0 = parse_iso_millis("2026-09-28T01:00:00.000Z").unwrap();
+    // A holder from before the lease window is dead: this trigger runs.
+    *state.probe_lease.lock().await = Some(t0 - PRESENCE_PROBE_LEASE_MS as i64 - 1);
+    presence_tick(&pool, &rest, guild, &state, t0)
+        .await
+        .unwrap();
+    let rows: Vec<(i32, Option<i32>)> = sqlx::query_as(
+        "SELECT approximate_presence_count, bot_floor FROM presence_probe
+          WHERE guild_id=$1 ORDER BY observed_at",
+    )
+    .bind(guild)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![(42, Some(0))]);
+    assert!(
+        state.probe_lease.lock().await.is_none(),
+        "the lease clears after the takeover cycle"
+    );
+    // A fresh holder blocks the next trigger: skip, no REST, no row.
+    *state.probe_lease.lock().await = Some(t0);
+    presence_tick(&pool, &rest, guild, &state, t0)
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "a concurrent trigger calls nothing"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM presence_probe WHERE guild_id=$1")
+        .bind(guild)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "a skipped trigger writes nothing");
     mock.shutdown().await;
     fixture.close().await.unwrap();
 }

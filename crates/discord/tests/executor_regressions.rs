@@ -39,11 +39,10 @@ fn context(action: ModerationAction, count: Option<u64>) -> ModerationExecution 
 
 #[tokio::test]
 async fn original_response_edit_suppresses_mentions_bounds_content_and_validates_ids() {
-    let mock = MockRest::start(
-        vec![ScriptedResponse::status(200), ScriptedResponse::status(200)],
-        ScriptedResponse::status(500),
-    )
-    .await;
+    // The `@original` PATCH requires a validated message id receipt under
+    // main's durable send admission; a bare 200 is `Unavailable`, not success.
+    let receipt = || ScriptedResponse::json(200, serde_json::json!({"id": "555555555555555555"}));
+    let mock = MockRest::start(vec![receipt(), receipt()], ScriptedResponse::status(500)).await;
     let executor = executor_for(&mock);
     executor
         .edit_interaction_response(1234, "synthetic-webhook-token", "@everyone <@3333> result")
@@ -90,7 +89,11 @@ async fn original_response_edit_suppresses_mentions_bounds_content_and_validates
 // pinned Twilight parser accepts (the `Z` form never survived `Timestamp`).
 #[tokio::test]
 async fn timeout_outcome_sends_a_valid_timestamp() {
-    let mock = MockRest::start(vec![], ScriptedResponse::json(200, serde_json::json!({}))).await;
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!({"user": {"id": USER}})),
+    )
+    .await;
     let result = executor_for(&mock)
         .execute_outcome(
             &context(ModerationAction::Timeout, None),

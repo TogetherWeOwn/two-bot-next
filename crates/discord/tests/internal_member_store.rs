@@ -54,6 +54,193 @@ fn executor(mock: &MockRest) -> ActionExecutor {
 
 #[tokio::test]
 #[ignore = "requires agent-testdb; CI explicitly runs this suite"]
+async fn guard_refused_member_actions_retry_same_key_after_cooldown() {
+    use std::{sync::Arc, time::Duration};
+    use two_bot_discord::ratelimit_guard::{GuardConfig, RateLimitGuard};
+
+    let db = TestDb::new().await;
+    let store = InternalActionStore::new(db.pool.clone());
+    let keys = HashMap::from([("member".into(), ROLE.into())]);
+    let config = config(&keys);
+    let role_reads = || {
+        vec![
+            ScriptedResponse::json(200, json!({"roles":[]})),
+            ScriptedResponse::json(200, json!({"roles":[BOT_ROLE]})),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id":GUILD,"position":0,"managed":false},
+                    {"id":ROLE,"position":1,"managed":false},
+                    {"id":BOT_ROLE,"position":10,"managed":true}
+                ]),
+            ),
+        ]
+    };
+    for restriction in [
+        "add_breaker",
+        "add_global",
+        "add_token",
+        "role_breaker",
+        "role_late",
+    ] {
+        let role = restriction.starts_with("role");
+        let mut script = vec![];
+        if restriction == "role_late" {
+            script.extend(role_reads());
+            script[2].delay = Duration::from_millis(200);
+        }
+        if role {
+            script.extend(role_reads());
+        }
+        script.push(ScriptedResponse::status(if role { 204 } else { 201 }));
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let guard = Arc::new(
+            RateLimitGuard::new(GuardConfig {
+                invalid_request_threshold: 1,
+                window: Duration::from_millis(500),
+            })
+            .unwrap(),
+        );
+        let exec = ActionExecutor::with_proxy_and_guard(
+            "fixture-bot-token".into(),
+            Some(mock.origin()),
+            guard.clone(),
+        )
+        .unwrap();
+        match restriction {
+            "add_global" => guard.observe_global(Some(2.0)),
+            "add_token" => guard.observe_status(401, true),
+            "role_late" => {}
+            _ => guard.observe_status(403, true),
+        }
+        let payload = if role {
+            json!({"action":"role.assign","discord_id":USER,"role_key":"member"})
+        } else {
+            json!({"action":"guild.add_member","discord_id":USER,"access_token":TOKEN})
+        }
+        .to_string();
+        let key = format!("guard-{restriction}");
+        let close_before_put = async {
+            if restriction == "role_late" {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while mock.requests().len() < 3 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                guard.observe_status(403, true);
+            }
+        };
+        let (result, ()) = tokio::join!(
+            exec.execute_stored_member(&store, "website", &key, payload.as_bytes(), &config),
+            close_before_put,
+        );
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code,
+            if restriction == "add_token" {
+                ErrorCode::DiscordUnavailable
+            } else {
+                ErrorCode::RateLimited
+            }
+        );
+        assert!(error.code.retryable());
+        assert_eq!(error.log_reason, "discord_guard_refused");
+        let before = if restriction == "role_late" { 3 } else { 0 };
+        assert_eq!(mock.requests().len(), before);
+        assert!(mock
+            .requests()
+            .iter()
+            .all(|request| request.method == "GET"));
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM internal_idempotency WHERE key_hash = $1")
+                .bind(two_bot_core::body_hash(key.as_bytes()))
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "not_sent");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        // Fatal state requires a new process/guard, not an automatic reset.
+        let retry = if restriction == "add_token" {
+            ActionExecutor::with_proxy_and_guard(
+                "fixture-bot-token".into(),
+                Some(mock.origin()),
+                Arc::new(RateLimitGuard::new(Default::default()).unwrap()),
+            )
+            .unwrap()
+        } else {
+            exec.clone()
+        };
+        let outcome = retry
+            .execute_stored_member(&store, "website", &key, payload.as_bytes(), &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.outcome,
+            if role {
+                MemberOutcome::Assigned
+            } else {
+                MemberOutcome::Added
+            }
+        );
+        assert!(!outcome.replayed);
+        assert_eq!(mock.requests().len(), before + if role { 4 } else { 1 });
+        let replay = retry
+            .execute_stored_member(&store, "website", &key, payload.as_bytes(), &config)
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .filter(|request| request.method == "PUT")
+                .count(),
+            1
+        );
+        mock.shutdown().await;
+    }
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
+async fn dispatched_member_errors_keep_the_unknown_fence() {
+    let db = TestDb::new().await;
+    let store = InternalActionStore::new(db.pool.clone());
+    let keys = HashMap::new();
+    let config = config(&keys);
+    let payload =
+        json!({"action":"guild.add_member","discord_id":USER,"access_token":TOKEN}).to_string();
+    for status in [429, 503] {
+        let mock = MockRest::start(
+            vec![ScriptedResponse::status(status)],
+            ScriptedResponse::status(201),
+        )
+        .await;
+        let exec = executor(&mock);
+        let key = format!("wire-error-{status}");
+        let error = exec
+            .execute_stored_member(&store, "website", &key, payload.as_bytes(), &config)
+            .await
+            .unwrap_err();
+        assert!(error.code.retryable());
+        assert_ne!(error.log_reason, "discord_guard_refused");
+        assert_eq!(
+            exec.execute_stored_member(&store, "website", &key, payload.as_bytes(), &config)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InProgress
+        );
+        assert_eq!(mock.requests().len(), 1);
+        mock.shutdown().await;
+    }
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn replay_returns_recorded_member_outcome_without_another_rest_call() {
     let db = TestDb::new().await;
     let store = InternalActionStore::new(db.pool.clone());

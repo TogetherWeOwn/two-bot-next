@@ -1,8 +1,45 @@
 use super::*;
 use serde_json::json;
+use two_bot_core::apply_web_contract;
 use two_bot_testsupport::TestDatabase;
 
 use crate::discord_test_common::{MockRest, ScriptedResponse};
+
+use crate::tracing_capture;
+
+#[test]
+fn admission_lazy_pool_rejects_query_secrets_before_sqlx_logging() {
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let error = admission_pool("postgres://fixture:fixture-password@127.0.0.1:1/fixture?api_key=fixture-admission-query-secret").unwrap_err();
+            assert_eq!(error, "invalid admission authority");
+            let pool = admission_pool("postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable").unwrap();
+            assert_eq!(pool.size(), 0);
+            pool.close().await;
+            tracing::warn!("website admission capture remains active");
+        });
+    });
+    let text = capture.text();
+    assert!(text.contains("website admission capture remains active"));
+    assert!(!text.contains("fixture-admission-query-secret"));
+    assert!(!text.contains("ignoring unrecognized connect parameter"));
+}
+
+async fn tick(
+    kind: Kind,
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    observation: &Mutex<()>,
+) -> Result<(), ErrorClass> {
+    let (_stop, shutdown) = watch::channel(false);
+    run_once(kind, pool, rest, guild, observation, &shutdown).await
+}
 
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
@@ -134,11 +171,16 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     let observation = Arc::new(Mutex::new(()));
 
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
-    let rest = executor(&mock);
-    run_once(Kind::Rank, &pool, &rest, guild, &observation)
+    let rest = governed_executor(
+        "synthetic-job-test-token",
+        Some(mock.origin()),
+        pool.clone(),
+    )
+    .unwrap();
+    tick(Kind::Rank, &pool, &rest, guild, &observation)
         .await
         .unwrap();
-    run_once(Kind::Counter, &pool, &rest, guild, &observation)
+    tick(Kind::Counter, &pool, &rest, guild, &observation)
         .await
         .unwrap();
     assert!(
@@ -176,7 +218,12 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         ScriptedResponse::status(500),
     )
     .await;
-    let rest = executor(&mock);
+    let rest = governed_executor(
+        "synthetic-job-test-token",
+        Some(mock.origin()),
+        pool.clone(),
+    )
+    .unwrap();
     // Exercise the supervisor as well as the adapters, sequentially for the
     // ordered-response mock. Each job has an immediate first deadline.
     for (name, kind) in NAMES
@@ -198,9 +245,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
                     let pool = pool.clone();
                     let rest = rest.clone();
                     let observation = observation.clone();
-                    Box::pin(
-                        async move { run_once(kind, &pool, &rest, "2222", &observation).await },
-                    )
+                    Box::pin(async move { tick(kind, &pool, &rest, "2222", &observation).await })
                 }),
             }],
             status.clone(),
@@ -246,7 +291,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
     }
     for _ in 0..3 {
         assert_eq!(
-            run_once(Kind::Events, &pool, &rest, guild, &observation).await,
+            tick(Kind::Events, &pool, &rest, guild, &observation).await,
             Err(ErrorClass::Rest)
         );
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduled_events")
@@ -255,7 +300,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
             .unwrap();
         assert_eq!(rows, 1, "failed/malformed reads preserve mirror");
     }
-    run_once(Kind::Events, &pool, &rest, guild, &observation)
+    tick(Kind::Events, &pool, &rest, guild, &observation)
         .await
         .unwrap();
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduled_events")
@@ -264,6 +309,36 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
         .unwrap();
     assert_eq!(rows, 0, "valid empty response clears mirror");
     assert_eq!(mock.requests().len(), 8);
+    // The production constructor joins the same lane even for a mock proxy.
+    let guarded = governed_executor(
+        "synthetic-job-test-token",
+        Some(mock.origin()),
+        pool.clone(),
+    )
+    .unwrap();
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(
+        pool.clone(),
+        "synthetic-job-test-token",
+    )
+    .unwrap();
+    admission
+        .extend(two_bot_core::send_admission::SendCooldown::Indefinite)
+        .await
+        .unwrap();
+    let (_stop, shutdown) = watch::channel(false);
+    assert_eq!(
+        run_once(
+            Kind::Events,
+            &pool,
+            &guarded,
+            guild,
+            &observation,
+            &shutdown
+        )
+        .await,
+        Err(ErrorClass::Rest)
+    );
+    assert_eq!(mock.requests().len(), 8, "held job must not reach HTTP");
     mock.shutdown().await;
     for query in [
         "SELECT human_member_count_at FROM guild_counters WHERE guild_id=$1",
@@ -319,7 +394,7 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
         let pool = pool.clone();
         let rest = executor(&mock);
         let observation = observation.clone();
-        tokio::spawn(async move { run_once(Kind::Rank, &pool, &rest, "2222", &observation).await })
+        tokio::spawn(async move { tick(Kind::Rank, &pool, &rest, "2222", &observation).await })
     };
     // Rank has observed its old roster and is stalled on the role response.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -333,9 +408,7 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
         let pool = pool.clone();
         let rest = executor(&mock);
         let observation = observation.clone();
-        tokio::spawn(
-            async move { run_once(Kind::Counter, &pool, &rest, "2222", &observation).await },
-        )
+        tokio::spawn(async move { tick(Kind::Counter, &pool, &rest, "2222", &observation).await })
     };
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut counter)
@@ -348,7 +421,7 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
         "counter must wait before observing"
     );
     // Independent events still publish while the shared denominator lane is busy.
-    run_once(Kind::Events, pool, &executor(&mock), "2222", &observation)
+    tick(Kind::Events, pool, &executor(&mock), "2222", &observation)
         .await
         .unwrap();
     assert!(!rank.is_finished());

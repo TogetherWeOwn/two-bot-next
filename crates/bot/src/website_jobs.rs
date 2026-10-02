@@ -6,15 +6,15 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
-    apply_web_contract, build_community_snapshot, build_counter_reading, match_rank_roles,
-    normalize_events, now_iso, read_raid_windows, replace_events, write_counter,
-    write_rank_snapshot, Config, RawScheduledEvent, RosterMember, WebsiteStoreError,
-    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    build_community_snapshot, build_counter_reading, match_rank_roles, normalize_events, now_iso,
+    read_raid_windows, replace_events, write_counter, write_rank_snapshot, Config,
+    RawScheduledEvent, RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS,
+    RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
-    community_jobs,
+    audit_runtime, community_jobs,
     jobs::{self, ErrorClass, Job},
     server,
 };
@@ -24,6 +24,10 @@ pub const NAMES: [&str; 3] = ["counter", "rank", "scheduled_events"];
 #[cfg(test)]
 #[path = "website_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "website_snapshot_tests.rs"]
+mod snapshot_tests;
 
 #[derive(Clone, Copy)]
 pub enum Kind {
@@ -73,15 +77,11 @@ impl Context {
                 let db = two_bot_cutover::connect(
                     &self.url,
                     two_bot_cutover::DB_POOL_MAX_DEFAULT,
-                    false,
+                    true, // Operator provisions migrations/views; runtime is DML-only.
                 )
                 .await
                 .map_err(|_| ErrorClass::Database)?;
-                let pool = db.pool().clone();
-                apply_web_contract(&pool)
-                    .await
-                    .map_err(|_| ErrorClass::Database)?;
-                Ok(pool)
+                Ok(db.pool().clone())
             })
             .await
     }
@@ -95,6 +95,24 @@ impl Drop for Shutdown {
     }
 }
 
+fn governed_executor(
+    token: &str,
+    proxy: Option<String>,
+    pool: PgPool,
+) -> Result<ActionExecutor, String> {
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(pool, token)
+        .map_err(|error| error.to_string())?;
+    ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
+}
+
+fn admission_pool(url: &str) -> Result<PgPool, String> {
+    let options = two_bot_core::database_url::connect_options(url)
+        .map_err(|_| "invalid admission authority".to_owned())?;
+    Ok(sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(options))
+}
+
 pub async fn serve(
     config: &Config,
     listener: tokio::net::TcpListener,
@@ -104,7 +122,12 @@ pub async fn serve(
     let mut registered = Vec::new();
     let mut parked = Vec::new();
     if let Ok((token, url, guild)) = crate::gateway_prerequisites(config) {
-        match ActionExecutor::with_proxy(token.to_owned(), std::env::var("DISCORD_API_BASE").ok()) {
+        // Lazy connection preserves parked/startup behavior; every wire attempt
+        // still fails closed on this same runtime database authority.
+        let rest = admission_pool(url).and_then(|pool| {
+            governed_executor(token, std::env::var("DISCORD_API_BASE").ok(), pool)
+        });
+        match rest {
             Ok(rest) => {
                 let context = Arc::new(Context {
                     url: url.to_owned(),
@@ -118,6 +141,7 @@ pub async fn serve(
                     .zip([Kind::Counter, Kind::Rank, Kind::Events])
                 {
                     let context = context.clone();
+                    let shutdown = shutdown.subscribe();
                     let cadence = cadence(kind);
                     registered.push(Job {
                         name,
@@ -130,31 +154,46 @@ pub async fn serve(
                         }),
                         action: Arc::new(move || {
                             let context = context.clone();
+                            let shutdown = shutdown.clone();
                             Box::pin(async move {
-                                run_once(
-                                    kind,
-                                    context.pool().await?,
-                                    &context.rest,
-                                    &context.guild,
-                                    &context.observation,
-                                )
-                                .await
+                                tokio::select! {
+                                    biased;
+                                    _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
+                                    result = async {
+                                        run_once(
+                                            kind,
+                                            context.pool().await?,
+                                            &context.rest,
+                                            &context.guild,
+                                            &context.observation,
+                                            &shutdown,
+                                        ).await
+                                    } => result,
+                                }
                             })
                         }),
                     });
                 }
-                let registration = community_jobs::register(context);
+                let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
+                match audit_runtime::register(context, shutdown.subscribe()) {
+                    Some(job) => registered.push(job),
+                    None => parked.extend(audit_runtime::NAMES),
+                }
             }
             Err(_) => tracing::warn!("website jobs parked: invalid REST configuration"),
         }
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
-    // All six names park together when nothing registered; otherwise only the
-    // env-gated community names are parked and the rest report live status.
+    let names: Vec<&'static str> = NAMES
+        .into_iter()
+        .chain(community_jobs::NAMES)
+        .chain(audit_runtime::NAMES)
+        .collect();
+    // Every name parks when nothing registered; otherwise only the env-gated
+    // community and audit names are parked and the rest report live status.
     let status = jobs::statuses(&names, registered.is_empty());
     {
         let mut entries = status.write().await;
@@ -323,12 +362,36 @@ fn raw_event(value: &Value) -> Result<RawScheduledEvent, ErrorClass> {
     })
 }
 
+/// Cancel queued/in-flight observations directly, without waiting for the job
+/// supervisor to abort us. Biased selection discards a simultaneously-ready REST
+/// result; publication fences also cover shutdown arriving during that poll.
+/// This cannot undo a database commit already submitted before shutdown.
 pub async fn run_once(
     kind: Kind,
     pool: &PgPool,
     rest: &ActionExecutor,
     guild: &str,
     observation: &Mutex<()>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<(), ErrorClass> {
+    tokio::select! {
+        biased;
+        _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
+        result = snapshot_once(kind, pool, rest, guild, observation, shutdown) => result,
+    }
+}
+
+fn publication_stopped(shutdown: &watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+async fn snapshot_once(
+    kind: Kind,
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    observation: &Mutex<()>,
+    shutdown: &watch::Receiver<bool>,
 ) -> Result<(), ErrorClass> {
     if matches!(kind, Kind::Events) {
         let response = get(
@@ -343,6 +406,9 @@ pub async fn run_once(
             .map(raw_event)
             .collect::<Result<Vec<_>, _>>()?;
         let events = normalize_events(&raw).ok_or(ErrorClass::Rest)?;
+        if publication_stopped(shutdown) {
+            return Ok(());
+        }
         return replace_events(pool, guild, &now_iso(), &events)
             .await
             .map_err(|_| ErrorClass::Database);
@@ -351,6 +417,9 @@ pub async fn run_once(
     // observation through commit so a slow rank tick cannot overwrite a newer
     // counter roster. Events use independent tables and do not take this lock.
     let _observation = observation.lock().await;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     let Some(windows) = read_raid_windows(pool, guild)
         .await
         .map_err(|_| ErrorClass::Database)?
@@ -365,11 +434,20 @@ pub async fn run_once(
         );
         return Ok(());
     };
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     let members = roster(rest, guild).await?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     if matches!(kind, Kind::Counter) {
         let reading = build_counter_reading(&members, &windows).ok_or(ErrorClass::Rest)?;
         let count =
             i32::try_from(reading.human_member_count).map_err(|_| ErrorClass::Configuration)?;
+        if publication_stopped(shutdown) {
+            return Ok(());
+        }
         return write_counter(pool, guild, &now_iso(), count)
             .await
             .map_err(|_| ErrorClass::Database);
@@ -387,6 +465,9 @@ pub async fn run_once(
         .collect::<Result<Vec<_>, ErrorClass>>()?;
     let ladder = match_rank_roles(&roles).ok_or(ErrorClass::Configuration)?;
     let snapshot = build_community_snapshot(&members, &ladder, &windows).ok_or(ErrorClass::Rest)?;
+    if publication_stopped(shutdown) {
+        return Ok(());
+    }
     write_rank_snapshot(pool, guild, &now_iso(), &snapshot)
         .await
         .map_err(|error| match error {

@@ -19,6 +19,9 @@
 //! - channel moderation (`/purge`, `/slowmode`, `/lockdown`, `/unlock`): shared
 //!   router authorization → ephemeral defer → durable claim/lane → REST effect →
 //!   atomic result/audit → original-response edit. Ambiguity retains the lane.
+//! - leveling (`/rank [member]`, `/leaderboard`): one immediate callback,
+//!   ephemeral rank and public mention-suppressed top ten. The ordered gateway
+//!   award path shares this runtime's pool, executor and onboarding gates.
 //!
 //! Registry publication runs here too: every `Event::Ready` publishes the
 //! router's ONE merged publish set (`set_guild_commands` is idempotent, so a
@@ -60,7 +63,7 @@ use two_bot_core::{
 };
 use two_bot_discord::{
     publish_commands, register_channel_handlers, response_for_slash, route_interaction,
-    ActionExecutor, ChannelModerationRuntime, RoutedInteraction,
+    ActionExecutor, ChannelModerationRuntime, LevelingRuntime, RoutedInteraction,
 };
 
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
@@ -92,11 +95,11 @@ impl InteractionHandler for StickyHandler {
     }
 }
 
-/// Router handler marker for the feed-relay commands; one instance per id.
+/// Router handler marker for the feed and leveling slices; one per id.
 #[derive(Debug)]
-struct FeedHandler(HandlerId);
+struct SliceHandler(HandlerId);
 
-impl InteractionHandler for FeedHandler {
+impl InteractionHandler for SliceHandler {
     fn id(&self) -> HandlerId {
         self.0
     }
@@ -137,6 +140,7 @@ pub struct CommandRuntime {
     router: InteractionRouter,
     channel: ChannelModerationRuntime,
     tasks: Mutex<DispatchTasks>,
+    leveling: LevelingRuntime,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
     tickets: Option<Arc<crate::ticket_runtime::TicketRuntime>>,
@@ -157,7 +161,12 @@ impl CommandRuntime {
     /// boots — when gate parsing or executor construction fails, so bad
     /// env cannot take the shard down.
     #[must_use]
-    pub fn from_env(pool: Pool<Postgres>, token: &str, guild_id: u64) -> Option<Arc<Self>> {
+    pub fn from_env(
+        pool: Pool<Postgres>,
+        token: &str,
+        guild_id: u64,
+        onboarding: two_bot_core::OnboardingGates,
+    ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
             Err(err) => {
@@ -178,6 +187,7 @@ impl CommandRuntime {
             &features,
             &moderation,
             SurfaceFlags {
+                session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                 tickets: ticket_config.is_some(),
                 ..SurfaceFlags::default()
             },
@@ -189,19 +199,35 @@ impl CommandRuntime {
             HandlerId::FeedAdd,
             HandlerId::FeedRemove,
             HandlerId::FeedList,
+            HandlerId::Rank,
+            HandlerId::Leaderboard,
         ] {
-            router.register(Box::new(FeedHandler(id)));
+            router.register(Box::new(SliceHandler(id)));
         }
         let proxy = std::env::var("DISCORD_API_BASE")
             .ok()
             .filter(|value| !value.is_empty());
-        let executor = match ActionExecutor::with_proxy(token.to_owned(), proxy) {
+        let admission =
+            match two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token) {
+                Ok(admission) => Arc::new(admission),
+                Err(err) => {
+                    warn!(error = %err, "send admission invalid; command runtime disabled");
+                    return None;
+                }
+            };
+        let executor = match ActionExecutor::with_admission(token.to_owned(), proxy, admission) {
             Ok(executor) => executor,
             Err(err) => {
                 warn!(error = %err, "REST executor failed to build; command runtime disabled");
                 return None;
             }
         };
+        let leveling = LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            guild_id,
+            onboarding,
+        );
         let tickets = match ticket_config {
             Some(config) => match crate::ticket_runtime::TicketRuntime::new(
                 pool.clone(),
@@ -222,6 +248,7 @@ impl CommandRuntime {
             pool,
             executor,
             router,
+            leveling,
             guild_id,
             tickets,
             automations: features.automations,
@@ -240,6 +267,15 @@ impl CommandRuntime {
         guild_id: u64,
         automations: bool,
     ) -> Arc<Self> {
+        let leveling = LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            guild_id,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
         Arc::new(Self {
             channel: ChannelModerationRuntime::new(
                 ChannelModerationStore::from_pool(pool.clone()),
@@ -249,6 +285,7 @@ impl CommandRuntime {
             pool,
             executor,
             router,
+            leveling,
             guild_id,
             tickets: None,
             automations,
@@ -279,6 +316,12 @@ impl CommandRuntime {
         let task = tokio::spawn(work);
         handles.push(task.abort_handle());
         true
+    }
+
+    /// Shares this runtime's pool, executor/pacing and onboarding gates with
+    /// the ordered award path; only this runtime dispatches interactions.
+    pub fn leveling(&self) -> LevelingRuntime {
+        self.leveling.clone()
     }
 
     #[cfg(test)]
@@ -437,8 +480,8 @@ impl CommandRuntime {
     /// Route all slash commands through the shared router. Refusals get the
     /// existing ephemeral text; accepted builtins without a wired slice get
     /// an unavailable reply. Channel commands own their defer/audit lifecycle;
-    /// other implemented names use the existing lifecycle below. Router Ignore
-    /// (unknown names/guild fence) stays silent.
+    /// sticky/feed defer ephemerally; leveling sends its own immediate
+    /// callback. Router Ignore (unknown names/guild fence) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
         if ChannelModerationRuntime::accepts(interaction) {
             if let Err(error) = self.channel.respond(&self.router, interaction).await {
@@ -474,6 +517,14 @@ impl CommandRuntime {
         let SlashOutcome::Handled { handler } = outcome else {
             return;
         };
+        if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) {
+            // Leveling owns its immediate rank-ephemeral/leaderboard-public
+            // callback. Never send the generic ephemeral defer as well.
+            if let Err(error) = self.leveling.handle_interaction(interaction, handler).await {
+                warn!(interaction_id = %interaction.id.get(), command = %name, error = %error, "leveling interaction failed");
+            }
+            return;
+        }
         let owner = match name.as_str() {
             "sticky" | "sticky-remove" => Some(HandlerId::AutomationAdmin),
             "feed-add" => Some(HandlerId::FeedAdd),
@@ -1143,7 +1194,7 @@ pub(crate) fn feed_remove_option(interaction: &Interaction) -> Option<String> {
 }
 
 /// The runtime's router for tests that bypass `from_env`'s env reads:
-/// sticky + feed + channel handler markers, matching `from_env`'s registrations.
+/// sticky + feed + channel + leveling markers, matching `from_env`'s registrations.
 #[cfg(test)]
 pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     let mut router = InteractionRouter::new(gates);
@@ -1153,8 +1204,10 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
         HandlerId::FeedAdd,
         HandlerId::FeedRemove,
         HandlerId::FeedList,
+        HandlerId::Rank,
+        HandlerId::Leaderboard,
     ] {
-        router.register(Box::new(FeedHandler(id)));
+        router.register(Box::new(SliceHandler(id)));
     }
     router
 }

@@ -28,6 +28,7 @@ use crate::gateway::{
 };
 
 mod deadline;
+mod force_identify;
 mod member_journey;
 mod persistent;
 mod recovery;
@@ -392,6 +393,7 @@ async fn spawn_runner_until_shutdown(
     let shard = Shard::with_config(ShardId::ONE, builder.build());
     let pipeline = Arc::new(build_pipeline(
         db.store.milestones().await.expect("milestones"),
+        None,
     ));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
     let task = tokio::spawn(run_shard(

@@ -29,9 +29,11 @@ releases it. Scheduled events remain independent. Publication timestamps reuse
 core `now_iso`, the fixed `YYYY-MM-DDTHH:mm:ss.sssZ` website contract.
 
 The jobs park when `DISCORD_TOKEN`, `DATABASE_URL` or nonzero `GUILD_ID` is
-missing. They share a paced REST executor and a lazily initialized pool; the
-existing cutover migrations and `web_v1` contract are applied before the first
-publication. Initialization errors are retried on the next attempt, never
+missing. They share a paced, durably governed REST executor and lazily initialized
+pools using the gateway's `DATABASE_URL` authority. The operator must provision
+cutover migrations, `web_v1` and the reviewed role plan before runtime starts;
+jobs never execute migration/view DDL using the DML-only runtime credential.
+Admission refusal sends no HTTP. Initialization errors are retried on the next attempt, never
 logged with a database URL. Guild members are fully paginated; rank-role names
 come from the guild object's `roles` array. Domain/store semantics are unchanged:
 
@@ -115,7 +117,10 @@ the env gates below.
   read writes nothing — not a null row, not a zero. Rescan the bot floor only
   when `bot_floor_due`; a failed listing keeps the presence row with a NULL
   floor. Drive the probe every `PRESENCE_PROBE_INTERVAL_MS` (1 h), unref'd,
-  with one reading at startup.
+  with one reading at startup. A per-process overlap lease
+  (`PRESENCE_PROBE_LEASE_MS`, 30 min) makes a concurrent trigger skip with
+  `presence_probe_overlap_skipped` before any REST call; a holder older than
+  the lease is presumed dead and taken over.
 - Drive the scorecard every `SCORECARD_TICK_INTERVAL_MS` (60 s); fire at most
   once per Monday via `scorecard_tick`. Before scoring, persist full-week
   stream coverage (`mark_stream_coverage` for all six streams); a mid-week
