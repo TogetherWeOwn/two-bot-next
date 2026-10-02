@@ -215,7 +215,9 @@ class SupplyChainTests(unittest.TestCase):
                 line for line in path.read_text().splitlines()
                 if not line.lstrip().startswith("#")
             )
-            self.assertNotIn("ubuntu-latest", code, str(path))
+            # Only the documented routing expression may name a hosted runner.
+            routed = "'[\"ubuntu-latest\"]'"
+            self.assertNotIn("ubuntu-latest", code.replace(routed, ""), str(path))
 
     def test_candidate_preflight_cannot_replace_existing_gates(self):
         supply = (ROOT / ".github/workflows/sbom.yml").read_text()

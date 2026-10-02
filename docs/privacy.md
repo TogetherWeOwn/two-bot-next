@@ -23,6 +23,13 @@ are outside this implementation's scope.
 - Moderation, announcements, automation and operational audit rows, actor/target
   IDs, reasons and metadata. Some legacy-compatible payload columns are arbitrary
   TEXT, not database-validated JSON.
+- Automod violation counts and once-per-message ledgers store member and message
+  IDs and filter names, never content (`automod_violations`,
+  `automod_processed_messages`). Per-delivery replay claims may keep a matched
+  author ID (`automod_delivery_claims.matched_author_id`). Settled claims
+  (result recorded) are erased with the member; an unsettled claim (in flight,
+  started, counted or released without a result) is a replay guard and makes
+  erasure refuse until it settles, so a gateway retry cannot sanction twice.
 - Self-role audit and panel claims store member IDs, role effects, lease/recovery
   state and outcomes. Settled member records are covered; unresolved role effects
   or active leases refuse erasure rather than discard reconciliation evidence.

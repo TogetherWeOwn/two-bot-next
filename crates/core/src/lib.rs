@@ -61,6 +61,7 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod membership;
 pub mod message_safety;
 pub mod metrics;
 pub mod moderation;
@@ -72,6 +73,7 @@ pub mod presence;
 pub mod presence_store;
 pub mod raid;
 pub mod raid_removal;
+pub mod rejection_telemetry;
 pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
@@ -87,6 +89,7 @@ pub mod settings;
 pub mod sticky;
 pub mod tickets;
 pub mod voice;
+pub mod voice_alias;
 pub mod voice_assistant_cap;
 pub mod voice_config;
 pub mod voice_config_diff;
@@ -95,6 +98,7 @@ pub mod voice_ownership;
 pub mod voice_permission_health;
 pub mod voice_permissions;
 pub mod voice_placement;
+pub mod voice_private;
 pub mod voice_room_controls;
 pub mod voice_text_channel;
 pub mod voice_vote_kick;
@@ -156,8 +160,8 @@ pub use evidence::{
 };
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
-    announcement_commands, automation_commands, feature_commands, scorecard_attendance_command,
-    FeatureGates, GateError,
+    announcement_commands, automation_commands, feature_commands, parse_prefix_trigger,
+    scorecard_attendance_command, FeatureGates, GateError,
 };
 pub use funnel::{
     format_iso_millis, idempotency_key, is_measurable_gate_clearing, now_iso, parse_iso_millis,

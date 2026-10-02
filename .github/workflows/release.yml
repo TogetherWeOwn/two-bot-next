@@ -31,7 +31,8 @@ jobs:
   release-please:
     name: release-please
     if: github.ref == 'refs/heads/main' && inputs.dry_run != true && (inputs.release_tag == '' || github.event_name != 'workflow_dispatch')
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'release-please') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
     outputs:
       pr_available: ${{ steps.select.outputs.pr_available }}
@@ -163,7 +164,8 @@ jobs:
     name: dispatch-checks
     needs: release-please
     if: needs.release-please.outputs.pr_available == 'true'
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'dispatch-checks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     steps:
       - env:
@@ -187,7 +189,8 @@ jobs:
   sbom-target:
     needs: release-please
     if: ${{ !cancelled() && (inputs.dry_run == true || inputs.release_tag != '' || needs.release-please.outputs.release_created == 'true') }}
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sbom-target') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     permissions:
       contents: read
     outputs:
@@ -218,7 +221,8 @@ jobs:
   attach-sbom:
     needs: [sbom-target, release-sbom]
     if: ${{ !cancelled() && needs.release-sbom.result == 'success' && needs.sbom-target.outputs.tag != '' }}
-    runs-on: [self-hosted, two-selfhosted]
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'attach-sbom') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
     permissions:
       contents: write
