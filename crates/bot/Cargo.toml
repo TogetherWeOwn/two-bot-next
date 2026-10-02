@@ -45,6 +45,8 @@ twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
 [dev-dependencies]
+# The shared loopback Discord fixture uses SinkExt only in integration tests.
+futures-util = { workspace = true, features = ["sink"] }
 two-bot-testsupport = { version = "0.2.0", path = "../testsupport" }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }
