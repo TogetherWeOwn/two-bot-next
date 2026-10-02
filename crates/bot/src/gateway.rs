@@ -27,8 +27,7 @@ use two_bot_core::gateway_session::{
 use two_bot_core::{ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::GatewaySessionStore;
 use two_bot_discord::{
-    gateway_intents, needs_message_content, InviteSource, LevelingRuntime, NoClassification,
-    OrderedLevelingPipeline,
+    gateway_intents, needs_message_content, InviteSource, LevelingRuntime, OrderedLevelingPipeline,
 };
 
 /// Install the process-wide rustls crypto provider (ring) unless one is set.
@@ -237,21 +236,6 @@ pub async fn run_shard<I: InviteSource + 'static>(
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
-    let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
-    run_shard_inner(shard, pipeline, state, store, runtime, leveling, shutdown).await
-}
-
-/// Shared runner body so tests can inject a leveling runtime without a full
-/// command runtime.
-async fn run_shard_inner<I: InviteSource + 'static>(
-    shard: Shard,
-    pipeline: Arc<GatewayPipeline<I>>,
-    state: Arc<RwLock<GatewayState>>,
-    store: GatewaySessionStore,
-    runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
-    leveling: Option<LevelingRuntime>,
-    shutdown: impl std::future::Future<Output = ()>,
-) -> Result<(), sqlx::Error> {
     let generation = Arc::new(AtomicU64::new(0));
     let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;
     // Tickets run beside reception and are cancelled/joined before return.
@@ -361,25 +345,31 @@ async fn run_shard_inner<I: InviteSource + 'static>(
                 let mut connected = false;
                 if let Some(dispatch) = dispatch {
                     connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed);
-                    // Funnel first (synchronous, under the checkpoint
-                    // deadline), then drain deferred XP awards through the
-                    // leveling runtime before the cursor commits. Without a
-                    // leveling runtime the requests stay collected and inert.
+                    // Funnel first (synchronous), then drain deferred XP
+                    // awards through the leveling runtime under the checkpoint
+                    // deadline before the cursor commits. Without a leveling
+                    // runtime the drain is a no-op and the requests stay inert.
                     let requests = pipeline.collect_at(
                         &dispatch.event,
                         &dispatch.observed_at,
                         two_bot_discord::MessageEligibility::default(),
                     );
                     if !requests.is_empty() {
-                        let Some(leveling) = leveling.as_ref() else {
-                            panic!("gateway leveling dispatch without runtime")
-                        };
                         handle
-                            .block_on(pipeline.drain(requests))
-                            .unwrap_or_else(|error| {
-                                // Runtime Display is sanitized; never log its
-                                // SQL/HTTP source.
-                                tracing::warn!(error = %error, "gateway leveling dispatch failed");
+                            .block_on(checkpoint_io(&worker_state, &generation, deadline, async {
+                                pipeline.drain(requests).await.map(drop).map_err(|error| {
+                                    // Runtime Display is sanitized; never
+                                    // log its SQL/HTTP source.
+                                    tracing::warn!(
+                                        error = %error,
+                                        "gateway leveling dispatch failed"
+                                    );
+                                    sqlx::Error::InvalidArgument(
+                                        "leveling gateway dispatch failed".into(),
+                                    )
+                                })
+                            }))
+                            .unwrap_or_else(|_| {
                                 panic!("gateway leveling dispatch failed; checkpoint unchanged")
                             });
                     }
@@ -523,7 +513,13 @@ pub fn build_pipeline(
     milestones: Vec<two_bot_core::FunnelEvent>,
     runtime: Option<LevelingRuntime>,
 ) -> GatewayPipeline {
-    OrderedLevelingPipeline::new(GatewayFunnelBuffer::from_milestones(milestones), runtime)
+    let buffer = GatewayFunnelBuffer::from_milestones(milestones);
+    OrderedLevelingPipeline::with_snapshots(
+        buffer.clone(),
+        runtime,
+        two_bot_discord::NoInvites,
+        buffer,
+    )
 }
 
 pub async fn build_persistent_pipeline(

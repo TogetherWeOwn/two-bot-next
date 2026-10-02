@@ -26,8 +26,8 @@ use two_bot_core::{
 };
 
 use crate::{
-    pipeline::MessageEligibility, ActionExecutor, ChannelClassifier, DiscordError, InviteSource,
-    NoClassification, NoInvites, Pipeline, PipelineSnapshots,
+    pipeline::MessageEligibility, ActionExecutor, DiscordError, InviteSource, NoClassification,
+    NoInvites, Pipeline, PipelineSnapshots,
 };
 
 /// Failures propagate to the gateway supervisor; Display never includes SQL
