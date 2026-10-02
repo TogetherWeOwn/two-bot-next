@@ -693,3 +693,46 @@ async fn uncertain_response_retains_fence_and_disabled_action_never_sends() {
     mock.shutdown().await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; CI explicitly runs this suite"]
+async fn repeated_json_key_refuses_before_claim_or_rest() {
+    let db = TestDb::new().await;
+    let store = InternalActionStore::new(db.pool.clone());
+    let keys = HashMap::from([("member".into(), ROLE.into())]);
+    let config = config(&keys);
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!({"roles":[ROLE]}))],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let exec = executor(&mock);
+    // serde_json alone keeps the last `discord_id`; the store must not act on
+    // a body whose readers can disagree about the target.
+    let repeated = format!(
+        r#"{{"action":"role.assign","discord_id":"{USER}","discord_id":"{BOT}","role_key":"member"}}"#
+    );
+    let err = exec
+        .execute_stored_member(&store, "website", "dup-key-1", repeated.as_bytes(), &config)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Malformed);
+    assert_eq!(err.log_reason, "duplicate_json_key");
+    assert!(mock.requests().is_empty());
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    // No claim was taken, so the same key still runs a well-formed body fresh.
+    let payload = json!({"action":"role.assign","discord_id":USER,"role_key":"member"}).to_string();
+    let first = exec
+        .execute_stored_member(&store, "website", "dup-key-1", payload.as_bytes(), &config)
+        .await
+        .unwrap();
+    assert_eq!(first.outcome, MemberOutcome::AlreadyHeld);
+    assert!(!first.replayed);
+    assert_eq!(mock.requests().len(), 1);
+    mock.shutdown().await;
+    db.cleanup().await;
+}

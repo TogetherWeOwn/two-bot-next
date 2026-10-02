@@ -887,6 +887,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     // Durable dedupe remains enforceable, not merely present in the dump.
     for statement in [
         "INSERT INTO internal_nonces SELECT * FROM internal_nonces WHERE nonce_hash = repeat('a', 64)",
+        "INSERT INTO internal_clock_high_water SELECT * FROM internal_clock_high_water",
         "INSERT INTO internal_discord_events SELECT * FROM internal_discord_events WHERE event_hash = repeat('3', 64)",
         "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')",
         "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'",
@@ -1465,7 +1466,7 @@ fn shipped_drill_script(archives: &Path, binary: &Path) -> String {
 fn shipped_cli(command: &mut Command, label: &str) -> Output {
     let output = command.output().expect("start the shipped two-bot binary");
     // Drill evidence for the CI log. The CLI never prints database URLs.
-    println!(
+    eprintln!(
         "--- {label}: {}\n{}{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
@@ -1536,7 +1537,7 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     let tables = covered_tables(source).await;
     let before = snapshot(source, &tables).await;
     let version = schema_version(source).await;
-    println!(
+    eprintln!(
         "drill: schema at migration {} {} ({} applied), {} bot-owned tables",
         version.0,
         version.1,
@@ -1597,8 +1598,14 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     let target_url = fixture_url(&target);
     // Month one restores into a dirtied scratch; month two into the previous
     // drill's result, as the monthly timer does.
+    let mut floors = BTreeMap::new();
     for month in 1..=2 {
         dirty_target(pool).await;
+        // Keep the floors in force before the last restore, as the
+        // reversed-rows caller does: dirty_target hands out target-only
+        // identities whose rows restore wipes, but the allocator must not
+        // rewind onto them.
+        floors.extend(allocation_floors(pool, &contents.manifest.sequence_marks).await);
         let cas_before = next_cas_token(pool).await;
         let drill = shipped_cli(
             Command::new("/usr/bin/bash")
@@ -1611,7 +1618,7 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
         assert_drill_verified(&drill, archive, &tables);
         let after = snapshot(pool, &tables).await;
         for table in &tables {
-            println!(
+            eprintln!(
                 "drill: month {month} {table:32} source {:5} restored {:5}",
                 before[table].rows.len(),
                 after[table].rows.len()
@@ -1628,9 +1635,9 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     }
     assert_guards_work(pool).await;
 
-    let allocations = allocate_owned_sequences(pool, false).await;
+    let allocations = allocate_owned_sequences(pool, false, &floors).await;
     for ((table, column), (next, increment)) in &allocations {
-        println!("drill: sequence {table}.{column} resumed at {next} (increment {increment})");
+        eprintln!("drill: sequence {table}.{column} resumed at {next} (increment {increment})");
     }
     assert_default_inserts(pool, &allocations).await;
     let allocated_version: i64 = sqlx::query_scalar("SELECT nextval('guild_settings_version_seq')")
@@ -1641,7 +1648,7 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
         allocated_version, 84,
         "standalone settings version resumes beyond restored max"
     );
-    println!("drill: sequence guild_settings_version_seq resumed at {allocated_version}");
+    eprintln!("drill: sequence guild_settings_version_seq resumed at {allocated_version}");
     let inserted_version: i64 = sqlx::query_scalar("INSERT INTO guild_settings (guild_id, key, value, version, updated_by) VALUES ('100000000000000001', 'TWO_BACKUP_TEST', 'true', nextval('guild_settings_version_seq'), 'post-restore') RETURNING version").fetch_one(pool).await.unwrap();
     assert_eq!(inserted_version, 85);
     for (table, statement) in [
@@ -1653,7 +1660,7 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
         ("automod_delivery_claims", "INSERT INTO automod_delivery_claims SELECT * FROM automod_delivery_claims"),
     ] {
         assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
-        println!("drill: replay refused (23505) in {table}");
+        eprintln!("drill: replay refused (23505) in {table}");
     }
     target.close().await.unwrap();
     db.close().await.unwrap();
