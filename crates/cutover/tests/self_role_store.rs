@@ -1168,6 +1168,7 @@ async fn terminal_repair_fences_and_completion(pool: &PgPool) -> TestResult {
                     .await?
             );
         }
+        #[allow(clippy::type_complexity)]
         let (outcome, code, desired, before, event, order, option, committed): (
             String,
             String,
