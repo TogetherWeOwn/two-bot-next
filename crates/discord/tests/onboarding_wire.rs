@@ -159,7 +159,19 @@ async fn shared_executor_renders_each_mode_and_goodbye_without_extra_messages() 
 
 #[tokio::test]
 async fn shared_executor_defer_role_delta_and_edit_are_not_broadcasts() {
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    // Callback and role writes answer 204; the edit returns the edited message.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, serde_json::json!({"id":"98"})),
+            ScriptedResponse::json(200, serde_json::json!({"id":"98"})),
+            ScriptedResponse::json(200, serde_json::json!({"id":"98"})),
+        ],
+        ScriptedResponse::status(204),
+    )
+    .await;
     let exec = executor(&mock);
     exec.answer_interaction(33, "mock-callback", &defer_ephemeral())
         .await

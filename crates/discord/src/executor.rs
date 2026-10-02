@@ -1403,13 +1403,16 @@ impl ActionExecutor {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
         loop {
-            self.pace(false).await;
             let request = Request::from_route(&route);
-            let res = match self.send(&request).await {
+            // Guard refusals are terminal; pacing completes before the send.
+            self.admit(&request, Some(false))
+                .await
+                .map_err(|error| error.to_string())?;
+            let (res, global) = match self.send_admitted(&request).await {
                 Ok(r) => r,
                 Err(detail) => {
                     if attempt >= MAX_HTTP_TRIES - 1 {
-                        return Err(detail);
+                        return Err(detail.to_string());
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms(attempt))).await;
                     attempt += 1;
@@ -1428,7 +1431,9 @@ impl ActionExecutor {
                     };
                 }
                 429 => {
-                    tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    if !global {
+                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    }
                 }
                 403 | 404 => return Ok(None),
                 500..=599 => {
@@ -2054,12 +2059,13 @@ impl ActionExecutor {
             builder = builder.components(components);
         }
         let req = Self::explicit_mentions(Self::request_of(builder)?, &mentions)?;
-        let response = self.call_once(req, &[200, 201]).await?.unwrap_or_default();
-        Ok(response
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned())
+        // An accepted mutation still needs its validated id receipt before the
+        // durable lane reopens; an unreadable receipt is uncertain, never an
+        // empty successful id that a caller would record as delivered.
+        let mut res = self.call_once_raw(req, &[200, 201]).await?;
+        let id = mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(id)
     }
 
     /// Add or remove one member role, preserving all unrelated roles. The
@@ -2090,8 +2096,8 @@ impl ActionExecutor {
                     .reason(reason),
             )?
         };
-        self.pace(false).await;
-        self.call_once(req, &[200, 204]).await?;
+        let mut res = self.call_once_raw_paced(req, &[200, 204]).await?;
+        res.complete().await;
         Ok(())
     }
 
