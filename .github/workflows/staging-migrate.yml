@@ -30,8 +30,7 @@ on:
         description: Reference to the reviewed ACL sequence
         required: true
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: staging-migrate
@@ -40,6 +39,8 @@ concurrency:
 jobs:
   migrate:
     name: staging-migrate (${{ inputs.mode }})
+    permissions:
+      contents: read
     # Dispatch from main only. The binding must be scoped to the
     # staging-migrate environment (required reviewer, main-only deployment
     # branches) so a workflow edited on another branch cannot read it.
@@ -55,6 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
       - name: Source SHA must be exact and reachable from main

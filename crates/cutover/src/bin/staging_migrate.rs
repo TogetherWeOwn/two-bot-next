@@ -5,6 +5,9 @@
 //! The database URL comes only from TWO_BOT_STAGING_MIGRATOR_DATABASE_URL.
 //! Exit: 0 ok, 2 refused before any DDL, 1 failed (evidence on stdout).
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use two_bot_cutover::staging_migrate::{run, Request, RunError, URL_ENV};
 
 fn main() {
