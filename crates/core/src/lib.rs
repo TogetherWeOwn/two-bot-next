@@ -33,6 +33,7 @@ pub mod config;
 pub mod containment;
 #[cfg(feature = "db")]
 pub mod database_roles;
+pub mod database_tls;
 pub mod database_url;
 pub mod events;
 pub mod evidence;
@@ -97,6 +98,7 @@ pub mod voice_alias;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_assistant_validate;
+pub mod voice_channelinfo;
 pub mod voice_conditions;
 pub mod voice_config;
 pub mod voice_config_diff;
