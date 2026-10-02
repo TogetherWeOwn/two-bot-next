@@ -577,6 +577,25 @@ async fn unreachable_dependencies_fail_the_job_and_retry_next_sweep() {
     );
 }
 
+// One global capture for this test binary: a thread-local set_default can
+// lose events when a sibling test on another thread with no subscriber
+// resolves the callsite's interest first (tracing-core caches "never").
+// Install once per process; assert only on text appended after the offset.
+fn sweep_log_capture() -> (crate::tracing_capture::Capture, usize) {
+    static SWEEP_LOGS: std::sync::OnceLock<crate::tracing_capture::Capture> =
+        std::sync::OnceLock::new();
+    let capture = SWEEP_LOGS
+        .get_or_init(|| {
+            let capture = crate::tracing_capture::Capture::default();
+            tracing::subscriber::set_global_default(capture.clone())
+                .expect("install global sweep log capture");
+            capture
+        })
+        .clone();
+    let start = capture.text().len();
+    (capture, start)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn sweep_logs_carry_ids_and_counts_only() {
     let Some(db) = database("sweep_logs_carry_ids_and_counts_only").await else {
@@ -599,11 +618,8 @@ async fn sweep_logs_carry_ids_and_counts_only() {
         "transport detail 7f3a".to_owned(),
     )));
 
-    let capture = crate::tracing_capture::Capture::default();
-    let deliveries = {
-        let _guard = tracing::subscriber::set_default(capture.clone());
-        drained(&runtime).await
-    };
+    let (capture, start) = sweep_log_capture();
+    let deliveries = drained(&runtime).await;
     assert_eq!(
         deliveries,
         [
@@ -616,7 +632,7 @@ async fn sweep_logs_carry_ids_and_counts_only() {
         ]
     );
 
-    let logs = capture.text();
+    let logs = capture.text()[start..].to_owned();
     for expected in [
         "audit_retry_swept",
         "rows=3",
