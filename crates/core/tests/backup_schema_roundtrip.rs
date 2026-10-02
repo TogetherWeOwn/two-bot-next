@@ -887,6 +887,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     // Durable dedupe remains enforceable, not merely present in the dump.
     for statement in [
         "INSERT INTO internal_nonces SELECT * FROM internal_nonces WHERE nonce_hash = repeat('a', 64)",
+        "INSERT INTO internal_clock_high_water SELECT * FROM internal_clock_high_water",
         "INSERT INTO internal_discord_events SELECT * FROM internal_discord_events WHERE event_hash = repeat('3', 64)",
         "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'in_flight')",
         "INSERT INTO feed_deliveries SELECT * FROM feed_deliveries WHERE item_key = 'backup:item:pending'",
