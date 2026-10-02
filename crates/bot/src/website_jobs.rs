@@ -16,7 +16,7 @@ use two_bot_discord::executor::ActionExecutor;
 use crate::{
     community_jobs,
     jobs::{self, ErrorClass, Job},
-    server,
+    scheduled_jobs, server,
 };
 
 pub const NAMES: [&str; 3] = ["counter", "rank", "scheduled_events"];
@@ -155,6 +155,7 @@ pub async fn serve(
                         }),
                     });
                 }
+                registered.push(scheduled_jobs::register(context.clone()));
                 let registration = community_jobs::register(context);
                 registered.extend(registration.jobs);
                 parked = registration.parked;
@@ -164,8 +165,12 @@ pub async fn serve(
     } else {
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
-    let names: Vec<&'static str> = NAMES.into_iter().chain(community_jobs::NAMES).collect();
-    // All six names park together when nothing registered; otherwise only the
+    let names: Vec<&'static str> = NAMES
+        .into_iter()
+        .chain(community_jobs::NAMES)
+        .chain(scheduled_jobs::NAMES)
+        .collect();
+    // All names park together when nothing registered; otherwise only the
     // env-gated community names are parked and the rest report live status.
     let status = jobs::statuses(&names, registered.is_empty());
     {
