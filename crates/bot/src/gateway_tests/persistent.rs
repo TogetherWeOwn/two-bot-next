@@ -3,6 +3,7 @@
 use super::*;
 use two_bot_core::gateway_funnel::SnapshotWrite;
 use two_bot_core::{InviteSnapshotStore, InviteState};
+use two_bot_discord::MessageEligibility;
 
 fn invite(uses: u64) -> InviteState {
     InviteState {
@@ -118,7 +119,7 @@ async fn persistent_pipeline_hydrates_invites_and_stages_bot_departure_on_restar
         )
         .await
         .unwrap();
-    let pipeline = crate::gateway::build_persistent_pipeline(&db.store, 2222, TOKEN.into())
+    let pipeline = crate::gateway::build_persistent_pipeline(&db.store, 2222, TOKEN.into(), None)
         .await
         .unwrap();
     assert_eq!(pipeline.handlers().store().load(2222)[0].uses, 7);
@@ -140,7 +141,14 @@ async fn persistent_pipeline_hydrates_invites_and_stages_bot_departure_on_restar
             .unwrap(),
         },
     );
-    pipeline.handle_at(&remove, "2026-09-30T04:00:01.000Z");
+    pipeline
+        .handle_at(
+            &remove,
+            "2026-09-30T04:00:01.000Z",
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
     let batch = pipeline.handlers().store().take_batch();
     assert_eq!(batch.bots, vec![(2222, 77)]);
     assert_eq!(batch.events[0].occurred_at, "2026-09-30T04:00:01.000Z");
@@ -153,7 +161,7 @@ async fn persistent_pipeline_hydrates_invites_and_stages_bot_departure_on_restar
         .await
         .unwrap();
     assert!(bot);
-    let restarted = crate::gateway::build_persistent_pipeline(&db.store, 2222, TOKEN.into())
+    let restarted = crate::gateway::build_persistent_pipeline(&db.store, 2222, TOKEN.into(), None)
         .await
         .unwrap();
     assert_eq!(restarted.handlers().store().load(2222)[0].uses, 7);
