@@ -12,6 +12,9 @@
 //! Env: `TWO_DATABASE_URL` (required), `TWO_INACTIVITY_DAYS` (fallback for
 //! `--days`, legacy default 14).
 
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use two_bot_core::inactivity::{
     parse_inactivity_days, render_reengagement_csv, render_reengagement_unscoped, InactivityOutcome,
 };
