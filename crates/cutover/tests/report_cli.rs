@@ -114,8 +114,12 @@ impl TestDb {
         command.output().unwrap()
     }
 
-    async fn seed(&self, sql: &str) -> TestResult {
-        sqlx::raw_sql(sql).execute(&self.pool).await?;
+    async fn seed(&self, sql: String) -> TestResult {
+        // Owned SQL (same AssertSqlSafe<String> pattern as the snapshot
+        // below): raw_sql takes no borrowed &str, only 'static or asserted.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -331,7 +335,7 @@ async fn seed_voice(db: &std::sync::Arc<TestDb>) -> TestResult {
             r#"{"startKnown":true,"startedAt":"2026-09-20T08:30:00.000Z","durationSeconds":null}"#,
         ),
     ];
-    db.seed(&format!(
+    db.seed(format!(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key) VALUES {}",
         rows.join(",")
     ))
@@ -461,7 +465,7 @@ async fn seed_gap(db: &std::sync::Arc<TestDb>) -> TestResult {
             "{}",
         ),
     ];
-    db.seed(&format!(
+    db.seed(format!(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key) VALUES {}",
         rows.join(",")
     ))
@@ -567,11 +571,7 @@ async fn ceiling_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     // loudly instead of counting it.
     const BASE: u64 = 200_000_000_000_000_000;
     let (base, count) = mock_roster(|after| {
-        let page = if after == 0 {
-            0
-        } else {
-            (after - BASE) / 1000;
-        };
+        let page = if after == 0 { 0 } else { (after - BASE) / 1000 };
         format!(
             "[{}]",
             (1..=1000)
