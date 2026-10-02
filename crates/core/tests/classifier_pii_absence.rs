@@ -5,13 +5,20 @@
 //! moderation reasons. `AuditEvent.metadata_json` carries small classifier
 //! context only.
 //!
-//! These tests pin the existing public classify API only, with hostile inputs
-//! held aside: nicknames / bodies / reasons containing snowflake-looking
-//! digits, JSON braces, `@everyone`, and URL shapes must never surface
-//! verbatim in any row's `metadata_json`, `identity()` or `entry_id`.
+//! Two layers, existing public classify API only:
+//! - Exercised: the string inputs that can carry free text (a raw message's
+//!   `edited_timestamp`, a moderation `reason`) take hostile values, which
+//!   must not surface in any row field, the decoded metadata, the serialized
+//!   row or the Discord mirror text.
+//! - API-unreachable: nicknames, usernames and message bodies have no
+//!   parameter at all (`MemberDelta::diff` takes a change flag, voice takes
+//!   channel IDs, `RawDispatch` has no body). Each row kind pins its exact
+//!   metadata key set, so a future name/body/reason field fails whatever the
+//!   input.
+//!
 //! Pure, no DB, no Discord.
 
-use two_bot_core::audit::AuditEvent;
+use two_bot_core::audit::{format_audit_event, AuditEvent};
 use two_bot_core::classify::{
     classify_member_update, classify_moderation_audit, classify_raw_message,
     classify_voice_boundary, MemberDelta, RawAuditLogEntry, RawDispatch, VoiceBoundary,
@@ -25,13 +32,9 @@ const GUILD_STR: &str = "111111111111111111";
 const ACTOR_STR: &str = "333333333333333333";
 const AT: &str = "2026-03-01T00:00:00.000Z";
 
-/// Hostile display name held aside: the member API only takes a change flag,
-/// so this string must never reach a row.
-const HOSTILE_NICK: &str = concat!(
-    "HostileNick-7f3a9c {\"forged\":\"999888777666555444\"} ",
-    "@everyone https://example.invalid/cb?code=not-a-real-code-0000"
-);
-/// Hostile message body held aside: the raw-message API never takes a body.
+/// Snowflake-looking id forged inside each hostile string's JSON braces.
+const FORGED_ID: &str = "999888777666555444";
+/// Hostile message-body shape, fed through `edited_timestamp`.
 const HOSTILE_BODY: &str = concat!(
     "HostileBody-b21e44 {\"message\":\"999888777666555444\"} ",
     "@everyone https://example.invalid/login?password=not-a-real-password-0000"
@@ -41,11 +44,14 @@ const HOSTILE_REASON: &str = concat!(
     "HostileReason-c84d11 {\"target\":\"999888777666555444\"} ",
     "@everyone https://example.invalid/reset?token=not-a-real-token-0000"
 );
-/// Hostile username held aside: voice rows only take channel/member IDs.
-const HOSTILE_USER: &str = concat!(
-    "HostileUser-d52f77 {\"user\":\"999888777666555444\"} ",
-    "@everyone https://example.invalid/u?next=https://example.invalid/"
-);
+
+const MEMBER_KEYS: &[&str] = &["nicknameChanged", "addedRoleIds", "removedRoleIds"];
+const VOICE_KEYS: &[&str] = &["isBot"];
+const RAW_MESSAGE_KEYS: &[&str] = &[];
+const UNCORRELATED_KEYS: &[&str] = &["auditLogEntryId", "count"];
+const CORRELATED_KEYS: &[&str] = &["auditLogEntryId", "count", "origin", "outcome"];
+const CORRELATED_COUNTED_KEYS: &[&str] =
+    &["auditLogEntryId", "count", "origin", "outcome", "affected"];
 
 /// Marker MAC key from the public, non-production vector fixture shared with
 /// the in-crate MAC/classifier tests (`mac::moderation_test_vectors`).
@@ -60,44 +66,89 @@ fn fixture_mac_key() -> String {
         .to_owned()
 }
 
-fn surfaces(event: &AuditEvent) -> String {
-    format!(
-        "{}\n{}\n{}",
-        event.entry_id,
-        event.identity(),
-        event.metadata_json
-    )
+fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| collect_strings(v, out)),
+        serde_json::Value::Object(map) => {
+            for (key, v) in map {
+                out.push(key.clone());
+                collect_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every string a row stores or mirrors: the serialized row, the Discord
+/// mirror text, each field value unescaped (a field added later is covered
+/// without editing this list) and each decoded metadata key/value.
+fn surfaces(event: &AuditEvent) -> Vec<String> {
+    let row = serde_json::to_value(event).expect("row serializes");
+    let mut out = vec![
+        serde_json::to_string(event).expect("row serializes"),
+        format_audit_event(event),
+    ];
+    collect_strings(&row, &mut out);
+    let meta: serde_json::Value =
+        serde_json::from_str(&event.metadata_json).expect("metadata is JSON");
+    collect_strings(&meta, &mut out);
+    out
 }
 
 fn assert_absent(event: &AuditEvent, hostile: &str, ctx: &str) {
     let haystack = surfaces(event);
-    // The failure message names the case only; it never echoes row contents.
-    assert!(
-        !haystack.contains(hostile),
-        "{ctx}: hostile input surfaces verbatim in row"
-    );
+    // Whole string plus each fragment: JSON escaping, mention neutralization
+    // or truncation in the mirror can split a verbatim match.
+    let needles = std::iter::once(hostile)
+        .chain(hostile.split_whitespace())
+        .chain([FORGED_ID]);
+    for needle in needles {
+        // The failure message names the case only; it never echoes row contents.
+        assert!(
+            !haystack.iter().any(|s| s.contains(needle)),
+            "{ctx}: hostile input surfaces in row"
+        );
+    }
 }
 
-fn assert_absent_all(event: &AuditEvent, ctx: &str) {
-    for hostile in [HOSTILE_NICK, HOSTILE_BODY, HOSTILE_REASON, HOSTILE_USER] {
-        assert_absent(event, hostile, ctx);
-    }
+/// Pin the exact metadata key set: a future name/body/reason key fails here
+/// whatever the input.
+fn assert_metadata_keys(event: &AuditEvent, expected: &[&str], ctx: &str) {
+    let meta: serde_json::Value =
+        serde_json::from_str(&event.metadata_json).expect("metadata is JSON");
+    let mut keys: Vec<&str> = meta
+        .as_object()
+        .expect("metadata is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    let mut want = expected.to_vec();
+    want.sort_unstable();
+    assert!(
+        keys == want,
+        "{ctx}: metadata key set drifts from {expected:?}"
+    );
 }
 
 #[test]
 fn member_update_never_carries_nicknames() {
-    // Nickname-only change for the hostile nick: only the flag may travel.
+    // Nickname-only change: the API takes a flag, so only the flag travels.
     let delta = MemberDelta::diff(true, &["1".to_owned()], &["1".to_owned()]).expect("flag row");
     assert!(delta.nickname_changed);
     let event = classify_member_update(GUILD_NUM, MEMBER_NUM, Some(delta), AT, false).expect("row");
-    assert_absent_all(&event, "member nickname-only");
+    assert_metadata_keys(&event, MEMBER_KEYS, "member nickname-only");
     let meta: serde_json::Value = serde_json::from_str(&event.metadata_json).unwrap();
-    assert_eq!(meta["nicknameChanged"], true);
+    assert!(
+        meta["nicknameChanged"] == true,
+        "member nickname-only: flag"
+    );
 
     // Role change plus nickname flag.
     let delta = MemberDelta::diff(true, &["1".to_owned()], &["2".to_owned()]).expect("role row");
     let event = classify_member_update(GUILD_NUM, MEMBER_NUM, Some(delta), AT, false).expect("row");
-    assert_absent_all(&event, "member role+nick");
+    assert_metadata_keys(&event, MEMBER_KEYS, "member role+nick");
 }
 
 #[test]
@@ -114,11 +165,8 @@ fn voice_boundaries_never_carry_names() {
         ),
     ] {
         let event = classify_voice_boundary(GUILD_NUM, MEMBER_NUM, boundary, AT, false);
-        assert_absent_all(&event, ctx);
         // Metadata is the `{ isBot }` flag only.
-        let meta: serde_json::Value = serde_json::from_str(&event.metadata_json).unwrap();
-        assert_eq!(meta.as_object().unwrap().len(), 1, "{ctx}: metadata grows");
-        assert!(meta.get("isBot").is_some(), "{ctx}: isBot flag stays");
+        assert_metadata_keys(&event, VOICE_KEYS, ctx);
     }
 }
 
@@ -138,10 +186,9 @@ fn delete_packet() -> RawDispatch<'static> {
 
 #[test]
 fn raw_message_never_carries_bodies() {
-    let packet = delete_packet();
-    let event = classify_raw_message(&packet, AT).expect("delete row");
-    assert_absent_all(&event, "message delete");
-    assert_absent(&event, HOSTILE_BODY, "message delete body");
+    // `RawDispatch` has no body field; both row kinds carry no metadata.
+    let event = classify_raw_message(&delete_packet(), AT).expect("delete row");
+    assert_metadata_keys(&event, RAW_MESSAGE_KEYS, "message delete");
 
     let edit = RawDispatch {
         event_type: Some("MESSAGE_UPDATE"),
@@ -150,26 +197,28 @@ fn raw_message_never_carries_bodies() {
         ..delete_packet()
     };
     let event = classify_raw_message(&edit, AT).expect("edit row");
-    assert_absent(&event, HOSTILE_BODY, "message edit body");
+    assert_metadata_keys(&event, RAW_MESSAGE_KEYS, "message edit");
 
-    // A hostile non-date edited timestamp takes the shard/sequence fallback —
-    // the hostile text itself must not land in the entry id.
-    let hostile_ts = RawDispatch {
-        edited_timestamp: Some(HOSTILE_BODY),
-        ..delete_packet()
-    };
+    // A hostile non-date edited timestamp takes the shard/sequence fallback
+    // identity and the observed instant — the hostile text itself must not
+    // land in the entry id, `occurred_at` or any other surface.
     let hostile_ts = RawDispatch {
         event_type: Some("MESSAGE_UPDATE"),
+        edited_timestamp: Some(HOSTILE_BODY),
         author_id: Some(ACTOR_STR),
-        ..hostile_ts
+        ..delete_packet()
     };
     let event = classify_raw_message(&hostile_ts, AT).expect("fallback row");
+    assert_absent(&event, HOSTILE_BODY, "message edit fallback");
+    assert_metadata_keys(&event, RAW_MESSAGE_KEYS, "message edit fallback");
     assert!(
-        !event.entry_id.contains(HOSTILE_BODY),
-        "hostile timestamp leaks into entry id: {}",
-        event.entry_id
+        event.entry_id.ends_with(":shard-0:sequence-7"),
+        "message edit fallback: identity is not shard/sequence"
     );
-    assert_absent_all(&event, "message fallback");
+    assert!(
+        event.occurred_at == AT,
+        "message edit fallback: occurred_at is not the observed instant"
+    );
 }
 
 fn uncorrelated_entry(reason: Option<String>) -> RawAuditLogEntry {
@@ -186,9 +235,24 @@ fn uncorrelated_entry(reason: Option<String>) -> RawAuditLogEntry {
     }
 }
 
+fn correlated_entry(reason: String, extra_count: Option<serde_json::Value>) -> RawAuditLogEntry {
+    RawAuditLogEntry {
+        action_id: AUDIT_LOG_MEMBER_BAN_ADD,
+        log_entry_id: "111".to_owned(),
+        executor_id: Some(ACTOR_STR.to_owned()),
+        target_id: Some("777777777777777777".to_owned()),
+        reason: Some(reason),
+        created_timestamp_ms: 1_767_225_600_000,
+        extra_channel_id: None,
+        extra_count,
+        extra_removed: None,
+    }
+}
+
 #[test]
 fn moderation_audit_never_carries_freeform_reasons() {
-    // Correlated row: the marker verifies, but the human suffix must not leak.
+    // Correlated rows: the marker verifies, but the human suffix must not leak
+    // into `action`/`actor_id` (marker-derived) or anywhere else.
     let mac_key = fixture_mac_key();
     let reason = moderation_audit_reason(
         Some(&mac_key),
@@ -198,29 +262,36 @@ fn moderation_audit_never_carries_freeform_reasons() {
         ACTOR_STR,
         HOSTILE_REASON,
     );
-    let entry = RawAuditLogEntry {
-        action_id: AUDIT_LOG_MEMBER_BAN_ADD,
-        log_entry_id: "111".to_owned(),
-        executor_id: Some(ACTOR_STR.to_owned()),
-        target_id: Some("777777777777777777".to_owned()),
-        reason: Some(reason),
-        created_timestamp_ms: 1_767_225_600_000,
-        extra_channel_id: None,
-        extra_count: None,
-        extra_removed: None,
-    };
-    let event = classify_moderation_audit(&entry, GUILD_STR, Some(ACTOR_STR), Some(&mac_key))
-        .expect("correlated row");
-    assert_absent(&event, HOSTILE_REASON, "correlated reason suffix");
-    assert_absent_all(&event, "correlated row");
-    assert_eq!(event.action.as_deref(), Some("moderation.ban"));
+    for (ctx, extra_count, keys) in [
+        ("correlated row", None, CORRELATED_KEYS),
+        (
+            "correlated counted row",
+            Some(serde_json::json!(3)),
+            CORRELATED_COUNTED_KEYS,
+        ),
+    ] {
+        let entry = correlated_entry(reason.clone(), extra_count);
+        let event = classify_moderation_audit(&entry, GUILD_STR, Some(ACTOR_STR), Some(&mac_key))
+            .expect("correlated row");
+        assert_absent(&event, HOSTILE_REASON, ctx);
+        assert_metadata_keys(&event, keys, ctx);
+        assert!(
+            event.action.as_deref() == Some("moderation.ban"),
+            "{ctx}: action is not the marker action"
+        );
+    }
 
-    // Uncorrelated row: plain hostile reason with no verifiable marker.
+    // Uncorrelated row: plain hostile reason with no verifiable marker keeps
+    // only the action table string.
     let entry = uncorrelated_entry(Some(HOSTILE_REASON.to_owned()));
     let event = classify_moderation_audit(&entry, GUILD_STR, Some(ACTOR_STR), None)
         .expect("uncorrelated row");
-    assert_absent(&event, HOSTILE_REASON, "uncorrelated reason");
-    assert_absent_all(&event, "uncorrelated row");
+    assert_absent(&event, HOSTILE_REASON, "uncorrelated row");
+    assert_metadata_keys(&event, UNCORRELATED_KEYS, "uncorrelated row");
+    assert!(
+        event.action.as_deref() == Some("member_kick"),
+        "uncorrelated row: action is not the table string"
+    );
 }
 
 #[test]

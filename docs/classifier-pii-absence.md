@@ -7,7 +7,7 @@ context only.
 
 ## What pins it
 
-`crates/core/tests/classifier_pii_absence.rs` exercises the existing public
+`crates/core/tests/classifier_pii_absence.rs` uses the existing public
 classify API only — no new production code, no DB, no Discord:
 
 - `classify_member_update` + `MemberDelta::diff` / `change_digest`
@@ -15,22 +15,40 @@ classify API only — no new production code, no DB, no Discord:
 - `classify_raw_message` + `RawDispatch`
 - `classify_moderation_audit` + `RawAuditLogEntry`
 
-## Hostile inputs held aside
+## Exercised: hostile text through the inputs that accept it
 
-Each PII shape is built once and asserted absent verbatim from every row's
-`metadata_json`, `identity()` and `entry_id`:
+Two classify inputs take free text. Each gets a hostile value (snowflake-looking
+digits, JSON braces, `@everyone`, a URL with a fake secret query) that must not
+surface in any row surface: every serialized field value (unescaped, so a
+field added later is covered), the decoded `metadata_json` keys and values,
+`serde_json::to_string(row)` and the Discord mirror text from
+`format_audit_event`. The check matches the whole string and each fragment, so
+JSON escaping, mention neutralization or truncation cannot hide a leak.
 
-- display-name shape: snowflake-looking digits, JSON braces, `@everyone`, URL
-  with a fake code query
-- message-body shape: same family with a fake password query (the raw-message
-  API never takes a body at all)
-- moderation-reason shape: same family with a fake token query (correlated
-  rows verify the `[two-audit:v1:…]` marker but drop the human suffix;
-  uncorrelated rows keep only the action table string)
-- username shape: same family (voice rows only take channel/member IDs)
+- message-body shape through `RawDispatch.edited_timestamp`: a non-date value
+  takes the shard/sequence fallback identity and the observed instant; it
+  must not land in `entry_id`, `occurred_at` or anywhere else.
+- moderation-reason shape through `RawAuditLogEntry.reason`: correlated rows
+  verify the `[two-audit:v1:…]` marker and take `action`/`actor_id` from it,
+  dropping the human suffix; uncorrelated rows keep only the action table
+  string.
 
-A hostile non-date `edited_timestamp` takes the shard/sequence fallback
-identity — the hostile text itself must not land in the entry id.
+## API-unreachable: pinned by exact metadata key sets
+
+Nicknames, usernames and message bodies have no parameter at all — a
+type-level guarantee: `MemberDelta::diff` takes a nickname change flag, voice
+boundaries take channel IDs, and `RawDispatch` has no body field. Instead of
+asserting the absence of strings that never enter the API, each row kind pins
+its exact metadata key set, so a future name/body/reason key fails whatever
+the input:
+
+| Row kind | Metadata keys |
+| --- | --- |
+| member update | `nicknameChanged`, `addedRoleIds`, `removedRoleIds` |
+| voice join / leave / move | `isBot` |
+| raw message delete / edit | none (`{}`) |
+| moderation, uncorrelated | `auditLogEntryId`, `count` |
+| moderation, correlated | `auditLogEntryId`, `count`, `origin`, `outcome` (+ `affected` only when a count is present) |
 
 ## Ordering and vacuous rows
 
