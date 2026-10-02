@@ -81,6 +81,12 @@ function missCacheFor(env: Env): RedirectMissCache {
   return redirectMisses;
 }
 
+// Public probe cap (threat-model F7, TOG-12245): /health and /readyz are
+// unauthenticated, so each caller gets a bounded budget before the Container
+// is touched. Over budget → 429. The Container's own alarm probe bypasses
+// the Worker and is unaffected.
+const healthBuckets = new TokenBuckets();
+
 function redirectStore(env: Env): RedirectStore {
   const raw = env.REDIRECT_MAPPINGS_JSON;
   const snapshot = raw === undefined || raw === "" ? [] : parseMappingsSnapshot(raw);
@@ -402,8 +408,39 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {
+      // Public probes carry no credentials, so only GET/HEAD are meaningful.
+      // Anything else cannot be a scraper or load-balancer check: refuse it
+      // before the Container is touched.
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return new Response("method not allowed", {
+          status: 405,
+          headers: { allow: "GET, HEAD" },
+        });
+      }
+      // Per-caller budget before the Container is touched. The key picks a
+      // bucket and never survives the call.
+      const probe = healthBuckets.take(
+        request.headers.get("cf-connecting-ip") ?? "unknown",
+      );
+      if (!probe.allowed) {
+        return new Response("slow down\n", {
+          status: 429,
+          headers: {
+            "content-type": "text/plain",
+            "retry-after": String(probe.retryAfter),
+          },
+        });
+      }
+      // Sanitize the forwarded probe: keep the origin (Host) the Container
+      // expects, but drop the query, caller headers and body.
+      const clean = new URL(request.url);
+      clean.search = "";
+      clean.hash = "";
+      const sanitized = new Request(clean.toString(), {
+        method: request.method,
+      });
       const container = env.TWO_BOT.getByName(SINGLETON_NAME);
-      return container.fetch(request);
+      return container.fetch(sanitized);
     }
 
     // Authenticated off-container scrape path. No configured token → 404 (the
