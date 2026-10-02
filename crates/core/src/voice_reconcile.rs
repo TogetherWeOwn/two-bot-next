@@ -337,8 +337,8 @@ pub fn reconcile_voice_halves(
         let mut open: Option<(&HalfStart, i64)> = None;
 
         for ev in events {
-            match ev {
-                &WalkEvent::Start { at_ms, start } => {
+            match *ev {
+                WalkEvent::Start { at_ms, start } => {
                     // A second start before any end: the tracker REPLACES (one
                     // channel at a time), so the earlier session's end is gone.
                     // Its close is bounded above by this start but the instant
@@ -363,7 +363,7 @@ pub fn reconcile_voice_halves(
                     }
                     open = Some((start, at_ms));
                 }
-                &WalkEvent::Leave { at_ms, leave } => {
+                WalkEvent::Leave { at_ms, leave } => {
                     // Pre-TOG-6122 server leave: no end row, but the leave
                     // proves presence up to its instant, so the open session
                     // closes here with a duration.
@@ -383,7 +383,7 @@ pub fn reconcile_voice_halves(
                         }
                     }
                 }
-                &WalkEvent::End { at_ms, end } => {
+                WalkEvent::End { at_ms, end } => {
                     let clean = usable_duration(end.duration_seconds);
                     let open_usable = open.filter(|(_, prev_ms)| *prev_ms <= at_ms);
 
