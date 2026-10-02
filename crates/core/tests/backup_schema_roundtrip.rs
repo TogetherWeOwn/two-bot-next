@@ -898,7 +898,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
 }
 
 #[tokio::test]
-async fn empty_archived_sequence_tables_restart_at_the_target_configured_start() {
+async fn empty_archived_sequence_tables_keep_the_target_position() {
     let Some(db) = database().await else {
         return;
     };
@@ -931,9 +931,17 @@ async fn empty_archived_sequence_tables_restart_at_the_target_configured_start()
         assert_eq!(report.restored[table], 0, "{table} must really be empty");
     }
     let allocations = allocate_owned_sequences(pool, true, &floors).await;
+    // The seed binds explicit member rows, so the test identity hands out 17
+    // and 20 for the two fixture rows before the dump; the target's own next
+    // value is 23, and restore keeps that position rather than rewinding to
+    // the configured start. `floors` already pins this exact expectation.
     assert_eq!(
         allocations[&("members".into(), "backup_identity".into())].0,
-        17
+        floors[&("members".into(), "backup_identity".into())],
+    );
+    assert_eq!(
+        allocations[&("members".into(), "backup_identity".into())].0,
+        23
     );
     let version: i64 = sqlx::query_scalar("SELECT nextval('guild_settings_version_seq')")
         .fetch_one(pool)
@@ -950,7 +958,7 @@ async fn empty_archived_sequence_tables_restart_at_the_target_configured_start()
     let audit: i64 = sqlx::query_scalar("INSERT INTO internal_action_log (intent_id, phase, caller_hash, action) VALUES ($1, 'intent', repeat('4', 64), 'event.read') RETURNING audit_id").bind(intent).fetch_one(pool).await.unwrap();
     assert_eq!(audit, 2);
     let identity: i64 = sqlx::query_scalar("INSERT INTO members (guild_id, member_id) VALUES ('100000000000000001', 'empty-default-member') RETURNING backup_identity").fetch_one(pool).await.unwrap();
-    assert_eq!(identity, 20);
+    assert_eq!(identity, 26);
     db.close().await.unwrap();
 }
 
