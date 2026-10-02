@@ -263,8 +263,9 @@ pub use presence::{
     REOPEN_PEAK_THRESHOLD,
 };
 pub use raid::{
-    count_recent_join_risks, JoinRiskEvidence, JoinRiskInput, JoinRiskObservation, JoinRiskPolicy,
-    RaidAlert, RaidConfigError, RaidTuning, RaidWatch, RecordedJoinRisk, StaffAlertMessage,
+    count_recent_join_risks, scan_joins_for_bursts, HistoricalJoin, JoinRiskEvidence,
+    JoinRiskInput, JoinRiskObservation, JoinRiskPolicy, RaidAlert, RaidConfigError,
+    RaidScanOptions, RaidTuning, RaidWatch, RecordedJoinRisk, StaffAlertMessage,
     DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS, DEFAULT_RAID_COOLDOWN_SECONDS,
     DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
 };
