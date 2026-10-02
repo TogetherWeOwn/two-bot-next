@@ -137,6 +137,10 @@
       "sha256": "bdd289d14af6cb28609daced594c476b4b9aceee4ddf4bef40dbe5018480ce95",
       "justification": "Baseline legacy-copy migration merged in PR #113 before this guard; no SQL changes."
     },
+    "crates/cutover/migrations/0410_member_erasure_audit.sql": {
+      "sha256": "712f85817c15262f42907114e35dbaeccdada1044833d8bac6b5bd661ca62fe5",
+      "justification": "TOG-11141: minimal actor/time erasure receipt with no subject or content."
+    },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
       "justification": "Add unpublished S6 funnel foundation for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
