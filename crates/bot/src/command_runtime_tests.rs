@@ -565,14 +565,18 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
             .filter(|name| {
                 !matches!(
                     *name,
-                    "sticky" | "sticky-remove" | "feed-add" | "feed-remove" | "feed-list"
+                    "sticky"
+                        | "sticky-remove"
+                        | "feed-add"
+                        | "feed-remove"
+                        | "feed-list"
+                        | "rank"
+                        | "leaderboard"
                 )
             })
             .collect();
-        assert!(
-            unwired.contains(&"rank"),
-            "rank publishes even with all gates off"
-        );
+        assert!(!unwired.contains(&"rank"));
+        assert!(!unwired.contains(&"leaderboard"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -1188,6 +1192,101 @@ async fn failed_resumed_publication_can_retry_on_a_later_connection() {
 // ---------------------------------------------------------------------------
 // agent-testdb acceptance (CI's Postgres service; never production/staging)
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fence() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    let (mock, origin) = MockRest::start(vec![204; 4]).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor,
+        router_with_commands(gates(false, false)),
+        GUILD,
+        false,
+    );
+    let pipeline = two_bot_discord::OrderedLevelingPipeline::new(
+        two_bot_core::MemStore::new(),
+        Some(runtime.leveling()),
+    );
+    let rank = slash("rank", Some(CHANNEL), Vec::new());
+    let mut value = serde_json::to_value(&rank).unwrap();
+    value["data"]["options"] = serde_json::json!([{"name":"member","type":6,"value":"88"}]);
+    let mut target = user(88, false);
+    target.global_name = Some("Target member".into());
+    value["data"]["resolved"] = serde_json::json!({"users":{"88":target}});
+    let optional_rank: Interaction = serde_json::from_value(value).unwrap();
+    let leaderboard = slash("leaderboard", Some(CHANNEL), Vec::new());
+    for interaction in [&rank, &optional_rank, &leaderboard] {
+        let event = Event::InteractionCreate(Box::new(InteractionCreate(interaction.clone())));
+        assert!(pipeline.handle(&event).await.unwrap().is_empty());
+        runtime.on_interaction(interaction).await;
+    }
+    for member in 77..89 {
+        sqlx::query("INSERT INTO member_levels (guild_id,member_id,xp,imported_xp,updated_at) VALUES ($1,$2,$3,$3,NOW())")
+            .bind(GUILD_S).bind(member.to_string()).bind(i64::from(member))
+            .execute(db.pool()).await.unwrap();
+    }
+    runtime.on_interaction(&leaderboard).await;
+    for name in ["rank", "leaderboard"] {
+        let mut foreign = slash(name, Some(CHANNEL), Vec::new());
+        foreign.guild_id = Some(Id::new(9999));
+        runtime.on_interaction(&foreign).await;
+    }
+    let requests = mock.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "exactly one callback per accepted command"
+    );
+    assert!(requests
+        .iter()
+        .all(|r| r.method == "POST" && r.path.ends_with("/callback")));
+    let replies: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    for reply in &replies {
+        assert_eq!(reply["type"], 4, "no generic defer or second response");
+    }
+    for (reply, name) in replies[..2].iter().zip(["member", "Target member"]) {
+        assert_eq!(reply["data"]["flags"], 64, "rank is ephemeral");
+        assert_eq!(
+            reply["data"]["content"],
+            two_bot_core::leveling::rank_text(name, 0, None, 0, 0)
+        );
+    }
+    assert_eq!(replies[2]["data"]["content"], "No XP has been earned yet.");
+    for reply in &replies[2..] {
+        assert!(reply["data"]["flags"].is_null(), "leaderboard stays public");
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert!(reply["data"]["components"].is_null(), "no invented paging");
+    }
+    assert_eq!(
+        replies[3]["data"]["content"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .count(),
+        11
+    );
+    assert!(!replies[3]["data"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("<@77>"));
+    drop(pipeline);
+    drop(runtime);
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
+}
 
 struct TestDb {
     pool: PgPool,

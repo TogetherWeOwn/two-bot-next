@@ -113,7 +113,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_BACKUP_S3_ACCESS_KEY_ID: SECRET,
   TWO_BACKUP_S3_SECRET_ACCESS_KEY: SECRET,
   TWO_DB_POOL_MAX: "cutover CLI pool size, not read by the Container runtime",
-  TWO_ERASURE_ACTOR: "erase-member operator CLI audit label; not read by the Container runtime",
+  TWO_ERASURE_ACTOR: "erase-member operator CLI audit actor, set per invocation; not read by the Container runtime",
   TWO_BACKUP_DIR: BACKUP,
   TWO_BACKUP_KEEP: BACKUP,
   TWO_BACKUP_S3_BUCKET: BACKUP,
