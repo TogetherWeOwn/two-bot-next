@@ -67,6 +67,14 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "automod_violations", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "community_facts", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "community_scorecard_alerts", measure: TableMeasure::Columns(&["created_at"]) },
+    // Retry reservation (TOG-11145): next_attempt_at is a BIGINT epoch-ms
+    // backoff deadline, not a write time, and has no timestamptz cast.
+    TableSpec {
+        table: "community_scorecard_attempts",
+        measure: TableMeasure::Unmeasurable(
+            "no timestamp column; next_attempt_at is an epoch-ms retry deadline, and a completed week is visible via community_scorecard_runs.generated_at",
+        ),
+    },
     TableSpec { table: "community_scorecard_runs", measure: TableMeasure::Columns(&["generated_at"]) },
     TableSpec { table: "community_stream_heartbeats", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "containment_events", measure: TableMeasure::Columns(&["created_at"]) },
