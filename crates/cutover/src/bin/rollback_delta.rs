@@ -1,3 +1,6 @@
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
+
 use two_bot_cutover::{
     cli::{open_db, Args},
     rollback_delta::{export_delta, file_writer, parse_since, report},

@@ -27,8 +27,9 @@ python3 scripts/cargo_cache.py run -- build -p two-bot-cutover --bin rollback-de
 `--since` is required, RFC3339, and must not be in the future; a missing,
 malformed, or future value exits 2 with no database connection attempt.
 `TWO_DATABASE_URL` is required; no migrations are applied. Exit **0** means a
-complete summary was written; **2** means refused arguments, a connection
-failure, or an export-cap refusal. Database errors and URLs are not printed.
+complete summary was written; **2** means refused arguments or an export-cap
+refusal; **1** means the database could not be opened. Database errors and
+URLs are not printed.
 
 ## What the report proves
 
