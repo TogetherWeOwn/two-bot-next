@@ -334,8 +334,12 @@ fn job_gate_prevents_overlapping_snapshot_cycles() {
     drop(guard);
     assert!(!gate.is_running());
     // The next tick acquires cleanly once the previous guard drops.
-    assert!(gate.try_acquire().is_some(), "gate releases after tick");
+    // Bind the guard: a bare `try_acquire()` temporary would drop at the
+    // end of the assert and release the gate before `is_running()` runs.
+    let reacquired = gate.try_acquire().expect("gate releases after tick");
     assert!(gate.is_running());
+    drop(reacquired);
+    assert!(!gate.is_running());
 }
 
 #[test]
