@@ -3072,7 +3072,10 @@ mod tests {
             &mut clock,
         )
         .expect("first delivery accepted");
-        let jumped_ms = seen_ms + 60_000;
+        // The jump must clear the ±120 s skew window: at +60 s the old
+        // capture is still fresh and its still-live nonce (TTL 241 s)
+        // correctly refuses as replay, not stale. +180 s makes it stale.
+        let jumped_ms = seen_ms + 180_000;
         let nonce = test_nonce();
         let timestamp = (jumped_ms / 1000).to_string();
         let sig = sign(
