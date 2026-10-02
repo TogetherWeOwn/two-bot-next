@@ -279,7 +279,7 @@ fn refresh_partitions_hot_cold_and_ignored() {
     // Ignored rows carry the reason: declared env-only (catalog or prefix)
     // versus never-classified unknown.
     assert_eq!(report.ignored.len(), 3);
-    let reasons: HashSet<(&str, IgnoreReason)> = report
+    let reasons: Vec<(&str, IgnoreReason)> = report
         .ignored
         .iter()
         .map(|i| (i.key.as_str(), i.reason))
