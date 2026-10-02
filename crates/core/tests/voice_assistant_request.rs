@@ -628,10 +628,8 @@ proptest! {
             for suggestion in parsed {
                 prop_assert!(suggestion.template().chars().count() <= MAX_TEMPLATE_CHARS);
                 prop_assert!(suggestion.explanation().chars().count() <= MAX_EXPLANATION_CHARS);
-                prop_assert_eq!(
-                    parse_template_strict(suggestion.template()).as_ref(),
-                    Ok(suggestion.parsed())
-                );
+                let strict = parse_template_strict(suggestion.template());
+                prop_assert_eq!(strict.as_ref(), Ok(suggestion.parsed()));
             }
         }
     }
