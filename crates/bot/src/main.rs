@@ -172,14 +172,20 @@ async fn main() {
                 let saved = gateway::load_boot_session(&store)
                     .await
                     .map_err(|error| gateway_failure("checkpoint_load_failed", error))?;
+                let onboarding = two_bot_core::OnboardingGates::from_env()
+                    .map_err(|_| sqlx::Error::InvalidArgument("invalid onboarding mode".into()))?;
+                // ONE router + REST executor + sqlx stores over the same pool.
+                // Bad command env gates still park only the command surface.
+                // The ordered leveling path shares this runtime's
+                // executor/pacing for XP awards and role rewards.
+                let runtime =
+                    command_runtime::CommandRuntime::from_env(pool, &token, guild_id, onboarding);
+                let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
                 let pipeline = Arc::new(
-                    build_persistent_pipeline(&store, guild_id, token.clone())
+                    build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
                         .await
                         .map_err(|error| gateway_failure("milestones_load_failed", error))?,
                 );
-                // ONE router + REST executor + sqlx stores over the same pool.
-                // Bad command env gates still park only the command surface.
-                let runtime = command_runtime::CommandRuntime::from_env(pool, &token, guild_id);
                 let shard = build_shard(
                     token,
                     intents_from_env(),
