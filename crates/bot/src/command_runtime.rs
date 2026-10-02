@@ -127,9 +127,16 @@ impl CommandRuntime {
     /// Build the runtime from process env gates + the optional
     /// `DISCORD_API_BASE` proxy override. Returns `None` — gateway still
     /// boots — when gate parsing or executor construction fails, so bad
-    /// env cannot take the shard down.
+    /// env cannot take the shard down. `self_roles` is the boot-composed
+    /// service shared with the recovery job; only its presence opens the
+    /// self-role router surface.
     #[must_use]
-    pub fn from_env(pool: Pool<Postgres>, token: &str, guild_id: u64) -> Option<Arc<Self>> {
+    pub fn from_env(
+        pool: Pool<Postgres>,
+        token: &str,
+        guild_id: u64,
+        self_roles: Option<Arc<SelfRoleService>>,
+    ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
             Err(err) => {
@@ -151,6 +158,7 @@ impl CommandRuntime {
             &moderation,
             SurfaceFlags {
                 tickets: ticket_config.is_some(),
+                self_roles: self_roles.is_some(),
                 ..SurfaceFlags::default()
             },
         );
@@ -188,7 +196,7 @@ impl CommandRuntime {
             pool,
             executor,
             router,
-            self_roles: None,
+            self_roles,
             guild_id,
             tickets,
             automations: features.automations,

@@ -329,9 +329,9 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   and release only their own fenced lane, retaining the processing audit.
 - The service constructor requires a nonempty catalogue and its guild in an
   injected approved staging allowlist. This is not process-level rollout wiring:
-  `CommandRuntime::from_env` still injects no service, and default router surface
-  flags remain disabled. Approved staging configuration and boot construction
-  are unfinished.
+  `CommandRuntime::from_env` injected no service at this checkpoint; see
+  [Boot composition](#boot-composition-staging-only-activation) for the gated
+  staging-only wiring.
 - Added unit input tests and isolated mock/Postgres orchestration regressions
   cover shared select replacement, duplicate delivery, dry-run, failed defer,
   disabled routing and recovered-mutation dry-run refusal. Reaction dispatch now
@@ -353,7 +353,7 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
   uninitialized evidence preservation.
 - `recovery_job` awaits a pass inside the existing fixed-phase supervisor, with
   a 30-second cadence, bounded startup jitter and 25-second attempt timeout.
-  `serve_with_self_roles` accepts the same injected service Arc used for dispatch;
+  `website_jobs::serve` accepts the same injected service Arc used for dispatch;
   no new scheduler, detached recovery task or HTTP client is created. Per-name
   status parking keeps unavailable website/community jobs parked even when only
   recovery is injected. A successful tick means the sweep completed, not that
@@ -362,9 +362,8 @@ The handler checkpoint adds an **injectable**, still boot-disabled service:
 - Added shared owner/supervisor fixtures cover recovery without redelivery,
   still-pending sweeps, timeout, in-flight-send shutdown, stopped startup and
   stopped renewals, plus bounded panel/row passes and status parking. These Rust
-  fixtures remain uncompiled. Production `serve` still passes no self-role
-  service, and `CommandRuntime::from_env` still creates none; approved boot
-  composition must share one Arc across both paths. Processing discovery still
+  fixtures remain uncompiled. [Boot composition](#boot-composition-staging-only-activation)
+  now shares one Arc across both paths. Processing discovery still
   refuses terminal rows; the separate terminal consumer below repairs only to
   committed targets. The unknown-work continuation contract below remains subject
   to compiled acceptance before activation.
@@ -521,9 +520,30 @@ boot composition still gate activation; source fixtures are not passed tests.
   post-lock expiry/chronology cases. These are **uncompiled source coverage**,
   not passed Rust acceptance or independent review.
 
-Production dispatch/boot remains disabled. The conservative unknown-work
-lifecycle, approved shared boot composition and compiled exact-head acceptance
-still gate activation, review and merge.
+### Boot composition (staging-only activation)
+
+`main` builds at most **one** `SelfRoleService` before spawning the gateway and
+passes the same `Arc` to `CommandRuntime::from_env` (dispatch) and
+`website_jobs::serve` (the `self_role_recovery` job in the existing supervisor).
+Only that service's presence opens the router's self-role surface; there is no
+second router, scheduler, feature service or HTTP client type.
+
+- An empty `TWO_SELF_ROLE_PANELS` returns before any executor or REST work.
+  A malformed catalogue logs an error and parks the surface and the job; old
+  panels stay unserved rather than silently ignored.
+- The approved allowlist is the pinned TWO Staging guild
+  (`TWO_STAGING_GUILD_ID`). Any other `GUILD_ID`, including production, creates
+  no service, registers no surface and runs no recovery.
+- The bot identity comes from one bounded `GET /users/@me` through the shared
+  `ActionExecutor`; a failed, slow or non-bot response parks the feature
+  instead of guessing an identity.
+- `TWO_SELF_ROLE_DRY_RUN=1` still audits without role mutations, and dry-run
+  recovery never claims terminal work.
+- Mock-REST fixtures cover the catalogue/allowlist gates before any request,
+  the single identity read and identity failures parking the feature.
+  Disabling the catalogue parks recovery without deleting its evidence.
+
+Compiled exact-head acceptance and non-author review still gate merge.
 
 Interrupted remote work stays explicitly unresolved; its durable continuation/
 reconciliation lifecycle must be wired before activation, not silently cleared

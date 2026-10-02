@@ -100,18 +100,9 @@ impl Drop for Shutdown {
     }
 }
 
+/// `self_roles` is the ONE boot-composed service Arc also injected into gateway
+/// dispatch; recovery joins the existing supervisor, never another feature service.
 pub async fn serve(
-    config: &Config,
-    listener: tokio::net::TcpListener,
-    gateway: server::SharedState,
-    shutdown: watch::Sender<bool>,
-) -> std::io::Result<()> {
-    // No production self-role boot construction until terminal recovery and
-    // compiled acceptance are complete. Do not create another feature service.
-    serve_with_self_roles(config, listener, gateway, shutdown, None).await
-}
-
-pub(crate) async fn serve_with_self_roles(
     config: &Config,
     listener: tokio::net::TcpListener,
     gateway: server::SharedState,

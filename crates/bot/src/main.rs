@@ -26,8 +26,8 @@ mod lifecycle_tests;
 mod metrics_http;
 mod preflight;
 mod server;
-// TOG-10292: shared dispatch is injectable for acceptance, but boot keeps the
-// service parked until unresolved-work continuation and verification are complete.
+// TOG-10292: boot composes the gated service below; fixture-only seams keep
+// the module-level allowance.
 #[allow(dead_code)]
 mod self_role_handlers;
 #[allow(dead_code)]
@@ -142,10 +142,21 @@ async fn main() {
         database: store.as_ref().map(|s| s.pool().clone()),
     };
 
+    // ONE optional self-role service: gateway dispatch and the supervised
+    // recovery job share this Arc. Empty/invalid catalogues, non-staging guilds
+    // and failed identity reads leave the surface and the job unregistered.
+    let self_roles = match (gateway_prerequisites(&config), store.as_ref()) {
+        (Ok((token, _, guild_id)), Some(db)) => {
+            self_role_handlers::SelfRoleService::from_env(db.pool().clone(), token, guild_id).await
+        }
+        _ => None,
+    };
+
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
     let gateway_task = if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
         let token = token.to_owned();
         let state = Arc::clone(&gateway);
+        let self_roles = self_roles.clone();
         Some(tokio::spawn(async move {
             let result: Result<(), sqlx::Error> = async {
                 let db = store.ok_or_else(|| {
@@ -164,7 +175,8 @@ async fn main() {
                     Arc::new(build_persistent_pipeline(&store, guild_id, token.clone()).await?);
                 // ONE router + REST executor + sqlx stores over the same pool.
                 // Bad command env gates still park only the command surface.
-                let runtime = command_runtime::CommandRuntime::from_env(pool, &token, guild_id);
+                let runtime =
+                    command_runtime::CommandRuntime::from_env(pool, &token, guild_id, self_roles);
                 let shard = build_shard(
                     token,
                     intents_from_env(),
@@ -210,7 +222,7 @@ async fn main() {
         None
     };
 
-    let http = serve(&config, listener, state, shutdown.clone());
+    let http = serve(&config, listener, state, shutdown.clone(), self_roles);
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,

@@ -1,12 +1,12 @@
 use super::*;
 use crate::command_runtime_tests::{message, slash};
+use crate::discord_test_common::{MockRest, ScriptedResponse};
+use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use twilight_model::{
     application::interaction::message_component::MessageComponentInteractionData, id::Id,
 };
 use two_bot_core::self_roles::{self_role_custom_id, SelfRoleOption};
-use two_bot_cutover::self_role_store::SelfRoleStore;
-use two_bot_discord::ActionExecutor;
 
 pub(crate) const GUILD: u64 = 100_000_000_000_000_001;
 const USER: u64 = 100_000_000_000_000_002;
@@ -62,16 +62,20 @@ pub(crate) fn reaction() -> GatewayReaction {
     }
 }
 
-fn runtime() -> SelfRoleRuntime {
+/// Lazy agent-testdb pool: these fixtures never perform database I/O.
+fn lazy_store() -> SelfRoleStore {
     let options = PgConnectOptions::new()
         .host("agent-testdb")
         .port(5432)
         .username("agent_test")
         .password("")
         .database("agent_test");
-    let pool = PgPoolOptions::new().connect_lazy_with(options);
+    SelfRoleStore::new(PgPoolOptions::new().connect_lazy_with(options))
+}
+
+fn runtime() -> SelfRoleRuntime {
     SelfRoleRuntime {
-        store: SelfRoleStore::new(pool),
+        store: lazy_store(),
         executor: ActionExecutor::with_proxy(
             "fixture-token".into(),
             Some("http://127.0.0.1:9".into()),
@@ -139,6 +143,85 @@ async fn empty_or_denied_catalogue_never_registers_a_surface() {
     )
     .is_none());
     assert!(SelfRoleService::new(runtime(), gates(PanelMode::Button), &HashSet::new()).is_none());
+}
+
+#[test]
+fn boot_allowlist_is_only_the_pinned_staging_guild() {
+    let allowlist = staging_allowlist();
+    assert_eq!(allowlist.len(), 1);
+    assert!(allowlist.contains(TWO_STAGING_GUILD_ID));
+    assert!(!allowlist.contains(two_bot_core::TWO_GUILD_ID));
+}
+
+#[tokio::test]
+async fn boot_checks_catalogue_and_staging_guild_before_one_identity_read() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, json!({"id": BOT.to_string(), "bot": true})),
+    )
+    .await;
+    let executor =
+        || ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin())).unwrap();
+    let allowlist: HashSet<String> = [GUILD.to_string()].into_iter().collect();
+    let empty = SelfRoleGates {
+        panels: vec![],
+        dry_run: false,
+    };
+    assert!(
+        SelfRoleService::boot(empty, lazy_store(), executor(), GUILD, &allowlist)
+            .await
+            .is_none()
+    );
+    let denied = GUILD + 1;
+    assert!(SelfRoleService::boot(
+        gates(PanelMode::Button),
+        lazy_store(),
+        executor(),
+        denied,
+        &allowlist
+    )
+    .await
+    .is_none());
+    assert!(mock.requests().is_empty());
+
+    let service = SelfRoleService::boot(
+        gates(PanelMode::Button),
+        lazy_store(),
+        executor(),
+        GUILD,
+        &allowlist,
+    )
+    .await
+    .expect("approved staging catalogue");
+    assert_eq!(service.runtime.guild_id, GUILD.to_string());
+    assert_eq!(service.runtime.bot_id, BOT.to_string());
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].path, "/api/v10/users/@me");
+}
+
+#[tokio::test]
+async fn boot_parks_without_a_verified_bot_identity() {
+    for response in [
+        ScriptedResponse::status(500),
+        ScriptedResponse::json(200, json!({"id": BOT.to_string(), "bot": false})),
+    ] {
+        let mock = MockRest::start(vec![], response).await;
+        let executor =
+            ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin())).unwrap();
+        let allowlist = [GUILD.to_string()].into_iter().collect();
+        assert!(SelfRoleService::boot(
+            gates(PanelMode::Select),
+            lazy_store(),
+            executor,
+            GUILD,
+            &allowlist
+        )
+        .await
+        .is_none());
+        assert_eq!(mock.requests().len(), 1);
+    }
 }
 
 #[tokio::test]

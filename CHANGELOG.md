@@ -82,9 +82,10 @@
   Document bounded unknown-work continuation and add a shared-service restart
   regression for repeated pending sweeps, durable lease backoff, other-row progress,
   one acknowledged repair, genuine sender completion and preserved legacy floors.
-  These source fixtures remain uncompiled. Production boot remains disabled until
-  approved shared boot configuration and compiled continuation acceptance are
-  complete.
+  Compose one boot-time self-role service, shared by gateway dispatch and the
+  supervised recovery job, only for a nonempty catalogue in the pinned TWO Staging
+  guild with a verified bot identity; any other guild, an empty or invalid
+  catalogue or a failed identity read parks the surface and the job.
 - Scheduled-message domain logic, PostgreSQL store and migration, with validation, prefix-resolved removal, recurring timing and retry outcomes. Discord router/executor wiring follows separately.
 - Scheduled-store integration tests run against the isolated PostgreSQL service container in CI.
 - Add ticket lifecycle domain logic and guild-scoped Postgres persistence, with atomic transcript capture, 300-second cooldowns, restart-recovery plans and 90-day transcript purge. Shared-router/REST runtime wiring remains pending.

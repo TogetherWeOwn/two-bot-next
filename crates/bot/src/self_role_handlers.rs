@@ -1,5 +1,5 @@
 //! Self-role input/orchestration owned by the shared command runtime.
-//! Boot injection remains parked until unresolved-work acceptance is complete.
+//! Boot composes at most one service, shared by dispatch and recovery.
 
 use std::{
     collections::HashSet,
@@ -10,16 +10,23 @@ use std::{
     time::Duration,
 };
 
+use sqlx::PgPool;
 use tracing::warn;
 use twilight_model::{
     application::interaction::{Interaction, InteractionData, InteractionType},
     channel::message::{component::ComponentType, EmojiReactionType},
     gateway::GatewayReaction,
 };
-use two_bot_core::self_roles::{
-    event_order_for_event_id, event_order_from_snowflake, is_snowflake, parse_self_role_custom_id,
-    reaction_option_key, self_role_reply, PanelMode, SelfRoleGates, SelfRolePanel, SettledOutcome,
+use two_bot_core::{
+    backup::guild_config::TWO_STAGING_GUILD_ID,
+    self_roles::{
+        event_order_for_event_id, event_order_from_snowflake, is_snowflake,
+        parse_self_role_custom_id, reaction_option_key, self_role_reply, PanelMode, SelfRoleGates,
+        SelfRolePanel, SettledOutcome,
+    },
 };
+use two_bot_cutover::self_role_store::SelfRoleStore;
+use two_bot_discord::ActionExecutor;
 
 use crate::{
     command_runtime::new_id,
@@ -28,6 +35,12 @@ use crate::{
 };
 
 pub(crate) const RECOVERY_JOB_NAME: &str = "self_role_recovery";
+const BOOT_IDENTITY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The approved activation scope: only the pinned TWO Staging guild.
+pub(crate) fn staging_allowlist() -> HashSet<String> {
+    HashSet::from([TWO_STAGING_GUILD_ID.to_owned()])
+}
 
 pub(crate) struct SelfRoleInput {
     pub panel: SelfRolePanel,
@@ -86,6 +99,69 @@ impl SelfRoleService {
             dry_run: gates.dry_run,
             recovery_cursor: AtomicUsize::new(0),
         })
+    }
+
+    /// Process boot: the ONE service Arc that `main` shares between gateway
+    /// dispatch and the supervised recovery job. Every gate fails closed, and
+    /// an empty or invalid catalogue returns before building a REST executor.
+    pub async fn from_env(pool: PgPool, token: &str, guild_id: u64) -> Option<Arc<Self>> {
+        let gates = match SelfRoleGates::from_env() {
+            Ok(gates) => gates,
+            Err(err) => {
+                // Parked, not ignored: old panels stay unserved until fixed.
+                tracing::error!(error = %err, "TWO_SELF_ROLE_PANELS invalid; self-roles disabled");
+                return None;
+            }
+        };
+        if gates.panels.is_empty() {
+            return None;
+        }
+        let proxy = std::env::var("DISCORD_API_BASE")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let Ok(executor) = ActionExecutor::with_proxy(token.to_owned(), proxy) else {
+            warn!("REST executor failed to build; self-roles disabled");
+            return None;
+        };
+        Self::boot(
+            gates,
+            SelfRoleStore::new(pool),
+            executor,
+            guild_id,
+            &staging_allowlist(),
+        )
+        .await
+    }
+
+    /// Allowlist and catalogue gates run before the one bot-identity read.
+    /// A failed or slow read parks the feature instead of guessing an identity.
+    pub(crate) async fn boot(
+        gates: SelfRoleGates,
+        store: SelfRoleStore,
+        executor: ActionExecutor,
+        guild_id: u64,
+        staging_allowlist: &HashSet<String>,
+    ) -> Option<Arc<Self>> {
+        let guild_id = guild_id.to_string();
+        if gates.panels.is_empty() || !staging_allowlist.contains(&guild_id) {
+            return None;
+        }
+        let bot_id =
+            match tokio::time::timeout(BOOT_IDENTITY_TIMEOUT, executor.current_bot_user_id()).await
+            {
+                Ok(Ok(id)) => id.to_string(),
+                _ => {
+                    warn!("bot user lookup failed; self-roles disabled");
+                    return None;
+                }
+            };
+        let runtime = SelfRoleRuntime {
+            store,
+            executor,
+            guild_id,
+            bot_id,
+        };
+        Self::new(runtime, gates, staging_allowlist).map(Arc::new)
     }
 
     /// Only actual button/text-select input on the configured source message.
