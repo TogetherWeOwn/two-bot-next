@@ -34,7 +34,20 @@ pub enum RestError {
     Twilight(#[from] TwilightError),
     #[error("discord response body unreadable: {0}")]
     Body(#[from] twilight_http::response::DeserializeBodyError),
+    /// A full member page did not advance the `after` cursor (repeated or
+    /// out-of-order page): traversal cannot be proven complete.
+    #[error("member pagination stalled: page did not advance the cursor")]
+    MemberCursorStalled,
+    /// A page/member ceiling was hit while Discord still reported full pages.
+    #[error("member pagination exceeded ceiling ({pages} pages, {members} members)")]
+    MemberCeilingExceeded { pages: u32, members: usize },
 }
+
+/// Default ceiling on member pages per traversal (1000 members/page, so
+/// 500k members: far beyond any TWO guild yet a hard memory/request bound).
+pub const MAX_MEMBER_PAGES: u32 = 500;
+/// Default ceiling on accumulated members per traversal.
+pub const MAX_MEMBERS: usize = 500_000;
 
 /// Paced twilight client with legacy retry semantics.
 #[derive(Debug, Clone)]
@@ -195,13 +208,34 @@ impl RestClient {
     /// Page a guild's full member list (`joined_at` is Discord's own record).
     /// Returns `None` when a page is unreadable (strict callers treat that
     /// as failure, not as end-of-list — legacy `fetchAllMembersStrict`).
+    /// Traversal is bounded by [`MAX_MEMBER_PAGES`] / [`MAX_MEMBERS`]; a
+    /// non-advancing cursor or a ceiling hit is an `Err`, never a partial
+    /// roster presented as complete.
     pub async fn fetch_all_members(
         &self,
         guild_id: Id<GuildMarker>,
     ) -> Result<Option<Vec<Member>>, RestError> {
+        self.fetch_all_members_bounded(guild_id, MAX_MEMBER_PAGES, MAX_MEMBERS)
+            .await
+    }
+
+    /// [`Self::fetch_all_members`] with explicit ceilings (tests, tuning).
+    pub async fn fetch_all_members_bounded(
+        &self,
+        guild_id: Id<GuildMarker>,
+        max_pages: u32,
+        max_members: usize,
+    ) -> Result<Option<Vec<Member>>, RestError> {
         let mut out = Vec::new();
         let mut after: Option<Id<UserMarker>> = None;
+        let mut pages: u32 = 0;
         loop {
+            if pages >= max_pages || out.len() >= max_members {
+                return Err(RestError::MemberCeilingExceeded {
+                    pages,
+                    members: out.len(),
+                });
+            }
             let page: ListPage<Member> = self
                 .exec_list(|| {
                     let client = &self.inner.client;
@@ -215,6 +249,7 @@ impl RestClient {
             let ListPage::Read(batch) = page else {
                 return Ok(None);
             };
+            pages += 1;
             if batch.is_empty() {
                 break;
             }
@@ -222,7 +257,12 @@ impl RestClient {
             let last = batch.last().map(|m| m.user.id);
             out.extend(batch);
             match (last, full) {
-                (Some(id), true) => after = Some(id),
+                (Some(id), true) => {
+                    if after.is_some_and(|prev| id <= prev) {
+                        return Err(RestError::MemberCursorStalled);
+                    }
+                    after = Some(id);
+                }
                 _ => break,
             }
         }
@@ -413,6 +453,11 @@ impl RestClient {
                 Ok(ListPage::Interrupted(reason)) => break reason,
                 Err(RestError::Body(_)) => break ScanCompletion::InvalidResponse,
                 Err(RestError::Twilight(_)) => break ScanCompletion::RequestFailed,
+                // Member-pagination errors never come from `exec_list`;
+                // propagate rather than mislabel a scan completion.
+                Err(
+                    e @ (RestError::MemberCursorStalled | RestError::MemberCeilingExceeded { .. }),
+                ) => return Err(e),
             };
             if batch.is_empty() {
                 break ScanCompletion::EndOfHistory;
