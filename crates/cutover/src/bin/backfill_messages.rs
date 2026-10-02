@@ -13,11 +13,11 @@
 use std::collections::HashMap;
 use twilight_model::channel::ChannelType;
 use twilight_model::id::Id;
-use two_bot_cutover::cli::{open_db, Args};
+use two_bot_cutover::cli::{open_db, Args, ScanReport};
 use two_bot_cutover::{
     find_early_messages, fold_messages, is_conversation_channel, iso_to_millis, record_earliest,
-    touch_activity, FunnelWrite, MemberMessages, RestClient, ScannedMessage, FORUM_CHANNEL_TYPES,
-    THREAD_CHANNEL_TYPES,
+    touch_activity, FunnelWrite, MemberMessages, RestClient, ScannedMessage,
+    DEFAULT_ARCHIVED_THREAD_PAGES, FORUM_CHANNEL_TYPES, THREAD_CHANNEL_TYPES,
 };
 
 const MESSAGE_RUNGS: [&str; 3] = ["first_message", "second_message", "third_message"];
@@ -110,13 +110,33 @@ async fn main() {
             }
         }
     }
+    let mut archived_truncated: Vec<String> = Vec::new();
     for forum in conversation
         .iter()
         .filter(|c| channel_type_code(&c.kind) == FORUM_CHANNEL_TYPES[0])
     {
-        if let Ok(Some(arch)) = rest.public_archived_threads(forum.id).await {
-            for t in &arch.threads {
-                thread_ids.push(t.id.get().to_string());
+        match rest
+            .list_all_archived_threads(forum.id, DEFAULT_ARCHIVED_THREAD_PAGES)
+            .await
+        {
+            Ok(Some(outcome)) => {
+                if !outcome.is_complete() {
+                    archived_truncated.push(forum.id.get().to_string());
+                }
+                for t in outcome.threads() {
+                    thread_ids.push(t.id.get().to_string());
+                }
+            }
+            Ok(None) => {
+                // Unreadable forum: same as the legacy one-page consumer —
+                // nothing discovered, nothing scanned.
+            }
+            Err(e) => {
+                eprintln!(
+                    "archived-thread discovery for forum {} failed: {e}",
+                    forum.id.get()
+                );
+                archived_truncated.push(forum.id.get().to_string());
             }
         }
     }
@@ -125,6 +145,7 @@ async fn main() {
     let mut last_active: HashMap<String, String> = HashMap::new();
     let (mut channels_scanned, mut threads_scanned, mut messages_read) = (0usize, 0usize, 0usize);
     let mut truncated: Vec<String> = Vec::new();
+    let mut scan_report = ScanReport::default();
     let mut scanned_back_to: Option<String> = None;
 
     // Text channels first, then threads (forum posts are threads only).
@@ -144,9 +165,14 @@ async fn main() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("scan of channel {} failed: {e}", target.get());
+                scan_report.record(
+                    &target.get().to_string(),
+                    two_bot_cutover::ScanCompletion::RequestFailed,
+                );
                 continue;
             }
         };
+        scan_report.record(&target.get().to_string(), page.completion);
         if is_thread {
             threads_scanned += 1;
         } else {
@@ -199,8 +225,13 @@ async fn main() {
     println!("  messages read         {}", pad(summary.messages_read));
     println!("  members who ever posted {}", pad(summary.authors_seen));
     println!(
-        "  members with 3+ posts   {}   (AM7 text bar, exactly)",
-        pad(summary.authors_with_full_ladder)
+        "  members with 3+ posts   {}   (AM7 text bar, {})",
+        pad(summary.authors_with_full_ladder),
+        if scan_report.has_incomplete_history() || !archived_truncated.is_empty() {
+            "lower bound - incomplete history"
+        } else {
+            "exactly"
+        }
     );
     println!(
         "  oldest message reached  {}",
@@ -257,12 +288,20 @@ async fn main() {
         println!("  (a re-run writes 0 and is a no-op, as intended)");
     }
 
+    print!("{}", scan_report.render());
     if !summary.truncated.is_empty() {
         println!(
             "\n  INCOMPLETE: hit the {max_pages}-page cap on {} channel(s).\n  A capped scan sees a subset of each member's posts, so the milestones we\n  recorded are at or LATER than the true ones - never earlier. AM7 can\n  therefore miss a member here, but it cannot wrongly admit one, and a\n  deeper re-run only moves the milestones towards the truth.\n  Re-run with --max-pages={}.\n  {}",
             summary.truncated.len(),
             max_pages * 4,
             summary.truncated.join(", ")
+        );
+    }
+    if !archived_truncated.is_empty() {
+        println!(
+            "\n  INCOMPLETE: archived-thread discovery stopped early on {} forum(s).\n  Threads beyond the pages we read were not scanned, so their posts are\n  missing from the milestones above rather than silently complete.\n  {}",
+            archived_truncated.len(),
+            archived_truncated.join(", ")
         );
     }
     println!(

@@ -645,13 +645,38 @@ async fn unwired_commands_preserve_disabled_and_permission_refusals() {
 }
 
 #[tokio::test]
-async fn unknown_and_foreign_non_moderation_commands_remain_silent() {
+async fn unknown_command_replies_ephemerally_without_other_effects() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
     runtime
         .on_interaction(&slash("not-a-command", Some(CHANNEL), Vec::new()))
         .await;
-    for name in ["rank", "rsvp", "command", "schedule"] {
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 1);
+    let reply: serde_json::Value = serde_json::from_slice(&callbacks[0].body).unwrap();
+    assert_eq!(reply["type"], 4, "immediate response, not a defer");
+    assert_eq!(reply["data"]["flags"], 64);
+    assert_eq!(
+        reply["data"]["content"],
+        two_bot_core::router::replies::UNKNOWN_INTERACTION_REPLY
+    );
+    assert_eq!(
+        reply["data"]["allowed_mentions"]["parse"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "only the unknown-command callback"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn foreign_non_moderation_commands_remain_silent() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    for name in ["not-a-command", "rank", "rsvp", "command", "schedule"] {
         for guild in [Some(Id::new(9999)), None] {
             let mut interaction = slash(name, Some(CHANNEL), Vec::new());
             interaction.guild_id = guild;

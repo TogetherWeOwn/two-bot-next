@@ -7,6 +7,7 @@
 #![allow(clippy::print_stdout)]
 
 use two_bot_cutover::cli::{open_db, require_guild, Args};
+use two_bot_cutover::db::normalize_role_rewards;
 use two_bot_cutover::{is_snowflake, replace_role_rewards, role_rewards, LevelRoleReward};
 
 fn usage() -> ! {
@@ -41,9 +42,19 @@ async fn main() {
     let args = Args::parse(&argv);
     let guild = require_guild(&args, "guild");
 
+    if args.flags.contains("set") {
+        usage();
+    }
+    let replacement = args.values.get("set").map(|set| parse_rewards(set));
+    if let Some(rewards) = &replacement {
+        if let Err(e) = normalize_role_rewards(rewards) {
+            eprintln!("invalid rewards: {e}");
+            std::process::exit(2);
+        }
+    }
     let db = open_db(&args, false).await;
-    if let Some(set) = args.values.get("set") {
-        if let Err(e) = replace_role_rewards(&db, &guild, &parse_rewards(set)).await {
+    if let Some(rewards) = &replacement {
+        if let Err(e) = replace_role_rewards(&db, &guild, rewards).await {
             eprintln!("replace failed: {e}");
             std::process::exit(1);
         }

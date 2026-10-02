@@ -10,7 +10,9 @@ Do not create a per-worktree `target/` or an external/container `/tmp` Cargo tar
 point Cargo at the old unbounded shared cache, change agent environments/rosters,
 or evade a busy/refused/missing pool by running Cargo directly. The wrapper places
 cooperative temporary output in quota-covered lease scratch, not container `/tmp`.
-A missing pool/quota/scratch-coverage receipt needs the Operator rollout;
+Run the wrapper with a Bash timeout that covers the build (600000 ms) or in the
+background; interrupted partial output stays in the slot and counts against its
+budget. A missing pool/quota/scratch-coverage receipt needs the Operator rollout;
 a full pool needs safe retention/continuation, not another cache. Agents must not
 clear crash sentinels, delete host caches, mount filesystems or restart services.
 

@@ -13,6 +13,9 @@ pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
 pub mod automod;
+pub mod automod_runtime;
+#[cfg(feature = "db")]
+pub mod automod_store;
 pub mod backup;
 pub mod channel_moderation;
 #[cfg(feature = "db")]
@@ -30,6 +33,7 @@ pub mod containment;
 pub mod database_roles;
 pub mod database_url;
 pub mod events;
+pub mod evidence;
 pub mod expected_joins;
 pub mod feature_commands;
 pub mod feeds;
@@ -57,6 +61,7 @@ pub mod lfg;
 #[cfg(feature = "db")]
 pub mod lfg_store;
 pub mod mac;
+pub mod membership;
 pub mod message_safety;
 pub mod metrics;
 pub mod moderation;
@@ -67,11 +72,16 @@ pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
 pub mod raid;
+pub mod raid_removal;
+pub mod rejection_telemetry;
 pub mod router;
 pub mod rsvp;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
+pub mod scheduled;
 pub mod scheduled_events;
+#[cfg(feature = "db")]
+pub mod scheduled_store;
 pub mod secret;
 pub use secret::Secret;
 pub mod self_roles;
@@ -79,8 +89,17 @@ pub mod settings;
 pub mod sticky;
 pub mod tickets;
 pub mod voice;
+pub mod voice_assistant_cap;
 pub mod voice_config;
+pub mod voice_config_diff;
+pub mod voice_naming;
 pub mod voice_ownership;
+pub mod voice_permission_health;
+pub mod voice_permissions;
+pub mod voice_placement;
+pub mod voice_private;
+pub mod voice_room_controls;
+pub mod voice_text_channel;
 pub mod voice_vote_kick;
 #[cfg(feature = "db")]
 pub mod website_store;
@@ -125,15 +144,23 @@ pub use community_snapshots::{
 pub use config::Config;
 pub use containment::{
     plan_quarantine, quarantine_outcome, role_removal_status, ClaimedContainmentEvent,
-    ContainmentDisposition, ContainmentEventState, ContainmentIncident, ContainmentIncidentState,
-    ContainmentPolicy, ContainmentPolicyError, ContainmentReason, ContainmentRole,
-    DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan, QuarantineRefusal,
+    ContainmentAlert, ContainmentDisposition, ContainmentEventState, ContainmentIncident,
+    ContainmentIncidentState, ContainmentPolicy, ContainmentPolicyError, ContainmentReason,
+    ContainmentRole, ContainmentSignal, DestructiveAction, DestructiveAuditEvent,
+    QuarantineFailure, QuarantinePlan, QuarantineRefusal, CONTAINMENT_ALERT_EVENT,
+    CONTAINMENT_ALERT_MAX_IDS, CONTAINMENT_SUPPRESSED_EVENT,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
+pub use evidence::{
+    evidence_packet_filename, family_of, Disposition, EventFamily, EvidenceLedger, ExpectedAction,
+    ReceiptingStore, ReconciledItem, Reconciliation, StoreReceipt, ALERT_RULE_IDS,
+    EVIDENCE_SCHEMA_VERSION, MATCH_WINDOW_MS, MAX_EXPECTED_ACTIONS, MAX_RECEIPTS,
+    SOAK_LEDGER_RULE_ID,
+};
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
-    announcement_commands, automation_commands, feature_commands, scorecard_attendance_command,
-    FeatureGates, GateError,
+    announcement_commands, automation_commands, feature_commands, parse_prefix_trigger,
+    scorecard_attendance_command, FeatureGates, GateError,
 };
 pub use funnel::{
     format_iso_millis, idempotency_key, is_measurable_gate_clearing, now_iso, parse_iso_millis,
@@ -171,9 +198,9 @@ pub use internal_actions::{
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
-    summarize_attribution_split, AttributionCategory, AttributionSplit, DowntimeWindow,
-    DowntimeWindowCount, InviteSnapshotStore, InviteState, InviteTracker, JoinAttribution,
-    MemSnapshots,
+    is_snapshot_stale, summarize_attribution_split, AttributionCategory, AttributionSplit,
+    DowntimeWindow, DowntimeWindowCount, InviteSnapshotStore, InviteState, InviteTracker,
+    JoinAttribution, MemSnapshots, INVITE_SNAPSHOT_STALENESS_BOUND_MS,
 };
 #[cfg(feature = "db")]
 pub use leveling_store::{
@@ -251,9 +278,25 @@ pub use rsvp::{
 pub use rsvp_store::{
     list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
 };
+pub use scheduled::{
+    advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
+    next_run_at_ms, no_such_schedule_text, no_unique_match_text, parse_iso_ms,
+    post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text, schedule_confirm_text,
+    schedule_list_line, schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome,
+    ScheduleError, ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX,
+    EVERY_MINUTES_MIN, INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
+    MAX_BODY_CHARS as SCHEDULED_MAX_BODY_CHARS, RETRY_DEFAULT_MS, RETRY_MAX_MS, RETRY_MIN_MS,
+    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+};
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
-    ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+    ScheduledEventMirror, ScheduledEventsSkip, SCHEDULED_EVENTS_INTERVAL_MS,
+};
+#[cfg(feature = "db")]
+pub use scheduled_store::{
+    audit_scheduled, claim_due, complete_run, delete_scheduled, get_scheduled, list_scheduled,
+    put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store, retry_scheduled,
+    ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError, ScheduledWrite,
 };
 pub use self_roles::{
     emoji_identity, event_order_for_event_id, event_order_from_snowflake,
@@ -285,12 +328,18 @@ pub use voice::{
     BlindWindow, BlindWindowCount, OpenSession, VoiceDurationRow, VoiceDurationSummary, VoiceEnd,
     VoiceSessionTracker, DEFAULT_BLIND_WINDOW_MAX_GAP_MS,
 };
+pub use voice_permission_health::{
+    evaluate_permissions, notice_target, resolve_effective_permissions, NoticeCandidates,
+    NoticeTarget, NoticeThrottle, OverwriteMasks, OverwriteTarget, PermissionFinding,
+    PermissionOverwrite, TrackedFailure, NOTICE_BACKOFF_MS, NOTICE_MAX_SENDS, PERM_ADMINISTRATOR,
+    PERM_MANAGE_CHANNELS, PERM_MANAGE_ROLES, PERM_MOVE_MEMBERS, PERM_VIEW_CHANNEL,
+};
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
     VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts, VOTE_KICK_TTL_MS,
 };
 #[cfg(feature = "db")]
 pub use website_store::{
-    apply_web_contract, read_raid_windows, replace_events, write_counter, write_rank_snapshot,
-    WebsiteStoreError, WEB_CONTRACT_VERSION, WEB_CONTRACT_VIEWS,
+    apply_web_contract, read_raid_windows, replace_events, upsert_event, write_counter,
+    write_rank_snapshot, WebsiteStoreError, WEB_CONTRACT_VERSION, WEB_CONTRACT_VIEWS,
 };

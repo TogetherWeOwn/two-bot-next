@@ -179,5 +179,6 @@ jobs:
           ")
           echo "Release PR #$PR_NUMBER on branch $HEAD_BRANCH; dispatching required checks."
           gh workflow run check.yml --ref "$HEAD_BRANCH"
-          gh workflow run secret-scan.yml --ref "$HEAD_BRANCH"
-          gh workflow run pr-lint.yml --ref "$HEAD_BRANCH" -f pr_number="$PR_NUMBER"
+          # TOG-11810: pr-lint and gitleaks are folded into supply-chain.yml,
+          # whose dispatch form keeps the pr_number input for the lint job.
+          gh workflow run supply-chain.yml --ref "$HEAD_BRANCH" -f pr_number="$PR_NUMBER"

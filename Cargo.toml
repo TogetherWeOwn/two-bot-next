@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/testsupport"]
-default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover"]
+members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport"]
+default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
 
 # One native Rust release strategy versions the whole workspace. The root
 # library exposes release metadata; it is not a crates.io distribution.
@@ -132,6 +132,6 @@ twilight-model = "0.17"
 opt-level = "z"
 lto = true
 codegen-units = 1
-# Job tasks must unwind so the supervisor can isolate a panic in release too.
+# Router handlers and supervised jobs must unwind to isolate panics in release.
 panic = "unwind"
 strip = true

@@ -273,57 +273,19 @@ async fn store_counters(
     invites: &[twilight_model::guild::invite::Invite],
     captured_at: &str,
 ) {
-    use std::collections::HashSet;
-    let now = now_iso();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for inv in invites {
-        seen.insert(inv.code.as_str());
-        sqlx::query(
-            "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6::timestamptz)
-             ON CONFLICT (guild_id, code) DO UPDATE SET
-               uses = excluded.uses, inviter_id = excluded.inviter_id,
-               channel_id = excluded.channel_id, updated_at = excluded.updated_at",
-        )
-        .bind(guild_id)
-        .bind(&inv.code)
-        .bind(inv.uses.unwrap_or(0) as i64)
-        .bind(inv.inviter.as_ref().map(|u| u.id.get().to_string()))
-        .bind(inv.channel.as_ref().map(|c| c.id.get().to_string()))
-        .bind(&now)
-        .execute(db.pool())
+    let rows: Vec<two_bot_cutover::invite_store::CounterRow> = invites
+        .iter()
+        .map(|inv| two_bot_cutover::invite_store::CounterRow {
+            code: inv.code.clone(),
+            uses: inv.uses.unwrap_or(0) as i64,
+            inviter_id: inv.inviter.as_ref().map(|u| u.id.get().to_string()),
+            channel_id: inv.channel.as_ref().map(|c| c.id.get().to_string()),
+        })
+        .collect();
+    two_bot_cutover::invite_store::store_counters(db.pool(), guild_id, &rows, captured_at)
         .await
         .unwrap_or_else(|e| {
             eprintln!("invite snapshot write failed: {e}");
-            std::process::exit(1);
-        });
-    }
-    let prev: Vec<(String,)> =
-        sqlx::query_as("SELECT code FROM invite_snapshots WHERE guild_id = $1")
-            .bind(guild_id)
-            .fetch_all(db.pool())
-            .await
-            .unwrap_or_default();
-    for (code,) in prev {
-        if !seen.contains(code.as_str()) {
-            sqlx::query("DELETE FROM invite_snapshots WHERE guild_id = $1 AND code = $2")
-                .bind(guild_id)
-                .bind(&code)
-                .execute(db.pool())
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("invite cleanup failed: {e}");
-                    std::process::exit(1);
-                });
-        }
-    }
-    sqlx::query("UPDATE invite_snapshots SET updated_at = $1::timestamptz WHERE guild_id = $2")
-        .bind(captured_at)
-        .bind(guild_id)
-        .execute(db.pool())
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("invite window stamp failed: {e}");
             std::process::exit(1);
         });
 }

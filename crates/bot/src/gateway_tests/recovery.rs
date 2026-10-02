@@ -101,6 +101,7 @@ async fn persistence_failure_stops_service_and_restart_recovers_committed_sequen
                 crate::server::shutdown_requested(receiver).await;
                 Ok(())
             },
+            state.clone(),
             shutdown,
         ),
     )
@@ -112,7 +113,7 @@ async fn persistence_failure_stops_service_and_restart_recovers_committed_sequen
         "gateway task stopped; container restart required"
     );
     assert_eq!(first.authentication().await["op"], 2);
-    assert_eq!(*state.read().await, GatewayState::Armed);
+    assert_eq!(*state.read().await, GatewayState::Draining);
     let saved = db.store.load().await.unwrap().unwrap();
     assert_eq!(
         saved.sequence, 1,

@@ -106,4 +106,43 @@ mod tests {
         assert!(text.contains("two_bot_gateway_resumes_total 1\n"));
         assert!(text.contains("two_bot_gateway_latency_seconds NaN\n"));
     }
+
+    #[test]
+    fn emitted_series_keep_stable_event_label_spellings() {
+        // Rename-proofing: scrapers and alert rules match these exact label
+        // values, so the observer must emit the canonical spellings already
+        // defined in crates/core/src/metrics.rs.
+        let metrics = metrics::Metrics::default();
+        let mut observer = Observer::default();
+        observer.observe_text(r#"{"op":0,"t":"RESUMED","s":7,"d":{}}"#, None, &metrics);
+        observer.observe_text(
+            r#"{"op":0,"t":"BOGUS_FUTURE_TYPE","s":8,"d":{}}"#,
+            None,
+            &metrics,
+        );
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_gateway_events_total{event=\"RESUMED\"} 1\n"));
+        assert!(text.contains("two_bot_gateway_resumes_total 1\n"));
+        assert!(text.contains("two_bot_gateway_events_total{event=\"other\"} 1\n"));
+    }
+
+    #[test]
+    fn dispatch_commit_records_session_checkpoint_success() {
+        // DispatchTimer commits durable gateway checkpoints under the stable
+        // `session_checkpoint` job label. Supervisor outcomes (TOG-11144)
+        // are separately owned and not asserted here.
+        let timer = DispatchTimer::start();
+        timer.committed();
+        let text = metrics::global().render(None);
+        let line = text
+            .lines()
+            .find(|line| {
+                line.starts_with(
+                    "two_bot_job_last_success_timestamp_seconds{job=\"session_checkpoint\"} ",
+                )
+            })
+            .expect("session_checkpoint series");
+        let value: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!(value > 0, "committed checkpoint must record success");
+    }
 }

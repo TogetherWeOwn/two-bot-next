@@ -35,6 +35,26 @@ pub fn boot_action(saved: Option<&GatewaySession>, now_ms: i64) -> BootAction {
     }
 }
 
+/// One-shot operator input read with the checkpoint at boot. `None` keeps the
+/// age policy above; an armed `ForceIdentify` never offers RESUME.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BootDirective {
+    #[default]
+    None,
+    ForceIdentify,
+}
+
+pub fn boot_action_with(
+    saved: Option<&GatewaySession>,
+    directive: BootDirective,
+    now_ms: i64,
+) -> BootAction {
+    match directive {
+        BootDirective::ForceIdentify => BootAction::DiscardAndIdentify,
+        BootDirective::None => boot_action(saved, now_ms),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DispatchAction {
     Apply,
@@ -119,6 +139,51 @@ mod tests {
             dispatch_action(Some(&session), "new-session", 1),
             DispatchAction::Apply
         );
+    }
+
+    #[test]
+    fn armed_directive_always_identifies_and_unarmed_keeps_age_policy() {
+        use BootAction::{DiscardAndIdentify, Identify, Resume};
+        let at = |updated_at_ms| GatewaySession {
+            updated_at_ms,
+            ..saved()
+        };
+        let empty = GatewaySession {
+            session_id: String::new(),
+            ..saved()
+        };
+        let now = 2000;
+        let cases = [
+            ("no checkpoint", None, Identify),
+            ("fresh", Some(at(now)), Resume),
+            ("oldest fresh", Some(at(now - SESSION_MAX_AGE_MS)), Resume),
+            (
+                "stale",
+                Some(at(now - SESSION_MAX_AGE_MS - 1)),
+                DiscardAndIdentify,
+            ),
+            ("future-dated", Some(at(now + 1)), DiscardAndIdentify),
+            ("empty session_id", Some(empty), DiscardAndIdentify),
+        ];
+        for (state, checkpoint, unarmed) in cases {
+            let checkpoint = checkpoint.as_ref();
+            assert_eq!(
+                boot_action_with(checkpoint, BootDirective::None, now),
+                unarmed,
+                "unarmed {state}"
+            );
+            assert_eq!(
+                boot_action_with(checkpoint, BootDirective::None, now),
+                boot_action(checkpoint, now),
+                "unarmed {state} matches the age policy"
+            );
+            assert_eq!(
+                boot_action_with(checkpoint, BootDirective::ForceIdentify, now),
+                DiscardAndIdentify,
+                "armed {state}"
+            );
+        }
+        assert_eq!(BootDirective::default(), BootDirective::None);
     }
 
     #[test]

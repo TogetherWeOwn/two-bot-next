@@ -18,6 +18,14 @@ CLI_MODULES = {
     "crates/cutover/src/bin/levels_import_mee6.rs",
     "crates/cutover/src/bin/levels_import_rewards_probe.rs",
     "crates/cutover/src/bin/levels_role_rewards.rs",
+    "crates/bot/src/erasure_cli.rs",
+    "crates/discord/examples/pipeline_bench.rs",
+    "crates/cutover/src/bin/audit_switch.rs",
+    "crates/cutover/src/bin/gate_stuck_report.rs",
+    "crates/cutover/src/bin/gateway_force_identify.rs",
+    "crates/cutover/src/bin/preconditions.rs",
+    "crates/cutover/src/bin/raid_list.rs",
+    "crates/cutover/src/bin/raid_remove.rs",
 }
 
 

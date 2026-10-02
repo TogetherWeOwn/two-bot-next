@@ -73,6 +73,7 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
                 crate::server::shutdown_requested(receiver).await;
                 Ok(())
             },
+            state.clone(),
             shutdown,
         ),
     )
@@ -83,7 +84,7 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
         result.to_string(),
         "gateway task stopped; container restart required"
     );
-    assert_eq!(*state.read().await, GatewayState::Armed);
+    assert_eq!(*state.read().await, GatewayState::Draining);
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
     assert_eq!(db.count().await, 0);
     lock.rollback().await.unwrap();

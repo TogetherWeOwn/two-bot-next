@@ -18,6 +18,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pipeline-benchmark:
+    name: nightly pipeline budget
+    # A called workflow can only narrow the caller grant; with the default-deny
+    # top level it would otherwise check out this private repo with no token.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pipeline-benchmark.yml
+
   advisories:
     name: nightly advisories
     permissions:
@@ -41,8 +49,7 @@ jobs:
       contents: read
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 45
-    # Job-private loopback forward preserves the guarded test endpoints without
-    # publishing a fixed port on the shared Docker host.
+    # Match required CI isolation on the shared Docker host.
     container:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
@@ -70,7 +77,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Job-container prerequisites (loopback forward to agent-testdb)
+      - name: Job-container prerequisites (job-private loopback forward)
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null

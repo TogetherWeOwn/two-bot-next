@@ -47,6 +47,28 @@ verify and retain evidence for:
 - The existing deployment/approval principal can still deploy and the
   `STAGING_WORKER_URL` variable resolves in that environment.
 
+## Production route
+
+`deploy-production.yml` (main #243) is the one live deployment workflow. The
+regression pins it as `workflow_dispatch`-only. Its `production` job must need
+`guard`, run in GitHub environment `production` and carry no job condition. The
+`guard` job may not have an environment, call a reusable workflow, or contain
+deploy/probe steps. Its script must still require a deploy-staging run with
+`status="success"` on the SHA, plus required reviewers on the production
+Environment. Negative fixtures cover extra triggers, removed `needs` or
+environment, a bypass condition, deploy steps in the guard, and dropping those
+checks.
+
+While staging is statically disabled, every deploy-staging run on a new SHA
+concludes `skipped`, so the guard refuses production for that SHA. This fails
+closed. Production for a newer SHA therefore waits on approved staging
+activation (TOG-11271); this change does not authorize a bypass.
+
+`supply-chain.yml` holds the required `pr-lint` and `gitleaks` jobs (main #187).
+The `pipeline-benchmark` reusable call in `nightly.yml` is the only permitted
+`uses:` job, and its caller grants `contents: read`. Under a default-deny top
+level, a called workflow can only narrow the caller's grant.
+
 Environment settings, secrets, branch protection, and deployments are not
 modified by this code change. An inaccessible environment API response is not
 proof of protection or proof of absence. Never create/substitute credentials to
