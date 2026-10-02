@@ -1,9 +1,9 @@
-//! Structural gate for the V6b independent golden corpus
-//! (`fixtures/voice_conditions_golden.json`, [TOG-12468](/TOG/issues/TOG-12468)).
+//! The V6b independent golden corpus (`fixtures/voice_conditions_golden.json`,
+//! [TOG-12468](/TOG/issues/TOG-12468)) and its evaluation through the merged
+//! `voice_conditions` evaluator ([TOG-12528](/TOG/issues/TOG-12528)).
 //!
-//! This test never touches the `voice_conditions` evaluator (TOG-12189 owns
-//! it; PR #246 unmerged at authoring time). It pins the fixture contract the
-//! eval-wiring follow-up will consume:
+//! The structural gate pins the fixture contract independently of the
+//! evaluator:
 //! - every condition head has at least one row (`MIN_PER_HEAD`);
 //! - unknown-head rows refuse (`expected.output == "no"`);
 //! - `spec` rows cite §V6 alone and `choice` rows cite the TOG-12189
@@ -17,13 +17,20 @@
 //!   the `DERIVED_CONTEXTS` allowlist, which the shared corpus must not define;
 //! - the spec pin matches the current `docs/voice-rooms.md` SHA-256.
 //!
-//! The eval follow-up (blocked on TOG-12189) renders `input` through the
-//! merged evaluator over the inlined `contexts` and asserts `expected.output`.
+//! The eval test renders every row's `input` through [`Conditions`] over the
+//! row's inlined context and asserts `expected.output` byte-for-byte. Expected
+//! outputs are never edited here: a disagreement is a finding for the
+//! evaluator owner, reported as row ID, basis, expected and actual.
+
+#[path = "support/voice_corpus_context.rs"]
+mod voice_corpus_context;
 
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use two_bot_core::voice_naming::{parse, Extension, Segment};
+use two_bot_core::voice_conditions::Conditions;
+use two_bot_core::voice_naming::{parse, render, Extension, Segment};
+use voice_corpus_context::{condition_facts, room_context, CorpusContext};
 
 const GOLDEN: &str = include_str!("fixtures/voice_conditions_golden.json");
 const SHARED: &str = include_str!("../../../tests/voice_templates/corpus.json");
@@ -101,7 +108,6 @@ struct Case {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Expected {
-    #[allow(dead_code)]
     kind: String,
     output: String,
 }
@@ -345,4 +351,46 @@ fn contexts_are_shared_verbatim_except_the_derived_allowlist() {
         copied += 1;
     }
     assert_eq!(copied, 26, "26 contexts are copied verbatim");
+}
+
+#[test]
+fn every_row_renders_its_expected_output_through_the_evaluator() {
+    let fixture = fixture();
+    let mut rooms = BTreeMap::new();
+    for (name, body) in &fixture.contexts {
+        let context: CorpusContext = serde_json::from_value(body.clone())
+            .unwrap_or_else(|error| panic!("context {name}: {error}"));
+        let room = room_context(&context);
+        let facts = condition_facts(&context);
+        // `GAME` must agree with the `@@game@@` the same name renders.
+        let shown = match facts.games.as_slice() {
+            [] => context.settings.no_game.clone(),
+            titles => titles.join(" & "),
+        };
+        assert_eq!(room.game_name, shown, "context {name}: GAME facts drift");
+        rooms.insert(name.as_str(), (room, facts));
+    }
+    let mut failures = Vec::new();
+    for case in &fixture.cases {
+        assert_eq!(case.expected.kind, "exact", "{}: not exact", case.id);
+        let (room, facts) = &rooms[case.context.as_str()];
+        let actual = render(&parse(&case.input), room, &Conditions::new(facts));
+        if actual != case.expected.output {
+            failures.push(format!(
+                "{} ({}): expected {:?}, actual {actual:?}",
+                case.id, case.basis, case.expected.output
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} row(s) disagree with the evaluator:\n{}",
+        failures.len(),
+        fixture.cases.len(),
+        failures.join("\n")
+    );
+    assert!(
+        rooms.contains_key("v6b-party-capped"),
+        "the derived context is evaluated"
+    );
 }

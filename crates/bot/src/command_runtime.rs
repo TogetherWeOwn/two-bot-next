@@ -36,12 +36,14 @@ use std::sync::{
     Arc,
 };
 
+use crate::self_role_handlers::SelfRoleService;
 use sqlx::{Pool, Postgres};
 use tracing::warn;
 use twilight_gateway::Event;
 use twilight_model::{
     application::interaction::{application_command::CommandOptionValue, Interaction},
     channel::message::{Message, MessageFlags},
+    gateway::GatewayReaction,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
@@ -113,6 +115,8 @@ pub struct CommandRuntime {
     pool: Pool<Postgres>,
     executor: ActionExecutor,
     router: InteractionRouter,
+    /// Shared self-role surface; production boot stays parked pending acceptance.
+    self_roles: Option<Arc<SelfRoleService>>,
     leveling: LevelingRuntime,
     /// Configured guild (`GUILD_ID`); also the router's guild fence.
     guild_id: u64,
@@ -132,12 +136,15 @@ impl CommandRuntime {
     /// Build the runtime from process env gates + the optional
     /// `DISCORD_API_BASE` proxy override. Returns `None` — gateway still
     /// boots — when gate parsing or executor construction fails, so bad
-    /// env cannot take the shard down.
+    /// env cannot take the shard down. `self_roles` is the boot-composed
+    /// service shared with the recovery job; only its presence opens the
+    /// self-role router surface.
     #[must_use]
     pub fn from_env(
         pool: Pool<Postgres>,
         token: &str,
         guild_id: u64,
+        self_roles: Option<Arc<SelfRoleService>>,
         onboarding: two_bot_core::OnboardingGates,
     ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
@@ -162,6 +169,7 @@ impl CommandRuntime {
             SurfaceFlags {
                 session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                 tickets: ticket_config.is_some(),
+                self_roles: self_roles.is_some(),
                 ..SurfaceFlags::default()
             },
         );
@@ -215,6 +223,7 @@ impl CommandRuntime {
             pool,
             executor,
             router,
+            self_roles,
             leveling,
             guild_id,
             tickets,
@@ -247,6 +256,7 @@ impl CommandRuntime {
             pool,
             executor,
             router,
+            self_roles: None,
             leveling,
             guild_id,
             tickets: None,
@@ -266,6 +276,22 @@ impl CommandRuntime {
     /// the ordered award path; only this runtime dispatches interactions.
     pub fn leveling(&self) -> LevelingRuntime {
         self.leveling.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_self_roles(
+        pool: Pool<Postgres>,
+        executor: ActionExecutor,
+        router: InteractionRouter,
+        guild_id: u64,
+        automations: bool,
+        service: Arc<SelfRoleService>,
+    ) -> Arc<Self> {
+        let mut runtime = Self::new(pool, executor, router, guild_id, automations);
+        Arc::get_mut(&mut runtime)
+            .expect("new runtime is unshared")
+            .self_roles = Some(service);
+        runtime
     }
 
     #[cfg(test)]
@@ -337,6 +363,8 @@ impl CommandRuntime {
                     }));
                 }
             }
+            Event::ReactionAdd(reaction) => self.dispatch_self_role_reaction(&reaction.0, false),
+            Event::ReactionRemove(reaction) => self.dispatch_self_role_reaction(&reaction.0, true),
             Event::Ready(ready) => {
                 if let Some(tickets) = &self.tickets {
                     tickets.on_ready(ready.user.id.get());
@@ -366,6 +394,36 @@ impl CommandRuntime {
             }
             _ => {}
         }
+    }
+
+    fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) {
+        if !self.router.gates().self_roles {
+            return;
+        }
+        let Some(service) = self.self_roles.as_ref().cloned() else {
+            return;
+        };
+        let Some(input) = service.reaction_input(reaction, remove) else {
+            return;
+        };
+        drop(tokio::spawn(async move {
+            let _ = service.handle(&input).await;
+        }));
+    }
+
+    async fn self_role_component(&self, interaction: &Interaction) {
+        let Some(service) = &self.self_roles else {
+            return;
+        };
+        let Some(input) = service.component_input(interaction) else {
+            return;
+        };
+        if !self.defer(interaction, "self-role").await {
+            return;
+        }
+        let result = service.handle(&input).await;
+        self.finish(interaction, result.reply(input.panel.color))
+            .await;
     }
 
     async fn ready_tickets_after_resume(&self) {
@@ -421,7 +479,8 @@ impl CommandRuntime {
         }
     }
 
-    /// Route all slash commands through the shared router. Refusals get the
+    /// Route interactions through the shared router. An injected self-role
+    /// service handles only its owned component surface. Refusals get the
     /// existing ephemeral text; accepted builtins without a wired slice get
     /// an unavailable reply. Sticky/feed/schedule defer ephemerally; leveling
     /// sends its own immediate callback. Router Ignore (unknown/guild) stays silent.
@@ -429,18 +488,23 @@ impl CommandRuntime {
         let routed = route_interaction(&self.router, interaction, None);
         if let RoutedInteraction::Component {
             custom_id,
-            outcome:
-                ComponentOutcome::Handled {
-                    handler: ComponentHandler::Tickets,
-                },
+            outcome: ComponentOutcome::Handled { handler },
             ..
         } = &routed
         {
-            if let (Some(tickets), Some(action)) =
-                (&self.tickets, TicketAction::from_custom_id(custom_id))
-            {
-                self.on_ticket_interaction(tickets, interaction, action)
-                    .await;
+            match handler {
+                ComponentHandler::SelfRole => {
+                    self.self_role_component(interaction).await;
+                }
+                ComponentHandler::Tickets => {
+                    if let (Some(tickets), Some(action)) =
+                        (&self.tickets, TicketAction::from_custom_id(custom_id))
+                    {
+                        self.on_ticket_interaction(tickets, interaction, action)
+                            .await;
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -477,22 +541,7 @@ impl CommandRuntime {
         }
         // Acknowledge before any database wait or Discord cleanup. If the
         // acknowledgement fails, do not mutate state without a reply path.
-        if let Err(err) = self
-            .executor
-            .answer_interaction(
-                interaction.id.get(),
-                &interaction.token,
-                &InteractionResponse {
-                    kind: InteractionResponseType::DeferredChannelMessageWithSource,
-                    data: Some(InteractionResponseData {
-                        flags: Some(MessageFlags::EPHEMERAL),
-                        ..Default::default()
-                    }),
-                },
-            )
-            .await
-        {
-            warn!(interaction_id = %interaction.id.get(), command = %name, error = %err, "command defer failed");
+        if !self.defer(interaction, &name).await {
             return;
         }
         match name.as_str() {
@@ -994,6 +1043,30 @@ impl CommandRuntime {
 
     /// Answer an interaction through the shared executor. The token never
     /// appears in logs — only the interaction id and error.
+    async fn defer(&self, interaction: &Interaction, command: &str) -> bool {
+        match self
+            .executor
+            .answer_interaction(
+                interaction.id.get(),
+                &interaction.token,
+                &InteractionResponse {
+                    kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                    data: Some(InteractionResponseData {
+                        flags: Some(MessageFlags::EPHEMERAL),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+        {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(interaction_id = %interaction.id.get(), command, error = %err, "command defer failed");
+                false
+            }
+        }
+    }
+
     async fn answer(&self, interaction: &Interaction, response: InteractionResponse) {
         if let Err(err) = self
             .executor

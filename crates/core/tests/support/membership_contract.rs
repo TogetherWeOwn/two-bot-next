@@ -184,9 +184,11 @@ pub fn inactivity<S: MembershipStore>(make: &impl Fn() -> S) {
     s.record(leave(l1));
     s.record(join(j2, "invite:latest"));
     expect(&s, Some(j2), Some("invite:latest"), None, None);
+    // Durable readbacks normalize to six fractional digits; compare the
+    // normalized instants, not the raw text shapes.
     assert_eq!(
-        row(&s, EventType::FirstMessage).occurred_at,
-        milestone.occurred_at
+        utc(&row(&s, EventType::FirstMessage).occurred_at),
+        utc(&milestone.occurred_at)
     );
     assert!(!s.record(milestone).inserted);
 
@@ -336,7 +338,7 @@ pub fn replay<S: MembershipStore>(make: &impl Fn() -> S) {
     let saved = row(&s, EventType::MemberJoin);
     assert_eq!(saved.idempotency_key, key);
     assert_eq!(saved.source, original.source);
-    assert_eq!(saved.occurred_at, original.occurred_at);
+    assert_eq!(utc(&saved.occurred_at), utc(&original.occurred_at));
     assert_eq!(
         saved.metadata.unwrap(),
         serde_json::json!({"inviterId":"original-inviter","membershipObservedAt":"2026-09-30T00:00:00.000Z"})

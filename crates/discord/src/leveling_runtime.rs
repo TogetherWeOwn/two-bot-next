@@ -308,8 +308,8 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.handlers()
     }
 
-    /// The member cache, read by gateway-side captures that must observe state
-    /// before the funnel mutates it.
+    /// Access the cache (shard runner updates, tests seed).
+    #[must_use]
     pub fn cache(&self) -> &twilight_cache_inmemory::InMemoryCache {
         self.pipeline.cache()
     }
