@@ -55,27 +55,28 @@ const GUILD: &str = "100000000000000010";
 const OTHER_GUILD: &str = "100000000000000011";
 const NOW: &str = "2026-09-07T00:00:00.000Z";
 
-async fn seed_member(
-    pool: &sqlx::PgPool,
-    guild: &str,
-    member: &str,
-    joined_at: Option<&str>,
-    last_active_at: Option<&str>,
-    flagged_at: Option<&str>,
+struct SeedMember<'a> {
+    guild: &'a str,
+    member: &'a str,
+    joined_at: Option<&'a str>,
+    last_active_at: Option<&'a str>,
+    flagged_at: Option<&'a str>,
     is_bot: bool,
-    left_at: Option<&str>,
-) {
+    left_at: Option<&'a str>,
+}
+
+async fn seed_member(pool: &sqlx::PgPool, seed: SeedMember<'_>) {
     sqlx::query(
         "INSERT INTO members (guild_id, member_id, joined_at, last_active_at, inactive_flagged_at, is_bot, left_at)
          VALUES ($1, $2, $3::timestamptz, $4::timestamptz, $5::timestamptz, $6, $7::timestamptz)",
     )
-    .bind(guild)
-    .bind(member)
-    .bind(joined_at)
-    .bind(last_active_at)
-    .bind(flagged_at)
-    .bind(is_bot)
-    .bind(left_at)
+    .bind(seed.guild)
+    .bind(seed.member)
+    .bind(seed.joined_at)
+    .bind(seed.last_active_at)
+    .bind(seed.flagged_at)
+    .bind(seed.is_bot)
+    .bind(seed.left_at)
     .execute(pool)
     .await
     .unwrap();
@@ -132,96 +133,112 @@ async fn list_is_guild_scoped_selector_shaped_and_read_only() {
     // Quiet past the 14-day cutoff: listed.
     seed_member(
         &pool,
-        GUILD,
-        "100000000000000001",
-        Some("2026-07-01T00:00:00.000Z"),
-        None,
-        None,
-        false,
-        None,
+        SeedMember {
+            guild: GUILD,
+            member: "100000000000000001",
+            joined_at: Some("2026-07-01T00:00:00.000Z"),
+            last_active_at: None,
+            flagged_at: None,
+            is_bot: false,
+            left_at: None,
+        },
     )
     .await;
     // Quiet 60 days ago but flagged 30 days ago (before the cutoff): a new
     // quiet spell, listed again.
     seed_member(
         &pool,
-        GUILD,
-        "100000000000000002",
-        Some("2026-06-01T00:00:00.000Z"),
-        Some("2026-07-01T00:00:00.000Z"),
-        Some("2026-08-08T00:00:00.000Z"),
-        false,
-        None,
+        SeedMember {
+            guild: GUILD,
+            member: "100000000000000002",
+            joined_at: Some("2026-06-01T00:00:00.000Z"),
+            last_active_at: Some("2026-07-01T00:00:00.000Z"),
+            flagged_at: Some("2026-08-08T00:00:00.000Z"),
+            is_bot: false,
+            left_at: None,
+        },
     )
     .await;
     // Active yesterday: not listed.
     seed_member(
         &pool,
-        GUILD,
-        "100000000000000003",
-        Some("2026-07-01T00:00:00.000Z"),
-        Some("2026-09-06T00:00:00.000Z"),
-        None,
-        false,
-        None,
+        SeedMember {
+            guild: GUILD,
+            member: "100000000000000003",
+            joined_at: Some("2026-07-01T00:00:00.000Z"),
+            last_active_at: Some("2026-09-06T00:00:00.000Z"),
+            flagged_at: None,
+            is_bot: false,
+            left_at: None,
+        },
     )
     .await;
     // Quiet but a bot / departed / flagged-this-spell: not listed.
     seed_member(
         &pool,
-        GUILD,
-        "100000000000000004",
-        Some("2026-07-01T00:00:00.000Z"),
-        None,
-        None,
-        true,
-        None,
+        SeedMember {
+            guild: GUILD,
+            member: "100000000000000004",
+            joined_at: Some("2026-07-01T00:00:00.000Z"),
+            last_active_at: None,
+            flagged_at: None,
+            is_bot: true,
+            left_at: None,
+        },
     )
     .await;
     seed_member(
         &pool,
-        GUILD,
-        "100000000000000005",
-        Some("2026-07-01T00:00:00.000Z"),
-        None,
-        None,
-        false,
-        Some("2026-08-01T00:00:00.000Z"),
+        SeedMember {
+            guild: GUILD,
+            member: "100000000000000005",
+            joined_at: Some("2026-07-01T00:00:00.000Z"),
+            last_active_at: None,
+            flagged_at: None,
+            is_bot: false,
+            left_at: Some("2026-08-01T00:00:00.000Z"),
+        },
     )
     .await;
     seed_member(
         &pool,
-        GUILD,
-        "100000000000000006",
-        Some("2026-07-01T00:00:00.000Z"),
-        None,
-        Some("2026-09-06T00:00:00.000Z"),
-        false,
-        None,
+        SeedMember {
+            guild: GUILD,
+            member: "100000000000000006",
+            joined_at: Some("2026-07-01T00:00:00.000Z"),
+            last_active_at: None,
+            flagged_at: Some("2026-09-06T00:00:00.000Z"),
+            is_bot: false,
+            left_at: None,
+        },
     )
     .await;
     // Quiet in another guild: guild-scoped out.
     seed_member(
         &pool,
-        OTHER_GUILD,
-        "100000000000000007",
-        Some("2026-07-01T00:00:00.000Z"),
-        None,
-        None,
-        false,
-        None,
+        SeedMember {
+            guild: OTHER_GUILD,
+            member: "100000000000000007",
+            joined_at: Some("2026-07-01T00:00:00.000Z"),
+            last_active_at: None,
+            flagged_at: None,
+            is_bot: false,
+            left_at: None,
+        },
     )
     .await;
     // Never seen at all (neither activity nor join): SQL NULL logic excludes.
     seed_member(
         &pool,
-        GUILD,
-        "100000000000000008",
-        None,
-        None,
-        None,
-        false,
-        None,
+        SeedMember {
+            guild: GUILD,
+            member: "100000000000000008",
+            joined_at: None,
+            last_active_at: None,
+            flagged_at: None,
+            is_bot: false,
+            left_at: None,
+        },
     )
     .await;
 
