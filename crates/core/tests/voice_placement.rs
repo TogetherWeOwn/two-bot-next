@@ -1,9 +1,10 @@
 //! Hermetic V8b acceptance cases against the public placement core API.
 
 use proptest::prelude::*;
+use two_bot_core::voice_config::RoomPosition;
 use two_bot_core::voice_placement::{
     next_room_number, plan_placement, resolve_initial_state, CategoryChannel, CategoryEntryKind,
-    PlacementError, PlacementRequest, RoomInitialState, RoomSide, MAX_ROOM_USER_LIMIT,
+    PlacementError, PlacementRequest, RoomInitialState, MAX_ROOM_USER_LIMIT,
 };
 
 fn creator(id: u64, position: i32) -> CategoryChannel {
@@ -32,7 +33,7 @@ fn other(id: u64, position: i32) -> CategoryChannel {
 
 fn request<'a>(
     creator_id: u64,
-    side: RoomSide,
+    side: RoomPosition,
     grouped: bool,
     group_room_ids: &'a [u64],
     category_order: &'a [CategoryChannel],
@@ -116,11 +117,11 @@ fn numbering_saturates_at_u32_max() {
 fn creator_only_category_places_adjacent_to_creator() {
     let category = [creator(10, 0)];
     assert_eq!(
-        plan_placement(request(10, RoomSide::Above, false, &[], &category)),
+        plan_placement(request(10, RoomPosition::Above, false, &[], &category)),
         Ok(0)
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, false, &[], &category)),
+        plan_placement(request(10, RoomPosition::Below, false, &[], &category)),
         Ok(1)
     );
 }
@@ -129,11 +130,11 @@ fn creator_only_category_places_adjacent_to_creator() {
 fn creator_at_top_places_without_moving_others() {
     let category = [creator(10, 0), other(20, 1), room(30, 2)];
     assert_eq!(
-        plan_placement(request(10, RoomSide::Above, false, &[], &category)),
+        plan_placement(request(10, RoomPosition::Above, false, &[], &category)),
         Ok(0)
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, false, &[], &category)),
+        plan_placement(request(10, RoomPosition::Below, false, &[], &category)),
         Ok(1)
     );
     // Existing relative order is untouched by the decision itself.
@@ -145,11 +146,11 @@ fn creator_at_top_places_without_moving_others() {
 fn creator_at_bottom_places_without_moving_others() {
     let category = [other(20, 0), room(30, 1), creator(10, 2)];
     assert_eq!(
-        plan_placement(request(10, RoomSide::Above, false, &[], &category)),
+        plan_placement(request(10, RoomPosition::Above, false, &[], &category)),
         Ok(2)
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, false, &[], &category)),
+        plan_placement(request(10, RoomPosition::Below, false, &[], &category)),
         Ok(3)
     );
 }
@@ -160,11 +161,11 @@ fn placement_uses_display_order_not_input_order() {
     let category = [other(20, 100), creator(10, 0), room(30, 50)];
     assert_eq!(display_order(&category), vec![10, 30, 20]);
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, false, &[], &category)),
+        plan_placement(request(10, RoomPosition::Below, false, &[], &category)),
         Ok(1)
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Above, false, &[], &category)),
+        plan_placement(request(10, RoomPosition::Above, false, &[], &category)),
         Ok(0)
     );
 }
@@ -174,11 +175,11 @@ fn position_ties_break_by_channel_id() {
     let category = [creator(30, 0), other(10, 0), other(20, 0)];
     assert_eq!(display_order(&category), vec![10, 20, 30]);
     assert_eq!(
-        plan_placement(request(30, RoomSide::Above, false, &[], &category)),
+        plan_placement(request(30, RoomPosition::Above, false, &[], &category)),
         Ok(2)
     );
     assert_eq!(
-        plan_placement(request(30, RoomSide::Below, false, &[], &category)),
+        plan_placement(request(30, RoomPosition::Below, false, &[], &category)),
         Ok(3)
     );
 }
@@ -189,11 +190,11 @@ fn position_ties_break_by_channel_id() {
 fn group_with_no_rooms_yet_starts_beside_the_creator() {
     let category = [creator(10, 0), creator(20, 1), other(30, 2)];
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, true, &[], &category)),
+        plan_placement(request(10, RoomPosition::Below, true, &[], &category)),
         Ok(1)
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Above, true, &[], &category)),
+        plan_placement(request(10, RoomPosition::Above, true, &[], &category)),
         Ok(0)
     );
 }
@@ -211,21 +212,21 @@ fn group_block_spanning_two_creators_stays_contiguous() {
     let group = [11, 21];
     // Below: after the last group room, not beside the triggering creator.
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, true, &group, &category)),
+        plan_placement(request(10, RoomPosition::Below, true, &group, &category)),
         Ok(4)
     );
     // Above: before the first group room.
     assert_eq!(
-        plan_placement(request(20, RoomSide::Above, true, &group, &category)),
+        plan_placement(request(20, RoomPosition::Above, true, &group, &category)),
         Ok(1)
     );
     // Triggering creator does not matter, only the side and the group set.
     assert_eq!(
-        plan_placement(request(20, RoomSide::Below, true, &group, &category)),
+        plan_placement(request(20, RoomPosition::Below, true, &group, &category)),
         Ok(4)
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Above, true, &group, &category)),
+        plan_placement(request(10, RoomPosition::Above, true, &group, &category)),
         Ok(1)
     );
 }
@@ -244,11 +245,11 @@ fn group_split_block_places_at_its_outer_edges() {
     ];
     let group = [12, 11];
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, true, &group, &category)),
+        plan_placement(request(10, RoomPosition::Below, true, &group, &category)),
         Ok(5)
     );
     assert_eq!(
-        plan_placement(request(20, RoomSide::Above, true, &group, &category)),
+        plan_placement(request(20, RoomPosition::Above, true, &group, &category)),
         Ok(2)
     );
 }
@@ -258,12 +259,68 @@ fn group_room_duplicates_are_deduplicated() {
     let category = [creator(10, 0), room(11, 1), other(30, 2)];
     let group = [11, 11, 11];
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, true, &group, &category)),
+        plan_placement(request(10, RoomPosition::Below, true, &group, &category)),
         Ok(2)
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Above, true, &group, &category)),
+        plan_placement(request(10, RoomPosition::Above, true, &group, &category)),
         Ok(1)
+    );
+}
+
+// ---- plan_placement: successive rooms ----
+
+/// Creates `count` rooms one after another from creator 10, inserting each at
+/// its planned index and renumbering positions densely as Discord would, and
+/// returns the final display order. Rooms are 101, 102, ... in creation order.
+fn create_rooms_in_sequence(side: RoomPosition, grouped: bool, count: u64) -> Vec<u64> {
+    let mut category = vec![creator(10, 0)];
+    let mut rooms: Vec<u64> = Vec::new();
+    for new_id in (1..=count).map(|n| 100 + n) {
+        let group: &[u64] = if grouped { &rooms } else { &[] };
+        let index = plan_placement(request(10, side, grouped, group, &category))
+            .expect("room plans in a valid category");
+        category = with_insertion(&category, index, new_id)
+            .into_iter()
+            .enumerate()
+            .map(|(position, id)| {
+                let position = i32::try_from(position).expect("small category");
+                if id == 10 {
+                    creator(id, position)
+                } else {
+                    room(id, position)
+                }
+            })
+            .collect();
+        rooms.push(new_id);
+    }
+    display_order(&category)
+}
+
+#[test]
+fn ungrouped_rooms_keep_the_newest_next_to_the_creator() {
+    // Existing rooms are not moved, so each new room takes the slot beside
+    // the creator and pushes older rooms outward.
+    assert_eq!(
+        create_rooms_in_sequence(RoomPosition::Below, false, 3),
+        vec![10, 103, 102, 101]
+    );
+    assert_eq!(
+        create_rooms_in_sequence(RoomPosition::Above, false, 3),
+        vec![101, 102, 103, 10]
+    );
+}
+
+#[test]
+fn grouped_rooms_extend_the_block_in_creation_order() {
+    // `/group` keeps one contiguous block and appends at its outer edge.
+    assert_eq!(
+        create_rooms_in_sequence(RoomPosition::Below, true, 3),
+        vec![10, 101, 102, 103]
+    );
+    assert_eq!(
+        create_rooms_in_sequence(RoomPosition::Above, true, 3),
+        vec![103, 102, 101, 10]
     );
 }
 
@@ -273,54 +330,54 @@ fn group_room_duplicates_are_deduplicated() {
 fn placement_refusals_name_the_bad_entry() {
     let category = [creator(10, 0), room(11, 1), other(30, 2)];
     assert_eq!(
-        plan_placement(request(99, RoomSide::Below, false, &[], &category)),
+        plan_placement(request(99, RoomPosition::Below, false, &[], &category)),
         Err(PlacementError::UnknownCreator(99))
     );
     assert_eq!(
-        plan_placement(request(11, RoomSide::Below, false, &[], &category)),
+        plan_placement(request(11, RoomPosition::Below, false, &[], &category)),
         Err(PlacementError::NotACreator(11))
     );
     assert_eq!(
-        plan_placement(request(30, RoomSide::Below, false, &[], &category)),
+        plan_placement(request(30, RoomPosition::Below, false, &[], &category)),
         Err(PlacementError::NotACreator(30))
     );
     assert_eq!(
-        plan_placement(request(0, RoomSide::Below, false, &[], &category)),
+        plan_placement(request(0, RoomPosition::Below, false, &[], &category)),
         Err(PlacementError::InvalidChannelId)
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, false, &[11], &category)),
+        plan_placement(request(10, RoomPosition::Below, false, &[11], &category)),
         Err(PlacementError::UnexpectedGroupRooms)
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, true, &[99], &category)),
+        plan_placement(request(10, RoomPosition::Below, true, &[99], &category)),
         Err(PlacementError::UnknownGroupRoom(99))
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, true, &[10], &category)),
+        plan_placement(request(10, RoomPosition::Below, true, &[10], &category)),
         Err(PlacementError::GroupEntryNotRoom(10))
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, true, &[30], &category)),
+        plan_placement(request(10, RoomPosition::Below, true, &[30], &category)),
         Err(PlacementError::GroupEntryNotRoom(30))
     );
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, true, &[0], &category)),
+        plan_placement(request(10, RoomPosition::Below, true, &[0], &category)),
         Err(PlacementError::InvalidChannelId)
     );
     let duplicate = [creator(10, 0), room(11, 1), room(11, 2)];
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, false, &[], &duplicate)),
+        plan_placement(request(10, RoomPosition::Below, false, &[], &duplicate)),
         Err(PlacementError::DuplicateChannel(11))
     );
     let zero = [creator(10, 0), room(0, 1)];
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, false, &[], &zero)),
+        plan_placement(request(10, RoomPosition::Below, false, &[], &zero)),
         Err(PlacementError::InvalidChannelId)
     );
     let empty: [CategoryChannel; 0] = [];
     assert_eq!(
-        plan_placement(request(10, RoomSide::Below, false, &[], &empty)),
+        plan_placement(request(10, RoomPosition::Below, false, &[], &empty)),
         Err(PlacementError::UnknownCreator(10))
     );
 }
@@ -329,7 +386,7 @@ fn placement_refusals_name_the_bad_entry() {
 fn placement_refusals_leave_input_unchanged() {
     let category = [creator(10, 0), room(11, 1)];
     let before = category;
-    assert!(plan_placement(request(99, RoomSide::Below, false, &[], &category)).is_err());
+    assert!(plan_placement(request(99, RoomPosition::Below, false, &[], &category)).is_err());
     assert_eq!(category, before);
 }
 
@@ -371,67 +428,122 @@ fn initial_state_refuses_out_of_range_limits_instead_of_clamping() {
     }
 }
 
-// ---- property: existing channels never move ----
+// ---- property: adjacency ----
+
+/// Stand-in ID for the new room; synthetic channel IDs stay far below it.
+const NEW_ROOM: u64 = u64::MAX;
+
+/// A synthetic category in display order: `lead` unrelated channels, then the
+/// creator, a gap of `gap` unrelated channels and a contiguous block of
+/// `block` rooms (or the block, the gap and the creator when `block_first`),
+/// then `tail` unrelated channels.
+#[derive(Debug, Clone)]
+struct AdjacencyCase {
+    /// Every channel, in shuffled input order with sparse positions.
+    category: Vec<CategoryChannel>,
+    creator_id: u64,
+    /// The room block in display order.
+    block: Vec<u64>,
+}
+
+fn adjacency_case() -> impl Strategy<Value = AdjacencyCase> {
+    (0usize..4, 0usize..3, 0usize..4, 0usize..4, any::<bool>()).prop_flat_map(
+        |(lead, gap, block, tail, block_first)| {
+            let len = lead + 1 + gap + block + tail;
+            (
+                proptest::collection::btree_set(1u64..1_000_000, len)
+                    .prop_map(|ids| ids.into_iter().collect::<Vec<_>>())
+                    .prop_shuffle(),
+                proptest::collection::vec(1i32..6, len),
+                -40i32..40,
+            )
+                .prop_flat_map(move |(ids, steps, start)| {
+                    let mut kinds = vec![CategoryEntryKind::Other; lead];
+                    let mut middle = vec![CategoryEntryKind::Creator];
+                    middle.extend(vec![CategoryEntryKind::Other; gap]);
+                    middle.extend(vec![CategoryEntryKind::Room; block]);
+                    if block_first {
+                        middle.reverse();
+                    }
+                    kinds.extend(middle);
+                    kinds.extend(vec![CategoryEntryKind::Other; tail]);
+                    // Strictly increasing but sparse positions: the layout
+                    // above is the display order regardless of channel IDs.
+                    let mut position = start;
+                    let mut category = Vec::with_capacity(len);
+                    for ((&id, &kind), &step) in ids.iter().zip(&kinds).zip(&steps) {
+                        position += step;
+                        category.push(CategoryChannel { id, position, kind });
+                    }
+                    let creator_id = category
+                        .iter()
+                        .find(|entry| entry.kind == CategoryEntryKind::Creator)
+                        .map(|entry| entry.id)
+                        .expect("layout has one creator");
+                    let block: Vec<u64> = category
+                        .iter()
+                        .filter(|entry| entry.kind == CategoryEntryKind::Room)
+                        .map(|entry| entry.id)
+                        .collect();
+                    Just(category)
+                        .prop_shuffle()
+                        .prop_map(move |category| AdjacencyCase {
+                            category,
+                            creator_id,
+                            block: block.clone(),
+                        })
+                })
+        },
+    )
+}
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// Inserting the new channel at the planned index preserves the relative
-    /// order of every existing channel, for arbitrary categories and inputs.
+    /// The new room lands beside its anchor: the outer edge of the group's
+    /// room block when grouped with rooms (keeping block plus new room
+    /// contiguous), otherwise the creator channel itself.
     #[test]
-    fn property_planned_insertion_preserves_existing_order(
-        positions in proptest::collection::vec(-8..8i32, 0..8),
-        side in any::<bool>(),
+    fn property_new_room_is_adjacent_to_its_anchor(
+        case in adjacency_case(),
+        above in any::<bool>(),
         grouped in any::<bool>(),
     ) {
-        // Deterministic synthetic category: channel 1 is the creator, even
-        // IDs below 20 are rooms, the rest are other channels.
-        let category: Vec<CategoryChannel> = positions
-            .iter()
-            .enumerate()
-            .map(|(index, &position)| {
-                let id = index as u64 + 1;
-                let kind = if id == 1 {
-                    CategoryEntryKind::Creator
-                } else if id < 20 && id.is_multiple_of(2) {
-                    CategoryEntryKind::Room
-                } else {
-                    CategoryEntryKind::Other
-                };
-                CategoryChannel { id, position, kind }
-            })
-            .collect();
-        let group_rooms: Vec<u64> = category
-            .iter()
-            .filter(|entry| entry.kind == CategoryEntryKind::Room)
-            .map(|entry| entry.id)
-            .collect();
-        let side = if side { RoomSide::Above } else { RoomSide::Below };
-        let request = PlacementRequest {
-            creator_id: 1,
+        let side = if above { RoomPosition::Above } else { RoomPosition::Below };
+        let group_room_ids: &[u64] = if grouped { &case.block } else { &[] };
+        let index = plan_placement(request(
+            case.creator_id,
             side,
             grouped,
-            group_room_ids: if grouped { &group_rooms } else { &[] },
-            category_order: &category,
+            group_room_ids,
+            &case.category,
+        ))
+        .expect("synthetic category must plan");
+        prop_assert!(index <= case.category.len());
+        let after = with_insertion(&case.category, index, NEW_ROOM);
+        let neighbour = match side {
+            RoomPosition::Above => after.get(index + 1),
+            RoomPosition::Below => index.checked_sub(1).and_then(|before| after.get(before)),
         };
-        let before = display_order(&category);
-        let index = match plan_placement(request) {
-            Ok(index) => index,
-            // Empty category has no creator entry; anything else is a bug in
-            // the generator, not a silent pass.
-            Err(PlacementError::UnknownCreator(1)) => {
-                prop_assert!(category.is_empty());
-                return Ok(());
-            }
-            Err(error) => panic!("synthetic category must plan: {error:?}"),
-        };
-        prop_assert!(index <= category.len());
-        let after = with_insertion(&category, index, u64::MAX);
-        let retained: Vec<u64> = after.into_iter().filter(|id| *id != u64::MAX).collect();
-        prop_assert_eq!(retained, before);
-        // The new channel is exactly where the decision says, nowhere else.
-        let placed: Vec<u64> = with_insertion(&category, index, u64::MAX);
-        prop_assert_eq!(placed[index], u64::MAX);
+        if grouped && !case.block.is_empty() {
+            let edge = match side {
+                RoomPosition::Above => case.block.first(),
+                RoomPosition::Below => case.block.last(),
+            };
+            prop_assert_eq!(neighbour, edge);
+            // Slots are collected in display order, so first and last bound
+            // the block; no outsider fits between them when the span matches.
+            let slots: Vec<usize> = after
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| **id == NEW_ROOM || case.block.contains(id))
+                .map(|(slot, _)| slot)
+                .collect();
+            prop_assert_eq!(slots.len(), case.block.len() + 1);
+            prop_assert_eq!(slots[slots.len() - 1] - slots[0], case.block.len());
+        } else {
+            prop_assert_eq!(neighbour, Some(&case.creator_id));
+        }
     }
 
     /// Lowest-free-number is stable: it never collides and never shifts when
