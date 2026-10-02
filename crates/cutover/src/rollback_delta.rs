@@ -91,6 +91,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         ),
     },
     TableSpec { table: "internal_action_log", measure: TableMeasure::Columns(&["created_at"]) },
+    // One row per clock domain, rewritten on every burn; observed_at is the
+    // DB instant that advanced the mark, so its maximum is the row's last write.
+    TableSpec { table: "internal_clock_high_water", measure: TableMeasure::Columns(&["observed_at"]) },
     TableSpec { table: "internal_discord_events", measure: TableMeasure::Columns(&["claimed_at"]) },
     TableSpec { table: "internal_idempotency", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "internal_nonces", measure: TableMeasure::Columns(&["burned_at"]) },
