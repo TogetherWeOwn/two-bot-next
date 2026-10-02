@@ -24,7 +24,7 @@ the ported core, [parity inventory](parity.md) and
 
 **Implemented libraries are not deployed receiver controls.** Executor additions
 since the prior review are libraries: announcement execution
-(`crates/discord/src/internal_actions.rs:107`), member join/role assignment
+(`crates/discord/src/internal_actions.rs:115`), member join/role assignment
 (`crates/discord/src/internal_exec/member.rs`), guild settings CAS (via #81),
 channel-moderation wiring
 (`crates/discord/src/internal_channel_moderation.rs:67`) and the ticket runtime
@@ -187,7 +187,7 @@ policy; that fence must not be taken from a caller-supplied guild ID.
 | --- | --- | --- | --- |
 | `role.assign` | Grant a configured role to an arbitrary named member; a badly mapped privileged role is escalation | Phase-1 default; validated member snowflake, explicit role-key map (currently no inherited self-role seed). `RoleAssignRequest` (`crates/core/src/internal_actions.rs:1242`) plus `resolved_role_id` pinned in the same intent/audit transaction (`crates/core/src/internal_action_store.rs:92`, `:328`); later audits copy the pin. Map only safe self-assignable roles and confirm member/guild. | No |
 | `guild.add_member` | Join a member to the configured guild with their OAuth capability | `ALLOW_ADD_MEMBER`; member ID/token presence checks, tighter bucket. `GuildAddMemberRequest` keeps the OAuth token a separate transient argument (`crates/core/src/internal_actions.rs:1272`); member mutations are single-attempt with 1.5 s/2.0 s timeouts, no unfollowed-redirect success, and never format token-bearing bodies into errors (`crates/discord/src/internal_exec/member.rs:20-21`). Validate OAuth subject/consent through Discord, never log or cache token. | No |
-| `announcement.post` | Spam, impersonation or mass mentions in mapped channels | Phase-1 default; channel map starts empty; 2,000 UTF-16 units. `AnnouncementExecutor` supports only this verb (`crates/discord/src/internal_actions.rs:136`), sends one 10-second attempt with no status retries, suppresses mentions, returns only scalar IDs, and reports 429 as a shared-governor `RateLimited` obligation, never a resend (`docs/internal-action-executor.md:42-79`). Executor mention suppression must be used on this path. | Yes |
+| `announcement.post` | Spam, impersonation or mass mentions in mapped channels | Phase-1 default; channel map starts empty; 2,000 UTF-16 units. `AnnouncementExecutor` supports only this verb (`crates/discord/src/internal_actions.rs:150`), sends one 10-second attempt with no status retries, suppresses mentions, returns only scalar IDs, and feeds every 429 into the bot token's shared `CooldownGovernor`, refusing later intents without HTTP while a matching hold is active; a 429 is never resent (`docs/internal-action-executor.md:43-64`). Executor mention suppression must be used on this path. | Yes |
 | `event.upsert` | Create/edit guild events and associated public content | Phase-1 default; name ≤100, description ≤1,000 UTF-16 units; valid ordered RFC3339 times; exactly one mapped channel or external location. Verify ownership of any existing event mapping. | Yes |
 | `event.cancel` | Cancel a mapped event and disrupt attendance | `ALLOW_EVENT_CANCEL`; verify event/guild mapping and authorized actor rather than accepting any raw event ID. | Yes |
 | `automations.import` | Bulk change automation/role behavior; overwrite can destroy configuration | `ALLOW_AUTOMATIONS`, plus `ALLOW_AUTOMATIONS_OVERWRITE` for destructive mode. Schema/count/role validation and transactional import must be wired; body cap alone is insufficient. | Yes |
@@ -327,17 +327,23 @@ change the legacy canonical format.
   at `:503`, kick/get lanes at `:687`, `:819`). Member join/role paths use
   shorter single-attempt 1.5 s/2.0 s timeouts
   (`crates/discord/src/internal_exec/member.rs:20-21`). The separate
-  `AnnouncementExecutor` (`crates/discord/src/internal_actions.rs:107`) is
-  unpaced: one ten-second attempt, no retries, and its
-  `RateLimited(RateLimitCooldown)` outcome only *reports* scope/timing — it
-  installs no governor. Per-key HMAC buckets and the terminal original intent
-  do not stop *fresh* intents from firing into an active global/channel
-  cooldown, so before admitting independent intents the receiver must feed every
-  `RateLimitCooldown` into one shared per-bot-token cooldown governor covering
-  all callers, guild workers and Discord transports
-  ([executor contract](internal-action-executor.md:42-79)). Pacing protects
-  upstream quota; it is not action authorization or exactly-once. F7 requires
-  the governor plus a multi-intent 429 acceptance case. Ticket recovery adds
+  `AnnouncementExecutor` (`crates/discord/src/internal_actions.rs:115`) is
+  unpaced: one ten-second attempt and no retries. Every
+  `RateLimited(RateLimitCooldown)` now feeds the caller-supplied per-bot-token
+  `CooldownGovernor` (`crates/discord/src/internal_actions/governor.rs`), and the
+  executor refuses with `NoEffect(CoolingDown)`, without HTTP, while a global or
+  matching channel hold is active, so fresh intents no longer fire into an active
+  cooldown. Holds only lengthen, untimed holds wait for reconciliation, and at
+  most 1,024 channel holds are kept before overflow widens to the token-wide
+  hold. The governor refuses rather than queues, so repeated 429s cannot keep an
+  operation alive. It is per process and in memory; the receiver must still hand
+  the same governor to all callers, guild workers and Discord transports for the
+  token (`docs/internal-action-executor.md:43-64`). In-flight intents are not
+  recalled. Pacing protects upstream quota; it is not action authorization or
+  exactly-once. F7's governor and multi-intent 429 acceptance cases landed as
+  paused-time fixtures for channel, global and repeated 429s plus the key
+  ceiling (`crates/discord/src/internal_actions/tests.rs`, `governor.rs`).
+  Ticket recovery adds
   bounded budgets (10-second button lane, 120-second cumulative, supervisor
   scope per #155); those bound ticket work, not action ingress.
 - `assert_private_bind` accepts specific loopback/RFC1918/CGNAT/link-local IPv4,
@@ -468,7 +474,7 @@ Remaining proposals are intentionally **not implemented** here:
 | F4 / P2 rejection telemetry | Receiver implementer: scalar structured logger with bounded labels/suppression | Capture every rejection class with token/body/SQL marker fixtures; no marker or full input escapes and rejection flood stays bounded. `Secret`/redaction and `database_url` allowlist work has landed; staging and production log head-sampling 1 make log proof load-bearing in both. |
 | F5 / P2 action-specific safety | Action owners: mapped event ownership, automation import schema/cardinality/overwrite transaction, key-specific setting validation, tempban recovery and lockdown/unlock overwrite serialization | Unmapped events, excessive imports, protected roles, invalid setting types, conflicting channel intents and unknown outcomes fail closed; legitimate operation/reconciliation has scalar evidence. Moderation duration caps and settings CAS have landed as narrowing, not closure. |
 | F6 / P1 deployment gate | Deployment owner with CISO: verify secret custody, per-environment guild/DB/key bindings, least-privilege DB role and mandatory authenticated TLS for Neon | Record non-secret binding/TLS/role receipts on the deployment card; test only fixtures/CI or explicitly authorized staging. Least-privilege roles/verifier/DML-only gateway/operator-migrates-first (via #102) and the `database_url` allowlist are procedure progress, not isolation proof; staging observability is telemetry, not a fence. Source URL-prefix validation is not TLS or isolation proof. |
-| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: edge probe limits, global guild/caller quotas, bounded redirect caller-map/nonce/intent growth, a shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429, and total REST deadlines; preserve gateway resources | Local many-caller fixtures, including invalid-slug/unknown-campaign 404s and long simulated idle intervals, prove a fixed caller-state ceiling and idle reclamation (reserved-internal 404s and ticket/dispatch budgets have landed; the uncapped caller map has not). Define eviction/overflow behavior so churn cannot reset a depleted caller's quota or create unbounded work. Also prove bounded collection/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. Prove the 429 governor: first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent admitted before that cooldown elapses is held without a Discord send, then proceeds only after the cooldown closes; the original key stays terminal throughout. No destructive live load tests. |
+| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: edge probe limits, global guild/caller quotas, bounded redirect caller-map/nonce/intent growth, the shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429 (landed; receiver must share one per token), and total REST deadlines; preserve gateway resources | Local many-caller fixtures, including invalid-slug/unknown-campaign 404s and long simulated idle intervals, prove a fixed caller-state ceiling and idle reclamation (reserved-internal 404s and ticket/dispatch budgets have landed; the uncapped caller map has not). Define eviction/overflow behavior so churn cannot reset a depleted caller's quota or create unbounded work. Also prove bounded collection/concurrency; quota survives aliases/instances/restarts, unknown-key traffic cannot starve valid calls, repeated 429 cannot keep an operation alive indefinitely. The executor-level 429 governor is proven locally: the first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent before that cooldown elapses is refused as `NoEffect(CoolingDown)` without a Discord send while other channels proceed, and a new intent proceeds only after the cooldown closes; the original key stays terminal throughout. Receiver wiring of one governor per token remains open. No destructive live load tests. |
 | F8 / P1 receiver clock-policy gate | Receiver/store owners with Security review: define fail-closed behavior for backwards freshness/expiry clocks (including DB time), bounded retention and safe recovery across restart/failover; TTL coverage is conditional | Accept a capture, expire/sweep/replace its nonce, then roll time back into its signed window: memory and durable paths must refuse, including across instance restart/failover and lock waits. Record the trusted clock/high-water or equivalent policy and recovery criteria; cleanup (including transcript/intent retention) must not erase replay protection. Legitimate traffic resumes only under that verified policy. |
 
 F1/F2/F8 are requirements for the existing receiver slice, not new route work in
