@@ -270,16 +270,14 @@ jobs:
           GITLEAKS_VERSION: 8.30.1
         run: |
           set -euo pipefail
-          # Per-job $RUNNER_TEMP: fixed /tmp paths collide across the runners
-          # sharing one Docker host (TOG-11810).
           curl -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
-          sudo install -m 0755 "$RUNNER_TEMP/gitleaks" /usr/local/bin/gitleaks
-          gitleaks version
+          chmod 0755 "$RUNNER_TEMP/gitleaks"
+          "$RUNNER_TEMP/gitleaks" version
 
       - name: Scan the full history
         run: |
           set -euo pipefail
           # --log-opts=HEAD: scan only history reachable from HEAD, not every fetched branch.
-          gitleaks git . --redact --verbose --exit-code 1 --log-opts=HEAD
+          "$RUNNER_TEMP/gitleaks" git . --redact --verbose --exit-code 1 --log-opts=HEAD

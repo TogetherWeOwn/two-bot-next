@@ -68,6 +68,7 @@ the actual Twilight guild bulk-set JSON are checked against that snapshot.
 | Intentional difference | Matrix reference | Exact allowance |
 |---|---|---|
 | `rsvp-attendance` | docs/parity.md §1 #12 / #25 | Rename only the RSVP-totals `attendance` (its option is `event-id`); scorecard keeps `attendance`. No option, choice, description or permission waiver. |
+| `attendance` | docs/parity.md §1 #12 bound | Advertise `max_length` 128 on the scorecard `event-occurrence` option; every other field stays legacy-identical. |
 | `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
 
 These are the complete behavioural exceptions, mirrored by the test allowlist.
@@ -220,13 +221,13 @@ Full catalogue: legacy `src/core/settingsCatalog.ts` (~90 keys in `env_only`/`co
 | Automod (staging-only unless live-approved; `dryRun` unless `ENFORCE=1`; 6 filters; sanctions `1:delete,2:warn,3:timeout:600`; target-protection before delete) | bad-word NFKC matching, invite/link checks, `bat/cmd/…` attachment blocklist | **S4** (staging gate until soak) |
 | Anti-nuke (default alerts-only; weights kick/ban/webhook=1, channel/role delete=3; quarantine strips dangerous perms below bot hierarchy; join-risk flag-only) | `containment_alert` always logged; `**Join burst**` raid alerts, no DMs/pings | **S4** (staging gate until soak) |
 | Onboarding modes (`legacy` catalog + hub routing / `session` roleless two-pick LIVE / anchor Sunday-Squad one-message) | no-DM, idempotent `onboarding_prompted`, dry-run aware | **S4** |
-| Operator scripts (82 files) | schedule/backfill/migration one-shots → **[TOG-9882](/TOG/issues/TOG-9882)** (MEE6 XP, rewards, history backfill, dedupe, message-milestone scan, join capture); backup/restore/snapshot → [TOG-9881](/TOG/issues/TOG-9881); read-only reports (funnel, gate, attribution, roster, dashboard, scorecard, presence-trend, growth-review, raid-list) → **DROP** as runtime (query Postgres/`web_v1` on demand); staging provision/verify/reset + e2e harness → **DROP** (replaced by mock-discord acceptance + **S6** cutover plan); `reconcile` → **DROP** (absent/broken upstream); guild-config snapshot/restore → [TOG-9881](/TOG/issues/TOG-9881); temp-voice → staging shape-check only, no runtime on legacy `main` (TOG-3471 unmerged) → port the check under **S6**, no runtime row | **S6**, [TOG-9881](/TOG/issues/TOG-9881), [TOG-9882](/TOG/issues/TOG-9882) (mapped one-shots/shape-check only; runtime drops above) |
+| Operator scripts (82 files) | schedule/backfill/migration one-shots → **[TOG-9882](/TOG/issues/TOG-9882)** (MEE6 XP, rewards, history backfill, dedupe, message-milestone scan, join capture); backup/restore/snapshot → [TOG-9881](/TOG/issues/TOG-9881); read-only reports (funnel, gate, attribution, roster, dashboard, scorecard, presence-trend, growth-review) → **DROP** as runtime (query Postgres/`web_v1` on demand); manual raid-list/raid-remove → [TOG-10867](/TOG/issues/TOG-10867) ([runbook](raid-response.md)), not scheduled runtime; staging provision/verify/reset + e2e harness → **DROP** (replaced by mock-discord acceptance + **S6** cutover plan); `reconcile` → **DROP** (absent/broken upstream); guild-config snapshot/restore → [TOG-9881](/TOG/issues/TOG-9881); temp-voice → staging shape-check only, no runtime on legacy `main` (TOG-3471 unmerged) → port the check under **S6**, no runtime row | **S6**, [TOG-9881](/TOG/issues/TOG-9881), [TOG-9882](/TOG/issues/TOG-9882), [TOG-10867](/TOG/issues/TOG-10867) (mapped one-shots/shape-check only; runtime drops above) |
 
 ## 9. Drops (not ported, with reason)
 
 1. Rota measurement stack (observer, notice delivery, `/rota-acknowledge`, 0028–0033 migrations, 60s ticker) — staging-only experiment, never prod-enabled.
 2. Staging restart containment gateway filter — superseded by session persist (**S5**) + staging guild (**S6**).
-3. Read-only operator reports (funnel/gate/attribution/roster/dashboard/scorecard/presence/growth/raid-list) — ad-hoc queries, not runtime.
+3. Read-only operator reports (funnel/gate/attribution/roster/dashboard/scorecard/presence/growth) — ad-hoc queries, not runtime. Exception: `raid-list` and `raid-remove` are manual cutover-style tools ([TOG-10867](/TOG/issues/TOG-10867), [runbook](raid-response.md)); neither is a scheduled runtime feature.
 4. Staging provision/verify/reset scripts + e2e harness — replaced by mock-discord acceptance + **S6** cutover.
 5. `reconcile` script — absent/broken upstream.
 6. Temp-voice runtime — never shipped on legacy `main`; only the staging shape-check ports (**S6**).

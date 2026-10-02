@@ -19,9 +19,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pipeline-benchmark:
+    name: nightly pipeline budget
+    uses: ./.github/workflows/pipeline-benchmark.yml
+
   advisories:
     name: nightly advisories
-    # TOG-11810: private repo, so ubuntu-latest is paid minutes. Self-hosted.
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 10
     steps:
@@ -37,13 +40,9 @@ jobs:
 
   sweep:
     name: nightly ignored tests and docs
-    # TOG-11810: private repo, so ubuntu-latest is paid minutes. Self-hosted.
-    # Same job-container pattern as check.yml (TOG-11358): a published 5432
-    # collides across jobs sharing one Docker host, and the self-hosted
-    # runners have no docker CLI for `docker exec` into services. Inside a
-    # job container the service resolves as agent-testdb:5432 directly.
     runs-on: [self-hosted, two-selfhosted]
     timeout-minutes: 45
+    # Match required CI isolation on the shared Docker host.
     container:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
@@ -53,7 +52,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       TWO_LFG_TESTDB_CI: '1'
       TWO_LEVELING_TEST_CI: '1'
-      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@agent-testdb:5432/agent_test
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
     services:
       agent-testdb:
         image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
@@ -71,14 +70,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Job-container prerequisites (job-private loopback forward)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
           toolchain: stable
-      - name: Job-container prerequisites (postgresql-client for createdb)
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -94,7 +96,6 @@ jobs:
         id: databases
         run: |
           # Match the existing guards; never relax them or use a repository secret.
-          # Test clients reach the service by its container name (see check.yml).
           createdb -h agent-testdb -U agent_test two_bot_test_tog10090_nightly
           createdb -h agent-testdb -U agent_test two_next_backup_nightly
           createdb -h agent-testdb -U agent_test two_next_backup_publication_nightly
