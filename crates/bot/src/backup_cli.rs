@@ -114,7 +114,7 @@ two-bot operator commands
       Read-only privilege drift inspection. Env: TWO_DATABASE_URL (required).
 
   two-bot backup
-      Dump all bot-owned tables (v3 format) to TWO_BACKUP_DIR
+      Dump all bot-owned tables (v4 format) to TWO_BACKUP_DIR
       (default ./backups) as two-funnel-<stamp>.ndjson.gz, prune to
       TWO_BACKUP_KEEP newest (default 14), then run TWO_BACKUP_UPLOAD_CMD
       with the file path as its last argument.
