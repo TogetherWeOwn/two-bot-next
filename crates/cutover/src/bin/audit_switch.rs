@@ -7,7 +7,7 @@
 //! first engagement wins, and a failed halt read fails open in the mirror
 //! (the failure is reported here, never silently treated as clear).
 //!
-//! Usage: audit_switch --halt --actor <snowflake> | --resume | --status
+//! Usage: audit_switch --halt --actor `<snowflake>` | --resume | --status
 //!   Env: TWO_DATABASE_URL (agent-testdb test databases only; anything else
 //!   is refused before connecting, and no credential is ever printed).
 //!   Exit codes: 0 ok (already-engaged and already-clear count as ok),
