@@ -201,9 +201,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
             "no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)",
         ),
     },
-    // Insert-once rows (PgRoomStore::add_room never overwrites). An ownership
-    // transfer that updates owner_id must add its own timestamp column.
-    TableSpec { table: "voice_rooms", measure: TableMeasure::Columns(&["created_at"]) },
+    // Insert-once creation snapshot plus V2 ownership handoffs, whose
+    // timestamp lives in `owner_touched_at` (migration 0412).
+    TableSpec { table: "voice_rooms", measure: TableMeasure::Columns(&["created_at", "owner_touched_at"]) },
     // Same insert-once shape as voice_rooms (PgRoomStore::add_companion never
     // overwrites the creation snapshot).
     TableSpec { table: "voice_text_companions", measure: TableMeasure::Columns(&["created_at"]) },

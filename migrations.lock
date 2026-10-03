@@ -237,6 +237,10 @@
       "sha256": "289623820243f17a9b0cb327aa600bae9b638f64070614612597cccef224aacf",
       "justification": "TOG-12415: legacy-copy target DDL for the go.two.gg redirect store; same shape as store 0407."
     },
+    "crates/cutover/migrations/0412_voice_rooms_ownership_touched.sql": {
+      "sha256": "9dfe6648848bc7d42ba7534b710eab36473ac57ad5c4eee26d88d3f453d60b2f",
+      "justification": "Voice V2 ownership handoff stamp so the rollback delta keeps measuring rooms whose owner_id changes in place."
+    },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",
       "justification": "Add unpublished S6 funnel foundation for TOG-9811 under an unused workspace number; preserve proposed SQL bytes."
