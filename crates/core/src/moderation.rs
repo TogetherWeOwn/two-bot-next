@@ -98,8 +98,8 @@ impl ModerationAction {
         }
     }
 
-    /// Discord permission display name for denial copy (TOG-13624): what the
-    /// member sees in Server Settings → Roles, not the internal action id.
+    /// Discord permission display name for denial copy: what the member sees
+    /// in Server Settings → Roles, not the internal action id.
     #[must_use]
     pub fn discord_permission_name(self) -> &'static str {
         match self {
