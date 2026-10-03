@@ -287,7 +287,7 @@ async fn run(
                             BanAttempt {
                                 generation: *generation,
                             },
-                            now,
+                            &now,
                         )
                         .await
                 },
@@ -313,7 +313,7 @@ async fn run(
                             BanAttempt {
                                 generation: *generation,
                             },
-                            now,
+                            &now,
                         )
                         .await
                 },
@@ -378,7 +378,7 @@ async fn run(
                                 generation: *generation,
                             },
                             &evidence,
-                            now,
+                            &now,
                         )
                         .await
                 },
@@ -399,7 +399,7 @@ async fn resolve<'a, F, Fut>(
     write: F,
 ) -> i32
 where
-    F: FnOnce(&'a PgMemberModerationStore, &'a str) -> Fut + Send,
+    F: FnOnce(&'a PgMemberModerationStore, String) -> Fut + Send,
     Fut: std::future::Future<Output = Result<(), two_bot_core::member_moderation::StoreError>>
         + Send
         + 'a,
@@ -410,7 +410,7 @@ where
         return 0;
     }
     let now = now_iso();
-    match write(store, &now).await {
+    match write(store, now).await {
         Ok(()) => {
             println!("RECONCILED: {intent}");
             0
