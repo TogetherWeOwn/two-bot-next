@@ -35,6 +35,7 @@ mod join_risk_runtime_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 mod metrics_http;
+mod moderation_cli;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
@@ -80,6 +81,9 @@ async fn main() {
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli_args.first().is_some_and(|arg| arg == "preflight") {
         std::process::exit(preflight::dispatch(&cli_args[1..]).await);
+    }
+    if cli_args.first().is_some_and(|arg| arg == "moderation") {
+        std::process::exit(moderation_cli::dispatch(&cli_args[1..]).await);
     }
     // Docker HEALTHCHECK probe: GET /health on the configured port and exit
     // 0/1. Kept dependency-free (std + tokio only) so the check path cannot
@@ -217,6 +221,42 @@ async fn main() {
         Arc::clone(&gateway),
         store.as_ref().map(|s| s.pool().clone()),
     );
+
+    // Disable guard: refuse to boot with moderation/automation disabled
+    // while releases are still owed (pending tempban unbans, active
+    // lockdowns, enabled scheduled messages). Enabled gates short-circuit without a
+    // database read; the explicit override proceeds and is logged loudly.
+    // Without a database there is no owed state to read.
+    if let Some(pool) = store.as_ref().map(|s| s.pool().clone()) {
+        let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let gates = two_bot_core::disable_preflight::DisableGates::from_map(&vars);
+        if !gates.moderation || !gates.automations {
+            let overridden = two_bot_core::disable_preflight::override_active(&vars, &cli_args);
+            match two_bot_core::disable_preflight::boot_check(&pool, &gates, overridden).await {
+                Ok(two_bot_core::disable_preflight::BootVerdict::Proceed) => {}
+                Ok(two_bot_core::disable_preflight::BootVerdict::Refused(owed)) => {
+                    tracing::error!(
+                        owed = %owed.report(),
+                        "moderation_disable_refused: boot refused with moderation/automation disabled while releases are owed; complete or cancel them, or set TWO_ALLOW_OWED_RELEASES=1 to override"
+                    );
+                    std::process::exit(1);
+                }
+                Ok(two_bot_core::disable_preflight::BootVerdict::Overridden(owed)) => {
+                    tracing::warn!(
+                        owed = %owed.report(),
+                        "moderation_disable_override: booting with moderation/automation disabled while releases are owed; members may stay banned and channels locked"
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        error_class = "moderation_disable_unknown",
+                        "moderation_disable_refused: owed-release state unreadable while moderation/automation is disabled; refusing boot"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
