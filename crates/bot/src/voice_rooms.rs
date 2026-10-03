@@ -12,6 +12,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
@@ -29,10 +30,20 @@ use twilight_model::{
         application_command::{CommandDataOption, CommandOptionValue},
         Interaction, InteractionData, InteractionType,
     },
-    channel::{message::MessageFlags, permission_overwrite::PermissionOverwriteType, Channel},
+    channel::{
+        message::{
+            component::{ActionRow, Button, ButtonStyle, Component},
+            AllowedMentions, MessageFlags,
+        },
+        permission_overwrite::PermissionOverwriteType,
+        Channel,
+    },
     guild::{Permissions, Role},
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
-    id::{marker::RoleMarker, Id},
+    id::{
+        marker::{RoleMarker, UserMarker},
+        Id,
+    },
 };
 use two_bot_core::{
     evaluate_permissions as evaluate_health, now_iso,
@@ -51,8 +62,8 @@ use two_bot_core::{
     },
     voice_utilities::{invite_render, ping_render},
     voice_vote_kick::{
-        VoteBallot, VoteClock, VoteKickCore, VoteKickError, VoteKickRef, VoteKickStatus,
-        VoteKickUpdate, VoteRoomFacts,
+        VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
+        VoteKickStatus, VoteKickUpdate, VoteRoomFacts,
     },
     CommandDefinition, OverwriteTarget, PermissionFinding, PermissionOverwrite as HealthOverwrite,
     Snowflake, VoicePermission, VoicePermissionScope,
@@ -967,6 +978,19 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         Some(self.renames.propose(channel, current, name, now_ms))
     }
 
+    /// The tracked temporary room a member is currently in, if any. `None`
+    /// while live evidence is not authoritative, when the member is not in
+    /// voice, or when their channel is not a tracked room. The router claim
+    /// check uses this to tell vote-kick targets from moderation targets.
+    pub fn kick_room_of(&self, member: Snowflake) -> Option<Snowflake> {
+        let live = self.live.inner.read().expect("live voice lock");
+        if !live.ready || self.halted {
+            return None;
+        }
+        let channel = live.members.get(&member)?.channel_id?;
+        self.rooms.contains_key(&channel).then_some(channel)
+    }
+
     /// Owner, original creator and human occupants of a tracked room. `None`
     /// unless live evidence is authoritative and the room is tracked.
     fn kick_facts(
@@ -1740,6 +1764,19 @@ pub trait VoiceEventSink: Send + Sync {
     /// A cold RESUME has replayed durably but cannot populate a fresh cache.
     /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
+    /// Resolve the tracked room a member is currently in, if any. The shared
+    /// router asks this for `/kick`: a tracked-room target means the voice
+    /// sink owns the interaction (vote-kick) and the router must stay silent;
+    /// anything else keeps the existing moderation path. Boxed (not `impl
+    /// Future`) so the trait stays object-safe behind `Arc<dyn _>`.
+    fn kick_claim_room(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
+        let _ = (guild, member);
+        Box::pin(async { None })
+    }
 }
 
 /// The gateway shares only live evidence; the actor owns the mutable queue.
@@ -1776,6 +1813,13 @@ enum ActorCommand {
         voter_id: Snowflake,
         ballot: VoteBallot,
         reply: oneshot::Sender<KickReply>,
+    },
+    /// V4: resolve the tracked room a member is currently in, if any. The
+    /// shared router uses this to tell vote-kick targets (voice owns the
+    /// interaction) from moderation targets (the router keeps it).
+    KickRoomOf {
+        member: Snowflake,
+        reply: oneshot::Sender<Option<Snowflake>>,
     },
 }
 
@@ -1965,6 +2009,19 @@ where
         inbox.await.ok()
     }
 
+    /// Resolve the tracked room a member is currently in, if any. `None`
+    /// when the guild has no live actor, while evidence is stale, or when
+    /// the member is not in a tracked room.
+    pub async fn kick_room_of(&self, guild: Snowflake, member: Snowflake) -> Option<Snowflake> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::KickRoomOf { member, reply })
+            .ok()?;
+        inbox.await.ok()?
+    }
+
     /// Invalidate first: even an in-flight task cannot write after GuildDelete.
     pub fn remove_guild(&self, guild: Snowflake) {
         if let Some(actor) = self
@@ -2109,6 +2166,14 @@ where
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.enabled && cache.current_user().is_none()
     }
+
+    fn kick_claim_room(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
+        Box::pin(self.kick_room_of(guild, member))
+    }
 }
 
 async fn run_actor<S: RoomPersistence, H: RoomWrites>(
@@ -2202,6 +2267,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             reply,
         } => {
             let _ = reply.send(worker.kick_cast(vote_id, voter_id, ballot, now_ms));
+        }
+        ActorCommand::KickRoomOf { member, reply } => {
+            let _ = reply.send(worker.kick_room_of(member));
         }
     }
 }
@@ -2444,12 +2512,24 @@ pub fn voice_command_set(gates: &VoiceGates) -> Vec<CommandDefinition> {
 /// A voice slash command carried by an interaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceCommand {
-    Create { name: String },
+    Create {
+        name: String,
+    },
     Setup,
     Ping,
     Invite,
     Access(AccessAction),
     Logging(LoggingAction),
+    /// V4 vote-kick: start a vote against a room occupant.
+    Kick {
+        target: Snowflake,
+        reason: Option<String>,
+    },
+    /// V4 vote-kick: one ballot button press, addressed by vote ID.
+    Ballot {
+        vote_id: Snowflake,
+        ballot: VoteBallot,
+    },
 }
 
 /// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -2489,6 +2569,15 @@ pub fn interaction_guild(interaction: &Interaction) -> Option<Snowflake> {
 /// (non-command interactions, other commands, guild-less invocations).
 #[must_use]
 pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
+    // Ballot buttons bypass the slash parser: the custom ID carries the vote.
+    // Unknown custom IDs stay silent here so the shared router keeps them.
+    if interaction.kind == InteractionType::MessageComponent {
+        let InteractionData::MessageComponent(component) = interaction.data.as_ref()? else {
+            return None;
+        };
+        interaction_guild(interaction)?;
+        return parse_vote_button(&component.custom_id);
+    }
     if interaction.kind != InteractionType::ApplicationCommand {
         return None;
     }
@@ -2516,8 +2605,41 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
         "logging" => Some(VoiceCommand::Logging(parse_logging_action(
             &command.options,
         ))),
+        // The published shape may be ours (`member`, reason optional) or the
+        // moderation one (`target`, reason required): runtime dispatch, not
+        // the published shape, decides vote-kick versus moderation kick, so
+        // accept both. An unparsable shape stays silent here so the shared
+        // router keeps the interaction.
+        "kick" => parse_kick_target(&command.options).map(|target| VoiceCommand::Kick {
+            target,
+            reason: parse_kick_reason(&command.options),
+        }),
         _ => None,
     }
+}
+
+/// The vote target: our `member` option or the moderation `target` option.
+fn parse_kick_target(options: &[CommandDataOption]) -> Option<Snowflake> {
+    options.iter().find_map(|option| match &option.value {
+        CommandOptionValue::User(id) if option.name == "member" || option.name == "target" => {
+            Some(id.get())
+        }
+        _ => None,
+    })
+}
+
+/// The optional vote reason, trimmed and length-capped like the definition.
+fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
+    options
+        .iter()
+        .find(|option| option.name == "reason")
+        .and_then(|option| match &option.value {
+            CommandOptionValue::String(value) => {
+                let reason: String = value.trim().chars().take(512).collect();
+                (!reason.is_empty()).then_some(reason)
+            }
+            _ => None,
+        })
 }
 
 fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
@@ -2620,8 +2742,38 @@ impl VoiceCommand {
             Self::Invite => "invite",
             Self::Access(_) => "access",
             Self::Logging(_) => "logging",
+            // Ballots share the `kick` restriction surface: one role gate
+            // covers starting votes and casting them.
+            Self::Kick { .. } | Self::Ballot { .. } => "kick",
         }
     }
+}
+
+/// Button namespace for V4 ballots. The button carries only the vote ID (the
+/// initiating interaction ID); guild, room and target always come from the
+/// worker ledger, never from the payload.
+const VOTE_BUTTON_PREFIX: &str = "votekick:";
+
+/// Parse one ballot button press. `None` when the custom ID is not ours.
+fn parse_vote_button(custom_id: &str) -> Option<VoiceCommand> {
+    let rest = custom_id.strip_prefix(VOTE_BUTTON_PREFIX)?;
+    let (vote_id, ballot) = rest.split_once(':')?;
+    let vote_id: Snowflake = vote_id.parse().ok()?;
+    let ballot = match ballot {
+        "yes" => VoteBallot::Yes,
+        "no" => VoteBallot::No,
+        _ => return None,
+    };
+    Some(VoiceCommand::Ballot { vote_id, ballot })
+}
+
+/// Button custom ID for one ballot. Inverse of [`parse_vote_button`].
+fn vote_button_id(vote_id: Snowflake, ballot: VoteBallot) -> String {
+    let vote = match ballot {
+        VoteBallot::Yes => "yes",
+        VoteBallot::No => "no",
+    };
+    format!("{VOTE_BUTTON_PREFIX}{vote_id}:{vote}")
 }
 
 /// The invoking member's access facts: effective admin flag and role IDs.
@@ -2663,6 +2815,139 @@ fn unix_now_ms() -> u64 {
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+/// Public vote-kick ballot message for a freshly started vote.
+#[must_use]
+fn vote_message(
+    update: &VoteKickUpdate,
+    initiator: Snowflake,
+    target: Snowflake,
+    reason: Option<&str>,
+) -> InteractionResponse {
+    let mut lines = vec![format!(
+        "<@{target}> — <@{initiator}> started a vote to disconnect them from this voice room."
+    )];
+    if let Some(reason) = reason {
+        lines.push(format!("Reason: {reason}"));
+    }
+    lines.push(format!(
+        "Vote with the buttons: {}/{} needed. Not voting counts as No. The vote ends in 2 minutes.",
+        update.progress.required, update.progress.total,
+    ));
+    ballot_response(
+        &lines.join("\n"),
+        update,
+        target,
+        InteractionResponseType::ChannelMessageWithSource,
+        false,
+    )
+}
+
+/// Follow-up ballot state for an in-flight vote, delivered as an in-place
+/// message update so the ballot stays a single message.
+#[must_use]
+fn vote_update_message(update: &VoteKickUpdate) -> InteractionResponse {
+    let content = match update.status {
+        VoteKickStatus::Active => format!(
+            "Vote-kick <@{}>: {}/{} needed. Not voting counts as No. The vote ends in 2 minutes.",
+            update.vote.target_id, update.progress.required, update.progress.total,
+        ),
+        VoteKickStatus::Passed => format!(
+            "Vote passed: <@{}> will be disconnected and kept out of this room.",
+            update.vote.target_id
+        ),
+        VoteKickStatus::Expired => "Vote expired with too few Yes votes.".to_owned(),
+        VoteKickStatus::Cancelled(VoteCancellation::TargetLeft) => {
+            "Vote cancelled: the target left the room.".to_owned()
+        }
+        VoteKickStatus::Cancelled(VoteCancellation::TargetProtected) => {
+            "Vote cancelled: the target can no longer be voted out.".to_owned()
+        }
+    };
+    ballot_response(
+        &content,
+        update,
+        update.vote.target_id,
+        InteractionResponseType::UpdateMessage,
+        update.status != VoteKickStatus::Active,
+    )
+}
+
+/// Shared ballot shell: public message plus Yes/No buttons bound to the vote.
+/// Buttons disable once the vote leaves Active so late presses cannot imply
+/// a live ballot (the worker still rejects them by ID).
+fn ballot_response(
+    content: &str,
+    update: &VoteKickUpdate,
+    target: Snowflake,
+    kind: InteractionResponseType,
+    disabled: bool,
+) -> InteractionResponse {
+    let button = |ballot: VoteBallot, label: &str, style: ButtonStyle| {
+        Component::Button(Button {
+            id: None,
+            custom_id: Some(vote_button_id(update.vote.id, ballot)),
+            disabled,
+            emoji: None,
+            label: Some(label.to_owned()),
+            style,
+            url: None,
+            sku_id: None,
+        })
+    };
+    InteractionResponse {
+        kind,
+        data: Some(InteractionResponseData {
+            content: Some(content.to_owned()),
+            allowed_mentions: Some(AllowedMentions {
+                parse: Vec::new(),
+                users: vec![Id::<UserMarker>::new(target)],
+                roles: Vec::new(),
+                replied_user: false,
+            }),
+            components: Some(vec![Component::ActionRow(ActionRow {
+                id: None,
+                components: vec![
+                    button(VoteBallot::Yes, "Yes", ButtonStyle::Danger),
+                    button(VoteBallot::No, "No", ButtonStyle::Secondary),
+                ],
+            })]),
+            ..Default::default()
+        }),
+    }
+}
+
+/// One-line refusal for a rejected vote-kick start or ballot.
+fn kick_refusal_text(refusal: &KickRefusal) -> &'static str {
+    match refusal {
+        KickRefusal::Unavailable => "Voice state is syncing right now. Try again shortly.",
+        KickRefusal::NotARoom => "That member is not in a temporary voice room.",
+        KickRefusal::Vote(VoteKickError::InitiatorNotOccupant) => {
+            "Only room occupants can start a vote."
+        }
+        KickRefusal::Vote(VoteKickError::TargetNotOccupant) => "The target must be in the room.",
+        KickRefusal::Vote(VoteKickError::SelfTarget) => "You cannot start a vote against yourself.",
+        KickRefusal::Vote(VoteKickError::ProtectedTarget) => {
+            "The room owner and original creator cannot be voted out."
+        }
+        KickRefusal::Vote(VoteKickError::ActiveVoteExists) => {
+            "A vote is already active for that member."
+        }
+        KickRefusal::Vote(VoteKickError::ReusedVoteId) => {
+            "That vote was already started. Try again."
+        }
+        KickRefusal::Vote(VoteKickError::UnknownVote | VoteKickError::WrongVoteBoundary) => {
+            "That vote has already ended."
+        }
+        KickRefusal::Vote(VoteKickError::IneligibleVoter) => {
+            "Only current occupants other than the target can vote."
+        }
+        KickRefusal::Vote(VoteKickError::RepeatedVote) => "You have already voted.",
+        KickRefusal::Vote(VoteKickError::InvalidTime) => {
+            "The vote clock disagrees with this device. Try again shortly."
+        }
+    }
 }
 
 /// Ephemeral `ChannelMessageWithSource` reply shell.
@@ -3013,6 +3298,64 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::Kick { target, reason } => {
+            let Some(initiator) = interaction.author_id().map(|id| id.get()) else {
+                reply(ephemeral_response(
+                    "Could not tell who started the vote. Try again.",
+                ))
+                .await;
+                return true;
+            };
+            // Resolve the room first: a non-room target is a moderation
+            // kick, so stay silent here and keep the router's path (the
+            // claim check made the same read concurrently). A target who
+            // left since a positive claim lands in the NotARoom refusal
+            // below — still exactly one response, since the router stayed
+            // silent for the claimed vote. `kick_start` revalidates
+            // atomically, so a join in between cannot corrupt the ledger.
+            let Some(room_id) = runtime.kick_room_of(guild_id, target).await else {
+                return true;
+            };
+            match runtime
+                .kick_start(guild_id, interaction.id.get(), room_id, initiator, target)
+                .await
+            {
+                None => {
+                    reply(ephemeral_response(
+                        "Voice state is syncing right now. Try again shortly.",
+                    ))
+                    .await;
+                }
+                Some(Ok(update)) => {
+                    reply(vote_message(&update, initiator, target, reason.as_deref())).await;
+                }
+                Some(Err(refusal)) => {
+                    reply(ephemeral_response(kick_refusal_text(&refusal))).await;
+                }
+            }
+            true
+        }
+        VoiceCommand::Ballot { vote_id, ballot } => {
+            let Some(voter) = interaction.author_id().map(|id| id.get()) else {
+                reply(ephemeral_response("Could not tell who voted. Try again.")).await;
+                return true;
+            };
+            match runtime.kick_ballot(guild_id, vote_id, voter, ballot).await {
+                None => {
+                    reply(ephemeral_response(
+                        "Voice state is syncing right now. Try again shortly.",
+                    ))
+                    .await;
+                }
+                Some(Ok(update)) => {
+                    reply(vote_update_message(&update)).await;
+                }
+                Some(Err(refusal)) => {
+                    reply(ephemeral_response(kick_refusal_text(&refusal))).await;
+                }
+            }
+            true
+        }
         VoiceCommand::Setup => {
             let (store, _) = runtime.make_pair();
             let (creators, store_error) = match store.creators(guild_id).await {
@@ -3201,6 +3544,15 @@ where
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.runtime.needs_bootstrap(cache)
+    }
+
+    fn kick_claim_room(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move { runtime.kick_room_of(guild, member).await })
     }
 }
 

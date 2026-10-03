@@ -959,7 +959,7 @@ fn voice_command_set_is_gated_on_two_voice() {
         .collect();
     assert_eq!(
         names,
-        ["create", "setup", "ping", "invite", "access", "logging"]
+        ["create", "setup", "ping", "invite", "access", "logging", "kick"]
     );
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
@@ -2616,4 +2616,139 @@ fn notice_text_is_bounded() {
         message: "x".repeat(5000),
     };
     assert!(notice_text(&failure, DetailLevel::Full).chars().count() <= NOTICE_MAX_CHARS);
+}
+
+fn user_option(name: &str, id: u64) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::User(Id::new(id)),
+    }
+}
+
+#[allow(deprecated)]
+fn component_interaction(custom_id: &str, with_guild: bool) -> Interaction {
+    let mut interaction = voice_interaction(None, None, with_guild);
+    interaction.kind = InteractionType::MessageComponent;
+    interaction.data = Some(InteractionData::MessageComponent(Box::new(
+        twilight_model::application::interaction::MessageComponentInteractionData {
+            custom_id: custom_id.to_owned(),
+            component_type: twilight_model::channel::message::component::ComponentType::Button,
+            resolved: None,
+            values: Vec::new(),
+        },
+    )));
+    interaction
+}
+
+#[test]
+fn parse_kick_extracts_member_and_reason() {
+    let interaction = voice_interaction(
+        Some(command_data(
+            "kick",
+            vec![
+                user_option("member", 303),
+                command_option("reason", "too loud"),
+            ],
+        )),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Kick {
+            target: 303,
+            reason: Some("too loud".to_owned()),
+        })
+    );
+}
+
+#[test]
+fn parse_kick_accepts_moderation_shape_without_reason() {
+    let interaction = voice_interaction(
+        Some(command_data("kick", vec![user_option("target", 303)])),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Kick {
+            target: 303,
+            reason: None,
+        })
+    );
+}
+
+#[test]
+fn parse_kick_without_user_stays_silent_for_the_router() {
+    let interaction = voice_interaction(
+        Some(command_data("kick", vec![command_option("reason", "x")])),
+        None,
+        true,
+    );
+    assert_eq!(parse_voice_command(&interaction), None);
+}
+
+#[test]
+fn parse_ballot_buttons_by_vote_id() {
+    for (custom_id, expected) in [
+        (
+            "votekick:7000:yes",
+            VoiceCommand::Ballot {
+                vote_id: 7000,
+                ballot: VoteBallot::Yes,
+            },
+        ),
+        (
+            "votekick:7000:no",
+            VoiceCommand::Ballot {
+                vote_id: 7000,
+                ballot: VoteBallot::No,
+            },
+        ),
+    ] {
+        let interaction = component_interaction(custom_id, true);
+        assert_eq!(parse_voice_command(&interaction), Some(expected));
+    }
+}
+
+#[test]
+fn parse_foreign_buttons_stay_silent() {
+    for custom_id in [
+        "self-role:1",
+        "votekick:abc:yes",
+        "votekick:7000:maybe",
+        "votekick:7000",
+        "votekick:",
+    ] {
+        let interaction = component_interaction(custom_id, true);
+        assert_eq!(parse_voice_command(&interaction), None);
+    }
+    let guildless = component_interaction("votekick:7000:yes", false);
+    assert_eq!(parse_voice_command(&guildless), None);
+}
+
+#[test]
+fn vote_button_ids_round_trip() {
+    assert_eq!(vote_button_id(7000, VoteBallot::Yes), "votekick:7000:yes");
+    assert_eq!(vote_button_id(7000, VoteBallot::No), "votekick:7000:no");
+}
+
+#[test]
+fn kick_and_ballot_share_the_kick_restriction_name() {
+    assert_eq!(
+        VoiceCommand::Kick {
+            target: 303,
+            reason: None,
+        }
+        .name(),
+        "kick"
+    );
+    assert_eq!(
+        VoiceCommand::Ballot {
+            vote_id: 7000,
+            ballot: VoteBallot::Yes,
+        }
+        .name(),
+        "kick"
+    );
 }

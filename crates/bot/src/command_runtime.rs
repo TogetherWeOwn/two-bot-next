@@ -31,9 +31,13 @@
 //! or command definitions. No custom-command store exists on `main` yet —
 //! `publish_set` gets an empty custom slice until that slice lands its own reader.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crate::self_role_handlers::SelfRoleService;
@@ -61,7 +65,7 @@ use two_bot_core::{
     },
     tickets::TicketAction,
     ComponentHandler, ComponentOutcome, FeatureGates, HandlerId, InteractionHandler,
-    InteractionRouter, ModerationGates, RouterGates, SlashOutcome, SurfaceFlags,
+    InteractionRouter, ModerationGates, RouterGates, SlashOutcome, Snowflake, SurfaceFlags,
 };
 use two_bot_discord::{
     publish_commands, response_for_slash, route_interaction, ActionExecutor, LevelingRuntime,
@@ -107,6 +111,35 @@ impl InteractionHandler for SliceHandler {
     }
 }
 
+/// Voice vote-kick claim check: resolves the tracked room a member is
+/// currently in, if any. Wired from the voice sink in `main`; `None` until
+/// then, which keeps every `/kick` on the pre-existing router path.
+pub type VoiceKickClaim = Arc<
+    dyn Fn(
+            Snowflake,
+            Snowflake,
+        ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + 'static>>
+        + Send
+        + Sync,
+>;
+
+/// The vote target of a `/kick` slash interaction, if the published shape
+/// carries one. Accepts both the voice `member` option and the moderation
+/// `target` option; `None` keeps the existing router path untouched.
+fn kick_target_user(interaction: &Interaction) -> Option<Snowflake> {
+    let twilight_model::application::interaction::InteractionData::ApplicationCommand(data) =
+        interaction.data.as_ref()?
+    else {
+        return None;
+    };
+    data.options.iter().find_map(|option| match &option.value {
+        CommandOptionValue::User(id) if option.name == "member" || option.name == "target" => {
+            Some(id.get())
+        }
+        _ => None,
+    })
+}
+
 /// The shared command runtime: one router + one REST executor + the sqlx
 /// stores, driven by gateway dispatches. Cheap to clone behind `Arc`; every
 /// `dispatch` spawns detached work because twilight only drives heartbeats
@@ -130,6 +163,10 @@ pub struct CommandRuntime {
     /// Monotonic attempt ids: one value mints both the DB claim token
     /// (`s{n:x}`, ≤25 chars) and the numeric post nonce for dedupe.
     attempts: AtomicU64,
+    /// Voice vote-kick claim (V4 `kick` collision): when set and the target
+    /// sits in a tracked room, the voice sink owns the interaction and the
+    /// router must stay silent so the vote is answered exactly once.
+    voice_kick_claim: Mutex<Option<VoiceKickClaim>>,
 }
 
 impl CommandRuntime {
@@ -230,6 +267,7 @@ impl CommandRuntime {
             automations: features.automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
+            voice_kick_claim: Mutex::new(None),
         }))
     }
 
@@ -263,6 +301,7 @@ impl CommandRuntime {
             automations,
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
+            voice_kick_claim: Mutex::new(None),
         })
     }
 
@@ -277,6 +316,12 @@ impl CommandRuntime {
     /// the ordered award path; only this runtime dispatches interactions.
     pub fn leveling(&self) -> LevelingRuntime {
         self.leveling.clone()
+    }
+
+    /// Wire the voice vote-kick claim after boot composes both runtimes.
+    /// Called once from `main`; the `None` default keeps router behavior.
+    pub fn set_voice_kick_claim(&self, claim: VoiceKickClaim) {
+        *self.voice_kick_claim.lock().expect("voice claim lock") = Some(claim);
     }
 
     #[cfg(test)]
@@ -512,6 +557,26 @@ impl CommandRuntime {
         let RoutedInteraction::Slash { name, outcome } = routed else {
             return;
         };
+        // V4 `kick` collision: the voice sink owns interactions whose target
+        // sits in a tracked room (it answers the vote exactly once). Yield
+        // those here so the router never double-answers; every other `kick`
+        // keeps the pre-existing moderation path bit-for-bit.
+        if name == "kick" {
+            if let Some(target) = kick_target_user(interaction) {
+                if let Some(guild) = interaction.guild_id.map(|id| id.get()) {
+                    let claim = self
+                        .voice_kick_claim
+                        .lock()
+                        .expect("voice claim lock")
+                        .clone();
+                    if let Some(claim) = claim {
+                        if claim(guild, target).await.is_some() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(response) = response_for_slash(&outcome) {
             self.answer(interaction, response).await;
             return;
