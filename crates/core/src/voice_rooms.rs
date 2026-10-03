@@ -1303,6 +1303,24 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
             CommandOptionType::Attachment,
         )
         .required()]),
+        CommandDefinition::new(
+            "kick",
+            "Start a vote to disconnect a member from your voice room",
+        )
+        .options(vec![
+            CommandOption::new(
+                "member",
+                "Room occupant to put to a vote",
+                CommandOptionType::User,
+            )
+            .required(),
+            CommandOption::new(
+                "reason",
+                "Why the vote was started (shown on the ballot)",
+                CommandOptionType::String,
+            )
+            .max_length(512),
+        ]),
     ]
 }
 
@@ -2004,7 +2022,8 @@ mod tests {
                 "transfer",
                 "logging",
                 "export",
-                "import"
+                "import",
+                "kick"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -2090,6 +2109,19 @@ mod tests {
                 .all(|o| o.required != Some(true));
             assert!(required_first, "{} lists a required option late", sub.name);
         }
+        // `/kick` is open to every occupant; the worker refuses
+        // non-occupant initiators and protected targets.
+        let kick = &defs[11];
+        assert_eq!(kick.default_member_permissions, None);
+        assert_eq!(
+            kick.options
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>(),
+            ["member", "reason"]
+        );
+        assert_eq!(kick.options[0].required, Some(true));
+        assert_eq!(kick.options[1].required, None);
         // `/export` takes no options; `/import` takes one required file
         // attachment. Both are Manage Server (Manage Guild) gated.
         let export = &defs[9];
@@ -2117,6 +2149,9 @@ mod tests {
         assert_eq!(defs[7].options[0].kind, CommandOptionType::User as u8);
         assert!(defs[7].options[0].required == Some(true));
         // Merges cleanly alongside the other slices, first-wins.
+        // Moderation's `kick` sorts before the voice one, so the shared
+        // merge keeps the moderation definition; runtime dispatch (not the
+        // published shape) decides vote-kick versus moderation kick.
         let merged = merge_commands(
             &[feature_commands(), moderation_commands(), voice_commands()],
             &[],

@@ -1431,7 +1431,8 @@ fn voice_command_set_is_gated_on_two_voice() {
             "transfer",
             "logging",
             "export",
-            "import"
+            "import",
+            "kick"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -3106,6 +3107,16 @@ impl InteractionReplies for Replies {
         self.completed.lock().unwrap().push(response);
         self.complete_error.map_or(Ok(()), Err)
     }
+
+    async fn respond(
+        &self,
+        _: &Interaction,
+        response: InteractionResponse,
+    ) -> Result<(), RoomHttpError> {
+        self.trace.lock().unwrap().push("respond".to_owned());
+        self.completed.lock().unwrap().push(response);
+        self.complete_error.map_or(Ok(()), Err)
+    }
 }
 
 fn create_interaction() -> Interaction {
@@ -4770,4 +4781,236 @@ fn notice_text_is_bounded() {
         message: "x".repeat(5000),
     };
     assert!(notice_text(&failure, DetailLevel::Full).chars().count() <= NOTICE_MAX_CHARS);
+}
+
+/// Guild-less ballot interaction: the shared builder always attaches a
+/// guild, but unscoped presses must stay silent too.
+#[allow(deprecated)]
+fn guildless_component_interaction(custom_id: &str) -> Interaction {
+    let mut interaction = voice_interaction(None, None, false);
+    interaction.kind = InteractionType::MessageComponent;
+    interaction.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: custom_id.to_owned(),
+            component_type: ComponentType::Button,
+            resolved: None,
+            values: Vec::new(),
+        },
+    )));
+    interaction
+}
+
+#[test]
+fn parse_kick_extracts_member_and_reason() {
+    let interaction = voice_interaction(
+        Some(command_data(
+            "kick",
+            vec![
+                user_option("member", 303),
+                command_option("reason", "too loud"),
+            ],
+        )),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Kick {
+            target: 303,
+            reason: Some("too loud".to_owned()),
+        })
+    );
+}
+
+#[test]
+fn parse_kick_accepts_moderation_shape_without_reason() {
+    let interaction = voice_interaction(
+        Some(command_data("kick", vec![user_option("target", 303)])),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Kick {
+            target: 303,
+            reason: None,
+        })
+    );
+}
+
+#[test]
+fn parse_kick_without_user_stays_silent_for_the_router() {
+    let interaction = voice_interaction(
+        Some(command_data("kick", vec![command_option("reason", "x")])),
+        None,
+        true,
+    );
+    assert_eq!(parse_voice_command(&interaction), None);
+}
+
+#[test]
+fn parse_ballot_buttons_by_vote_id() {
+    for (custom_id, expected) in [
+        (
+            "votekick:7000:yes",
+            VoiceCommand::Ballot {
+                vote_id: 7000,
+                ballot: VoteBallot::Yes,
+            },
+        ),
+        (
+            "votekick:7000:no",
+            VoiceCommand::Ballot {
+                vote_id: 7000,
+                ballot: VoteBallot::No,
+            },
+        ),
+    ] {
+        let interaction = component_interaction(custom_id, None, MEMBER);
+        assert_eq!(parse_voice_command(&interaction), Some(expected));
+    }
+}
+
+#[test]
+fn parse_foreign_buttons_stay_silent() {
+    for custom_id in [
+        "self-role:1",
+        "votekick:abc:yes",
+        "votekick:7000:maybe",
+        "votekick:7000",
+        "votekick:",
+    ] {
+        let interaction = component_interaction(custom_id, None, MEMBER);
+        assert_eq!(parse_voice_command(&interaction), None);
+    }
+    let guildless = guildless_component_interaction("votekick:7000:yes");
+    assert_eq!(parse_voice_command(&guildless), None);
+}
+
+#[test]
+fn vote_button_ids_round_trip() {
+    assert_eq!(vote_button_id(7000, VoteBallot::Yes), "votekick:7000:yes");
+    assert_eq!(vote_button_id(7000, VoteBallot::No), "votekick:7000:no");
+}
+
+#[test]
+fn kick_and_ballot_share_the_kick_restriction_name() {
+    assert_eq!(
+        VoiceCommand::Kick {
+            target: 303,
+            reason: None,
+        }
+        .name(),
+        "kick"
+    );
+    assert_eq!(
+        VoiceCommand::Ballot {
+            vote_id: 7000,
+            ballot: VoteBallot::Yes,
+        }
+        .name(),
+        "kick"
+    );
+}
+
+fn kick_sink_interaction(target: u64, initiator: u64) -> Interaction {
+    with_user(
+        voice_interaction(
+            Some(command_data(
+                "kick",
+                vec![
+                    user_option("member", target),
+                    command_option("reason", "too loud"),
+                ],
+            )),
+            None,
+            true,
+        ),
+        initiator,
+    )
+}
+
+fn voice_member_in(member_id: u64, channel_id: u64) -> VoiceMember {
+    VoiceMember {
+        member_id,
+        channel_id,
+        bot: Some(false),
+    }
+}
+
+#[tokio::test]
+async fn sink_claimed_kick_answers_public_ballot_without_defer() {
+    const VOTER: u64 = 301;
+    const TARGET: u64 = 303;
+    const KICK_ROOM: u64 = 500;
+    let trace = Trace::default();
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || {
+                let store = Store::new(trace.clone());
+                store
+                    .rooms
+                    .lock()
+                    .unwrap()
+                    .insert(KICK_ROOM, room(KICK_ROOM));
+                (store, Http::new(trace.clone()))
+            }
+        },
+        Duration::from_millis(10),
+        true,
+    );
+    assert!(runtime.publish_snapshot(
+        GUILD,
+        snapshot(
+            &[KICK_ROOM],
+            vec![
+                voice_member_in(VOTER, KICK_ROOM),
+                voice_member_in(TARGET, KICK_ROOM),
+            ],
+        )
+    ));
+    let replies = Replies::new(trace.clone());
+    VoiceResponder::respond_with(
+        &runtime,
+        &replies,
+        &kick_sink_interaction(TARGET, VOTER),
+        None,
+        None,
+    )
+    .await;
+    // No defer: the ballot goes out as the initial public callback, so every
+    // occupant can see the buttons and reach quorum.
+    assert_eq!(*trace.lock().unwrap(), ["respond"]);
+    let completed = replies.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0].kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let data = completed[0].data.as_ref().expect("ballot body");
+    assert_ne!(data.flags, Some(MessageFlags::EPHEMERAL));
+    let content = data.content.as_deref().unwrap_or_default();
+    assert!(content.contains("<@303>"), "{content}");
+    assert!(content.contains("too loud"), "{content}");
+    assert_eq!(data.components.as_ref().map_or(0, Vec::len), 1);
+}
+
+#[tokio::test]
+async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let replies = Replies::new(trace.clone());
+    // No actor, no rooms: a moderation-shaped target must produce no ack at
+    // all here, otherwise the defer races (and loses to) the router answer.
+    VoiceResponder::respond_with(
+        &runtime,
+        &replies,
+        &kick_sink_interaction(303, 301),
+        None,
+        None,
+    )
+    .await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(replies.completed.lock().unwrap().is_empty());
 }

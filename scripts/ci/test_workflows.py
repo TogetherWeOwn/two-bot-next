@@ -133,6 +133,10 @@ def staging_migrate_errors(workflow):
                 or "ascending" not in str(pending.get("description")).lower()):
             errors.append(f"{name}: expected_pending must stay optional, default empty, "
                           "and documented as the ascending reviewed plan list")
+        acl = inputs.get("acl_plan_ref") or {}
+        if "bare" not in str(acl.get("description")).lower():
+            errors.append(f"{name}: acl_plan_ref must document the bare reference contract "
+                          "(refused before any DDL otherwise)")
     job = (workflow.get("jobs") or {}).get("migrate", {})
     if job.get("environment") != "staging-migrate":
         errors.append(f"{name}:migrate: must read the staging-migrate Environment binding")
@@ -143,6 +147,13 @@ def staging_migrate_errors(workflow):
     text = str(job).lower()
     if job.get("uses") is not None or any(marker in text for marker in DEPLOY_MARKERS):
         errors.append(f"{name}:migrate: deployment/probe alternative outside approved deploy workflows")
+    run_steps = [step for step in job.get("steps", []) if "tee" in str(step.get("run", ""))]
+    if not run_steps:
+        errors.append(f"{name}:migrate: no Run step piping through tee")
+    for step in run_steps:
+        if step.get("shell") != "bash" or "set -o pipefail" not in str(step.get("run", "")):
+            errors.append(f"{name}:migrate: Run step must use a pipefail shell so a "
+                          "migrator refusal/failure fails the job instead of reporting green")
     return errors
 
 
