@@ -2,6 +2,8 @@
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
 
+use two_bot_core::database_tls::TlsPolicy;
+
 /// Child-process probe: a malformed passfile entry must not reach WARN logs.
 /// Runs only when `CUTOVER_PGPASS_PROBE` is set (see the parent test below);
 /// a no-op in the normal suite. Opens no connection and prints no credential.
@@ -20,10 +22,11 @@ fn pgpass_probe_redacts_malformed_entry_child() {
             // Passwordless URL with no URL/env password: the driver consults
             // the passfile. The parent points PGPASSFILE at a synthetic
             // malformed fixture, never a real credential or file.
-            let error = two_bot_cutover::connect(
+            let error = two_bot_cutover::connect_with_tls(
                 "postgres://fixture-user@agent-testdb/db?sslmode=disable",
                 1,
                 true,
+                TlsPolicy::LocalOnly,
             )
             .await
             .unwrap_err();
@@ -138,6 +141,37 @@ fn unsupported_query_secrets_never_reach_sqlx_warn_logs() {
     assert!(!text.contains("fixture-query-secret"));
     assert!(!text.contains("ignoring unrecognized connect parameter"));
 }
+#[test]
+fn neon_channel_binding_never_reaches_sqlx_warn_logs() {
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        for query in [
+            "sslmode=require&channel_binding=require",
+            "channel%5Fbinding=fixture-binding-secret&sslmode=require&channel_binding=fixture-repeated-secret",
+        ] {
+            // Parse only: this synthetic Neon hostname is never contacted.
+            let url =
+                format!("postgres://fixture-user:fixture-password@ep-fixture.neon.tech/db?{query}");
+            let options = two_bot_core::database_url::connect_options(&url).unwrap();
+            assert!(matches!(
+                options.get_ssl_mode(),
+                sqlx::postgres::PgSslMode::Require
+            ));
+        }
+        tracing::warn!("capture remains active");
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    for forbidden in [
+        "fixture-binding-secret",
+        "fixture-repeated-secret",
+        "channel_binding",
+        "ignoring unrecognized connect parameter",
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+}
+
 #[tokio::test]
 async fn connection_errors_and_their_source_chains_never_echo_urls() {
     for url in [
@@ -165,4 +199,63 @@ async fn connection_errors_and_their_source_chains_never_echo_urls() {
             current = error.source();
         }
     }
+}
+
+/// Threat-model F6 refusals happen before SQLx parses the URL or opens a
+/// socket: the error is a fixed string and no URL part reaches any log level.
+#[test]
+fn tls_policy_refusals_never_echo_urls_or_reach_logs() {
+    let cases = [
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+            TlsPolicy::Required,
+            "database sslmode does not require TLS",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+            TlsPolicy::Required,
+            "database URL must set sslmode under the required TLS policy",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=prefer",
+            TlsPolicy::LocalOnly,
+            "remote database host is refused under the local-only TLS policy",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+            TlsPolicy::Required,
+            "local database host is refused under the required TLS policy",
+        ),
+        (
+            "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=fixture-mode",
+            TlsPolicy::LocalOnly,
+            "unsupported database sslmode",
+        ),
+    ];
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (url, policy, expected) in cases {
+                let error = two_bot_cutover::connect_with_tls(url, 1, true, policy)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.to_string(), expected);
+                let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+                while let Some(error) = current {
+                    for shown in [format!("{error}"), format!("{error:?}")] {
+                        assert!(!shown.contains("fixture"), "TLS refusal echoed the URL");
+                    }
+                    current = error.source();
+                }
+            }
+            tracing::warn!("capture remains active");
+        });
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    assert!(!text.contains("fixture"), "TLS refusal reached logs");
 }

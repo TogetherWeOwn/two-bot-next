@@ -14,12 +14,25 @@ use tower_http::trace::TraceLayer;
 use two_bot_core::{ComponentStatus, HealthReport};
 
 use crate::gateway::GatewayState;
+use crate::gateway_failure::{FailureSlot, GatewayFailure};
 
 /// Readiness reflects the live database, not only successful boot.
 #[derive(Clone)]
 pub struct SharedState {
     pub gateway: Arc<RwLock<GatewayState>>,
     pub database: Option<sqlx::PgPool>,
+    /// Why the gateway task last stopped (TOG-13044); empty until it fails.
+    pub failure: FailureSlot,
+}
+
+impl SharedState {
+    pub fn new(gateway: Arc<RwLock<GatewayState>>, database: Option<sqlx::PgPool>) -> Self {
+        Self {
+            gateway,
+            database,
+            failure: FailureSlot::default(),
+        }
+    }
 }
 
 /// Build the router (split out for tests: no socket needed).
@@ -29,11 +42,24 @@ pub fn router(state: SharedState) -> Router {
 }
 
 pub fn router_with_jobs(state: SharedState, jobs: crate::jobs::SharedStatus) -> Router {
+    router_with_guard(
+        state,
+        jobs,
+        two_bot_discord::ratelimit_guard::process_guard(),
+    )
+}
+
+fn router_with_guard(
+    state: SharedState,
+    jobs: crate::jobs::SharedStatus,
+    guard: Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
         .with_state((state, jobs))
+        .layer(axum::Extension(guard))
         // Internal metrics live on the same listener (Worker never proxies it).
         .merge(crate::metrics_http::router())
         .layer(TraceLayer::new_for_http())
@@ -49,6 +75,12 @@ struct ReadinessReport {
     health: HealthReport,
     // Informational component: not included in HealthReport::ready().
     jobs: std::collections::BTreeMap<String, crate::jobs::JobStatus>,
+    /// Fixed-vocabulary phase/class of the last gateway task failure; absent
+    /// while none has happened. Never carries error text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_failure: Option<GatewayFailure>,
+    build_revision: &'static str,
+    build_id: &'static str,
 }
 
 async fn readyz(
@@ -56,6 +88,7 @@ async fn readyz(
         SharedState,
         crate::jobs::SharedStatus,
     )>,
+    axum::Extension(guard): axum::Extension<Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>>,
 ) -> (StatusCode, Json<ReadinessReport>) {
     // Sample informational jobs before the ping/gateway fence too: awaiting
     // their lock afterward could publish a readiness snapshot from before stop.
@@ -71,7 +104,39 @@ async fn readyz(
         }
     })
     .await;
-    (code, Json(ReadinessReport { health, jobs }))
+    let (code, health) = with_token_state(code, health, guard.snapshot().token_invalid);
+    (
+        code,
+        Json(ReadinessReport {
+            health,
+            jobs,
+            gateway_failure: state.failure.get(),
+            build_revision: option_env!("BOT_BUILD_REVISION").unwrap_or("unknown"),
+            build_id: option_env!("BOT_BUILD_ID").unwrap_or("unknown"),
+        }),
+    )
+}
+
+/// A rejected bot token is fatal: surface it as its own readiness component.
+fn with_token_state(
+    code: StatusCode,
+    mut health: HealthReport,
+    token_invalid: bool,
+) -> (StatusCode, HealthReport) {
+    health.components.push((
+        "token_invalid".to_owned(),
+        if token_invalid {
+            ComponentStatus::Down
+        } else {
+            ComponentStatus::Ready
+        },
+    ));
+    let code = if token_invalid {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        code
+    };
+    (code, health)
 }
 
 async fn readiness_after_ping(
@@ -129,6 +194,7 @@ pub async fn serve(
             }
             *gateway.write().await = GatewayState::Draining;
             shutdown.send_replace(true);
+            crate::shutdown::exit_on_second_signal();
         })
         .await
 }
@@ -167,10 +233,49 @@ mod tests {
     use tower::ServiceExt as _;
 
     fn state(s: GatewayState) -> SharedState {
-        SharedState {
-            gateway: Arc::new(RwLock::new(s)),
-            database: None,
-        }
+        SharedState::new(Arc::new(RwLock::new(s)), None)
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_fatal_bot_token_while_health_stays_live() {
+        let guard = Arc::new(
+            two_bot_discord::ratelimit_guard::RateLimitGuard::new(Default::default()).unwrap(),
+        );
+        guard.observe_status(401, true);
+        let app = router_with_guard(
+            state(GatewayState::Connected),
+            crate::jobs::statuses(&[], true),
+            guard,
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["components"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(["token_invalid", "down"])));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -218,6 +323,14 @@ mod tests {
             assert_eq!(json["jobs"]["counter"]["consecutive_failures"], 2);
             assert_eq!(json["components"][0][0], "process");
             assert_eq!(
+                json["build_revision"],
+                option_env!("BOT_BUILD_REVISION").unwrap_or("unknown")
+            );
+            assert_eq!(
+                json["build_id"],
+                option_env!("BOT_BUILD_ID").unwrap_or("unknown")
+            );
+            assert_eq!(
                 json["components"][1],
                 serde_json::json!(["gateway", gateway.status()])
             );
@@ -263,9 +376,48 @@ mod tests {
             serde_json::json!([
                 ["process", "ready"],
                 ["gateway", "down"],
-                ["database", "down"]
+                ["database", "down"],
+                ["token_invalid", "ready"]
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_the_gateway_failure_only_once_one_is_recorded() {
+        use crate::gateway_failure::FailureClass;
+        let shared = state(GatewayState::Armed);
+        let fetch = |shared: SharedState| async move {
+            let response = router(shared)
+                .oneshot(
+                    Request::builder()
+                        .uri("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        assert!(fetch(shared.clone()).await.get("gateway_failure").is_none());
+        for class in FailureClass::ALL {
+            shared
+                .failure
+                .record(GatewayFailure::durable_gateway(class));
+            let json = fetch(shared.clone()).await;
+            assert_eq!(
+                json["gateway_failure"],
+                serde_json::json!({"phase": "durable_gateway", "class": class.as_str()})
+            );
+            // The component breakdown is untouched by the new field.
+            assert_eq!(
+                json["components"][1],
+                serde_json::json!(["gateway", "starting"])
+            );
+        }
     }
 
     #[test]

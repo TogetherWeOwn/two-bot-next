@@ -2,11 +2,12 @@
 
 The Rust process exposes `GET /metrics` on its existing `LISTEN_ADDR` listener.
 This is **internal-only**, unauthenticated operational data: scrape only from the
-container/private network. Do not expose the container port publicly, add a Worker
-proxy route, or route this through a public ingress. Both the Worker entrypoint
+container/private network. Do not expose the container port publicly or route it through a
+public ingress; the only off-container path is the authenticated
+`/ops/metrics` route below. Both the Worker entrypoint
 and the Container DO refuse `/metrics`; the Worker also reserves `/metrics`,
 `/metrics/*` and canonical case/encoding/slash aliases before
-invite-campaign lookup. No Prometheus server is added by this change.
+invite-campaign lookup. No Prometheus server exists; see the off-container path below.
 
 Format: Prometheus text 0.0.4, `text/plain; version=0.0.4; charset=utf-8`, `no-store`.
 Counters reset when the process restarts; timestamps use Unix seconds. Missing
@@ -29,13 +30,21 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
+| `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
+| `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
+| `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename` or `other` |
+| `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
+| `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
+| `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 
 ## Job coverage and outcomes
 
 The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
-`community_scorecard` and `inactivity` (the last two may be parked by configuration).
+`community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery` and
+`scheduled_messages` (the 15 s scheduled-message ticker). The community, audit,
+recovery and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -110,9 +119,28 @@ as dynamic labels.
   `POST /guilds/:guild/scheduled-events`,
   `PATCH /guilds/:guild/scheduled-events/:event`,
   `DELETE /guilds/:guild/scheduled-events/:event`, `other`).
-- `two_bot_job_last_success_timestamp_seconds{job}` — `job` is one of
-  `invite_snapshot`, `session_checkpoint`, `other`. `session_checkpoint`
-  records successful durable gateway commits; zero means never run.
+- `two_bot_job_runs_total{job,outcome}`,
+  `two_bot_job_last_success_timestamp_seconds{job}` and
+  `two_bot_job_consecutive_failures{job}` — `job` is one of
+  `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
+  `scheduled_events`, `presence_probe`, `community_scorecard`, `inactivity`,
+  `audit_retry`, `scheduled_messages`, `other`; `outcome` is `success` or `failure`.
+  `session_checkpoint` records successful durable gateway commits; zero means
+  never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
+- `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
+  or `delete`; `outcome` is `success`, `category_full`, `discord`,
+  `persistence` or `cancelled`. `Rejected` status/code values never become
+  labels; all store variants share `persistence`.
+- `two_bot_voice_reconcile_actions_total{action}` — `action` is
+  `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
+- `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
+  `delete`, `companion`, `ownership`, `kick`, `rename` or `other`.
+- Log fields (coordinated with blocked structured-log work, which owns JSON
+  formatting): `voice_event="voice_operation"` with `op`/`outcome`,
+  `voice_event="voice_reconcile"` with plan counts,
+  `voice_event="voice_dead_letter"` with `action`/`attempts`, and
+  `voice_event="voice_creator_orphan"`. No channel, member, token, body or
+  ID leaves the process in any label or field.
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
   `_sum` and `_count`.
@@ -173,3 +201,47 @@ controller's bounded cache pool was missing at implementation time.
   <https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Latency.html#method.recent>
 - Axum router composition follows the existing router/state pattern (0.8.9 in
   `Cargo.lock`); no middleware or additional dependency is introduced.
+
+## Off-container scrape and alert rules
+
+Chosen path: the Container Durable Object (the only caller that can reach the
+container-internal listener) pulls `/metrics` via `containerFetch` on every
+keepalive tick, evaluates the checked-in rules and posts transitions to the
+optional `OPS_ALERT_WEBHOOK_URL` Discord-compatible webhook. No Prometheus
+server, no new infrastructure.
+
+- Authenticated pull: `GET /ops/metrics` on the Worker with
+  `Authorization: Bearer <METRICS_SCRAPE_TOKEN>`. The token is an optional
+  Worker secret (never a plain var). Unset → `404`; missing or wrong bearer →
+  `401` (compared via SHA-256 digests); non-GET → `404`. Unauthenticated
+  requests never reach the container. `/metrics` itself stays `404`.
+- Rules live in `wrangler/src/alert-rules.ts`; each links to a
+  [runbook](runbook.md#metrics-alerts) section (a test enforces the anchors):
+
+| Rule | Fires when | Runbook |
+| --- | --- | --- |
+| `job_stale:<job>` | last success older than 2 x the job cadence (never-succeeded is ignored) | [job stale](runbook.md#alert-job-stale) |
+| `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
+| `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
+| `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
+
+`job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
+Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
+have no cadence and are exempt. `wrangler/test/alert-job-catalog.test.ts` fails
+when a `JOBS` label has neither a matching cadence nor a reasoned exemption.
+
+Packet identity (TOG-12100): rule ids above are the single shared spelling
+used on both sides of the B2 soak evidence seam. The Rust canonical list is
+`ALERT_RULE_IDS` in `crates/core/src/evidence.rs`; the Worker mirrors it in
+`packetFilename` (`wrangler/src/alert-rules.ts`). Every evidence/alert packet
+is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
+`soak_expected_committed` ledger identity), so the QA evidence table can
+attribute packets when several rules fire in one window. Both sides pin all
+four spellings with tests; the payload shape is unchanged.
+
+Known gaps: there is no DB error counter (the pool rule is a proxy) and no
+send-admission series, so neither is alerted. Add the series first, then a rule.
+A forced job failure on staging (three failures) raises
+`job_consecutive_failures:<job>` within about one keepalive tick. Counter resets
+(process restart) skip the 429 window. Alert state is persisted in DO storage
+before notifying, so delivery is at most once per transition.

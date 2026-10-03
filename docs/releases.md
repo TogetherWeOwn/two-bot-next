@@ -57,9 +57,10 @@ snapshot, including every manifest/dependency/lock update and the migrated
 changelog, then feeds a second native release to verify the post-release state.
 `security` entries appear under Fixed and advance the patch.
 Before dispatching checks, `scripts/migrate-release-notes.cjs` consumes the
-native updater's first-release bootstrap tail: it merges the existing RSVP
-Added/Fixed notes (plus the hand-written Notes tail the live changelog carries)
-into the generated version section and the release PR body,
+native updater's first-release bootstrap tail: it merges the existing
+Added/Fixed/Changed notes (plus the hand-written Notes tail and Security
+section the live changelog carries) into the generated version section and
+the release PR body,
 removing the duplicate title and Unreleased section. The PR body matters because
 release-please uses it, not the changelog file, for GitHub Release notes. The
 changelog and body are reconciled independently, so retries recover if only one
@@ -84,6 +85,60 @@ layer from the actual Dockerfile and verifies all five package targets. Add
 `--cargo` to run that layer's `cargo fetch --locked` (as Rust CI does). These
 fixtures do not contact a database; full Docker builds remain a deployment gate.
 
+## Release triggers and procedure
+
+`.github/workflows/release.yml` treats its events differently (TOG-12931).
+Previously every push to `main` regenerated the release PR: the head was
+rewritten about a minute after each merge and a full `check` (~20 min) started
+on it, so the PR could never stay green long enough to merge while `main` moved
+and every merge wasted a run. Now:
+
+| Event | Publishes a merged release PR | Regenerates the PR | Reconciles notes and dispatches `check` / `supply-chain` |
+| --- | --- | --- | --- |
+| `push` to `main` | yes | **no** (`skip-github-pull-request`) | **no** |
+| `workflow_dispatch` on `main` | yes | yes, unless the branch already holds this main snapshot | yes |
+| `schedule` (Mondays 04:23 UTC) | yes | same as dispatch | yes |
+
+The tag/release (and the SBOM assets, see `docs/supply-chain.md`) are published
+by the `push` run for the release PR's merge commit, exactly as before: the
+publication path and the job permissions did not change, and `skip-github-release`
+is never set. A missed publication is recovered by the next run of any kind. The
+`dry_run` and `release_tag` dispatch inputs keep their SBOM-only meaning.
+`pr-lint`, `gitleaks` and `check` remain required on the release PR; the
+dispatched runs are still the only way they start on a `GITHUB_TOKEN`-created PR.
+
+With no push regeneration the open release PR lags `main` by design. Cut a
+release with a short freeze: release-please drops commits that land between the
+PR's generation snapshot and its merge commit (they ship in the tag but appear
+in neither release's notes).
+
+1. **Announce the freeze.** The Director (or the COO) posts on the release card
+   that nothing merges to `main` until the freeze is lifted, and confirms no
+   merge is in flight.
+2. **Dispatch regeneration.** `gh workflow run release.yml --ref main`, then wait
+   for the run. It regenerates the PR from the current `main`, preserves the
+   bootstrap notes and dispatches `check.yml` and `supply-chain.yml` on the head.
+3. **Confirm the PR is fresh.** From a checkout of `main`:
+   ```sh
+   GH_REPO=<owner>/<repo> GITHUB_SHA="$(gh api "repos/<owner>/<repo>/commits/main" --jq .sha)" \
+     GITHUB_OUTPUT=/dev/stdout node scripts/release-pr-state.cjs plan
+   ```
+   `reuse_pr=true` means the PR was generated from today's `main`. `reuse_pr=false`
+   means there is no open release PR or `main` moved after its snapshot: do not
+   merge, dispatch again.
+4. **Exact-head green and review.** `check`, `pr-lint` and `gitleaks` are green on
+   the PR's current head SHA, and the Code Reviewer approved that same SHA.
+   A re-push (including a new regeneration) restarts both.
+5. **Reviewer merges.** The approving reviewer squash-merges with
+   `expectedHeadSha` set to the reviewed head. The merge's `push` run publishes
+   the tag and GitHub Release and attaches the SBOMs; verify the new `vX.Y.Z`
+   release, the `attach-sbom` job and the `autorelease: tagged` label.
+6. **Lift the freeze** once publication is verified. The next release PR appears
+   at the next dispatch or Monday run.
+
+The freeze is the exception path for the cut, not a standing hold: outside steps
+1-6 `main` merges freely and nothing rewrites the release PR.
+
 ## Retry-safe PR reconciliation
 
 `scripts/release-pr-state.cjs` selects only an open, same-repository, main-base
@@ -102,7 +157,8 @@ regeneration; a closed/merged PR also leaves publication and creation enabled.
 
 Selection after the action queries GitHub, rather than relying on `prs_created`:
 a native no-op or prior migration failure must still reconcile the existing PR
-and dispatch its checks. When publication leaves no open PR, selection emits
+and dispatch its checks (on `schedule` and `workflow_dispatch`; a `push` skips
+planning, reconciliation and dispatch entirely). When publication leaves no open PR, selection emits
 `pr_available=false` and valid empty-object `pr={}` JSON. Actions evaluates
 step environment expressions even when the step's `if` is false, so an empty
 string would make the skipped reconciliation step fail at `fromJSON` after
@@ -124,8 +180,8 @@ push or dispatch, and a stale notes branch alongside a normal body is ignored.
 The stored-notes Contents PUT carries the branch inside the JSON payload
 (`gh api --input` moves `-f` flags to the URL query, which the Contents API
 ignores). PR lint resolves the same validated notes-branch file before its
-card-reference check, so required lint passes on overflow PRs without
-weakening the `Refs: TOG-*` gate. Migration can also grow a large normal body
+body checks, so required lint passes on overflow PRs without weakening the
+empty-body gate. Migration can also grow a large normal body
 past the native 65,536-char limit; the workflow routes that reconciled output
 through the same overflow representation (stored notes plus link) instead of an
 oversized PATCH that GitHub would reject on every retry. The next run resolves
@@ -133,7 +189,14 @@ the new representation exactly like a native overflow.
 
 `python3 scripts/test-release-retry.py` runs the workflow's actual reconciliation
 shell and state CLI using complete disposable local Git repositories and a
-fail-closed GitHub mock. It covers native-output-free recovery, failures before
+fail-closed GitHub mock. It also evaluates the workflow's real `if` and
+`skip-github-pull-request` expressions per event, showing a `push` skips
+planning, regeneration, reconciliation and dispatch while a dispatch or schedule
+runs them, and that `main` running ahead of an untouched PR reads as stale.
+`scripts/test-release-publication.cjs` additionally replays a push run against
+the fail-closed mock: it publishes `v0.2.0` once, swaps the labels, publishes
+nothing on a rerun and has no pull-request write to reach. It covers
+native-output-free recovery, failures before
 PATCH, failed push, failed PATCH after push, one-sided migration, unchanged-main
 no-op, new-main regeneration, Update-branch stale regeneration, overflow
 stored-notes reconciliation (including failed notes-restore and dangling-link
@@ -143,7 +206,7 @@ uses a token, contacts GitHub or accesses a database, and runs in Worker CI.
 ## Required-check dispatch
 
 `GITHUB_TOKEN`-created PRs do not trigger ordinary PR workflows. The release
-workflow dispatches `check.yml`, `secret-scan.yml`, and `pr-lint.yml` on the
+workflow, on `schedule` and `workflow_dispatch` only, dispatches `check.yml` and `supply-chain.yml` (the folded `pr-lint` + `gitleaks` gate) on the
 release PR branch. `GH_REPO` explicitly names the repository because that job
 has no checkout. PR lint reads the open release PR's title and body via the
 API, verifies that its open same-repository head SHA and branch match the

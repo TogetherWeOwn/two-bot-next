@@ -66,6 +66,24 @@ it applies nothing to the running gateway.\n\n\
 resolved from legacy `TWO_DATABASE_URL` / `DISCORD_GUILD_ID`. Token, database URL\n\
 and guild ID have no embedded deployment value; the listen address defaults to\n\
 `0.0.0.0:8080`. Missing configuration is not proof of readiness.\n\n\
+### Shutdown\n\n\
+SIGTERM/SIGINT flips `/readyz` to 503, stops gateway intake, drains accepted\n\
+dispatches and jobs, commits the gateway checkpoint and closes the pool. The\n\
+whole drain is bounded by `SHUTDOWN_TIMEOUT_SECONDS` (whole seconds, 1–900;\n\
+default 35 = the 30 s dispatch drain plus 5 s margin). Past the bound the process\n\
+logs `shutdown_deadline_exceeded` and exits 1, so the supervisor restarts from the\n\
+last committed checkpoint; a blocking checkpoint writer cannot be abandoned\n\
+safely. A second SIGTERM/SIGINT exits 1 immediately. The Container stop\n\
+grace period (SIGTERM, 15 minutes, SIGKILL) is a wrangler setting and is not\n\
+configured here.\n\n\
+Under the Worker, the Container also receives the reviewed `TWO_*` runtime\n\
+flags in `wrangler/src/container-env.ts` (`FORWARDED_FLAGS`), forwarded\n\
+verbatim when the Worker env defines them as strings. Secrets never pass\n\
+through that allowlist: a Container secret needs its own explicit line in\n\
+`containerEnvVars` (`wrangler/src/index.ts`), like `DISCORD_TOKEN` and\n\
+`DATABASE_URL`. Every other `TWO_*` name the Rust sources mention sits in\n\
+`NOT_FORWARDED` with a reason, and `wrangler/test/container-env.test.ts`\n\
+fails when a name is in neither list.\n\n\
 ## Settings catalog\n\n\
 Default sources (parsed defaults only, not boot wiring): feature/announcement\n\
 gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding\n\
@@ -166,7 +184,10 @@ fn render_commands() -> String {
             let kind = match option.kind {
                 n if n == CommandOptionType::String.as_u8() => "string",
                 n if n == CommandOptionType::Integer.as_u8() => "integer",
+                n if n == CommandOptionType::Boolean.as_u8() => "boolean",
                 n if n == CommandOptionType::User.as_u8() => "user",
+                n if n == CommandOptionType::Channel.as_u8() => "channel",
+                n if n == CommandOptionType::Role.as_u8() => "role",
                 n => panic!("document new command option type {n}"),
             };
             let choices = if option.choices.is_empty() {

@@ -23,9 +23,14 @@ It requires no `db` feature, Discord wire types, clock, store or external I/O.
   defaults change.
 
 Without grouping the room lands directly above (`Above`) or below (`Below`) its
-creator channel (`/position`). With grouping and existing group rooms it lands
-at the matching edge of the group's room block, keeping the block contiguous
-going forward; a block split by earlier manual moves is not repaired. With
+creator channel (`/position`, the V11 codec's `RoomPosition`). Because existing
+rooms are not moved, the newest ungrouped room always sits next to the creator:
+three rooms created in turn read `[creator, r3, r2, r1]` for `Below` and
+`[r1, r2, r3, creator]` for `Above`. Keeping rooms in creation order is the
+`/group` feature. With grouping and existing group rooms the room lands at the
+matching edge of the group's room block, keeping the block contiguous going
+forward (`[creator, r1, r2, r3]` for `Below`, `[r3, r2, r1, creator]` for
+`Above`); a block split by earlier manual moves is not repaired. With
 grouping but no group rooms yet, placement falls back to creator-adjacent,
 starting the block there. A contiguous block under a category's 50-channel limit
 is the runtime's concern: this core returns an index, not a Discord position.
@@ -62,6 +67,9 @@ python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_placemen
 The acceptance fixture covers lowest-free numbering (gaps, raised starts,
 unsorted/duplicated input, start above one, `u32::MAX` saturation), empty and
 edge creator placement, two-creator group blocks, creator-adjacent group starts,
-every typed refusal, limit/privacy defaults, and proptest properties proving
-insertion preserves existing order and the chosen number is free and stable.
+the pinned three-room orderings for both sides with and without grouping, every
+typed refusal, limit/privacy defaults, and proptest properties proving the new
+room lands beside its anchor (the creator, or the group block's outer edge with
+block and new room contiguous) under shuffled input order and sparse positions,
+and that the chosen number is free and stable.
 No tests in this fixture use a database, Redis, Discord, or a staging identity.

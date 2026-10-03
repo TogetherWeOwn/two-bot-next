@@ -12,22 +12,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::voice_config::RoomPosition;
 use crate::Snowflake;
 
 /// Highest user limit a new room may start with (`/limit` and `/defaultlimit`,
 /// 0 means unlimited).
 pub const MAX_ROOM_USER_LIMIT: u16 = 99;
-
-/// The `/position` choice of the creator channel that triggered creation: the
-/// new room goes directly above or directly below an anchor. Without grouping
-/// the anchor is the creator channel itself; with `/group` and existing group
-/// rooms the anchor is the corresponding edge of the group's room block, so
-/// the block stays contiguous without moving any existing channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoomSide {
-    Above,
-    Below,
-}
 
 /// Role of one channel in the category's current order, as classified by the
 /// caller from authoritative guild state.
@@ -57,8 +47,13 @@ pub struct CategoryChannel {
 pub struct PlacementRequest<'a> {
     /// Creator channel the join (or `/create`) triggered on.
     pub creator_id: Snowflake,
-    /// That creator's `/position` setting.
-    pub side: RoomSide,
+    /// That creator's `/position` setting, as stored by the V11 codec: the new
+    /// room goes directly above or directly below an anchor. Without grouping
+    /// the anchor is the creator channel itself; with `/group` and existing
+    /// group rooms the anchor is the corresponding edge of the group's room
+    /// block, so the block stays contiguous without moving any existing
+    /// channel.
+    pub side: RoomPosition,
     /// That creator's `/group` (shared numbering and contiguous block) flag.
     pub grouped: bool,
     /// Existing rooms in the same numbering/placement group. With grouping,
@@ -140,13 +135,21 @@ pub fn next_room_number(existing_numbers: &[u32], first_number: u32) -> u32 {
 /// always in `0..=category_order.len()`.
 ///
 /// Without grouping the new room lands directly above (`Above`) or below
-/// (`Below`) its creator. With grouping and existing group rooms it lands at
-/// the corresponding edge of the group's room block (before the first group
-/// room for `Above`, after the last for `Below`), keeping the block contiguous
-/// going forward. A block split by earlier moves is not repaired: only the new
-/// channel's index is returned, never a reorder plan. With grouping but no
-/// group rooms yet, placement falls back to creator-adjacent, starting the
-/// block there. The runtime maps the index to a concrete Discord position.
+/// (`Below`) its creator. Because existing rooms are not moved, the newest
+/// ungrouped room always sits next to the creator: three rooms created one
+/// after another read `[creator, r3, r2, r1]` for `Below` and
+/// `[r1, r2, r3, creator]` for `Above`. Keeping rooms in creation order as a
+/// contiguous block is the `/group` feature.
+///
+/// With grouping and existing group rooms the new room lands at the
+/// corresponding edge of the group's room block (before the first group room
+/// for `Above`, after the last for `Below`), keeping the block contiguous
+/// going forward: three grouped rooms read `[creator, r1, r2, r3]` for `Below`
+/// and `[r3, r2, r1, creator]` for `Above`. A block split by earlier moves is
+/// not repaired: only the new channel's index is returned, never a reorder
+/// plan. With grouping but no group rooms yet, placement falls back to
+/// creator-adjacent, starting the block there. The runtime maps the index to a
+/// concrete Discord position.
 pub fn plan_placement(request: PlacementRequest<'_>) -> Result<usize, PlacementError> {
     let order = request.category_order;
     let mut seen = BTreeSet::new();
@@ -212,14 +215,38 @@ pub fn plan_placement(request: PlacementRequest<'_>) -> Result<usize, PlacementE
             last = last.max(rank[index]);
         }
         return Ok(match request.side {
-            RoomSide::Above => first,
-            RoomSide::Below => last + 1,
+            RoomPosition::Above => first,
+            RoomPosition::Below => last + 1,
         });
     }
     Ok(match request.side {
-        RoomSide::Above => rank[creator_index],
-        RoomSide::Below => rank[creator_index] + 1,
+        RoomPosition::Above => rank[creator_index],
+        RoomPosition::Below => rank[creator_index] + 1,
     })
+}
+
+/// Discord `position` to create the new channel with so it takes the slot at
+/// `index` (as returned by [`plan_placement`]) among the category's channels.
+///
+/// The new channel asks for the slot of the channel currently at `index`, so
+/// Discord inserts it there and pushes that channel and everything after it
+/// down; no existing channel is patched. Appending (`index` at or past the
+/// end) asks for one past the last channel's position. Raw positions may be
+/// sparse or negative-free; ties break by ascending ID like `plan_placement`.
+/// This is the single place that encodes the assumed create-time position
+/// semantics, so a staging observation that disagrees changes only this
+/// function.
+#[must_use]
+pub fn position_for_index(category_order: &[CategoryChannel], index: usize) -> u64 {
+    let mut sorted: Vec<&CategoryChannel> = category_order.iter().collect();
+    sorted.sort_by_key(|entry| (entry.position, entry.id));
+    let clamp = |position: i32| u64::try_from(position).unwrap_or(0);
+    match sorted.get(index) {
+        Some(entry) => clamp(entry.position),
+        None => sorted
+            .last()
+            .map_or(0, |last| clamp(last.position).saturating_add(1)),
+    }
 }
 
 /// Resolve a new room's starting limit and privacy from its creator's

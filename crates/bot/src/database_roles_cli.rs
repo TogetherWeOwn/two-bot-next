@@ -1,9 +1,12 @@
 //! Database-role commands never enter the gateway or migration path.
 
+// Operator commands intentionally emit human-readable/SQL output to stdout.
+#![allow(clippy::print_stdout)]
+
 use two_bot_core::database_roles;
 
 const USAGE: &str = "two-bot db roles plan|verify\n\
-    plan: print SQL only; no connection, apply flag or credential required\n\
+    plan [--phase full|bootstrap]: print SQL only; no connection, apply flag or credential required\n\
     verify: read-only inspection using TWO_DATABASE_URL; exit 1 on drift/error\n";
 
 pub async fn dispatch(args: &[String]) -> i32 {
@@ -17,6 +20,17 @@ pub async fn dispatch(args: &[String]) -> i32 {
             print!("{}", database_roles::plan());
             0
         }
+        ["roles", "plan", "--phase", phase] => match phase.parse() {
+            Ok(selected) => {
+                print!("{}", database_roles::plan_for_phase(selected));
+                0
+            }
+            Err(error) => {
+                eprintln!("db roles plan: {error}");
+                eprintln!("{USAGE}");
+                2
+            }
+        },
         ["roles", "verify"] => verify().await,
         _ => {
             eprintln!("{USAGE}");
@@ -80,5 +94,31 @@ mod tests {
         assert_eq!(dispatch(&args(&["roles", "apply"])).await, 2);
         assert_eq!(dispatch(&args(&["roles", "verify", "--apply"])).await, 2);
         assert_eq!(dispatch(&args(&["roles", "--help"])).await, 0);
+    }
+
+    #[tokio::test]
+    async fn plan_phase_defaults_to_full_and_rejects_unknown_phases() {
+        use two_bot_core::database_roles;
+        assert_eq!(
+            dispatch(&args(&["roles", "plan", "--phase", "full"])).await,
+            0
+        );
+        assert_eq!(
+            dispatch(&args(&["roles", "plan", "--phase", "bootstrap"])).await,
+            0
+        );
+        assert_ne!(
+            database_roles::plan_for_phase(database_roles::Phase::Bootstrap),
+            database_roles::plan()
+        );
+        assert_eq!(dispatch(&args(&["roles", "plan", "--phase"])).await, 2);
+        assert_eq!(
+            dispatch(&args(&["roles", "plan", "--phase", "partial"])).await,
+            2
+        );
+        assert_eq!(
+            dispatch(&args(&["roles", "plan", "--phase", "bootstrap", "--apply"])).await,
+            2
+        );
     }
 }

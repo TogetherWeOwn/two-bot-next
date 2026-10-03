@@ -7,11 +7,14 @@
 //! first engagement wins, and a failed halt read fails open in the mirror
 //! (the failure is reported here, never silently treated as clear).
 //!
-//! Usage: audit_switch --halt --actor <snowflake> | --resume | --status
+//! Usage: audit_switch --halt --actor `<snowflake>` | --resume | --status
 //!   Env: TWO_DATABASE_URL (agent-testdb test databases only; anything else
 //!   is refused before connecting, and no credential is ever printed).
 //!   Exit codes: 0 ok (already-engaged and already-clear count as ok),
 //!   1 database failure, 2 usage or refused target.
+
+// Operator CLI reports intentionally use stdout; runtime/library modules do not.
+#![allow(clippy::print_stdout)]
 
 use time::format_description::well_known::Rfc3339;
 use two_bot_core::audit_store::AuditStore;
