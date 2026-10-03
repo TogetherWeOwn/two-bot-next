@@ -321,7 +321,7 @@ async fn ready_routes_custom_slash_and_accepted_prefix_before_checkpoint() {
     wait_connected(&state).await;
     assert_rendered_replies(&rest, 51);
     assert_eq!(db.count().await, 1, "ordinary message capture still runs");
-    wait_audit_ok(&db.pool, 2);
+    wait_audit_ok(&db.pool, 2).await;
 
     // A terminal runtime failure is not a shard failure and does not block
     // capture/checkpoint; its already-committed reservation still fences replay.
@@ -453,7 +453,7 @@ async fn cold_resume_publishes_complete_registry_and_uses_bootstrap_guild_name()
     wait_requests(&rest, 7).await;
     assert_rendered_replies(&rest, 53);
     assert_eq!(db.count().await, 1);
-    wait_audit_ok(&db.pool, 2);
+    wait_audit_ok(&db.pool, 2).await;
     runner.abort();
     let _ = runner.await;
     gateway.stop().await;
