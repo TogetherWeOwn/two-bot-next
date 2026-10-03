@@ -561,12 +561,12 @@ async fn authenticated_unsupported_actions_and_bad_channel_keys_stay_redacted() 
 
 #[tokio::test]
 async fn health_router_has_no_action_route() {
-    let state = crate::server::SharedState {
-        gateway: Arc::new(tokio::sync::RwLock::new(
+    let state = crate::server::SharedState::new(
+        Arc::new(tokio::sync::RwLock::new(
             crate::gateway::GatewayState::Unconfigured,
         )),
-        database: None,
-    };
+        None,
+    );
     let response = crate::server::router(state)
         .oneshot(signed(payload(), "old", "intent-fixture"))
         .await

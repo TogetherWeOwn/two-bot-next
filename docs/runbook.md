@@ -112,7 +112,10 @@ Look for these literal messages:
   loaded its durable state; not yet proof of a successful RESUMED event.
 - `gateway shard loop started` / `gateway reconnect failed; Twilight will retry`.
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
-  initialization failure; underlying SQL error deliberately not logged.
+  initialization failure; underlying SQL error deliberately not logged. Its
+  `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
+  and in Workers Logs as `container_gateway_failure` (see
+  [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
 - Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
   `two-bot keepalive probe failed`, `two-bot container error`.
@@ -294,13 +297,15 @@ staging-migrate --plan --source-sha <40hex> --staging-host <host> \
 ```
 
 It refuses (exit 2, before any DDL) when the binding is absent, the target does
-not equal the named staging identity, the database name does not contain
-`staging` or looks like production, the login cannot assume `two_bot_migrator`,
-a reference is missing, or the ledger has a failed/incomplete row, a SHA-384
-mismatch, an unknown version or a non-prefix order. It never resets, reverts,
-restores, creates roles or grants. The sanitized JSON manifest (source SHA,
-per-migration SHA-384, ledger before/after, applied count) is the evidence; on
-failure the ledger-after is preserved, not repaired.
+not equal the pinned staging host/database inputs, either pin is empty or looks
+like production, the login cannot assume `two_bot_migrator`, a reference is
+missing, or the ledger has a failed/incomplete row, a SHA-384 mismatch, an
+unknown version or a non-prefix order. The database name needs no `staging`
+substring (the verified shared-Neon staging database is `two_bot`); the pinned
+host plus the binding-match check is the staging identity. It never resets,
+reverts, restores, creates roles or grants. The sanitized JSON manifest (source
+SHA, per-migration SHA-384, ledger before/after, applied count) is the evidence;
+on failure the ledger-after is preserved, not repaired.
 
 The workflow runs only when dispatched from `main` and reads the binding from
 the `staging-migrate` GitHub environment. That environment must have a required

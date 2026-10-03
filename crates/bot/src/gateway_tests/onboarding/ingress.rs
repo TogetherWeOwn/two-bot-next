@@ -145,7 +145,10 @@ async fn onboarding_gateway_ingress_settings_timeout_finishes_confirmed_defer_wi
         )
         .await;
         assert!(
-            reply.received_at.duration_since(ack.sent_at) < Duration::from_secs(7),
+            reply
+                .received_at
+                .duration_since(tokio::time::Instant::from_std(ack.sent_at))
+                < Duration::from_secs(7),
             "bounded error edit includes 1.5s settings and 5s reply budgets"
         );
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -224,7 +227,12 @@ async fn onboarding_gateway_ingress_unconfirmed_ack_has_no_selection_effects_or_
             "/api/v10/webhooks/1111/slow-ack-test-token/messages/@original",
         )
         .await;
-        assert!(reply.received_at.duration_since(wire_at) < Duration::from_secs(8));
+        assert!(
+            reply
+                .received_at
+                .duration_since(tokio::time::Instant::from_std(wire_at))
+                < Duration::from_secs(8)
+        );
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert!(body["content"]
             .as_str()

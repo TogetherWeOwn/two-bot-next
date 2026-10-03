@@ -29,7 +29,7 @@
 //! production guild or tokens.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
 use twilight_model::gateway::event::Event;
@@ -47,6 +47,27 @@ use two_bot_core::{
 #[must_use]
 pub fn legacy_stamp(ts: Timestamp) -> String {
     two_bot_core::format_iso_millis(ts.as_micros().div_euclid(1000))
+}
+
+/// A non-bot member join, handed to a runtime observer after the funnel has
+/// recorded it (legacy `client.ts`: the burst check runs last, "never at the
+/// expense of the join record").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinObservation {
+    pub guild_id: u64,
+    pub member_id: u64,
+    /// The attribution the funnel just recorded (`unknown`, `vanity`, an
+    /// invite, or the web path's expected-join source).
+    pub source: String,
+    /// Discord's `joined_at`, else the gateway receipt time (legacy
+    /// `member.joinedAt?.getTime() ?? Date.now()`).
+    pub joined_at_ms: i64,
+}
+
+/// Receives joins from the serial gateway writer. Implementations must not
+/// block or await: hand the join to a queue and return.
+pub trait JoinObserver: Send + Sync {
+    fn observe_join(&self, join: JoinObservation);
 }
 
 use crate::intents::cache_resource_types;
@@ -219,6 +240,8 @@ pub struct Pipeline<
     voice_chains: VoiceChains,
     /// Guild IDs whose invites carry a vanity URL (for `vanity` attribution).
     vanity_guilds: Mutex<HashSet<Snowflake>>,
+    /// Set once at startup by the runtime that wants joins (raid watch).
+    join_observer: OnceLock<Arc<dyn JoinObserver>>,
 }
 
 impl<S, L, F, I, C, P> std::fmt::Debug for Pipeline<S, L, F, I, C, P> {
@@ -278,7 +301,14 @@ impl<
             classifier,
             voice_chains: VoiceChains::default(),
             vanity_guilds: Mutex::new(HashSet::new()),
+            join_observer: OnceLock::new(),
         }
+    }
+
+    /// Register the join observer. First registration wins; a second call is
+    /// ignored so a late caller can never swap the observer under the writer.
+    pub fn set_join_observer(&self, observer: Arc<dyn JoinObserver>) {
+        let _ = self.join_observer.set(observer);
     }
 
     /// Access the core handlers (tracker reads, replay assertions).
@@ -477,6 +507,10 @@ impl<
                 } else {
                     None
                 };
+                let joined_at_ms = add.member.joined_at.map_or_else(
+                    || two_bot_core::parse_iso_millis(observed_at),
+                    |at| Some(at.as_micros().div_euclid(1000)),
+                );
                 let joined_at = add
                     .member
                     .joined_at
@@ -484,6 +518,7 @@ impl<
                 let source_event_id = format!("{guild_id}:{member_id}:{joined_at}");
                 let occurred_at = Some(joined_at);
                 let is_bot = add.user.bot;
+                let observed_source = source.clone();
                 self.cache.update(event);
                 self.handlers.on_join(JoinInput {
                     guild_id,
@@ -504,6 +539,19 @@ impl<
                         is_bot,
                         occurred_at,
                         source: None,
+                    });
+                }
+                // Last, after the funnel rows: an observer problem must never
+                // cost the join record it is reporting on. Bots are never
+                // observed, and an unreadable timestamp is skipped, not guessed.
+                if let (Some(observer), false, Some(joined_at_ms)) =
+                    (self.join_observer.get(), is_bot, joined_at_ms)
+                {
+                    observer.observe_join(JoinObservation {
+                        guild_id,
+                        member_id,
+                        source: observed_source,
+                        joined_at_ms,
                     });
                 }
             }

@@ -40,6 +40,10 @@ use two_bot_core::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
+    voice_logging::{
+        parse_detail_level, resolve_log_target, should_log, DetailLevel, LogTarget,
+        LoggingCandidates, LoggingSettings, RepeatLedger,
+    },
     voice_rooms::{
         category_full_message, voice_commands, ActionQueue, CreatorChannel, NewRoomSpec,
         ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition, VoiceGates,
@@ -94,6 +98,17 @@ pub trait RoomPersistence: Send + Sync {
         guild: Snowflake,
         controls: &AccessControls,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// The guild's V10a logging settings; an unconfigured guild reads as the defaults.
+    fn logging_settings(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<LoggingSettings, StoreError>> + Send;
+    /// Replace the guild's logging settings.
+    fn save_logging_settings(
+        &self,
+        guild: Snowflake,
+        settings: &LoggingSettings,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
         guild: Snowflake,
@@ -143,6 +158,20 @@ impl RoomPersistence for PgRoomStore {
             .map_err(store_error)
     }
 
+    async fn logging_settings(&self, guild: Snowflake) -> Result<LoggingSettings, StoreError> {
+        self.logging_settings(guild).await.map_err(store_error)
+    }
+
+    async fn save_logging_settings(
+        &self,
+        guild: Snowflake,
+        settings: &LoggingSettings,
+    ) -> Result<(), StoreError> {
+        self.save_logging_settings(guild, settings)
+            .await
+            .map_err(store_error)
+    }
+
     async fn forget(&self, guild: Snowflake, channel: Snowflake) -> Result<(), StoreError> {
         self.remove_room(guild, channel)
             .await
@@ -162,6 +191,13 @@ fn store_error(error: sqlx::Error) -> StoreError {
         }
         _ => StoreError::Unavailable,
     }
+}
+
+/// Where one operator notice is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeTarget {
+    Channel(Snowflake),
+    DirectMessage(Snowflake),
 }
 
 /// The production adapter performs one attempt and returns 429s to this worker.
@@ -206,6 +242,19 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         name: &str,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V10 error notice. `mention_role` is pinged on channel targets only.
+    /// The default refuses, so a writer that cannot post notices fails closed
+    /// (the worker counts the attempt and moves on) instead of dropping them
+    /// silently as delivered.
+    fn send_notice(
+        &self,
+        target: NoticeTarget,
+        content: &str,
+        mention_role: Option<Snowflake>,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (target, content, mention_role);
+        async { Err(RoomHttpError::InvalidRequest) }
+    }
 }
 
 impl RoomWrites for RoomHttp {
@@ -257,12 +306,28 @@ impl RoomWrites for RoomHttp {
     async fn rename(&self, channel: Snowflake, name: &str) -> Result<(), RoomHttpError> {
         self.rename_room(channel, name).await
     }
+
+    async fn send_notice(
+        &self,
+        target: NoticeTarget,
+        content: &str,
+        mention_role: Option<Snowflake>,
+    ) -> Result<(), RoomHttpError> {
+        match target {
+            NoticeTarget::Channel(channel) => {
+                self.post_notice(channel, content, mention_role).await
+            }
+            NoticeTarget::DirectMessage(user) => self.direct_notice(user, content).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct BotAccess {
     pub member_id: Snowflake,
     pub guild_owner_id: Snowflake,
+    /// The guild's system channel, first stop for V10 error notices.
+    pub system_channel_id: Option<Snowflake>,
     pub member_roles: Vec<Id<RoleMarker>>,
     pub roles: Vec<Role>,
 }
@@ -478,6 +543,14 @@ impl LiveGuild {
         self.inner.write().expect("live voice lock").bot = Some(access);
     }
 
+    /// System channel and owner for V10 notice routing; `None` until the bot
+    /// evidence is published.
+    fn notice_context(&self) -> Option<(Option<Snowflake>, Snowflake)> {
+        let state = self.inner.read().expect("live voice lock");
+        let bot = state.bot.as_ref()?;
+        Some((bot.system_channel_id, bot.guild_owner_id))
+    }
+
     /// Publish before enqueueing the ticket. Same-channel mute/deaf updates do
     /// not create rooms; leaving and returning yields a different ticket even
     /// if an older HTTP call is still awaiting its response.
@@ -672,6 +745,7 @@ pub struct GuildRoomWorker<S, H> {
     compensation: HashSet<Snowflake>,
     denied: HashMap<Snowflake, (u64, Option<Permissions>)>,
     failures: VecDeque<LifecycleFailure>,
+    notices: Vec<NoticeState>,
     halted: bool,
     votes: VoteKickCore,
     /// Every vote started this session, by its initiating interaction ID. A
@@ -699,6 +773,22 @@ impl VoteClock for ActorClock {
     fn now_ms(&self) -> u64 {
         self.0
     }
+}
+
+/// Minimum gap between notices about the same failure: one initial notice plus
+/// two repeats ([`two_bot_core::voice_logging::MAX_LOG_SENDS`]) span half an hour.
+const NOTICE_REPEAT_INTERVAL_MS: u64 = 15 * 60 * 1000;
+
+/// Longest notice body; Discord's message limit is 2000 characters.
+const NOTICE_MAX_CHARS: usize = 1500;
+
+/// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
+/// actor's monotonic clock, so a restart begins a fresh budget.
+#[derive(Debug, Clone)]
+struct NoticeState {
+    failure: LifecycleFailure,
+    ledger: RepeatLedger,
+    last_attempt_ms: Option<u64>,
 }
 
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
@@ -734,6 +824,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             compensation: HashSet::new(),
             denied: HashMap::new(),
             failures: VecDeque::new(),
+            notices: Vec::new(),
             halted: false,
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
@@ -1017,6 +1108,141 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
     pub fn tracked(&self) -> &HashMap<Snowflake, VoiceRoom> {
         &self.rooms
+    }
+
+    /// Send at most one due error notice per call, per the guild's
+    /// `/logging` settings. Each failure is noticed once plus two repeats at
+    /// least [`NOTICE_REPEAT_INTERVAL_MS`] apart, then stays listed in
+    /// `/setup` but silent. Every delivery attempt counts, delivered or not,
+    /// so an unreachable guild cannot cause unbounded REST traffic. Returns
+    /// whether an attempt was made.
+    pub async fn send_notices(&mut self, now_ms: u64) -> bool {
+        if self.halted {
+            return false;
+        }
+        let failures = &self.failures;
+        self.notices
+            .retain(|state| failures.contains(&state.failure));
+        let due = self.failures.iter().find(|failure| {
+            match self.notices.iter().find(|state| &state.failure == *failure) {
+                None => true,
+                Some(state) => {
+                    state.ledger.should_send()
+                        && match state.last_attempt_ms {
+                            None => true,
+                            Some(last) => now_ms.saturating_sub(last) >= NOTICE_REPEAT_INTERVAL_MS,
+                        }
+                }
+            }
+        });
+        let Some(failure) = due.cloned() else {
+            return false;
+        };
+        let settings = match self.store.logging_settings(self.live.guild_id).await {
+            Ok(settings) => settings,
+            Err(error) => {
+                // Unreadable settings: send nothing, look again next interval.
+                warn!(
+                    guild = self.live.guild_id,
+                    ?error,
+                    "voice notice settings unreadable"
+                );
+                self.note_attempt(&failure, now_ms, false);
+                return false;
+            }
+        };
+        if !should_log(settings.level, false) {
+            self.note_attempt(&failure, now_ms, false);
+            return false;
+        }
+        let text = notice_text(&failure, settings.level);
+        let delivered = self.deliver_notice(&settings, &text).await;
+        if !delivered {
+            warn!(
+                guild = self.live.guild_id,
+                "voice notice had no working destination"
+            );
+        }
+        self.note_attempt(&failure, now_ms, true);
+        true
+    }
+
+    fn note_attempt(&mut self, failure: &LifecycleFailure, now_ms: u64, counted: bool) {
+        let index = match self
+            .notices
+            .iter()
+            .position(|state| &state.failure == failure)
+        {
+            Some(index) => index,
+            None => {
+                self.notices.push(NoticeState {
+                    failure: failure.clone(),
+                    ledger: RepeatLedger::new(),
+                    last_attempt_ms: None,
+                });
+                self.notices.len() - 1
+            }
+        };
+        let state = &mut self.notices[index];
+        state.last_attempt_ms = Some(now_ms);
+        if counted {
+            state.ledger.record_send();
+        }
+    }
+
+    /// First working destination: the configured channel, then the guild
+    /// system channel, a DM to the guild owner, and finally a creator
+    /// channel's chat. A destination that fails is dropped and the next is
+    /// tried.
+    async fn deliver_notice(&self, settings: &LoggingSettings, text: &str) -> bool {
+        let mention = settings.mention_role_id.filter(|role| *role != 0);
+        if let Some(channel) = settings.channel_id.filter(|channel| *channel != 0) {
+            if self
+                .http
+                .send_notice(NoticeTarget::Channel(channel), text, mention)
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        let Some((system_channel_id, owner_id)) = self.live.notice_context() else {
+            return false;
+        };
+        let mut candidates = LoggingCandidates {
+            system_channel_id,
+            dm_user_id: Some(owner_id),
+            dm_reachable: true,
+            creator_channel_id: self.creators.keys().min().copied(),
+            setup_user_id: None,
+        };
+        while let Some(target) = resolve_log_target(candidates) {
+            let (notice_target, role) = match target {
+                LogTarget::SystemChannel { channel_id, .. } => {
+                    (NoticeTarget::Channel(channel_id), mention)
+                }
+                LogTarget::DirectMessage { user_id } => {
+                    (NoticeTarget::DirectMessage(user_id), None)
+                }
+                LogTarget::CreatorChat { channel_id } => {
+                    (NoticeTarget::Channel(channel_id), mention)
+                }
+            };
+            if self
+                .http
+                .send_notice(notice_target, text, role)
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            match target {
+                LogTarget::SystemChannel { .. } => candidates.system_channel_id = None,
+                LogTarget::DirectMessage { .. } => candidates.dm_reachable = false,
+                LogTarget::CreatorChat { .. } => candidates.creator_channel_id = None,
+            }
+        }
+        false
     }
 
     fn record(&mut self, failure: LifecycleFailure) {
@@ -1917,6 +2143,7 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                 // live, but creator configuration/status commands must not sit
                 // behind a 64-write burst either.
                 worker.dispatch_one(now_ms).await;
+                worker.send_notices(now_ms).await;
             }
         }
     }
@@ -2043,6 +2270,7 @@ fn bot_access_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> O
     Some(BotAccess {
         member_id: bot_id.get(),
         guild_owner_id: guild.owner_id().get(),
+        system_channel_id: guild.system_channel_id().map(|id| id.get()),
         member_roles,
         roles,
     })
@@ -2221,6 +2449,18 @@ pub enum VoiceCommand {
     Ping,
     Invite,
     Access(AccessAction),
+    Logging(LoggingAction),
+}
+
+/// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
+/// is answered, never silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoggingAction {
+    Show,
+    Level(String),
+    Channel(Option<Snowflake>),
+    Mention(Option<Snowflake>),
+    Invalid,
 }
 
 /// One `/access` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -2273,7 +2513,38 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
         "ping" => Some(VoiceCommand::Ping),
         "invite" => Some(VoiceCommand::Invite),
         "access" => Some(VoiceCommand::Access(parse_access_action(&command.options))),
+        "logging" => Some(VoiceCommand::Logging(parse_logging_action(
+            &command.options,
+        ))),
         _ => None,
+    }
+}
+
+fn parse_logging_action(options: &[CommandDataOption]) -> LoggingAction {
+    let Some(sub) = options.first() else {
+        return LoggingAction::Invalid;
+    };
+    let CommandOptionValue::SubCommand(args) = &sub.value else {
+        return LoggingAction::Invalid;
+    };
+    let arg = |name: &str| args.iter().find(|option| option.name == name);
+    match sub.name.as_str() {
+        "show" => LoggingAction::Show,
+        "level" => arg("level")
+            .and_then(|option| match &option.value {
+                CommandOptionValue::String(value) => Some(LoggingAction::Level(value.clone())),
+                _ => None,
+            })
+            .unwrap_or(LoggingAction::Invalid),
+        "channel" => LoggingAction::Channel(arg("channel").and_then(|option| match option.value {
+            CommandOptionValue::Channel(channel) => Some(channel.get()),
+            _ => None,
+        })),
+        "mention" => LoggingAction::Mention(arg("role").and_then(|option| match option.value {
+            CommandOptionValue::Role(role) => Some(role.get()),
+            _ => None,
+        })),
+        _ => LoggingAction::Invalid,
     }
 }
 
@@ -2348,6 +2619,7 @@ impl VoiceCommand {
             Self::Ping => "ping",
             Self::Invite => "invite",
             Self::Access(_) => "access",
+            Self::Logging(_) => "logging",
         }
     }
 }
@@ -2415,6 +2687,22 @@ pub struct WorkerStatus {
     pub health: Vec<String>,
     pub failures: Vec<String>,
     pub halted: bool,
+}
+
+/// Notice body for one failure. `brief` points at `/setup`; `full` adds the
+/// failure itself. Never `off`: callers gate on [`should_log`] first.
+fn notice_text(failure: &LifecycleFailure, level: DetailLevel) -> String {
+    let mut text = match level {
+        DetailLevel::Full => format!(
+            "Voice rooms need attention: {}. Run /setup to see all current problems.",
+            failure_line(failure)
+        ),
+        _ => "Voice rooms need attention. Run /setup to see the current problems.".to_owned(),
+    };
+    if text.chars().count() > NOTICE_MAX_CHARS {
+        text = text.chars().take(NOTICE_MAX_CHARS).collect();
+    }
+    text
 }
 
 fn failure_line(failure: &LifecycleFailure) -> String {
@@ -2567,6 +2855,52 @@ async fn execute_access<S: RoomPersistence>(
     }
 }
 
+/// Render the settings for `/logging show` and as the confirmation after a change.
+fn logging_summary(settings: &LoggingSettings) -> String {
+    let level = match settings.level {
+        DetailLevel::Off => "off (no notices are sent)",
+        DetailLevel::Brief => "brief",
+        DetailLevel::Full => "full",
+    };
+    let channel = match settings.channel_id {
+        Some(channel) => format!("<#{channel}>"),
+        None => "not set (falls back to the server's system channel, then a DM, then the creator channel's chat)".to_owned(),
+    };
+    let mention = match settings.mention_role_id {
+        Some(role) => format!("<@&{role}>"),
+        None => "none".to_owned(),
+    };
+    format!("Log level: {level}\nLog channel: {channel}\nMentioned on errors: {mention}")
+}
+
+/// Apply one `/logging` action: read, change, save. A failed read or write
+/// changes nothing and says so.
+async fn execute_logging<S: RoomPersistence>(
+    store: &S,
+    guild_id: Snowflake,
+    action: LoggingAction,
+) -> String {
+    let Ok(mut settings) = store.logging_settings(guild_id).await else {
+        return "Could not read the logging settings. Nothing was changed; try again.".to_owned();
+    };
+    match action {
+        LoggingAction::Show => return logging_summary(&settings),
+        LoggingAction::Invalid => {
+            return "Unknown /logging option. Use show, level, channel or mention.".to_owned()
+        }
+        LoggingAction::Level(raw) => match parse_detail_level(&raw) {
+            Ok(level) => settings.level = level,
+            Err(error) => return format!("{error} Nothing was changed."),
+        },
+        LoggingAction::Channel(channel) => settings.channel_id = channel,
+        LoggingAction::Mention(role) => settings.mention_role_id = role,
+    }
+    match store.save_logging_settings(guild_id, &settings).await {
+        Ok(()) => format!("Saved.\n{}", logging_summary(&settings)),
+        Err(_) => "Could not save the logging settings. Nothing was changed; try again.".to_owned(),
+    }
+}
+
 fn create_error_text(error: RoomHttpError) -> String {
     match error {
         RoomHttpError::Unauthorized => "Voice rooms are paused: Discord refused the bot credential. Tell an admin to fix the token, then restart the bot.".to_owned(),
@@ -2661,6 +2995,21 @@ where
                 runtime.access_changed(guild_id, controls);
             })
             .await;
+            reply(ephemeral_response(&text)).await;
+            true
+        }
+        VoiceCommand::Logging(action) => {
+            if !member.is_admin {
+                reply(ephemeral_response(
+                    "You need Manage Channels to use /logging.",
+                ))
+                .await;
+                return true;
+            }
+            // Same lock as `/access`: admin-only and rare, so one lock is enough.
+            let _serialized = runtime.access_lock.lock().await;
+            let (store, _) = runtime.make_pair();
+            let text = execute_logging(&store, guild_id, action).await;
             reply(ephemeral_response(&text)).await;
             true
         }
