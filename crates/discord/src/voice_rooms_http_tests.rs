@@ -118,6 +118,7 @@ fn attributes() -> RoomChannelAttributes {
         video_quality_mode: Some(VideoQualityMode::Full),
         nsfw: true,
         user_limit: 8,
+        position: None,
         overwrites: vec![PermissionOverwrite {
             id: Id::new(100),
             kind: PermissionOverwriteType::Role,
@@ -289,6 +290,24 @@ async fn sends_overwrites_with_create_then_move_and_treats_only_missing_delete_a
     assert_eq!(requests[1].path, "/api/v10/guilds/100/members/300");
     assert_eq!(requests[1].body, json!({"channel_id": "600"}));
     assert_eq!(requests[2].method, Method::DELETE);
+}
+
+#[tokio::test]
+async fn create_sends_position_and_omits_an_empty_override_list() {
+    let mock = Mock::start(vec![response(201, created_channel())]).await;
+    let mut synced = attributes();
+    synced.position = Some(3);
+    synced.overwrites = Vec::new();
+    mock.api
+        .create_room(100, "room", &synced, || true)
+        .await
+        .unwrap();
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests[0].body["position"], json!(3));
+    assert!(
+        requests[0].body.get("permission_overwrites").is_none(),
+        "an empty set must not be sent, so the room syncs to its category"
+    );
 }
 
 #[tokio::test]
