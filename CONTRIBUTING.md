@@ -18,11 +18,16 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 - **Body.** Fill in every section of the
   [PR template](.github/pull_request_template.md), in short, active sentences:
   Thinking Path, Linked Issues or Issue Description, What Changed, Verification,
-  Risks, Model Used, Checklist. The `pr-lint` check fails an empty body.
-- **Public-safe references.** Put no secret, token, private URL or internal
-  tracker ID (`TOG-`, `PAP-`) in any title, body, commit, comment or branch name.
-  Link public GitHub issues as `Closes #123`. `pr-lint` warns when it sees an
-  internal ID.
+  Risks, Model Used, Checklist. A PR created through the API gets no template,
+  so paste it in. `docs`, `chore`, `build`, `ci`, `style`, `test` and `revert`
+  PRs need no linked issue and no duplicate-search tick. The `pr-lint` check
+  fails an empty body; the other body rules warn until open PRs migrate.
+- **Search first.** Look for an open or recent PR that touches the same area,
+  and link what you find. Tick the duplicate-search line in the checklist.
+- **No internal references.** This repo is public: put no internal ticket id,
+  instance link, localhost URL or private host in any title, body, commit,
+  comment or branch name. Link public GitHub issues as `Closes #123` and say
+  the rest in plain words. `pr-lint` warns when it sees one.
 - **Honest disclosure.** Name the exact model ID in Model Used, or write "None —
   human-authored". Report only test runs you saw, and say what you did not run.
 - **Review.** Address every review finding, or reply with why it does not apply.
@@ -36,11 +41,16 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 The rulesets on `main` require one PR and squash-only merges, and block deletion
 and force-pushes. They require two status checks: `pr-lint` (ruleset
 `pr-conventions`) and `gitleaks` (ruleset `protect-main`). Both run from
-`.github/workflows/supply-chain.yml`. `pr-lint` checks the title format, the
-100-character limit, the trailing period and a non-empty body. On a push to
-`main` it also checks every commit subject.
+`.github/workflows/supply-chain.yml`. `pr-lint` runs
+`.github/scripts/pr_standards.py` (tests beside it): it checks the title
+format, the 100-character limit, the trailing period and a non-empty body as
+errors, and the template sections, duplicate search and internal references in
+warn mode (`PR_STANDARDS_MODE: "warn"`). On a push to `main` it also checks
+every commit subject.
 `check`, `worker check`, `gitleaks` and `pr-lint` are required checks on `main`: the rulesets enforce `gitleaks` and `pr-lint`, and a PR also merges only when `check` and `worker check` are green on the exact head commit.
 Never bypass or weaken a check.
+
+`check`, `worker check`, `gitleaks` and `pr-lint` are required checks on `main`.
 
 ### Issues
 

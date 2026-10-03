@@ -40,7 +40,7 @@ use two_bot_core::{
     ChannelClass, FunnelHandlers, GateClearedInput, InviteState, JoinInput, MemStore, MessageInput,
     StoredRow, VoiceInput, WEB_ONE_CLICK_SOURCE,
 };
-use two_bot_discord::{MemPipeline, NoClassification};
+use two_bot_discord::{JoinObservation, JoinObserver, MemPipeline, NoClassification};
 
 const GUILD: u64 = 100_000_000_000_000_001;
 const A: u64 = 900_000_000_000_001_111;
@@ -713,6 +713,70 @@ fn pipeline_voice_move_and_server_leave_share_receipt_boundaries() {
         row.event_type == two_bot_core::EventType::MemberLeave
             && row.occurred_at == ends[1].occurred_at
     }));
+}
+
+struct RecordedJoins(std::sync::Mutex<Vec<JoinObservation>>);
+
+impl JoinObserver for RecordedJoins {
+    fn observe_join(&self, join: JoinObservation) {
+        self.0.lock().unwrap().push(join);
+    }
+}
+
+/// The raid-watch seam: non-bot joins reach the observer after the funnel
+/// rows, with Discord's `joined_at` (receipt time when absent) in epoch ms.
+#[test]
+fn pipeline_join_observer_sees_non_bot_joins_after_the_funnel() {
+    let pipeline = MemPipeline::for_replay();
+    let seen = std::sync::Arc::new(RecordedJoins(std::sync::Mutex::new(Vec::new())));
+    pipeline.set_join_observer(seen.clone());
+    let observed_at = stamp("12:10:00");
+
+    pipeline.handle_at(&join_event(A, true, "12:00:00"), &observed_at);
+    let mut unstamped = join_event(B, true, "12:00:00");
+    if let Event::MemberAdd(ref mut add) = unstamped {
+        add.member.joined_at = None;
+    }
+    pipeline.handle_at(&unstamped, &observed_at);
+    let mut bot_join = join_event(BOT, true, "12:00:30");
+    if let Event::MemberAdd(ref mut add) = bot_join {
+        add.member.user.bot = true;
+    }
+    pipeline.handle_at(&bot_join, &observed_at);
+
+    let joins = seen.0.lock().unwrap().clone();
+    assert_eq!(joins.len(), 2, "the bot join is never observed");
+    assert_eq!(joins[0].guild_id, GUILD);
+    assert_eq!(joins[0].member_id, A);
+    assert_eq!(joins[0].joined_at_ms, 1_789_905_600_000, "12:00:00Z");
+    assert_eq!(joins[0].source, "unknown");
+    assert_eq!(joins[1].member_id, B);
+    assert_eq!(
+        joins[1].joined_at_ms, 1_789_906_200_000,
+        "receipt 12:10:00Z"
+    );
+    // The funnel recorded the joins the observer was told about.
+    let rows = pipeline.handlers().store().rows();
+    for member_id in [A, B] {
+        assert!(rows.iter().any(|row| {
+            row.event_type == two_bot_core::EventType::MemberJoin
+                && row.member_id == Some(member_id)
+        }));
+    }
+}
+
+/// First registration wins; a pipeline with no observer behaves as before.
+#[test]
+fn pipeline_join_observer_registration_is_first_wins() {
+    let pipeline = MemPipeline::for_replay();
+    pipeline.handle_at(&join_event(A, true, "12:00:00"), &stamp("12:10:00"));
+    let first = std::sync::Arc::new(RecordedJoins(std::sync::Mutex::new(Vec::new())));
+    let second = std::sync::Arc::new(RecordedJoins(std::sync::Mutex::new(Vec::new())));
+    pipeline.set_join_observer(first.clone());
+    pipeline.set_join_observer(second.clone());
+    pipeline.handle_at(&join_event(B, true, "12:01:00"), &stamp("12:10:00"));
+    assert_eq!(first.0.lock().unwrap().len(), 1);
+    assert!(second.0.lock().unwrap().is_empty());
 }
 
 /// Messages: guild rows advance the ladder with the frame stamp; DMs drop.

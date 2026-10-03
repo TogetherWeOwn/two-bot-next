@@ -32,7 +32,9 @@ use twilight_model::application::command::CommandType;
 use twilight_model::application::interaction::application_command::{
     CommandData, CommandDataOption, CommandOptionValue,
 };
+use twilight_model::application::interaction::message_component::MessageComponentInteractionData;
 use twilight_model::application::interaction::{Interaction, InteractionData, InteractionType};
+use twilight_model::channel::message::component::ComponentType;
 use twilight_model::channel::message::{Message, MessageFlags, MessageType};
 use twilight_model::gateway::event::Event;
 use twilight_model::gateway::payload::incoming::{InteractionCreate, Ready};
@@ -46,13 +48,13 @@ use two_bot_core::funnel::now_millis_for_test;
 use two_bot_core::sticky::{store, ActivityOutcome};
 use two_bot_core::{
     RouterGates, RouterRefusal, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY,
-    MANAGE_SERVER_REQUIRED,
+    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED,
 };
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
-    sticky_options, CommandRuntime,
+    sticky_options, CommandRuntime, RegistrySyncError,
 };
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
@@ -389,6 +391,21 @@ pub(crate) fn slash(
     }
 }
 
+fn lfg_select(values: Vec<String>) -> Interaction {
+    let mut interaction = slash("lfg", Some(CHANNEL), Vec::new());
+    interaction.kind = InteractionType::MessageComponent;
+    interaction.data = Some(InteractionData::MessageComponent(Box::new(
+        MessageComponentInteractionData {
+            custom_id: two_bot_core::lfg::lfg_custom_id("lfg-test-post"),
+            component_type: ComponentType::TextSelectMenu,
+            resolved: None,
+            values,
+        },
+    )));
+    interaction.member.as_mut().unwrap().permissions = Some(Permissions::empty());
+    interaction
+}
+
 fn option(name: &str, value: CommandOptionValue) -> CommandDataOption {
     CommandDataOption {
         name: name.to_owned(),
@@ -528,7 +545,7 @@ async fn message_gate_short_circuits_before_db_and_rest() {
         (true, false, Some(9999)),
         (false, false, Some(GUILD)),
     ] {
-        let runtime = runtime_without_db(gates(true, false), automations, origin.clone());
+        let runtime = runtime_without_db(gates(automations, false), automations, origin.clone());
         let outcome = runtime.on_message(&message(1, CHANNEL, bot, guild)).await;
         assert_eq!(outcome, ActivityOutcome::None);
     }
@@ -588,6 +605,8 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "feed-add"
                         | "feed-remove"
                         | "feed-list"
+                        | "lfg"
+                        | "lfg-close"
                         | "schedule"
                         | "schedule-remove"
                         | "schedule-list"
@@ -782,6 +801,352 @@ async fn dispatch_remaining_keeps_rsvp_replies_and_registry_with_the_ordered_own
         assert_eq!(reply["data"]["content"], AUTOMATIONS_DISABLED_REPLY);
         mock.shutdown().await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Consolidated LFG + sticky/feed runtime (no database)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lfg_sticky_and_feed_routes_coexist_without_db() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime.set_identity(1111, 1111);
+
+    // Each accepted route fails validation before SQL: LFG lacks required
+    // options, sticky has no channel, and feeds have an invalid kind/id.
+    // This exercises feature execution, not just registry coexistence.
+    for (index, (name, channel, permissions, expected)) in [
+        (
+            "lfg",
+            Some(CHANNEL),
+            Permissions::MANAGE_EVENTS,
+            "Missing title option.",
+        ),
+        (
+            "lfg-close",
+            Some(CHANNEL),
+            Permissions::MANAGE_EVENTS,
+            "Missing id option.",
+        ),
+        (
+            "sticky",
+            None,
+            Permissions::MANAGE_GUILD,
+            "This command only works in a channel.",
+        ),
+        (
+            "sticky-remove",
+            None,
+            Permissions::MANAGE_GUILD,
+            "This command only works in a channel.",
+        ),
+        (
+            "feed-add",
+            Some(CHANNEL),
+            Permissions::MANAGE_GUILD,
+            "Unknown feed kind.",
+        ),
+        (
+            "feed-remove",
+            Some(CHANNEL),
+            Permissions::MANAGE_GUILD,
+            "Invalid feed id.",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut interaction = slash(name, channel, Vec::new());
+        interaction.id = Id::new(7000 + index as u64);
+        interaction.member.as_mut().unwrap().permissions = Some(permissions);
+        tokio::time::timeout(Duration::from_secs(2), runtime.on_interaction(&interaction))
+            .await
+            .expect("validation must finish without waiting for the lazy pool");
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            2 * (index + 1),
+            "only defer and edit for {name}"
+        );
+        let callback = &requests[2 * index];
+        assert_eq!(callback.method, "POST");
+        assert_eq!(
+            callback.path,
+            format!(
+                "/api/v10/interactions/{}/sticky-test-token/callback",
+                interaction.id
+            )
+        );
+        let acknowledgement: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
+        assert_eq!(
+            acknowledgement["type"], 5,
+            "one deferred callback for {name}"
+        );
+        assert_eq!(acknowledgement["data"]["flags"], 64);
+        let edit = &requests[2 * index + 1];
+        assert_eq!(edit.method, "PATCH");
+        assert_eq!(
+            edit.path,
+            "/api/v10/webhooks/1111/sticky-test-token/messages/@original"
+        );
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        assert_eq!(reply["content"], expected, "correct feature owns {name}");
+        assert_eq!(reply["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn lfg_commands_preserve_manage_events_and_disabled_refusals() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    for (announcements, permissions, expected) in [
+        (true, Some(Permissions::empty()), MANAGE_EVENTS_REQUIRED),
+        (
+            true,
+            Some(Permissions::MANAGE_GUILD),
+            MANAGE_EVENTS_REQUIRED,
+        ),
+        (true, None, MANAGE_EVENTS_REQUIRED),
+        (
+            false,
+            Some(Permissions::MANAGE_EVENTS),
+            ANNOUNCEMENTS_DISABLED_REPLY,
+        ),
+    ] {
+        let runtime = runtime_without_db(gates(true, announcements), true, origin.clone());
+        runtime.set_identity(1111, 1111);
+        for name in ["lfg", "lfg-close"] {
+            let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+            interaction.member.as_mut().unwrap().permissions = permissions;
+            let before = mock.requests().len();
+            runtime.on_interaction(&interaction).await;
+            let requests = mock.requests();
+            assert_eq!(requests.len(), before + 1, "one refusal, no defer/effects");
+            let callback = requests.last().unwrap();
+            assert_eq!(callback.method, "POST");
+            assert_eq!(
+                callback.path,
+                "/api/v10/interactions/7/sticky-test-token/callback"
+            );
+            let reply: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
+            assert_eq!(reply["type"], 4);
+            assert_eq!(reply["data"]["flags"], 64);
+            assert_eq!(
+                reply["data"]["content"], expected,
+                "router refusal for {name}"
+            );
+        }
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn ordinary_member_lfg_select_reaches_the_feature_before_db() {
+    for values in [Vec::new(), vec!["tank".to_owned(), "dps".to_owned()]] {
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let runtime = runtime_without_db(gates(true, true), true, origin);
+        runtime.set_identity(1111, 1111);
+        // Zero admin permissions are intentional: signup is not gated by
+        // ManageEvents/ManageGuild. Invalid cardinality avoids store access.
+        let interaction = lfg_select(values);
+        tokio::time::timeout(Duration::from_secs(2), runtime.on_interaction(&interaction))
+            .await
+            .expect("invalid select must not wait for the lazy pool");
+        assert_eq!(mock.deferred_reply()["content"], "Choose one LFG role.");
+        assert_eq!(
+            mock.requests().len(),
+            2,
+            "one defer, one completion; no effects"
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn consolidated_runtime_preserves_guild_fences_for_lfg_and_siblings() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime.set_identity(1111, 1111);
+    for guild in [Some(Id::new(9999)), None] {
+        for name in [
+            "lfg",
+            "lfg-close",
+            "sticky",
+            "sticky-remove",
+            "feed-add",
+            "feed-remove",
+            "feed-list",
+        ] {
+            let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+            interaction.guild_id = guild;
+            interaction.member.as_mut().unwrap().permissions =
+                Some(Permissions::MANAGE_EVENTS | Permissions::MANAGE_GUILD);
+            runtime.on_interaction(&interaction).await;
+        }
+        let mut interaction = lfg_select(Vec::new());
+        interaction.guild_id = guild;
+        runtime.on_interaction(&interaction).await;
+    }
+    assert!(
+        mock.requests().is_empty(),
+        "foreign guild/DM routes stay silent"
+    );
+
+    // Moderation's guild fence remains an explicit refusal, unlike the
+    // announcement/automation routes above, even with its feature gate off.
+    let mut interaction = slash("ban", Some(CHANNEL), Vec::new());
+    interaction.guild_id = Some(Id::new(9999));
+    runtime.on_interaction(&interaction).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1, "only the moderation guild refusal");
+    assert_eq!(requests[0].method, "POST");
+    assert!(requests[0].path.ends_with("/callback"));
+    let reply: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(reply["type"], 4);
+    assert_eq!(reply["data"]["flags"], 64);
+    assert_eq!(
+        reply["data"]["content"],
+        RouterRefusal::GuildRestricted.message()
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn production_build_requires_authoritative_custom_rows_before_full_publication() {
+    let expected_names: Vec<String> = router_with_commands(gates(true, true))
+        .publish_set(&[])
+        .expect("complete registry")
+        .into_iter()
+        .map(|command| command.name)
+        .collect();
+    for custom_commands in [None, Some(Vec::new())] {
+        let has_authoritative_rows = custom_commands.is_some();
+        let (mock, origin) = MockRest::start(Vec::new()).await;
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        pool.close().await;
+        // Use the production constructor, not `new`'s Some(empty) fixture.
+        // Closing the lazy pool proves publication needs no DB connection.
+        let executor = executor_at(origin);
+        let leveling = two_bot_discord::LevelingRuntime::new(
+            pool.clone(),
+            Arc::new(executor.clone()),
+            GUILD,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
+        let runtime = CommandRuntime::build(
+            pool,
+            executor,
+            router_with_commands(gates(true, true)),
+            None,
+            leveling,
+            GUILD,
+            custom_commands,
+            None,
+        );
+        runtime.set_identity(1111, 1111);
+        runtime.publish_registry(Some(1111)).await;
+        let requests = mock.requests();
+        if has_authoritative_rows {
+            assert_eq!(requests.len(), 1, "one full replacement");
+            assert_eq!(requests[0].method, "PUT");
+            assert_eq!(
+                requests[0].path,
+                "/api/v10/applications/1111/guilds/2222/commands"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            let names: Vec<String> = body
+                .as_array()
+                .expect("command array")
+                .iter()
+                .map(|command| command["name"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                names, expected_names,
+                "publish every gated builtin, not LFG-only"
+            );
+            for name in [
+                "lfg",
+                "lfg-close",
+                "sticky",
+                "sticky-remove",
+                "feed-add",
+                "feed-remove",
+                "feed-list",
+            ] {
+                assert!(
+                    names.iter().any(|published| published == name),
+                    "missing {name}"
+                );
+            }
+        } else {
+            assert!(
+                requests.is_empty(),
+                "unavailable custom store must not replace the registry"
+            );
+        }
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn boot_publication_failure_is_reported_and_remains_retryable() {
+    let (mock, origin) = MockRest::start_script(vec![
+        RestResponse::status(403),
+        RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"1111"}"#.to_owned()),
+            delay: Duration::ZERO,
+        },
+    ])
+    .await;
+    let runtime = runtime_without_db(gates(false, true), false, origin);
+    runtime.set_identity(1111, 1111);
+    let error = runtime
+        .publish_registry_checked(Some(1111))
+        .await
+        .unwrap_err();
+    assert_eq!(error, RegistrySyncError::Publish);
+    runtime.publish_registry_checked(None).await.unwrap();
+    runtime.publish_registry_checked(None).await.unwrap();
+    let requests = mock.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "failed sync retries; successful RESUME sync runs once"
+    );
+    assert_eq!(requests[0].method, "PUT");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(requests[2].method, "PUT");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn foreign_application_interactions_never_reach_a_feature() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+    runtime.set_identity(1111, 1111);
+    for name in ["lfg", "lfg-close", "sticky", "feed-add"] {
+        let mut interaction = slash(name, Some(CHANNEL), Vec::new());
+        interaction.application_id = Id::new(9999);
+        interaction.member.as_mut().unwrap().permissions =
+            Some(Permissions::MANAGE_EVENTS | Permissions::MANAGE_GUILD);
+        runtime.on_interaction(&interaction).await;
+    }
+    let mut interaction = lfg_select(Vec::new());
+    interaction.application_id = Id::new(9999);
+    runtime.on_interaction(&interaction).await;
+    assert!(
+        mock.requests().is_empty(),
+        "application fence precedes all execution"
+    );
+    mock.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

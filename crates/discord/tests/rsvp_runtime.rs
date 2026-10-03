@@ -178,12 +178,13 @@ fn assert_reply(mock: &MockRest, content: &str, deferred: bool) {
 }
 
 fn runtime(pool: &Pool<Postgres>, mock: &MockRest) -> InteractionRuntime {
-    InteractionRuntime {
-        router: router(),
-        pool: pool.clone(),
-        executor: executor(mock),
-        classifier: ClassifierConfig::default(),
-    }
+    InteractionRuntime::with_router(
+        router(),
+        pool.clone(),
+        executor(mock),
+        0,
+        ClassifierConfig::default(),
+    )
 }
 
 async fn run(pool: &Pool<Postgres>, mock: &MockRest, interaction: &Interaction) {

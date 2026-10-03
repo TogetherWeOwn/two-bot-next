@@ -400,6 +400,11 @@ jobs:
         run: >-
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
+      - name: LFG actual-router and mock-Discord regressions
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: >-
+          cargo test -p two-bot-discord --features db --locked --test lfg_interactions -- --ignored --test-threads=1
+
       - name: leveling gateway and interaction integration (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
@@ -413,6 +418,10 @@ jobs:
       - name: onboarding shared runtime acceptance (mock Discord and CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
+
+      - name: raid runtime acceptance (mock Discord and CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot --locked raid_runtime_ -- --include-ignored
 
       - name: automod durable dedupe (CI service container only)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -445,6 +454,10 @@ jobs:
       - name: voice room store regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --test voice_rooms_store --locked -- --ignored
+
+      - name: Voice configuration store (CI service container only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-cutover --test voice_config_store --locked -- --ignored
 
       - name: Docker dependency-layer manifests (offline)
         if: needs.job-inputs.outputs.rust != 'false'

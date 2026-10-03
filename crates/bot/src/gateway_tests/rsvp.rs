@@ -37,12 +37,13 @@ fn gates() -> RouterGates {
 }
 
 fn runtime(db: &TestDb, rest: &MockRest) -> Arc<InteractionRuntime> {
-    Arc::new(InteractionRuntime {
-        router: InteractionRouter::new(gates()),
-        pool: db.pool.clone(),
-        executor: ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap(),
-        classifier: ClassifierConfig::default(),
-    })
+    Arc::new(InteractionRuntime::with_router(
+        InteractionRouter::new(gates()),
+        db.pool.clone(),
+        ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap(),
+        0,
+        ClassifierConfig::default(),
+    ))
 }
 
 async fn spawn(db: &TestDb, url: &str, rest: &MockRest) -> JoinHandle<Result<(), sqlx::Error>> {
