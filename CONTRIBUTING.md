@@ -42,6 +42,8 @@ and force-pushes. They require two status checks: `pr-lint` (ruleset
 `check`, `worker check`, `gitleaks` and `pr-lint` are required checks on `main`: the rulesets enforce `gitleaks` and `pr-lint`, and a PR also merges only when `check` and `worker check` are green on the exact head commit.
 Never bypass or weaken a check.
 
+`check`, `worker check`, `gitleaks` and `pr-lint` are required checks on `main`.
+
 ### Issues
 
 Use an issue form: bug report, feature request, enhancement or documentation
