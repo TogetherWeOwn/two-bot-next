@@ -568,6 +568,10 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
 
+      - name: automations import/export Postgres proof
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-core --features db --locked --test automation_transfer -- --ignored
+
       - name: custom-command routed runtime proof (mock Discord and CI Postgres only)
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-discord --features db --locked --test custom_command_runtime -- --include-ignored
