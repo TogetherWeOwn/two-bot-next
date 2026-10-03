@@ -13,7 +13,10 @@ included in that request and never patched afterwards.
   `(position, id)` order. Existing channels are never moved. The index becomes
   Discord's create-time `position` via `position_for_index`. A category that
   cannot be planned leaves the position to Discord (append) instead of blocking
-  the join. `/group` is not wired yet (see below).
+  the join. With the creator's `/group` flag on, the room lands at the edge of
+  the category's tracked-room block (before the first group room for above,
+  after the last for below), keeping the block contiguous; rooms gone from
+  Discord or moved to another category are not counted.
 - **Permission inheritance.** The creator's stored source (creator channel,
   category, or a chosen channel) supplies the overrides that are copied. The
   owner gets the V8a owner grant on their own room only; private rooms deny
@@ -41,8 +44,7 @@ room lands next to its creator; if not, only that function changes.
 
 ## Not in this slice
 
-`/group` (shared numbering and a contiguous block) needs a stored per-creator
-flag and a migration; the settings commands (`/position`, `/inheritpermissions`,
+The settings commands (`/position`, `/inheritpermissions`,
 `/defaultlimit`, `/alwaysprivate`) and the required-role setting are not wired.
 Until then the stored defaults come from `/create` (spec defaults) or the V11
 import.

@@ -36,10 +36,10 @@ Rules the rehearsal verified in source:
   `/alwaysprivate`) are not wired as slash commands. There is no partial
   per-creator edit path: change the value in the exported JSON and re-import.
 - `group_by_category` (shared numbering and contiguous block per category)
-  is stored by the V11 import and shown in the diff, but the room planner
-  hardcodes ungrouped placement. Do not promise shared numbering at cutover
-  until that wiring lands; map each interim generator to its own creator
-  channel instead.
+  is stored by the V11 import, shown in the diff, and honored by the room
+  planner (new rooms land at the edge of the category's room block). Shared
+  numbering still needs a live staging confirmation before cutover promises;
+  until then, map each interim generator to its own creator channel.
 
 ## 2. Template/settings map (V11 export/import)
 
@@ -142,9 +142,11 @@ Each gap below is filed as its own card and linked from the rehearsal
 issue. Live staging practice (§4 live run) is a follow-up blocked on
 staging returning to healthy; it is not listed here as a code gap.
 
-1. Shared/category numbering (`/group`) is stored but not honored: the
-   room planner hardcodes ungrouped placement, so an import carrying
-   `group_by_category` changes nothing at runtime.
+1. ~~Shared/category numbering (`/group`) is stored but not honored~~ Wired:
+   the room planner now threads the stored `group_by_category` flag and the
+   category's live room set into placement (contiguous block at the block
+   edge), covered by unit tests. Still open: confirming the block lands as
+   planned on the staging guild once staging is healthy (§4 live run).
 2. No dedicated ghost-channel count for cutover verification: room
    tracking diffs live only in the runtime reconcile pass, surfaced via
    `/setup` health and logs; there is no read-only count an operator can
