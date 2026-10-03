@@ -29,6 +29,17 @@ fn announcement_executor(mock: &MockDiscord, gate: Arc<dyn SendAdmission>) -> An
     executor
 }
 
+/// These journeys cross Postgres on a real-time runtime, so they cannot use
+/// the frozen-clock `run_once`; a hidden retry loop must still fail fast.
+async fn run_live(executor: &AnnouncementExecutor, body: &Map<String, Value>) -> ExecutionOutcome {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        executor.execute("announcement.post", body),
+    )
+    .await
+    .unwrap()
+}
+
 async fn reached_wire(mock: &MockDiscord) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while mock.count() == 0 {
@@ -47,7 +58,7 @@ async fn admission_success_releases_lane_for_another_transport() {
     let gate = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
     let announced = announcement_executor(&mock, gate.clone());
     assert!(matches!(
-        run_once(&announced, &announcement("first intent")).await,
+        run_live(&announced, &announcement("first intent")).await,
         ExecutionOutcome::Posted(_)
     ));
     let action = ActionExecutor::with_admission(token(), Some(mock.origin.clone()), gate).unwrap();
@@ -104,7 +115,7 @@ async fn admission_announcement_429_blocks_action_backup_and_restart_cross_pool(
     let mock = MockDiscord::start(Reply::new(429, r#"{"retry_after":120,"global":false}"#)).await;
     let gate = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
     let announced = announcement_executor(&mock, gate);
-    let outcome = run_once(&announced, &announcement("first independent intent")).await;
+    let outcome = run_live(&announced, &announcement("first independent intent")).await;
     assert!(matches!(
         outcome,
         ExecutionOutcome::RateLimited(RateLimitCooldown {
@@ -137,7 +148,7 @@ async fn admission_announcement_429_blocks_action_backup_and_restart_cross_pool(
         .is_err());
     let restarted = announcement_executor(&mock, gate);
     assert_eq!(
-        run_once(&restarted, &announcement("second independent intent")).await,
+        run_live(&restarted, &announcement("second independent intent")).await,
         ExecutionOutcome::NoEffect(Refusal::SendAdmissionBlocked)
     );
     assert_eq!(
@@ -171,7 +182,7 @@ async fn admission_action_429_without_timing_installs_indefinite_global_hold() {
     assert!(indefinite);
     let announced = announcement_executor(&mock, gate);
     assert_eq!(
-        run_once(&announced, &announcement("new intent")).await,
+        run_live(&announced, &announcement("new intent")).await,
         ExecutionOutcome::NoEffect(Refusal::SendAdmissionBlocked)
     );
     assert_eq!(mock.count(), 1);
@@ -204,7 +215,7 @@ async fn admission_cancellation_after_wire_keeps_restart_and_other_transport_blo
         .is_err());
     let restarted = announcement_executor(&mock, gate);
     assert_eq!(
-        run_once(&restarted, &announcement("new independent intent")).await,
+        run_live(&restarted, &announcement("new independent intent")).await,
         ExecutionOutcome::NoEffect(Refusal::SendAdmissionBlocked)
     );
     assert_eq!(mock.count(), 1);
@@ -238,7 +249,7 @@ async fn admission_completion_storage_failure_preserves_definitive_429_no_resend
         Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap()),
     );
     assert_eq!(
-        run_once(&restarted, &announcement("other intent")).await,
+        run_live(&restarted, &announcement("other intent")).await,
         ExecutionOutcome::NoEffect(Refusal::SendAdmissionBlocked)
     );
     assert_eq!(mock.count(), 1);
@@ -255,7 +266,7 @@ async fn admission_storage_failure_before_send_and_token_mismatch_refuse_locally
     second.close().await;
     let executor = announcement_executor(&mock, gate.clone());
     assert_eq!(
-        run_once(&executor, &announcement("new intent")).await,
+        run_live(&executor, &announcement("new intent")).await,
         ExecutionOutcome::NoEffect(Refusal::SendAdmissionBlocked)
     );
     assert!(ActionExecutor::with_admission(

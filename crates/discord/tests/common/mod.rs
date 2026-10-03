@@ -472,7 +472,7 @@ pub struct RestRequest {
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
-    pub received_at: std::time::Instant,
+    pub received_at: tokio::time::Instant,
 }
 
 impl RestRequest {
@@ -483,6 +483,17 @@ impl RestRequest {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+}
+
+/// Delay the first mock observation after parsing, not executor admission.
+pub struct ReceiptGate {
+    pub entered: oneshot::Receiver<()>,
+    pub release: oneshot::Sender<()>,
+}
+
+struct ReceiptHold {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
 }
 
 /// Synchronize request arrival, response release and handler completion without timers.
@@ -540,7 +551,7 @@ impl MockRest {
         default: ScriptedResponse,
         body_delay: Duration,
     ) -> Self {
-        Self::start_inner(ungated(script), default, Some(body_delay)).await
+        Self::start_inner(ungated(script), default, Some(body_delay), None).await
     }
 
     /// Send headers but never finish a nonempty body; clients must time out.
@@ -548,7 +559,32 @@ impl MockRest {
         script: Vec<ScriptedResponse>,
         default: ScriptedResponse,
     ) -> Self {
-        Self::start_inner(ungated(script), default, None).await
+        Self::start_inner(ungated(script), default, None, None).await
+    }
+
+    pub async fn start_with_first_receipt_gate(
+        script: Vec<ScriptedResponse>,
+        default: ScriptedResponse,
+    ) -> (Self, ReceiptGate) {
+        let (entered, observed) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let mock = Self::start_inner(
+            ungated(script),
+            default,
+            Some(Duration::ZERO),
+            Some(ReceiptHold {
+                entered,
+                release: released,
+            }),
+        )
+        .await;
+        (
+            mock,
+            ReceiptGate {
+                entered: observed,
+                release,
+            },
+        )
     }
 
     /// Hold the final scripted response until the caller releases its gate.
@@ -561,7 +597,7 @@ impl MockRest {
         let mut queue = ungated(script);
         queue.push_back((last, Some(Arc::clone(&gate))));
         (
-            Self::start_inner(queue, default, Some(Duration::ZERO)).await,
+            Self::start_inner(queue, default, Some(Duration::ZERO), None).await,
             gate,
         )
     }
@@ -570,6 +606,7 @@ impl MockRest {
         script: VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)>,
         default: ScriptedResponse,
         body_delay: Option<Duration>,
+        first_receipt: Option<ReceiptHold>,
     ) -> Self {
         let queue = Mutex::new(script);
         Self::serve(
@@ -581,6 +618,7 @@ impl MockRest {
                     .unwrap_or_else(|| (default.clone(), None))
             }),
             body_delay,
+            first_receipt,
         )
         .await
     }
@@ -592,11 +630,16 @@ impl MockRest {
         Self::serve(
             Arc::new(move |request: &RestRequest| (responder(request), None)),
             Some(Duration::ZERO),
+            None,
         )
         .await
     }
 
-    async fn serve(responder: RestResponder, body_delay: Option<Duration>) -> Self {
+    async fn serve(
+        responder: RestResponder,
+        body_delay: Option<Duration>,
+        first_receipt: Option<ReceiptHold>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind rest");
         let addr = listener.local_addr().expect("rest addr");
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -605,7 +648,15 @@ impl MockRest {
             let recorded = Arc::clone(&recorded);
             let responses = Arc::clone(&responses);
             tokio::spawn(async move {
-                rest_task(listener, recorded, responses, responder, body_delay).await;
+                rest_task(
+                    listener,
+                    recorded,
+                    responses,
+                    responder,
+                    body_delay,
+                    first_receipt,
+                )
+                .await;
             })
         };
         Self {
@@ -638,6 +689,14 @@ impl MockRest {
     }
 }
 
+impl Drop for MockRest {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 fn ungated(
     script: Vec<ScriptedResponse>,
 ) -> VecDeque<(ScriptedResponse, Option<Arc<ResponseGate>>)> {
@@ -653,6 +712,7 @@ async fn rest_task(
     responses: Arc<Mutex<Vec<RestResponse>>>,
     responder: RestResponder,
     body_delay: Option<Duration>,
+    mut first_receipt: Option<ReceiptHold>,
 ) {
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -664,8 +724,9 @@ async fn rest_task(
         let recorded = Arc::clone(&recorded);
         let responses = Arc::clone(&responses);
         let responder = Arc::clone(&responder);
+        let receipt = first_receipt.take();
         connections.spawn(async move {
-            handle_rest(stream, recorded, responses, responder, body_delay).await
+            handle_rest(stream, recorded, responses, responder, body_delay, receipt).await
         });
     }
 }
@@ -676,16 +737,21 @@ async fn handle_rest(
     responses: Arc<Mutex<Vec<RestResponse>>>,
     responder: RestResponder,
     body_delay: Option<Duration>,
+    receipt: Option<ReceiptHold>,
 ) {
     let Some((method, path, headers, body)) = read_rest_request(&mut stream).await else {
         return;
     };
+    if let Some(receipt) = receipt {
+        let _ = receipt.entered.send(());
+        let _ = receipt.release.await;
+    }
     let request = RestRequest {
         method: method.clone(),
         path: path.clone(),
         headers,
         body: body.clone(),
-        received_at: std::time::Instant::now(),
+        received_at: tokio::time::Instant::now(),
     };
     let (mut next, gate) = responder(&request);
     recorded.lock().expect("recorded").push(request);
