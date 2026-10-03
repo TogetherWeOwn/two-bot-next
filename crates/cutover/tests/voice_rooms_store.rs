@@ -139,7 +139,12 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         ..first.clone()
     };
     assert_eq!(store.room_for(100, 500).await?, Some(handed.clone()));
-    assert_eq!(store.rooms_for_owner(100, 301).await?, vec![handed]);
+    // Channel 501 (`second`) already belongs to owner 301, so both rows
+    // now list under 301 in channel order.
+    assert_eq!(
+        store.rooms_for_owner(100, 301).await?,
+        vec![handed.clone(), second.clone()]
+    );
     assert!(store.rooms_for_owner(100, 300).await?.is_empty());
     let touched_after: String =
         sqlx::query_scalar("SELECT owner_touched_at::text FROM voice_rooms WHERE guild_id = '100' AND channel_id = '500'")
@@ -187,12 +192,14 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert!(store.remove_creator(100, 200).await?);
     assert!(!store.remove_creator(100, 200).await?);
     let restarted = PgRoomStore::new(pool.clone());
+    // Channel 500 still carries the handoff above, so the reload sees
+    // `handed` (not the pre-handoff `first`) alongside `second`.
     assert_eq!(
         restarted.rooms_in_guild(100).await?,
-        vec![first.clone(), second.clone()]
+        vec![handed.clone(), second.clone()]
     );
     assert_eq!(restarted.remove_room(101, 500).await?, None);
-    assert_eq!(restarted.remove_room(100, 500).await?, Some(first));
+    assert_eq!(restarted.remove_room(100, 500).await?, Some(handed));
     assert_eq!(restarted.remove_room(100, 500).await?, None);
     assert_eq!(restarted.rooms_in_guild(100).await?, vec![second]);
 
