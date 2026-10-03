@@ -208,6 +208,9 @@ impl RoomPersistence for Store {
     }
 }
 
+/// Scripted `/import` download queue shared with the harness.
+type DownloadResults = Arc<Mutex<VecDeque<Result<Vec<u8>, RoomHttpError>>>>;
+
 struct Http {
     trace: Trace,
     next_id: Mutex<u64>,
@@ -222,7 +225,7 @@ struct Http {
     before_move: Option<Hook>,
     before_delete: Option<Hook>,
     downloaded_urls: Mutex<Vec<String>>,
-    download_results: Arc<Mutex<VecDeque<Result<Vec<u8>, RoomHttpError>>>>,
+    download_results: DownloadResults,
 }
 
 impl Http {
