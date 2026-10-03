@@ -1943,7 +1943,7 @@ fn companion_fixture() -> (LiveGuild, Store, Http, Trace) {
     let trace = Trace::default();
     let live = LiveGuild::new(GUILD);
     live.publish(snapshot(&[], vec![]));
-    let mut store = Store::new(trace.clone());
+    let store = Store::new(trace.clone());
     store.creators.lock().unwrap()[0] = text_creator();
     (live, store, Http::new(trace.clone()), trace)
 }
@@ -2122,7 +2122,7 @@ async fn companion_create_is_idempotent_when_record_already_exists() {
 
 #[tokio::test]
 async fn unknown_companion_outcome_adopts_visible_channel_without_repost() {
-    let (live, store, mut http, trace) = companion_fixture();
+    let (live, store, http, trace) = companion_fixture();
     http.companion_errors
         .lock()
         .unwrap()
