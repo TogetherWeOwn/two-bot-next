@@ -65,6 +65,51 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
 
+    def test_voice_template_assets_skip_heavy_jobs(self):
+        # Coverage, validator tests and readme are validated by the check
+        # job's hermetic offline step, which always runs. Only the corpus
+        # (include_str! in Rust tests) and the validator itself need Rust.
+        for path in ["tests/voice_templates/coverage.json",
+                     "tests/voice_templates/test_validator.py",
+                     "tests/voice_templates/README.md"]:
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path), set(), path)
+
+    def test_changed_path_fixture_matrix(self):
+        # Fixture matrix: docs-only vs code vs asset PRs. Docs/asset-only
+        # skips the heavy Rust matrix; the always-run `check` and
+        # `worker check` aggregators still report success.
+        # Docs-only: skips Rust, keeps worker (docs/ listing assertion).
+        self.assertEqual(
+            jobs(["docs/metrics.md", "README.md"]),
+            {RUST: False, WORKER: True, PARITY: False})
+        # Asset-only: validator assets plus chrome select nothing.
+        self.assertEqual(
+            jobs(["tests/voice_templates/coverage.json",
+                  "tests/voice_templates/test_validator.py",
+                  "tests/voice_templates/README.md",
+                  "LICENSE", "PACKAGES.md"]),
+            {RUST: False, WORKER: False, PARITY: False})
+        # Docs + asset: still skips Rust, keeps worker for the docs half.
+        self.assertEqual(
+            jobs(["tests/voice_templates/coverage.json",
+                  "tests/voice_templates/README.md",
+                  "docs/metrics.md", "README.md"]),
+            {RUST: False, WORKER: True, PARITY: False})
+        # Code: runs Rust and worker, skips parity.
+        self.assertEqual(
+            jobs(["crates/core/src/lib.rs"]),
+            {RUST: True, WORKER: True, PARITY: False})
+
+    def test_corpus_change_still_runs_rust(self):
+        self.assertEqual(
+            jobs(["tests/voice_templates/corpus.json"]),
+            {RUST: True, WORKER: False, PARITY: False})
+        self.assertEqual(
+            jobs(["tests/voice_templates/coverage.json",
+                  "tests/voice_templates/corpus.json"]),
+            {RUST: True, WORKER: False, PARITY: False})
+
     def test_scripts_run_rust_and_worker(self):
         for path in ["scripts/check-migrations.py",
                      "scripts/check_soak_checklist.py",
@@ -363,6 +408,40 @@ class WorkflowSurfaceTests(unittest.TestCase):
             head = self.text.split(f"\n  {job}:")[1].split("steps:", 1)[0]
             with self.subTest(job=job):
                 self.assertIn("job-inputs", head)
+
+    def test_worker_is_always_run_required_check(self):
+        # `worker check` is required on main: it must never skip at the job
+        # level (a `paths:` filter or job-level selector `if:` would strand
+        # the gate). Fast-pass is per-step so the check always reports.
+        head = self.text.split("\n  worker:")[1].split("steps:", 1)[0]
+        self.assertIn("always()", head)
+        self.assertNotIn("outputs.worker != 'false'", head,
+                         "worker must not skip at the job level")
+
+    def test_worker_fast_pass_and_selector_guard(self):
+        body = self.text.split("\n  worker:")[1]
+        self.assertIn("Docs/asset-only fast pass", body)
+        self.assertIn("needs.job-inputs.outputs.worker == 'false'", body)
+        self.assertIn("require job inputs selection to pass", body)
+        self.assertIn("needs.job-inputs.result != 'success'", body)
+
+    def test_worker_heavy_steps_are_gated(self):
+        body = self.text.split("\n  worker:")[1]
+        # setup-node, npm ci/typecheck/test, env bindings, verifications.
+        gated = [line for line in body.splitlines()
+                 if "needs.job-inputs.outputs.worker != 'false'" in line]
+        self.assertGreaterEqual(len(gated), 10,
+                                "every heavy worker step needs the selector guard")
+
+    def test_staging_rollout_suite_stays_unconditional(self):
+        # The offline suite pins its worker step with no `if:`
+        # (test_required_worker_ci_runs_this_offline_suite): fast-pass
+        # must not gate it, or worker check fails on every PR.
+        worker = self.text.split("\n  worker:")[1]
+        steps = re.split(r"(?m)^      - ", worker)[1:]
+        matching = [step for step in steps if "test_staging_rollout.py" in step]
+        self.assertEqual(len(matching), 1)
+        self.assertNotRegex(matching[0], r"(?m)^\s*(?:if|continue-on-error):")
 
     def test_heavy_steps_are_gated(self):
         # Every gated step references a job-inputs output; the check job's
