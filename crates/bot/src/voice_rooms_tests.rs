@@ -2,6 +2,8 @@ use super::*;
 use serde_json::json;
 use std::sync::Mutex;
 
+#[path = "voice_kick_tests.rs"]
+mod kick;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 
