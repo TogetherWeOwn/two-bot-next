@@ -705,7 +705,11 @@ async fn resumed_startup_publishes_full_registry_without_ready() {
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn receipt_callback_waits_out_brief_lane_occupancy() {
-    let db = TestDb::new().await;
+    // Bound every unbounded await below: a wedge must fail loudly with a
+    // message instead of burning the CI budget with zero output.
+    let db = tokio::time::timeout(Duration::from_secs(120), TestDb::new())
+        .await
+        .expect("test database setup deadline");
     let seen = Arc::new(AtomicBool::new(false));
     // A's live-event read holds the single-flight lane for 1.5 s: inside B's
     // 2.5 s retry budget and Discord's three-second acknowledgement window.
@@ -713,17 +717,30 @@ async fn receipt_callback_waits_out_brief_lane_occupancy() {
     let admission: Arc<dyn SendAdmission> =
         Arc::new(PgSendAdmission::new(db.pool.clone(), TOKEN).unwrap());
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
-    let (runner, mut ws) = connect_governed(&db, &rest, admission, Some(receiver)).await;
-    ws.send(Message::text(interaction(2, "going").to_string()))
-        .await
-        .unwrap();
+    let (runner, mut ws) = tokio::time::timeout(
+        Duration::from_secs(120),
+        connect_governed(&db, &rest, admission, Some(receiver)),
+    )
+    .await
+    .expect("governed gateway connect deadline");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        ws.send(Message::text(interaction(2, "going").to_string())),
+    )
+    .await
+    .expect("gateway dispatch send deadline")
+    .unwrap();
     // B is sent into certain occupancy: A's read has reached the mock, so the
     // lane stays held until the delayed response lands.
     wait_flag(&seen).await;
     let delivered = tokio::time::Instant::now();
-    ws.send(Message::text(interaction(3, "interested").to_string()))
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        ws.send(Message::text(interaction(3, "interested").to_string())),
+    )
+    .await
+    .expect("gateway dispatch send deadline")
+    .unwrap();
     wait_sequence(&db.store, 3).await;
     let requests = rest.requests();
     let callbacks: Vec<_> = requests
@@ -756,16 +773,23 @@ async fn receipt_callback_waits_out_brief_lane_occupancy() {
         serde_json::from_slice::<Value>(&edits[1].body).unwrap()["content"],
         "RSVP saved: interested."
     );
-    let status: String = sqlx::query_scalar("SELECT status FROM event_rsvps")
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+    let status: String = tokio::time::timeout(
+        Duration::from_secs(60),
+        sqlx::query_scalar("SELECT status FROM event_rsvps").fetch_one(&db.pool),
+    )
+    .await
+    .expect("rsvp status read deadline")
+    .unwrap();
     assert_eq!(status, "interested");
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap(),
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
+                .fetch_one(&db.pool),
+        )
+        .await
+        .expect("audit count read deadline")
+        .unwrap(),
         2
     );
     shutdown.send_replace(true);
