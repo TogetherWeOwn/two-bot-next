@@ -35,6 +35,12 @@ impl InternalActionConfig {
         Self::from_lookup(env::var)
     }
 
+    /// Validate explicit settings through the same parser, without mutating
+    /// process environment. Useful for isolated configuration/receiver tests.
+    pub fn from_map(vars: &HashMap<String, String>) -> Result<Option<Self>, ConfigError> {
+        Self::from_lookup(|name| vars.get(name).cloned().ok_or(env::VarError::NotPresent))
+    }
+
     fn from_lookup(
         mut lookup: impl FnMut(&'static str) -> Result<String, env::VarError>,
     ) -> Result<Option<Self>, ConfigError> {

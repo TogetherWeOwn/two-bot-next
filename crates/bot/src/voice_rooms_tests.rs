@@ -82,6 +82,8 @@ struct Store {
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     companions: Mutex<HashMap<(u64, u64), TextCompanion>>,
     persist_error: Option<StoreError>,
+    access: Mutex<AccessControls>,
+    access_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     companion_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
@@ -96,6 +98,8 @@ impl Store {
             rooms: Mutex::new(HashMap::new()),
             companions: Mutex::new(HashMap::new()),
             persist_error: None,
+            access: Mutex::new(AccessControls::default()),
+            access_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             companion_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
@@ -107,6 +111,12 @@ impl Store {
 impl RoomPersistence for Store {
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
         Ok(self.creators.lock().unwrap().clone())
+    }
+    async fn access_controls(&self, _: u64) -> Result<AccessControls, StoreError> {
+        match self.access_error {
+            Some(error) => Err(error),
+            None => Ok(self.access.lock().unwrap().clone()),
+        }
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
         Ok(self.rooms.lock().unwrap().values().cloned().collect())
@@ -285,6 +295,36 @@ impl RoomWrites for Http {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+    async fn disconnect(
+        &self,
+        guild: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("disconnect:{guild}:{member}"));
+        Ok(())
+    }
+    async fn deny_connect(
+        &self,
+        channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        if !guard() {
+            return Err(RoomHttpError::Cancelled);
+        }
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("deny:{channel}:{member}"));
+        Ok(())
     }
     async fn delete(&self, channel: u64, guard: WriteGuard) -> Result<(), RoomHttpError> {
         if let Some(hook) = &self.before_delete {
@@ -1274,6 +1314,119 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
         "Join the server: https://discord.gg/abc-123"
     );
     assert!(trace.lock().unwrap().is_empty());
+}
+
+fn gated_runtime(
+    trace: Trace,
+    controls: AccessControls,
+    access_error: Option<StoreError>,
+) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            *store.access.lock().unwrap() = controls.clone();
+            store.access_error = access_error;
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+fn with_roles(mut interaction: Interaction, roles: &[u64]) -> Interaction {
+    interaction.member.as_mut().expect("member").roles =
+        roles.iter().map(|role| Id::new(*role)).collect();
+    interaction
+}
+
+#[tokio::test]
+async fn creation_switch_off_refuses_new_rooms() {
+    let (live, store, http, _) = fixture();
+    *store.access.lock().unwrap() = AccessControls {
+        room_creation_enabled: false,
+        ..AccessControls::default()
+    };
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!worker.accept_join(ticket, "new room".to_owned(), 7, NOW.to_owned()));
+    assert!(!worker.dispatch_one(0).await);
+    assert!(worker.tracked().is_empty());
+}
+
+#[tokio::test]
+async fn required_role_gates_members_but_never_admins() {
+    let controls = AccessControls {
+        required_role: Some(9),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(Trace::default(), controls, None);
+    let ping = || voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+
+    let (owned, response) = handle_capture(&runtime, &ping()).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        access_denied_text(AccessDenyReason::RequiredRole)
+    );
+
+    let (_, response) = handle_capture(&runtime, &with_roles(ping(), &[9])).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+
+    let admin = voice_interaction(
+        Some(command_data("ping", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (_, response) = handle_capture(&runtime, &admin).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+}
+
+#[tokio::test]
+async fn per_command_restriction_applies_only_to_that_command() {
+    let controls = AccessControls {
+        command_roles: [("invite".to_owned(), vec![7])].into(),
+        ..AccessControls::default()
+    };
+    let runtime = gated_runtime(Trace::default(), controls, None);
+    let invite = || voice_interaction(Some(command_data("invite", Vec::new())), None, true);
+    let ping = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+
+    let (_, response) = handle_capture(&runtime, &ping).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
+    let (_, response) = handle_capture(&runtime, &invite()).await;
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        access_denied_text(AccessDenyReason::CommandRestricted)
+    );
+    let (_, response) = handle_capture(&runtime, &with_roles(invite(), &[7])).await;
+    assert_eq!(
+        response_text(&response.expect("invite")),
+        two_bot_core::voice_utilities::NO_INVITE_CONFIGURED
+    );
+}
+
+#[tokio::test]
+async fn unreadable_settings_fail_closed_for_members_only() {
+    let runtime = gated_runtime(
+        Trace::default(),
+        AccessControls::default(),
+        Some(StoreError::Unavailable),
+    );
+    let member = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
+    let (owned, response) = handle_capture(&runtime, &member).await;
+    assert!(owned);
+    assert!(response_text(&response.expect("notice")).contains("unavailable"));
+
+    let admin = voice_interaction(
+        Some(command_data("ping", Vec::new())),
+        Some(Permissions::MANAGE_CHANNELS),
+        true,
+    );
+    let (_, response) = handle_capture(&runtime, &admin).await;
+    assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
 }
 
 #[test]

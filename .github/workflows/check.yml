@@ -309,6 +309,13 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
+
+      - name: onboarding prompt store regressions (CI service only)
+        run: cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
+
+      - name: onboarding shared runtime acceptance (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
+
       - name: automod durable dedupe (CI service container only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
@@ -335,6 +342,10 @@ jobs:
       - name: settings database regressions (CI service only)
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
+
+      - name: voice room store regressions (CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot-cutover --test voice_rooms_store --locked -- --ignored
 
       - name: Docker dependency-layer manifests (offline)
         run: python3 scripts/check-docker-manifests.py
