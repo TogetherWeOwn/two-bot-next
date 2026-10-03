@@ -167,10 +167,10 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             ["token_invalid", "ready"],
         ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
         # The runtime always reports informational job status alongside
-        # readiness; with no credentials all nine jobs must be parked,
+        # readiness; with no credentials all ten jobs must be parked,
         # non-running and never started. Jobs never flip the 503 above. The
-        # audit-retry and self-role recovery entries are always listed
-        # (parked when their services are unregistered).
+        # audit-retry, scheduled-messages, self-role recovery and feeds entries
+        # are always listed (parked when their services are unregistered).
         parked = {"parked": True, "running": False, "last_start": None,
                   "last_success": None, "last_error_class": None,
                   "consecutive_failures": 0}
@@ -178,9 +178,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             name: dict(parked) for name in (
                 "counter", "rank", "scheduled_events", "presence_probe",
                 "community_scorecard", "inactivity", "audit_retry",
-                "self_role_recovery", "scheduled_messages",
+                "self_role_recovery", "scheduled_messages", "feeds",
             )
-        }, "/readyz body must report all nine jobs parked, non-running, never started")
+        }, "/readyz body must report all ten jobs parked, non-running, never started")
         # Check PID 1, not merely Docker's configured user or an exec helper.
         uid = pid1_uids(name)
         require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")

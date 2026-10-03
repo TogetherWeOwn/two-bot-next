@@ -2076,6 +2076,24 @@ impl ActionExecutor {
             .await
     }
 
+    /// Preserve the exact legacy feed nonce, even when all its hex digits are
+    /// decimal or it has leading zeroes. Never infer a numeric wire identity.
+    /// Uses the same paced, single-attempt transport and mention suppression.
+    pub async fn post_message_with_nonce(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: &str,
+    ) -> Result<String, DiscordError> {
+        self.send_message(
+            channel_id,
+            content,
+            Some(serde_json::Value::from(nonce)),
+            false,
+        )
+        .await
+    }
+
     /// Post a rendered feature message through the shared request factory.
     pub async fn post_message_with_components(
         &self,
@@ -3100,14 +3118,14 @@ fn format_iso_secs(epoch_secs: u64) -> String {
 /// (finding 2). Route Display renders the query string twilight's way so the
 /// mock sees byte-identical paths.
 fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
+    if path == "/users/@me" {
+        return Ok(Route::GetCurrentUser);
+    }
     let err = || format!("unsupported GET path: {path}");
     let (base, query) = match path.split_once('?') {
         Some((b, q)) => (b, q),
         None => (path, ""),
     };
-    if base == "/users/@me" && query.is_empty() {
-        return Ok(Route::GetCurrentUser);
-    }
     // Route borrows nothing here (u64/bool fields); the 'static bound is
     // satisfied because no borrowed variant is constructed.
     if let Some(id) = base.strip_prefix("/guilds/") {
@@ -3263,6 +3281,23 @@ mod tests {
 
     fn never_send_admission(token: &str) -> Arc<dyn SendAdmission> {
         Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
+    }
+
+    #[test]
+    fn current_user_read_accepts_only_the_exact_route() {
+        assert!(matches!(
+            raw_get_route("/users/@me").unwrap(),
+            Route::GetCurrentUser
+        ));
+        for path in [
+            "/users/@me?",
+            "/users/@me?limit=100",
+            "/users/@me/",
+            "/users/5555",
+            "https://discord.com/api/v10/users/@me",
+        ] {
+            assert!(raw_get_route(path).is_err());
+        }
     }
 
     #[tokio::test]
