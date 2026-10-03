@@ -376,9 +376,8 @@ impl RoomHttp {
         components: Option<&[Component]>,
     ) -> Result<(), RoomHttpError> {
         let mentions = AllowedMentions::default();
-        let mut update = self
-            .http
-            .interaction(application)
+        let interaction = self.http.interaction(application);
+        let mut update = interaction
             .update_response(token)
             .content(Some(content))
             .allowed_mentions(Some(&mentions));
@@ -423,7 +422,7 @@ impl RoomHttp {
         if !(200..300).contains(&status) {
             return Err(classify_response(status, &[]));
         }
-        let body = Limited::new(response.into_body(), max_bytes.saturating_add(1) as u64)
+        let body = Limited::new(response.into_body(), max_bytes.saturating_add(1))
             .collect()
             .await
             .map_err(|_| RoomHttpError::UnknownOutcome)?
