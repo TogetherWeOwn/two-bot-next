@@ -70,6 +70,24 @@ pub trait JoinObserver: Send + Sync {
     fn observe_join(&self, join: JoinObservation);
 }
 
+/// A destructive-potential audit-log entry, handed to a runtime observer. No
+/// funnel row: entries are evidence for the containment runtime, which claims
+/// and scores them in its own store.
+#[derive(Debug, Clone)]
+pub struct AuditLogObservation {
+    pub guild_id: u64,
+    pub entry_id: u64,
+    pub action: twilight_model::guild::audit_log::AuditLogEventType,
+    pub executor_id: Option<u64>,
+    pub target_id: Option<u64>,
+}
+
+/// Receives audit-log entries from the serial gateway writer. Implementations
+/// must not block or await: hand the entry to a queue and return.
+pub trait AuditEntryObserver: Send + Sync {
+    fn observe_audit_entry(&self, entry: AuditLogObservation);
+}
+
 use crate::intents::cache_resource_types;
 
 fn user_id_key(u: u64) -> twilight_model::id::Id<twilight_model::id::marker::UserMarker> {
@@ -242,6 +260,9 @@ pub struct Pipeline<
     vanity_guilds: Mutex<HashSet<Snowflake>>,
     /// Set once at startup by the runtime that wants joins (raid watch).
     join_observer: OnceLock<Arc<dyn JoinObserver>>,
+    /// Set once at startup by the runtime that wants audit entries
+    /// (containment).
+    audit_entry_observer: OnceLock<Arc<dyn AuditEntryObserver>>,
 }
 
 impl<S, L, F, I, C, P> std::fmt::Debug for Pipeline<S, L, F, I, C, P> {
@@ -302,6 +323,7 @@ impl<
             voice_chains: VoiceChains::default(),
             vanity_guilds: Mutex::new(HashSet::new()),
             join_observer: OnceLock::new(),
+            audit_entry_observer: OnceLock::new(),
         }
     }
 
@@ -309,6 +331,11 @@ impl<
     /// ignored so a late caller can never swap the observer under the writer.
     pub fn set_join_observer(&self, observer: Arc<dyn JoinObserver>) {
         let _ = self.join_observer.set(observer);
+    }
+
+    /// Register the audit-entry observer. First registration wins, like joins.
+    pub fn set_audit_entry_observer(&self, observer: Arc<dyn AuditEntryObserver>) {
+        let _ = self.audit_entry_observer.set(observer);
     }
 
     /// Access the core handlers (tracker reads, replay assertions).
@@ -675,9 +702,26 @@ impl<
                 );
                 self.cache.update(event);
             }
+            // Destructive-potential audit entries: evidence for the
+            // containment runtime, claimed and scored in its own store. No
+            // funnel row; an observer problem must never cost the entry.
+            Event::GuildAuditLogEntryCreate(created) => {
+                self.cache.update(event);
+                if let (Some(observer), Some(guild_id)) =
+                    (self.audit_entry_observer.get(), created.guild_id)
+                {
+                    observer.observe_audit_entry(AuditLogObservation {
+                        guild_id: guild_id.get(),
+                        entry_id: created.id.get(),
+                        action: created.action_type.clone(),
+                        executor_id: created.user_id.map(|id| id.get()),
+                        target_id: created.target_id.map(|id| id.get()),
+                    });
+                }
+            }
             // Connection lifecycle and S4/S5 surfaces: no funnel row.
-            // (Reactions, audit-log entries, interactions, bans, message
-            // updates/deletes are S4/S5 — parity matrix §§1–3. This match is
+            // (Reactions, interactions, bans, message updates/deletes are
+            // S4/S5 — parity matrix §§1–3. This match is
             // exhaustive-by-construction: new twilight variants land here and
             // must be triaged, never silently swallowed.)
             _ => {

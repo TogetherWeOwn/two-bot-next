@@ -447,6 +447,10 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
 
+      - name: containment runtime acceptance (mock Discord and CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
+        run: cargo test -p two-bot --locked containment_runtime_ -- --include-ignored
+
       - name: automod durable dedupe (CI service container only)
         if: needs.job-inputs.outputs.rust != 'false'
         env:
