@@ -16,6 +16,7 @@ use two_bot_discord::executor::ActionExecutor;
 use crate::{
     audit_runtime, community_jobs,
     jobs::{self, ErrorClass, Job},
+    scheduled_jobs,
     self_role_handlers::{SelfRoleService, RECOVERY_JOB_NAME},
     server,
 };
@@ -179,6 +180,7 @@ pub async fn serve(
                         }),
                     });
                 }
+                registered.push(scheduled_jobs::register(context.clone()));
                 let registration = community_jobs::register(context.clone());
                 registered.extend(registration.jobs);
                 parked = registration.parked;
@@ -209,6 +211,7 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
         .into_iter()
         .chain(community_jobs::NAMES)
         .chain(audit_runtime::NAMES)
+        .chain(scheduled_jobs::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .collect();
     if crate::automod_gateway::enabled() {

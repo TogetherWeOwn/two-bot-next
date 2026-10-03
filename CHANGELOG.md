@@ -118,6 +118,7 @@
 ### Security
 
 - Require authenticated TLS for `two_bot_cutover::connect` (threat-model F6). `TWO_DATABASE_TLS` defaults to `required`, which refuses local hosts and missing, `disable`, `allow` or `prefer` sslmode, and always connects as `verify-full`. `local-only` (tests and CI only) allows loopback, CI service and socket hosts and refuses remote ones. Refusals are fixed strings that never echo the URL. See `docs/database-tls.md`.
+- Fence the remaining Postgres connect paths with the same TLS policy (threat-model F6): the gateway store pool, both `two-bot backup` URL parses, and `channel_moderation_store::connect`. Each refuses a `sslmode=disable` remote URL with the same fixed string and connects `Required` URLs as `verify-full`. (TOG-12208)
 
 ### Fixed
 

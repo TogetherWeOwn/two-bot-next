@@ -35,6 +35,7 @@ mod onboarding;
 mod onboarding_tests;
 mod preflight;
 mod schedule_runtime;
+mod scheduled_jobs;
 mod server;
 // TOG-10292: boot composes the gated service below; fixture-only seams keep
 // the module-level allowance.
