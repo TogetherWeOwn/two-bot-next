@@ -98,7 +98,7 @@ async fn seed_text_command(pool: &sqlx::PgPool, template: &str) {
 fn test_options() -> PgConnectOptions {
     let ci_service = std::env::var("CI").as_deref() == Ok("true")
         && std::env::var("TWO_CUSTOM_COMMAND_TEST_CI").as_deref() == Ok("1");
-    PgPoolOptions::new()
+    PgConnectOptions::new()
         .host(if ci_service {
             "127.0.0.1"
         } else {
@@ -451,7 +451,9 @@ async fn prefix_storage_failure_never_permits_an_untracked_or_repeated_post() {
         .is_err());
     assert!(mock.requests().is_empty());
     sqlx::query("ALTER TABLE automation_audit_log DROP CONSTRAINT refuse_attempt")
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("ALTER TABLE automation_audit_log ADD CONSTRAINT refuse_result CHECK (action <> 'command.run')")
         .execute(&pool).await.unwrap();
     assert!(runtime
@@ -691,7 +693,7 @@ async fn disabled_and_unknown_dynamic_rows_and_failed_delivery() {
         text_trigger: None,
     };
     two_bot_core::custom_command_service::put(
-        pool,
+        &pool,
         true,
         "2222",
         "3333",
