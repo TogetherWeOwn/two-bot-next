@@ -298,10 +298,31 @@ impl MemberDiscord for SigningDiscord<'_> {
         until_iso: &str,
         reason: &str,
     ) -> Result<(), MemberDiscordError> {
+        // The shared service emits `format_iso_millis` (`...20.000Z`), but
+        // pinned Twilight 0.17.1 `Timestamp::parse` rejects the `Z` form
+        // (see `timeout_until_iso` docs): normalize to `...+00:00` before the
+        // wire so website timeouts survive `timeout_member` like the legacy
+        // `execute_outcome` path does.
+        let normalized = normalize_timeout_until(until_iso);
         self.inner
-            .timeout_member(guild_id, user_id, Some(until_iso), &self.signed(reason))
+            .timeout_member(guild_id, user_id, Some(&normalized), &self.signed(reason))
             .await
             .map_err(map_discord_error)
+    }
+}
+
+/// Normalize the service's `format_iso_millis` expiry for Twilight:
+/// `2023-11-14T23:13:20.000Z` becomes `2023-11-14T23:13:20+00:00`.
+/// Inputs already carrying an offset pass through untouched.
+fn normalize_timeout_until(until_iso: &str) -> String {
+    if let Some(core) = until_iso.strip_suffix(['Z', 'z']) {
+        let base = match core.split_once('.') {
+            Some((date_time, _)) => date_time,
+            None => core,
+        };
+        format!("{base}+00:00")
+    } else {
+        until_iso.to_owned()
     }
 }
 
@@ -481,6 +502,18 @@ mod tests {
             // The shared moderation reason trims; the ledger stores the trimmed form.
             assert_eq!(request.reason, "spam");
         }
+    }
+
+    #[test]
+    fn timeout_until_normalizes_z_to_offset() {
+        assert_eq!(
+            normalize_timeout_until("2023-11-14T23:13:20.000Z"),
+            "2023-11-14T23:13:20+00:00"
+        );
+        assert_eq!(
+            normalize_timeout_until("2023-11-14T23:13:20+00:00"),
+            "2023-11-14T23:13:20+00:00"
+        );
     }
 
     #[test]

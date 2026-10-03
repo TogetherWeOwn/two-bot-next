@@ -247,10 +247,20 @@ async fn wire_paths_match_discord_routes() {
         assert_eq!(calls[0].path, path);
         if action == "moderation.timeout" {
             let body: Value = serde_json::from_slice(&calls[0].body).unwrap();
-            assert_eq!(
-                body.get("communication_disabled_until")
-                    .and_then(Value::as_str),
-                Some(format_iso_millis(NOW_MS + 3_600_000).as_str())
+            let until = body
+                .get("communication_disabled_until")
+                .and_then(Value::as_str)
+                .expect("timeout PATCH carries communication_disabled_until");
+            // The service emits `format_iso_millis` (`...20.000Z`); the
+            // executor normalizes to the Twilight-parseable `+00:00` form
+            // before the wire, so assert the date prefix and offset suffix.
+            assert!(
+                until.starts_with("2023-11-14T23:13:20"),
+                "timeout expiry matches NOW_MS + 3600s, got {until}"
+            );
+            assert!(
+                until.ends_with("+00:00"),
+                "until uses the parser-accepted offset form, got {until}"
             );
         }
         mock.shutdown().await;
@@ -259,7 +269,13 @@ async fn wire_paths_match_discord_routes() {
 
 #[tokio::test]
 async fn hierarchy_refusal_makes_no_claim_or_wire_call() {
-    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    // Queue one ban success: the refusal makes no wire call, so the same-key
+    // retry against the lower target consumes the single queued 204.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let store = MemMemberStore::new();
     let exec = executor(store.clone(), &mock);
     let mut high = target();
