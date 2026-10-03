@@ -22,7 +22,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use two_bot_core::raid_removal::RemovalMode;
-use two_bot_core::voice_ghost_cleanup::{plan_ghost_cleanup, GhostCleanupPlan};
+use two_bot_core::voice_ghost_cleanup::GhostCleanupPlan;
 use two_bot_core::voice_rooms::{SeenChannel, VoiceRoom};
 use two_bot_core::Snowflake;
 
@@ -305,6 +305,7 @@ pub fn build_seed_ghost_cleanup() -> (Vec<VoiceRoom>, Vec<SnapshotChannel>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use two_bot_core::voice_ghost_cleanup::plan_ghost_cleanup;
 
     #[test]
     fn snapshot_accepts_string_and_integer_ids() {
