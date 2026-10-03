@@ -214,8 +214,8 @@
       "justification": "TOG-12415: legacy-copy target DDL for the go.two.gg redirect store; same shape as store 0407."
     },
     "crates/cutover/migrations/0412_voice_rooms_ownership_touched.sql": {
-      "sha256": "57e901ca8710b3577debb9b09fcf7ed55dca2d58ceae149fc37f015a75f3c12a",
-      "justification": "TOG-10099: V2 ownership handoff stamp so the rollback delta keeps measuring rooms whose owner_id changes in place."
+      "sha256": "9dfe6648848bc7d42ba7534b710eab36473ac57ad5c4eee26d88d3f453d60b2f",
+      "justification": "Voice V2 ownership handoff stamp so the rollback delta keeps measuring rooms whose owner_id changes in place."
     },
     "crates/store/migrations/0400_initial.sql": {
       "sha256": "49c7136827484e0625cad889208a03e48026acb854282de3a0a9c5aa4d951b00",

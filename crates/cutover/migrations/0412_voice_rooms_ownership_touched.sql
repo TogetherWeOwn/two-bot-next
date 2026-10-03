@@ -1,4 +1,4 @@
--- V2 ownership handoffs (TOG-10099): caretaker succession and /reclaim +
+-- Voice V2 ownership handoffs: caretaker succession and /reclaim +
 -- /transfer update `owner_id`/`original_creator_id` in place, breaking the
 -- 0224 insert-once shape. `owner_touched_at` records the last handoff so the
 -- rollback delta keeps measuring the row (see `rollback_delta.rs`); existing
