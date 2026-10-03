@@ -157,7 +157,7 @@ pub fn moderation_commands() -> Vec<CommandDefinition> {
                 .min_value(TEMPBAN_DURATION_MIN_SECONDS),
                 CommandOption::reason(),
             ]),
-        CommandDefinition::new("kick", "Kick a member")
+        CommandDefinition::new("kick", "Kick a member from the server (moderators only)")
             .permissions(PERM_KICK_MEMBERS)
             .options(vec![CommandOption::target(), CommandOption::reason()]),
         CommandDefinition::new("timeout", "Timeout a member")

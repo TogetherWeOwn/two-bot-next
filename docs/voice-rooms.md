@@ -83,7 +83,9 @@ library code with no Discord dependency and can start immediately.
 
 ## V4: Vote-kick
 
-- `/kick member [reason]`: any occupant can start a vote.
+- `/votekick member [reason]`: any occupant can start a vote. This is a
+  separate command from the moderation `/kick`: votes never remove a member
+  from the server, and `/kick` never starts a vote.
 - It passes with a strict majority of the occupants other than the target.
   Progress shows as required/total. Votes are cast with buttons; not voting
   counts as No. The vote expires after 2 minutes.

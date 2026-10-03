@@ -75,12 +75,14 @@ use PolicyHook::{
 
 /// All 30 parity rows, including the three non-static-slash dispositions,
 /// plus the Next-only `/help` discovery command (parity row 31 — legacy has
-/// no help command, see the registry golden exceptions).
+/// no help command) and the Next-only voice vote-kick (parity row 32 —
+/// legacy has no vote-kick slash, see the registry golden exceptions).
 /// No Administrator-only exception: preserve the legacy resolved-bit check.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 31] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 32] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
+    row(32, "votekick", BuiltinSlash, 0, None),
     row(
         3,
         "ban",

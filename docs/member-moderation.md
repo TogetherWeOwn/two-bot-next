@@ -3,7 +3,9 @@
 This slice implements `/ban`, `/tempban`, `/kick`, `/timeout`, `/warn`, and
 scheduled unban processing. It does **not** register live handlers, instantiate
 a Discord HTTP client, or start a scheduler. It stays independently testable
-until the shared S4 interaction router and REST executor merge.
+until the shared S4 interaction router and REST executor merge. `/kick` here is
+always the server moderation kick; room vote-kicks are the separate
+`/votekick` voice command.
 
 ## Integration contract
 

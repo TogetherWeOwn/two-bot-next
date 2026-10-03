@@ -2,12 +2,20 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{CommandDefinition, HELP_DESCRIPTION, OCCURRENCE_ID_MAX_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
+use two_bot_core::voice_rooms::vote_kick_command;
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
     ("rota-acknowledge", "docs/parity.md §1 #13 / §9 drop 1"),
     ("attendance", "docs/parity.md §1 #12 bound"),
     ("help", "docs/parity.md §1 help"),
+    ("votekick", "docs/parity.md §1 voice vote-kick"),
+    ("kick", "docs/parity.md §1 #5 copy"),
+    ("attendance", "docs/parity.md §1 #12 copy"),
+    ("rsvp", "docs/parity.md §1 #24 copy"),
+    ("rsvp-attendance", "docs/parity.md §1 #25 copy"),
+    ("lfg", "docs/parity.md §1 #26 copy"),
+    ("lfg-close", "docs/parity.md §1 #27 copy"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -17,6 +25,7 @@ pub fn all_on_router() -> InteractionRouter {
         automations: true,
         announcements: true,
         moderation: true,
+        voice: true,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
@@ -72,6 +81,67 @@ pub fn expected_registry() -> Value {
     let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION))
         .expect("help serializes");
     commands.insert(2, help);
+    // Next-only `/votekick` voice vote-kick: no legacy counterpart (legacy
+    // has no vote-kick slash). Appended at the publish position (last among
+    // builtins) as the exact published definition.
+    let votekick = serde_json::to_value(vote_kick_command()).expect("votekick serializes");
+    commands.push(votekick);
+    // Picker-copy exceptions (registry golden exceptions table): command and
+    // option descriptions intentionally differ from legacy. Pointers mirror
+    // the published option order.
+    for (name, pointer, value) in [
+        (
+            "kick",
+            "/description",
+            "Kick a member from the server (moderators only)",
+        ),
+        (
+            "attendance",
+            "/description",
+            "Check in a verified human attendee for a scheduled event (scorecard)",
+        ),
+        (
+            "attendance",
+            "/options/0/description",
+            "Scheduled event id (number in the event URL) or stable occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
+        ),
+        (
+            "rsvp",
+            "/options/0/description",
+            "Discord scheduled event id (number in the event URL), e.g. 12345",
+        ),
+        (
+            "rsvp-attendance",
+            "/description",
+            "Show RSVP totals for a scheduled event",
+        ),
+        (
+            "rsvp-attendance",
+            "/options/0/description",
+            "Discord scheduled event id (number in the event URL), e.g. 12345",
+        ),
+        (
+            "lfg",
+            "/options/1/description",
+            "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+        ),
+        (
+            "lfg",
+            "/options/2/description",
+            "Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6",
+        ),
+        (
+            "lfg-close",
+            "/options/0/description",
+            "LFG id from the posted signup",
+        ),
+    ] {
+        let command = commands
+            .iter_mut()
+            .find(|c| c["name"] == name)
+            .expect("copy exception names a published command");
+        *command.pointer_mut(pointer).expect("copy field exists") = json!(value);
+    }
     canonical_registry(json!(commands))
 }
 

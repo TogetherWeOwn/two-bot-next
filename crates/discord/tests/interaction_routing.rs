@@ -60,6 +60,7 @@ fn all_on() -> RouterGates {
         automations: true,
         announcements: true,
         moderation: true,
+        voice: true,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
@@ -342,11 +343,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 31);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 32);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 28);
+    assert_eq!(commands.len(), 29);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -419,7 +420,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
     ];
-    assert_eq!(cases.len(), 28, "all 28 builtins covered");
+    assert_eq!(cases.len(), 28, "all 28 handler-owned builtins covered");
     for (_, id) in cases {
         router.register(Box::new(Stub(*id)));
     }
@@ -435,6 +436,13 @@ fn every_section1_row_routes_to_its_registered_handler() {
             "/{name} has its registered stub",
         );
     }
+    // `/votekick` is voice-sink-owned: the core router yields silently so the
+    // shared runtime never answers with an unknown-command reply.
+    assert_eq!(
+        slash_outcome(&router, "votekick"),
+        SlashOutcome::Ignore,
+        "/votekick yields to the voice sink"
+    );
 }
 
 #[test]
@@ -469,6 +477,7 @@ fn disabled_and_ungated_wire_interactions_take_the_refusal_path() {
         automations: false,
         announcements: false,
         moderation: false,
+        voice: false,
         ..all_on()
     });
     for (name, refusal, text) in [

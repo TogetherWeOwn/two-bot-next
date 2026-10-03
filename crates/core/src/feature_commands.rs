@@ -45,13 +45,13 @@ use super::commands::{
 pub fn scorecard_attendance_command() -> CommandDefinition {
     CommandDefinition::new(
         "attendance",
-        "Record a verified human attendee for a Discord event occurrence.",
+        "Check in a verified human attendee for a scheduled event (scorecard)",
     )
     .permissions(PERM_MANAGE_EVENTS)
     .options(vec![
         CommandOption::new(
             "event-occurrence",
-            "Scheduled event id or stable occurrence id.",
+            "Scheduled event id (number in the event URL) or stable occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
             CommandOptionType::String,
         )
         .required()
@@ -160,7 +160,7 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new("rsvp", "RSVP to a Discord scheduled event").options(vec![
             CommandOption::new(
                 "event-id",
-                "Discord scheduled event id",
+                "Discord scheduled event id (number in the event URL), e.g. 12345",
                 CommandOptionType::String,
             )
             .required(),
@@ -183,16 +183,13 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
         ]),
         // Namespaced: legacy `attendance` (RSVP totals) collides with the
         // scorecard `attendance` (#12) on `guild.commands.set`.
-        CommandDefinition::new(
-            "rsvp-attendance",
-            "Show Owen RSVP totals for a scheduled event",
-        )
-        .options(vec![CommandOption::new(
-            "event-id",
-            "Discord scheduled event id",
-            CommandOptionType::String,
-        )
-        .required()]),
+        CommandDefinition::new("rsvp-attendance", "Show RSVP totals for a scheduled event")
+            .options(vec![CommandOption::new(
+                "event-id",
+                "Discord scheduled event id (number in the event URL), e.g. 12345",
+                CommandOptionType::String,
+            )
+            .required()]),
         CommandDefinition::new("lfg", "Post a raid/LFG signup with role slots")
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![
@@ -200,13 +197,13 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                     .required(),
                 CommandOption::new(
                     "starts-at",
-                    "ISO-8601 start time",
+                    "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
                     CommandOptionType::String,
                 )
                 .required(),
                 CommandOption::new(
                     "roles",
-                    "tank:Tank:2,healer:Healer:2,dps:DPS:6",
+                    "Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6",
                     CommandOptionType::String,
                 )
                 .required(),
@@ -215,7 +212,7 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![CommandOption::new(
                 "id",
-                "LFG id",
+                "LFG id from the posted signup",
                 CommandOptionType::String,
             )
             .required()]),

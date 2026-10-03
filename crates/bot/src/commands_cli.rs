@@ -9,6 +9,7 @@ use two_bot_core::commands::CommandDefinition;
 use two_bot_core::feature_commands::FeatureGates;
 use two_bot_core::moderation::ModerationGates;
 use two_bot_core::router::{InteractionRouter, RouterGates, SurfaceFlags};
+use two_bot_core::VoiceGates;
 use two_bot_discord::{publish_commands, ActionExecutor};
 
 pub const USAGE: &str = "\
@@ -108,6 +109,7 @@ fn desired_definitions(
         scorecard: vars
             .get("TWO_COMMUNITY_SCORECARD")
             .is_some_and(|v| v == "1"),
+        voice: VoiceGates::from_map(vars).enabled,
         ..SurfaceFlags::default()
     };
     InteractionRouter::new(RouterGates::from_slices(
