@@ -142,6 +142,31 @@ What was rehearsed and passed (offline, from merged source):
 - Reconcile forgets hand-deleted rooms and never touches untracked
   channels.
 
+### Ghost-count staging verification (2026-10-03, read-only)
+
+Head `87d98060`. Staging guild only: one `voice_rooms` SELECT attempt,
+read-only legacy temp-voice counts, one channel-listing GET. No writes,
+no cleanup actions, no live guild queries.
+
+- The `voice_rooms` table is absent on the staging database (zero
+  `voice_*` tables; migrations pending), so the tracked-rows SELECT the
+  live `report voice-ghosts` count needs fails with `UndefinedTable`.
+  The diff is unverifiable until staging migrates.
+- Legacy temp-voice rows for staging: `temp_voice_channels` 0 (no legacy
+  ghosts), `temp_voice_creates` 1 (dated 2026-09-29), `temp_voice_audit`
+  24 with the latest a 2026-09-29 boot-reconcile delete. No post-cleanup
+  run is recorded.
+- The live listing shows 3 voice channels (`Lobby`, `Squad`, `Voice 1`).
+  With zero tracked rows the arithmetic gives `tracked_gone=[]`,
+  `untracked_present=[3]`, `clean=false`.
+- Candidate residual baseline: the 3 live voice channels read as
+  permanent staging voice, but no baseline documents them as residual
+  yet, so the count cannot certify "back to baseline".
+- Verdict: NEEDS WORK — the count is not at baseline (expected
+  `clean=true` or a documented residual). Needs staging migrated and
+  healthy plus a written residual baseline naming the permanent
+  channels.
+
 ## 6. Gaps
 
 Each gap below is filed as its own card and linked from the rehearsal
