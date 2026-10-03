@@ -55,12 +55,12 @@ mod tests {
 
     #[tokio::test]
     async fn existing_server_exposes_metrics_without_gateway_or_database() {
-        let state = crate::server::SharedState {
-            gateway: Arc::new(tokio::sync::RwLock::new(
+        let state = crate::server::SharedState::new(
+            Arc::new(tokio::sync::RwLock::new(
                 crate::gateway::GatewayState::Unconfigured,
             )),
-            database: None,
-        };
+            None,
+        );
         let response = crate::server::router(state)
             .oneshot(
                 Request::builder()
@@ -105,12 +105,12 @@ mod tests {
             metrics::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8"
         );
-        let state = crate::server::SharedState {
-            gateway: Arc::new(tokio::sync::RwLock::new(
+        let state = crate::server::SharedState::new(
+            Arc::new(tokio::sync::RwLock::new(
                 crate::gateway::GatewayState::Unconfigured,
             )),
-            database: None,
-        };
+            None,
+        );
         let response = crate::server::router(state)
             .oneshot(
                 Request::builder()

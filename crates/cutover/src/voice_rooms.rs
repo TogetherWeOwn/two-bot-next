@@ -11,6 +11,7 @@ use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use two_bot_core::voice_access::{validate_access_controls, AccessControls};
+use two_bot_core::voice_logging::{parse_detail_level, LoggingSettings};
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
@@ -318,6 +319,52 @@ impl PgRoomStore {
         .await?;
         Ok(())
     }
+
+    /// The guild's logging settings, or the defaults when never configured.
+    pub async fn logging_settings(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<LoggingSettings, sqlx::Error> {
+        sqlx::query(
+            "SELECT detail_level, log_channel_id, mention_role_id
+             FROM voice_logging_settings WHERE guild_id = $1",
+        )
+        .bind(guild_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(decode_logging_settings)
+        .transpose()
+        .map(Option::unwrap_or_default)
+    }
+
+    /// Replace the guild's logging settings atomically (one upsert). Refuses
+    /// zero channel and role IDs before touching the database.
+    pub async fn save_logging_settings(
+        &self,
+        guild_id: Snowflake,
+        settings: &LoggingSettings,
+    ) -> Result<(), sqlx::Error> {
+        if settings.channel_id == Some(0) || settings.mention_role_id == Some(0) {
+            return Err(invalid_argument("logging ids must be nonzero"));
+        }
+        sqlx::query(
+            "INSERT INTO voice_logging_settings
+             (guild_id, detail_level, log_channel_id, mention_role_id)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (guild_id) DO UPDATE SET
+               detail_level = EXCLUDED.detail_level,
+               log_channel_id = EXCLUDED.log_channel_id,
+               mention_role_id = EXCLUDED.mention_role_id",
+        )
+        .bind(guild_id.to_string())
+        .bind(settings.level.as_str())
+        .bind(settings.channel_id.map(|id| id.to_string()))
+        .bind(settings.mention_role_id.map(|id| id.to_string()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 fn decode_access_controls(row: &PgRow) -> Result<AccessControls, sqlx::Error> {
@@ -350,6 +397,22 @@ fn decode_access_controls(row: &PgRow) -> Result<AccessControls, sqlx::Error> {
     };
     validate_access_controls(&controls).map_err(invalid_argument)?;
     Ok(controls)
+}
+
+fn decode_logging_settings(row: &PgRow) -> Result<LoggingSettings, sqlx::Error> {
+    let parse_id = |value: Option<String>| {
+        value
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+    };
+    let level = parse_detail_level(row.try_get::<&str, _>("detail_level")?)
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    Ok(LoggingSettings {
+        level,
+        channel_id: parse_id(row.try_get("log_channel_id")?)?,
+        mention_role_id: parse_id(row.try_get("mention_role_id")?)?,
+    })
 }
 
 fn invalid_argument(error: impl std::fmt::Display) -> sqlx::Error {

@@ -41,7 +41,7 @@ async fn wait_unready(runner: &Runner) {
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn onboarding_gateway_ingress_ack_precedes_blocked_sql_but_selection_waits_for_commit() {
-    let db = TestDb::with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
+    let db = TestDb::exclusive_with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
     let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
     let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
     let mock = discord(Arc::new(AtomicBool::new(false)), PauseAt::PermissionRead).await;
@@ -171,7 +171,7 @@ async fn onboarding_gateway_ingress_settings_timeout_finishes_confirmed_defer_wi
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn onboarding_gateway_ingress_overflow_fails_closed_and_cancels_pending_checkpoint() {
-    let db = TestDb::new().await;
+    let db = TestDb::exclusive().await;
     let mock = discord(Arc::new(AtomicBool::new(false)), PauseAt::PermissionRead).await;
     let result = bounded(async {
         let mut ws = gateway(false).await;
