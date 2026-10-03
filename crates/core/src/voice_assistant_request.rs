@@ -406,7 +406,28 @@ pub enum ReplyError {
 }
 
 /// Parse a chat-completions response body into validated suggestions.
+///
+/// A suggestion whose template [`parse_template_strict`] rejects fails the
+/// whole reply; callers that want to try the next suggestion first use
+/// [`parse_reply_each`].
 pub fn parse_reply(body: &[u8]) -> Result<Vec<Suggestion>, ReplyError> {
+    parse_reply_each(body)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| item.map_err(|issue| ReplyError::InvalidTemplate { index, issue }))
+        .collect()
+}
+
+/// Parse a chat-completions response body into one result per suggestion.
+///
+/// Envelope failures (oversize, non-JSON, error object, wrong shape, empty or
+/// over-long suggestion list) and per-suggestion shape failures (missing
+/// fields, over-long explanation) fail the whole reply exactly as
+/// [`parse_reply`] does. A suggestion whose template [`parse_template_strict`]
+/// rejects is returned as `Err(issue)` at its own position instead, so the
+/// caller can try the next suggestion — best first — before regenerating.
+/// Succeeds only with a non-empty list.
+pub fn parse_reply_each(body: &[u8]) -> Result<Vec<Result<Suggestion, TemplateIssue>>, ReplyError> {
     if body.len() > MAX_REPLY_BYTES {
         return Err(ReplyError::Oversize { len: body.len() });
     }
@@ -451,11 +472,18 @@ pub fn parse_reply(body: &[u8]) -> Result<Vec<Suggestion>, ReplyError> {
     suggestions
         .iter()
         .enumerate()
-        .map(|(index, item)| parse_suggestion(index, item))
+        .map(|(index, item)| parse_suggestion_each(index, item))
         .collect()
 }
 
-fn parse_suggestion(index: usize, item: &Value) -> Result<Suggestion, ReplyError> {
+/// Parse one suggestion: shape failures (missing fields, over-long
+/// explanation) fail the whole reply, while a template
+/// [`parse_template_strict`] rejects comes back as `Ok(Err(issue))` so the
+/// caller can try the next suggestion — best first — before regenerating.
+fn parse_suggestion_each(
+    index: usize,
+    item: &Value,
+) -> Result<Result<Suggestion, TemplateIssue>, ReplyError> {
     let template = item
         .get("template")
         .and_then(Value::as_str)
@@ -470,16 +498,18 @@ fn parse_suggestion(index: usize, item: &Value) -> Result<Suggestion, ReplyError
             at: "suggestions[].explanation",
         })?
         .trim();
-    let parsed = parse_template_strict(template)
-        .map_err(|issue| ReplyError::InvalidTemplate { index, issue })?;
+    let parsed = match parse_template_strict(template) {
+        Ok(parsed) => parsed,
+        Err(issue) => return Ok(Err(issue)),
+    };
     if explanation.chars().count() > MAX_EXPLANATION_CHARS {
         return Err(ReplyError::ExplanationTooLong { index });
     }
-    Ok(Suggestion {
+    Ok(Ok(Suggestion {
         template: template.to_string(),
         explanation: explanation.to_string(),
         parsed,
-    })
+    }))
 }
 
 /// Accept a single surrounding Markdown code fence (with an optional info
