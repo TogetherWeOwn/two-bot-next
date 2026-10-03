@@ -122,6 +122,8 @@ pub struct AnnouncementExecutor {
     channel_keys: HashMap<String, String>,
     timeout: Duration,
     api_origin: String,
+    #[cfg(test)]
+    response_received: Option<Arc<tokio::sync::Notify>>,
     admission: Option<Arc<dyn SendAdmission>>,
     governor: CooldownGovernor,
 }
@@ -147,6 +149,8 @@ impl AnnouncementExecutor {
             channel_keys,
             timeout: Duration::from_secs(10),
             api_origin: "https://discord.com".to_owned(),
+            #[cfg(test)]
+            response_received: None,
             admission: None,
             governor,
         }
@@ -308,6 +312,10 @@ impl AnnouncementExecutor {
             Ok(Err(_)) => return ExecutionOutcome::Unknown(UnknownReason::Transport),
             Err(_) => return ExecutionOutcome::Unknown(UnknownReason::Timeout),
         };
+        #[cfg(test)]
+        if let Some(ready) = &self.response_received {
+            ready.notify_one();
+        }
         match response.status().as_u16() {
             // Narrow confirmed-rejection allowlist. 408, other statuses,
             // redirects and 5xx are NOT proof of no message being created.

@@ -7,6 +7,9 @@
 //! core's mirror types. Everything the crash protocol needs to decide is
 //! preserved: refusal vs rate-limit vs uncertain, proven-empty vs unreadable.
 
+#[cfg(test)]
+mod tests;
+
 use two_bot_core::audit_mirror::{
     AuditMirror, MirrorChannel, MirrorError, MirrorMessage, MirrorOverwrite,
 };
@@ -63,7 +66,7 @@ impl AuditMirror for ActionExecutor {
             Err(error) => return Ok(Err(MirrorError::Rejected(error.to_string()))),
         };
         authorize.await?;
-        *lane = std::time::Instant::now();
+        self.stamp_paced_lane(&mut lane, false);
         Ok(self
             .post_message_after_authorization(channel_id, content, nonce)
             .await
