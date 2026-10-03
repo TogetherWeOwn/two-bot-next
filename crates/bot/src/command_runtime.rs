@@ -266,6 +266,13 @@ impl CommandRuntime {
         })
     }
 
+    /// The one process executor (admission lane and pacing included); other
+    /// runtimes (onboarding, automod) render through a clone, never a private
+    /// client.
+    pub fn executor(&self) -> ActionExecutor {
+        self.executor.clone()
+    }
+
     /// Shares this runtime's pool, executor/pacing and onboarding gates with
     /// the ordered award path; only this runtime dispatches interactions.
     pub fn leveling(&self) -> LevelingRuntime {

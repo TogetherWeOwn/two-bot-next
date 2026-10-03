@@ -24,6 +24,7 @@ pub mod channel_moderation_store;
 pub mod classify;
 pub mod clock_guard;
 pub mod command_permissions;
+pub mod command_restoration;
 pub mod commands;
 pub mod community;
 pub mod community_snapshots;
@@ -31,6 +32,8 @@ pub mod community_snapshots;
 pub mod community_store;
 pub mod config;
 pub mod containment;
+#[cfg(feature = "db")]
+pub mod containment_store;
 #[cfg(feature = "db")]
 pub mod database_roles;
 pub mod database_tls;
@@ -97,6 +100,8 @@ pub mod tickets;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
+pub mod voice_alias_core;
+pub mod voice_assistant;
 pub mod voice_assistant_cap;
 pub mod voice_assistant_request;
 pub mod voice_assistant_validate;

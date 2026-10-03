@@ -14,6 +14,12 @@ are outside this implementation's scope.
 - Join-risk evidence copied from legacy anti-raid scoring: member ID, account
   age, join time, score and reasons (`join_risk_flags`). Erased by member ID; the
   legacy TEXT `event_id` and `reasons_json` are also checked for the snowflake.
+- Anti-nuke containment evidence: the executor and target IDs of observed audit
+  events and the incidents they triggered (`containment_events`,
+  `containment_incidents`). Erased with the member (as executor, as target, or
+  when a serialized result names them); incidents go first because they
+  reference their trigger event. An in-flight (`containing`) or `uncertain`
+  incident is a replay/block guard and makes erasure refuse until it settles.
 - Tickets: `tickets` and `ticket_transcripts` (opener or claimer; 90-day transcript purge applies independently).
 - Temporary voice rooms: each tracked room stores its current owner and original
   creator IDs (`voice_rooms`), erased by either. Erasure removes the tracking row
@@ -21,7 +27,9 @@ are outside this implementation's scope.
   (`voice_creators`, including V9 text-channel name/viewer-role settings) and
   companion text-channel records (`voice_text_companions`, Discord channel IDs
   plus the creation-time settings snapshot) store no member IDs and are
-  untouched by member erasure.
+  untouched by member erasure. Guild room-command controls
+  (`voice_access_controls`: creation switch, required role ID, per-command role
+  IDs) hold role IDs only and no member IDs.
 - Event RSVPs and attendance/community facts, including attribution and compound
   voice-session/event keys (`event_rsvps`, `community_facts`). Scorecards normally
   store aggregates; the erasure plan also checks their serialized payloads.

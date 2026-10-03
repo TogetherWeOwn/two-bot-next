@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::voice_room_plan::{plan_room, RoomPlanInput};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -27,19 +28,23 @@ use twilight_model::{
     application::interaction::{
         application_command::CommandOptionValue, Interaction, InteractionData, InteractionType,
     },
-    channel::{message::MessageFlags, permission_overwrite::PermissionOverwrite, Channel},
+    channel::{message::MessageFlags, Channel},
     guild::{Permissions, Role},
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     id::{marker::RoleMarker, Id},
 };
 use two_bot_core::{
     now_iso,
+    voice_access::{
+        may_create_room, may_use_command, AccessControls, AccessDecision, AccessDenyReason,
+        AccessMember,
+    },
     voice_rooms::{
         category_full_message, voice_commands, ActionQueue, CreatorChannel, NewRoomSpec,
-        PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition,
-        VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN,
-        RENAME_MIN_INTERVAL_MS,
+        ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction, RoomPosition, VoiceGates,
+        VoiceRoom, MAX_CHANNELS_PER_CATEGORY, MAX_CHANNEL_NAME_LEN, RENAME_MIN_INTERVAL_MS,
     },
+    voice_utilities::{invite_render, ping_render},
     CommandDefinition, Snowflake,
 };
 use two_bot_cutover::voice_rooms::PgRoomStore;
@@ -71,6 +76,11 @@ pub trait RoomPersistence: Send + Sync {
         creator: &CreatorChannel,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn persist(&self, room: &VoiceRoom) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// The guild's V10b controls; an unconfigured guild reads as the defaults.
+    fn access_controls(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<AccessControls, StoreError>> + Send;
     fn forget(
         &self,
         guild: Snowflake,
@@ -104,6 +114,10 @@ impl RoomPersistence for PgRoomStore {
             return Err(StoreError::Conflict);
         }
         Ok(())
+    }
+
+    async fn access_controls(&self, guild: Snowflake) -> Result<AccessControls, StoreError> {
+        self.access_controls(guild).await.map_err(store_error)
     }
 
     async fn forget(&self, guild: Snowflake, channel: Snowflake) -> Result<(), StoreError> {
@@ -143,6 +157,22 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V4 vote-kick enforcement: disconnect the member from voice
+    /// (`channel_id: null`); 404 (already left) is success.
+    fn disconnect(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V4 vote-kick enforcement: deny Connect to the member on one room
+    /// channel only (member-scoped overwrite, not a guild kick or ban).
+    fn deny_connect(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
     fn delete(
         &self,
         channel: Snowflake,
@@ -175,6 +205,25 @@ impl RoomWrites for RoomHttp {
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
         self.move_member(guild, member, channel, move || guard())
+            .await
+    }
+
+    async fn disconnect(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.disconnect_member(guild, member, move || guard()).await
+    }
+
+    async fn deny_connect(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.deny_member_connect(channel, member, move || guard())
             .await
     }
 
@@ -439,6 +488,7 @@ pub struct GuildRoomWorker<S, H> {
     store: S,
     http: H,
     creators: HashMap<Snowflake, CreatorChannel>,
+    access: AccessControls,
     rooms: HashMap<Snowflake, VoiceRoom>,
     queue: ActionQueue,
     renames: RenameCoalescer,
@@ -462,6 +512,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.channel_id, c))
             .collect();
+        let access = store.access_controls(live.guild_id).await?;
         let rooms = store
             .rooms(live.guild_id)
             .await?
@@ -473,6 +524,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             store,
             http,
             creators,
+            access,
             rooms,
             queue: ActionQueue::new(),
             renames: RenameCoalescer::new(),
@@ -497,6 +549,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         created_at: String,
     ) -> bool {
         if self.halted
+            || !may_create_room(&self.access)
             || !self.creators.contains_key(&ticket.creator_id)
             || !self
                 .live
@@ -674,42 +727,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 });
             }
         }
-        let source = if permissions.is_some_and(|p| p.contains(Permissions::MANAGE_ROLES)) {
-            match settings.permission_source {
-                PermissionSource::Creator => Some(ticket.creator_id),
-                PermissionSource::Category => channel.parent_id.map(Id::get),
-                PermissionSource::Channel(id) => Some(id),
-            }
-        } else {
-            channel.parent_id.map(Id::get)
-        };
-        let mut overwrites: Vec<PermissionOverwrite> = match source {
-            Some(id) => live
-                .channels
-                .get(&id)
-                .ok_or(RoomHttpError::AccessDenied)?
-                .permission_overwrites
-                .clone()
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        // Privacy/default owner permissions are applied by V8. Never silently
-        // create a public room if a later slice has enabled an unsupported default.
-        if settings.private_default || settings.text_channels {
-            return Err(RoomHttpError::InvalidRequest);
-        }
         let bot = live.bot.as_ref().ok_or(RoomHttpError::AccessDenied)?;
-        if !can_manage_room(effective_permissions(
-            self.live.guild_id,
-            bot.guild_owner_id,
-            bot.member_id,
-            &bot.member_roles,
-            &bot.roles,
-            &overwrites,
-        )) {
-            return Err(RoomHttpError::AccessDenied);
-        }
-        RoomChannelAttributes::from_creator(settings, channel, std::mem::take(&mut overwrites))
+        plan_room(&RoomPlanInput {
+            guild_id: self.live.guild_id,
+            owner_id: ticket.member_id,
+            settings,
+            creator: channel,
+            channels: &live.channels,
+            creators: &self.creators,
+            rooms: &self.rooms,
+            bot,
+            bot_permissions: permissions,
+        })
     }
 
     /// Executes at most one write, releasing the guild lane on every outcome.
@@ -1674,6 +1703,8 @@ pub fn voice_command_set(gates: &VoiceGates) -> Vec<CommandDefinition> {
 pub enum VoiceCommand {
     Create { name: String },
     Setup,
+    Ping,
+    Invite,
 }
 
 /// Guild the interaction was invoked in. `PartialMember` carries no guild, so
@@ -1708,6 +1739,8 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
             Some(VoiceCommand::Create { name })
         }
         "setup" => Some(VoiceCommand::Setup),
+        "ping" => Some(VoiceCommand::Ping),
+        "invite" => Some(VoiceCommand::Invite),
         _ => None,
     }
 }
@@ -1716,9 +1749,68 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
 /// view-open, so this gate applies to `/create` only. Fail closed on
 /// missing permissions.
 fn may_create(permissions: Option<Permissions>) -> bool {
+    is_voice_admin(permissions)
+}
+
+/// The spec's "admin": Manage Channels (Administrator implies it). Fail
+/// closed on missing permissions.
+fn is_voice_admin(permissions: Option<Permissions>) -> bool {
     permissions.is_some_and(|permissions| {
         permissions.intersects(Permissions::ADMINISTRATOR | Permissions::MANAGE_CHANNELS)
     })
+}
+
+impl VoiceCommand {
+    /// The slash-command name per-command role restrictions are keyed on.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::Setup => "setup",
+            Self::Ping => "ping",
+            Self::Invite => "invite",
+        }
+    }
+}
+
+/// The invoking member's access facts: effective admin flag and role IDs.
+fn access_member(interaction: &Interaction) -> AccessMember {
+    let member = interaction.member.as_ref();
+    AccessMember {
+        is_admin: is_voice_admin(member.and_then(|member| member.permissions)),
+        roles: member.map_or_else(Vec::new, |member| {
+            member.roles.iter().map(|role| role.get()).collect()
+        }),
+    }
+}
+
+fn access_denied_text(reason: AccessDenyReason) -> &'static str {
+    match reason {
+        AccessDenyReason::RequiredRole => {
+            "You need the server's required role to use voice-room commands."
+        }
+        AccessDenyReason::CommandRestricted => {
+            "You do not have a role that may use this command here."
+        }
+    }
+}
+
+/// Discord snowflake epoch (2015-01-01T00:00:00Z) in Unix milliseconds.
+const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+
+/// Milliseconds between Discord creating an interaction and `now_ms`.
+/// A host clock behind Discord's saturates to zero instead of underflowing.
+#[must_use]
+fn interaction_latency_ms(interaction_id: u64, now_ms: u64) -> u64 {
+    let created_ms = (interaction_id >> 22).saturating_add(DISCORD_EPOCH_MS);
+    now_ms.saturating_sub(created_ms)
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Ephemeral `ChannelMessageWithSource` reply shell.
@@ -1778,6 +1870,7 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
         video_quality_mode: None,
         nsfw: false,
         user_limit: 0,
+        position: None,
         overwrites: Vec::new(),
     };
     let always: WriteGuard = Arc::new(|| true);
@@ -1834,13 +1927,60 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
+    handle_voice_interaction_with(runtime, interaction, None, reply).await
+}
+
+/// [`handle_voice_interaction`] with the guild's vanity invite code, which
+/// only the gateway cache knows. `None` renders the "no invite" notice.
+pub async fn handle_voice_interaction_with<S, H, F>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    invite_code: Option<&str>,
+    reply: impl FnOnce(InteractionResponse) -> F + Send,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
     let Some(command) = parse_voice_command(interaction) else {
         return false;
     };
     let Some(guild_id) = interaction_guild(interaction) else {
         return false;
     };
+    // Guild-level role gate first. Settings that cannot be read fail closed for
+    // members: only an admin proceeds without them.
+    let member = access_member(interaction);
+    let (gate_store, _) = runtime.make_pair();
+    match gate_store.access_controls(guild_id).await {
+        Ok(controls) => {
+            if let AccessDecision::Deny(reason) =
+                may_use_command(&controls, &member, command.name())
+            {
+                reply(ephemeral_response(access_denied_text(reason))).await;
+                return true;
+            }
+        }
+        Err(_) if !member.is_admin => {
+            reply(ephemeral_response(
+                "Voice-room settings are unavailable right now. Try again shortly.",
+            ))
+            .await;
+            return true;
+        }
+        Err(_) => {}
+    }
     match command {
+        VoiceCommand::Ping => {
+            let latency = interaction_latency_ms(interaction.id.get(), unix_now_ms());
+            reply(ephemeral_response(&ping_render(latency))).await;
+            true
+        }
+        VoiceCommand::Invite => {
+            reply(ephemeral_response(&invite_render(invite_code))).await;
+            true
+        }
         VoiceCommand::Setup => {
             let (store, _) = runtime.make_pair();
             let (creators, store_error) = match store.creators(guild_id).await {
@@ -1891,6 +2031,17 @@ where
             true
         }
     }
+}
+
+/// The invoking guild's vanity invite code from the gateway cache, if any.
+fn vanity_code_from_cache(
+    cache: &DefaultInMemoryCache,
+    interaction: &Interaction,
+) -> Option<String> {
+    let guild_id = interaction.guild_id?;
+    cache
+        .guild(guild_id)
+        .and_then(|guild| guild.vanity_url_code().map(str::to_owned))
 }
 
 /// Reply seam for deterministic responder tests; errors are sanitized.
@@ -1960,13 +2111,18 @@ where
         Self { runtime, replies }
     }
 
-    async fn respond(runtime: &VoiceRuntime<S, H>, replies: &R, interaction: &Interaction) {
+    async fn respond_with(
+        runtime: &VoiceRuntime<S, H>,
+        replies: &R,
+        interaction: &Interaction,
+        invite_code: Option<&str>,
+    ) {
         if let Err(error) = replies.defer(interaction).await {
             warn!(interaction_id = interaction.id.get(), %error,
                 "voice acknowledgement failed; command not executed");
             return;
         }
-        handle_voice_interaction(runtime, interaction, |response| async move {
+        handle_voice_interaction_with(runtime, interaction, invite_code, |response| async move {
             if let Err(error) = replies.complete(interaction, response).await {
                 warn!(interaction_id = interaction.id.get(), %error,
                     "voice response completion failed; not retried");
@@ -1992,10 +2148,11 @@ where
                 return;
             }
             let interaction = created.0.clone();
+            let invite_code = vanity_code_from_cache(cache, &interaction);
             let runtime = Arc::clone(&self.runtime);
             let replies = Arc::clone(&self.replies);
             tokio::spawn(async move {
-                Self::respond(&runtime, &replies, &interaction).await;
+                Self::respond_with(&runtime, &replies, &interaction, invite_code.as_deref()).await;
             });
         }
     }

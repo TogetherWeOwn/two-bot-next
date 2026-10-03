@@ -60,6 +60,23 @@ VALUES ('100000000000000001', 'backup:moderation:key', 'lockdown', 'backup-reque
 INSERT INTO moderation_channel_executions (channel_id, guild_id, idempotency_key, claim_token)
 VALUES ('100000000000000003', '100000000000000001', 'backup:moderation:key', 'backup-channel-claim');
 
+INSERT INTO containment_events
+    (audit_entry_id, guild_id, executor_id, action, target_id, weight, occurred_at, state, reason,
+     created_at)
+VALUES ('100000000000000101', '100000000000000001', '100000000000000005', 'channel.delete',
+        '100000000000000003', 3, '2026-08-01T09:00:00.000Z', 'contain',
+        E'counted toward destructive-action heat | NULL\\n雪 \\"quote\\"',
+        '2026-08-01T09:00:00.120Z'),
+       ('100000000000000102', '100000000000000001', NULL, 'webhook.create', NULL, 1,
+        '2026-08-01T09:00:01.000Z', 'ignored', 'audit entry has no executor; refusing to guess',
+        '2026-08-01T09:00:01.000Z');
+INSERT INTO containment_incidents
+    (id, guild_id, executor_id, trigger_audit_entry_id, heat, state, result_json, started_at,
+     cooldown_until, completed_at)
+VALUES ('100000000000000101', '100000000000000001', '100000000000000005', '100000000000000101',
+        6, 'uncertain', E'{"removedRoleIds":["100000000000000004"],"failure":"timeout | NULL\\n雪"}',
+        '2026-08-01T09:00:00.200Z', '2026-08-01T09:01:00.200Z', '2026-08-01T09:00:02.000Z');
+
 INSERT INTO join_risk_flags
     (event_id, guild_id, member_id, account_created_at, joined_at, source, score, reasons_json,
      bulk_join_window, flagged, created_at)
@@ -363,3 +380,10 @@ VALUES ('100000000000000001', '100000000000000033', '100000000000000036',
         TRUE, NULL, NULL, '2026-08-01T10:00:00.123456Z'),
        ('100000000000000001', '100000000000000034', '100000000000000037',
         TRUE, 'Squad chat', '100000000000000001', '2026-08-02T10:00:00Z');
+-- Guild room-command controls: one configured guild (creation off, required
+-- role, a restricted command and a fail-closed empty list), one defaulted.
+INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id,
+  command_roles)
+VALUES ('100000000000000001', FALSE, '100000000000000040',
+        '{"kick": ["100000000000000041", "100000000000000042"], "template": []}'::jsonb),
+       ('100000000000000002', TRUE, NULL, '{}'::jsonb);

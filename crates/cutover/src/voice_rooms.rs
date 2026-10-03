@@ -8,7 +8,9 @@
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
+use two_bot_core::voice_access::{validate_access_controls, AccessControls};
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
@@ -261,6 +263,93 @@ impl PgRoomStore {
         .map(decode_companion)
         .transpose()
     }
+
+    /// The guild's access controls, or the defaults when never configured.
+    pub async fn access_controls(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<AccessControls, sqlx::Error> {
+        sqlx::query(
+            "SELECT room_creation_enabled, required_role_id, command_roles::text AS command_roles
+             FROM voice_access_controls WHERE guild_id = $1",
+        )
+        .bind(guild_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(decode_access_controls)
+        .transpose()
+        .map(Option::unwrap_or_default)
+    }
+
+    /// Replace the guild's access controls atomically (one upsert). Refuses
+    /// unknown command names and zero role IDs before touching the database.
+    pub async fn save_access_controls(
+        &self,
+        guild_id: Snowflake,
+        controls: &AccessControls,
+    ) -> Result<(), sqlx::Error> {
+        validate_access_controls(controls).map_err(invalid_argument)?;
+        let command_roles: BTreeMap<&str, Vec<String>> = controls
+            .command_roles
+            .iter()
+            .map(|(command, roles)| {
+                (
+                    command.as_str(),
+                    roles.iter().map(ToString::to_string).collect(),
+                )
+            })
+            .collect();
+        let command_roles = serde_json::to_string(&command_roles).map_err(invalid_argument)?;
+        sqlx::query(
+            "INSERT INTO voice_access_controls
+             (guild_id, room_creation_enabled, required_role_id, command_roles)
+             VALUES ($1,$2,$3,$4::jsonb)
+             ON CONFLICT (guild_id) DO UPDATE SET
+               room_creation_enabled = EXCLUDED.room_creation_enabled,
+               required_role_id = EXCLUDED.required_role_id,
+               command_roles = EXCLUDED.command_roles",
+        )
+        .bind(guild_id.to_string())
+        .bind(controls.room_creation_enabled)
+        .bind(controls.required_role.map(|role| role.to_string()))
+        .bind(command_roles)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+fn decode_access_controls(row: &PgRow) -> Result<AccessControls, sqlx::Error> {
+    let parse_role = |value: &str| {
+        value
+            .parse::<u64>()
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+    };
+    let required_role = row
+        .try_get::<Option<String>, _>("required_role_id")?
+        .map(|value| parse_role(&value))
+        .transpose()?;
+    let stored: BTreeMap<String, Vec<String>> =
+        serde_json::from_str(row.try_get::<&str, _>("command_roles")?)
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    let command_roles = stored
+        .into_iter()
+        .map(|(command, roles)| {
+            roles
+                .iter()
+                .map(|role| parse_role(role))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|roles| (command, roles))
+        })
+        .collect::<Result<_, _>>()?;
+    let controls = AccessControls {
+        room_creation_enabled: row.try_get("room_creation_enabled")?,
+        required_role,
+        command_roles,
+    };
+    validate_access_controls(&controls).map_err(invalid_argument)?;
+    Ok(controls)
 }
 
 fn invalid_argument(error: impl std::fmt::Display) -> sqlx::Error {
