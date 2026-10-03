@@ -140,7 +140,7 @@ impl JoinRiskSettings {
         let bulk_join_window_until_ms = match vars.get(BULK_UNTIL_KEY).map(|raw| raw.trim()) {
             None | Some("") => None,
             Some(raw) => match raw.parse::<i64>() {
-                Ok(value) => Some(value),
+                Ok(value) if value > 0 => Some(value),
                 _ => {
                     warn!(key = BULK_UNTIL_KEY, "bulk window unusable; no bulk window");
                     None
