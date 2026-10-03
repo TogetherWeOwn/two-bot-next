@@ -1,7 +1,9 @@
 //! Fixed test-container target: never read DATABASE_URL or use staging credentials.
 
 use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use two_bot_core::voice_access::AccessControls;
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
@@ -184,5 +186,64 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
             .await
             .is_err()
     );
+    verify_access_controls(&store, pool).await
+}
+
+async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResult {
+    // A never-configured guild reads as the defaults.
+    assert_eq!(store.access_controls(100).await?, AccessControls::default());
+
+    let controls = AccessControls {
+        room_creation_enabled: false,
+        required_role: Some(u64::MAX),
+        command_roles: BTreeMap::from([
+            ("kick".to_owned(), vec![7, u64::MAX]),
+            // Present-but-empty denies every non-admin and must survive a reload.
+            ("template".to_owned(), vec![]),
+        ]),
+    };
+    store.save_access_controls(100, &controls).await?;
+    assert_eq!(store.access_controls(100).await?, controls);
+    assert_eq!(
+        PgRoomStore::new(pool.clone()).access_controls(100).await?,
+        controls
+    );
+    assert_eq!(
+        store.access_controls(101).await?,
+        AccessControls::default(),
+        "controls are per guild"
+    );
+
+    // Saving replaces the whole row: lifting every restriction sticks.
+    store
+        .save_access_controls(100, &AccessControls::default())
+        .await?;
+    assert_eq!(store.access_controls(100).await?, AccessControls::default());
+
+    // Refused before the database: unknown command, zero role ids.
+    let mut bad = AccessControls::default();
+    bad.command_roles.insert("kik".to_owned(), vec![7]);
+    assert!(store.save_access_controls(100, &bad).await.is_err());
+    bad.command_roles.clear();
+    bad.required_role = Some(0);
+    assert!(store.save_access_controls(100, &bad).await.is_err());
+    bad.required_role = None;
+    bad.command_roles.insert("kick".to_owned(), vec![0]);
+    assert!(store.save_access_controls(100, &bad).await.is_err());
+    assert_eq!(store.access_controls(100).await?, AccessControls::default());
+
+    // The table's own checks hold when SQL bypasses the adapter.
+    assert!(sqlx::query(
+        "UPDATE voice_access_controls SET required_role_id = '0' WHERE guild_id = '100'"
+    )
+    .execute(pool)
+    .await
+    .is_err());
+    assert!(sqlx::query(
+        "UPDATE voice_access_controls SET command_roles = '[]'::jsonb WHERE guild_id = '100'"
+    )
+    .execute(pool)
+    .await
+    .is_err());
     Ok(())
 }
