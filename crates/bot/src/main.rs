@@ -25,6 +25,7 @@ mod gateway;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
+mod internal_action_http;
 mod jobs;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -95,7 +96,22 @@ async fn main() {
         )
         .init();
 
+    let receiver_config = two_bot_core::internal_action_config::InternalActionConfig::from_env()
+        .unwrap_or_else(|_| {
+            tracing::error!(
+                error_class = "receiver_config_invalid",
+                "internal-action startup refused"
+            );
+            std::process::exit(1);
+        });
     let config = Config::from_env().unwrap_or_else(|err| {
+        if receiver_config.is_some() {
+            tracing::error!(
+                error_class = "receiver_prerequisites_invalid",
+                "internal-action startup refused"
+            );
+            std::process::exit(1);
+        }
         tracing::warn!(error = %err, "config invalid; continuing with safe defaults");
         Config {
             discord_token: None,
@@ -107,6 +123,13 @@ async fn main() {
         }
     });
 
+    if receiver_config.is_some() && internal_receiver_prerequisites(&config).is_err() {
+        tracing::error!(
+            error_class = "receiver_prerequisites_invalid",
+            "internal-action startup refused"
+        );
+        std::process::exit(1);
+    }
     let gateway = Arc::new(RwLock::new(GatewayState::new(&config)));
     let listener = server::bind(&config.listen_addr).await.unwrap_or_else(|_| {
         tracing::error!(
@@ -178,6 +201,32 @@ async fn main() {
     let state = SharedState {
         gateway: Arc::clone(&gateway),
         database: store.as_ref().map(|s| s.pool().clone()),
+    };
+
+    // Capture the authoritative pool before the gateway's async move owns it.
+    // Bind privately before starting tasks; enabled failures never fall back.
+    let receiver = match receiver_config {
+        Some(receiver_config) => {
+            let token =
+                internal_receiver_prerequisites(&config).expect("validated receiver prerequisites");
+            let pool = store
+                .as_ref()
+                .expect("required receiver store")
+                .pool()
+                .clone();
+            Some(
+                internal_action_http::bind(receiver_config, pool, token)
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::error!(
+                            error_class = "receiver_bind_failed",
+                            "internal-action startup refused"
+                        );
+                        std::process::exit(1);
+                    }),
+            )
+        }
+        None => None,
     };
 
     // ONE optional self-role service: gateway dispatch and the supervised
@@ -281,7 +330,14 @@ async fn main() {
         None
     };
 
-    let http = serve(&config, listener, state, shutdown.clone(), self_roles);
+    let http = serve(
+        &config,
+        listener,
+        state,
+        shutdown.clone(),
+        self_roles,
+        receiver,
+    );
     let result = match gateway_task {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
@@ -294,6 +350,15 @@ async fn main() {
         );
         std::process::exit(1);
     }
+}
+
+/// This receiver slice is staging-only, not authority to enable production.
+fn internal_receiver_prerequisites(config: &Config) -> Result<&str, &'static str> {
+    let (token, _, guild) = gateway_prerequisites(config)?;
+    if guild.to_string() != two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID {
+        return Err("internal-action receiver requires the staging guild");
+    }
+    Ok(token)
 }
 
 /// Fixed operation classes only: neither SQLx errors nor their sources are logged.
