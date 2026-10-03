@@ -1085,7 +1085,8 @@ jobs:
   # required context to `required checks` separately.
   required-checks:
     name: required checks
-    permissions: {}
+    permissions:
+      contents: read
     needs: [job-inputs, supply-chain, check, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db]
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
