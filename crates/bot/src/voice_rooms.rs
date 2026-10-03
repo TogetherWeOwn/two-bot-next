@@ -29,16 +29,41 @@ use twilight_model::{
         application_command::{CommandDataOption, CommandOptionValue},
         Interaction, InteractionData, InteractionType,
     },
-    channel::{message::MessageFlags, permission_overwrite::PermissionOverwriteType, Channel},
+    channel::{
+        message::{
+            component::{ActionRow, Button, ButtonStyle, Component},
+            MessageFlags,
+        },
+        permission_overwrite::PermissionOverwriteType,
+        Channel, ChannelType,
+    },
     guild::{Permissions, Role},
-    http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
-    id::{marker::RoleMarker, Id},
+    http::{
+        attachment::Attachment,
+        interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
+    },
+    id::{
+        marker::{AttachmentMarker, RoleMarker},
+        Id,
+    },
 };
 use two_bot_core::{
     evaluate_permissions as evaluate_health, now_iso,
     voice_access::{
         is_voice_command, may_create_room, may_use_command, validate_access_controls,
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
+    },
+    voice_config::{
+        export_configuration, validate_configuration, ChannelKind, ChannelReference,
+        GuildInventory, VoiceConfiguration, MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
+    },
+    voice_config_diff::{
+        diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
+        DIFF_HASH_CHARS,
+    },
+    voice_custom_id::{
+        import_cancel_custom_id, import_confirm_custom_id, parse_voice_custom_id, VoiceAction,
+        IMPORT_HASH_CHARS,
     },
     voice_logging::{
         parse_detail_level, resolve_log_target, should_log, DetailLevel, LogTarget,
@@ -133,6 +158,19 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
         settings: &LoggingSettings,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// The guild's V11 voice configuration; a never-configured guild reads
+    /// as the defaults, so `/export` works on a fresh guild.
+    fn config_snapshot(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<VoiceConfiguration, StoreError>> + Send;
+    /// Replace the guild's V11 voice configuration in one transaction
+    /// (`/import` Confirm only; never touches live rooms or companions).
+    fn config_apply(
+        &self,
+        guild: Snowflake,
+        config: &VoiceConfiguration,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     fn forget(
         &self,
@@ -241,6 +279,24 @@ impl RoomPersistence for PgRoomStore {
         Ok(())
     }
 
+    async fn config_snapshot(&self, guild: Snowflake) -> Result<VoiceConfiguration, StoreError> {
+        self.voice_configs()
+            .snapshot(guild)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn config_apply(
+        &self,
+        guild: Snowflake,
+        config: &VoiceConfiguration,
+    ) -> Result<(), StoreError> {
+        self.voice_configs()
+            .apply(guild, config)
+            .await
+            .map_err(store_error)
+    }
+
     async fn companions(&self, guild: Snowflake) -> Result<Vec<TextCompanion>, StoreError> {
         self.companions_in_guild(guild).await.map_err(store_error)
     }
@@ -322,6 +378,14 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         name: &str,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Download a Discord-hosted `/import` file, capped at `max_bytes`
+    /// (the caller checks the attachment size before asking).
+    fn download_attachment(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, RoomHttpError>> + Send;
+
     /// Create a V9 companion text channel with its full overwrite set in the
     /// POST (never patched afterwards). The bot's own View allow rides the
     /// POST via `bot_id`.
@@ -410,6 +474,14 @@ impl RoomWrites for RoomHttp {
 
     async fn rename(&self, channel: Snowflake, name: &str) -> Result<(), RoomHttpError> {
         self.rename_room(channel, name).await
+    }
+
+    async fn download_attachment(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RoomHttpError> {
+        self.download_attachment(url, max_bytes).await
     }
 
     async fn create_companion(
@@ -2816,6 +2888,24 @@ pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
 /// Per-guild actor registry. Actors spawn lazily on the first complete
 /// snapshot and exit when their guild leaves (sender dropped) or their store
 /// load fails (respawned on the next event via `UnboundedSender::is_closed`).
+/// How long an `/import` preview stays confirmable. Past that the Confirm
+/// button answers "expired" and writes nothing; the member uploads again.
+pub const PENDING_IMPORT_TTL: Duration = Duration::from_secs(15 * 60);
+/// Upper bound on remembered previews across all guilds; the oldest expired
+/// entries are evicted first, then the oldest entries, so a flood of uploads
+/// cannot grow memory without bound.
+const MAX_PENDING_IMPORTS: usize = 128;
+
+/// An `/import` preview awaiting Confirm: the validated, unknown-channel
+/// skipped candidate plus its expiry. The bytes are never re-downloaded:
+/// attachment URLs expire, so Confirm works from this copy and re-diffs it
+/// against freshly read state.
+#[derive(Debug, Clone)]
+struct PendingImport {
+    candidate: VoiceConfiguration,
+    expires_at: Instant,
+}
+
 pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
@@ -2825,6 +2915,10 @@ pub struct VoiceRuntime<S, H> {
     /// Serializes `/access` read-modify-write cycles so two admins cannot
     /// overwrite each other's change (rare, admin-only, so one lock is enough).
     access_lock: tokio::sync::Mutex<()>,
+    /// Previewed import candidates by (guild, uploading member, content
+    /// hash). Confirm consumes the entry, so a double click cannot apply
+    /// twice; Cancel and expiry remove it with no write.
+    pending_imports: Mutex<HashMap<(Snowflake, Snowflake, String), PendingImport>>,
 }
 
 impl<S, H> VoiceRuntime<S, H>
@@ -2847,6 +2941,7 @@ where
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
             access_lock: tokio::sync::Mutex::new(()),
+            pending_imports: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3055,6 +3150,62 @@ where
             actor.live.upsert_channel(channel);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
+    }
+
+    /// Remember a previewed import candidate for one Confirm. Expired
+    /// entries are dropped first; past the cap the oldest entry goes.
+    fn remember_pending_import(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        hash: &str,
+        candidate: VoiceConfiguration,
+    ) {
+        let mut pending = self.pending_imports.lock().expect("voice runtime lock");
+        let now = Instant::now();
+        pending.retain(|_, entry| entry.expires_at > now);
+        if pending.len() >= MAX_PENDING_IMPORTS {
+            let oldest = pending
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = oldest {
+                pending.remove(&key);
+            }
+        }
+        pending.insert(
+            (guild_id, member_id, hash.to_owned()),
+            PendingImport {
+                candidate,
+                expires_at: now + PENDING_IMPORT_TTL,
+            },
+        );
+    }
+
+    /// Consume a previewed candidate for Confirm. `None` means no preview,
+    /// a foreign member/hash, or expiry: the caller answers without writing.
+    /// Expired entries are dropped as they are found.
+    fn take_pending_import(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        hash: &str,
+    ) -> Option<VoiceConfiguration> {
+        let mut pending = self.pending_imports.lock().expect("voice runtime lock");
+        let now = Instant::now();
+        pending.retain(|_, entry| entry.expires_at > now);
+        pending
+            .remove(&(guild_id, member_id, hash.to_owned()))
+            .map(|entry| entry.candidate)
+    }
+
+    /// Drop a preview without writing (Cancel). Missing entries are fine:
+    /// Cancel is idempotent and also covers already-consumed previews.
+    fn cancel_pending_import(&self, guild_id: Snowflake, member_id: Snowflake, hash: &str) {
+        self.pending_imports
+            .lock()
+            .expect("voice runtime lock")
+            .remove(&(guild_id, member_id, hash.to_owned()));
     }
 
     /// Hand an edited creator row to the guild worker (V9d `/textchannels`).
@@ -3351,6 +3502,65 @@ fn bot_access_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> O
     })
 }
 
+/// Trusted guild inventory for V11 export/import, built from the live
+/// gateway cache at dispatch time, never from uploaded data. `None` when the
+/// guild itself is not cached yet (the caller refuses with "try again").
+/// Channel, role and member sets are best-effort: a set the cache has not
+/// populated yet reads as empty, and validation then refuses references to
+/// it instead of silently passing them.
+#[must_use]
+pub fn inventory_from_cache(
+    cache: &DefaultInMemoryCache,
+    guild_id: Snowflake,
+) -> Option<GuildInventory> {
+    let guild_key = Id::new(guild_id);
+    cache.guild(guild_key)?;
+    let guild_string = guild_id.to_string();
+    let mut channels = std::collections::BTreeMap::new();
+    if let Some(ids) = cache.guild_channels(guild_key) {
+        for id in ids.value().iter() {
+            let Some(channel) = cache.channel(*id) else {
+                continue;
+            };
+            let kind = match channel.kind {
+                ChannelType::GuildText => ChannelKind::Text,
+                ChannelType::GuildVoice => ChannelKind::Voice,
+                ChannelType::GuildStageVoice => ChannelKind::Stage,
+                ChannelType::GuildCategory => ChannelKind::Category,
+                _ => continue,
+            };
+            if channel.guild_id.map(Id::get) != Some(guild_id) {
+                continue;
+            }
+            channels.insert(
+                id.get().to_string(),
+                ChannelReference {
+                    guild_id: guild_string.clone(),
+                    kind,
+                },
+            );
+        }
+    }
+    let mut roles = std::collections::BTreeMap::new();
+    if let Some(ids) = cache.guild_roles(guild_key) {
+        for id in ids.value().iter() {
+            roles.insert(id.get().to_string(), guild_string.clone());
+        }
+    }
+    let mut members = std::collections::BTreeMap::new();
+    if let Some(ids) = cache.guild_members(guild_key) {
+        for id in ids.value().iter() {
+            members.insert(id.get().to_string(), guild_string.clone());
+        }
+    }
+    Some(GuildInventory {
+        guild_id: guild_string,
+        channels,
+        roles,
+        members,
+    })
+}
+
 fn display_name(cache: &DefaultInMemoryCache, guild_id: Snowflake, member_id: Snowflake) -> String {
     let guild_key = Id::new(guild_id);
     let user_key = Id::new(member_id);
@@ -3582,6 +3792,266 @@ pub fn voice_command_set(gates: &VoiceGates) -> Vec<CommandDefinition> {
     }
 }
 
+// --- V11 `/export` + `/import` decisions (pure, no Discord) ---------------------
+//
+// `/export` snapshots the store and encodes it; `/import` previews an upload
+// against a trusted inventory and only writes on Confirm. Parsing, skipping,
+// revalidation, diffing and hashing stay testable here; the S4 handlers below
+// supply the store snapshot, the attachment bytes and the pending preview.
+
+/// Preview lines in one `/import` message body. The diff renderer also caps
+/// the whole body at its Discord limit; this bounds the line count.
+pub const MAX_IMPORT_PREVIEW_LINES: usize = 20;
+
+/// The spec's Manage Server gate for `/export`, `/import` and their
+/// Confirm/Cancel buttons: Manage Guild, with Administrator implying it.
+/// Fail closed on missing permissions.
+fn may_manage_server(permissions: Option<Permissions>) -> bool {
+    permissions.is_some_and(|permissions| {
+        permissions.intersects(Permissions::ADMINISTRATOR | Permissions::MANAGE_GUILD)
+    })
+}
+
+/// Versioned export filename: the codec version plus the guild, never room
+/// or owner state (the document itself carries none either).
+fn export_filename(guild_id: Snowflake) -> String {
+    format!("voice-config-guild-{guild_id}-v{VOICE_CONFIG_VERSION}.json")
+}
+
+/// One `/import` planning outcome. Refusals and notices reply with text
+/// alone and store nothing; only `Preview` writes a pending entry and only
+/// `Apply` touches the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportDecision {
+    /// Refused before any write: malformed upload, failed revalidation, or
+    /// an unreadable guild. Reply with `message` alone.
+    Refuse { message: String },
+    /// Nothing to confirm (empty diff, cancel, expiry): reply with `text`
+    /// alone and store nothing.
+    Notice { text: String },
+    /// Show `text` with Confirm/Cancel bound to (`member_id`, `hash`) and
+    /// remember `candidate` for Confirm.
+    Preview {
+        candidate: VoiceConfiguration,
+        hash: String,
+        text: String,
+    },
+    /// Confirm verified against fresh state: apply `candidate`, then reply
+    /// with `message`.
+    Apply {
+        candidate: VoiceConfiguration,
+        message: String,
+    },
+}
+
+/// Plan an `/import` preview from uploaded bytes: strict-decode (never from
+/// a trusted source), report and skip unknown channels, revalidate the
+/// remainder, then diff against `current`. Unknown-channel, cross-guild and
+/// wrong-kind entries refuse here with a safe field-level message; uploaded
+/// text is never echoed.
+#[must_use]
+pub fn plan_import_preview(
+    current: &VoiceConfiguration,
+    bytes: &[u8],
+    inventory: &GuildInventory,
+) -> ImportDecision {
+    debug_assert_eq!(DIFF_HASH_CHARS, IMPORT_HASH_CHARS);
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return ImportDecision::Refuse {
+            message: format!(
+                "That file is too large ({} bytes; the limit is {} bytes). Nothing was changed.",
+                bytes.len(),
+                MAX_IMPORT_BYTES,
+            ),
+        };
+    }
+    let incoming: VoiceConfiguration = match serde_json::from_slice(bytes) {
+        Ok(config) => config,
+        Err(error) => {
+            return ImportDecision::Refuse {
+                message: format!(
+                    "Could not import that file: malformed configuration JSON at line {}, column {}. Nothing was changed.",
+                    error.line(),
+                    error.column(),
+                ),
+            };
+        }
+    };
+    let (remaining, _) = skip_unknown_channels(&incoming, inventory);
+    if let Err(error) = validate_configuration(&remaining, inventory) {
+        return ImportDecision::Refuse {
+            message: format!("Could not import that file: {error} Nothing was changed."),
+        };
+    }
+    // Diff the full upload, not the pruned remainder: `diff_configuration`
+    // re-skips unknown channels itself, so diffing `remaining` would always
+    // report an empty skipped list and an unknown-channels-only file would
+    // read as `No changes`. The pruned `remaining` stays the candidate.
+    let diff = diff_configuration(current, &incoming, inventory);
+    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
+    if diff.change_count() == 0 {
+        return ImportDecision::Notice { text };
+    }
+    ImportDecision::Preview {
+        hash: diff_content_hash(current, &remaining),
+        candidate: remaining,
+        text,
+    }
+}
+
+/// Plan a Confirm click: re-skip the remembered candidate against a fresh
+/// inventory, revalidate, re-diff against freshly read `current` and compare
+/// the content hash with the button's. A match applies; any concurrent
+/// change (or a guild edit that invalidates the candidate) re-previews or
+/// refuses instead of applying stale state.
+#[must_use]
+pub fn plan_import_confirm(
+    current: &VoiceConfiguration,
+    candidate: &VoiceConfiguration,
+    inventory: &GuildInventory,
+    hash: &str,
+) -> ImportDecision {
+    debug_assert_eq!(DIFF_HASH_CHARS, IMPORT_HASH_CHARS);
+    let (remaining, _) = skip_unknown_channels(candidate, inventory);
+    if let Err(error) = validate_configuration(&remaining, inventory) {
+        return ImportDecision::Refuse {
+            message: format!(
+                "That preview no longer applies cleanly: {error} Nothing was changed. Upload the file again for a fresh preview.",
+            ),
+        };
+    }
+    if diff_content_hash(current, &remaining) == hash {
+        let changes = diff_configuration(current, &remaining, inventory).change_count();
+        return ImportDecision::Apply {
+            candidate: remaining,
+            message: format!(
+                "Import applied: {} {}.",
+                changes,
+                if changes == 1 { "change" } else { "changes" },
+            ),
+        };
+    }
+    let diff = diff_configuration(current, &remaining, inventory);
+    let text = render_preview(&diff, MAX_IMPORT_PREVIEW_LINES);
+    if diff.change_count() == 0 {
+        return ImportDecision::Notice { text };
+    }
+    ImportDecision::Preview {
+        hash: diff_content_hash(current, &remaining),
+        candidate: remaining,
+        text,
+    }
+}
+
+/// Confirm/Cancel buttons for a preview, bound to the uploading member and
+/// the diff's content hash via the voice custom-id codec.
+fn import_preview_components(member_id: Snowflake, hash: &str) -> Vec<Component> {
+    let button = |label: &str, style: ButtonStyle, custom_id: String| {
+        Component::Button(Button {
+            id: None,
+            custom_id: Some(custom_id),
+            disabled: false,
+            emoji: None,
+            label: Some(label.to_owned()),
+            style,
+            url: None,
+            sku_id: None,
+        })
+    };
+    vec![Component::ActionRow(ActionRow {
+        id: None,
+        components: vec![
+            button(
+                "Confirm",
+                ButtonStyle::Success,
+                import_confirm_custom_id(member_id, hash),
+            ),
+            button(
+                "Cancel",
+                ButtonStyle::Secondary,
+                import_cancel_custom_id(member_id, hash),
+            ),
+        ],
+    })]
+}
+
+/// Ephemeral `/export` reply carrying the JSON as a versioned file.
+fn export_file_response(content: &str, filename: String, bytes: Vec<u8>) -> InteractionResponse {
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            content: Some(content.to_owned()),
+            attachments: Some(vec![Attachment::from_bytes(filename, bytes, 0)]),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
+/// Ephemeral `/import` preview reply with Confirm/Cancel buttons.
+fn import_preview_response(text: &str, member_id: Snowflake, hash: &str) -> InteractionResponse {
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            content: Some(text.to_owned()),
+            components: Some(import_preview_components(member_id, hash)),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    }
+}
+
+/// The invoking member's user id, binding previews to their uploader.
+/// Guild slash and component interactions carry it on the member; fall back
+/// to the top-level user for other contexts. `None` refuses the command.
+fn invoker_member_id(interaction: &Interaction) -> Option<Snowflake> {
+    interaction
+        .member
+        .as_ref()
+        .and_then(|member| member.user.as_ref())
+        .map(|user| user.id.get())
+        .or_else(|| interaction.user.as_ref().map(|user| user.id.get()))
+}
+
+/// A V11 `/import` Confirm/Cancel component, or `None` for anything this
+/// slice does not own (other commands' components stay untouched).
+fn voice_import_action(interaction: &Interaction) -> Option<VoiceAction> {
+    if interaction.kind != InteractionType::MessageComponent {
+        return None;
+    }
+    let InteractionData::MessageComponent(data) = interaction.data.as_ref()? else {
+        return None;
+    };
+    match parse_voice_custom_id(&data.custom_id)? {
+        action @ (VoiceAction::ImportConfirm { .. } | VoiceAction::ImportCancel { .. }) => {
+            Some(action)
+        }
+        _ => None,
+    }
+}
+
+/// Guild-level role gate shared by voice slash commands and the `/import`
+/// Confirm/Cancel buttons. `None` means proceed; `Some(response)` is the
+/// refusal to send (required role, per-command restriction, or unreadable
+/// settings for non-admins).
+async fn command_gate<S: RoomPersistence + Send + 'static>(
+    store: &S,
+    guild_id: Snowflake,
+    member: &AccessMember,
+    command_name: &str,
+) -> Option<InteractionResponse> {
+    match store.access_controls(guild_id).await {
+        Ok(controls) => match may_use_command(&controls, member, command_name) {
+            AccessDecision::Allow => None,
+            AccessDecision::Deny(reason) => Some(ephemeral_response(access_denied_text(reason))),
+        },
+        Err(_) if !member.is_admin => Some(ephemeral_response(
+            "Voice-room settings are unavailable right now. Try again shortly.",
+        )),
+        Err(_) => None,
+    }
+}
+
 // --- `/create` + `/setup` interaction handlers (S4) ---------------------------
 //
 // Pure parse and auth stay testable without Discord; execution runs one
@@ -3611,6 +4081,12 @@ pub enum VoiceCommand {
     },
     Access(AccessAction),
     Logging(LoggingAction),
+    Export,
+    /// `/import file`: the resolved attachment id; `None` when the option
+    /// is missing or of the wrong type (answered, never ignored).
+    Import {
+        file_id: Option<Id<AttachmentMarker>>,
+    },
 }
 
 /// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -3720,6 +4196,19 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
         "logging" => Some(VoiceCommand::Logging(parse_logging_action(
             &command.options,
         ))),
+        "export" => Some(VoiceCommand::Export),
+        "import" => Some(VoiceCommand::Import {
+            file_id: command.options.iter().find_map(|option| {
+                if option.name == "file" {
+                    match &option.value {
+                        CommandOptionValue::Attachment(id) => Some(*id),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }),
+        }),
         _ => None,
     }
 }
@@ -3846,6 +4335,8 @@ impl VoiceCommand {
             Self::Reclaim => "reclaim",
             Self::Transfer { .. } => "transfer",
             Self::Logging(_) => "logging",
+            Self::Export => "export",
+            Self::Import { .. } => "import",
         }
     }
 }
@@ -4182,15 +4673,18 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
-    handle_voice_interaction_with(runtime, interaction, None, reply).await
+    handle_voice_interaction_with(runtime, interaction, None, None, reply).await
 }
 
 /// [`handle_voice_interaction`] with the guild's vanity invite code, which
 /// only the gateway cache knows. `None` renders the "no invite" notice.
+/// `inventory` is the trusted live guild inventory for `/export` and
+/// `/import`; `None` refuses those two commands as unavailable.
 pub async fn handle_voice_interaction_with<S, H, F>(
     runtime: &VoiceRuntime<S, H>,
     interaction: &Interaction,
     invite_code: Option<&str>,
+    inventory: Option<&GuildInventory>,
     reply: impl FnOnce(InteractionResponse) -> F + Send,
 ) -> bool
 where
@@ -4198,33 +4692,23 @@ where
     H: RoomWrites + Send + 'static,
     F: Future<Output = ()> + Send,
 {
-    let Some(command) = parse_voice_command(interaction) else {
+    let Some(guild_id) = interaction_guild(interaction) else {
         return false;
     };
-    let Some(guild_id) = interaction_guild(interaction) else {
+    if let Some(action) = voice_import_action(interaction) {
+        return handle_import_component(runtime, interaction, guild_id, action, inventory, reply)
+            .await;
+    }
+    let Some(command) = parse_voice_command(interaction) else {
         return false;
     };
     // Guild-level role gate first. Settings that cannot be read fail closed for
     // members: only an admin proceeds without them.
     let member = access_member(interaction);
     let (gate_store, _) = runtime.make_pair();
-    match gate_store.access_controls(guild_id).await {
-        Ok(controls) => {
-            if let AccessDecision::Deny(reason) =
-                may_use_command(&controls, &member, command.name())
-            {
-                reply(ephemeral_response(access_denied_text(reason))).await;
-                return true;
-            }
-        }
-        Err(_) if !member.is_admin => {
-            reply(ephemeral_response(
-                "Voice-room settings are unavailable right now. Try again shortly.",
-            ))
-            .await;
-            return true;
-        }
-        Err(_) => {}
+    if let Some(denial) = command_gate(&gate_store, guild_id, &member, command.name()).await {
+        reply(denial).await;
+        return true;
     }
     match command {
         VoiceCommand::Ping => {
@@ -4406,7 +4890,294 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::Export => {
+            let Some(inventory) = inventory else {
+                reply(ephemeral_response(
+                    "Voice configuration is unavailable right now. Try again shortly.",
+                ))
+                .await;
+                return true;
+            };
+            let permissions = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions);
+            if !may_manage_server(permissions) {
+                reply(ephemeral_response("You need Manage Server to use /export.")).await;
+                return true;
+            }
+            let (store, _) = runtime.make_pair();
+            let config = match store.config_snapshot(guild_id).await {
+                Ok(config) => config,
+                Err(_) => {
+                    reply(ephemeral_response(
+                        "Could not read the voice configuration. Nothing was sent; try again.",
+                    ))
+                    .await;
+                    return true;
+                }
+            };
+            match export_configuration(&config, inventory) {
+                Ok(bytes) => {
+                    reply(export_file_response(
+                        &format!(
+                            "Voice configuration for this server (v{}). Re-import it with /import.",
+                            VOICE_CONFIG_VERSION
+                        ),
+                        export_filename(guild_id),
+                        bytes,
+                    ))
+                    .await;
+                }
+                Err(error) => {
+                    reply(ephemeral_response(&format!(
+                        "Could not export the voice configuration: {error} Nothing was sent."
+                    )))
+                    .await;
+                }
+            }
+            true
+        }
+        VoiceCommand::Import { file_id } => {
+            handle_import_upload(runtime, interaction, guild_id, file_id, inventory, reply).await
+        }
     }
+}
+
+/// Handle one `/import file` upload: Manage Server check, attachment size
+/// check before download, snapshot, plan, and either refuse, show the diff
+/// preview with Confirm/Cancel, or note an empty diff. Always replies
+/// exactly once and returns true.
+async fn handle_import_upload<S, H, F>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    guild_id: Snowflake,
+    file_id: Option<Id<AttachmentMarker>>,
+    inventory: Option<&GuildInventory>,
+    reply: impl FnOnce(InteractionResponse) -> F + Send,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
+    let Some(inventory) = inventory else {
+        reply(ephemeral_response(
+            "Voice configuration is unavailable right now. Try again shortly.",
+        ))
+        .await;
+        return true;
+    };
+    let permissions = interaction
+        .member
+        .as_ref()
+        .and_then(|member| member.permissions);
+    if !may_manage_server(permissions) {
+        reply(ephemeral_response("You need Manage Server to use /import.")).await;
+        return true;
+    }
+    let Some(member_id) = invoker_member_id(interaction) else {
+        reply(ephemeral_response(
+            "Could not tell who uploaded that file. Nothing was changed; try again.",
+        ))
+        .await;
+        return true;
+    };
+    let Some(file_id) = file_id else {
+        reply(ephemeral_response(
+            "Attach a voice configuration JSON file to /import, then try again.",
+        ))
+        .await;
+        return true;
+    };
+    let attachment = match &interaction.data {
+        Some(InteractionData::ApplicationCommand(command)) => command
+            .resolved
+            .as_ref()
+            .and_then(|resolved| resolved.attachments.get(&file_id))
+            .cloned(),
+        _ => None,
+    };
+    let Some(attachment) = attachment else {
+        reply(ephemeral_response(
+            "Could not read that attachment. Nothing was changed; attach the file again.",
+        ))
+        .await;
+        return true;
+    };
+    if attachment.size > MAX_IMPORT_BYTES as u64 {
+        reply(ephemeral_response(&format!(
+            "That file is too large ({} bytes; the limit is {} bytes). Nothing was changed.",
+            attachment.size, MAX_IMPORT_BYTES,
+        )))
+        .await;
+        return true;
+    }
+    let (store, http) = runtime.make_pair();
+    let current = match store.config_snapshot(guild_id).await {
+        Ok(config) => config,
+        Err(_) => {
+            reply(ephemeral_response(
+                "Could not read the current voice configuration. Nothing was changed; try again.",
+            ))
+            .await;
+            return true;
+        }
+    };
+    let bytes = match http
+        .download_attachment(&attachment.url, MAX_IMPORT_BYTES)
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            reply(ephemeral_response(
+                "Could not download that file. Nothing was changed; attach it again.",
+            ))
+            .await;
+            return true;
+        }
+    };
+    match plan_import_preview(&current, &bytes, inventory) {
+        ImportDecision::Refuse { message } => {
+            reply(ephemeral_response(&message)).await;
+        }
+        ImportDecision::Notice { text } => {
+            reply(ephemeral_response(&text)).await;
+        }
+        ImportDecision::Preview {
+            candidate,
+            hash,
+            text,
+        } => {
+            runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+            reply(import_preview_response(&text, member_id, &hash)).await;
+        }
+        ImportDecision::Apply { .. } => {
+            warn!(
+                guild_id,
+                "import preview planned an apply; refusing without writing"
+            );
+            reply(ephemeral_response(
+                "Could not plan that import. Nothing was changed; try again.",
+            ))
+            .await;
+        }
+    }
+    true
+}
+
+/// Handle one `/import` Confirm/Cancel click: the clicker must be the
+/// uploader with Manage Server, and the preview must be unexpired. Confirm
+/// re-reads current state, re-diffs and applies on a hash match, or shows a
+/// fresh preview when the guild changed underneath. Cancel and expiry write
+/// nothing. Always replies exactly once and returns true.
+async fn handle_import_component<S, H, F>(
+    runtime: &VoiceRuntime<S, H>,
+    interaction: &Interaction,
+    guild_id: Snowflake,
+    action: VoiceAction,
+    inventory: Option<&GuildInventory>,
+    reply: impl FnOnce(InteractionResponse) -> F + Send,
+) -> bool
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+    F: Future<Output = ()> + Send,
+{
+    let (member_id, hash, confirm) = match action {
+        VoiceAction::ImportConfirm { member_id, hash } => (member_id, hash, true),
+        VoiceAction::ImportCancel { member_id, hash } => (member_id, hash, false),
+        _ => return false,
+    };
+    if invoker_member_id(interaction) != Some(member_id) {
+        reply(ephemeral_response(
+            "Only the member who uploaded the file can answer this preview.",
+        ))
+        .await;
+        return true;
+    }
+    let permissions = interaction
+        .member
+        .as_ref()
+        .and_then(|member| member.permissions);
+    if !may_manage_server(permissions) {
+        reply(ephemeral_response(
+            "You need Manage Server to confirm an import.",
+        ))
+        .await;
+        return true;
+    }
+    let member = access_member(interaction);
+    let (store, _) = runtime.make_pair();
+    if let Some(denial) = command_gate(&store, guild_id, &member, "import").await {
+        reply(denial).await;
+        return true;
+    }
+    // Cancel needs no inventory: dropping a pending preview must work even
+    // when the guild cache is briefly unavailable.
+    if !confirm {
+        runtime.cancel_pending_import(guild_id, member_id, &hash);
+        reply(ephemeral_response("Import cancelled. Nothing was changed.")).await;
+        return true;
+    }
+    let Some(inventory) = inventory else {
+        reply(ephemeral_response(
+            "Voice configuration is unavailable right now. Try again shortly.",
+        ))
+        .await;
+        return true;
+    };
+    let Some(candidate) = runtime.take_pending_import(guild_id, member_id, &hash) else {
+        reply(ephemeral_response(
+            "That preview expired. Nothing was changed; upload the file again for a fresh preview.",
+        ))
+        .await;
+        return true;
+    };
+    let current = match store.config_snapshot(guild_id).await {
+        Ok(config) => config,
+        Err(_) => {
+            // A transient store blip must not force a re-upload: keep the
+            // preview so Confirm can be retried.
+            runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+            reply(ephemeral_response(
+                "Could not read the current configuration. Nothing was changed; try confirming again.",
+            ))
+            .await;
+            return true;
+        }
+    };
+    match plan_import_confirm(&current, &candidate, inventory, &hash) {
+        ImportDecision::Refuse { message } => {
+            reply(ephemeral_response(&message)).await;
+        }
+        ImportDecision::Notice { text } => {
+            reply(ephemeral_response(&text)).await;
+        }
+        ImportDecision::Preview {
+            candidate,
+            hash,
+            text,
+        } => {
+            runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+            reply(import_preview_response(&text, member_id, &hash)).await;
+        }
+        ImportDecision::Apply { candidate, message } => {
+            match store.config_apply(guild_id, &candidate).await {
+                Ok(()) => {
+                    reply(ephemeral_response(&message)).await;
+                }
+                Err(_) => {
+                    runtime.remember_pending_import(guild_id, member_id, &hash, candidate);
+                    reply(ephemeral_response(
+                        "Could not save the import. Nothing was changed; try confirming again.",
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// The invoking guild's vanity invite code from the gateway cache, if any.
@@ -4456,16 +5227,25 @@ impl InteractionReplies for RoomHttp {
         interaction: &Interaction,
         response: InteractionResponse,
     ) -> Result<(), RoomHttpError> {
-        let content = response
-            .data
-            .as_ref()
+        let data = response.data.as_ref();
+        let content = data
             .and_then(|data| data.content.as_deref())
             .unwrap_or_default();
         // Discord limits message content to 2000 characters, including setup
         // listings. Keep the transport valid even in a large guild.
         let content: String = content.chars().take(2000).collect();
-        self.complete_interaction(interaction.application_id, &interaction.token, &content)
-            .await
+        let attachments: &[Attachment] = data
+            .and_then(|data| data.attachments.as_deref())
+            .unwrap_or(&[]);
+        let components: Option<&[Component]> = data.and_then(|data| data.components.as_deref());
+        self.complete_interaction(
+            interaction.application_id,
+            &interaction.token,
+            &content,
+            attachments,
+            components,
+        )
+        .await
     }
 }
 
@@ -4492,18 +5272,25 @@ where
         replies: &R,
         interaction: &Interaction,
         invite_code: Option<&str>,
+        inventory: Option<GuildInventory>,
     ) {
         if let Err(error) = replies.defer(interaction).await {
             warn!(interaction_id = interaction.id.get(), %error,
                 "voice acknowledgement failed; command not executed");
             return;
         }
-        handle_voice_interaction_with(runtime, interaction, invite_code, |response| async move {
-            if let Err(error) = replies.complete(interaction, response).await {
-                warn!(interaction_id = interaction.id.get(), %error,
-                    "voice response completion failed; not retried");
-            }
-        })
+        handle_voice_interaction_with(
+            runtime,
+            interaction,
+            invite_code,
+            inventory.as_ref(),
+            |response| async move {
+                if let Err(error) = replies.complete(interaction, response).await {
+                    warn!(interaction_id = interaction.id.get(), %error,
+                        "voice response completion failed; not retried");
+                }
+            },
+        )
         .await;
     }
 }
@@ -4520,15 +5307,26 @@ where
             return;
         }
         if let Event::InteractionCreate(created) = event {
-            if parse_voice_command(&created.0).is_none() {
+            if parse_voice_command(&created.0).is_none()
+                && voice_import_action(&created.0).is_none()
+            {
                 return;
             }
             let interaction = created.0.clone();
             let invite_code = vanity_code_from_cache(cache, &interaction);
+            let inventory = interaction_guild(&interaction)
+                .and_then(|guild_id| inventory_from_cache(cache, guild_id));
             let runtime = Arc::clone(&self.runtime);
             let replies = Arc::clone(&self.replies);
             tokio::spawn(async move {
-                Self::respond_with(&runtime, &replies, &interaction, invite_code.as_deref()).await;
+                Self::respond_with(
+                    &runtime,
+                    &replies,
+                    &interaction,
+                    invite_code.as_deref(),
+                    inventory,
+                )
+                .await;
             });
         }
     }

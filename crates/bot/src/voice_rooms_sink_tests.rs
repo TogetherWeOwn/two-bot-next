@@ -49,6 +49,17 @@ impl RoomPersistence for Arc<Store> {
     async fn forget(&self, guild: u64, channel: u64) -> Result<(), StoreError> {
         self.as_ref().forget(guild, channel).await
     }
+    async fn config_snapshot(&self, guild: u64) -> Result<VoiceConfiguration, StoreError> {
+        self.as_ref().config_snapshot(guild).await
+    }
+    async fn config_apply(
+        &self,
+        guild: u64,
+        config: &VoiceConfiguration,
+    ) -> Result<(), StoreError> {
+        self.as_ref().config_apply(guild, config).await
+    }
+
     async fn companions(&self, guild: u64) -> Result<Vec<TextCompanion>, StoreError> {
         self.as_ref().companions(guild).await
     }
@@ -137,6 +148,14 @@ impl RoomWrites for GatedHttp {
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.http.rename(channel, name).await
     }
+    async fn download_attachment(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RoomHttpError> {
+        self.http.download_attachment(url, max_bytes).await
+    }
+
     async fn create_companion(
         &self,
         plan: &TextChannelPlan,
