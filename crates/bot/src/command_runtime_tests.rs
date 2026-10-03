@@ -2360,6 +2360,7 @@ async fn gateway_keeps_checkpointing_and_heartbeating_during_channel_rest_work()
         Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
         store.clone(),
         None,
+        None,
         Some(Arc::clone(&runtime)),
         None,
         None,

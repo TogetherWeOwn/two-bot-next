@@ -346,21 +346,18 @@ impl InteractionRuntime {
             .store(id, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_bot_user_id(&self) -> u64 {
+    pub fn test_bot_user_id(&self) -> u64 {
         self.bot_user_id.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_application_id(&self) -> u64 {
+    pub fn test_application_id(&self) -> u64 {
         self.application_id
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Test-only lazy bot-user resolution: proves a READY-stored identity is
     /// retained without HTTP even when the identity lookup would fail.
-    #[cfg(test)]
-    pub(crate) async fn test_resolved_bot_user_id(&self) -> u64 {
+    pub async fn test_resolved_bot_user_id(&self) -> u64 {
         self.bot_user_id().await
     }
 

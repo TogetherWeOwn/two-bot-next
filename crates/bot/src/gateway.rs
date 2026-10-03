@@ -661,6 +661,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 )),
                             )
                         });
+                        let mut acknowledgement_held = false;
                         if let Some(dispatch) = dispatch {
                             // A cold voice RESUME is followed by IDENTIFY; READY connects.
                             connected = matches!(dispatch.event, Event::Ready(_) | Event::Resumed)
@@ -728,8 +729,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             // never-acknowledged: hold the cursor instead of
                             // silently passing it. The error path below releases
                             // a cold-resume wait and records the fence.
-                            let acknowledgement_held = if let Some(completion) = dispatch.completion
-                            {
+                            acknowledgement_held = if let Some(completion) = dispatch.completion {
                                 !handle.block_on(completion).unwrap_or_else(|_| {
                                     panic!("interaction drain failed; checkpoint unchanged")
                                 })
