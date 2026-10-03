@@ -155,6 +155,19 @@ pub fn response_for_slash(outcome: &SlashOutcome) -> Option<InteractionResponse>
     }
 }
 
+/// Component / modal-submit unknown reply: the control expired, so re-running
+/// the command for a fresh one is the fix.
+#[must_use]
+pub fn response_for_component(outcome: &ComponentOutcome) -> Option<InteractionResponse> {
+    match outcome {
+        ComponentOutcome::Unknown => Some(text_response(InteractionReply::new(
+            EXPIRED_COMPONENT_REPLY,
+            true,
+        ))),
+        ComponentOutcome::Handled { .. } | ComponentOutcome::Ignore => None,
+    }
+}
+
 /// Shared execution runtime: route once, acknowledge promptly, then run the
 /// registered feature through the shared REST executor. Unsupported features
 /// remain owned by their integration slices, not by a second dispatcher.

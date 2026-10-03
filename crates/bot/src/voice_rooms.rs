@@ -12,7 +12,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
@@ -2981,19 +2980,6 @@ pub trait VoiceEventSink: Send + Sync {
     /// A cold RESUME has replayed durably but cannot populate a fresh cache.
     /// The supervisor must IDENTIFY after committing RESUMED, not before replay.
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool;
-    /// Resolve the tracked room a member is currently in, if any. The shared
-    /// router asks this for `/kick`: a tracked-room target means the voice
-    /// sink owns the interaction (vote-kick) and the router must stay silent;
-    /// anything else keeps the existing moderation path. Boxed (not `impl
-    /// Future`) so the trait stays object-safe behind `Arc<dyn _>`.
-    fn kick_claim_room(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
-        let _ = (guild, member);
-        Box::pin(async { None })
-    }
 }
 
 /// The gateway shares only live evidence; the actor owns the mutable queue.
@@ -3517,14 +3503,6 @@ where
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.enabled && cache.current_user().is_none()
-    }
-
-    fn kick_claim_room(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
-        Box::pin(self.kick_room_of(guild, member))
     }
 }
 
@@ -4430,12 +4408,12 @@ pub fn parse_voice_command(interaction: &Interaction) -> Option<VoiceCommand> {
                 }
             }),
         }),
-        // The published shape may be ours (`member`, reason optional) or the
-        // moderation one (`target`, reason required): runtime dispatch, not
-        // the published shape, decides vote-kick versus moderation kick, so
-        // accept both. An unparsable shape stays silent here so the shared
-        // router keeps the interaction.
-        "kick" => parse_kick_target(&command.options).map(|target| VoiceCommand::Kick {
+        // The vote-kick publishes as `/votekick` (never the moderation
+        // `/kick`, which the shared router owns outright). Accept both the
+        // vote `member` option and the legacy `target` spelling so
+        // in-flight ballots keep parsing. An unparsable shape stays silent
+        // here so the shared router keeps the interaction.
+        "votekick" => parse_kick_target(&command.options).map(|target| VoiceCommand::Kick {
             target,
             reason: parse_kick_reason(&command.options),
         }),
@@ -4592,7 +4570,9 @@ impl VoiceCommand {
             Self::Export => "export",
             Self::Import { .. } => "import",
             // Ballots share the `kick` restriction surface: one role gate
-            // covers starting votes and casting them.
+            // covers starting votes and casting them. The key stays `kick`
+            // (stored access configs) even though the slash publishes as
+            // `/votekick`; `/access restrict command:kick` still gates votes.
             Self::Kick { .. } | Self::Ballot { .. } => "kick",
         }
     }
@@ -5784,16 +5764,11 @@ where
         invite_code: Option<&str>,
         inventory: Option<GuildInventory>,
     ) {
-        // Vote-kick owns its transport. A non-room `/kick` belongs to the
-        // moderation path, so return before any acknowledgement and let the
-        // router answer: deferring here would race it and hang on "thinking".
-        if let Some(VoiceCommand::Kick { target, .. }) = parse_voice_command(interaction) {
-            let Some(guild) = interaction_guild(interaction) else {
-                return;
-            };
-            if runtime.kick_room_of(guild, target).await.is_none() {
-                return;
-            }
+        // Vote-kick owns its transport: `/votekick` is always ours (the
+        // handler answers non-room targets with a refusal), so capture the
+        // single reply and send it exactly once. The moderation `/kick`
+        // never parses here, so the shared router answers it alone.
+        if let Some(VoiceCommand::Kick { .. }) = parse_voice_command(interaction) {
             let answered: Arc<Mutex<Option<InteractionResponse>>> = Arc::new(Mutex::new(None));
             let writer = Arc::clone(&answered);
             handle_voice_interaction_with(
@@ -5903,15 +5878,6 @@ where
 
     fn needs_bootstrap(&self, cache: &DefaultInMemoryCache) -> bool {
         self.runtime.needs_bootstrap(cache)
-    }
-
-    fn kick_claim_room(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-    ) -> Pin<Box<dyn Future<Output = Option<Snowflake>> + Send + '_>> {
-        let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move { runtime.kick_room_of(guild, member).await })
     }
 }
 

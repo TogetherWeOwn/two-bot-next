@@ -5,12 +5,12 @@
 //! Two layers, mirroring `funnel_replay.rs`:
 //!
 //! 1. `route_*` — in-memory twilight `Interaction`s through
-//!    [`route_interaction`]: all 27 builtins, gates-off refusals, permission
+//!    [`route_interaction`]: all 28 builtins, gates-off refusals, permission
 //!    refusals, custom rows, unknown names/ids, modal submits, and the
 //!    refusal-response wire shape.
 //! 2. `publish_*` — the router's complete set through the real
 //!    `twilight_http` bulk-set endpoint against the mock Discord double in
-//!    `common`: one request, all 28 names, guild-only, permission bits as
+//!    `common`: one request, all 29 names, guild-only, permission bits as
 //!    decimal strings. The REST executor ([TOG-10076]) owns the production
 //!    call; this proves the payload it will send.
 //!
@@ -60,6 +60,7 @@ fn all_on() -> RouterGates {
         automations: true,
         announcements: true,
         moderation: true,
+        voice: true,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
@@ -342,11 +343,11 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 30);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 32);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
-    assert_eq!(commands.len(), 27);
+    assert_eq!(commands.len(), 29);
     for command in commands {
         let row = command_permission(&command.name).unwrap();
         assert_eq!(
@@ -386,6 +387,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
     let cases: &[(&str, HandlerId)] = &[
         ("rank", HandlerId::Rank),
         ("leaderboard", HandlerId::Leaderboard),
+        ("help", HandlerId::Help),
         ("ban", HandlerId::Moderation(ModerationAction::Ban)),
         ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
         ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -418,7 +420,7 @@ fn every_section1_row_routes_to_its_registered_handler() {
         ("feed-remove", HandlerId::FeedRemove),
         ("feed-list", HandlerId::FeedList),
     ];
-    assert_eq!(cases.len(), 27, "all 27 builtins covered");
+    assert_eq!(cases.len(), 28, "all 28 handler-owned builtins covered");
     for (_, id) in cases {
         router.register(Box::new(Stub(*id)));
     }
@@ -434,6 +436,13 @@ fn every_section1_row_routes_to_its_registered_handler() {
             "/{name} has its registered stub",
         );
     }
+    // `/votekick` is voice-sink-owned: the core router yields silently so the
+    // shared runtime never answers with an unknown-command reply.
+    assert_eq!(
+        slash_outcome(&router, "votekick"),
+        SlashOutcome::Ignore,
+        "/votekick yields to the voice sink"
+    );
 }
 
 #[test]
@@ -468,6 +477,7 @@ fn disabled_and_ungated_wire_interactions_take_the_refusal_path() {
         automations: false,
         announcements: false,
         moderation: false,
+        voice: false,
         ..all_on()
     });
     for (name, refusal, text) in [
@@ -1021,7 +1031,7 @@ async fn followup_requires_a_valid_message_identity_without_retrying() {
 #[tokio::test]
 async fn publish_sends_the_complete_merged_set_once() {
     // Publish-once against the mock double through the real bulk-set
-    // endpoint: one request, all 28 names, no partial view.
+    // endpoint: one request, all 29 names, no partial view.
     let router = InteractionRouter::new(all_on());
     let defs = router
         .publish_set(&[CustomCommand {
@@ -1032,8 +1042,8 @@ async fn publish_sends_the_complete_merged_set_once() {
         .expect("full set assembles");
     assert_eq!(
         defs.len(),
-        28,
-        "2 core + 16 slice-2 + 9 moderation + 1 custom"
+        29,
+        "3 core + 16 slice-2 + 9 moderation + 1 custom"
     );
     let commands = publish_commands(&defs);
 
@@ -1065,10 +1075,11 @@ async fn publish_sends_the_complete_merged_set_once() {
         .iter()
         .map(|c| c["name"].as_str().expect("command has a name"))
         .collect();
-    assert_eq!(names.len(), 28, "no partial view");
+    assert_eq!(names.len(), 29, "no partial view");
     for expected in [
         "rank",
         "leaderboard",
+        "help",
         "attendance",
         "command",
         "schedule-list",

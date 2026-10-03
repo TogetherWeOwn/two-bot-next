@@ -63,6 +63,7 @@ use super::feature_commands::{
 };
 use super::moderation::{ModerationAction, ModerationGates};
 use super::onboarding::{GAME_SELECT_ID, SESSION_SELECT_ID};
+use super::voice_rooms::vote_kick_command;
 
 // --- component ids (legacy exact) --------------------------------------------
 
@@ -110,6 +111,7 @@ pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on
 pub enum HandlerId {
     Rank,
     Leaderboard,
+    Help,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
@@ -163,6 +165,10 @@ pub struct RouterGates {
     pub announcements: bool,
     /// `TWO_MODERATION=1` — moderation commands (#3–#11).
     pub moderation: bool,
+    /// `TWO_VOICE=1` — voice vote-kick command (`/votekick`). The rest of
+    /// the voice slice publishes separately (TOG-10119); only the vote-kick
+    /// rides this registry so the picker shows it next to `/kick`.
+    pub voice: bool,
     /// Ticket env triple set (category + staff role + panel channel).
     pub tickets: bool,
     /// Non-empty self-role panel catalogue (`TWO_SELF_ROLE_PANELS`).
@@ -181,6 +187,8 @@ pub struct RouterGates {
 pub struct SurfaceFlags {
     /// `TWO_COMMUNITY_SCORECARD=1` — scorecard `attendance` (#12).
     pub scorecard: bool,
+    /// `TWO_VOICE=1` — voice vote-kick (`/votekick`).
+    pub voice: bool,
     /// Ticket env triple set (category + staff role + panel channel).
     pub tickets: bool,
     /// Non-empty self-role panel catalogue (`TWO_SELF_ROLE_PANELS`).
@@ -206,6 +214,7 @@ impl RouterGates {
             automations: features.automations,
             announcements: features.announcements,
             moderation: moderation.enabled,
+            voice: surfaces.voice,
             tickets: surfaces.tickets,
             self_roles: surfaces.self_roles,
             onboarding_picker: surfaces.onboarding_picker,
@@ -392,6 +401,13 @@ impl InteractionRouter {
         }
     }
 
+    /// Voice vote-kick yields to the bot-crate voice sink, which answers the
+    /// interaction (vote, ballot or refusal). The core router stays silent so
+    /// the shared runtime never double-answers with an unknown-command reply.
+    fn is_voice_yield(name: &str) -> bool {
+        name == "votekick"
+    }
+
     /// Built-in §1 rows. `None` = not a builtin (caller falls through to the
     /// custom-command path).
     fn route_builtin(
@@ -471,6 +487,13 @@ impl InteractionRouter {
                 gate: RowGate::Always,
                 permission_refusal: None,
             },
+            // Next-only discovery surface (TOG-13622): always on, open to
+            // everyone, answered from the live publish set.
+            "help" => Row {
+                handler: HandlerId::Help,
+                gate: RowGate::Always,
+                permission_refusal: None,
+            },
             // Scorecard check-in gates `ManageEvents` both in the published
             // definition (`feature_commands.rs`) and at dispatch (`rsvp.rs`
             // `require_manage_events`): Discord picker hiding is not
@@ -524,6 +547,7 @@ impl InteractionRouter {
                 gate: RowGate::Announcements,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
             },
+            _ if Self::is_voice_yield(name) => return Some(SlashOutcome::Ignore),
             _ => return None,
         };
 
@@ -607,14 +631,15 @@ impl InteractionRouter {
             .chain(automation_commands().iter())
             .chain(announcement_commands().iter())
             .chain(super::moderation::moderation_commands().iter())
+            .chain(std::iter::once(&vote_kick_command()))
             .map(|def| def.name.clone())
             .collect()
     }
 
     /// Assemble the ONE complete guild command set for publish-on-ready
     /// (legacy `CommandRegistry::sync` order: community, automation,
-    /// announcement, moderation — then DB custom commands). First-wins dedupe
-    /// and the 100-command ceiling come from `merge_commands`.
+    /// announcement, moderation, voice vote-kick — then DB custom commands).
+    /// First-wins dedupe and the 100-command ceiling come from `merge_commands`.
     ///
     /// Two publish/routing agreements keep a published command executable:
     /// - custom rows publish only while automations are on. Every custom
@@ -623,12 +648,13 @@ impl InteractionRouter {
     /// - every built-in name is reserved even when its feature is off.
     ///   Dispatch matches builtins first (moderation included) and refuses
     ///   the disabled row, so a same-named custom command would publish yet
-    ///   never execute.
+    ///   never execute. `/votekick` is the exception: the bot-crate voice
+    ///   sink owns it, so the core router yields (`Ignore`) and stays silent.
     pub fn publish_set(
         &self,
         custom: &[CustomCommand],
     ) -> Result<Vec<CommandDefinition>, RegistryError> {
-        let mut extra: Vec<Vec<CommandDefinition>> = Vec::with_capacity(4);
+        let mut extra: Vec<Vec<CommandDefinition>> = Vec::with_capacity(5);
         if self.gates.scorecard {
             extra.push(vec![scorecard_attendance_command()]);
         }
@@ -640,6 +666,9 @@ impl InteractionRouter {
         }
         if self.gates.moderation {
             extra.push(super::moderation::moderation_commands());
+        }
+        if self.gates.voice {
+            extra.push(vec![vote_kick_command()]);
         }
         // `merge_commands` reserves the active builtins; the router additionally
         // withholds disabled builtin names (same precedence as dispatch) and
@@ -674,6 +703,7 @@ mod tests {
             automations: true,
             announcements: true,
             moderation: true,
+            voice: true,
             tickets: true,
             self_roles: true,
             onboarding_picker: true,
@@ -710,6 +740,7 @@ mod tests {
         let cases: &[(&str, HandlerId)] = &[
             ("rank", HandlerId::Rank),
             ("leaderboard", HandlerId::Leaderboard),
+            ("help", HandlerId::Help),
             ("ban", HandlerId::Moderation(ModerationAction::Ban)),
             ("tempban", HandlerId::Moderation(ModerationAction::TempBan)),
             ("kick", HandlerId::Moderation(ModerationAction::Kick)),
@@ -742,7 +773,7 @@ mod tests {
             ("feed-remove", HandlerId::FeedRemove),
             ("feed-list", HandlerId::FeedList),
         ];
-        assert_eq!(cases.len(), 27, "all 27 builtins covered");
+        assert_eq!(cases.len(), 28, "all 28 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -820,6 +851,7 @@ mod tests {
             automations: false,
             announcements: false,
             moderation: false,
+            voice: false,
             ..all_on()
         };
         let r = InteractionRouter::new(off);
@@ -1217,20 +1249,22 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 2 core + 1 scorecard + 8 automation + 7 announcement + 9 moderation
-        // + 1 custom = 28, in legacy publish order, guild-only throughout.
-        assert_eq!(set.len(), 28);
-        assert_eq!(&names[..3], ["rank", "leaderboard", "attendance"]);
+        // 3 core + 1 scorecard + 8 automation + 7 announcement + 9 moderation
+        // + 1 vote-kick + 1 custom = 30, in legacy publish order (vote-kick
+        // last among builtins), guild-only throughout.
+        assert_eq!(set.len(), 30);
+        assert_eq!(&names[..4], ["rank", "leaderboard", "help", "attendance"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
         assert_eq!(
-            &names[18..27],
+            &names[19..28],
             [
                 "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown",
                 "unlock",
             ]
         );
-        assert_eq!(names[27], "faq");
+        assert_eq!(names[28], "votekick");
+        assert_eq!(names[29], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1241,11 +1275,12 @@ mod tests {
             automations: false,
             announcements: false,
             moderation: false,
+            voice: false,
             ..all_on()
         });
         let set = off.publish_set(&[]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
     }
 
     #[test]
@@ -1255,6 +1290,7 @@ mod tests {
             automations: false,
             announcements: false,
             moderation: false,
+            voice: false,
             ..all_on()
         });
         let row = || CustomCommand {
@@ -1266,7 +1302,7 @@ mod tests {
         // invocation refuses at dispatch, so publishing burns the ceiling.
         let set = off.publish_set(&[row()]).expect("core-only set");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard"]);
+        assert_eq!(names, ["rank", "leaderboard", "help"]);
         // Over-limit stored catalogs no longer fail the publish either.
         let crowded: Vec<_> = (0..99)
             .map(|i| CustomCommand {
@@ -1276,7 +1312,7 @@ mod tests {
             })
             .collect();
         let set = off.publish_set(&crowded).expect("core-only set");
-        assert_eq!(set.len(), 2);
+        assert_eq!(set.len(), 3);
     }
 
     #[test]
@@ -1288,11 +1324,13 @@ mod tests {
             ("moderation", "ban"),
             ("announcements", "lfg"),
             ("scorecard", "attendance"),
+            ("voice", "votekick"),
         ] {
             let mut gates = all_on();
             match gate {
                 "moderation" => gates.moderation = false,
                 "announcements" => gates.announcements = false,
+                "voice" => gates.voice = false,
                 _ => gates.scorecard = false,
             }
             let r = InteractionRouter::new(gates);
@@ -1329,5 +1367,38 @@ mod tests {
         );
         assert!(!gates.automations && gates.announcements && !gates.moderation);
         assert!(gates.scorecard && !gates.tickets && gates.onboarding_picker);
+    }
+
+    #[test]
+    fn votekick_publishes_only_with_voice_and_yields_to_the_voice_sink() {
+        // Gated on: the picker shows `/votekick` next to `/kick` while
+        // `TWO_VOICE=1`; the core router stays silent and the bot-crate
+        // voice sink answers.
+        let set = router().publish_set(&[]).expect("voice-on set assembles");
+        assert!(set.iter().any(|d| d.name == "votekick"));
+        let off = InteractionRouter::new(RouterGates {
+            voice: false,
+            ..all_on()
+        });
+        let set = off.publish_set(&[]).expect("voice-off set assembles");
+        assert!(!set.iter().any(|d| d.name == "votekick"));
+        // Yield holds in and out of the configured guild and with the gate
+        // off: silence, never a refusal or an unknown-command reply.
+        for router in [&router(), &off] {
+            for guild in [Some(GUILD), Some(9999), None] {
+                assert_eq!(
+                    router.route_slash(&ctx("votekick", guild, Some(u64::MAX))),
+                    SlashOutcome::Ignore,
+                    "votekick yields"
+                );
+            }
+        }
+        // `/kick` keeps its moderation route untouched.
+        assert_eq!(
+            router().route_slash(&ctx("kick", Some(GUILD), Some(u64::MAX))),
+            SlashOutcome::Handled {
+                handler: HandlerId::Moderation(ModerationAction::Kick)
+            }
+        );
     }
 }

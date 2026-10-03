@@ -1432,7 +1432,7 @@ fn voice_command_set_is_gated_on_two_voice() {
             "logging",
             "export",
             "import",
-            "kick"
+            "votekick"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -4804,7 +4804,7 @@ fn guildless_component_interaction(custom_id: &str) -> Interaction {
 fn parse_kick_extracts_member_and_reason() {
     let interaction = voice_interaction(
         Some(command_data(
-            "kick",
+            "votekick",
             vec![
                 user_option("member", 303),
                 command_option("reason", "too loud"),
@@ -4825,7 +4825,7 @@ fn parse_kick_extracts_member_and_reason() {
 #[test]
 fn parse_kick_accepts_moderation_shape_without_reason() {
     let interaction = voice_interaction(
-        Some(command_data("kick", vec![user_option("target", 303)])),
+        Some(command_data("votekick", vec![user_option("target", 303)])),
         None,
         true,
     );
@@ -4841,11 +4841,27 @@ fn parse_kick_accepts_moderation_shape_without_reason() {
 #[test]
 fn parse_kick_without_user_stays_silent_for_the_router() {
     let interaction = voice_interaction(
-        Some(command_data("kick", vec![command_option("reason", "x")])),
+        Some(command_data(
+            "votekick",
+            vec![command_option("reason", "x")],
+        )),
         None,
         true,
     );
     assert_eq!(parse_voice_command(&interaction), None);
+}
+
+#[test]
+fn parse_legacy_kick_stays_silent_for_the_moderation_router() {
+    // The moderation `/kick` never parses as a voice command: the shared
+    // router answers it alone, so the voice sink must not double-answer.
+    for options in [
+        vec![user_option("target", 303)],
+        vec![user_option("target", 303), command_option("reason", "spam")],
+    ] {
+        let interaction = voice_interaction(Some(command_data("kick", options)), None, true);
+        assert_eq!(parse_voice_command(&interaction), None);
+    }
 }
 
 #[test]
@@ -4917,7 +4933,7 @@ fn kick_sink_interaction(target: u64, initiator: u64) -> Interaction {
     with_user(
         voice_interaction(
             Some(command_data(
-                "kick",
+                "votekick",
                 vec![
                     user_option("member", target),
                     command_option("reason", "too loud"),
@@ -4997,12 +5013,15 @@ async fn sink_claimed_kick_answers_public_ballot_without_defer() {
 }
 
 #[tokio::test]
-async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+async fn sink_unclaimed_votekick_answers_ephemeral_refusal() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let replies = Replies::new(trace.clone());
-    // No actor, no rooms: a moderation-shaped target must produce no ack at
-    // all here, otherwise the defer races (and loses to) the router answer.
+    // No actor, no rooms: `/votekick` is voice-owned, so the sink answers
+    // the non-room target with an ephemeral refusal exactly once. Silence
+    // here would surface as "interaction is no longer available"; the
+    // moderation `/kick` never parses in the sink, so the router answers it
+    // alone and there is no defer race.
     VoiceResponder::respond_with(
         &runtime,
         &replies,
@@ -5011,6 +5030,18 @@ async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
         None,
     )
     .await;
-    assert!(trace.lock().unwrap().is_empty());
-    assert!(replies.completed.lock().unwrap().is_empty());
+    assert_eq!(*trace.lock().unwrap(), ["respond"]);
+    let completed = replies.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0].kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let data = completed[0].data.as_ref().expect("refusal body");
+    assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+    let content = data.content.as_deref().unwrap_or_default();
+    assert!(
+        content.contains("not in a temporary voice room"),
+        "{content}"
+    );
 }

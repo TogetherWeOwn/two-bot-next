@@ -218,6 +218,7 @@ fn gates() -> RouterGates {
         automations: true,
         announcements: true,
         moderation: false,
+        voice: false,
         tickets: false,
         self_roles: false,
         onboarding_picker: false,
