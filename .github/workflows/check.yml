@@ -274,6 +274,7 @@ jobs:
         run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump
 
       - name: Backup publication faults (actual CLI, dedicated CI service database)
+        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_publication_ci
           TWO_BOT_TEST_BACKUP_BIN: ${{ github.workspace }}/target/debug/two-bot
@@ -451,6 +452,7 @@ jobs:
         run: timeout 60s cargo test -p two-bot --locked --test alive -- --ignored --nocapture
 
       - name: Consecutive retained restore drills (actual CLI, CI service only)
+        if: needs.job-inputs.outputs.rust != 'false'
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
@@ -462,6 +464,9 @@ jobs:
     name: moderation db
     permissions:
       contents: read
+    needs: [job-inputs]
+    # Skip when the selector sees no Rust inputs (not a required check).
+    if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'moderation-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 15
@@ -486,12 +491,15 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        if: needs.job-inputs.outputs.rust != 'false'
         with:
           toolchain: stable
           components: clippy
       - name: Check feature-gated moderation store
+        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test SQL ledger on ephemeral Postgres
+        if: needs.job-inputs.outputs.rust != 'false'
         run: cargo test -p two-bot-core --features db --locked --test member_moderation_db -- --ignored
 
   parity-docs:
