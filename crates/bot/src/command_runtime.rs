@@ -267,7 +267,8 @@ impl CommandRuntime {
     }
 
     /// The one process executor (admission lane and pacing included); other
-    /// runtimes render through a clone, never a private client.
+    /// runtimes (onboarding, automod) render through a clone, never a private
+    /// client.
     pub fn executor(&self) -> ActionExecutor {
         self.executor.clone()
     }
@@ -322,12 +323,6 @@ impl CommandRuntime {
     #[cfg(test)]
     pub(crate) async fn suppress_registry_for_test(&self) {
         *self.registry_synced.lock().await = true;
-    }
-
-    /// The shared REST executor, for runtimes (automod) that must use it
-    /// rather than build a private client.
-    pub(crate) fn executor(&self) -> ActionExecutor {
-        self.executor.clone()
     }
 
     pub(crate) fn start_tickets(&self) -> Option<crate::ticket_runtime::TicketSupervisor> {
