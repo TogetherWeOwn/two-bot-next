@@ -5,6 +5,7 @@
 ### Added
 
 - Enforce the live-activation identity and capability fence at boot: derive the application id from the bot token (never config), permit every capability only for the staging guild/application pair, and restrict the live pair to the reviewed `LIVE_CLEARED_CAPABILITIES` allowlist (shipped: `self_roles` only). Refused capabilities validate no feature gates, register no commands, construct no runtime, request no privileged intents, and log one structured refusal line while the process stays up for cleared surfaces. The tickets runtime and its ticket-driven `MESSAGE_CONTENT` request land under the same default-deny rule.
+- Register an immediate-first, non-overlapping feed poll job with the existing owned job supervisor, pinned HTTPS connector, shared REST executor and fenced SQLx ledger. Preserve exact string nonces (including decimal-looking values), recover pending deliveries even after items leave the feed, rotate the bounded recovery queue without starving XML-present items, and surface bounded-history misses or uncertain send/completion receipts as recovery-required rather than reposting. Announcements remain off by default; no deployment or activation is included.
 - Add self-role reads and singular role operations to the shared REST executor:
   authoritative member/bot/role/channel policy snapshots, fetched reaction-message
   identity, paced single-attempt operations with pre/post ownership checks and
@@ -155,6 +156,7 @@
 
 ### Fixed
 
+- Support the exact authenticated-user REST read used by feed history reconciliation, and preserve the uncompressed runtime-image budget when Docker's containerd store also accounts for compressed blobs.
 - Retain unsent onboarding welcome/goodbye payloads when successful REST responses contain inconsistent role snapshots or unusable channel evidence, while preserving proven-denial skips. Resolve only submitted session destinations so an unavailable unselected room cannot block valid routing. Add mock restart and selected/unselected regressions; current-head execution and independent review remain pending.
 - Synchronize the interrupted onboarding callback restart fixture on its first durable claim, not early HTTP arrival. Keep token-free receipts, exact attempt counts, replay fencing and fresh-reselection assertions unchanged.
 - Reconcile onboarding with the shared sticky/feed command runtime and outbound message safety. Component posts accept only typed no-mention/one-member welcome policies, neutralize mass mentions and validate effective payloads; original-response edits retain shared scalar-safe truncation and clearing semantics. Preserve independent gateway/feature pools, bounded ingress and worker admission. Add focused mock-wire regressions; preceding ingress repair passed required CI, while the complete reconciliation and independent review remain pending.

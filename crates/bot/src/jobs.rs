@@ -23,6 +23,8 @@ pub enum ErrorClass {
     Configuration,
     Timeout,
     Panic,
+    Feed,
+    RecoveryRequired,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
