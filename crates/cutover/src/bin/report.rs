@@ -16,12 +16,17 @@
 //! shared durable send admission (one lane claim per request, same as every
 //! other REST-calling operator tool), while report data itself is never written.
 //!
-//! Usage: report voice-reconcile --guild <snowflake> [--days <N>] [--seed]
-//!        report leave-gap --guild <snowflake> [--days <N>] [--floor <ISO>]
-//!          [--discord-base <url>] [--seed]
-//!   Env: TWO_DATABASE_URL; leave-gap live mode also needs DISCORD_TOKEN (or
-//!   DISCORD_BOT_TOKEN). Exit 0 on a report (gaps are findings, not failure),
-//!   1 on database/roster failure, 2 on usage errors, 3 on a bad --floor.
+//! Usage:
+//!
+//! ```text
+//! report voice-reconcile --guild <snowflake> [--days <N>] [--seed]
+//! report leave-gap --guild <snowflake> [--days <N>] [--floor <ISO>]
+//!   [--discord-base <url>] [--seed]
+//! ```
+//!
+//! Env: TWO_DATABASE_URL; leave-gap live mode also needs DISCORD_TOKEN (or
+//! DISCORD_BOT_TOKEN). Exit 0 on a report (gaps are findings, not failure),
+//! 1 on database/roster failure, 2 on usage errors, 3 on a bad --floor.
 
 // Operator CLI reports intentionally use stdout; runtime/library modules do not.
 #![allow(clippy::print_stdout)]

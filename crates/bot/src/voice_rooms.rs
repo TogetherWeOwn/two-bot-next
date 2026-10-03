@@ -1670,7 +1670,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
 
     /// Send at most one due error notice per call, per the guild's
     /// `/logging` settings. Each failure is noticed once plus two repeats at
-    /// least [`NOTICE_REPEAT_INTERVAL_MS`] apart, then stays listed in
+    /// least `NOTICE_REPEAT_INTERVAL_MS` apart, then stays listed in
     /// `/setup` but silent. Every delivery attempt counts, delivered or not,
     /// so an unreachable guild cannot cause unbounded REST traffic. Returns
     /// whether an attempt was made.
@@ -2815,7 +2815,7 @@ pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
 
 /// Per-guild actor registry. Actors spawn lazily on the first complete
 /// snapshot and exit when their guild leaves (sender dropped) or their store
-/// load fails (respawned on the next event via [`UnboundedSender::is_closed`]).
+/// load fails (respawned on the next event via `UnboundedSender::is_closed`).
 pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,

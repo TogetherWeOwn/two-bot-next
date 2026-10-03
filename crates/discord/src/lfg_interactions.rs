@@ -325,7 +325,7 @@ impl LfgInteractions {
 }
 
 /// Legacy message shape. Closed posts remove the select; user references never ping.
-/// Component contract: https://docs.discord.com/developers/components/reference#string-select
+/// Component contract: <https://docs.discord.com/developers/components/reference#string-select>
 pub fn message_payload(post: &LfgPost, roles: &[LfgRole], signups: &[LfgSignup]) -> Value {
     let options = lfg::lfg_select_options(post.status, roles, signups);
     let components = if options.is_empty() {

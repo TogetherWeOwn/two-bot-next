@@ -2340,7 +2340,7 @@ impl ActionExecutor {
     /// No automatic retry: send-then-record callers must not hide ambiguity.
     /// Only the domain-authorized welcome recipient may notify; arbitrary parse,
     /// role, multi-user and reply policies cannot enter this boundary.
-    /// Source: https://docs.rs/twilight-http/0.17.1/twilight_http/request/channel/message/struct.CreateMessage.html
+    /// Source: <https://docs.rs/twilight-http/0.17.1/twilight_http/request/channel/message/struct.CreateMessage.html>
     pub async fn post_channel_message(
         &self,
         channel_id: &str,
