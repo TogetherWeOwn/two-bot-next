@@ -1,4 +1,4 @@
-//! Gateway recording for the staff audit sink (TOG-12241).
+//! Gateway recording for the staff audit sink.
 //!
 //! [`translate`] runs on the serial dispatch worker before the funnel mutates
 //! the cache: member role/nickname deltas and voice channel boundaries need

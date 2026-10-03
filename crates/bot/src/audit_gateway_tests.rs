@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-//! Gateway audit recording acceptance (TOG-12241): fixtures for member
+//! Gateway audit recording acceptance: fixtures for member
 //! role/nick changes, voice join/leave/move, raw message edit/delete and the
 //! 14 audit-log action classes produce stored rows matching the core/legacy
 //! contracts. No bodies, names or reasons are stored, and a store failure is
