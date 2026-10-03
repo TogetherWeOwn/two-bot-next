@@ -45,6 +45,14 @@ impl std::fmt::Debug for PreparedRsvp {
     }
 }
 
+/// Slash commands owned by the RSVP path. A refusal for any other command must
+/// be answered by the shared routed path: this path ignores those names, so
+/// leaving the refusal here would drop the denial silently.
+#[must_use]
+pub fn is_rsvp_command(name: &str) -> bool {
+    matches!(name, "rsvp" | "rsvp-attendance" | "attendance")
+}
+
 pub async fn prepare_rsvp_interaction(
     router: &InteractionRouter,
     executor: &ActionExecutor,
@@ -58,7 +66,7 @@ pub async fn prepare_rsvp_interaction(
     else {
         return Ok(ignored());
     };
-    if !matches!(name.as_str(), "rsvp" | "rsvp-attendance" | "attendance") {
+    if !is_rsvp_command(name.as_str()) {
         return Ok(ignored());
     }
     if let Some(response) = response_for_slash(&outcome) {

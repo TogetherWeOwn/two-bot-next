@@ -200,6 +200,20 @@ impl InteractionRuntime {
         ) {
             return self.handle_routed(interaction, routed).await;
         }
+        // A refusal for a non-RSVP command (LFG permission or feature gates)
+        // must still be answered. The RSVP path ignores those names, so it
+        // would drop the denial silently; RSVP refusals stay on the RSVP
+        // path, which answers the identical refusal.
+        let refusal_for_other = match &routed {
+            RoutedInteraction::Slash {
+                name,
+                outcome: SlashOutcome::Refuse { .. },
+            } => !crate::rsvp::is_rsvp_command(name),
+            _ => false,
+        };
+        if refusal_for_other {
+            return self.handle_routed(interaction, routed).await;
+        }
         crate::rsvp::handle_rsvp_interaction(
             &self.router,
             &self.pool,
