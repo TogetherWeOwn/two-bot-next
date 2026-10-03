@@ -41,6 +41,7 @@ mod preflight;
 mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
+mod restore_drill;
 mod schedule_runtime;
 mod scheduled_jobs;
 mod server;

@@ -8,6 +8,18 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use two_bot_core::database_roles;
+use two_bot_core::member_moderation::{AuditRow, ClaimState, MemberModerationStore, StoreError};
+use two_bot_core::member_moderation_store::PgMemberModerationStore;
+
+const MEMBER_GRANTS: &str =
+    include_str!("../../cutover/migrations/0114_moderation_member_runtime_grants.sql");
+const MEMBER_TABLES: [&str; 5] = [
+    "moderation_warnings",
+    "moderation_scheduled_unbans",
+    "moderation_member_bans",
+    "moderation_audit",
+    "moderation_idempotency",
+];
 
 // Parallel tests share one pid and can read the same clock tick.
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
@@ -193,6 +205,11 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     for migration in [
         include_str!("../../cutover/migrations/0001_funnel.sql"),
         include_str!("../../cutover/migrations/0002_leveling.sql"),
+        include_str!("../../cutover/migrations/0110_moderation_member.sql"),
+        include_str!("../../cutover/migrations/0111_moderation_ban_ownership.sql"),
+        include_str!("../../cutover/migrations/0112_moderation_legacy_timestamps.sql"),
+        include_str!("../../cutover/migrations/0113_moderation_unban_retry_order.sql"),
+        include_str!("../../cutover/migrations/0114_moderation_member_runtime_grants.sql"),
         include_str!("../../cutover/migrations/0120_channel_moderation.sql"),
         include_str!("../../cutover/migrations/0121_channel_claim_generation.sql"),
         include_str!("../../cutover/migrations/0122_channel_lockdown_generation.sql"),
@@ -234,7 +251,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         include_str!("../../cutover/migrations/0361_discord_send_admission.sql"),
         include_str!("../../cutover/migrations/0362_gateway_onboarding_jobs.sql"),
     ] {
-        sqlx::raw_sql(migration).execute(pool).await?;
+        // Never grant a shared cluster role: isolate names even in migrations.
+        execute(pool, isolated(migration, roles)).await?;
     }
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
         .execute(pool)
@@ -257,6 +275,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         findings(pool, roles).await?.is_empty(),
         "clean plan drifted",
     )?;
+
+    exercise_member_grants(pool, roles).await?;
+    exercise_member_store(pool, &roles[1]).await?;
 
     // Effective ACLs include PUBLIC/inherited access. Schema denial alone is
     // not proof of no reader sequence or function grant. The CAS sequence is
@@ -473,6 +494,174 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "restored matrix drifted",
     )?;
     Ok(())
+}
+
+async fn exercise_member_grants(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
+    let (migrator, runtime, reader) = (&roles[0], &roles[1], &roles[2]);
+    // Bootstrap above ran 0114 without groups. Also prove an existing deployment
+    // is repaired by the additive migration alone, executed by the object owner.
+    for table in MEMBER_TABLES {
+        execute(pool, format!("REVOKE ALL ON public.{table} FROM {runtime}")).await?;
+    }
+    execute(
+        pool,
+        format!(
+            "REVOKE ALL ON SEQUENCE public.moderation_member_bans_generation_seq FROM {runtime}"
+        ),
+    )
+    .await?;
+    require(
+        !findings(pool, roles).await?.is_empty(),
+        "missing member grants were not reported",
+    )?;
+    for _ in 0..2 {
+        let mut tx = pool.begin().await?;
+        let sql = format!(
+            "SET LOCAL ROLE {migrator}; {}",
+            isolated(MEMBER_GRANTS, roles)
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        require(
+            findings(pool, roles).await?.is_empty(),
+            "member grant migration drifted",
+        )?;
+    }
+    as_role(pool, runtime, "SELECT nextval('public.moderation_member_bans_generation_seq'); SELECT last_value FROM public.moderation_member_bans_generation_seq").await?;
+    for table in MEMBER_TABLES {
+        denied(
+            pool,
+            runtime,
+            &format!("ALTER TABLE public.{table} ADD COLUMN forbidden int"),
+        )
+        .await?;
+        denied(pool, runtime, &format!("TRUNCATE public.{table}")).await?;
+        denied(pool, runtime, &format!("DROP TABLE public.{table}")).await?;
+        denied(pool, reader, &format!("SELECT * FROM public.{table}")).await?;
+    }
+    // Backup/restore sequence resets and owner-level DDL remain administrative;
+    // runtime SELECT is intentionally allowed, not a blanket ban on data export.
+    for sql in [
+        "SELECT setval('public.moderation_member_bans_generation_seq', 1)",
+        "ALTER SEQUENCE public.moderation_member_bans_generation_seq RESTART WITH 1",
+        "SELECT * FROM public._sqlx_migrations",
+    ] {
+        denied(pool, runtime, sql).await?;
+    }
+    for sql in [
+        "SELECT nextval('public.moderation_member_bans_generation_seq')",
+        "SELECT last_value FROM public.moderation_member_bans_generation_seq",
+        "SELECT setval('public.moderation_member_bans_generation_seq', 1)",
+    ] {
+        denied(pool, reader, sql).await?;
+    }
+    denied(pool, runtime, &format!("GRANT {migrator} TO {reader}")).await?;
+    denied(
+        pool,
+        runtime,
+        &format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {migrator} GRANT SELECT ON TABLES TO {runtime}"
+        ),
+    )
+    .await?;
+    // PostgreSQL may warn and no-op, rather than error, when GRANT lacks a
+    // grant option. Check the effective result inside the same transaction.
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL ROLE {runtime}; GRANT SELECT ON public.moderation_warnings TO {reader}; GRANT USAGE ON SEQUENCE public.moderation_member_bans_generation_seq TO {reader}"
+    ))).execute(&mut *tx).await?;
+    let cannot_delegate: bool = sqlx::query_scalar(
+        "SELECT NOT has_table_privilege($1::text, 'public.moderation_warnings', 'SELECT')
+         AND NOT has_sequence_privilege($1::text, 'public.moderation_member_bans_generation_seq', 'USAGE')",
+    ).bind(reader).fetch_one(&mut *tx).await?;
+    tx.rollback().await?;
+    require(cannot_delegate, "runtime delegated member privileges")?;
+    // Named sequence coverage survives detachment, and effective PUBLIC/reader
+    // privileges or grant options cannot hide behind schema denial.
+    for (change, expected) in [
+        (format!("REVOKE SELECT ON public.moderation_warnings FROM {runtime}"), "missing table privilege:"),
+        (format!("GRANT SELECT ON public.moderation_member_bans TO {runtime} WITH GRANT OPTION"), "unexpected grant option:"),
+        (format!("ALTER SEQUENCE public.moderation_member_bans_generation_seq OWNED BY NONE; REVOKE USAGE ON SEQUENCE public.moderation_member_bans_generation_seq FROM {runtime}"), "sequence privilege differs:"),
+        (format!("GRANT UPDATE ON SEQUENCE public.moderation_member_bans_generation_seq TO {runtime}"), "sequence privilege differs:"),
+        (format!("GRANT USAGE, SELECT ON SEQUENCE public.moderation_member_bans_generation_seq TO {reader}"), "sequence privilege differs:"),
+        ("GRANT USAGE ON SEQUENCE public.moderation_member_bans_generation_seq TO PUBLIC".to_owned(), "sequence privilege differs:"),
+    ] {
+        require(transactional_drift(pool, roles, &change).await?.iter().any(|f| f.starts_with(expected)), &format!("missed member drift: {change}"))?;
+    }
+    require(
+        findings(pool, roles).await?.is_empty(),
+        "member probes left drift",
+    )
+}
+
+fn store_error(_: StoreError) -> sqlx::Error {
+    sqlx::Error::InvalidArgument("runtime member store operation failed".to_owned())
+}
+
+async fn exercise_member_store(pool: &PgPool, runtime: &str) -> Result<(), sqlx::Error> {
+    // Every connection uses the restricted group; store-owned transactions must
+    // not accidentally execute through the scratch database's admin pool.
+    let setup = format!("SET ROLE {runtime}; SET search_path = public");
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _| {
+            let sql = setup.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await?;
+    let result = async {
+        let store = PgMemberModerationStore::new(runtime_pool.clone(), "roles-member");
+        let now = "2026-01-01T00:00:00Z";
+        let due = "2026-01-01T00:01:00Z";
+        require(matches!(store.claim("roles-member", "warn", "warn", "hash", now).await.map_err(store_error)?, ClaimState::Claimed), "runtime did not claim")?;
+        store.add_warning("roles-warning", "roles-member", "member", "actor", "probe", "roles-warning", now).await.map_err(store_error)?;
+        store.record_audit(&AuditRow {
+            request_id: "roles-warning".to_owned(),
+            guild_id: "roles-member".to_owned(),
+            actor_id: "actor".to_owned(),
+            action: "warn",
+            target_id: Some("member".to_owned()),
+            reason: "probe".to_owned(),
+            outcome: "accepted",
+            idempotency_key: "warn".to_owned(),
+            metadata_json: "{}".to_owned(),
+        }).await.map_err(store_error)?;
+        store.complete("roles-member", "warn", "accepted", "{}", now).await.map_err(store_error)?;
+        require(matches!(store.claim("roles-member", "warn", "warn", "hash", now).await.map_err(store_error)?, ClaimState::Replayed { .. }), "runtime did not replay")?;
+        store.claim("roles-member", "release", "warn", "hash", now).await.map_err(store_error)?;
+        store.release("roles-member", "release").await.map_err(store_error)?;
+        let attempt = store.stage_unban("roles-member", "member", due, "probe", "roles-expiry", now).await.map_err(store_error)?;
+        require(attempt.generation > 0, "runtime did not allocate ban generation")?;
+        store.confirm_ban_attempt("roles-member", "member", "roles-expiry", attempt, now).await.map_err(store_error)?;
+        store.activate_staged_unban("roles-member", "member", "roles-expiry", now).await.map_err(store_error)?;
+        let jobs = store.claim_due_unbans("roles-member", due, 1).await.map_err(store_error)?;
+        require(jobs.len() == 1, "runtime did not claim expiry")?;
+        let job = &jobs[0];
+        require(store.owns_unban_claim(&job.request_id, &job.claim_token).await.map_err(store_error)?, "runtime lost expiry claim")?;
+        store.requeue_unban(&job.request_id, &job.claim_token).await.map_err(store_error)?;
+        let jobs = store.claim_due_unbans("roles-member", due, 1).await.map_err(store_error)?;
+        require(jobs.len() == 1, "runtime did not reclaim expiry")?;
+        store.complete_unban(&jobs[0].request_id, &jobs[0].claim_token).await.map_err(store_error)?;
+        // The store exercised INSERT/SELECT/UPDATE and claim release DELETE.
+        // Verify remaining CRUD on every ledger, without weakening its schema.
+        sqlx::raw_sql("UPDATE public.moderation_warnings SET reason = 'updated' WHERE guild_id = 'roles-member'; UPDATE public.moderation_audit SET reason = 'updated' WHERE guild_id = 'roles-member'").execute(&runtime_pool).await?;
+        for table in MEMBER_TABLES {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM public.{table} WHERE guild_id = 'roles-member'"))).fetch_one(&runtime_pool).await?;
+            require(count == 1, "runtime member ledger CRUD differed")?;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DELETE FROM public.{table} WHERE guild_id = 'roles-member'"))).execute(&runtime_pool).await?;
+        }
+        Ok(())
+    }.await;
+    runtime_pool.close().await;
+    result
 }
 
 async fn automod_runtime_role_regression(
