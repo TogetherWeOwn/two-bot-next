@@ -254,6 +254,24 @@ impl PgRoomStore {
             != 0)
     }
 
+    /// Every companion tracked in a guild, for worker load and startup
+    /// reconciliation (V9c): each row carries its creation-time settings
+    /// snapshot, so later `/textchannels` changes never alter it.
+    pub async fn companions_in_guild(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<Vec<TextCompanion>, sqlx::Error> {
+        sqlx::query(
+            "SELECT * FROM voice_text_companions WHERE guild_id = $1 ORDER BY room_channel_id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(decode_companion)
+        .collect()
+    }
+
     pub async fn companion_for(
         &self,
         guild_id: Snowflake,
