@@ -685,6 +685,57 @@ impl RoomHttp {
         }
     }
 
+    /// Post an operator notice to a channel. Only the given role (if any) can
+    /// be pinged: `allowed_mentions` is otherwise empty, so notice text can
+    /// never ping members, `@everyone` or other roles.
+    pub async fn post_notice(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        mention_role: Option<Snowflake>,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let mut text = String::new();
+        let mut mentions = AllowedMentions::default();
+        if let Some(role) = mention_role.filter(|role| *role != 0) {
+            text.push_str(&format!("<@&{role}> "));
+            mentions.roles.push(Id::new(role));
+        }
+        text.push_str(content);
+        let request = self
+            .http
+            .create_message(Id::new(channel_id))
+            .content(&text)
+            .allowed_mentions(Some(&mentions))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send(request, || true).await?;
+        Ok(())
+    }
+
+    /// Open (or reuse) the DM channel with `user_id`, then post the notice
+    /// with no mentions allowed.
+    pub async fn direct_notice(
+        &self,
+        user_id: Snowflake,
+        content: &str,
+    ) -> Result<(), RoomHttpError> {
+        if user_id == 0 {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = self
+            .http
+            .create_private_channel(Id::new(user_id))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        let body = self.send(request, || true).await?;
+        let channel: Channel =
+            serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)?;
+        self.post_notice(channel.id.get(), content, None).await
+    }
+
     pub async fn rename_room(
         &self,
         channel_id: Snowflake,
