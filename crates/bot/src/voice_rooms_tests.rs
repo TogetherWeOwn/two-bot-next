@@ -2981,7 +2981,6 @@ use twilight_model::{
         message_component::MessageComponentInteractionData, InteractionDataResolved,
     },
     channel::message::component::ComponentType,
-    user::User,
 };
 use two_bot_core::voice_config as config_codec;
 
