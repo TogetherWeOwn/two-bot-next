@@ -399,12 +399,25 @@ fn all_fourteen_audit_log_actions_produce_uncorrelated_rows() {
 }
 
 #[test]
+/// Marker MAC key from the public, non-production vectors shared with the
+/// core MAC acceptance tests; no operational key is embedded in test source.
+fn fixture_mac_key() -> String {
+    let json: serde_json::Value = serde_json::from_str(include_str!(
+        "../../core/tests/fixtures/moderation-mac.json"
+    ))
+    .expect("public MAC vector fixture");
+    json.as_array().expect("vector list")[0]["secret"]
+        .as_str()
+        .expect("fixture vector key")
+        .to_owned()
+}
+
 fn correlated_audit_log_row_matches_moderation_service_shape() {
     let cache = build_cache();
-    let secret = "fixture-secret-for-correlation";
+    let secret = fixture_mac_key();
     let bot = BOT.to_string();
     let reason = two_bot_core::mac::moderation_audit_reason(
-        Some(secret),
+        Some(secret.as_str()),
         &guild_str(),
         "idem-1",
         "moderation.ban",
