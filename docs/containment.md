@@ -104,6 +104,9 @@ concurrent incident serialization. The ignored `containment_store` suite
 (agent-testdb or the CI Postgres service) covers exactly-once audit-ID claims
 under concurrency, serialized heat, one concurrent incident per guild/executor,
 the in-transaction blocker recheck, dispositions across a reconnect and an
-upgrade from the legacy 0015 schema. Gateway hooks, executor delivery, startup
-gates, real HTTP, alert delivery and staging soak acceptance remain
-unimplemented and untested.
+upgrade from the legacy 0015 schema. Gateway hooks, executor delivery,
+startup gates and alert delivery are wired by `crates/bot/src/containment_runtime.rs`
+(audit-entry observer seam, fenced construction, verified application identity,
+dry-run-default plans, armed-only removals, shared-executor staff posts) with
+mock-Discord plus ignored agent-testdb worker tests; staging soak acceptance
+remains unimplemented and untested.
