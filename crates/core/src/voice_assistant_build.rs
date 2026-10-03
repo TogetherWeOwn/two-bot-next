@@ -45,6 +45,8 @@
 //! calling, the Apply/Refine/Cancel flow around the returned build, and
 //! publish wiring alongside the V1 `voice_command_set` path.
 
+use std::future::Future;
+
 use crate::voice_assistant::AssistantConfig;
 use crate::voice_assistant_request::{
     parse_reply_each, AssistantRequest, ModelName, ModelNameError, ReplyError, TemplateIssue,
