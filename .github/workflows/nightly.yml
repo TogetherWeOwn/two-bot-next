@@ -90,6 +90,8 @@ jobs:
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
+      - name: Guarded fixture routing and doc references (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-12)
         with:
@@ -112,22 +114,24 @@ jobs:
           createdb -h agent-testdb -U agent_test two_bot_test_tog10090_nightly
           createdb -h agent-testdb -U agent_test two_next_backup_nightly
           createdb -h agent-testdb -U agent_test two_next_backup_publication_nightly
-          mkdir -p "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
+          mkdir -p "$RUNNER_TEMP/nightly-workspace" "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
       # Serial execution prevents the ignored stores' shared tables/locks from
       # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
-      # Channel moderation, feeds_store, legacy_verify_db, raid_list_db,
-      # reengagement_list_db, staging_migrate_db, internal_channel_moderation and
-      # internal_events require agent_test, not the two_bot_test_* bootstrap used by
-      # TestDatabase suites. Skip only those tests here, then run ALL of those
-      # suites below with their accepted URL. No ignored suite is permanently
-      # excluded. The store suites read TEST_DATABASE_URL and use isolated schemas,
-      # so they run in the sweep itself (same URL as check.yml).
+      # Channel moderation, the discord channel-moderation executor, feeds_store,
+      # legacy_verify_db, raid_list_db, reengagement_list_db, staging_migrate_db
+      # and internal_events require agent_test, not the two_bot_test_* bootstrap
+      # used by TestDatabase suites. Skip only those tests here, then run ALL of
+      # those suites below with their accepted URL.
+      # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
+      # No ignored suite is permanently excluded.
       # --no-fail-fast: cargo otherwise stops at the first failing test binary and
       # hides every later failure, so one red target masked the rest of the sweep.
       - name: Full workspace sweep including ignored tests
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
-          TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
+          MEMBER_TESTDB: agent-testdb
+          TEST_DATABASE_URL: postgresql://agent_test@agent-testdb:5432/postgres
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
         run: >-
           cargo test --workspace --all-features --locked --no-fail-fast -- --include-ignored --test-threads=1
           --skip channel_moderation_store::tests::lockdown_round_trip_stores_and_restores_exact_masks
@@ -139,33 +143,35 @@ jobs:
           --skip channel_moderation_store::tests::stale_claim_writes_cannot_affect_a_new_winner
           --skip channel_moderation_store::tests::action_only_reuse_is_mismatch_in_flight_and_done
           --skip channel_moderation_store::tests::audit_rows_are_written_once
+          --skip channel_moderation_store::tests::shared_timestamp_schema_preserves_channel_claim_and_audit_instants
+          --skip delayed_unlock_cannot_overwrite_a_later_lockdown_cycle
+          --skip post_mutation_audit_failure_rolls_back_completion_and_retains_recovery
+          --skip rejected_repeated_lockdown_preserves_original_seed_and_unlock_failure_keeps_it
+          --skip stale_channel_ticket_and_recovery_generation_cannot_finish_current_owner
+          --skip ambiguous_permission_responses_retain_request_channel_and_recovery_fences
+          --skip recovery_read_failures_release_both_fences_and_preserve_original_seed
+          --skip rejected_channel_reservations_release_request_claim_and_allow_same_key_retry
+          --skip unknown_channel_reservation_completion_retains_request_claim
+          --skip rejected_recovery_writes_release_reservations_without_discord_mutation
+          --skip purge_history_failures_are_retryable_without_any_deletion
+          --skip uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced
+          --skip purge_counts_bulk_delete_and_replays_without_rest_or_duplicate_audit
+          --skip slowmode_zero_and_signed_maximum_unicode_reason_survive_replay
+          --skip lockdown_and_unlock_restore_full_masks_and_replay_independently
+          --skip missing_overwrite_is_deleted_on_unlock_and_untracked_unlock_refuses
+          --skip concurrent_lock_and_unlock_are_ordered_across_independent_pools
+          --skip uncertain_lockdown_keeps_seed_and_channel_fence_against_distinct_key_unlock
+          --skip rejected_lockdown_removes_only_new_seed_and_allows_same_key_retry
+          --skip permission_actor_and_guild_refusals_never_mutate
           --skip feed_crud_audit_scope_and_timestamp_roundtrip
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance
+          --skip dump_inspect_restore_round_trip
           --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected
           --skip list_is_guild_scoped_selector_shaped_and_read_only
           --skip real_sqlx_runner_cases
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
-          --skip ambiguous_permission_responses_retain_request_channel_and_recovery_fences
-          --skip concurrent_lock_and_unlock_are_ordered_across_independent_pools
-          --skip delayed_unlock_cannot_overwrite_a_later_lockdown_cycle
-          --skip lockdown_and_unlock_restore_full_masks_and_replay_independently
-          --skip missing_overwrite_is_deleted_on_unlock_and_untracked_unlock_refuses
-          --skip permission_actor_and_guild_refusals_never_mutate
-          --skip post_mutation_audit_failure_rolls_back_completion_and_retains_recovery
-          --skip purge_counts_bulk_delete_and_replays_without_rest_or_duplicate_audit
-          --skip purge_history_failures_are_retryable_without_any_deletion
-          --skip recovery_read_failures_release_both_fences_and_preserve_original_seed
-          --skip rejected_channel_reservations_release_request_claim_and_allow_same_key_retry
-          --skip rejected_lockdown_removes_only_new_seed_and_allows_same_key_retry
-          --skip rejected_recovery_writes_release_reservations_without_discord_mutation
-          --skip rejected_repeated_lockdown_preserves_original_seed_and_unlock_failure_keeps_it
-          --skip slowmode_zero_and_signed_maximum_unicode_reason_survive_replay
-          --skip stale_channel_ticket_and_recovery_generation_cannot_finish_current_owner
-          --skip uncertain_lockdown_keeps_seed_and_channel_fence_against_distinct_key_unlock
-          --skip uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced
-          --skip unknown_channel_reservation_completion_retains_request_claim
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
@@ -173,12 +179,26 @@ jobs:
         run: >-
           cargo test -p two-bot-core --all-features --lib --locked channel_moderation_store::
           -- --include-ignored --test-threads=1
-      - name: Raid cohort ignored tests with their guarded URL
+      - name: Discord channel-moderation executor ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
-          cargo test -p two-bot-cutover --all-features --test raid_list_db --locked
+          cargo test -p two-bot-discord --all-features --test internal_channel_moderation --locked
+          -- --include-ignored --test-threads=1
+      - name: Feed store ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-core --all-features --test feeds_store --locked
+          -- --include-ignored --test-threads=1
+      - name: Legacy verification ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test legacy_verify_db --locked
           -- --include-ignored --test-threads=1
       - name: Reengagement list ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
@@ -194,13 +214,6 @@ jobs:
         run: >-
           cargo test -p two-bot-cutover --all-features --test staging_migrate_db --locked
           -- --include-ignored --test-threads=1
-      - name: Internal channel moderation ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: >-
-          cargo test -p two-bot-discord --all-features --test internal_channel_moderation --locked
-          -- --include-ignored --test-threads=1
       - name: Internal events ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
@@ -208,19 +221,12 @@ jobs:
         run: >-
           cargo test -p two-bot-discord --all-features --test internal_events --locked
           -- --include-ignored --test-threads=1
-      - name: Feed store ignored tests with their guarded URL
+      - name: Raid list ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: >-
-          cargo test -p two-bot-core --all-features --test feeds_store --locked
-          -- --include-ignored --test-threads=1
-      - name: Legacy verification ignored tests with their guarded URL
-        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: >-
-          cargo test -p two-bot-cutover --all-features --test legacy_verify_db --locked
+          cargo test -p two-bot-cutover --all-features --test raid_list_db --locked
           -- --include-ignored --test-threads=1
       # Backup integration tests are opt-in (not #[ignore]); the URL is unset in
       # the broad sweep because they rebuild tables and need dedicated databases.

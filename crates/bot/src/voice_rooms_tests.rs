@@ -180,6 +180,20 @@ impl RoomPersistence for Store {
             .insert(room.channel_id, room.clone());
         Ok(())
     }
+    async fn update_ownership(&self, room: &VoiceRoom) -> Result<bool, StoreError> {
+        self.trace.lock().unwrap().push(format!(
+            "update_ownership:{}:{}",
+            room.channel_id, room.owner_id
+        ));
+        let mut rooms = self.rooms.lock().unwrap();
+        if let Some(stored) = rooms.get_mut(&room.channel_id) {
+            stored.owner_id = room.owner_id;
+            stored.original_creator_id = room.original_creator_id;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
     async fn forget(&self, _: u64, channel: u64) -> Result<(), StoreError> {
         self.trace.lock().unwrap().push(format!("forget:{channel}"));
         if let Some(error) = self.forget_errors.lock().unwrap().pop_front() {
@@ -567,6 +581,289 @@ async fn reconnect_only_prunes_tracked_empty_channels_and_counts_unknown_members
     assert!(!calls.contains(&"delete:501".to_owned()));
     assert!(!calls.iter().any(|call| call.contains("900")));
     assert_eq!(worker.tracked().len(), 2);
+}
+
+#[tokio::test]
+async fn owner_leave_hands_room_to_earliest_joiner_and_persists() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    // Owner 300 alone first; 302 arrives, then 301. Caretaker is 302 by
+    // earliest join time even though 301 sorts first by id.
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    live.voice_update_at(302, Some(500), Some(false), 1_000);
+    live.voice_update_at(301, Some(500), Some(false), 2_000);
+    live.voice_update_at(MEMBER, None, Some(false), 3_000);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reconcile();
+    let tracked = worker.tracked().get(&500).expect("tracked room");
+    assert_eq!(tracked.owner_id, 302);
+    assert_eq!(tracked.original_creator_id, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&"update_ownership:500:302".to_owned()));
+    // Idempotent: the next tick sees the owner present and enqueues nothing.
+    let queued = worker.queue.pending_counts(GUILD);
+    worker.reconcile();
+    assert_eq!(worker.queue.pending_counts(GUILD), queued);
+}
+
+#[tokio::test]
+async fn succession_skips_present_owners_and_pending_moves() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.publish(snapshot(
+        &[500],
+        vec![
+            VoiceMember {
+                member_id: MEMBER,
+                channel_id: 500,
+                bot: Some(false),
+            },
+            VoiceMember {
+                member_id: 301,
+                channel_id: 500,
+                bot: Some(false),
+            },
+        ],
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Owner present: no handoff.
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    // Owner leaves while their move is still in flight: succession waits
+    // for the inbound owner instead of handing the room off.
+    worker.moves.insert(
+        500,
+        JoinTicket {
+            member_id: MEMBER,
+            creator_id: CREATOR,
+            generation: 0,
+            transition: 0,
+        },
+    );
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 4_000);
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.starts_with("update_ownership")));
+}
+
+/// One room with two occupants: owner `MEMBER` (creator), plus 301.
+fn owned_room() -> (LiveGuild, Store, Http, Trace) {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.publish(snapshot(
+        &[500],
+        vec![
+            VoiceMember {
+                member_id: MEMBER,
+                channel_id: 500,
+                bot: Some(false),
+            },
+            VoiceMember {
+                member_id: 301,
+                channel_id: 500,
+                bot: Some(false),
+            },
+        ],
+    ));
+    (live, store, http, trace)
+}
+
+#[tokio::test]
+async fn reclaim_hands_room_back_to_returned_creator_and_persists() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Owner leaves first, so 301 is the caretaker; the creator returns.
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, 301);
+    worker
+        .live
+        .voice_update_at(MEMBER, Some(500), Some(false), 2_000);
+    let text = worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("owner of this room again"), "{text}");
+    let tracked = worker.tracked().get(&500).expect("tracked room");
+    assert_eq!(tracked.owner_id, MEMBER);
+    assert_eq!(tracked.original_creator_id, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("update_ownership"))
+            .count()
+            >= 1
+    );
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&format!("update_ownership:500:{MEMBER}")));
+}
+
+#[tokio::test]
+async fn reclaim_claims_room_whose_owner_is_gone() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Owner leaves; the claim runs before any succession pass while the
+    // owner-absent snapshot is current.
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    let text = worker.apply_ownership(301, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("yours now"), "{text}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, 301);
+}
+
+#[tokio::test]
+async fn reclaim_refuses_non_creator_while_owner_present() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(301, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("original creator"), "{text}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn reclaim_repeated_is_idempotent() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker.reconcile();
+    worker
+        .live
+        .voice_update_at(MEMBER, Some(500), Some(false), 2_000);
+    let first = worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(first.contains("again"), "{first}");
+    let second = worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(second.contains("already the owner"), "{second}");
+}
+
+#[tokio::test]
+async fn reclaim_outside_voice_asks_to_join() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(302, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("need to be in a voice room"), "{text}");
+}
+
+#[tokio::test]
+async fn transfer_hands_room_to_occupant_and_remembers_creator() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    assert!(
+        text.contains("Transferred") && text.contains("<@301>"),
+        "{text}"
+    );
+    let tracked = worker.tracked().get(&500).expect("tracked room");
+    assert_eq!(tracked.owner_id, 301);
+    assert_eq!(tracked.original_creator_id, 301);
+    dispatch(&mut worker, 0).await;
+    assert!(trace
+        .lock()
+        .unwrap()
+        .contains(&"update_ownership:500:301".to_owned()));
+}
+
+#[tokio::test]
+async fn transfer_rejects_recipient_outside_room() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 302 });
+    assert!(text.contains("must be in the room"), "{text}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn transfer_refuses_non_owner() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let text = worker.apply_ownership(301, false, OwnershipCommand::Transfer { target_id: MEMBER });
+    assert!(text.contains("Only the room owner"), "{text}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, MEMBER);
+}
+
+#[tokio::test]
+async fn transfer_replay_by_former_owner_fails_authorization() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let first =
+        worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    assert!(first.contains("Transferred"), "{first}");
+    // The former owner cannot replay the same handoff to take the room back.
+    let replay = worker.apply_ownership(
+        MEMBER,
+        false,
+        OwnershipCommand::Transfer { target_id: MEMBER },
+    );
+    assert!(replay.contains("Only the room owner"), "{replay}");
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, 301);
+}
+
+#[tokio::test]
+async fn admin_transfer_from_outside_voice_names_occupied_room() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Admin 999 is nowhere in voice but may act on any room.
+    let text = worker.apply_ownership(999, true, OwnershipCommand::Transfer { target_id: 301 });
+    assert!(
+        text.contains("Transferred") && text.contains("<@301>"),
+        "{text}"
+    );
+    let tracked = worker.tracked().get(&500).expect("tracked room");
+    assert_eq!(tracked.owner_id, 301);
+    assert_eq!(tracked.original_creator_id, 301);
+}
+
+#[tokio::test]
+async fn ownership_commands_on_untracked_channel_refuse() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(302, Some(999), Some(false), 1_000);
+    let text = worker.apply_ownership(302, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("isn't a temporary room"), "{text}");
+}
+
+#[tokio::test]
+async fn ownership_commands_while_halted_refuse_paused() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.halted = true;
+    let text = worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("paused"), "{text}");
 }
 
 #[tokio::test]
@@ -959,7 +1256,7 @@ fn voice_command_set_is_gated_on_two_voice() {
         .collect();
     assert_eq!(
         names,
-        ["create", "setup", "ping", "invite", "access", "logging"]
+        ["create", "setup", "ping", "invite", "access", "reclaim", "transfer", "logging"]
     );
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
@@ -1046,7 +1343,84 @@ use twilight_model::{
     },
     guild::{MemberFlags, PartialMember},
     oauth::ApplicationIntegrationMap,
+    user::User,
 };
+
+fn test_user(id: u64) -> User {
+    User {
+        accent_color: None,
+        avatar: None,
+        avatar_decoration: None,
+        avatar_decoration_data: None,
+        banner: None,
+        bot: false,
+        discriminator: 0,
+        email: None,
+        flags: None,
+        global_name: None,
+        id: Id::new(id),
+        locale: None,
+        mfa_enabled: None,
+        name: "member".to_owned(),
+        premium_type: None,
+        primary_guild: None,
+        public_flags: None,
+        system: None,
+        verified: None,
+    }
+}
+
+/// Interaction invoked by `user_id` (guild member by default). The ownership
+/// handlers authenticate the actor from `member.user`, else the top-level user.
+fn voice_interaction_as(
+    command: Option<CommandData>,
+    permissions: Option<Permissions>,
+    user_id: u64,
+) -> Interaction {
+    let mut interaction = voice_interaction(command, permissions, true);
+    if let Some(member) = interaction.member.as_mut() {
+        member.user = Some(test_user(user_id));
+    } else {
+        interaction.user = Some(test_user(user_id));
+    }
+    interaction
+}
+
+async fn wait_trace(trace: &Trace, entry: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if trace.lock().unwrap().iter().any(|value| value == entry) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "lifecycle trace deadline waiting for {entry}: {:?}",
+            trace.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Runtime with one tracked room (channel 500, owner/creator `MEMBER`) and a
+/// second occupant 301. Drives the real actor so ownership commands run
+/// against live worker state. The trailing voice frames are Discord reporting
+/// both members inside the new room — live occupancy only moves on frames,
+/// never on the create/move dispatch itself.
+async fn ownership_room_runtime(trace: Trace) -> VoiceRuntime<Store, Http> {
+    let runtime = test_runtime(trace.clone());
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    assert!(runtime.voice_frame(
+        GUILD,
+        MEMBER,
+        Some(CREATOR),
+        Some(false),
+        "ava's room".to_owned(),
+    ));
+    wait_trace(&trace, "persist:500").await;
+    assert!(runtime.voice_frame(GUILD, MEMBER, Some(500), Some(false), "x".to_owned()));
+    assert!(runtime.voice_frame(GUILD, 301, Some(500), Some(false), "x".to_owned()));
+    runtime
+}
 
 fn member_with(permissions: Option<Permissions>) -> PartialMember {
     PartialMember {
@@ -1132,10 +1506,14 @@ fn response_text(response: &InteractionResponse) -> String {
         .unwrap_or_default()
 }
 
-async fn handle_capture(
-    runtime: &VoiceRuntime<Store, Http>,
+async fn handle_capture<S, H>(
+    runtime: &VoiceRuntime<S, H>,
     interaction: &Interaction,
-) -> (bool, Option<InteractionResponse>) {
+) -> (bool, Option<InteractionResponse>)
+where
+    S: RoomPersistence + Send + 'static,
+    H: RoomWrites + Send + 'static,
+{
     let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
     let writer = seen.clone();
     let owned = handle_voice_interaction(runtime, interaction, |response| {
@@ -1200,6 +1578,58 @@ fn parse_ping_and_invite_commands() {
     }
 }
 
+fn user_option(name: &str, id: u64) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::User(Id::new(id)),
+    }
+}
+
+#[test]
+fn parse_reclaim_command() {
+    let interaction = voice_interaction(Some(command_data("reclaim", Vec::new())), None, true);
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Reclaim)
+    );
+    let guildless = voice_interaction(Some(command_data("reclaim", Vec::new())), None, false);
+    assert_eq!(parse_voice_command(&guildless), None);
+}
+
+#[test]
+fn parse_transfer_extracts_member_target() {
+    let interaction = voice_interaction(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Transfer { target_id: 301 })
+    );
+}
+
+#[test]
+fn parse_transfer_without_member_defaults_zero_for_refusal() {
+    let interaction = voice_interaction(Some(command_data("transfer", Vec::new())), None, true);
+    assert_eq!(
+        parse_voice_command(&interaction),
+        Some(VoiceCommand::Transfer { target_id: 0 })
+    );
+    let wrong_type = voice_interaction(
+        Some(command_data(
+            "transfer",
+            vec![command_option("member", "301")],
+        )),
+        None,
+        true,
+    );
+    assert_eq!(
+        parse_voice_command(&wrong_type),
+        Some(VoiceCommand::Transfer { target_id: 0 })
+    );
+}
+
 #[test]
 fn interaction_latency_counts_from_the_snowflake_timestamp() {
     let created_ms = DISCORD_EPOCH_MS + 1_000_000;
@@ -1252,6 +1682,78 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
         "Join the server: https://discord.gg/abc-123"
     );
     assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn handle_transfer_by_owner_hands_room_to_occupant() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(
+        text.contains("Transferred") && text.contains("<@301>"),
+        "{text}"
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), runtime.worker_status(GUILD))
+        .await
+        .expect("status reply")
+        .expect("live actor");
+    assert_eq!(status.tracked_rooms, 1);
+    // Persistence lands on the actor's timer tick, not in the reply path.
+    wait_trace(&trace, "update_ownership:500:301").await;
+}
+
+#[tokio::test]
+async fn handle_transfer_rejects_recipient_outside_room() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 302)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("must be in the room"), "{text}");
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn handle_reclaim_by_non_creator_refuses_while_owner_present() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 301);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("original creator"), "{text}");
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn handle_reclaim_outside_voice_asks_to_join() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 302);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(response.as_ref().expect("reply"));
+    assert!(text.contains("need to be in a voice room"), "{text}");
 }
 
 fn gated_runtime(
