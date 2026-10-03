@@ -2092,8 +2092,8 @@ mod tests {
         }
         // `/export` takes no options; `/import` takes one required file
         // attachment. Both are Manage Server (Manage Guild) gated.
-        let export = &defs[8];
-        let import = &defs[9];
+        let export = &defs[9];
+        let import = &defs[10];
         for def in [export, import] {
             assert_eq!(
                 def.default_member_permissions,
