@@ -5013,12 +5013,15 @@ async fn sink_claimed_kick_answers_public_ballot_without_defer() {
 }
 
 #[tokio::test]
-async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
+async fn sink_unclaimed_votekick_answers_ephemeral_refusal() {
     let trace = Trace::default();
     let runtime = test_runtime(trace.clone());
     let replies = Replies::new(trace.clone());
-    // No actor, no rooms: a moderation-shaped target must produce no ack at
-    // all here, otherwise the defer races (and loses to) the router answer.
+    // No actor, no rooms: `/votekick` is voice-owned, so the sink answers
+    // the non-room target with an ephemeral refusal exactly once. Silence
+    // here would surface as "interaction is no longer available"; the
+    // moderation `/kick` never parses in the sink, so the router answers it
+    // alone and there is no defer race.
     VoiceResponder::respond_with(
         &runtime,
         &replies,
@@ -5027,6 +5030,18 @@ async fn sink_unclaimed_kick_stays_fully_silent_for_the_router() {
         None,
     )
     .await;
-    assert!(trace.lock().unwrap().is_empty());
-    assert!(replies.completed.lock().unwrap().is_empty());
+    assert_eq!(*trace.lock().unwrap(), ["respond"]);
+    let completed = replies.completed.lock().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0].kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let data = completed[0].data.as_ref().expect("refusal body");
+    assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+    let content = data.content.as_deref().unwrap_or_default();
+    assert!(
+        content.contains("not in a temporary voice room"),
+        "{content}"
+    );
 }
