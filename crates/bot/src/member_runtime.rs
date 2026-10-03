@@ -16,7 +16,11 @@
 //! Until the authenticated audit-reason seam lands, the Discord reason is the
 //! plain moderator reason.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use sqlx::{Pool, Postgres};
 use tokio::sync::OnceCell;
@@ -102,6 +106,24 @@ impl MemberRuntime {
             guild_id,
             bot_id: OnceCell::new(),
         }))
+    }
+
+    /// Test-only consumer over an explicit pool; skips the `TWO_MODERATION`
+    /// and staging gates so router tests can attach the verbs without process
+    /// env or a live database (the lazy pool stays unused on the covered
+    /// fail-closed paths).
+    #[cfg(test)]
+    pub(crate) fn for_test(pool: Pool<Postgres>, guild_id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            store: PgMemberModerationStore::new(pool, guild_id.to_owned()),
+            policy: ModerationPolicy {
+                owen_user_id: "1".to_owned(),
+                protected_role_ids: HashSet::new(),
+                bot_user_id: None,
+            },
+            guild_id: guild_id.to_owned(),
+            bot_id: OnceCell::new(),
+        })
     }
 
     /// Clone the shared guild store (commands and sweep share one consumer).
