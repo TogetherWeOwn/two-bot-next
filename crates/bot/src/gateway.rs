@@ -290,6 +290,7 @@ fn voice_disconnected(voice: Option<&Arc<dyn VoiceEventSink>>) {
 /// token + database configured (see [`build_voice_runtime`]). The serial
 /// writer feeds it after each cache update; reception invalidates occupancy
 /// at every transport loss, so a disconnect is never deferred behind backlog.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_shard<I: InviteSource + 'static>(
     shard: Shard,
     pipeline: Arc<GatewayPipeline<I>>,
