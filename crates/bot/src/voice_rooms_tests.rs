@@ -80,6 +80,9 @@ struct Store {
     access: Arc<Mutex<AccessControls>>,
     access_error: Option<StoreError>,
     save_access_error: Option<StoreError>,
+    logging: Arc<Mutex<LoggingSettings>>,
+    logging_error: Option<StoreError>,
+    save_logging_error: Option<StoreError>,
     forget_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
@@ -95,6 +98,9 @@ impl Store {
             access: Arc::new(Mutex::new(AccessControls::default())),
             access_error: None,
             save_access_error: None,
+            logging: Arc::new(Mutex::new(LoggingSettings::default())),
+            logging_error: None,
+            save_logging_error: None,
             forget_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
             after_persist: None,
@@ -121,6 +127,23 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         *self.access.lock().unwrap() = controls.clone();
+        Ok(())
+    }
+    async fn logging_settings(&self, _: u64) -> Result<LoggingSettings, StoreError> {
+        match self.logging_error {
+            Some(error) => Err(error),
+            None => Ok(*self.logging.lock().unwrap()),
+        }
+    }
+    async fn save_logging_settings(
+        &self,
+        _: u64,
+        settings: &LoggingSettings,
+    ) -> Result<(), StoreError> {
+        if let Some(error) = self.save_logging_error {
+            return Err(error);
+        }
+        *self.logging.lock().unwrap() = *settings;
         Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
@@ -912,7 +935,10 @@ fn voice_command_set_is_gated_on_two_voice() {
         .iter()
         .map(|definition| definition.name.clone())
         .collect();
-    assert_eq!(names, ["create", "setup", "ping", "invite", "access"]);
+    assert_eq!(
+        names,
+        ["create", "setup", "ping", "invite", "access", "logging"]
+    );
     let off = VoiceGates::from_map(&Default::default());
     assert!(voice_command_set(&off).is_empty());
 }
@@ -1559,6 +1585,181 @@ async fn access_command_reports_store_failures_and_changes_nothing() {
     );
     let (_, response) = handle_capture(&unreadable, &disable()).await;
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
+}
+
+fn channel_option(name: &str, id: u64) -> CommandDataOption {
+    CommandDataOption {
+        name: name.to_owned(),
+        value: CommandOptionValue::Channel(Id::new(id)),
+    }
+}
+
+fn logging_interaction(sub: CommandDataOption, admin: bool) -> Interaction {
+    voice_interaction(
+        Some(command_data("logging", vec![sub])),
+        admin.then_some(Permissions::MANAGE_CHANNELS),
+        true,
+    )
+}
+
+fn logging_action(sub: CommandDataOption) -> LoggingAction {
+    match parse_voice_command(&logging_interaction(sub, true)) {
+        Some(VoiceCommand::Logging(action)) => action,
+        other => panic!("not a /logging command: {other:?}"),
+    }
+}
+
+fn logging_runtime(
+    shared: Arc<Mutex<LoggingSettings>>,
+    read_error: Option<StoreError>,
+    save_error: Option<StoreError>,
+) -> VoiceRuntime<Store, Http> {
+    let trace = Trace::default();
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.logging = shared.clone();
+            store.logging_error = read_error;
+            store.save_logging_error = save_error;
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[test]
+fn parse_logging_subcommands() {
+    assert_eq!(
+        logging_action(sub_option("show", vec![])),
+        LoggingAction::Show
+    );
+    assert_eq!(
+        logging_action(sub_option("level", vec![command_option("level", "Full")])),
+        LoggingAction::Level("Full".to_owned())
+    );
+    assert_eq!(
+        logging_action(sub_option("channel", vec![channel_option("channel", 5)])),
+        LoggingAction::Channel(Some(5))
+    );
+    // No channel or role clears the setting.
+    assert_eq!(
+        logging_action(sub_option("channel", vec![])),
+        LoggingAction::Channel(None)
+    );
+    assert_eq!(
+        logging_action(sub_option("mention", vec![role_option("role", 9)])),
+        LoggingAction::Mention(Some(9))
+    );
+    assert_eq!(
+        logging_action(sub_option("mention", vec![])),
+        LoggingAction::Mention(None)
+    );
+    // Malformed shapes are answered, never ignored.
+    for sub in [sub_option("bogus", vec![]), sub_option("level", vec![])] {
+        assert_eq!(logging_action(sub), LoggingAction::Invalid);
+    }
+    let bare = voice_interaction(Some(command_data("logging", Vec::new())), None, true);
+    assert_eq!(
+        parse_voice_command(&bare),
+        Some(VoiceCommand::Logging(LoggingAction::Invalid))
+    );
+}
+
+#[tokio::test]
+async fn logging_command_needs_an_admin() {
+    let runtime = logging_runtime(Arc::default(), None, None);
+    let member = logging_interaction(sub_option("show", vec![]), false);
+    let (owned, response) = handle_capture(&runtime, &member).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("denial")),
+        "You need Manage Channels to use /logging."
+    );
+}
+
+#[tokio::test]
+async fn logging_command_changes_are_saved_and_shown() {
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), None, None);
+    let run = |sub| {
+        let interaction = logging_interaction(sub, true);
+        let runtime = &runtime;
+        async move {
+            let (_, response) = handle_capture(runtime, &interaction).await;
+            response_text(&response.expect("reply"))
+        }
+    };
+
+    let text = run(sub_option("show", vec![])).await;
+    assert!(text.contains("Log level: brief"), "{text}");
+    assert!(!text.starts_with("Saved."), "{text}");
+
+    let text = run(sub_option("level", vec![command_option("level", " FULL ")])).await;
+    assert!(text.starts_with("Saved."), "{text}");
+    assert_eq!(shared.lock().unwrap().level, DetailLevel::Full);
+
+    let text = run(sub_option("channel", vec![channel_option("channel", 5)])).await;
+    assert!(text.contains("Log channel: <#5>"), "{text}");
+    let text = run(sub_option("mention", vec![role_option("role", 9)])).await;
+    assert!(text.contains("Mentioned on errors: <@&9>"), "{text}");
+    assert_eq!(
+        *shared.lock().unwrap(),
+        LoggingSettings {
+            level: DetailLevel::Full,
+            channel_id: Some(5),
+            mention_role_id: Some(9),
+        }
+    );
+
+    // Clearing the channel and mention keeps the level.
+    run(sub_option("channel", vec![])).await;
+    run(sub_option("mention", vec![])).await;
+    let text = run(sub_option("level", vec![command_option("level", "off")])).await;
+    assert!(text.contains("Log level: off"), "{text}");
+    assert_eq!(
+        *shared.lock().unwrap(),
+        LoggingSettings {
+            level: DetailLevel::Off,
+            channel_id: None,
+            mention_role_id: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn logging_command_refuses_bad_input_without_changing_anything() {
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), None, None);
+    for sub in [
+        sub_option("level", vec![command_option("level", "loud")]),
+        sub_option("bogus", vec![]),
+    ] {
+        let (_, response) = handle_capture(&runtime, &logging_interaction(sub, true)).await;
+        let text = response_text(&response.expect("reply"));
+        assert!(!text.starts_with("Saved."), "{text}");
+        assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+    }
+}
+
+#[tokio::test]
+async fn logging_command_reports_store_failures_and_changes_nothing() {
+    let level = || {
+        logging_interaction(
+            sub_option("level", vec![command_option("level", "off")]),
+            true,
+        )
+    };
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let unsavable = logging_runtime(shared.clone(), None, Some(StoreError::Unavailable));
+    let (_, response) = handle_capture(&unsavable, &level()).await;
+    assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+
+    let unreadable = logging_runtime(shared.clone(), Some(StoreError::Unavailable), None);
+    let (_, response) = handle_capture(&unreadable, &level()).await;
+    assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
 }
 
 #[tokio::test]
