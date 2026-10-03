@@ -191,8 +191,8 @@ async fn row(pool: &PgPool, id: &str) -> Result<StoredRow, sqlx::Error> {
 async fn event_id_is_claimed_exactly_once_under_concurrency() -> TestResult {
     let db = TestDb::new(&[MIGRATION]).await?;
     let guild = db.guild("once");
-    let policy = Arc::new(policy(&guild, None));
-    let observation = observation(&policy, &guild, "member", NOW, 3_600_000);
+    let risk_policy = policy(&guild, None);
+    let observation = observation(&risk_policy, &guild, "member", NOW, 3_600_000);
     let barrier = Arc::new(Barrier::new(10));
     let mut tasks = Vec::new();
     for _ in 0..10 {
@@ -223,11 +223,17 @@ async fn event_id_is_claimed_exactly_once_under_concurrency() -> TestResult {
 async fn guild_join_counts_are_serialized_with_burst_scoring() -> TestResult {
     let db = TestDb::new(&[MIGRATION]).await?;
     let guild = db.guild("burst");
-    let policy = Arc::new(policy(&guild, None));
+    let risk_policy = policy(&guild, None);
     let barrier = Arc::new(Barrier::new(10));
     let mut tasks = Vec::new();
     for n in 0..10 {
-        let observation = observation(&policy, &guild, &format!("member-{n:02}"), NOW, 3_600_000);
+        let observation = observation(
+            &risk_policy,
+            &guild,
+            &format!("member-{n:02}"),
+            NOW,
+            3_600_000,
+        );
         let (store, barrier) = (db.store(), barrier.clone());
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
@@ -261,7 +267,7 @@ async fn guild_join_counts_are_serialized_with_burst_scoring() -> TestResult {
     // An old account needs the burst to flag: score 0 + 2 at the 11th join.
     let (count, evidence) = persisted(
         &db.store(),
-        observation(&policy, &guild, "member-old", NOW, 30 * 86_400_000),
+        observation(&risk_policy, &guild, "member-old", NOW, 30 * 86_400_000),
         NOW,
     )
     .await?;
@@ -288,7 +294,7 @@ async fn guild_join_counts_are_serialized_with_burst_scoring() -> TestResult {
 async fn stale_window_rows_and_bulk_suppression_behave() -> TestResult {
     let db = TestDb::new(&[MIGRATION]).await?;
     let guild = db.guild("window");
-    let policy = policy(&guild, None);
+    let risk_policy = policy(&guild, None);
     // A row whose processing-time `created_at` fell out of the window must not
     // count, even though its occurrence time is fresh (legacy WHERE clause).
     sqlx::query(
@@ -306,7 +312,7 @@ async fn stale_window_rows_and_bulk_suppression_behave() -> TestResult {
     .await?;
     let (count, _) = persisted(
         &db.store(),
-        observation(&policy, &guild, "member-00", NOW, 3_600_000),
+        observation(&risk_policy, &guild, "member-00", NOW, 3_600_000),
         NOW,
     )
     .await?;
