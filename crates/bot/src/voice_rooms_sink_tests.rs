@@ -72,6 +72,22 @@ impl RoomWrites for GatedHttp {
     ) -> Result<(), RoomHttpError> {
         self.http.move_member(guild, member, channel, guard).await
     }
+    async fn disconnect(
+        &self,
+        guild: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.disconnect(guild, member, guard).await
+    }
+    async fn deny_connect(
+        &self,
+        channel: u64,
+        member: u64,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.http.deny_connect(channel, member, guard).await
+    }
     async fn delete(&self, channel: u64, guard: WriteGuard) -> Result<(), RoomHttpError> {
         if let Some(gate) = &self.delete {
             gate.wait().await;

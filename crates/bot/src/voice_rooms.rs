@@ -157,6 +157,22 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V4 vote-kick enforcement: disconnect the member from voice
+    /// (`channel_id: null`); 404 (already left) is success.
+    fn disconnect(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// V4 vote-kick enforcement: deny Connect to the member on one room
+    /// channel only (member-scoped overwrite, not a guild kick or ban).
+    fn deny_connect(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
     fn delete(
         &self,
         channel: Snowflake,
@@ -189,6 +205,25 @@ impl RoomWrites for RoomHttp {
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
         self.move_member(guild, member, channel, move || guard())
+            .await
+    }
+
+    async fn disconnect(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.disconnect_member(guild, member, move || guard()).await
+    }
+
+    async fn deny_connect(
+        &self,
+        channel: Snowflake,
+        member: Snowflake,
+        guard: WriteGuard,
+    ) -> Result<(), RoomHttpError> {
+        self.deny_member_connect(channel, member, move || guard())
             .await
     }
 
