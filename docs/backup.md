@@ -52,14 +52,15 @@ selectors ignore it.
 ### Coverage and recovery semantics (v4, TOG-11142)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **54 durable tables from the
+inventory for both dump and restore. It includes **65 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
-tables, the self-role send receipts (`self_role_exchanges`) plus their
-uncertainty baselines (`self_role_exchange_baselines`), the automod delivery
-claims, the gateway boot directives and the member-erasure audit, plus
-**5 optional retired legacy tables**. A dump from a fresh Rust schema has 56
-table entries; a compatible legacy-extended schema may have up to
-61. A missing current table refuses a dump/restore: migrate the target first.
+tables, the member-moderation ledger, the self-role send receipts
+(`self_role_exchanges`) plus their uncertainty baselines
+(`self_role_exchange_baselines`), the automod delivery claims, the gateway
+boot directives, the member-erasure audit and the internal clock high-water
+mark, plus **3 optional retired legacy tables**. A dump from a fresh Rust
+schema has 65 table entries; a compatible legacy-extended schema may have up to
+68. A missing current table refuses a dump/restore: migrate the target first.
 A v4 archive written before a table joined the inventory is refused at inspect
 ("manifest is missing tables"); take a fresh dump after upgrading.
 An optional legacy table may be absent only when there are no archived rows for
@@ -98,11 +99,15 @@ hardcoded list of `id` columns or untrusted archive sequence names. This include
 `internal_idempotency.intent_id` and `internal_action_log.audit_id`. The standalone
 `guild_settings_version_seq` and `guild_settings_cas_seq` are also restarted.
 Archive marks are matched to target sequences by `(table, column)`; a mark never
-names a sequence. The truncate does **not** `RESTART IDENTITY`. Each allocator
-resumes at the furthest of its configured start, one step past the restored
-rows, the archive's mark and the target's own position, in the sequence's
-direction and within its bounds. A restore therefore never reissues a value the
-source or the target handed out, including one whose row was deleted (the
+names a sequence. The ban-ownership `moderation_member_bans.generation`
+sequence resumes past restored `moderation_scheduled_unbans.retry_generation`
+queue tickets drawn from it, not only past restored generations; the first
+source names the allocator and supplies its archive mark. The truncate does
+**not** `RESTART IDENTITY`. Each allocator resumes at the furthest of its
+configured start, one step past the restored rows, the archive's mark and the
+target's own position, in the sequence's direction and within its bounds. A
+restore therefore never reissues a value the source or the target handed out,
+including one whose row was deleted (the
 [cutover allocator gate](cutover.md#data-copy-and-verification)). That
 matters beyond the database: `community_scorecard_runs.watermark` is a
 `community_facts.id`. Exhaustion, or a mark running the other way from the
@@ -125,6 +130,39 @@ PostgreSQL behavior references:
 - [Serial/identity ownership discovery](https://www.postgresql.org/docs/16/functions-info.html)
 - [Transactional RESTART semantics](https://www.postgresql.org/docs/16/sql-altersequence.html)
 - [Identity override](https://www.postgresql.org/docs/16/sql-insert.html)
+
+### Moderation history fence and expiry quarantine (TOG-10078)
+
+`moderation_member_bans` (acceptance, insertion-order generation and
+prepared/rejected fences) is appended after the frozen v3 prefix and read in the
+same repeatable-read snapshot as scheduled unbans and idempotency. **Restore
+refuses any destination with member ban, scheduled-unban, audit, idempotency,
+warning or channel-execution history**, after locking every replaced table and
+before truncation, so concurrent writes cannot slip through; no `CASCADE`
+bypass removes unrelated evidence. Preserve the existing database; use a fresh
+migrated target, not a manual deletion of evidence to satisfy this
+precondition. This deliberately avoids guessing how to merge incompatible
+ownership generations or forgetting post-backup PUT/DELETE evidence. Other
+bot-owned tables are still replaced.
+
+Every imported staged, pending or running expiry is **quarantined**, including
+one with matching accepted ownership. A snapshot's accepted tempban cannot
+prove current Discord ownership: a newer permanent ban may have superseded it
+after the backup. The file keeps the original states; restored acceptance,
+generations, reasons and timestamps remain historical evidence, not remote
+reconciliation. Ordinary activation/recovery never re-enables quarantined rows.
+Imported running DELETEs keep their independent uncertainty fence, original
+claim token and timestamps. Resolving one DELETE does not authorize an expiry.
+
+A v3 envelope has no ownership table. A fresh-target restore does not invent
+acceptance or order from request IDs or timestamps. The CLI warns in both
+dry-run and apply and reports the quarantine count; row-count verification is
+data fidelity, **not** moderation-enable approval. Stop consumers and keep
+`TWO_MODERATION` off until an authorized reconciliation considers the original
+snapshot **and preserved destination history**, proves the actual remote
+outcomes/order, and records expiry dispositions before any activation. Consumer
+shutdown alone is not remote reconciliation. No automatic release or
+destructive in-place override is provided by this slice.
 
 ### Migration-backed regression suite
 
@@ -225,21 +263,64 @@ mismatch → exit 1 with the residual operations listed.
 
 ## Monthly restore drill — 1st, 05:30
 
-`deploy/two-bot-next-restore-drill.{service,timer}` restores the newest
-backup into the **scratch** database and requires `RESTORE VERIFIED`.
-A red drill means the backups are not real — better on the 1st than during
-an outage.
+`deploy/two-bot-next-restore-drill.{service,timer}` invokes `restore-drill`
+for the newest published backup and requires `RESTORE VERIFIED`. **Every run
+allocates a distinct fresh scratch database**, applies the same embedded S6
+migrations, then prepares seven still-unported legacy archive tables using the
+full preserved DDL pinned by an offline provenance regression. This private
+scratch-only compatibility layer is not a production migration, feature
+initializer or consumer; it adds no roles, grants or backfill. Future S6-owned
+schemas remain authoritative (`IF NOT EXISTS`). It then performs the normal
+guarded restore and never reuses or drops previous targets. A destination with
+moderation history still refuses direct restore, even with `--force`; do not erase
+history to pass that guard.
 
-Manual drill (what the timer does, step by step):
+The currently authorized provisioning path is only the disposable
+`agent-testdb:5432` service, explicitly empty-password `agent_test` and bootstrap
+`postgres`. Production/staging, arbitrary hosts, runtime credentials, URL query
+options and inherited libpq `PG*` settings refuse before allocation. No login,
+role, membership or Discord consumer is created. Ordinary shipped S6 migrations
+can apply their existing scoped grants to an already-present runtime group in
+this new test database; the drill adds no special runtime grants or credentials
+and changes no existing database. Extending this binding to another environment
+requires separate authorization and review, not a URL edit.
+
+Operator installation must provide protected `/etc/two-bot-next/restore-drill.env`
+with `TWO_RESTORE_DRILL_BOOTSTRAP_URL=postgres://agent_test:@agent-testdb:5432/postgres`.
+The unit does not read shared `backup.env`, source or upload credentials. Its
+`StateDirectory` supplies protected `/var/lib/two-bot-next-restore-drills`,
+writable under the unit sandbox. The absolute evidence root must already exist;
+manual operators must provision a protected retained directory first. The drill
+syncs its new child directory entry before database allocation. No service
+installation/execution is authorized by this PR.
+
+Each run retains a private archive copy, hashes it with a bounded 32 KiB read
+buffer rather than loading the whole compressed archive, and writes exclusive
+`planned`, `allocated`,
+`migrated` and `verified` JSON receipts as those stages complete. A provisioning,
+migration or restore failure records a `failed` classification without raw SQL
+errors or credentials; any partially allocated target and completed evidence
+remain. Archive-validation failures allocate no database and preserve the private
+copy for diagnosis. No prior target, archive or receipt is overwritten or pruned.
+The verified receipt includes `dropped_columns` and warns when any archive
+columns are absent from the target. `RESTORE VERIFIED` proves per-table row counts,
+not that every source column survived; inspect these diagnostics and the retained
+archive before accepting data fidelity. Neither receipt nor counts authorize
+moderation activation. Capacity/retention decisions require a separate authorized
+evidence-preservation policy; do not clear drill history to free a build cache or make the next run pass.
+
+Manual drill (with that explicit scratch authority, no production restore):
 
 ```bash
 # 1. Is last night's file any good? (writes nothing; TWO_RESTORE_URL optional)
 two-bot restore /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --dry-run
 # → DRY RUN VERIFIED
 
-# 2. Rehearse into scratch. Never restore straight to prod.
-TWO_RESTORE_URL=postgres://.../two_scratch two-bot restore /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --force
-# → RESTORE VERIFIED (every table count matches the manifest)
+# 2. Allocate a NEW migrated scratch target; retain earlier drill evidence.
+TWO_RESTORE_DRILL_BOOTSTRAP_URL=postgres://agent_test:@agent-testdb:5432/postgres \
+TWO_RESTORE_DRILL_EVIDENCE_DIR=/var/lib/two-bot-next-restore-drills \
+two-bot restore-drill /var/backups/two-bot-next/two-funnel-<stamp>.ndjson.gz --confirm-scratch
+# → retained evidence <unique directory>, then RESTORE VERIFIED
 ```
 
 Production restore is **not authorized by this slice**. S6 must establish its

@@ -4,7 +4,7 @@
 //! errors to the caller. Callers must persist a created channel before moving
 //! its owner and compensate a failed write by deleting that new channel.
 //!
-//! Parameter binding: https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html
+//! Parameter binding: <https://docs.rs/sqlx/0.9.0/sqlx/fn.query.html>
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -143,6 +143,31 @@ impl PgRoomStore {
             != 0)
     }
 
+    /// Persist a V2 ownership handoff on an already-tracked room. Only the
+    /// owner fields move: seed, creator channel and timestamp stay insert-once
+    /// like [`PgRoomStore::add_room`]. Returns false when no row exists.
+    pub async fn update_ownership(
+        &self,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        owner_id: Snowflake,
+        original_creator_id: Snowflake,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query(
+            "UPDATE voice_rooms
+             SET owner_id = $3, original_creator_id = $4, owner_touched_at = now()
+             WHERE guild_id = $1 AND channel_id = $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(owner_id.to_string())
+        .bind(original_creator_id.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            != 0)
+    }
+
     pub async fn room_for(
         &self,
         guild_id: Snowflake,
@@ -227,6 +252,24 @@ impl PgRoomStore {
         .await?
         .rows_affected()
             != 0)
+    }
+
+    /// Every companion tracked in a guild, for worker load and startup
+    /// reconciliation (V9c): each row carries its creation-time settings
+    /// snapshot, so later `/textchannels` changes never alter it.
+    pub async fn companions_in_guild(
+        &self,
+        guild_id: Snowflake,
+    ) -> Result<Vec<TextCompanion>, sqlx::Error> {
+        sqlx::query(
+            "SELECT * FROM voice_text_companions WHERE guild_id = $1 ORDER BY room_channel_id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(decode_companion)
+        .collect()
     }
 
     pub async fn companion_for(

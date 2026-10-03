@@ -69,10 +69,22 @@ fn restore_drill_runs_monthly_after_the_nightly_backup() {
     // The 1st of each month, well after the 04:17 nightly backup.
     assert!(timer.contains("OnCalendar=*-*-01 05:30:00"), "{timer}");
     let service = read("two-bot-next-restore-drill.service");
-    assert!(service.contains("two-bot restore"), "{service}");
-    assert!(service.contains("--force"), "{service}");
-    // The drill restores with TWO_RESTORE_URL (scratch), never TWO_DATABASE_URL.
-    assert!(service.contains("TWO_RESTORE_URL"), "{service}");
+    assert!(service.contains("two-bot restore-drill"), "{service}");
+    assert!(service.contains("--confirm-scratch"), "{service}");
+    assert!(!service.contains("--force"), "{service}");
+    assert!(!service.contains("TWO_RESTORE_URL="), "{service}");
+    assert!(
+        service.contains("TWO_RESTORE_DRILL_BOOTSTRAP_URL"),
+        "{service}"
+    );
+    assert!(
+        service.contains("EnvironmentFile=/etc/two-bot-next/restore-drill.env"),
+        "{service}"
+    );
+    assert!(
+        service.contains("StateDirectory=two-bot-next-restore-drills"),
+        "{service}"
+    );
     for line in service.lines().filter(|l| l.starts_with("ExecStart=")) {
         assert!(!line.contains("TWO_DATABASE_URL"), "{line}");
     }

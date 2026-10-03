@@ -13,9 +13,12 @@
 # This unit fails loudly. A red drill means the backups are not real, and it
 # is better to find that out on the 1st of the month than during an outage.
 #
-# TWO_RESTORE_URL must point at the SCRATCH database, never production. It is
-# a separate variable from TWO_DATABASE_URL for exactly that reason - see the
-# note in crates/bot/src/backup_cli.rs.
+# Each invocation allocates a NEW migrated scratch database and retains all
+# previous targets/evidence. Never wipe history to make a repeated drill pass.
+# Operator installation requires the authorized agent-testdb test service and
+# /etc/two-bot-next/restore-drill.env (protected, not the shared backup.env):
+# TWO_RESTORE_DRILL_BOOTSTRAP_URL=postgres://agent_test:@agent-testdb:5432/postgres
+# No production/staging database, runtime role or source credential is accepted.
 
 [Unit]
 Description=Prove the two-bot-next backups can actually be restored
@@ -27,15 +30,18 @@ User=twobot
 Group=twobot
 WorkingDirectory=/opt/two-bot-next
 
-# TWO_RESTORE_URL=postgres://.../two_scratch
-EnvironmentFile=/etc/two-bot-next/backup.env
+EnvironmentFile=/etc/two-bot-next/restore-drill.env
+StateDirectory=two-bot-next-restore-drills
+StateDirectoryMode=0700
+Environment=TWO_RESTORE_DRILL_EVIDENCE_DIR=/var/lib/two-bot-next-restore-drills
+ReadWritePaths=/var/lib/two-bot-next-restore-drills
 
 # Newest backup in the directory. `set -o pipefail` so an empty directory fails
 # the unit rather than running a restore against an empty path.
 ExecStart=/usr/bin/bash -o pipefail -c '\
   latest=$(ls -1t /var/backups/two-bot-next/two-funnel-*.ndjson.gz | head -1); \
-  echo "drill: restoring $latest into the scratch database"; \
-  exec /opt/two-bot-next/two-bot restore "$latest" --force'
+  echo "drill: restoring $latest into a NEW migrated scratch database"; \
+  exec /opt/two-bot-next/two-bot restore-drill "$latest" --confirm-scratch'
 
 StandardOutput=journal
 StandardError=journal
