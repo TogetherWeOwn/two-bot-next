@@ -140,7 +140,17 @@ impl MockRest {
                         path: request.1.clone(),
                         body: request.2.clone(),
                     });
-                    let body = "{}".to_owned();
+                    // Callbacks and original-response edits must carry a
+                    // nonzero snowflake `id`: the executor's
+                    // `mutation_receipt_id` rejects the mutation otherwise
+                    // and the runtime never reaches its completion edit.
+                    let body = if request.1.ends_with("/callback")
+                        || request.1.ends_with("/messages/@original")
+                    {
+                        "{\"id\":\"99\"}".to_owned()
+                    } else {
+                        "{}".to_owned()
+                    };
                     let head = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         body.len()
