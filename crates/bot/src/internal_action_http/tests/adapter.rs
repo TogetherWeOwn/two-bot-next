@@ -12,6 +12,12 @@ struct MockDiscord {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct MockState {
+    requests: Arc<Mutex<Vec<Value>>>,
+    replies: Arc<Vec<(StatusCode, Value)>>,
+}
+
 impl MockDiscord {
     async fn start(replies: Vec<(StatusCode, Value)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -19,17 +25,13 @@ impl MockDiscord {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
             .fallback(
-                |State((seen, replies)): State<(
-                    Arc<Mutex<Vec<Value>>>,
-                    Arc<Vec<(StatusCode, Value)>>,
-                )>,
-                 request: Request| async move {
+                |State(state): State<MockState>, request: Request| async move {
                     let (parts, body) = request.into_parts();
                     let raw = to_bytes(body, 8192).await.unwrap();
                     let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
                     let reply = {
-                        let mut seen = seen.lock().unwrap();
-                        let reply = replies[seen.len().min(replies.len() - 1)].clone();
+                        let mut seen = state.requests.lock().unwrap();
+                        let reply = state.replies[seen.len().min(state.replies.len() - 1)].clone();
                         seen.push(json!({
                             "method": parts.method.as_str(),
                             "path": parts.uri.path(),
@@ -40,7 +42,10 @@ impl MockDiscord {
                     (reply.0, Json(reply.1))
                 },
             )
-            .with_state((requests.clone(), Arc::new(replies)));
+            .with_state(MockState {
+                requests: requests.clone(),
+                replies: Arc::new(replies),
+            });
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
