@@ -1,14 +1,52 @@
 # Contributing
 
-## Commits and PRs
+## Pull request contract
 
-- Squash-merge only. Each PR is one logical change.
-- PR title = Conventional Commits header: `type(scope): summary`, at most 100
+The root [`AGENTS.md`](AGENTS.md) carries the same contract for human and AI
+contributors. Every change lands through a PR; nobody pushes to `main`.
+
+- **Branch.** Name it `type/short-slug`, for example `fix/gateway-resume`.
+- **One logical change per PR.** Keep it small enough to review in one sitting.
+- **Squash-merge only.** The `protect-main` ruleset allows no other merge
+  method, and the squash commit takes the PR title and body, so `main` holds one
+  conventional commit per PR. Do not pass a custom commit title when you merge.
+- **Title.** A Conventional Commits header: `type(scope): summary`, at most 100
   characters, no trailing period. Types: `feat`, `fix`, `perf`, `refactor`,
-  `test`, `docs`, `build`, `ci`, `chore`, `revert`, `style`, `security`.
-- Card ID goes in the body as `Refs: TOG-1234`, never in the title.
-- PR body explains what changed, why, and how it was tested (see the PR template).
-- `check`, `worker check`, `gitleaks` and `pr-lint` are required checks on `main`.
+  `test`, `docs`, `build`, `ci`, `chore`, `revert`, `style`, `security`. The
+  scope names the area of the code (`gateway`, `automod`, `store`). The release
+  automation below reads these headers.
+- **Body.** Fill in every section of the
+  [PR template](.github/pull_request_template.md), in short, active sentences:
+  Thinking Path, Linked Issues or Issue Description, What Changed, Verification,
+  Risks, Model Used, Checklist. The `pr-lint` check fails an empty body.
+- **Public-safe references.** Put no secret, token, private URL or internal
+  tracker ID (`TOG-`, `PAP-`) in any title, body, commit, comment or branch name.
+  Link public GitHub issues as `Closes #123`. `pr-lint` warns when it sees an
+  internal ID.
+- **Honest disclosure.** Name the exact model ID in Model Used, or write "None —
+  human-authored". Report only test runs you saw, and say what you did not run.
+- **Review.** Address every review finding, or reply with why it does not apply.
+  Re-request review after you push.
+- **Credit.** Credit the contributors whose work you build on.
+- **Done means merged.** Do not leave an orphan PR open: merge it, or close it
+  with a comment that names what replaced it.
+
+### Required checks
+
+The rulesets on `main` require one PR and squash-only merges, and block deletion
+and force-pushes. They require two status checks: `pr-lint` (ruleset
+`pr-conventions`) and `gitleaks` (ruleset `protect-main`). Both run from
+`.github/workflows/supply-chain.yml`. `pr-lint` checks the title format, the
+100-character limit, the trailing period and a non-empty body. On a push to
+`main` it also checks every commit subject. `check` and `worker check` run on
+every PR too, and a PR merges only when they are green on the exact head commit,
+even though the rulesets do not enforce them. Never bypass or weaken a check.
+
+### Issues
+
+Use an issue form: bug report, feature request, enhancement or documentation
+issue. Blank issues are off. Report a vulnerability privately; see
+[`SECURITY.md`](SECURITY.md).
 
 ## Releases
 

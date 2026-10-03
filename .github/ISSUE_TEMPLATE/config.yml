@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Contributing guide
+    url: https://github.com/TogetherWeOwn/two-bot-next/blob/main/CONTRIBUTING.md
+    about: Read the pull request contract and local checks before you open an issue or a PR
+  - name: Report a security vulnerability
+    url: https://github.com/TogetherWeOwn/two-bot-next/blob/main/SECURITY.md
+    about: Never file a vulnerability as a public issue; follow the private disclosure steps here
