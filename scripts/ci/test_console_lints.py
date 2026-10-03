@@ -20,6 +20,7 @@ CLI_MODULES = {
     "crates/cutover/src/bin/levels_import_rewards_probe.rs",
     "crates/cutover/src/bin/levels_role_rewards.rs",
     "crates/bot/src/erasure_cli.rs",
+    "crates/bot/src/member_cli.rs",
     "crates/bot/src/restore_drill.rs",
     "crates/discord/examples/pipeline_bench.rs",
     "crates/cutover/src/bin/audit_switch.rs",
