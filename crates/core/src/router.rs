@@ -110,7 +110,6 @@ pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on
 pub enum HandlerId {
     Rank,
     Leaderboard,
-    Help,
     ScorecardAttendance,
     AutomationAdmin,
     AutomationCustom,
